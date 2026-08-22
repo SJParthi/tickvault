@@ -156,7 +156,7 @@ crates/
 
 | Module | Contains |
 |--------|----------|
-| `oms/` | Engine, API client (`access-token` header, v2 base URL), state machine (10 valid transitions, 26 target), rate limiter (GCRA: 10/sec; **the 7,000/day half is NOT implemented — corrected 2026-08-22**), circuit breaker (3-state FSM), idempotency (UUID v4), reconciliation (f64::EPSILON) |
+| `oms/` | Engine, API client (`access-token` header, v2 base URL), state machine (10 valid transitions, 26 target), rate limiter (GCRA 10/sec + `OrderBudget` 250/min · 1000/hr · 7000/day — all four vendor tiers enforced since 2026-08-22; only the per-second one was, before), circuit breaker (3-state FSM), idempotency (UUID v4), reconciliation (f64::EPSILON) |
 | `risk/` | Pre-trade checks (halt → daily loss → position limit), P&L tracker, tick gap detection |
 | `indicator/` | O(1) indicator engine (SMA, EMA, RSI, MACD, BB via yata), types |
 | `strategy/` | FSM evaluator, TOML config, hot reload (notify crate) |

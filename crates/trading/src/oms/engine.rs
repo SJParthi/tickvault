@@ -33,7 +33,7 @@ use super::error_taxonomy::{self, DhanErrorClass, OrderEndpoint, OrderErrorPolic
 use super::exit_rules;
 use super::idempotency::CorrelationTracker;
 use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_order_readiness};
-use super::rate_limiter::OrderRateLimiter;
+use super::rate_limiter::{OrderBudget, OrderRateLimiter};
 use super::reconciliation::reconcile_orders;
 use super::state_machine::{is_valid_transition, parse_order_status};
 use super::types::{
@@ -195,6 +195,11 @@ pub struct OrderManagementSystem {
     api_client: OrderApiClient,
     /// SEBI rate limiter.
     rate_limiter: OrderRateLimiter,
+    /// The broker's per-minute / per-hour / per-day order ceilings. The
+    /// limiter above paces the per-SECOND burst; this bounds the totals.
+    /// Added 2026-08-22 -- three of the vendor's four documented tiers had
+    /// no enforcement at all.
+    order_budget: OrderBudget,
     /// Circuit breaker for Dhan API.
     circuit_breaker: OrderCircuitBreaker,
     /// Token provider for authentication.
@@ -329,6 +334,7 @@ impl OrderManagementSystem {
             correlations: CorrelationTracker::new(),
             api_client,
             rate_limiter,
+            order_budget: OrderBudget::new(),
             circuit_breaker: OrderCircuitBreaker::new(),
             token_provider,
             client_id,
@@ -401,6 +407,7 @@ impl OrderManagementSystem {
             // record); without this the CB stays stuck HalfOpen after the halt is
             // cleared and every later order is refused with CircuitBreakerOpen.
             self.circuit_breaker.reset();
+            self.order_budget.reset_daily();
         }
     }
 
@@ -651,6 +658,7 @@ impl OrderManagementSystem {
 
         // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
         self.check_order_book_capacity()?;
+        self.order_budget.try_consume(now_epoch_s())?;
 
         if let Err(err) = self.rate_limiter.check() {
             self.fire_alert(OmsAlert::RateLimitExhausted {
@@ -911,6 +919,8 @@ impl OrderManagementSystem {
 
         self.check_order_book_capacity()?;
 
+        self.order_budget.try_consume(now_epoch_s())?;
+
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
 
@@ -1019,6 +1029,8 @@ impl OrderManagementSystem {
         }
 
         self.check_order_book_capacity()?;
+
+        self.order_budget.try_consume(now_epoch_s())?;
 
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
@@ -2722,6 +2734,7 @@ impl OrderManagementSystem {
 
         // Step 1: the probe consumes the shared GCRA — dry-run included.
         self.check_order_book_capacity()?;
+        self.order_budget.try_consume(now_epoch_s())?;
         self.rate_limiter.check()?;
 
         // ---- DRY-RUN: tracked paper order ⇒ deterministic verdict, no HTTP ----
@@ -2856,8 +2869,9 @@ impl OrderManagementSystem {
 
     /// Steps 1+2 of the pinned skeleton: rate limiter then circuit breaker,
     /// with the place_order alert semantics.
-    fn check_order_gates(&self) -> Result<(), OmsError> {
+    fn check_order_gates(&mut self) -> Result<(), OmsError> {
         self.check_order_book_capacity()?;
+        self.order_budget.try_consume(now_epoch_s())?;
 
         if let Err(err) = self.rate_limiter.check() {
             self.fire_alert(OmsAlert::RateLimitExhausted {
