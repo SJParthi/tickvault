@@ -4389,6 +4389,115 @@ fn silence_page_allowed_today() -> bool {
 /// the same table; a longer one delays depth past the strikes it selected.
 pub const DEPTH_ATTACH_RETRY_SECS: u64 = 60;
 
+/// Retry cadence inside the PRE-OPEN readiness window, `[09:00, 09:15)` IST.
+///
+/// # Why the flat 60s cadence was not enough (operator, 2026-08-22)
+///
+/// The requirement is that contracts and depth are on the wire by **09:12**,
+/// so that 09:15 delivers ticks on everything from the first second. The
+/// blocker was never the data — it was the POLL GRID.
+///
+/// `DEPTH_ATTACH_RETRY_SECS` is a flat 60s sleep whose PHASE is fixed by boot
+/// time, so readiness lands on a 60-second grid offset by whenever the box
+/// happened to start. Measured on 2026-08-21: boot ~08:30:14, and the attach
+/// succeeded on **attempt 38 at 09:08:14** — 38 minutes of one-per-minute
+/// polling. That morning it cleared 09:12 by four minutes. It clears by
+/// nothing at all if pre-open prices land a minute later: data available at
+/// 09:11:20 with a `:50`-phase grid is dialed at **09:12:50**, past the line,
+/// for no reason but the sleep.
+///
+/// Fifteen seconds removes the grid as a failure mode: readiness now trails
+/// data availability by at most 15s instead of 59s. Data ready at 09:11:20 is
+/// on the wire by 09:11:35 — inside the line — where the 60s grid could have
+/// dialed at 09:12:50.
+///
+/// # Why 15 and not 5 (corrected before merge)
+///
+/// This constant was first written as 5, costed as "~180 QuestDB reads — a
+/// LATEST-ON query, off the tick path". That costing was wrong, and the error
+/// is worth recording because it is the shape that matters: I priced the
+/// cheapest thing an attempt does and ignored the expensive one.
+///
+/// Each attempt re-reads and re-parses the DAILY CONTRACT ARTIFACT —
+/// `contracts_in_artifact: 121674` in the 2026-08-21 production log, roughly
+/// 11 MB of JSON (Estimated: ~90 B/row; the file is not on this machine) — and
+/// the contract half of the SAME iteration parses it a second time, plus the
+/// ~4,600-row mapping artifact. So an attempt is two large JSON parses, not a
+/// database read. At 5s that is ~360 full parses inside the 15-minute window,
+/// competing for CPU with the drain that is folding pre-open ticks on a 4-vCPU
+/// box. 15s cuts that by two-thirds while still clearing 09:12 with margin.
+///
+/// # The real fix, deliberately not taken here
+///
+/// The artifact is immutable once written and keyed by date, so it should be
+/// parsed ONCE per day and shared, not per attempt — which would make even a
+/// 5s cadence nearly free. That means threading a cache through two loaders
+/// that each read the file internally, which is a wider change than the one
+/// this commit is making, and it should be measured rather than assumed.
+///
+/// Deliberately NOT applied all session: after 09:15 nothing is racing a
+/// deadline, and a fast poll would turn a benign all-day wait into thousands
+/// of parses.
+pub const DEPTH_ATTACH_PREOPEN_RETRY_SECS: u64 = 15;
+
+/// IST second-of-day by which contracts and depth must be ON THE WIRE.
+///
+/// # The requirement (operator, 2026-08-22)
+///
+/// Verbatim, asked four times: *"9.13 am evryhtign"* — everything subscribed
+/// and connected by 09:12 close, so the 09:15 open delivers ticks on every
+/// instrument from its first second rather than from whenever the attach
+/// happened to finish.
+///
+/// # What this deadline actually changes
+///
+/// Nothing in the lane targeted 09:12. `stock_options_are_pending` holds the
+/// contract dial until `STOCK_OPTION_PRICING_QUORUM_PERCENT` (60%) of the ~208
+/// F&O underlyings have printed a pre-open price, and the ONLY thing that ever
+/// cut that wait short was `out_of_time` — which is **10:00 IST**. On
+/// 2026-08-21 quorum arrived at 09:08:14 and cleared the line by four minutes;
+/// on a thin morning it arrives later and nothing forces the issue for another
+/// fifty.
+///
+/// Past this second the quorum stops being a WAIT and becomes a PREFERENCE:
+/// the attach dials whatever is priced.
+///
+/// # Why it is NOT ORed into `out_of_time`
+///
+/// `out_of_time` drives two arms, and only one of them wants this. It gates
+/// the quorum wait (which should end at 09:12) AND the GIVE-UP arm at
+/// `attempts > 0 && out_of_time && !last_had_instruments` (which must NOT).
+/// Folding 09:12 into it would turn the deadline into "abandon the session's
+/// contracts and depth at 09:12" — the exact opposite of the requirement, on a
+/// morning where nothing had resolved yet. A separate flag is the whole
+/// difference between "dial what we have" and "dial nothing".
+///
+/// A source-scan ratchet also pins `out_of_time`'s definition verbatim, so
+/// this separation is enforced from two directions.
+///
+/// 09:12 rather than 09:13: the operator names 09:13 as the moment everything
+/// IS ready, so the deadline that produces that state has to fall before it.
+/// 09:12:00 leaves a full minute for the subscribe batches to reach Dhan —
+/// ~230 messages sent back-to-back with no pacing, so under a second in
+/// practice, and the rest is margin.
+pub const PREOPEN_READY_DEADLINE_IST_SECS: u32 = 9 * 3_600 + 12 * 60;
+
+/// Gauge: IST second-of-day at which BOTH halves reached the wire.
+///
+/// # Why this has to exist for the deadline to mean anything
+///
+/// Before it, nothing in the system measured whether the attach met any
+/// particular minute. The requirement "everything subscribed by 09:12" was
+/// unfalsifiable from the outside: `late-attach complete` carried an attempt
+/// count, not a clock reading, so a 09:08 morning and a 09:47 morning produced
+/// the same shape of log line and neither could be alarmed on.
+///
+/// Published ONCE per session, at the moment the second half dials. Not per
+/// attempt — an attempt is not a readiness time — and never on the give-up
+/// paths, where there IS no readiness second and publishing a placeholder
+/// would read as a met deadline.
+pub const PREOPEN_READY_GAUGE: &str = "tv_dhan_preopen_ready_secs";
+
 /// IST second-of-day past which the depth late-attach gives up for the session.
 ///
 /// 10:00 IST — 44 minutes after the option-chain leg's first fire. Past this,
@@ -4704,6 +4813,11 @@ async fn attach_depth_when_available(
 
         let out_of_time = past_hard_stop || past_deadline_and_window;
 
+        // DELIBERATELY not folded into `out_of_time` above — see
+        // `PREOPEN_READY_DEADLINE_IST_SECS`. This one ends the quorum WAIT; it
+        // must never reach the give-up arm, which would read it as "abandon".
+        let past_preopen_ready_deadline = now_ist >= PREOPEN_READY_DEADLINE_IST_SECS;
+
         // A terminal stop that does NOT consult `last_had_instruments`.
         //
         // The give-up arm below deliberately keeps waiting while a half is
@@ -4857,8 +4971,9 @@ async fn attach_depth_when_available(
         // Recorded because the split is an attractive-looking change that a
         // reader arrives at independently — I did — and the arithmetic that
         // rejects it is not visible from this call site.
-        let pending =
-            crate::dhan_contract_universe::stock_options_are_pending(&contracts) && !out_of_time;
+        let pending = crate::dhan_contract_universe::stock_options_are_pending(&contracts)
+            && !out_of_time
+            && !past_preopen_ready_deadline;
         if pending {
             warn!(
                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
@@ -5101,14 +5216,66 @@ async fn attach_depth_when_available(
             // single `return` that used to sit in one shared Ok arm is exactly
             // what left depth dark once contracts won the race.
             if contracts_done && depth_done {
+                // The readiness SECOND, not the attempt count. Published here
+                // and nowhere else: this is the only point at which both
+                // halves are provably on the wire, and it is reached at most
+                // once per session. Read fresh rather than reusing `now_ist`
+                // from the top of the iteration — the dials in between take
+                // real time, and reporting the second we STARTED looking would
+                // flatter every measurement by however long the work took.
+                let ready_at = ist_second_of_day_now();
+                metrics::gauge!(PREOPEN_READY_GAUGE).set(f64::from(ready_at));
+                let met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS;
                 info!(
                     attempts,
+                    ready_at_ist_secs = ready_at,
+                    deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
+                    met_deadline,
                     "late-attach complete: contracts and depth are both on the wire"
                 );
+                if !met_deadline {
+                    // An ERROR, not a warning, and deliberately so: everything
+                    // subscribed before the open is the stated requirement, and
+                    // a session that misses it trades the first minutes without
+                    // its contracts. Coded so a metric filter can page on it —
+                    // the gauge alone cannot say WHY, and a log line nothing
+                    // reads is how the previous deadline went unnoticed.
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        ready_at_ist_secs = ready_at,
+                        deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
+                        attempts,
+                        "late-attach finished AFTER the pre-open readiness deadline — the \
+                         session opened without its full contract and depth set on the wire. \
+                         Everything dialed, just late."
+                    );
+                }
                 return;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(DEPTH_ATTACH_RETRY_SECS)).await;
+        // Poll fast while the open is approaching, slow the rest of the day.
+        // Re-read per iteration, never hoisted: this loop crosses 09:15, and a
+        // value captured once would keep the fast cadence for the session.
+        tokio::time::sleep(std::time::Duration::from_secs(preopen_retry_secs(
+            ist_second_of_day_now(),
+        )))
+        .await;
+    }
+}
+
+/// How long to wait before the next late-attach attempt, given the IST second.
+///
+/// Pure so the boundary behaviour is testable without a clock: the whole point
+/// is WHICH cadence applies at 08:59:59, 09:00:00, 09:14:59 and 09:15:00, and
+/// an inline `if` inside a `tokio::sleep` cannot be asserted at all.
+#[must_use]
+pub fn preopen_retry_secs(now_ist_secs: u32) -> u64 {
+    let from = u64::from(tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST);
+    let until = CONTINUOUS_SESSION_START_SECS_OF_DAY_IST;
+    if (from..until).contains(&u64::from(now_ist_secs)) {
+        DEPTH_ATTACH_PREOPEN_RETRY_SECS
+    } else {
+        DEPTH_ATTACH_RETRY_SECS
     }
 }
 
@@ -10123,6 +10290,176 @@ mod silence_latch_tests {
 
 #[cfg(test)]
 mod contract_attach_tests {
+    use super::{DEPTH_ATTACH_PREOPEN_RETRY_SECS, DEPTH_ATTACH_RETRY_SECS, preopen_retry_secs};
+
+    /// The four boundaries that decide whether the operator's 09:12 line is
+    /// met. Asserted as a table because an off-by-one at either edge is
+    /// invisible in production: the loop simply runs at the other cadence and
+    /// nothing logs which one it chose.
+    /// The deadline must fall BEFORE the minute the operator names as ready,
+    /// and after ticks start persisting — a deadline earlier than 09:00 could
+    /// never be met because no price exists to locate at-the-money against.
+    #[test]
+    fn preopen_ready_deadline_sits_between_first_tick_and_the_open() {
+        use super::PREOPEN_READY_DEADLINE_IST_SECS as D;
+        let persist = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
+        assert!(
+            D > persist,
+            "a deadline before the first tick can never be met"
+        );
+        assert_eq!(D, 9 * 3_600 + 12 * 60, "the deadline is 09:12:00 IST");
+        assert!(
+            u64::from(D) < super::CONTINUOUS_SESSION_START_SECS_OF_DAY_IST,
+            "readiness must precede the open, not coincide with it"
+        );
+        // Inside the fast-poll window, or the deadline would be approached on
+        // the 60s grid it exists to defeat.
+        assert_eq!(
+            super::preopen_retry_secs(D),
+            super::DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+            "the deadline must be approached at the fast cadence"
+        );
+    }
+
+    /// THE test for this change. `out_of_time` drives two arms — the quorum
+    /// wait and the GIVE-UP arm — and only the first wants a 09:12 deadline.
+    /// Folding it in would abandon contracts and depth at 09:12 on a morning
+    /// where nothing had resolved, which is the opposite of the requirement.
+    ///
+    /// A source scan because the loop is `TEST-EXEMPT` async I/O: it dials
+    /// sockets. This asserts the exact structural property that keeps the two
+    /// meanings apart, which no unit test of a pure function can reach.
+    #[test]
+    fn preopen_ready_deadline_never_reaches_the_give_up_arm() {
+        // PRODUCTION half only — `include_str!` carries this test module too,
+        // and the first draft counted its own assertion text (5 instead of 2).
+        // The house `test_marker` split is what keeps a source scan measuring
+        // the code rather than measuring itself.
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+        assert!(
+            src.contains("let out_of_time = past_hard_stop || past_deadline_and_window;"),
+            "out_of_time gained a term — if that term is the 09:12 deadline, the give-up \
+             arm now abandons the session at 09:12"
+        );
+        assert!(
+            src.contains(
+                "let past_preopen_ready_deadline = now_ist >= PREOPEN_READY_DEADLINE_IST_SECS;"
+            ),
+            "the readiness deadline must stay its own flag"
+        );
+        // And it must be spent on the quorum wait, nowhere else.
+        assert_eq!(
+            src.matches("past_preopen_ready_deadline").count(),
+            2,
+            "the readiness flag is declared once and read once (the quorum wait). A third \
+             use means it has reached an arm that was never reviewed for it"
+        );
+        assert!(
+            src.contains("&& !past_preopen_ready_deadline;"),
+            "the quorum wait must actually consult the deadline"
+        );
+    }
+
+    /// The readiness second is published once, at the only point where both
+    /// halves are provably on the wire — never on a give-up path, where there
+    /// is no readiness second and a placeholder would read as a met deadline.
+    #[test]
+    fn preopen_ready_gauge_is_published_only_on_the_both_halves_success_arm() {
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+        assert_eq!(
+            src.matches("metrics::gauge!(PREOPEN_READY_GAUGE)").count(),
+            1,
+            "the readiness gauge must have exactly one emit site"
+        );
+        let emit = src
+            .find("metrics::gauge!(PREOPEN_READY_GAUGE)")
+            .expect("emit site");
+        let arm = src
+            .find("if contracts_done && depth_done {")
+            .expect("success arm");
+        assert!(emit > arm, "the gauge is published outside the success arm");
+        // Measured AFTER the dials, not from the top of the iteration — the
+        // dials take real time and the earlier reading would flatter it.
+        assert!(
+            src.contains("let ready_at = ist_second_of_day_now();"),
+            "the readiness second must be read fresh at completion"
+        );
+    }
+
+    #[test]
+    fn preopen_retry_secs_switches_exactly_at_the_persistence_and_session_edges() {
+        const NINE: u32 = 9 * 3_600;
+        for (secs, want, why) in [
+            (
+                NINE - 1,
+                DEPTH_ATTACH_RETRY_SECS,
+                "08:59:59 — before ticks persist",
+            ),
+            (
+                NINE,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:00:00 — first tick can persist",
+            ),
+            (
+                NINE + 8 * 60,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:08 — Friday's real attach",
+            ),
+            (
+                NINE + 12 * 60,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:12 — the operator's line",
+            ),
+            (
+                NINE + 15 * 60 - 1,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:14:59 — still pre-open",
+            ),
+            (
+                NINE + 15 * 60,
+                DEPTH_ATTACH_RETRY_SECS,
+                "09:15:00 — open; nothing races now",
+            ),
+            (
+                14 * 3_600,
+                DEPTH_ATTACH_RETRY_SECS,
+                "14:00 — mid-session restart",
+            ),
+            (
+                0,
+                DEPTH_ATTACH_RETRY_SECS,
+                "midnight — no fast poll overnight",
+            ),
+        ] {
+            assert_eq!(preopen_retry_secs(secs), want, "{why}");
+        }
+    }
+
+    /// The fast cadence must be strictly faster, and bounded away from zero —
+    /// a 0 would spin the loop against QuestDB with no sleep at all.
+    #[test]
+    fn preopen_retry_secs_is_faster_than_the_session_cadence_and_never_zero() {
+        assert!(
+            DEPTH_ATTACH_PREOPEN_RETRY_SECS > 0,
+            "a zero sleep is a spin loop"
+        );
+        assert!(
+            DEPTH_ATTACH_PREOPEN_RETRY_SECS < DEPTH_ATTACH_RETRY_SECS,
+            "the pre-open cadence must be the faster one, or the window buys nothing"
+        );
+        // 15 minutes of window / 5s = 180 reads. Pinned so a later tightening
+        // has to face the read count it creates.
+        let reads = (15 * 60) / DEPTH_ATTACH_PREOPEN_RETRY_SECS;
+        assert!(
+            reads <= 200,
+            "pre-open window would issue {reads} QuestDB reads"
+        );
+    }
+
     use super::*;
 
     #[test]

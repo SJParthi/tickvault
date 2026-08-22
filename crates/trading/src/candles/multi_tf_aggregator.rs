@@ -1660,6 +1660,81 @@ mod tests {
             elapsed.as_nanos() as f64 / (slots * TF_COUNT).max(1) as f64
         );
     }
+
+    /// MEASUREMENT (not a CI gate): what does the per-tick FOLD actually cost
+    /// at the authorized 25,000-instrument ceiling?
+    ///
+    /// Every scaling document in this repo sizes MEMORY at 25,000 instruments
+    /// and then says CPU is UNMEASURED — `websocket-connection-scope-lock.md`
+    /// states it outright ("~12,500 packets/sec at the open × (decode +
+    /// 24-timeframe fold + ILP append) has never run"). Memory fitting is not
+    /// the same claim as the box keeping up, and the second one is what drops
+    /// ticks. This turns the CPU half into a number.
+    ///
+    /// What it measures: `consume_tick` at FULL slot occupancy, round-robin
+    /// across all 25,000 instruments with advancing timestamps, so the slot
+    /// hash runs at its real load factor and real seals fire. What it does NOT
+    /// measure: packet decode (separately DHAT-gated and fixed-offset), the
+    /// ILP append, or the socket read — so the real per-tick budget is LARGER
+    /// than this figure, and the headroom printed here is an UPPER bound on
+    /// the fold's share, never a claim about the whole pipeline.
+    ///
+    /// `#[ignore]`d for the same reason as the sweep harness above: a
+    /// wall-clock bound on a shared CI runner is a flake, and a flaky gate is
+    /// worse than no gate. Run it deliberately, in RELEASE — a debug build
+    /// measures the allocator and the bounds checks, not the design:
+    ///
+    ///     cargo test -p tickvault-trading --release \
+    ///       fold_cost_at_the_authorized_ceiling -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement harness, not a gate — see doc comment"]
+    fn fold_cost_at_the_authorized_ceiling() {
+        let cap = crate::candles::AGGREGATOR_MAX_SLOTS;
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, cap);
+
+        // Fill every slot first: a half-empty map is a friendlier hash than
+        // the one production actually runs.
+        for sid in 0..cap as u64 {
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid, SEG_EQ, OPEN, 100.0, 1),
+                None,
+                |_, _, _, _, _| {},
+            );
+        }
+        let slots = agg.len();
+
+        // Drive ticks round-robin with a clock that advances, so buckets close
+        // and seals fire — sealing is part of what a tick costs.
+        const TICKS: usize = 250_000;
+        let mut seals = 0usize;
+        let t0 = std::time::Instant::now();
+        for i in 0..TICKS {
+            let sid = (i % cap) as u64;
+            let ts = OPEN + (i / cap) as u32;
+            let px = 100.0 + (i % 97) as f32 * 0.05;
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid, SEG_EQ, ts, px, (i % 1000) as u32 + 1),
+                None,
+                |_, _, _, _, _| seals += 1,
+            );
+            std::hint::black_box(stats);
+        }
+        let elapsed = t0.elapsed();
+
+        let ns_per_tick = elapsed.as_nanos() as f64 / TICKS as f64;
+        let ticks_per_sec = 1_000_000_000.0 / ns_per_tick;
+        // The open-burst envelope this repo sizes against.
+        let envelope = 12_500.0;
+        println!(
+            "fold cost: {slots} slots, {TICKS} ticks, {seals} seals, {elapsed:?}\n  \
+             {ns_per_tick:.1} ns/tick -> {ticks_per_sec:.0} ticks/sec on ONE core\n  \
+             headroom vs the {envelope:.0}/sec open burst: {:.1}x (fold only; \
+             decode + ILP append are NOT included)",
+            ticks_per_sec / envelope
+        );
+    }
 }
 
 #[cfg(test)]

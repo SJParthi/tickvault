@@ -1354,3 +1354,221 @@ tradeable instruments off depth-5); sends a mixed-segment batch as ONE message
 (one Dhan message carries exactly one RequestCode, so one half would get the
 wrong mode); or reports the index set as covered while its never-ticked count
 is non-zero.
+
+### 2026-08-21 — SPOT UNIVERSE NARROWED to indices + F&O underlyings (the change that makes the authorized contract set fit)
+
+**The verbatim operator demands (2026-08-21, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "See for nifty and banknifty indices alone only enifr cuurent options of current expiry right dude but for entire stocks options of fno alone only w ehsoud always pull current expiries of atm plus minus 25 alone right dude oaky."
+
+> "Go ahead and fix evrfhbrin fuxd eokay?"
+
+The first quote SPECIFIES the contract shape; the second authorizes the work.
+Both are recorded here BEFORE any code, per this file's own rule-file-first law.
+
+#### What the first quote CONFIRMS (already true — no change authorized or needed)
+
+| Operator's words | Code today | Status |
+|---|---|---|
+| NIFTY + BANKNIFTY: "entire options of current expiry" | `FULL_CHAIN_INDEX_UNDERLYINGS = ["NIFTY","BANKNIFTY"]`, full chain, current expiry, NO ATM window (`dhan_contract_universe.rs:223,655`) | **already correct** |
+| F&O stocks: "current expiries of atm plus minus 25 alone" | `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` (`constants.rs:995`) | **already correct** |
+
+This retires the executor's earlier recommendation to CAP the index chains. The
+operator has now explicitly ruled the opposite: index chains stay UNCAPPED. That
+is a decision on the record, not a loose end — and it means index-chain depth
+(measured 542 contracts on 2026-07-13, and 2,037 for three indices on
+2026-04-25) is a vendor-controlled swing the design accepts.
+
+#### What the second quote AUTHORIZES (the actual change)
+
+**The spot universe narrows from the master-sourced constituent set to NSE
+indices + F&O stock underlyings only.**
+
+The arithmetic, on MEASURED figures:
+
+| Component | Slots | Source |
+|---|---|---|
+| NSE indices (spot) | 119 | MEASURED — never-ticked count, 2026-08-21 |
+| F&O stock spots (required to compute ATM) | 216 | MEASURED — live QuestDB, 2026-04-25 (`constants.rs:981-983`) |
+| NIFTY+BANKNIFTY current-expiry options, full chain | 542–~1,200 | MEASURED range |
+| NIFTY+BANKNIFTY futures, all expiries | 6 | 2 × 3 |
+| F&O stock futures, all expiries | 648 | 216 × 3 |
+| F&O stock options, ATM ± 25 | 22,042 | MEASURED (`constants.rs:981-983`) |
+| **TOTAL** | **23,573–24,231** | **fits, 769–1,427 spare** |
+
+Against the CURRENT spot universe (`live_subscription_from_master = true`,
+measured **4,565** SIDs) the same contract set totals **~27,800–28,500** —
+over by ~3,000. The code says so itself at `dhan_feed_stack.rs:4855-4862`:
+*"leaving 4 whole connections plus ~435 spare ≈ 20,435 for contracts. The
+authorized contract set is ~23,820, so it ALREADY does not fit."*
+
+**So the spot universe is the ONLY lever left, and narrowing it is what makes
+the operator's stated design fit.** Nothing about the contract shape changes.
+
+#### The mechanical contract
+
+| Aspect | Locked value |
+|---|---|
+| New spot set | NSE indices (all, as today) + the F&O stock UNDERLYING set derived from `FUTSTK`/`OPTSTK` rows of the daily master |
+| Derivation point | artifact build time — `dhan_universe.rs` already holds `&[MasterRow]` with `InstrumentClass` (`:276`), so no new fetch and no new parse pass |
+| Artifact shape | a SEPARATE artifact listing F&O underlying ids. The existing mapping artifact is **not** re-shaped — an additive file cannot break a consumer that never reads it |
+| Default | **OFF.** Serde default false; an absent section keeps today's behaviour byte-for-byte |
+| Fail-soft | an unreadable/absent F&O artifact falls back to today's master-sourced set with a coded error — never a silent narrowing, and never an empty spot set |
+| Unchanged | the 16-connection budget, the 4 endpoint types, `dry_run`, the §28 frozen area, the per-minute REST legs, and the contract selection in every respect |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the narrowed spot universe **enabled by default**, in any config file, env var, deploy script, or serde default.
+- Caps, windows, or otherwise narrows the NIFTY/BANKNIFTY option chains — the operator explicitly ruled them UNCAPPED in the first quote above.
+- Changes `STOCK_OPTION_ATM_STRIKES_EACH_SIDE` away from 25.
+- Derives the F&O underlying set from anything other than the daily master's own `FUTSTK`/`OPTSTK` rows (a hardcoded list goes stale weekly — the standing no-manual-intervention mandate).
+- Lets an unreadable F&O artifact produce a SILENT fallback, or an empty spot set.
+- Re-shapes the existing mapping artifact rather than adding a separate one.
+
+#### Honest envelope
+
+The 22,042 stock-option figure is **2026-04-25** at **216** stocks. If today's
+F&O list or ladder depth has grown, the 769–1,427 spare shrinks accordingly —
+and at the top of the measured index-chain range the margin is already under
+800. `scripts/count-current-expiry-universe.sh` exists to replace April's
+number with a measured one; until it has been run on the box, **this section's
+"fits" verdict rests on a four-month-old measurement** and is stated as such.
+
+### 2026-08-22 — SPOT UNIVERSE = NSE INDICES + NIFTY TOTAL MARKET ONLY (supersedes the 2026-08-21 F&O-underlyings narrowing)
+
+**The verbatim operator demand (2026-08-22, typed directly in-session — preserve EXACTLY, expletives and typos included):**
+
+> "what the fick i clelayrl otld you o skip bse and aske dyout uckign pcik only nifty toal marjet stcoks and enitre nse indices aloen rigth mtoehrfucker then whyt he fuck stills truggligj motherufcke rhwy ? see emanhwiel why the fuck you didnt do the crsoss ebrificatione ntorley with nse india real nse idncies svcsv fiels downlaod becuase onl ywhen yo uhave thsoe aloen only then you cna do the cross verifictaion of each and eveyr data to preicsley fidn nifty total amrket symbsols repsectively rigtnh dude do yoir elaly udnerstand dude because if im not worn nse idnices woudl comeb anywhere between 120 and nifty total amrket would be aorudn 750 or 755 right dude then whyt he fuck still tehse are msisin dud ehwy if you dont do that then always you mtoehrukcxer wil lawlays tell me 4500 spots onl ywrist do thes emtoherucke rokay?"
+
+This is the dated quote the rule-file-first law requires, recorded BEFORE the
+code change it authorizes.
+
+#### What was already true, and what was actually missing
+
+The operator's two premises were checked against source before anything moved.
+One was already satisfied; the other was not, and he is right that it was not.
+
+| Premise | Verdict |
+|---|---|
+| "skip BSE" | **ALREADY DONE.** The spot path is NSE-only by construction — `nse_index_mappings` and `fno_underlying_mappings` both filter `row.exch_id != "NSE"`, and two tests pin it (`"NSE cash equities only: no BSE rows, no index legs"`, `"SENSEX is BSE — the operator narrowed to NSE alone"`). |
+| "you didn't do the cross-verification with the real NSE India index CSVs" | **HALF TRUE, and the half that is false matters less than the half that is true.** The download and the ISIN join DO exist and DO run: `build_once` fetches all **49** `INDEX_CONSTITUENCY_SLUGS` from `niftyindices.com` — `ind_niftytotalmarket_list` among them — and joins every constituent to the Dhan master **by ISIN** through `join_constituents`, fail-closed at a 2% unresolved tolerance and a 10% failed-list ceiling. So the cross-verification is built and gated. |
+| "then why do you still tell me 4,500 spots" | **THE REAL DEFECT.** The join's dedup key is `(index_name, security_id, segment)` — scoped PER LIST. The artifact therefore carries the **UNION of all 49 lists**, and `select_live_universe` dedupes that to the recorded **~4,565** SIDs. Nifty Total Market's ~750 rows are IN there, tagged `index_name = "Nifty Total Market"`, and **nothing ever selected them**. The data was resolved and then thrown into a pile. |
+
+So the machinery he asked for exists; what never existed is a selector that
+takes the ONE list he named out of the pile.
+
+#### What this quote changes
+
+| Surface | Before | After |
+|---|---|---|
+| Spot set, as configured | union of all 49 index lists (~4,565) | **NSE indices + Nifty Total Market constituents only (~869)** |
+| 2026-08-21 narrowing (indices + F&O underlyings, ~335) | the only narrowing that existed; OFF | **SUPERSEDED as the default choice**, key retained and still honoured when NTM is off |
+| BSE | excluded | excluded (unchanged) |
+| Contract shape | NIFTY+BANKNIFTY full current-expiry chains, stock options ATM ±25, all futures expiries | **unchanged — this quote does not touch it** |
+
+Precedence when both narrowing keys are on: **NTM wins**, because it is the
+later dated instruction. Stated in the config and pinned by a test rather than
+left to the order of two `if` blocks.
+
+#### The arithmetic this fixes (the reason the operator kept hitting a wall)
+
+| Spot set | Spot | Contracts authorized | Total vs the 25,000 cap |
+|---|---|---|---|
+| Union of 49 lists (today) | ~4,565 | ~23,820 | **~28,385 — OVER by ~3,385** |
+| Indices + F&O underlyings (2026-08-21) | ~335 | ~23,820 | ~24,155 — fits, 845 spare |
+| **Indices + NTM (this quote)** | **~869** | ~23,820 | **~24,689 — fits, ~311 spare** |
+
+The margin is thinner than the F&O-underlyings option and that is stated
+plainly: at the top of the measured index-chain range (2,037 legs for two
+underlyings) the total breaches the cap and `plan_pool` refuses the WHOLE pool
+fail-closed rather than truncating. That refusal is loud and is the correct
+failure — but it is a session-ending one, so the headroom here is real and
+small.
+
+#### Honest envelope
+
+- **~119 indices and ~750 NTM constituents are EXPECTED, not measured.** The
+  index count comes from the master's NSE `INDEX` rows and the NTM count from
+  whatever `ind_niftytotalmarket_list` serves on the day. Neither is a constant
+  in this repository and neither can be verified from a dev container. The
+  operator's own figures (~120 and ~750–755) match the expectation.
+- **Nothing here makes the feed work.** It changes which instruments are asked
+  for. A non-zero `compared` from the 15:31 cross-verification remains the only
+  evidence this repository can offer that ticks arrive at all.
+- **Fail-soft direction is UNCHANGED and deliberate:** an unreadable or
+  unparseable NTM artifact falls THROUGH to the full master-sourced set with a
+  coded error — the session subscribes MORE than was asked for, never less. A
+  silent narrowing would drop ~3,700 instruments with nothing to say so.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Sources the NTM set from anything other than `ind_niftytotalmarket_list`
+  joined to the Dhan master **by ISIN** (symbol-alone joins are banned by
+  §31.1 of `daily-universe-scope-expansion-2026-05-27.md` — tickers are reused
+  and renamed).
+- Hardcodes an NTM constituent list (it rebalances; a hardcoded list goes
+  stale and breaches the standing no-manual-intervention mandate).
+- Re-admits BSE to the spot set.
+- Lets an unreadable NTM artifact produce a SILENT fallback, or an empty spot
+  set.
+- Changes the contract shape (chain scope, ATM ±25, futures expiries) under
+  cover of this quote — it says nothing about contracts.
+- Flips `dry_run`, touches the §28 frozen area, or arms live order fire.
+
+#### 2026-08-22 (SAME DAY) — MEASURED ON THE BOX: the "~4,565 spot" figure in the section above is WRONG, and so is its capacity table
+
+The section above was written from source and from the figures this repository
+has been repeating since 2026-08-12. Both were then checked against the live
+box (`aws logs filter-log-events`, `/tickvault/prod/app`, session of
+2026-08-21). The correction matters more than the change it corrects.
+
+**The live spot set is 868. It has been 868. Nothing was ever subscribing 4,565.**
+
+```
+"live universe: widened from today's resolved master"
+  instruments: 868   master_entries: 4636   deduped: 3771   capacity: 25000
+```
+
+`4,565` / `4,636` is the **artifact ROW count** — one row per
+(index list, stock) membership pair, because `join_constituents` dedupes per
+list. `select_live_universe` then dedupes on `(security_id, segment)` and
+**3,771 of those rows collapse**. The union of 49 NSE index lists is ~749
+distinct stocks, which is essentially Nifty Total Market's own membership,
+because NTM is the superset the other broad lists are drawn from.
+
+**What this does to the capacity table above.** Measured the same session:
+
+| Line | This file said | Box says |
+|---|---:|---:|
+| Spot | ~4,565 | **868** |
+| F&O underlyings with ladders | 216 | **208** |
+| Index futures | ~6 | **18** |
+| Stock futures | ~648 | **640** |
+| Index options (current expiry) | 542–2,037 | **1,250** |
+| Stock options at ATM ±25 | 22,032 | **20,220** |
+| **Total subscribed** | ~28,385 (OVER by 3,385) | **22,996 — 2,004 spare** |
+| ATM window actually applied | "would silently shrink" | **25, `dropped_for_capacity: 0`** |
+
+So the capacity problem the section above was written to solve **did not
+exist**. ±25 fits at full width today with 2,004 slots spare.
+
+**What the NTM change therefore is, honestly.** Not a capacity fix — it
+changes the subscribed count by roughly nothing (868 → ~869). What it does
+buy is real but narrower: the set becomes **deliberately** NSE indices + Nifty
+Total Market instead of **incidentally** the union of 49 lists that happens to
+dedupe to the same membership. That removes a dependency on 48 lists nobody
+selected, makes the set reproducible from one named source, and shrinks the
+artifact from ~4,600 rows to ~869. The commit message and the section above
+claim a ~3,700-instrument saving. **That claim is withdrawn.**
+
+**How this file came to carry a wrong number for ten days.** The 4,565 figure
+entered on 2026-08-12 from a log line, was copied into `config/base.toml`'s
+comments, into `dhan_feed_stack`'s own reasoning ("~4,565 spot instruments
+leave ~20,435 for contracts"), into `config.rs`'s doc comment, and into the
+2026-08-21 narrowing rationale — each copy citing the last. Nobody re-read the
+line it came from, which reports `instruments` and `master_entries` as
+separate fields. A number that is only ever quoted is not evidence.
+
+**Still true, and unaffected by the correction:** the NTM rows really were
+being resolved and never selected; BSE really is excluded; the ISIN join
+really does run fail-closed. Those were checked in source, not quoted.

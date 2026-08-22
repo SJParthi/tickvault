@@ -85,3 +85,11 @@ harness = false
 
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]
+
+# Explicit name so the documented invocation works. Cargo derives a bin name
+# from the FILE name, giving `tv_guarantees`, while this binary's own docs --
+# and every operator-facing mention of it -- say `tv-guarantees`. A tool whose
+# documented command errors out is a tool nobody runs twice.
+[[bin]]
+name = "tv-guarantees"
+path = "src/bin/tv_guarantees.rs"

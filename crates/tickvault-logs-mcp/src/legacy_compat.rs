@@ -1,8 +1,8 @@
-//! Small legacy-runtime-semantics helpers so tool outputs match server.py
+//! Small legacy-runtime-semantics helpers so tool outputs match the retired reference implementation
 //! byte-for-byte (after the harness's documented normalization).
 
 /// legacy `s[:n]` — slice by UNICODE CHARACTERS, not bytes.
-pub fn py_slice_chars(s: &str, n: usize) -> &str {
+pub fn legacy_slice_chars(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {
         Some((idx, _)) => &s[..idx],
         None => s,
@@ -10,7 +10,7 @@ pub fn py_slice_chars(s: &str, n: usize) -> &str {
 }
 
 /// legacy `s[-n:]` — last `n` characters.
-pub fn py_tail_chars(s: &str, n: usize) -> &str {
+pub fn legacy_tail_chars(s: &str, n: usize) -> &str {
     let count = s.chars().count();
     if count <= n {
         return s;
@@ -26,7 +26,7 @@ pub fn py_tail_chars(s: &str, n: usize) -> &str {
 /// files: `\n`, `\r\n`, `\r`. (the legacy runtime also splits on `\v`, `\f`, `\x1c`,
 /// `\x1d`, `\x1e`, `\x85`, ` `, ` ` — those never appear in the
 /// tickvault log sinks; documented bounded-parity deviation.)
-pub fn py_splitlines(s: &str) -> Vec<&str> {
+pub fn legacy_splitlines(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let bytes = s.as_bytes();
     let mut start = 0usize;
@@ -57,7 +57,7 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
 
 /// legacy `line.rstrip("\n")` — strip trailing `\n` chars only.
 // WIRING-EXEMPT: parity-shim helper landed dormant on main via #1644 (phase 2c, pre-cutover — call sites arrive with the MCP cutover PR); annotated 2026-07-18 because the local wiring guard diffs the whole merge range and flags main's own fn.
-pub fn py_rstrip_newline(s: &str) -> &str {
+pub fn legacy_rstrip_newline(s: &str) -> &str {
     s.trim_end_matches('\n')
 }
 
@@ -65,7 +65,7 @@ pub fn py_rstrip_newline(s: &str) -> &str {
 /// strings parse as base-10 integers. Returns Err(msg) with a
 /// `ValueError`-shaped message when it cannot coerce (the transcript
 /// avoids these; the message shape is a documented deviation).
-pub fn py_int(v: &serde_json::Value) -> Result<i64, String> {
+pub fn legacy_int(v: &serde_json::Value) -> Result<i64, String> {
     match v {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -88,7 +88,7 @@ pub fn py_int(v: &serde_json::Value) -> Result<i64, String> {
 /// `urllib.parse.quote(s)` with the default `safe="/"`: percent-encode the
 /// UTF-8 bytes of `s`, leaving unreserved chars (ALPHA / DIGIT / `_.-~`)
 /// and `/` literal. Uppercase hex, matching the legacy runtime.
-pub fn py_urllib_quote(s: &str) -> String {
+pub fn legacy_urllib_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {
@@ -106,7 +106,7 @@ pub fn py_urllib_quote(s: &str) -> String {
 
 /// `fnmatch.fnmatch(name, pattern)` (posix, case-sensitive): `*` matches
 /// any run, `?` one char, `[seq]` a char class (`[!seq]` negated).
-pub fn py_fnmatch(name: &str, pattern: &str) -> bool {
+pub fn legacy_fnmatch(name: &str, pattern: &str) -> bool {
     fn matches(n: &[char], p: &[char]) -> bool {
         if p.is_empty() {
             return n.is_empty();
@@ -242,57 +242,57 @@ mod tests {
 
     #[test]
     fn slice_chars_is_unicode_aware() {
-        assert_eq!(py_slice_chars("héllo", 2), "hé");
-        assert_eq!(py_slice_chars("ab", 5), "ab");
-        assert_eq!(py_slice_chars("", 3), "");
+        assert_eq!(legacy_slice_chars("héllo", 2), "hé");
+        assert_eq!(legacy_slice_chars("ab", 5), "ab");
+        assert_eq!(legacy_slice_chars("", 3), "");
         let e200: String = "é".repeat(200);
-        assert_eq!(py_slice_chars(&e200, 160).chars().count(), 160);
+        assert_eq!(legacy_slice_chars(&e200, 160).chars().count(), 160);
     }
 
     #[test]
     fn tail_chars_matches_legacy_negative_slice() {
-        assert_eq!(py_tail_chars("abcdef", 3), "def");
-        assert_eq!(py_tail_chars("ab", 5), "ab");
-        assert_eq!(py_tail_chars("héllo", 4), "éllo");
+        assert_eq!(legacy_tail_chars("abcdef", 3), "def");
+        assert_eq!(legacy_tail_chars("ab", 5), "ab");
+        assert_eq!(legacy_tail_chars("héllo", 4), "éllo");
     }
 
     #[test]
     fn splitlines_common_terminators() {
-        assert_eq!(py_splitlines("a\nb\n"), vec!["a", "b"]);
-        assert_eq!(py_splitlines("a\r\nb\rc"), vec!["a", "b", "c"]);
-        assert_eq!(py_splitlines(""), Vec::<&str>::new());
-        assert_eq!(py_splitlines("x"), vec!["x"]);
+        assert_eq!(legacy_splitlines("a\nb\n"), vec!["a", "b"]);
+        assert_eq!(legacy_splitlines("a\r\nb\rc"), vec!["a", "b", "c"]);
+        assert_eq!(legacy_splitlines(""), Vec::<&str>::new());
+        assert_eq!(legacy_splitlines("x"), vec!["x"]);
     }
 
     #[test]
     fn int_coercion_matches_legacy() {
         use serde_json::json;
-        assert_eq!(py_int(&json!(5)).unwrap(), 5);
-        assert_eq!(py_int(&json!(5.9)).unwrap(), 5);
-        assert_eq!(py_int(&json!(-5.9)).unwrap(), -5);
-        assert_eq!(py_int(&json!("42")).unwrap(), 42);
-        assert!(py_int(&json!("4.2")).is_err());
-        assert_eq!(py_int(&json!(true)).unwrap(), 1);
+        assert_eq!(legacy_int(&json!(5)).unwrap(), 5);
+        assert_eq!(legacy_int(&json!(5.9)).unwrap(), 5);
+        assert_eq!(legacy_int(&json!(-5.9)).unwrap(), -5);
+        assert_eq!(legacy_int(&json!("42")).unwrap(), 42);
+        assert!(legacy_int(&json!("4.2")).is_err());
+        assert_eq!(legacy_int(&json!(true)).unwrap(), 1);
     }
 
     #[test]
     fn urllib_quote_default_safe_slash() {
         assert_eq!(
-            py_urllib_quote("SELECT count() FROM ticks"),
+            legacy_urllib_quote("SELECT count() FROM ticks"),
             "SELECT%20count%28%29%20FROM%20ticks"
         );
-        assert_eq!(py_urllib_quote("a/b_c.d-e~f"), "a/b_c.d-e~f");
-        assert_eq!(py_urllib_quote("é"), "%C3%A9");
+        assert_eq!(legacy_urllib_quote("a/b_c.d-e~f"), "a/b_c.d-e~f");
+        assert_eq!(legacy_urllib_quote("é"), "%C3%A9");
     }
 
     #[test]
     fn fnmatch_basic() {
-        assert!(py_fnmatch("server.py", "*.py"));
-        assert!(!py_fnmatch("server.rs", "*.py"));
-        assert!(py_fnmatch("a1", "a?"));
-        assert!(py_fnmatch("ab.rs", "[ax]b.rs"));
-        assert!(!py_fnmatch("bb.rs", "[!b]b.rs"));
-        assert!(py_fnmatch("f3.log", "f[0-9].log"));
+        assert!(legacy_fnmatch("server.log", "*.log"));
+        assert!(!legacy_fnmatch("server.rs", "*.log"));
+        assert!(legacy_fnmatch("a1", "a?"));
+        assert!(legacy_fnmatch("ab.rs", "[ax]b.rs"));
+        assert!(!legacy_fnmatch("bb.rs", "[!b]b.rs"));
+        assert!(legacy_fnmatch("f3.log", "f[0-9].log"));
     }
 
     #[test]

@@ -1162,11 +1162,30 @@ pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
 /// The bound that ACTUALLY binds the live set is
 /// `DhanEndpointType::MainFeed.subscription_capacity()` (5 connections ×
 /// `MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION` = 25,000), which `main.rs`
-/// passes to `resolve_live_universe` and which `plan_pool` enforces
-/// fail-closed — refusing the WHOLE pool rather than truncating. This
-/// constant is now numerically consistent with that real bound, so a future
-/// reader who trusts it is not misled about the SIZE even while it is not the
-/// thing doing the enforcing.
+/// passes to `resolve_live_universe`. This constant is now numerically
+/// consistent with that real bound, so a future reader who trusts it is not
+/// misled about the SIZE even while it is not the thing doing the enforcing.
+///
+/// **CORRECTED 2026-08-21 — this paragraph named the wrong enforcer, and the
+/// error was not academic.** It used to say the capacity is enforced by
+/// `plan_pool` "refusing the WHOLE pool rather than truncating". `plan_pool`
+/// does refuse whole pools — but it is NEVER REACHED with an oversize set.
+/// `select_live_universe` intercepts first
+/// (`dhan_live_universe.rs`, the `instruments.len() > capacity` arm) and
+/// returns the INDEX universe, i.e. the live set collapses from ~25,000 to
+/// the index count. That is a fallback, not a refusal, and it is the correct
+/// design — the feed stays alive instead of going dark, and nothing is
+/// silently truncated to fit. What was wrong was the NAME of the mechanism.
+///
+/// Recorded because of what the stale sentence actually cost: an audit read
+/// it, traced `plan_pool`, found the documented failure mode could not fire,
+/// and reported a CRITICAL defect that did not exist — while the real
+/// behaviour (loud, alarmed via `tv_dhan_live_universe_fallback_total`, and
+/// pinned by
+/// `test_select_live_universe_falls_back_whole_when_over_the_envelope`) was
+/// correct the whole time. A doc that names the wrong mechanism does not
+/// merely fail to inform; it manufactures false findings that cost real
+/// review cycles.
 pub const MAX_DAILY_UNIVERSE_SIZE: usize = 25_000;
 
 /// CSV download body size cap (per rule file §18 hardening contract).

@@ -1939,6 +1939,68 @@ pub struct DhanUniverseConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Narrow the SPOT universe to NSE indices + the F&O stock underlyings.
+    ///
+    /// Default OFF, and the default is the safety property: absent this key the
+    /// spot set is whatever `live_subscription_from_master` already produces,
+    /// byte for byte.
+    ///
+    /// # Why it exists (operator, 2026-08-21)
+    ///
+    /// The authorized contract set -- full NIFTY/BANKNIFTY current-expiry
+    /// chains plus every F&O stock's current-expiry options at ATM +/- 25 --
+    /// does not fit inside the 25,000 subscription capacity alongside the
+    /// master-sourced spot universe. `dhan_feed_stack` says so itself: ~4,565
+    /// spot instruments leave ~20,435 for contracts against an authorized
+    /// ~23,820. Narrowing the spot side to indices plus the underlyings we
+    /// actually write options on is the only lever that does not change the
+    /// contract shape the operator specified.
+    ///
+    /// # What turning it ON costs
+    ///
+    /// Live spot prices for every NSE cash equity that is NOT an F&O
+    /// underlying -- roughly 4,200 of them -- stop being subscribed. That is
+    /// the trade, stated plainly: it is a real loss of coverage, taken because
+    /// the contracts are what the strategy needs and they do not otherwise fit.
+    #[serde(default)]
+    pub spot_universe_fno_underlyings_only: bool,
+
+    /// Narrow the SPOT universe to NSE indices + the **Nifty Total Market**
+    /// constituents. Default OFF.
+    ///
+    /// # Why it exists (operator, 2026-08-22)
+    ///
+    /// Verbatim: *"pcik only nifty toal marjet stcoks and enitre nse indices
+    /// aloen"*, alongside *"why the fuck you didnt do the crsoss ebrificatione
+    /// ntorley with nse india real nse idncies csv fiels downlaod"*.
+    ///
+    /// The cross-verification he is asking about was already built and already
+    /// running: the daily rider downloads all 49 `INDEX_CONSTITUENCY_SLUGS`
+    /// from niftyindices.com — `ind_niftytotalmarket_list` among them — and
+    /// joins every constituent to the Dhan master BY ISIN, fail-closed at a 2%
+    /// unresolved tolerance. What did not exist was a selector for the ONE
+    /// list he named. `join_constituents` dedupes per `(index_name,
+    /// security_id, segment)`, so the artifact carries the UNION of all 49 and
+    /// the live selector dedupes that to the recorded ~4,565 SIDs. The Nifty
+    /// Total Market rows were resolved, tagged, written — and never picked out.
+    ///
+    /// # Precedence
+    ///
+    /// When this and `spot_universe_fno_underlyings_only` are BOTH true, this
+    /// one wins — it is the later dated instruction. Pinned by a test rather
+    /// than left to the order of two `if` blocks, because "whichever branch I
+    /// wrote first" is not a decision anyone can review.
+    ///
+    /// # What turning it ON costs
+    ///
+    /// Roughly 3,700 NSE cash equities that sit in one of the other 48 lists
+    /// but NOT in Nifty Total Market lose their live spot subscription. Their
+    /// per-minute REST legs are unaffected. Expected size: ~119 indices +
+    /// ~750 constituents. Neither figure is a constant in this repository —
+    /// both come from what the vendors serve on the day.
+    #[serde(default)]
+    pub spot_universe_ntm_only: bool,
+
     /// IST second-of-day at which the daily build is TARGETED.
     ///
     /// # Why a target rather than a guarantee
@@ -2004,6 +2066,8 @@ impl Default for DhanUniverseConfig {
             target_secs_of_day_ist: default_dhan_universe_target_secs(),
             retry_backoff_cap_secs: default_dhan_universe_backoff_cap_secs(),
             live_subscription_from_master: false,
+            spot_universe_fno_underlyings_only: false,
+            spot_universe_ntm_only: false,
         }
     }
 }

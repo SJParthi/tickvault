@@ -583,7 +583,7 @@ jobs:
       # ignored gate.
       - name: Guarantee report (Rust-only + O(1) + automation, measured)
         shell: bash
-        run: cargo run -q -p tickvault-app --bin tv_guarantees
+        run: cargo run -q -p tickvault-app --bin tv-guarantees
 
       - name: Banned pattern scan (full workspace)
         shell: bash

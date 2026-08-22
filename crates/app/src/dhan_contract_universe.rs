@@ -196,8 +196,107 @@ pub fn write_contract_artifact(date_ist: &str, rows: &[ContractRow]) -> anyhow::
 /// looks like a market with no derivatives.
 pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>> {
     let path = contract_artifact_path(date_ist);
+    let stamp = artifact_stamp(&path);
+
+    // Cache hit: same file, same size, same mtime.
+    if let Some(hit) = cached_artifact(date_ist, stamp) {
+        return Ok(hit);
+    }
+
     let body = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&body)?)
+    let rows: Vec<ContractRow> = serde_json::from_str(&body)?;
+    store_artifact(date_ist, stamp, &rows);
+    Ok(rows)
+}
+
+/// `(len, mtime_nanos)` for the artifact, or `None` when it cannot be stat'd.
+///
+/// `None` DISABLES the cache for that call rather than being treated as a
+/// stable identity: a file we cannot stat is one we cannot prove unchanged,
+/// and serving a cached universe against an unknown file is the failure this
+/// guard exists to prevent.
+fn artifact_stamp(path: &std::path::Path) -> Option<(u64, i128)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md.modified().ok()?;
+    let nanos = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i128::try_from(d.as_nanos()).ok()?,
+        // Pre-epoch mtime: representable, and negative keeps it distinct from
+        // any post-epoch value rather than collapsing onto 0.
+        Err(e) => -i128::try_from(e.duration().as_nanos()).ok()?,
+    };
+    Some((md.len(), nanos))
+}
+
+/// The parsed artifact, kept across attempts.
+///
+/// # Why this exists (2026-08-22)
+///
+/// `attach_depth_when_available` retries on a timer, and BOTH halves of each
+/// iteration open this file: the depth loader reads it, then the contract
+/// loader reads it again. The 2026-08-21 production log records
+/// `contracts_in_artifact: 121674` — roughly 11 MB of JSON (Estimated at
+/// ~90 B/row). So every attempt was two full parses of a multi-megabyte file,
+/// and tightening the pre-open cadence multiplied them, on a 4-vCPU box,
+/// during the pre-open minutes when the drain is folding ticks.
+///
+/// The file is written once per trading day by the daily rider, atomically
+/// (tmp then rename), and is immutable afterwards. So it is parsed once and
+/// shared.
+///
+/// # Why a stat guard rather than trusting the date
+///
+/// Keying on the date ALONE would be wrong in the one case that matters: the
+/// rider is supervised, so a respawn can legitimately rewrite TODAY's file
+/// after something has already read it. A date-keyed cache would then serve
+/// the superseded universe for the rest of the session, silently — a stale
+/// contract set is indistinguishable downstream from a correct one. Comparing
+/// `(len, mtime)` costs one `stat` instead of an 11 MB parse and makes a
+/// rewrite land on the next attempt.
+static CONTRACT_ARTIFACT_CACHE: std::sync::Mutex<Option<CachedArtifact>> =
+    std::sync::Mutex::new(None);
+
+/// `(trading date, stat stamp, parsed rows)` — the one cached artifact.
+///
+/// Named rather than inlined because all three parts are load-bearing and a
+/// bare tuple hides that: the date stops yesterday answering for today, the
+/// stamp stops a same-day rewrite being served stale, and the `Arc` is what
+/// keeps the ~11 MB from being held twice while a caller clones it out.
+type CachedArtifact = (
+    String,
+    Option<(u64, i128)>,
+    std::sync::Arc<Vec<ContractRow>>,
+);
+
+/// Returns the cached rows when the date AND the stat stamp both match.
+///
+/// A `None` stamp never matches — see [`artifact_stamp`]. Lock poisoning is
+/// recovered with `into_inner()` (the house pattern): a panic in another
+/// thread must not turn a cache into a hard failure of the boot path.
+fn cached_artifact(date_ist: &str, stamp: Option<(u64, i128)>) -> Option<Vec<ContractRow>> {
+    let stamp = stamp?;
+    let guard = CONTRACT_ARTIFACT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (cached_date, cached_stamp, rows) = guard.as_ref()?;
+    if cached_date == date_ist && *cached_stamp == Some(stamp) {
+        return Some(rows.as_ref().clone());
+    }
+    None
+}
+
+/// Replaces whatever is cached. One entry, never a growing map: only today's
+/// artifact is ever asked for, so keeping yesterday's would hold ~11 MB for
+/// nothing.
+fn store_artifact(date_ist: &str, stamp: Option<(u64, i128)>, rows: &[ContractRow]) {
+    let Some(stamp) = stamp else { return };
+    let mut guard = CONTRACT_ARTIFACT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((
+        date_ist.to_owned(),
+        Some(stamp),
+        std::sync::Arc::new(rows.to_vec()),
+    ));
 }
 
 /// Index underlyings whose FULL option chain is subscribed.
@@ -1363,6 +1462,108 @@ pub async fn fetch_spot_prices(
 
 #[cfg(test)]
 mod tests {
+    /// The cache is a process-global single slot, so these tests must not run
+    /// concurrently with each other — one storing while another reads would
+    /// make a genuine failure look like a flake and vice versa. Poisoning is
+    /// recovered rather than propagated, the house pattern.
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn crow(id: u64) -> super::ContractRow {
+        super::ContractRow {
+            i: id,
+            x: "NSE".into(),
+            c: "OPTSTK".into(),
+            e: 20_260_828,
+            s: 250_000,
+            l: "CE".into(),
+            u: "RELIANCE".into(),
+        }
+    }
+
+    /// The hit: same date, same stamp, rows come back without touching disk.
+    /// This is the whole point of the cache — ~120 attempts in the pre-open
+    /// window would otherwise be ~240 parses of an ~11 MB file.
+    #[test]
+    fn contract_artifact_cache_returns_rows_on_an_identical_date_and_stamp() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_artifact("2026-08-22", stamp, &[crow(7), crow(8)]);
+        let hit = super::cached_artifact("2026-08-22", stamp).expect("identical stamp must hit");
+        assert_eq!(hit.len(), 2);
+        assert_eq!(hit[0].i, 7);
+    }
+
+    /// The miss that MATTERS. The daily rider is supervised, so a respawn can
+    /// legitimately rewrite TODAY's artifact after something has already read
+    /// it. A date-only cache would serve the superseded contract set for the
+    /// rest of the session, and downstream a stale universe is
+    /// indistinguishable from a correct one. Any change to len or mtime must
+    /// miss.
+    #[test]
+    fn contract_artifact_cache_misses_when_the_file_was_rewritten_the_same_day() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_artifact("2026-08-22", first, &[crow(7)]);
+
+        // Same size, later mtime — a rewrite that happens to land the same
+        // byte count. Length alone would have called this unchanged.
+        let same_len_new_mtime = Some((4_242_u64, 1_700_000_000_000_000_001_i128));
+        assert!(
+            super::cached_artifact("2026-08-22", same_len_new_mtime).is_none(),
+            "a rewrite with an identical byte count must still invalidate"
+        );
+
+        // Same mtime, different size — the filesystem's mtime resolution can
+        // put two writes in the same tick, so size has to be checked too.
+        let new_len_same_mtime = Some((4_243_u64, 1_700_000_000_000_000_000_i128));
+        assert!(
+            super::cached_artifact("2026-08-22", new_len_same_mtime).is_none(),
+            "a rewrite inside one mtime tick must still invalidate"
+        );
+    }
+
+    /// A new trading day must never serve yesterday's contracts — the artifact
+    /// is per-date and derivative ids are documented as unstable across days.
+    #[test]
+    fn contract_artifact_cache_misses_on_a_different_date() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_artifact("2026-08-21", stamp, &[crow(7)]);
+        assert!(
+            super::cached_artifact("2026-08-22", stamp).is_none(),
+            "yesterday's artifact must not answer for today"
+        );
+    }
+
+    /// A file we cannot stat is one we cannot prove unchanged, so the cache is
+    /// DISABLED for that call rather than the unknown being treated as a
+    /// stable identity. Both directions: an unstattable read never hits, and
+    /// an unstattable result is never stored.
+    #[test]
+    fn contract_artifact_cache_is_disabled_when_the_file_cannot_be_stat_ed() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            super::artifact_stamp(std::path::Path::new(
+                "/nonexistent/tickvault/contract-artifact.json"
+            ))
+            .is_none(),
+            "a missing file must not produce a stamp"
+        );
+        super::store_artifact("2026-08-22", None, &[crow(7)]);
+        assert!(
+            super::cached_artifact("2026-08-22", None).is_none(),
+            "an unknown stamp must never hit"
+        );
+    }
+
     use super::*;
 
     /// Builds a master row. Only the fields selection reads are meaningful.

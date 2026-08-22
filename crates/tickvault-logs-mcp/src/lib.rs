@@ -1,6 +1,6 @@
 //! tickvault-logs MCP server — Rust port of
-//! `scripts/mcp-servers/tickvault-logs/server.py` (rust-only purge
-//! phase 2c, 2026-07-18).
+//! the retired reference implementation, formerly under
+//! `scripts/mcp-servers/tickvault-logs/` (rust-only purge phase 2c, 2026-07-18).
 //!
 //! Behavior-parity port: same 14 tools, same tool names, same inputSchema
 //! JSON, same output shapes, same JSON-RPC 2.0 newline-delimited stdio
@@ -16,7 +16,7 @@
 //!   - Cold path, out-of-process: not bound by the hot-path zero-alloc
 //!     rules (this process never touches the tick pipeline).
 //!
-//! Known deliberate deviations from server.py (each documented at the
+//! Known deliberate deviations from the retired reference implementation (each documented at the
 //! deviation site and in the PR body):
 //!   - Repo-root resolution: legacy uses `__file__`; this binary resolves
 //!     the repo root from `TICKVAULT_MCP_REPO_ROOT` (if set + resolved),
@@ -80,14 +80,14 @@
 //!     PARITY-MATCHED since review r8 (2026-07-18) — the inner
 //!     tool-result text, the outer JSON-RPC envelope line, and the
 //!     self-test demo blocks all pass through
-//!     `pycompat::ensure_ascii`, replicating the legacy runtime's default escaping
+//!     `legacy_compat::ensure_ascii`, replicating the legacy runtime's default escaping
 //!     (every char >= U+007F, DEL included, as lowercase `\uXXXX`;
 //!     astral chars as UTF-16 surrogate pairs). Previously raw UTF-8
 //!     rode the wire (e.g. a runbook em-dash), a byte divergence the
 //!     harness's inner canonicalization absorbed but real-transcript
 //!     byte diffing showed. Verified live: the inner tool-result text
 //!     for find_runbook_for_code("WS-GAP-05") over the real repo is now
-//!     byte-identical to server.py's. No ESCAPING residual on the stdio
+//!     byte-identical to the retired reference implementation's. No ESCAPING residual on the stdio
 //!     wire; the envelope's key ORDER (insertion vs sorted) and compact
 //!     vs `", "`/`": "` separators remain the pre-existing documented
 //!     canonicalization, unrelated to escaping. Outbound HTTP request
@@ -117,7 +117,7 @@
 #![cfg_attr(not(test), warn(clippy::let_underscore_must_use))]
 
 pub mod config;
-pub mod pycompat;
+pub mod legacy_compat;
 pub mod rpc;
 pub mod selftest;
 pub mod signature;
