@@ -4,6 +4,17 @@
 # Called by: pre-commit (Gate 8), pre-push (Gate 5), pre-PR (Gate 5)
 #
 # Baseline stored in .claude/hooks/.test-count-baseline (gitignored)
+#
+# 2026-08-22 — SECOND BLIND SPOT, covered elsewhere, recorded here so nobody
+# assumes this file handles it: counting ATTRIBUTES cannot see a test that is
+# still present but no longer runs. Adding #[ignore] leaves the #[test]
+# attribute in place, so the total is unchanged and this guard prints "stable"
+# while the test is parked. The house rule bans skipping as well as deleting;
+# this file enforces the deleting half only.
+# The skipping half lives in crates/common/tests/ignored_test_guard.rs, which
+# requires every #[ignore] to state a reason AND keeps the ignored set on a
+# shrink-only allowlist keyed by (file, fn) — because a reason string alone
+# lets a real gate be parked behind a plausible excuse.
 # Manual override: echo <count> > .claude/hooks/.test-count-baseline
 
 set -uo pipefail
