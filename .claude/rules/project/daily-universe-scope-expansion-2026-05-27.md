@@ -488,6 +488,65 @@ need for the pressure-triggered archival landing alongside it, and neither does 
 make a full disk impossible.
 breached; kill-ceiling $100).
 
+**Quote 18 (2026-08-22, HARD BILL CAP $125 — preserve EXACTLY, typos included):**
+> "see the max poir aws bill cannot cost more than 125 dude okay? do you udnerstadn bro okay?"
+
+Operator set a **hard maximum of $125/month on the AWS bill**. This is a
+SPENDING constraint, and it is recorded here before any terraform change per
+the rule-file-first law.
+
+**Where the bill actually stands.** The Quote 17 envelope puts the high-side
+estimate at **$112.72/mo** (pre-GST, the basis every §7 bill uses). So the
+constraint is **MET today** with $12.28 of room — nothing is over budget and
+nothing needs cutting to comply.
+
+**⚠ The trap, and why the ceiling was NOT flipped to 125 in the same breath.**
+`limit_amount` is not a reporting threshold. The budget's AUTOMATIC actions are
+`STOP_EC2_INSTANCES` on the prod box at **90% and 100% of it**. So:
+
+| limit_amount | 90% action line | vs the $112.72 high side |
+|---|---|---|
+| $130 (live) | $117.00 | $4.28 of room |
+| **$125** | **$112.50** | **$0.22 BELOW the bill — the box gets stopped mid-month** |
+
+Setting the ceiling to the operator's cap would arm an automatic shutdown of
+the trading box inside a NORMAL high-side month. That is the exact reasoning
+that rejected $30 on 2026-07-31 ("its 90% line already sits below the live
+actual") and $80/$100 on 2026-08-08, and it applies here with a margin of
+twenty-two cents.
+
+**The real gap this quote exposes, which is worth more than the number.** The
+live ceiling ($130) is now **above the operator's stated maximum ($125)**, so
+the automatic guard would permit a month that breaches his limit before it
+acted at all. The kill-switch is no longer aligned with the rule it is supposed
+to enforce.
+
+**Resolution path (not taken here — it needs an operator decision, not an
+executor's).** Cutting **$0.22 or more** from the monthly high side makes $125 a
+safe ceiling. The lever set, from the 2026-07-31 standing-waste record:
+
+| Lever | Save/mo | Status |
+|---|---|---|
+| Release the Elastic IP | ~$3.60 | **Already approved** — Quote 10 (2026-07-19) authorizes release for the no-real-orders period. Execution is bundled with an instance recreate; the 2026-08-12 recreate happened and RETAINED the address, so it needs a fresh one. Takes the high side to ~$109.1 and gives $3.4 of margin under $112.50. |
+| Cost Explorer polling | ~$2.38 | **Already minimal** — verified 2026-08-22: `hard_stop_guard` returns early when the box is stopped and only calls `mtd_usd` inside the up-window, so it bills ~198 requests/mo, not 720. Cutting it removes the in-session spend guard. |
+| CloudWatch alarms/metrics | ~$3.27 | Cutting means losing pages; each has its own dated authorization. |
+| Secrets Manager | ~$0.38 | Trivial, and on its own it clears the $0.22 with only $0.16 of margin — not margin. |
+
+**What a PR that violates Quote 18 looks like (REJECT):** sets `limit_amount`
+to 125 (or lower) while the recorded high-side estimate still exceeds 90% of
+it; raises `limit_amount` above 125 without a fresh dated quote superseding
+this one; or changes the ceiling in fewer than the three lockstep sites
+(`budget.tf` + `budget-guards.tf` + `budget_digest.rs`).
+
+**⚠ UNRESOLVED, carried forward from Quotes 13 and 17 and NOT fixed by this
+record:** the 2026-07-31 ruling found BOTH `STOP_EC2_INSTANCES` actions in
+`EXECUTION_FAILURE`, and neither the 2026-08-12 nor this check could re-read
+them — `budgets:DescribeBudgetActionsForBudget` returns `AccessDeniedException`
+for `user/claude-code-agent`. If those actions are still failing, every ceiling
+number above is arithmetic about a switch that does not throw. That needs an
+identity with budgets read access, and it is the single most important open
+item on this whole surface.
+
 ---
 
 > **[ARCHIVED 2026-07-20]** §1 The rule (retired subscription contract) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).
