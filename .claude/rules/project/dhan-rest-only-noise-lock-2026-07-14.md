@@ -496,3 +496,57 @@ same unverified assumption. Their failure direction is milder — a loss counter
 the cumulative reading pages correctly on the FIRST loss and then latches, so a second
 episode in the same session is silent — but milder is not fixed, and it is a separate
 piece of work rather than something this note closed.
+
+### §2.3c — 2026-08-22 FINDING (no authorization claimed): the universe can collapse 24,600 → 4 with every signal green
+
+**This section authorizes NOTHING.** It records a verified defect found by an
+adversarial permutation sweep, and the reason it was NOT fixed in the same pass.
+Adding the alarm it argues for still requires a fresh dated operator quote, per
+§3. It is written here because §2.3a/§2.3b are where this file records what is
+measured-but-unpageable, and this is the sharper case: measured, and not even
+shipped.
+
+**The defect.** `select_live_universe` (`dhan_live_universe.rs:252`) falls back to
+the 4-instrument index universe on EITHER of two triggers: the resolved set
+exceeding the capacity envelope, or a master that produced "no usable widening"
+(unreadable/absent/empty artifact). The fallback is correct and deliberate —
+fail-soft beats a dark lane. What is wrong is that nobody is told.
+
+| # | Verified fact | Evidence |
+|---|---|---|
+| 1 | Fallback lands on 4 instruments | `dhan_live_universe.rs:252` |
+| 2 | It logs `error!` + counter + gauge | `:483`, `record_master_sourcing_fallback` |
+| 3 | `tv_dhan_live_universe_instruments` is in **0** deploy files | not in either EMF selector copy, not on the dashboard, not alarmed |
+| 4 | `WS-GAP-03` is **not** among the 14 metric-filter-alarmed codes | `error-code-alarms.tf` |
+| 5 | The §2.3b tick-flow alarm CANNOT catch it | it reads flow, and 4 indices still tick — the gauge stays healthy |
+
+Net: a **99.98% loss of market data** (24,600 → 4) presents to the operator as a
+normal session. Every dashboard line is green, no page fires, and the sole trace
+is one ERROR line in a log sink nothing watches. That is the false-OK class this
+file exists to prevent, with a larger blast radius than most of what IS alarmed.
+
+**Why it is not merely theoretical.** The margin is thin and shrinking from the
+outside: `websocket-connection-scope-lock.md` (2026-08-21) puts the authorized set
+at ~24,600 against a 25,000 cap — 400 to 1,427 spare — while the SAME section
+rules index option chains **UNCAPPED**, and records vendor-controlled chain depth
+observed at 542 and at 2,037 for three indices. That section also states plainly
+that its "fits" verdict rests on a 2026-04-25 measurement. A volatile expiry week
+that adds strikes is an ordinary event, not an exotic one.
+
+**Why it was not fixed in the finding pass (the honest blocker).** The fix is to
+ship the gauge in both EMF selector copies. That was attempted and REVERTED:
+`user_data_size_guard` failed at **15,905 bytes against a 15,872 budget — 33 over**
+(AWS hard limit 16,384, 512 reserved). The metric name is 33 bytes. The guard's own
+message forbids the cheap workaround verbatim — "DO NOT fix this by shaving
+comments off unrelated blocks" — and prescribes moving content to a file `cp`'d in
+after the Step 5 repo clone. That is a change to the prod boot path whose failure
+mode (clone fails ⇒ agent gets no config ⇒ NO metrics at all) is worse than the gap
+it closes, and it cannot be tested from a dev container. Doing it blind was
+refused deliberately.
+
+**The two candidate fixes, for whoever takes this up.** (a) Free the 33 bytes by
+the architectural route the guard prescribes, then ship the gauge and alarm on it
+falling below a floor during market hours. (b) Cheaper and rule-cheaper: add
+`WS-GAP-03` to the existing metric-filter set in `error-code-alarms.tf` — it reuses
+the log-filter machinery already in place, costs ~$0.10/mo, and needs no user-data
+byte. Either way the alarm itself needs the §3 dated quote first.
