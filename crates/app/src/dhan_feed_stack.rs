@@ -4477,6 +4477,33 @@ fn silence_page_allowed_today() -> bool {
 /// the same table; a longer one delays depth past the strikes it selected.
 pub const DEPTH_ATTACH_RETRY_SECS: u64 = 60;
 
+/// Retry cadence inside the PRE-OPEN readiness window, `[09:00, 09:15)` IST.
+///
+/// # Why the flat 60s cadence was not enough (operator, 2026-08-22)
+///
+/// The requirement is that contracts and depth are on the wire by **09:12**,
+/// so that 09:15 delivers ticks on everything from the first second. The
+/// blocker was never the data — it was the POLL GRID.
+///
+/// `DEPTH_ATTACH_RETRY_SECS` is a flat 60s sleep whose PHASE is fixed by boot
+/// time, so readiness lands on a 60-second grid offset by whenever the box
+/// happened to start. Measured on 2026-08-21: boot ~08:30:14, and the attach
+/// succeeded on **attempt 38 at 09:08:14** — 38 minutes of one-per-minute
+/// polling. That morning it cleared 09:12 by four minutes. It clears by
+/// nothing at all if pre-open prices land a minute later: data available at
+/// 09:11:20 with a `:50`-phase grid is dialed at **09:12:50**, past the line,
+/// for no reason but the sleep.
+///
+/// Five seconds removes the grid as a failure mode: readiness now trails data
+/// availability by at most 5s instead of 60s, inside a 15-minute window that
+/// runs once a day. The cost is ~180 QuestDB reads spread over that window
+/// against the ~38 a normal morning already does — a cold-path read of a
+/// LATEST-ON query, off the tick path entirely.
+///
+/// Deliberately NOT applied all session: after 09:15 nothing is racing a
+/// deadline, and a 5s poll would turn a benign all-day wait into 4,500 reads.
+pub const DEPTH_ATTACH_PREOPEN_RETRY_SECS: u64 = 5;
+
 /// IST second-of-day past which the depth late-attach gives up for the session.
 ///
 /// 10:00 IST — 44 minutes after the option-chain leg's first fire. Past this,
@@ -5196,7 +5223,29 @@ async fn attach_depth_when_available(
                 return;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(DEPTH_ATTACH_RETRY_SECS)).await;
+        // Poll fast while the open is approaching, slow the rest of the day.
+        // Re-read per iteration, never hoisted: this loop crosses 09:15, and a
+        // value captured once would keep the fast cadence for the session.
+        tokio::time::sleep(std::time::Duration::from_secs(preopen_retry_secs(
+            ist_second_of_day_now(),
+        )))
+        .await;
+    }
+}
+
+/// How long to wait before the next late-attach attempt, given the IST second.
+///
+/// Pure so the boundary behaviour is testable without a clock: the whole point
+/// is WHICH cadence applies at 08:59:59, 09:00:00, 09:14:59 and 09:15:00, and
+/// an inline `if` inside a `tokio::sleep` cannot be asserted at all.
+#[must_use]
+pub fn preopen_retry_secs(now_ist_secs: u32) -> u64 {
+    let from = u64::from(tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST);
+    let until = CONTINUOUS_SESSION_START_SECS_OF_DAY_IST;
+    if (from..until).contains(&u64::from(now_ist_secs)) {
+        DEPTH_ATTACH_PREOPEN_RETRY_SECS
+    } else {
+        DEPTH_ATTACH_RETRY_SECS
     }
 }
 
@@ -10282,6 +10331,82 @@ mod silence_latch_tests {
 
 #[cfg(test)]
 mod contract_attach_tests {
+    use super::{DEPTH_ATTACH_PREOPEN_RETRY_SECS, DEPTH_ATTACH_RETRY_SECS, preopen_retry_secs};
+
+    /// The four boundaries that decide whether the operator's 09:12 line is
+    /// met. Asserted as a table because an off-by-one at either edge is
+    /// invisible in production: the loop simply runs at the other cadence and
+    /// nothing logs which one it chose.
+    #[test]
+    fn preopen_retry_secs_switches_exactly_at_the_persistence_and_session_edges() {
+        const NINE: u32 = 9 * 3_600;
+        for (secs, want, why) in [
+            (
+                NINE - 1,
+                DEPTH_ATTACH_RETRY_SECS,
+                "08:59:59 — before ticks persist",
+            ),
+            (
+                NINE,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:00:00 — first tick can persist",
+            ),
+            (
+                NINE + 8 * 60,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:08 — Friday's real attach",
+            ),
+            (
+                NINE + 12 * 60,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:12 — the operator's line",
+            ),
+            (
+                NINE + 15 * 60 - 1,
+                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
+                "09:14:59 — still pre-open",
+            ),
+            (
+                NINE + 15 * 60,
+                DEPTH_ATTACH_RETRY_SECS,
+                "09:15:00 — open; nothing races now",
+            ),
+            (
+                14 * 3_600,
+                DEPTH_ATTACH_RETRY_SECS,
+                "14:00 — mid-session restart",
+            ),
+            (
+                0,
+                DEPTH_ATTACH_RETRY_SECS,
+                "midnight — no fast poll overnight",
+            ),
+        ] {
+            assert_eq!(preopen_retry_secs(secs), want, "{why}");
+        }
+    }
+
+    /// The fast cadence must be strictly faster, and bounded away from zero —
+    /// a 0 would spin the loop against QuestDB with no sleep at all.
+    #[test]
+    fn preopen_retry_secs_is_faster_than_the_session_cadence_and_never_zero() {
+        assert!(
+            DEPTH_ATTACH_PREOPEN_RETRY_SECS > 0,
+            "a zero sleep is a spin loop"
+        );
+        assert!(
+            DEPTH_ATTACH_PREOPEN_RETRY_SECS < DEPTH_ATTACH_RETRY_SECS,
+            "the pre-open cadence must be the faster one, or the window buys nothing"
+        );
+        // 15 minutes of window / 5s = 180 reads. Pinned so a later tightening
+        // has to face the read count it creates.
+        let reads = (15 * 60) / DEPTH_ATTACH_PREOPEN_RETRY_SECS;
+        assert!(
+            reads <= 200,
+            "pre-open window would issue {reads} QuestDB reads"
+        );
+    }
+
     use super::*;
 
     #[test]
