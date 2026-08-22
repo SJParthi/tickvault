@@ -88,16 +88,37 @@ impl Feed {
     }
 
     /// True for lanes whose LIVE-WS transport was RETIRED by operator
-    /// directive (Dhan 2026-07-13) — market data now
-    /// arrives via the per-minute REST cadence pulls. Drives the honest
-    /// "off by design" wording on the /feeds panel instead of the scary
-    /// "switched off by operator" (operator-scare fix, 2026-07-20). A
-    /// NON-retired feed (TrueData — its live WS is the intended tick
-    /// source, operator lock 2026-07-24) has a `false` arm here.
+    /// directive — market data for such a lane arrives via the per-minute
+    /// REST cadence pulls instead. Drives the honest "off by design" wording
+    /// on the /feeds panel rather than the scary "switched off by operator"
+    /// (operator-scare fix, 2026-07-20).
+    ///
+    /// **CORRECTED 2026-08-22: no feed is retired, so every arm is `false`.**
+    /// This returned `true` for Dhan from the 2026-07-13 retirement until
+    /// today — eleven days after that retirement was REVERSED. The operator's
+    /// 2026-08-09 quotes revived the Dhan live WS (and authorized 16
+    /// connections), the 2026-08-11 quote flipped `[feeds] dhan_enabled` and
+    /// `TICKVAULT_DHAN_LIVE_FEED` ON, and `dhan_live_ws_retired_guard.rs` was
+    /// re-blessed on 2026-08-11 to REQUIRE the revived modules. Every other
+    /// surface moved; this predicate did not.
+    ///
+    /// What that cost: a Dhan lane that is off is now a FAULT, and this made
+    /// the operator panel render it as "off by design" — a broken state
+    /// wearing an intentional label, which is precisely the false-OK class
+    /// rule 11 forbids. With the arm corrected, a disabled Dhan lane reads
+    /// "switched off by operator", which is true.
+    ///
+    /// The predicate is KEPT rather than deleted: it is the seam a future
+    /// retirement flips, and both call sites (`feeds_page::feed_note`,
+    /// `feed_health::evaluate_feed_health`) stay correct with no edit. A
+    /// predicate that is currently false everywhere is not dead — it is a
+    /// switch in the off position.
     #[must_use]
     pub const fn live_ws_retired(self) -> bool {
         match self {
-            Self::Dhan => true,
+            // Revived 2026-08-09/11 by dated operator quote; see the doc above.
+            Self::Dhan => false,
+            // Its live WS is the intended tick source (operator lock 2026-07-24).
             Self::Truedata => false,
         }
     }
@@ -153,16 +174,35 @@ mod tests {
     }
 
     #[test]
-    fn test_live_ws_retired_true_for_both_retired_lanes() {
-        // Operator-scare fix (2026-07-20): the Dhan live-WS lane is
-        // retired (Dhan 2026-07-13) — OFF is the designed
-        // state. TrueData (feed #4, operator lock 2026-07-24) is the intended
-        // live-tick source, so its lane is NOT retired.
-        assert!(Feed::Dhan.live_ws_retired());
+    fn test_no_feed_reports_a_retired_live_ws_lane() {
+        // CORRECTED 2026-08-22. This test asserted `Feed::Dhan.live_ws_retired()`
+        // and passed for eleven days after the retirement it pinned had been
+        // REVERSED — the operator's 2026-08-09 revival quotes and the
+        // 2026-08-11 config flip. A ratchet that keeps asserting a fact the
+        // operator has withdrawn does not protect the invariant; it protects
+        // the stale claim, and it is why the /feeds panel was still calling a
+        // FAULTED Dhan lane "off by design".
+        //
+        // Neither lane is retired today, so both arms are false. The predicate
+        // stays because it is the seam a future retirement flips.
+        assert!(
+            !Feed::Dhan.live_ws_retired(),
+            "the Dhan live WS was revived 2026-08-09/11 — a disabled lane is a \
+             fault now, and must not read as 'off by design'"
+        );
         assert!(
             !Feed::Truedata.live_ws_retired(),
             "TrueData live-WS lane is the intended tick source, not retired"
         );
+        // Every variant, so a new feed cannot silently arrive claiming
+        // retirement without this test being read again.
+        for f in Feed::ALL {
+            assert!(
+                !f.live_ws_retired(),
+                "{f:?} claims a retired live-WS lane; no retirement is in force \
+                 — add the dated operator quote to the doc before flipping it"
+            );
+        }
     }
 
     #[test]

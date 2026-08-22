@@ -582,18 +582,47 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_retired_lane_reads_off_by_design() {
-        // Operator-scare fix (2026-07-20): a retired live-WS lane reads
-        // "off by design", never the scary "switched off by operator".
-        let r = evaluate_feed_health(
-            Feed::Dhan,
-            FeedHealthInput {
-                enabled: false,
-                ..base()
-            },
+    fn test_disabled_lane_reads_switched_off_while_no_feed_is_retired() {
+        // CORRECTED 2026-08-22. This asserted that a disabled `Feed::Dhan`
+        // reads "live-WS lane (retired) — off by design", which was true from
+        // the 2026-07-13 retirement until the operator REVIVED that lane on
+        // 2026-08-09 and turned it on by default on 2026-08-11. The assertion
+        // outlived its fact by eleven days, and while it did, a Dhan lane that
+        // was off — a FAULT after the revival — rendered on the operator panel
+        // as intentional.
+        //
+        // No feed is retired today, so the relabel must NOT apply to any of
+        // them, and a disabled lane reads the plain truth.
+        for &feed in Feed::ALL.iter() {
+            let r = evaluate_feed_health(
+                feed,
+                FeedHealthInput {
+                    enabled: false,
+                    ..base()
+                },
+            );
+            assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
+            assert_eq!(
+                r.reason, "switched off by operator",
+                "{feed:?} is not a retired lane, so its OFF state is not 'by design'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retired_relabel_is_gated_on_the_predicate_not_on_a_feed_name() {
+        // The relabel branch has no live feed to exercise it (nothing is
+        // retired), so this pins the GATE rather than the outcome: the wording
+        // swap in `evaluate_feed_health` is driven by `live_ws_retired()`, so
+        // a future retirement is one predicate arm away and needs no edit
+        // here. Stated plainly instead of leaving the branch silently
+        // uncovered — an unexercised branch that nobody names is how the
+        // stale assertion above survived.
+        assert!(
+            Feed::ALL.iter().all(|f| !f.live_ws_retired()),
+            "a retired feed exists: give it a case here that asserts the \
+             'off by design' wording, and re-read the test above"
         );
-        assert_eq!(r.verdict, FeedHealthVerdict::Disabled);
-        assert_eq!(r.reason, "live-WS lane (retired) — off by design");
     }
 
     #[test]

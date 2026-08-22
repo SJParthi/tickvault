@@ -353,9 +353,16 @@ struct FeedRowDescriptor {
 /// Build the per-feed UI note generically (no per-feed hardcoded copy) so any
 /// future feed gets an accurate description automatically.
 fn feed_note(feed: Feed) -> String {
-    // Operator-scare fix (2026-07-20): the retired live-WS lanes must never
-    // read as a fault — OFF is the designed runtime; the per-minute REST
-    // cadence pulls are the market-data capture now.
+    // Operator-scare fix (2026-07-20): a retired live-WS lane must never read
+    // as a fault — OFF is the designed runtime; the per-minute REST cadence
+    // pulls are the market-data capture for such a lane.
+    //
+    // UNREACHABLE as of 2026-08-22 and deliberately kept: `live_ws_retired()`
+    // returns false for every feed since the Dhan lane was revived
+    // (2026-08-09/11 operator quotes). Keeping the branch means a future
+    // retirement is one predicate arm away with no page edit; deleting it
+    // would put this copy back in a hardcoded per-feed `if`, which is what
+    // the generic `feed_note` exists to avoid.
     if feed.live_ws_retired() {
         return format!(
             "{} live-WS lane (retired) — off by design. Market data arrives \
