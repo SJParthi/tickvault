@@ -4862,15 +4862,31 @@ fn top_up_late_contracts(
     }
     let unplaced = delta.len().saturating_sub(placed);
     if unplaced > 0 {
+        // TWO causes, one message until 2026-08-22 — and they send triage in
+        // opposite directions. An EMPTY `slots` means no connection ever
+        // registered a top-up channel at all: every dial failed, or the
+        // contract half was marked done without leaving a sender behind. That
+        // is a wiring failure with nothing to do with capacity, and blaming
+        // the 5 x 5,000 budget for it sends the operator hunting an overflow
+        // that does not exist. Found by the 2026-08-22 permutation sweep,
+        // which asked what this line says when there is nothing to send to.
+        let cause = if slots.is_empty() {
+            "no live connection ever registered a top-up channel — a WIRING failure, not a \
+             capacity one: the contract half reported done without leaving a sender behind"
+        } else {
+            "every main-feed connection is at its cap, which means the authorized universe no \
+             longer fits the 5 x 5,000 budget"
+        };
         error!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
             attempts,
             delta = delta.len(),
             placed,
             unplaced,
+            connections = slots.len(),
+            cause,
             "late-priced contracts had no room on any live connection — they are NOT \
-             subscribed this session. Every main-feed connection is at its cap, which means \
-             the authorized universe no longer fits the 5 x 5,000 budget."
+             subscribed this session"
         );
     } else {
         info!(
@@ -7425,6 +7441,64 @@ mod tests {
         );
         assert!(sent.is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// No connection registered a top-up channel at all.
+    ///
+    /// Distinct from "every connection is at its cap" and NOT interchangeable
+    /// with it: this is a wiring failure, and until 2026-08-22 both produced
+    /// the same message blaming the 5 x 5,000 capacity budget. Pinned because
+    /// the two send triage in opposite directions.
+    #[test]
+    fn top_up_late_contracts_survives_no_registered_connection() {
+        let mut sent = std::collections::HashSet::new();
+        let mut slots: [(
+            tokio::sync::mpsc::Sender<
+                Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+            >,
+            usize,
+        ); 0] = [];
+        let selection = [inst(11, ExchangeSegment::NseFno)];
+
+        assert_eq!(
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000),
+            0,
+            "nothing can be placed with nowhere to place it"
+        );
+        assert!(
+            sent.is_empty(),
+            "and nothing may be recorded as subscribed — recording here would lock these \
+             contracts out of every later attempt"
+        );
+    }
+
+    /// The unplaced diagnostic must name WHICH of its two causes applies.
+    ///
+    /// A source scan rather than a log capture: the value under test is the
+    /// operator-facing wording, and a behavioural assertion on `tracing`
+    /// output would pin the harness rather than the message.
+    #[test]
+    fn top_up_unplaced_error_separates_wiring_from_capacity() {
+        // The test module is scanned OUT before searching. `include_str!`
+        // embeds this whole file, so a needle spelled here matches ITSELF and
+        // the guard can never fail. Written that way first, on 2026-08-22,
+        // and caught only because the bite-proof was actually run: collapsing
+        // the branch to `if false` left the test green.
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+        assert!(
+            src.contains("let cause = if slots.is_empty()"),
+            "the unplaced error must branch on whether any connection exists"
+        );
+        assert!(
+            src.contains("a WIRING failure, not a"),
+            "the empty-slots branch must say it is NOT a capacity problem"
+        );
+        assert!(
+            src.contains("every main-feed connection is at its cap"),
+            "the genuine capacity branch must survive"
+        );
     }
 
     #[test]
