@@ -1854,7 +1854,8 @@ pub struct DrainCounters {
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
     abandoned_bytes: metrics::Counter,
-    xverify_ran: metrics::Counter,
+    xverify_measured: metrics::Counter,
+    xverify_vacuous: metrics::Counter,
     xverify_failed: metrics::Counter,
     xverify_no_token: metrics::Counter,
 }
@@ -1916,15 +1917,30 @@ pub fn counters() -> &'static DrainCounters {
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
-        xverify_ran: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "ran"),
+        xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
+        xverify_vacuous: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "vacuous"),
         xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
         xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
     })
 }
 
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
-/// `ran` means the session's captured candles were never checked against
+/// `measured` means the session's captured candles were never checked against
 /// Dhan's own record.
+///
+/// # Why `vacuous` is its own label and not folded into `ran`
+///
+/// It WAS folded in, and the doc above said "anything other than `ran`" while
+/// a run that compared ZERO minutes counted as `ran`. So the one label an
+/// operator would read as "we checked" was also what a run that proved nothing
+/// reported -- the comment promised a guarantee the label could not deliver.
+///
+/// That matters more here than almost anywhere else: this comparison is the
+/// revived feed's ONLY ground truth, the `compared == 0` case is the exact
+/// false-OK this repository has retired twice, and the comparator itself is
+/// scrupulous about it -- `Blind` is a first-class outcome, `is_pass()` is
+/// false for it, and a vacuous run fires a coded `error!`. The gap was never
+/// the detection; it was that every DELIVERY surface flattened the distinction.
 pub const XVERIFY_RUNS_COUNTER: &str = "tv_dhan_feed_xverify_runs_total";
 
 /// Counter: sealed candles handed to the process-wide seal writer.
@@ -6345,8 +6361,14 @@ pub fn spawn_daily_crossverify(
             .await
             {
                 Ok(report) => {
-                    counters().xverify_ran.increment(1);
                     let c = &report.comparison;
+                    // Split BEFORE the log line, so the counter and the
+                    // `vacuous = ` field below can never disagree.
+                    if c.is_vacuous() {
+                        counters().xverify_vacuous.increment(1);
+                    } else {
+                        counters().xverify_measured.increment(1);
+                    }
                     // THE VERDICT AS FIELDS, not as a debug dump.
                     //
                     // 2026-08-20, measured on the box: this emitted `?report`,
@@ -8007,6 +8029,61 @@ mod tests {
             ingest.seq_refused(),
             0,
             "a representable sequence must not be refused"
+        );
+    }
+
+    /// The cross-verification counter must be able to tell "we checked" from
+    /// "we ran and proved nothing".
+    ///
+    /// This comparison is the revived Dhan feed's ONLY ground truth, and a
+    /// `compared == 0` day is the exact false-OK this repository has retired
+    /// twice. The comparator detects it properly -- `Blind` is a first-class
+    /// outcome, `is_pass()` is false for it, and a vacuous run fires a coded
+    /// `error!`. What was missing was DELIVERY: every surface flattened the
+    /// distinction.
+    ///
+    ///   * the counter counted a vacuous run as `ran`, under a doc comment
+    ///     that read "anything other than `ran` means the candles were never
+    ///     checked" -- a promise the label could not keep;
+    ///   * `WS-GAP-03`, the code the vacuous `error!` carries, is not one of
+    ///     the 18 alarmed error codes, so the line pages nobody;
+    ///   * the two audit tables it writes have no console query, no QuestDB
+    ///     view, no dashboard widget and no runbook mention -- their only
+    ///     other reader is `partition_manager`, which DELETES their
+    ///     partitions on retention.
+    ///
+    /// The label split is the part that costs nothing: no new metric name, no
+    /// new alarm, no operator quote. The remaining surfaces are recorded above
+    /// rather than quietly fixed, because an alarm needs a dated operator
+    /// quote per `dhan-rest-only-noise-lock-2026-07-14.md` §3.
+    #[test]
+    fn xverify_counter_separates_a_measured_run_from_a_vacuous_one() {
+        let src = include_str!("dhan_feed_stack.rs");
+
+        assert!(
+            src.contains("\"outcome\" => \"vacuous\""),
+            "the vacuous label must exist -- without it a run that compared zero \
+             minutes is indistinguishable from one that checked the whole day"
+        );
+        assert!(
+            src.contains("\"outcome\" => \"measured\""),
+            "the success label must say `measured`, not `ran`: a vacuous run also ran"
+        );
+        assert!(
+            !src.contains("\"outcome\" => \"ran\""),
+            "the ambiguous `ran` label must not come back"
+        );
+
+        // The split must be DRIVEN by is_vacuous(), not by anything a later
+        // edit could let drift from the logged `vacuous =` field.
+        let at = src
+            .find("counters().xverify_vacuous.increment(1)")
+            .expect("the vacuous arm must exist");
+        let window = &src[at.saturating_sub(200)..at];
+        assert!(
+            window.contains("c.is_vacuous()"),
+            "the vacuous counter must be gated on is_vacuous(), so the counter and \
+             the log field cannot disagree"
         );
     }
 
