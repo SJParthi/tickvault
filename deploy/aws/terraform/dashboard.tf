@@ -583,19 +583,78 @@ resource "aws_cloudwatch_dashboard" "operator" {
           ]
           period = 300
         }
+      },
+
+      # ----- Row 12: the counters we PAY to ship and nobody could see -----
+      # (2026-08-22 audit.) A sweep of the EMF allowlist against this file and
+      # every alarm found 17 metrics that reach CloudWatch — and therefore
+      # appear on the bill — while being charted nowhere and alarmed by
+      # nothing. Nine of them count LOSS or FAILURE, which is the worst
+      # possible thing to be paying for and not looking at: the loss is
+      # measured, the measurement is discarded, and every surface stays green.
+      #
+      # DELIBERATELY charted rather than alarmed. `dhan-rest-only-noise-lock`
+      # §2.3a already ruled on this trade for the live lane: each new pager
+      # costs ~$0.10/mo, several of these are downstream symptoms of failures
+      # that an existing alarm fires on first, and "a family of eleven pagers
+      # for one subsystem trains an operator to ignore all of them". A chart
+      # costs nothing, adds no page, and turns paid-for-and-invisible into
+      # paid-for-and-visible.
+      #
+      # Both of this file's own checks were run per metric before charting:
+      #   1. a producer exists in crates/*/src  (grep-verified 2026-08-22)
+      #   2. the name is in the EMF allowlist   (that is how they were found)
+      # So none of these renders "no data", which this file rightly calls
+      # strictly worse than no widget at all.
+      {
+        type   = "text"
+        x      = 0
+        y      = 76
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "## Quiet failures — measured, shipped, previously unwatched\nEvery line here should sit **flat at zero**. None of these raises an alarm on its own, by design: they are the second opinion you read when something else looks wrong, and the early warning you can spot before anything is wrong. A rising line means data was discarded, a write failed, or a boot step ran out of time."
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 78
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Rows discarded or refused — anything above zero is data that did not land"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_ilp_rows_discarded_total", { label = "database rows discarded", stat = "Sum" }],
+            [local.dash_namespace, "tv_depth_rows_dropped_total", { label = "depth rows dropped", stat = "Sum" }],
+            [local.dash_namespace, "tv_rest_fetch_audit_rows_discarded_total", { label = "fetch-audit rows discarded", stat = "Sum" }],
+            [local.dash_namespace, "tv_ws_frame_spill_drop_critical", { label = "raw frames lost before capture", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 78
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Writes and recovery that failed — the paths that keep the data safe"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_depth_persist_errors_total", { label = "depth writes failed", stat = "Sum" }],
+            [local.dash_namespace, "tv_rest_fetch_audit_persist_errors_total", { label = "fetch-audit writes failed", stat = "Sum" }],
+            [local.dash_namespace, "tv_wal_replay_corrupted_segments_total", { label = "corrupted segments on replay", stat = "Sum" }],
+            [local.dash_namespace, "tv_partition_archive_failed_total", { label = "archive to S3 failed", stat = "Sum" }],
+            [local.dash_namespace, "tv_boot_deadline_exceeded_total", { label = "boot step ran out of time", stat = "Sum" }]
+          ]
+          period = 300
+        }
       }
     ]
   })
 }
-
-# =============================================================================
-# CloudWatch Dashboard #2 (tv-<env>-scoreboard) RETIRED 2026-07-17 — dashboard
-# tidy. The dual-feed scoreboard dashboard's live-trend widgets charted the
-# Dhan/Groww exchange-lag gauges (producers deleted with the dead Dhan-lag
-# publisher chain, 2026-07-17), the stall/WS series (producers deleted with
-# the live-feed retirements 2026-07-13/2026-07-15), and a feed-focused alarm
-# strip over retired alarms. Coverage, blame and the daily verdict continue to
-# live in the 3:45 PM IST Telegram scorecard + the QuestDB scoreboard tables
-# (feed_scoreboard_daily / feed_coverage_daily / feed_episode_audit) — those
-# are unaffected. Frees dashboard slot #2 of the 3-slot CloudWatch free tier.
-# =============================================================================
