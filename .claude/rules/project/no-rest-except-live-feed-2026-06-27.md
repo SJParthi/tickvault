@@ -213,20 +213,6 @@ Per that relayed directive (rooted in the operator's standing 2026-07-12 §8.0 g
 **Quote 2 (2026-07-13, latency visibility):**
 > "always clearly note within a second — or within how many seconds precisely — we are fetching this live real OHLCV, along with the option chain API."
 
-**Same-day spot-window hotfix (recorded for §8.2 accuracy):** the spot half's FIRST live session (2026-07-13) failed every minute (`SPOT1M-01`, `ok=0/errors=0/empty=3` from 09:16 IST — Dhan answered `2xx` without the target candle) because the fetcher used a same-date `[minute open, open+60s]` request window, a shape never live-proven. The fix (same PR) switches each per-minute fire to the ONLY live-proven window shape — day-granular `fromDate = D 00:00:00, toDate = D+1 00:00:00` (the exact body the 15:31 cross-verify + prev-day fetchers use) — with client-side filtering to the exact minute, plus a previous-minute backfill on every fire AND one bounded post-session sweep (~15:31 IST) that repairs any session minute still missing above the per-SID persisted watermark (DEDUP-idempotent re-appends; the sweep is what gives the final 15:29 candle a repair path). Cadence, SIDs, table, and budget are UNCHANGED (still 3 requests per minute close; a full-day body is ~20 KB, far inside the 2 MiB cap and the Data-API budget) — this is a request-SHAPE correction inside the existing §8 grant, not a scope change.
-
----
-
-# §9. Groww per-minute REST pipeline — scheduled-pull KEEP class (operator authorization 2026-07-13)
-
-## §9.0 The verbatim operator demand (preserve exactly, do not paraphrase — typos included)
-
-**Quote 1 (2026-07-13, the directive — relayed verbatim via the coordinator session):**
-> "can we implement the same Groww one min fetch which is precisely very similar to the same Dhan — REST api pull ohlcv entirely and even then instantly option chain api also... for Groww live feed and now we planned to add this live REST which is very similar to Dhan. That's it."
-
-**Quote 2 (2026-07-13, latency visibility):**
-> "always clearly note within a second — or within how many seconds precisely — we are fetching this live real OHLCV, along with the option chain API."
-
 (Full authorization record incl. the verbatim-intent fill-model context lives in
 `groww-second-feed-scope-2026-06-19.md` §38 — the §33 partial-supersession edit this lock's
 §4 protocol requires.)

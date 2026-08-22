@@ -234,13 +234,6 @@ fi
 if [ -z "$COMMIT_MSG" ]; then
   COMMIT_MSG=$(echo "$COMMAND" | sed -n "s/.*-m [\"'][^\"']*[\"'].*/&/p" 2>/dev/null | sed "s/.*-m [\"']//" | sed "s/[\"'].*//" | head -1 || true)
 fi
-# NEW: also handle -F /path/to/file (file-based commit message)
-if [ -z "$COMMIT_MSG" ]; then
-  COMMIT_MSG_FILE=$(echo "$COMMAND" | sed -n 's/.*-F[= ]\+\([^ ]*\).*/\1/p' | head -1 || true)
-  if [ -n "$COMMIT_MSG_FILE" ] && [ -f "$COMMIT_MSG_FILE" ]; then
-    COMMIT_MSG=$(head -1 "$COMMIT_MSG_FILE" 2>/dev/null || true)
-  fi
-fi
 if [ -n "$COMMIT_MSG" ]; then
   # Extract first line only
   FIRST_LINE=$(echo "$COMMIT_MSG" | head -1)
