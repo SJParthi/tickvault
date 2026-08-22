@@ -901,6 +901,47 @@ instead of 4. That is a real cost and it was accepted deliberately, on the
 operator's explicit instruction, against a box (r8g.xlarge, 32 GiB) sized for
 exactly this load.
 
+> **⚠ CORRECTED 2026-08-22 — 4,565 is the MAPPING-ROW count, not the
+> instrument count, and the real live set is roughly 870.**
+>
+> `join_constituents` dedups on `(index_name, security_id, segment)` — scoped
+> to the INDEX — so a stock belonging to twelve of the forty-six downloaded
+> NSE India index lists produces TWELVE resolved rows. The artifact's
+> `mappings` array is that sum across all 46 lists WITH the duplicates, plus
+> one row per NSE index. 4,565 is what that array holds.
+>
+> The subscribe path has always deduped on the I-P1-11 composite key
+> (`dhan_live_universe::select_live_universe`, `seen: HashSet<(SecurityId,
+> ExchangeSegment)>`), so the number of instruments the lane DIALS is the
+> distinct count: about **120 NSE indices + ~750 unique NIFTY Total Market
+> stocks ≈ 870**. NTM is the broadest basket and contains the other lists'
+> members, which is why the distinct total lands near its own size rather than
+> near the sum.
+>
+> Pinned by `dhan_live_universe.rs::a_stock_repeated_across_many_index_lists_
+> is_subscribed_once`, which feeds exactly 4,565 rows in and asserts the
+> instrument count out, so this cannot be re-derived wrongly a third time.
+>
+> **What the wrong number changed downstream, so each is checked rather than
+> assumed:**
+>
+> * The packing table below reads "boot spots (4,565) → 1 connection". The
+>   CONCLUSION is unchanged and is now stronger: at ~870 the boot pass takes
+>   one connection with far more room to spare, and `ceil(870/5000) = 1` the
+>   same as `ceil(4565/5000) = 1`.
+> * `dhan-rest-only-noise-lock-2026-07-14.md` uses 4,565 to price
+>   per-instrument CloudWatch metrics at ~$1,369/mo. At ~870 that is ~$261/mo
+>   — still far above what the budget can absorb, so the decision to dimension
+>   latency per CONNECTION rather than per instrument stands unchanged.
+> * Sizing arguments that treat the boot pass as "already spending ~4,565 of
+>   the 25,000 slots" are working from the row count. The spot pass spends
+>   about 870, leaving correspondingly more headroom for contracts.
+>
+> No live figure is claimed here: `distinct_instruments` and
+> `tv_dhan_universe_distinct_instruments` were added the same day and publish
+> the measured value from the next 08:30 build onward. Until one lands, ~870
+> is what the code must produce, not what the box reported.
+
 Three things bound it, none of which is a promise that it works:
 - **Fail-soft, loudly.** An unreadable or unparseable mapping artifact falls
   back to the 4 index SIDs with a coded `error!` saying master sourcing was
