@@ -72,7 +72,7 @@ fn seed_slot(feed: Feed, underlying: ChainUnderlying, spot_paise: i64) {
 fn dhat_cadence_decide_pass_zero_alloc() {
     // Pre-seed ALL 6 registry slots OUTSIDE the profiler window (the
     // documented cold-path publish allocation).
-    for feed in [Feed::Dhan, Feed::Groww] {
+    for feed in [Feed::Dhan] {
         for (i, u) in ChainUnderlying::ALL.iter().enumerate() {
             seed_slot(feed, *u, SPOTS_PAISE[i]);
         }
@@ -100,7 +100,7 @@ fn dhat_cadence_decide_pass_zero_alloc() {
             // underlying (strike_step_paise → atm_strike_paise) + the
             // 6-slot load+fold the decision finalize runs.
             for pass in 0..10_000_u32 {
-                for feed in [Feed::Dhan, Feed::Groww] {
+                for feed in [Feed::Dhan] {
                     for (i, u) in ChainUnderlying::ALL.iter().enumerate() {
                         let spot = std::hint::black_box(SPOTS_PAISE[i]);
                         let atm = strike_step_paise(u.as_str())

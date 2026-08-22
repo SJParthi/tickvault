@@ -278,7 +278,7 @@ impl ShadowCandleWriter {
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
             // Feed-provenance label (operator 2026-06-19, "same tables + feed
-            // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Groww`
+            // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Truedata`
             // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
             // writer stamps whichever feed produced the seal, never a hardcoded
             // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
@@ -340,8 +340,8 @@ impl ShadowCandleWriter {
     /// - flush returns a CONNECTION error (broken pipe / reset / not-connected ⇒
     ///   `ErrorCode::SocketError`): drop the sender, reconnect, re-flush the SAME
     ///   buffer (RETAINED — questdb `flush` only `buf.clear()`s on `Ok`), bounded
-    ///   to [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES`] with
-    ///   [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS`] backoff.
+    ///   to [`crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES`] with
+    ///   [`crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_BACKOFF_MS`] backoff.
     ///   Replay is idempotent — `candles_1m` DEDUP `(ts, security_id, segment,
     ///   feed)` collapses any partially-written row, never a double candle.
     /// - flush returns a NON-connection error (`InvalidName`, server reject, etc.):
@@ -365,11 +365,11 @@ impl ShadowCandleWriter {
             return Ok(());
         }
         let mut reconnected = false;
-        for attempt in 0..=crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+        for attempt in 0..=crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
             if self.sender.is_none()
                 && let Err(err) = self.reconnect()
             {
-                if attempt == crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                if attempt == crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
                     return Err(err).context("shadow flush: reconnect to QuestDB failed");
                 }
                 metrics::counter!("tv_shadow_candle_reconnect_attempts_total").increment(1);
@@ -414,10 +414,10 @@ impl ShadowCandleWriter {
                     // Drop the broken sender so the next iteration reconnects. The
                     // buffer is RETAINED (questdb `flush` does not clear it on err).
                     self.sender = None;
-                    if !crate::groww_persistence::is_connection_error(&err) {
+                    if !crate::ilp_flush_reconnect::is_connection_error(&err) {
                         return Err(err).context("shadow flush: ILP send failed (non-connection)");
                     }
-                    if attempt == crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                    if attempt == crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
                         return Err(err)
                             .context("shadow flush: ILP send failed after reconnect retries");
                     }
@@ -477,7 +477,7 @@ impl ShadowCandleWriter {
     /// Synchronous: the seal-writer drain runs on its own task and the total
     /// across retries is tiny.
     fn backoff_sleep(attempt: usize) {
-        if let Some(&ms) = crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS.get(attempt) {
+        if let Some(&ms) = crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_BACKOFF_MS.get(attempt) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
     }
@@ -753,10 +753,11 @@ mod tests {
 
     #[test]
     fn test_append_seal_stamps_feed_from_seal_not_hardcoded() {
-        // ONE feed-parameterized writer: a `Feed::Groww` seal MUST stamp
-        // `feed=groww` (NOT the old hardcoded `feed=dhan`), so the SAME
-        // append_seal path serves both feeds and Groww candles never collide
-        // with Dhan candles under the (ts, security_id, segment, feed) DEDUP key.
+        // ONE feed-parameterized writer: a non-Dhan seal MUST stamp ITS OWN
+        // feed label, never the old hardcoded `feed=dhan`, so the same
+        // append_seal path serves every feed and their candles can never
+        // collide under the (ts, security_id, segment, feed) DEDUP key.
+        // Probed with Groww until 2026-08-21; TrueData is the non-Dhan feed now.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal_feed(
             13,
@@ -764,17 +765,17 @@ mod tests {
             TfIndex::M1,
             1_716_000_900,
             100.0,
-            Feed::Groww,
+            Feed::Truedata,
         ))
         .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(
-            s.contains("feed=groww"),
-            "Groww seal must stamp feed=groww (the writer is feed-parameterized), got {s}"
+            s.contains("feed=truedata"),
+            "a TrueData seal must stamp feed=truedata (the writer is feed-parameterized), got {s}"
         );
         assert!(
             !s.contains("feed=dhan"),
-            "a Groww seal must NOT stamp feed=dhan, got {s}"
+            "a non-Dhan seal must NOT stamp feed=dhan, got {s}"
         );
     }
 
@@ -994,7 +995,7 @@ mod tests {
         // The candle writer reuses the SAME `is_connection_error` classifier as the
         // Groww tick writer, so broken-pipe / reset → retry, structural → no retry.
         // (Proving the classifier wiring without a live QuestDB.)
-        use crate::groww_persistence::is_connection_error;
+        use crate::ilp_flush_reconnect::is_connection_error;
         let socket = questdb::Error::new(
             questdb::ErrorCode::SocketError,
             "Could not flush buffer: Broken pipe (os error 32)",
@@ -1052,7 +1053,7 @@ mod tests {
             "the candle path must stamp the ARBITRARY feed verbatim (feed-agnostic), got {s}"
         );
         assert!(
-            !s.contains("feed=dhan") && !s.contains("feed=groww"),
+            !s.contains("feed=dhan") && !s.contains("feed=truedata"),
             "a novel-feed candle must NOT be relabelled to a known feed, got {s}"
         );
     }
@@ -1153,7 +1154,7 @@ mod tests {
             TfIndex::M1,
             1_716_000_900,
             100.0,
-            Feed::Groww,
+            Feed::Truedata,
         );
         let row = ShadowSealRow::from_buffered_seal(&seal);
 

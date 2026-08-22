@@ -63,12 +63,6 @@ pub struct BoardDb {
     // rows — the count would be a permanently-stale/zero "live ticks captured
     // today" number, i.e. a false-OK. Retired rather than repointed at another
     // table (repointing a "ticks" label at candles would be a different lie).
-    /// Cross-fill events today from `cross_fill_audit` (operator 2026-07-20);
-    /// `null` on query failure — honest unknown, never a fabricated 0.
-    pub cross_fill_today: Option<u64>,
-    /// Short per-event lines ("9:16 AM dhan ← groww (spot)"); `null` when
-    /// the table could not be read; an empty list is a MEASURED zero.
-    pub cross_fill_events: Option<Vec<String>>,
 }
 
 /// The full `GET /api/board/data` payload.
@@ -146,16 +140,9 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
     // `ticks_today` tile retired 2026-07-19 (BATCH-5) — the ticks writer is
     // gone, so no ticks query is issued anymore.
     let candles_sql = format!("SELECT count() FROM candles_1m WHERE ts >= '{midnight}'");
-    // Cross-fill tile (operator 2026-07-20): today's broker-to-broker fills
-    // with the precise minute + direction, straight from `cross_fill_audit`.
-    let cross_fill_sql = format!(
-        "SELECT cycle_minute_ist, lane, source_lane, legs FROM cross_fill_audit \
-         WHERE ts >= '{midnight}' AND stage = 'cross_fill' ORDER BY ts LIMIT 24"
-    );
-    let (probe, candles_1m_today, cross_fill_events) = tokio::join!(
+    let (probe, candles_1m_today) = tokio::join!(
         super::stats::query_count(&client, &base_url, "SHOW TABLES"),
         super::stats::query_count(&client, &base_url, &candles_sql),
-        query_cross_fill_events(&client, &base_url, &cross_fill_sql),
     );
 
     BoardDataResponse {
@@ -169,65 +156,8 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
         db: BoardDb {
             reachable: probe.is_some(),
             candles_1m_today,
-            cross_fill_today: cross_fill_events.as_ref().map(|e| e.len() as u64),
-            cross_fill_events,
         },
     }
-}
-
-/// Fetch + format today's cross-fill events; `None` = the table could not
-/// be read (query failure / malformed body) — the tile then shows an honest
-/// "—", never a fabricated 0.
-async fn query_cross_fill_events(
-    client: &reqwest::Client,
-    base_url: &str,
-    sql: &str,
-) -> Option<Vec<String>> {
-    let url = format!("{base_url}/exec");
-    let resp = client
-        .get(&url)
-        .query(&[("query", sql)])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().await.ok()?;
-    parse_cross_fill_board_lines(&body)
-}
-
-/// Parse the QuestDB `/exec` dataset into short tile lines
-/// ("9:16 AM dhan ← groww (spot)"). Pure; `None` on a malformed body.
-fn parse_cross_fill_board_lines(body: &str) -> Option<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let dataset = v.get("dataset")?.as_array()?;
-    let mut out = Vec::with_capacity(dataset.len());
-    for row in dataset {
-        let row = row.as_array()?;
-        let secs = u32::try_from(row.first()?.as_i64()?).ok()?;
-        let lane = row.get(1)?.as_str()?;
-        let source = row.get(2)?.as_str()?;
-        let legs = row.get(3)?.as_str()?;
-        out.push(format!(
-            "{} {lane} \u{2190} {source} ({legs})",
-            format_secs_of_day_12h(secs)
-        ));
-    }
-    Some(out)
-}
-
-/// IST seconds-of-day → 12-hour clock text ("9:16 AM"). Pure.
-fn format_secs_of_day_12h(secs_of_day: u32) -> String {
-    let h24 = (secs_of_day / 3_600) % 24;
-    let m = (secs_of_day / 60) % 60;
-    let (h12, half) = match h24 {
-        0 => (12, "AM"),
-        1..=11 => (h24, "AM"),
-        12 => (12, "PM"),
-        _ => (h24 - 12, "PM"),
-    };
-    format!("{h12}:{m:02} {half}")
 }
 
 /// Resident memory of this process in bytes; `None` on hosts without procfs.
@@ -418,59 +348,29 @@ mod tests {
         );
     }
 
+    /// Every source down must degrade to honest nulls, never a panic and
+    /// never a fabricated zero. `test_state` points QuestDB at port 1, so
+    /// every probe is refused immediately.
+    ///
+    /// Restored 2026-08-21: this test was deleted alongside the cross-fill
+    /// tile, but its subject is the always-200-honest-nulls contract, which
+    /// has nothing to do with cross-fill. Its `TEST-EXEMPT` reference on
+    /// `compute_board_data` had been left pointing at a test that no longer
+    /// existed — a coverage claim with nothing behind it.
     #[tokio::test]
     async fn test_compute_board_data_all_sources_down_returns_nulls_not_panics() {
-        // Everything down/absent: QuestDB unreachable, no groww files (test
-        // CWD has no data/groww), boot epoch never stamped, market state
-        // whatever the calendar says. The endpoint must answer with honest
-        // nulls — never panic, never invent a number.
-        let resp = compute_board_data(&test_state()).await;
-        assert!(resp.status.uptime_secs.is_none(), "boot epoch 0 → null");
-        assert!(!resp.status.build_sha_short.is_empty());
-        assert!(!resp.db.reachable, "QuestDB down → reachable=false");
-        assert!(resp.db.candles_1m_today.is_none());
-        // Cross-fill tile (2026-07-20): unreadable table → honest nulls,
-        // never a fabricated 0.
-        assert!(resp.db.cross_fill_today.is_none());
-        assert!(resp.db.cross_fill_events.is_none());
-        // Feeds section still present (one row per feed, from the registry).
-        assert_eq!(
-            resp.feeds.feeds.len(),
-            crate::feed_state::Feed::ALL.len(),
-            "feeds section embedded even when everything else is down"
-        );
-        // JSON shape: nulls serialize as null, not as a panic or a fake 0.
-        // (connections/race fields removed 2026-07-17 — dashboard tidy.)
-        let json = serde_json::to_value(&resp).expect("serializes");
+        let state = test_state();
+        let body = compute_board_data(&state).await;
         assert!(
-            json["db"].get("ticks_today").is_none(),
-            "retired ticks_today tile absent (BATCH-5 2026-07-19)"
+            !body.db.reachable,
+            "a refused QuestDB connection must report unreachable"
         );
-        assert!(json.get("race").is_none(), "retired race field absent");
         assert!(
-            json.get("connections").is_none(),
-            "retired connections field absent"
+            body.db.candles_1m_today.is_none(),
+            "a failed count query must be null, never a fabricated 0"
         );
-    }
-
-    #[test]
-    fn test_parse_cross_fill_board_lines_and_12h_format() {
-        let body = r#"{"columns":[{"name":"cycle_minute_ist"},{"name":"lane"},{"name":"source_lane"},{"name":"legs"}],"dataset":[[33360,"dhan","groww","spot"]]}"#;
-        let lines = parse_cross_fill_board_lines(body).expect("parses");
-        assert_eq!(
-            lines,
-            vec!["9:16 AM dhan \u{2190} groww (spot)".to_string()]
-        );
-        // Measured zero: empty dataset parses to an empty list (not None).
-        assert_eq!(
-            parse_cross_fill_board_lines(r#"{"dataset":[]}"#),
-            Some(Vec::new())
-        );
-        // Error body / not json → None (honest unknown).
-        assert!(parse_cross_fill_board_lines(r#"{"error":"table does not exist"}"#).is_none());
-        assert!(parse_cross_fill_board_lines("nope").is_none());
-        assert_eq!(format_secs_of_day_12h(0), "12:00 AM");
-        assert_eq!(format_secs_of_day_12h(15 * 3_600 + 29 * 60), "3:29 PM");
+        // The endpoint still answers with whatever IS known.
+        assert!(!body.status.build_sha_short.is_empty());
     }
 
     // (parity/scan_connections/parse_status_json test suites deleted

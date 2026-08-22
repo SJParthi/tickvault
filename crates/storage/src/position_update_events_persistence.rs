@@ -498,7 +498,7 @@ mod tests {
     fn sample_record() -> PositionUpdateEventRecord {
         PositionUpdateEventRecord {
             ts_ist_nanos: 1_770_000_900_000_000_000,
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             event_seq: 7,
             symbol_isin: "INE002A01018".to_string(),
             security_id: -1,
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
         assert!(line.starts_with(POSITION_UPDATE_EVENTS_TABLE));
-        assert!(line.contains(",feed=groww"), "feed tag: {line}");
+        assert!(line.contains(",feed=truedata"), "feed tag: {line}");
         assert!(
             line.contains(",symbol_isin=INE002A01018"),
             "symbol_isin tag: {line}"

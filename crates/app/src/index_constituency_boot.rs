@@ -138,21 +138,25 @@ mod tests {
     /// died with the live lane; the surviving gate consumer is the
     /// `[groww_universe]` daily rider (persist_groww_instruments), so the
     /// process-global boot-prefix ts-pin migration task MUST still be spawned
-    /// BEFORE the rider spawn in `main()` source order — the Groww writer's
+    /// BEFORE the universe rider in `main()` source order — the rider's
     /// bounded 120s migration-gate wait depends on it.
+    ///
+    /// The rider this once named was the retired feed's; the surviving
+    /// consumer of the same gate is the Dhan universe rider, so the ordering
+    /// it pins is unchanged in substance.
     #[test]
-    fn ratchet_ts_pin_migration_spawns_before_groww_universe_rider() {
+    fn ratchet_ts_pin_migration_spawns_before_the_universe_rider() {
         let src = include_str!("main.rs");
         let migration = src
             .find("run_index_constituency_ts_pin_migration_at_boot(")
             .expect("the boot-prefix ts-pin migration spawn must exist in main.rs");
         let rider = src
-            .find("spawn_groww_universe_rider(")
-            .expect("the [groww_universe] daily rider spawn must exist in main.rs");
+            .find("spawn_dhan_universe_rider(")
+            .expect("the daily universe rider spawn must exist in main.rs");
         assert!(
             migration < rider,
             "F13/F14 regression: the process-global ts-pin migration task must be \
-             spawned BEFORE the [groww_universe] daily rider in main.rs source order"
+             spawned BEFORE the daily universe rider in main.rs source order"
         );
     }
 

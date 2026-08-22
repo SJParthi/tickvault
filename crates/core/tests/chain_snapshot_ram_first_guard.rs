@@ -222,26 +222,24 @@ fn without_fn_definitions(region: &str) -> String {
         .join("\n")
 }
 
-/// Wiring half: all three boot legs must keep CALLING the classification
-/// surface, both chain legs must keep PUBLISHING the RAM snapshot, and the
-/// contract leg (DB-audit-only by design) must NOT publish one. Scans the
-/// PRODUCTION region only — test-only code can neither satisfy the
-/// positive assertions nor trip the negative one.
+/// Wiring half: the chain boot leg must keep CALLING the classification
+/// surface and PUBLISHING the RAM snapshot. Scans the PRODUCTION region
+/// only — test-only code cannot satisfy the assertions.
+///
+/// This once covered three legs across two brokers; the second broker's
+/// chain and per-contract legs went with its feed on 2026-08-21, and with
+/// them the negative assertion that the contract leg must NOT publish a
+/// snapshot. That negative is worth naming as lost: it was the pin keeping
+/// a DB-audit-only leg from quietly becoming a second writer of the RAM
+/// decision surface.
 #[test]
 fn boot_legs_keep_moneyness_wiring() {
     let app_src = repo_root().join("crates/app/src");
 
     let dhan_chain = std::fs::read_to_string(app_src.join("option_chain_1m_boot.rs"))
         .expect("option_chain_1m_boot.rs must exist");
-    let groww_chain = std::fs::read_to_string(app_src.join("groww_option_chain_1m_boot.rs"))
-        .expect("groww_option_chain_1m_boot.rs must exist");
-    let groww_contract = std::fs::read_to_string(app_src.join("groww_contract_1m_boot.rs"))
-        .expect("groww_contract_1m_boot.rs must exist");
 
-    for (name, content) in [
-        ("option_chain_1m_boot.rs", &dhan_chain),
-        ("groww_option_chain_1m_boot.rs", &groww_chain),
-    ] {
+    for (name, content) in [("option_chain_1m_boot.rs", &dhan_chain)] {
         // TRH-NEW-1: the scan sees CALL SITES only — fn definition lines
         // are stripped so a leg that DEFINES the needle in its own
         // production region (the Dhan leg) cannot pass vacuously.
@@ -260,20 +258,6 @@ fn boot_legs_keep_moneyness_wiring() {
              the decision surface future strategy consumers read"
         );
     }
-
-    let contract_prod = without_fn_definitions(production_region(&groww_contract));
-    assert!(
-        contract_prod.contains("classify_moneyness_for("),
-        "groww_contract_1m_boot.rs must classify each contract row via \
-         classify_moneyness_for() in PRODUCTION code (chain-anchor spot + \
-         parsed strike + leg)"
-    );
-    assert!(
-        !contract_prod.contains("publish_chain_moneyness_snapshot("),
-        "the contract leg is DB-audit-only by design — its PRODUCTION code \
-         must NOT publish a chain snapshot (the chain legs own the RAM \
-         surface)"
-    );
 }
 
 /// Self-test for the production-region split: a needle that appears ONLY

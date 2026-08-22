@@ -278,7 +278,11 @@ fn scan_corpus_exists_and_is_substantial() {
 /// failure can be found by code in triage. The one that most needed it: a
 /// failed `DEDUP ENABLE UPSERT KEYS` leaves a SEBI table silently accepting
 /// duplicate rows.
-const UNCODED_ERROR_BUDGET: usize = 91;
+/// 91 -> 83 (2026-08-21). Not eight sites coded: eight sites DELETED with the
+/// Groww feed and the two-broker comparators that went with it. The budget
+/// follows the corpus down because a ratchet allowed to sit above the truth is
+/// a ceiling somebody padded once, and it stops ratcheting the moment it does.
+const UNCODED_ERROR_BUDGET: usize = 83;
 
 /// Sites where an `error!` carries no code and that is CORRECT.
 ///

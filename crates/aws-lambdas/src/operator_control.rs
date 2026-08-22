@@ -467,6 +467,12 @@ fn parse_num(s: &str) -> Option<f64> {
 /// value (';'-joined QuestDB CSV rows like `"dhan",123;"groww",45;`) into
 /// {feed: count_str}. Malformed fragments are skipped; an empty/absent value
 /// yields {} (the UI then shows nothing rather than fabricated zeros).
+///
+/// The `"groww"` in that example and in this module's parser fixtures is NOT
+/// stale after the 2026-08-21 feed removal: the `feed` column is part of every
+/// persisted DEDUP key, and the historical `feed='groww'` rows are retained
+/// (SEBI never-delete), so a GROUP BY feed genuinely still returns them. The
+/// parser must keep handling any feed label it is handed, known or retired.
 pub fn parse_feed_counts(raw: &str) -> Value {
     let mut out = serde_json::Map::new();
     for part in raw.split(';') {
@@ -951,7 +957,7 @@ pub fn validate_feed_toggle(feed: &Value, enabled: &Value) -> String {
         .as_str()
         .is_some_and(|s| FEED_NAME_RE.as_ref().is_some_and(|re| re.is_match(s)));
     if !feed_ok {
-        return "feed must be a lowercase feed name like 'dhan' or 'groww'".to_string();
+        return "feed must be a lowercase feed name like 'dhan' or 'truedata'".to_string();
     }
     if !enabled.is_boolean() {
         return "enabled must be a JSON boolean (true or false)".to_string();
@@ -3592,8 +3598,8 @@ mod tests {
     fn test_parse_feeds_view_full() {
         let stdout = concat!(
             "FEEDS_BEGIN\n",
-            "{\"dhan_enabled\": true, \"groww_enabled\": false, ",
-            "\"dhan_lane_running\": true, \"groww_lane_running\": false}\n",
+            "{\"dhan_enabled\": true, \"truedata_enabled\": false, ",
+            "\"dhan_lane_running\": true, \"truedata_lane_running\": false}\n",
             "FEEDS_END\n",
             "FEEDS_HEALTH_BEGIN\n",
             "{\"market_open\": true, \"feeds\": [{\"feed\": \"dhan\", \"verdict\": \"ok\", ",
@@ -3605,7 +3611,7 @@ mod tests {
         assert_eq!(out["feeds_error"], "");
         assert_eq!(out["health_error"], "");
         assert_eq!(out["feeds"]["dhan_enabled"], true);
-        assert_eq!(out["feeds"]["groww_enabled"], false);
+        assert_eq!(out["feeds"]["truedata_enabled"], false);
         assert_eq!(out["feeds"]["dhan_lane_running"], true);
         assert_eq!(out["health"]["feeds"][0]["feed"], "dhan");
         assert_eq!(out["health"]["feeds"][0]["verdict"], "ok");
@@ -3817,8 +3823,8 @@ mod tests {
 
     #[test]
     fn test_toggle_commands_target_correct_url_and_body() {
-        let joined = feed_toggle_commands("groww", true).join("\n");
-        assert!(joined.contains("http://127.0.0.1:3001/api/feeds/groww"));
+        let joined = feed_toggle_commands("truedata", true).join("\n");
+        assert!(joined.contains("http://127.0.0.1:3001/api/feeds/truedata"));
         assert!(joined.contains(r#"{"enabled": true}"#));
         assert!(joined.contains("-X POST"));
         let cmds_off = feed_toggle_commands("dhan", false).join("\n");
@@ -3844,14 +3850,14 @@ data-pull phase, so the system is never blinded mid-trade";
         let stdout = concat!(
             "FEED_TOGGLE_STATUS=200\n",
             "FEED_TOGGLE_BODY_BEGIN\n",
-            "{\"dhan_enabled\": true, \"groww_enabled\": true, ",
-            "\"dhan_lane_running\": true, \"groww_lane_running\": false}\n",
+            "{\"dhan_enabled\": true, \"truedata_enabled\": true, ",
+            "\"dhan_lane_running\": true, \"truedata_lane_running\": false}\n",
             "FEED_TOGGLE_BODY_END\n",
         );
         let out = parse_feed_toggle(stdout);
         assert_eq!(out["app_status"], 200);
         assert_eq!(out["error"], "");
-        assert_eq!(out["app_response"]["groww_enabled"], true);
+        assert_eq!(out["app_response"]["truedata_enabled"], true);
     }
 
     #[test]

@@ -195,18 +195,23 @@ mod tests {
         assert!(prod.starts_with("/tickvault/prod/"));
     }
 
-    /// The Dhan and Groww token parameters must be DISTINCT paths — publishing
-    /// a Dhan token over the Groww parameter would break the Groww REST legs.
+    /// The Dhan publish must be scoped by its SERVICE segment. The secret NAME
+    /// (`access-token`) is shared across vendors, so the service segment is the
+    /// only thing preventing a publish from landing on another vendor.s token.
     #[test]
-    fn test_dhan_publish_path_never_collides_with_groww_token_path() {
-        use tickvault_common::constants::{GROWW_ACCESS_TOKEN_SECRET, SSM_GROWW_SERVICE};
-
+    fn test_dhan_publish_path_is_scoped_by_its_service_segment() {
         let dhan = build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
-        let groww = build_ssm_path("prod", SSM_GROWW_SERVICE, GROWW_ACCESS_TOKEN_SECRET);
-        assert_ne!(
-            dhan, groww,
-            "the Dhan publish must never target the Groww token parameter \
-             (the secret NAME is identical — only the service segment differs)"
+        assert!(
+            dhan.contains('/'),
+            "the publish path must carry a service segment: {dhan}"
+        );
+        assert!(
+            dhan.contains(SSM_DHAN_SERVICE),
+            "the Dhan publish must target the Dhan service segment: {dhan}"
+        );
+        assert!(
+            dhan.ends_with(DHAN_ACCESS_TOKEN_SECRET),
+            "the publish path must end at the token secret name: {dhan}"
         );
     }
 }

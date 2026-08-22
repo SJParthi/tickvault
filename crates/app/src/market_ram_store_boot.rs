@@ -84,7 +84,8 @@ pub const RAM_CHAIN_REHYDRATE_WINDOW_MINUTES: usize = 30;
 /// 375-minute session plus the legs' boundary-fire margin.
 pub const RAM_CHAIN_REHYDRATE_WINDOW_COUNT: usize = 13;
 
-/// Ceiling on the spot store's PROJECTED ring capacity, in bytes.
+/// Ceiling on the spot store's PROJECTED ring capacity, in bytes — the
+/// FALLBACK, used only when the host's memory cannot be read.
 ///
 /// The spot rings are `VecDeque::with_capacity(bars_per_day × spot_days)`,
 /// allocated **eagerly when a slot is created** — so this memory is committed
@@ -93,11 +94,145 @@ pub const RAM_CHAIN_REHYDRATE_WINDOW_COUNT: usize = 13;
 /// a high-water mark it grows into, and it is the right thing to bound.
 ///
 /// 10 GiB is the operator's stated current-day RAM budget (2026-08-12,
-/// restated three times). Sized against the r8g.xlarge 32 GiB host it leaves
-/// room for QuestDB (`QDB_MEM_LIMIT` default 12g), the aggregator's ~155 MB,
-/// the seal + frame rings, and the OS — while still being generous enough
-/// that no honest current-day configuration trips it.
-pub const RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// restated three times), sized against the r8g.xlarge 32 GiB host.
+///
+/// **It is a FALLBACK rather than the budget itself** (2026-08-21). A budget
+/// pinned to one machine is the same shape the frame ring was repaired for:
+/// it is correct only while the host never changes, and it is silently wrong
+/// the moment it does — too generous on a smaller box, needlessly tight on a
+/// larger one, with no signal either way. [`ram_store_spot_capacity_budget_bytes`]
+/// derives it from the host at runtime and falls back to this value only when
+/// the host cannot be read, loudly.
+pub const RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The spot store's share of host memory, as an exact fraction: 5/16.
+///
+/// Chosen so the reference host reproduces the operator's stated figure
+/// EXACTLY rather than approximately — 5/16 × 32 GiB = 10 GiB to the byte.
+/// A percentage would have been 31.25%, and rounding it to 31% would have
+/// quietly tightened the live budget by 80 MiB while appearing to preserve
+/// it. The fraction is the honest way to say "same as today, but derived".
+///
+/// The remaining 11/16 is not slack: it is QuestDB (`QDB_MEM_LIMIT` default
+/// 12g), the aggregator's ~155 MB, the seal and frame rings, and the OS.
+pub const RAM_STORE_SPOT_BUDGET_NUMERATOR: u64 = 5;
+/// Denominator of [`RAM_STORE_SPOT_BUDGET_NUMERATOR`]'s fraction.
+pub const RAM_STORE_SPOT_BUDGET_DENOMINATOR: u64 = 16;
+
+/// Above this, a cgroup limit is "unlimited" rather than a real bound.
+///
+/// cgroup v1 reports no-limit as a saturated `u64` near `i64::MAX`, and v2
+/// uses the literal `max`. 1 PiB is far above any real host and far below
+/// the saturated sentinel, so it separates the two without pattern-matching
+/// on a specific kernel's choice of sentinel.
+const CGROUP_UNLIMITED_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
+
+/// Parses `MemTotal:` out of `/proc/meminfo`, returning BYTES.
+///
+/// `/proc/meminfo` reports kB (kibibytes, despite the label). Returns `None`
+/// on any shape it does not recognise rather than guessing — a wrong memory
+/// figure produces a wrong budget, which is worse than no budget at all.
+fn parse_meminfo_total_bytes(contents: &str) -> Option<u64> {
+    for line in contents.lines() {
+        let rest = match line.strip_prefix("MemTotal:") {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut parts = rest.split_whitespace();
+        let value: u64 = parts.next()?.parse().ok()?;
+        // The unit is present in every kernel that ships this file, but a
+        // missing unit is treated as kB rather than refused: the value's
+        // magnitude is unambiguous and refusing would lose a real reading.
+        return match parts.next() {
+            Some("kB") | Some("KB") | None => value.checked_mul(1024),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Parses a cgroup memory limit (v1 `memory.limit_in_bytes`, v2
+/// `memory.max`), returning `None` for "unlimited" in either dialect.
+fn parse_cgroup_limit_bytes(contents: &str) -> Option<u64> {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() || trimmed == "max" {
+        return None;
+    }
+    let value: u64 = trimmed.parse().ok()?;
+    if value >= CGROUP_UNLIMITED_THRESHOLD_BYTES {
+        return None;
+    }
+    Some(value)
+}
+
+/// The spot budget for a given host memory figure.
+///
+/// Saturating rather than wrapping: a nonsensical input yields a clamped
+/// number instead of a tiny one that would silently pass the projection
+/// check it exists to fail.
+fn budget_from_host_bytes(host_bytes: u64) -> u64 {
+    host_bytes
+        .saturating_mul(RAM_STORE_SPOT_BUDGET_NUMERATOR)
+        .saturating_div(RAM_STORE_SPOT_BUDGET_DENOMINATOR)
+}
+
+/// The memory this process may actually use, in bytes.
+///
+/// Takes the MINIMUM of the machine's RAM and any cgroup limit, because both
+/// bind and the smaller one is what the OOM killer enforces. Checking the
+/// cgroup is what makes this the same code on the AWS box (no container
+/// limit) and in a Docker dev run (limit set) — the common-runtime property
+/// a hardcoded constant cannot have.
+fn host_memory_limit_bytes() -> Option<u64> {
+    let machine = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .as_deref()
+        .and_then(parse_meminfo_total_bytes);
+
+    let cgroup = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .filter_map(|p| std::fs::read_to_string(p).ok())
+    .find_map(|c| parse_cgroup_limit_bytes(&c));
+
+    match (machine, cgroup) {
+        (Some(m), Some(c)) => Some(m.min(c)),
+        (Some(m), None) => Some(m),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// The spot store's RAM budget, derived from the host once per process.
+///
+/// Resolved on first call and cached, so every later call is O(1) and the
+/// value can never change mid-process — a budget that drifted between the
+/// projection check and the log line would make the two disagree.
+///
+/// Falls back to [`RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES`] with a
+/// coded `warn!` when the host cannot be read. That path is loud on purpose:
+/// silently reverting to a number sized for one specific machine is exactly
+/// the failure this function exists to remove.
+pub fn ram_store_spot_capacity_budget_bytes() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| match host_memory_limit_bytes() {
+        Some(host_bytes) => budget_from_host_bytes(host_bytes),
+        None => {
+            warn!(
+                code = ErrorCode::RamStore01Degraded.code_str(),
+                stage = "capacity_budget",
+                fallback_bytes = RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES,
+                "RAMSTORE-01: host memory could not be read — the spot RAM \
+                 budget falls back to the r8g.xlarge-sized figure. On a \
+                 SMALLER host that budget is too generous and the projection \
+                 check will under-report; verify the host size by hand"
+            );
+            RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES
+        }
+    })
+}
 
 /// The spot store's own slot ceiling, as the `u32` the capacity estimator
 /// takes. Same 25,000 the aggregator, indicator engine and day-OHLC tracker
@@ -175,8 +310,13 @@ pub fn install_market_ram_stores(cfg: &MarketRamStoreConfig, catchup_days: u32) 
     // rather than inferred.
     let projected_bytes = estimated_capacity_bytes(cfg.spot_days, MAX_SPOT_BAR_SLOTS_U32);
     let today_bytes = estimated_capacity_bytes(cfg.spot_days, RAM_STORE_SAMPLE_SLOT_COUNT);
+    // Resolved ONCE and reused for both the check and the log line: reading
+    // it twice would let the two disagree if the fallback path ever fired
+    // between them, and a check that reports a different budget than it
+    // enforced is unreadable at 3am.
+    let budget_bytes_resolved = ram_store_spot_capacity_budget_bytes();
 
-    if projected_bytes > RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES {
+    if projected_bytes > budget_bytes_resolved {
         // Fail LOUD, not closed. Refusing the install would leave the
         // decision path with no RAM store at all, which is strictly worse
         // than an oversized one — and the overshoot only materialises as the
@@ -187,7 +327,7 @@ pub fn install_market_ram_stores(cfg: &MarketRamStoreConfig, catchup_days: u32) 
             stage = "capacity_projection",
             spot_days = cfg.spot_days,
             projected_bytes,
-            budget_bytes = RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES,
+            budget_bytes = budget_bytes_resolved,
             slot_ceiling = MAX_SPOT_BAR_SLOTS_U32,
             "RAMSTORE-01: spot ring capacity at the slot ceiling EXCEEDS the \
              RAM budget — the rings allocate eagerly per slot, so this much \
@@ -203,7 +343,7 @@ pub fn install_market_ram_stores(cfg: &MarketRamStoreConfig, catchup_days: u32) 
         spot_capacity_bytes_at_slot_ceiling = projected_bytes,
         spot_capacity_bytes_at_sample = today_bytes,
         slot_ceiling = MAX_SPOT_BAR_SLOTS_U32,
-        budget_bytes = RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES,
+        budget_bytes = budget_bytes_resolved,
         "market_ram_store: RAM residency stores installed — spot depth bounded \
          by CAPTURED history (shown honestly by tv_ram_store_spot_days_depth), \
          options current-day (chain publishes + boot rehydrate)"
@@ -713,6 +853,94 @@ mod tests {
         ]
     }
 
+    // ---- host-derived RAM budget (2026-08-21) -------------------------
+
+    #[test]
+    fn the_reference_host_reproduces_the_operator_budget_exactly() {
+        // The whole point of the 5/16 fraction: on the r8g.xlarge the
+        // derived budget must equal the operator's stated 10 GiB TO THE
+        // BYTE, so deriving it changes nothing about the live box. A
+        // rounded percentage would drift here.
+        let r8g_xlarge = 32u64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            budget_from_host_bytes(r8g_xlarge),
+            RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES,
+            "5/16 of 32 GiB must be exactly the 10 GiB fallback"
+        );
+    }
+
+    #[test]
+    fn the_budget_tracks_the_host_up_and_down() {
+        // The failure being fixed: the budget did not move when the host
+        // did. Half the host must halve it; double must double it.
+        let base = 32u64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            budget_from_host_bytes(base / 2),
+            RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES / 2
+        );
+        assert_eq!(
+            budget_from_host_bytes(base * 2),
+            RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES * 2
+        );
+    }
+
+    #[test]
+    fn budget_saturates_instead_of_wrapping() {
+        // u64::MAX * 5 wraps to a SMALL number, which would silently pass
+        // the projection check this budget exists to fail.
+        assert!(budget_from_host_bytes(u64::MAX) > RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES);
+        assert_eq!(budget_from_host_bytes(0), 0);
+    }
+
+    #[test]
+    fn meminfo_total_is_parsed_from_a_real_file_shape() {
+        let sample = "MemTotal:       32819668 kB\nMemFree:         1234 kB\n";
+        assert_eq!(
+            parse_meminfo_total_bytes(sample),
+            Some(32_819_668u64 * 1024)
+        );
+    }
+
+    #[test]
+    fn meminfo_refuses_shapes_it_does_not_understand() {
+        // Refusing yields the loud fallback. GUESSING yields a wrong budget
+        // that looks authoritative, which is strictly worse.
+        assert_eq!(parse_meminfo_total_bytes(""), None);
+        assert_eq!(parse_meminfo_total_bytes("MemFree: 100 kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal:       zzz kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal:       12 GB\n"), None);
+    }
+
+    #[test]
+    fn cgroup_unlimited_is_not_mistaken_for_a_limit() {
+        // Both dialects. v1 saturates near i64::MAX; v2 writes "max".
+        // Reading either as a real limit would produce an astronomically
+        // large budget and disable the check entirely.
+        assert_eq!(parse_cgroup_limit_bytes("max\n"), None);
+        assert_eq!(parse_cgroup_limit_bytes("9223372036854771712\n"), None);
+        assert_eq!(parse_cgroup_limit_bytes(""), None);
+        assert_eq!(
+            parse_cgroup_limit_bytes("2147483648\n"),
+            Some(2_147_483_648)
+        );
+    }
+
+    #[test]
+    fn ram_store_spot_capacity_budget_bytes_is_stable_and_plausible() {
+        // Exercises the real host path, not a fixture. Cannot assert a
+        // specific figure -- CI runners differ, which is the entire point --
+        // so it asserts the two properties that must hold anywhere: it is
+        // non-zero, and it is CACHED so the check and the log can never
+        // disagree.
+        let first = ram_store_spot_capacity_budget_bytes();
+        assert!(first > 0, "a zero budget would fail every projection");
+        assert_eq!(
+            first,
+            ram_store_spot_capacity_budget_bytes(),
+            "the budget must resolve once per process"
+        );
+    }
+
     #[test]
     fn current_day_ram_at_25k_instruments_fits_the_operator_budget() {
         let terms = current_day_ram_terms_at_ceiling();
@@ -722,7 +950,7 @@ mod tests {
             .map(|(n, b)| format!("{n}={:.1} MB", *b as f64 / 1_048_576.0))
             .collect();
         assert!(
-            total <= RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES,
+            total <= RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES,
             "current-day RAM at the 25,000-instrument ceiling is {:.2} GB, over the \
              operator's 10 GiB budget (2026-08-12, stated three times). Terms: {}. \
              Raw ticks contribute ZERO by design (folded then dropped), so an \
@@ -859,7 +1087,7 @@ mod tests {
         assert_eq!(snaps[1].rows[0].moneyness, Moneyness::Unknown);
         // A zero-spot minute is honest: spot_missing + no fabricated ATM.
         let zero_spot = [row(m1, 24_500.0, "CE", "ITM", 0.0)];
-        let s = build_minute_snapshots(Feed::Groww, ChainUnderlying::Sensex, &zero_spot);
+        let s = build_minute_snapshots(Feed::Truedata, ChainUnderlying::Sensex, &zero_spot);
         assert_eq!(s.len(), 1);
         assert!(s[0].spot_missing);
         assert_eq!(s[0].atm_strike_paise, 0);

@@ -154,14 +154,6 @@ const BOOT_SPAWN_MARKERS: &[(&str, &str)] = &[
     ("dhan_rest_stack", "dhan_rest_stack::spawn_dhan_rest_stack"),
     ("dhan_spot_1m", "tv_spot1m_persist_errors_total"),
     ("dhan_option_chain_1m", "tv_chain1m_persist_errors_total"),
-    (
-        "groww_spot_1m",
-        "groww_spot_1m_boot::spawn_supervised_groww_spot_1m",
-    ),
-    (
-        "groww_option_chain_1m",
-        "groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m",
-    ),
     ("seal_writer", "spawn_seal_writer_loop"),
     (
         "market_ram_store",

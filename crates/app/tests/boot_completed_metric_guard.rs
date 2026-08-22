@@ -93,14 +93,11 @@ fn test_boot_completed_is_emitted_on_both_boot_paths() {
 #[test]
 fn boot_completed_emit_sites_are_gated_on_live_feed() {
     let main_src = read_app("src/main.rs");
-    // The pure verdict helper must exist and be feed-agnostic (4 bool inputs:
-    // per-feed enabled + per-feed running).
+    // The pure verdict helper must exist (per-feed enabled + running).
     assert!(
-        main_src.contains("fn boot_completed_should_emit(")
-            && main_src.contains("dhan_enabled")
-            && main_src.contains("groww_enabled"),
-        "main.rs must define the pure `boot_completed_should_emit(dhan_enabled, groww_enabled, \
-         dhan_running, groww_running)` verdict helper — the feed-agnostic gate for the alive signal."
+        main_src.contains("fn boot_completed_should_emit(") && main_src.contains("dhan_enabled"),
+        "main.rs must define the pure `boot_completed_should_emit(dhan_enabled, dhan_running)` \
+         verdict helper — the gate for the alive signal."
     );
     // The async wrapper that waits (bounded) for a live feed then emits/withholds.
     assert!(
@@ -112,11 +109,10 @@ fn boot_completed_emit_sites_are_gated_on_live_feed() {
     // lane-running signals (so a regression to an unconditional emit is caught).
     assert!(
         main_src.contains("boot_completed_should_emit(")
-            && main_src.contains("is_dhan_lane_running()")
-            && main_src.contains("is_groww_lane_running()"),
+            && main_src.contains("is_dhan_lane_running()"),
         "the feed-liveness gate must call `boot_completed_should_emit(...)` against \
-         `is_dhan_lane_running()` / `is_groww_lane_running()` — a bare unconditional emit is a \
-         regression that re-opens the alerting hole."
+         `is_dhan_lane_running()` — a bare unconditional emit is a regression that re-opens \
+         the alerting hole."
     );
     // The boot-path emit must go through the gate — no bare `emit_boot_completed();`
     // statement may remain on the success path (only the wrapper body calls it).

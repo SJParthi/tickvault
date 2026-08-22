@@ -241,9 +241,7 @@ resource "aws_cloudwatch_dashboard" "operator" {
           view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_spot1m_persist_errors_total", { label = "Dhan spot 1m", stat = "Sum" }],
-            [local.dash_namespace, "tv_chain1m_persist_errors_total", { label = "Dhan option chain 1m", stat = "Sum" }],
-            [local.dash_namespace, "tv_groww_spot1m_persist_errors_total", { label = "Groww spot 1m", stat = "Sum" }],
-            [local.dash_namespace, "tv_groww_chain1m_persist_errors_total", { label = "Groww option chain 1m", stat = "Sum" }]
+            [local.dash_namespace, "tv_chain1m_persist_errors_total", { label = "Dhan option chain 1m", stat = "Sum" }]
           ]
           period = 300
         }
