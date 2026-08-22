@@ -137,3 +137,48 @@ existed to prevent. It wants its own change, with a boot verified on the box.
 
 Until then, every new metric costs an existing one. Make that trade
 explicitly; do not discover it at 16,385 bytes.
+
+## 2026-08-22 — a dead entry was holding budget a live counter was refused for
+
+The section above closes with *"every new metric costs an existing one."* It was
+truer than it read: one of the 76 entries could never produce a datapoint.
+
+`tv_cadence_option_mark_unresolved_total` was deleted with the Groww feed in
+`1e3c9533`, and its name stayed in **both** selector copies. No alarm watched
+it, so nothing went permanently green — but the byte cost was real, and it had
+a second half that mattered more.
+
+The commit that "gave the refused option marks an operator surface" renamed the
+counter to **`tv_chain_mark_refused_total`** and did not move the selector
+entry. So the new counter reached `/metrics` and never reached CloudWatch. That
+is not a volume counter: when it fires, option legs carry no contract id and, in
+the emit site's own words, *"every option on it is silently unpriced"* — paper
+positions hold a stale mark until it returns. **The operator surface did not
+reach the operator**, for as long as its predecessor's name sat in the list
+pretending to.
+
+Both halves are the same defect facing opposite ways, and the *Deliberately
+EXCLUDED* section already named it: a stale exclusion hides a live producer's
+loss signal exactly as well as a dead inclusion advertises coverage that cannot
+exist.
+
+**The swap, and what it bought.** Removing the 38-byte dead name and adding the
+27-byte live one is a net **−11 bytes**, and headroom moves **19 → 31 bytes**
+(rendered 15,853 → 15,841 against the 15,872 budget). So the list is now shorter
+*and* carries one more real signal than before.
+
+**What it does NOT buy:** `tv_tick_spill_replayed_bytes_total` still does not
+fit — it needs 35 and 31 is what there is. It remains excluded for the reason
+recorded above, and remains on `/metrics`.
+
+**No alarm is added.** Shipping the metric makes it chartable and queryable;
+paging on it is a separate decision that
+`dhan-rest-only-noise-lock-2026-07-14.md` requires a dated operator quote for.
+
+Pinned by `crates/storage/tests/emf_selector_producer_guard.rs`: every shipped
+name must have a `"tv_*"` literal in production source — never a test, so a name
+kept alive only by its own assertion cannot count. Bite-proven by restoring the
+dead name, which turns two of its three tests red. The reverse direction (a
+producer that ought to ship but does not) is deliberately **not** asserted: that
+is a judgement argued case by case in this file, and a test demanding every
+counter ship would fail on the success/volume counters excluded here on purpose.
