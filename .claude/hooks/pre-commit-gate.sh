@@ -207,11 +207,32 @@ fi
 # GATE 7: Commit message format (conventional commits)
 # ─────────────────────────────────────────────
 echo "  [7/8] Commit message format..." >&2
-# Extract -m "message" from the git commit command (macOS-compatible, no grep -P)
-COMMIT_MSG=$(echo "$COMMAND" | sed -n "s/.*-m [\"'][^\"']*[\"'].*/&/p" 2>/dev/null | sed "s/.*-m [\"']//" | sed "s/[\"'].*//" | head -1 || true)
+# Extract the commit SUBJECT from the git commit command.
+#
+# Three forms reach this hook, and pr-completion-protocol.md MANDATES two of
+# them (heredoc and -F) for any body citing a section sign, because a
+# double-quoted -m expands $2 / $36 as positional parameters. The original
+# extractor understood only the third, so:
+#   -F <file>  -> extracted nothing, printed SKIP, and the gate never ran
+#   heredoc    -> extracted the literal "$(cat <<" and would FAIL a good subject
+# The three commits that failed the Commit Lint merge gate on PR #1794 went in
+# through the -F skip. This reads all three.
+COMMIT_MSG=""
+
+# Form 1: -F <path> / --file <path> (read the subject out of the file)
+MSG_FILE=$(echo "$COMMAND" | sed -n 's/.*[[:space:]]\(-F\|--file\)[[:space:]]\{1,\}\([^[:space:]"'"'"']\{1,\}\).*/\2/p' | head -1 || true)
+if [ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ]; then
+  COMMIT_MSG=$(head -1 "$MSG_FILE" || true)
+fi
+
+# Form 2: heredoc -m "$(cat <<'EOF' ... EOF )" -- subject is the next line
+if [ -z "$COMMIT_MSG" ] && echo "$COMMAND" | grep -q '<<'; then
+  COMMIT_MSG=$(echo "$COMMAND" | awk '/<</ {found=1; next} found {print; exit}' || true)
+fi
+
+# Form 3: plain -m "subject" / -m 'subject'
 if [ -z "$COMMIT_MSG" ]; then
-  # Try extracting from heredoc pattern: -m "$(cat <<'EOF' ... EOF )"
-  COMMIT_MSG=$(echo "$COMMAND" | sed -n 's/.*-m "\(.*\)/\1/p' 2>/dev/null | head -1 || true)
+  COMMIT_MSG=$(echo "$COMMAND" | sed -n "s/.*-m [\"'][^\"']*[\"'].*/&/p" 2>/dev/null | sed "s/.*-m [\"']//" | sed "s/[\"'].*//" | head -1 || true)
 fi
 if [ -n "$COMMIT_MSG" ]; then
   # Extract first line only
@@ -219,7 +240,7 @@ if [ -n "$COMMIT_MSG" ]; then
   # Allow: conventional commits, merge commits, revert commits
   if echo "$FIRST_LINE" | grep -qE '^(Merge|Revert) '; then
     echo "  PASS: Merge/Revert commit" >&2
-  elif echo "$FIRST_LINE" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/-]+\))?: .+'; then
+  elif echo "$FIRST_LINE" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/,-]+\))?: .+'; then
     echo "  PASS: Conventional commit format" >&2
   else
     echo "  FAIL: Commit message does not follow conventional format." >&2

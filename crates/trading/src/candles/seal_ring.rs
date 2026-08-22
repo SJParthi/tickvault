@@ -119,7 +119,7 @@ pub struct BufferedSeal {
     /// tick_count + 3 pct fields (already stamped by the seal-time
     /// writer per L-H6). Bucket-open IST seconds = `state.bucket_start_ist_secs`.
     pub state: LiveCandleState,
-    /// Broker-source provenance ([`Feed::Dhan`] / [`Feed::Groww`]). The seal
+    /// Broker-source provenance ([`Feed::Dhan`] / [`Feed::Truedata`]). The seal
     /// writer stamps `feed.as_str()` into the `candles_<tf>` `feed` SYMBOL column
     /// (part of the DEDUP key `(ts, security_id, segment, feed)`), so a Dhan candle
     /// and a Groww candle for the SAME minute/instrument are BOTH kept — distinct
@@ -132,7 +132,7 @@ impl BufferedSeal {
     /// Constructs a buffered seal from the per-TF callback the
     /// `MultiTfAggregator::consume_tick` emits.
     ///
-    /// `feed` is the source feed ([`Feed::Dhan`] / [`Feed::Groww`]); the writer
+    /// `feed` is the source feed ([`Feed::Dhan`] / [`Feed::Truedata`]); the writer
     /// stamps it as the `feed` SYMBOL so the two feeds never collide under the
     /// shared candle DEDUP key.
     ///

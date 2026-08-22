@@ -147,14 +147,6 @@ pub enum EpisodeFamily {
     /// Single fixed key ([`BOOT_EPISODE_KEY`]); excluded from the tick
     /// promote/expire scans and from the cross-restart snapshot.
     Boot,
-    /// The Groww market-data feed as ONE logical runtime incident (2026-07-14
-    /// operator noise directive): a persistent reject/never-streamed storm
-    /// (`GrowwSidecarRejected` + the Groww `FeedDown`/`FeedRecovered` arms)
-    /// folds into ONE live-edited bubble instead of a page every cooldown
-    /// window. `conn` is always 0 — the fleet path is already coalesced to
-    /// ≤1 notify/60s upstream. Dynamic like the WS families: snapshotted,
-    /// tick-promoted, tick-expired.
-    GrowwFeed,
     /// The Dhan per-minute REST candle/chain pulls as live-edited incident
     /// bubbles (2026-07-15 coordinator-relayed cleanliness directive): each
     /// leg's Degraded/Recovered pair folds into ONE bubble per
@@ -173,14 +165,6 @@ pub enum EpisodeFamily {
     /// the routed REST emitters are once-per-episode edge-latched, so an
     /// event-less hour is a still-failing incident, not a dead bubble).
     DhanRest,
-    /// The Groww per-minute REST candle/chain/contract pulls — the Groww
-    /// twin of [`Self::DhanRest`], SAME slot map: `conn` 0 = spot,
-    /// 1 = chain, 2 = contracts, 12..=14 = per-underlying CHAIN
-    /// not-served (NIFTY / BANKNIFTY / SENSEX; catch-all 7). Slots
-    /// 8..=11/15 are RESERVED for a future Groww per-symbol SPOT pair —
-    /// they are unused today (G10: the pre-F1 doc wrongly claimed the
-    /// chain pairs lived on 8..=11).
-    GrowwRest,
 }
 
 impl EpisodeFamily {
@@ -191,7 +175,6 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::DhanRest => "\u{1f537} DHAN", // 🔷
             Self::Boot => "\u{1f680}",                                                   // 🚀
-            Self::GrowwFeed | Self::GrowwRest => "\u{1f7e2} GROWW",                      // 🟢
         }
     }
 
@@ -202,9 +185,7 @@ impl EpisodeFamily {
             Self::MainFeedWs => "Live price feed",
             Self::OrderUpdateWs => "Order confirmations feed",
             Self::Boot => "System boot",
-            Self::GrowwFeed => "Groww price feed",
             Self::DhanRest => "Per-minute candle pull",
-            Self::GrowwRest => "Groww per-minute candle pull",
         }
     }
 
@@ -215,9 +196,7 @@ impl EpisodeFamily {
             Self::MainFeedWs => "main_feed_ws",
             Self::OrderUpdateWs => "order_update_ws",
             Self::Boot => "boot",
-            Self::GrowwFeed => "groww_feed",
             Self::DhanRest => "dhan_rest",
-            Self::GrowwRest => "groww_rest",
         }
     }
 
@@ -229,9 +208,7 @@ impl EpisodeFamily {
             "main_feed_ws" => Some(Self::MainFeedWs),
             "order_update_ws" => Some(Self::OrderUpdateWs),
             "boot" => Some(Self::Boot),
-            "groww_feed" => Some(Self::GrowwFeed),
             "dhan_rest" => Some(Self::DhanRest),
-            "groww_rest" => Some(Self::GrowwRest),
             _ => None,
         }
     }
@@ -252,8 +229,7 @@ impl EpisodeFamily {
     pub const fn down_headline(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "DOWN",
-            Self::GrowwFeed => "not receiving prices",
-            Self::DhanRest | Self::GrowwRest => "failing",
+            Self::DhanRest => "failing",
         }
     }
 
@@ -262,8 +238,7 @@ impl EpisodeFamily {
     pub const fn occurrence_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "drops",
-            Self::GrowwFeed => "rejections",
-            Self::DhanRest | Self::GrowwRest => "failed pulls",
+            Self::DhanRest => "failed pulls",
         }
     }
 
@@ -280,7 +255,7 @@ impl EpisodeFamily {
             // Same FIX-F honesty rationale: the folded NOTIFY count
             // undercounts the REST legs' real per-minute retry cadence —
             // the bubble shows only the failed-pull occurrence count.
-            Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
+            Self::DhanRest => "",
         }
     }
 
@@ -291,8 +266,7 @@ impl EpisodeFamily {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => {
                 "Now: reconnecting automatically"
             }
-            Self::GrowwFeed => "Now: retrying automatically",
-            Self::DhanRest | Self::GrowwRest => "Now: retrying every minute",
+            Self::DhanRest => "Now: retrying every minute",
         }
     }
 
@@ -301,8 +275,7 @@ impl EpisodeFamily {
     pub const fn recovering_line(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "Now: reconnected — confirming…",
-            Self::GrowwFeed => "Now: prices arriving again — confirming…",
-            Self::DhanRest | Self::GrowwRest => "Now: pulls succeeding again — confirming…",
+            Self::DhanRest => "Now: pulls succeeding again — confirming…",
         }
     }
 
@@ -311,8 +284,7 @@ impl EpisodeFamily {
     pub const fn recovered_verb(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "back",
-            Self::GrowwFeed => "streaming again",
-            Self::DhanRest | Self::GrowwRest => "pulling again",
+            Self::DhanRest => "pulling again",
         }
     }
 
@@ -324,7 +296,7 @@ impl EpisodeFamily {
     pub const fn recovered_noun(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs | Self::Boot => "attempts",
-            Self::GrowwFeed | Self::DhanRest | Self::GrowwRest => "",
+            Self::DhanRest => "",
         }
     }
 
@@ -366,7 +338,7 @@ impl EpisodeFamily {
     /// half hour there really does mean the incident stopped reporting.
     #[must_use]
     pub const fn down_stale_expiry_exempt(self) -> bool {
-        matches!(self, Self::Boot | Self::DhanRest | Self::GrowwRest)
+        matches!(self, Self::Boot | Self::DhanRest)
     }
 
     /// G2 (fix round 2, 2026-07-15): per-slot qualifier naming WHICH pull a
@@ -379,7 +351,7 @@ impl EpisodeFamily {
     #[must_use]
     pub const fn slot_desc(self, conn: u8) -> &'static str {
         match self {
-            Self::DhanRest | Self::GrowwRest => match conn {
+            Self::DhanRest => match conn {
                 0 => "spot pull",
                 1 => "chain pull",
                 2 => "contract pull",
@@ -423,11 +395,9 @@ pub const BOOT_EPISODE_KEY: EpisodeKey = EpisodeKey {
 #[must_use]
 pub fn episode_config_for(family: EpisodeFamily) -> EpisodeConfig {
     match family {
-        EpisodeFamily::MainFeedWs
-        | EpisodeFamily::OrderUpdateWs
-        | EpisodeFamily::GrowwFeed
-        | EpisodeFamily::DhanRest
-        | EpisodeFamily::GrowwRest => EpisodeConfig::default(),
+        EpisodeFamily::MainFeedWs | EpisodeFamily::OrderUpdateWs | EpisodeFamily::DhanRest => {
+            EpisodeConfig::default()
+        }
         EpisodeFamily::Boot => EpisodeConfig {
             edit_min_interval_secs: 0,
             ..EpisodeConfig::default()
@@ -618,12 +588,6 @@ pub enum BootMilestone {
     OrderUpdateConnected,
     /// Order-update WebSocket auth handshake confirmed by the server.
     OrderUpdateAuthenticated,
-    /// Groww feed token read + accepted.
-    GrowwAuth,
-    /// Groww feed instrument set resolved.
-    GrowwInstruments { subscribed: u32 },
-    /// Groww socket connected + subscribed (awaiting first tick).
-    GrowwConnected { market_open: bool },
     /// Boot finished (`StartupComplete`).
     Complete { mode: &'static str },
 }
@@ -646,20 +610,16 @@ pub struct BootChecklist {
     pub new_code: bool,
     /// Short build sha for the header; empty/`unknown` renders plainly.
     pub build_sha_short: String,
-    /// Which feed lines to show as ⏳-pending from the first page:
-    /// `(dhan_enabled, groww_enabled)`. `None` = lazy mode (only lines
-    /// with data render).
-    pub expectations: Option<(bool, bool)>,
+    /// Show the feed lines as ⏳-pending from the first page when
+    /// `Some(dhan_enabled)`. `None` = lazy mode (only lines with data
+    /// render).
+    pub expectations: Option<bool>,
     pub services: Option<(u32, u32)>,
     pub dhan_auth: bool,
     pub instruments: Option<u32>,
     pub dhan_feed: Option<BootDhanFeed>,
     pub order_update_connected: bool,
     pub order_update_authenticated: bool,
-    pub groww_auth: bool,
-    pub groww_instruments: Option<u32>,
-    /// `Some(market_open)` once the Groww socket connected + subscribed.
-    pub groww_connected: Option<bool>,
     /// A render is pending delivery (set on fold; cleared by the shell on
     /// a successfully-applied send/edit or a byte-identical hash-skip).
     /// The drain ticker re-drives a dirty checklist so a failed FINAL
@@ -716,13 +676,6 @@ impl BootChecklist {
             BootMilestone::OrderUpdateAuthenticated => {
                 self.order_update_connected = true;
                 self.order_update_authenticated = true;
-            }
-            BootMilestone::GrowwAuth => self.groww_auth = true,
-            BootMilestone::GrowwInstruments { subscribed } => {
-                self.groww_instruments = Some(subscribed);
-            }
-            BootMilestone::GrowwConnected { market_open } => {
-                self.groww_connected = Some(market_open);
             }
             BootMilestone::Complete { mode } => {
                 // First Complete wins (idempotence under duplicates).
@@ -968,10 +921,10 @@ impl EpisodeRegistry {
 
     /// Declares which feed lines the checklist shows as ⏳-pending from the
     /// first page (`None` until called → lazy render of data-only lines).
-    pub fn set_boot_expectations(&self, dhan: bool, groww: bool, now_ms: u64) {
+    pub fn set_boot_expectations(&self, dhan: bool, now_ms: u64) {
         let mut boot = self.lock_boot();
         let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
-        cl.expectations = Some((dhan, groww));
+        cl.expectations = Some(dhan);
     }
 
     /// Folds one boot milestone into the checklist, then runs the SAME
@@ -1627,7 +1580,7 @@ pub fn render_boot_checklist(cl: &BootChecklist, _ctx: &EpisodeRenderCtx) -> Str
         }
     };
 
-    let (expect_dhan, expect_groww) = cl.expectations.unwrap_or((false, false));
+    let expect_dhan = cl.expectations.unwrap_or(false);
     let mut lines: Vec<String> = Vec::new();
     let started = format_ist_12h(cl.started_at_ms);
     if !cl.mini {
@@ -1677,27 +1630,6 @@ pub fn render_boot_checklist(cl: &BootChecklist, _ctx: &EpisodeRenderCtx) -> Str
         lines.push("\u{2705} Order confirmations — connected".to_string());
     } else if expect_dhan {
         lines.push("\u{23f3} Order confirmations".to_string());
-    }
-    let groww_has_data =
-        cl.groww_auth || cl.groww_instruments.is_some() || cl.groww_connected.is_some();
-    if groww_has_data {
-        let mut parts: Vec<String> = Vec::new();
-        if cl.groww_auth {
-            parts.push("signed in".to_string());
-        }
-        if let Some(subscribed) = cl.groww_instruments {
-            parts.push(format!("{subscribed} instruments"));
-        }
-        if let Some(market_open) = cl.groww_connected {
-            parts.push(if market_open {
-                "connected — waiting for first price".to_string()
-            } else {
-                "connected (market closed — quiet is normal)".to_string()
-            });
-        }
-        lines.push(format!("\u{2705} Groww feed — {}", parts.join(" · ")));
-    } else if expect_groww {
-        lines.push("\u{23f3} Groww feed".to_string());
     }
     match cl.complete_at_ms {
         Some(done_ms) => {
@@ -2336,20 +2268,12 @@ mod tests {
     #[test]
     fn test_down_stale_expiry_exempt_family_predicate() {
         // G1 (fix round 2, 2026-07-15): Boot + the REST families are
-        // exempt; the WS/GrowwFeed families keep expiring (their Down
+        // exempt; the WS families keep expiring (their Down
         // bubbles receive per-cooldown folds while genuinely down).
-        for family in [
-            EpisodeFamily::Boot,
-            EpisodeFamily::DhanRest,
-            EpisodeFamily::GrowwRest,
-        ] {
+        for family in [EpisodeFamily::Boot, EpisodeFamily::DhanRest] {
             assert!(family.down_stale_expiry_exempt(), "{family:?}");
         }
-        for family in [
-            EpisodeFamily::MainFeedWs,
-            EpisodeFamily::OrderUpdateWs,
-            EpisodeFamily::GrowwFeed,
-        ] {
+        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
             assert!(!family.down_stale_expiry_exempt(), "{family:?}");
         }
     }
@@ -2361,7 +2285,7 @@ mod tests {
         // the routed emitters are once-per-episode edge-latched, so an
         // event-less Down bubble here is a STILL-FAILING incident. Only a
         // Resolve edge may close it while the envelope holds.
-        for family in [EpisodeFamily::DhanRest, EpisodeFamily::GrowwRest] {
+        for family in [EpisodeFamily::DhanRest] {
             let k = EpisodeKey { family, conn: 1 };
             let reg = EpisodeRegistry::new();
             let opened = ist_ms(9, 30);
@@ -2443,7 +2367,7 @@ mod tests {
         // restart, and a LATER real outage opens a FRESH episode with a
         // fresh first page (the stale expiry writes NO tombstone).
         let k = EpisodeKey {
-            family: EpisodeFamily::GrowwRest,
+            family: EpisodeFamily::DhanRest,
             conn: 3,
         };
         let reg = EpisodeRegistry::new();
@@ -2588,16 +2512,16 @@ mod tests {
             stale.contains("chain pull (NIFTY)"),
             "stale close must name the slot: {stale}"
         );
-        // A Groww spot-leg bubble names its own slot + broker.
+        // A spot-leg bubble names its own slot + broker.
         let gk = EpisodeKey {
-            family: EpisodeFamily::GrowwRest,
+            family: EpisodeFamily::DhanRest,
             conn: 0,
         };
         let gst = EpisodeState::open(gk, Severity::High, NOW);
         let gsteady = render_episode_steady(&gst, &ctx);
         assert!(
-            gsteady.contains("\u{1f7e2} GROWW — spot pull failing"),
-            "groww steady must name the slot: {gsteady}"
+            gsteady.contains("spot pull failing"),
+            "steady must name the slot: {gsteady}"
         );
         // Non-REST families keep the family description (byte-identical —
         // the WS regression ratchet also pins this).
@@ -2998,9 +2922,7 @@ mod tests {
             EpisodeFamily::MainFeedWs,
             EpisodeFamily::OrderUpdateWs,
             EpisodeFamily::Boot,
-            EpisodeFamily::GrowwFeed,
             EpisodeFamily::DhanRest,
-            EpisodeFamily::GrowwRest,
         ] {
             assert_eq!(
                 EpisodeFamily::from_snapshot_label(family.snapshot_label()),
@@ -3013,9 +2935,7 @@ mod tests {
             EpisodeFamily::MainFeedWs
             | EpisodeFamily::OrderUpdateWs
             | EpisodeFamily::Boot
-            | EpisodeFamily::GrowwFeed
-            | EpisodeFamily::DhanRest
-            | EpisodeFamily::GrowwRest => (),
+            | EpisodeFamily::DhanRest => (),
         };
         assert_eq!(EpisodeFamily::from_snapshot_label("alien_ws"), None);
         for phase in [EpisodePhase::Down, EpisodePhase::Recovering] {
@@ -3131,19 +3051,13 @@ mod tests {
         );
     }
 
-    // -- GrowwFeed runtime incident family (2026-07-14 noise fold) ----------
+    // -- Runtime incident family FSM (2026-07-14 noise fold) ---------------
 
-    fn groww_key() -> EpisodeKey {
+    fn incident_key() -> EpisodeKey {
         EpisodeKey {
-            family: EpisodeFamily::GrowwFeed,
+            family: EpisodeFamily::MainFeedWs,
             conn: 0,
         }
-    }
-
-    fn groww_state(message_id: Option<i64>) -> EpisodeState {
-        let mut st = EpisodeState::open(groww_key(), Severity::High, NOW);
-        st.message_id = message_id;
-        st
     }
 
     /// RATCHET (render regression): the renderer generalization must keep
@@ -3199,69 +3113,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_groww_feed_render_phrasing_no_ws_literals() {
-        let mut st = groww_state(Some(1));
-        st.occurrences = 5;
-        st.attempts = 9;
-        let ctx = EpisodeRenderCtx {
-            now_ms: NOW + 60_000,
-        };
-        let steady = render_episode_steady(&st, &ctx);
-        assert!(steady.starts_with("\u{1f7e2} GROWW"), "{steady:?}");
-        assert!(steady.contains("Groww price feed not receiving prices"));
-        assert!(steady.contains("5 rejections"));
-        // FIX-F (2026-07-14 hostile review): the attempts counter counts
-        // folded notify events — an ~12× undercount of the sidecar's real
-        // retries — so the Groww bubble OMITS it entirely.
-        assert!(!steady.contains("attempts"), "{steady:?}");
-        assert!(steady.contains("Now: retrying automatically"));
-        let recovering = render_episode_recovering(&st, &ctx);
-        assert!(recovering.contains("confirming"), "{recovering:?}");
-        let recovered = render_episode_recovered(&st, &ctx);
-        assert!(
-            recovered.contains("Groww price feed streaming again"),
-            "{recovered:?}"
-        );
-        assert!(!recovered.contains("attempts"), "{recovered:?}");
-        // No WS-flavored literals where inappropriate + commandment scan
-        // (plain English, no library names, no file paths, no jargon).
-        for r in [&steady, &recovering, &recovered] {
-            assert!(!r.contains("reconnect"), "WS literal leaked: {r:?}");
-            assert!(!r.contains("DOWN"), "WS literal leaked: {r:?}");
-            for banned in [
-                "rkyv",
-                "papaya",
-                "mpsc",
-                ".rs",
-                "data/",
-                "QuestDB",
-                "ring buffer",
-                "spill",
-                "editMessageText",
-            ] {
-                assert!(!r.contains(banned), "banned {banned:?} in {r:?}");
-            }
-        }
-    }
-
-    /// RATCHET (FSM): first Groww reject pages; recurrences edit-in-place
+    /// RATCHET (FSM): a first reject pages; recurrences edit-in-place
     /// (never a second page); FeedRecovered flips to Recovering; the
     /// stability tick closes green.
     #[test]
-    fn test_groww_reject_open_then_progress_edits_no_second_page() {
+    fn test_reject_open_then_progress_edits_no_second_page() {
         let reg = EpisodeRegistry::new();
         let c = cfg();
         // First reject → first page (the preserved High bypass + SMS leg).
-        let d1 = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, NOW, &c);
+        let d1 = reg.apply_event(
+            incident_key(),
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            NOW,
+            &c,
+        );
         assert_eq!(d1.action, EpisodeAction::SendFirstPage);
-        reg.record_sent(groww_key(), Some(77), NOW);
+        reg.record_sent(incident_key(), Some(77), NOW);
         // Recurring rejects (outside the edit throttle) → in-place edits,
         // NEVER a fresh page; occurrence counter advances.
         let mut now = NOW;
         for i in 2..=4u32 {
             now += (c.edit_min_interval_secs + 1) * 1000;
-            let d = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, now, &c);
+            let d = reg.apply_event(
+                incident_key(),
+                EpisodeRole::Open,
+                Severity::High,
+                0,
+                now,
+                &c,
+            );
             assert_eq!(
                 d.action,
                 EpisodeAction::Edit {
@@ -3271,12 +3153,12 @@ mod tests {
                 "recurrence {i} must edit in place"
             );
             assert_eq!(d.state.occurrences, i);
-            reg.record_edit_applied(groww_key(), now, i.into());
+            reg.record_edit_applied(incident_key(), now, i.into());
         }
         // Recovery → Recovering phase edit (amber confirming, no green yet).
         now += 1000;
         let dr = reg.apply_event(
-            groww_key(),
+            incident_key(),
             EpisodeRole::Resolve,
             Severity::Medium,
             0,
@@ -3294,31 +3176,38 @@ mod tests {
         // Stability window quiet → the tick closes it green.
         let out = reg.tick(now + (c.stability_secs + 1) * 1000, &c);
         assert_eq!(out.closed.len(), 1);
-        assert_eq!(out.closed[0].key, groww_key());
+        assert_eq!(out.closed[0].key, incident_key());
         assert_eq!(reg.live_count(), 0);
     }
 
-    /// RATCHET (Boot-exclusion inverse): the GrowwFeed family IS admitted
+    /// RATCHET (Boot-exclusion inverse): a non-Boot family IS admitted
     /// to the tick promote/expire scans and the cross-restart snapshot —
     /// only Boot stays excluded.
     #[test]
-    fn test_groww_feed_included_in_tick_scans_and_snapshot() {
+    fn test_non_boot_family_included_in_tick_scans_and_snapshot() {
         let c = cfg();
-        // Stale-Down expiry admits GrowwFeed.
+        // Stale-Down expiry admits a non-Boot family.
         let reg = EpisodeRegistry::new();
-        let _ = reg.apply_event(groww_key(), EpisodeRole::Open, Severity::High, 0, NOW, &c);
-        reg.record_sent(groww_key(), Some(5), NOW);
-        // Snapshot encode includes the live GrowwFeed episode (unlike Boot).
+        let _ = reg.apply_event(
+            incident_key(),
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            NOW,
+            &c,
+        );
+        reg.record_sent(incident_key(), Some(5), NOW);
+        // Snapshot encode includes the live episode (unlike Boot).
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 1);
         let encoded = episode_snapshot::encode(&snap);
         assert!(
-            encoded.contains("groww_feed"),
-            "GrowwFeed must be persisted: {encoded}"
+            encoded.contains("main_feed_ws"),
+            "a non-Boot family must be persisted: {encoded}"
         );
         let out = reg.tick(NOW + (c.down_stale_expire_secs + 1) * 1000, &c);
         assert_eq!(out.expired.len(), 1, "event-less Down must stale-expire");
-        assert_eq!(out.expired[0].key, groww_key());
+        assert_eq!(out.expired[0].key, incident_key());
         assert_eq!(reg.live_count(), 0);
     }
 
@@ -3326,7 +3215,7 @@ mod tests {
 
     fn full_checklist(now: u64) -> BootChecklist {
         let mut cl = BootChecklist::new(now, true, "a1b2c3d".to_string());
-        cl.expectations = Some((true, true));
+        cl.expectations = Some(true);
         cl.fold(
             BootMilestone::Services {
                 healthy: 3,
@@ -3346,15 +3235,6 @@ mod tests {
         );
         cl.fold(BootMilestone::OrderUpdateConnected, now + 4000);
         cl.fold(BootMilestone::OrderUpdateAuthenticated, now + 4500);
-        cl.fold(BootMilestone::GrowwAuth, now + 5000);
-        cl.fold(
-            BootMilestone::GrowwInstruments { subscribed: 768 },
-            now + 5500,
-        );
-        cl.fold(
-            BootMilestone::GrowwConnected { market_open: true },
-            now + 6000,
-        );
         cl
     }
 
@@ -3366,7 +3246,6 @@ mod tests {
             BootMilestone::DhanAuth,
             BootMilestone::Instruments { count: 1046 },
             BootMilestone::OrderUpdateAuthenticated,
-            BootMilestone::GrowwAuth,
             BootMilestone::Services {
                 healthy: 3,
                 total: 3,
@@ -3402,7 +3281,7 @@ mod tests {
         let ctx = EpisodeRenderCtx { now_ms: now };
         // First page: only Services folded, expectations set → ⏳ lines.
         let mut first = BootChecklist::new(now, true, "a1b2c3d".to_string());
-        first.expectations = Some((true, true));
+        first.expectations = Some(true);
         first.fold(
             BootMilestone::Services {
                 healthy: 3,
@@ -3414,7 +3293,6 @@ mod tests {
         assert!(page.contains("tickvault starting — NEW CODE deployed"));
         assert!(page.contains("(build a1b2c3d)"));
         assert!(page.contains("\u{23f3} Dhan login"));
-        assert!(page.contains("\u{23f3} Groww feed"));
         assert!(page.contains("Boot finishing"));
         assert!(page.contains("updates itself"));
         // Mid-boot: some ✅, some ⏳, fixed template order (Dhan login
@@ -3429,7 +3307,6 @@ mod tests {
         assert!(login_idx < instr_idx && instr_idx < feed_idx, "fixed order");
         assert!(mid_render.contains("last real price 2s ago"));
         assert!(mid_render.contains("Order confirmations — connected and confirmed"));
-        assert!(mid_render.contains("Groww feed — signed in \u{b7} 768 instruments"));
         // Final: Complete folds in → checklist header + footer.
         let mut done = full_checklist(now);
         done.fold(BootMilestone::Complete { mode: "sandbox" }, now + 94_000);
@@ -3461,7 +3338,6 @@ mod tests {
         let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: now });
         assert!(r.contains("\u{2705} Dhan login"));
         assert!(!r.contains("\u{23f3} Instruments"));
-        assert!(!r.contains("\u{23f3} Groww feed"));
         assert!(r.contains("Boot finishing"), "generic pending line stays");
         // No false "NEW CODE" flavor when new_code=false.
         assert!(!r.contains("NEW CODE"));
@@ -3584,7 +3460,7 @@ mod tests {
         assert!(reg.boot_checklist().is_none());
         // A post-retire milestone opens a FRESH mini bubble.
         let (decision, cl) = reg.apply_boot_milestone(
-            BootMilestone::GrowwConnected { market_open: true },
+            BootMilestone::DhanAuth,
             NOW + 20_000 + BOOT_BUBBLE_RETIRE_SECS * 1000,
             &cfg,
         );
@@ -3612,17 +3488,13 @@ mod tests {
         let _ = reg.apply_boot_milestone(BootMilestone::Complete { mode: "sandbox" }, NOW, &cfg);
         reg.mark_boot_delivered();
         assert!(reg.retire_boot(NOW + BOOT_BUBBLE_RETIRE_SECS * 1000));
-        // A Groww reconnect edge 3 hours later.
+        // A feed reconnect edge 3 hours later.
         let mid_day = NOW + 3 * 3600 * 1000;
-        let (_, cl) = reg.apply_boot_milestone(
-            BootMilestone::GrowwConnected { market_open: true },
-            mid_day,
-            &cfg,
-        );
+        let (_, cl) = reg.apply_boot_milestone(BootMilestone::DhanAuth, mid_day, &cfg);
         assert!(cl.mini);
         let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: mid_day });
         assert!(r.contains("\u{1f504} Feed update"), "neutral header: {r:?}");
-        assert!(r.contains("Groww feed"), "component line renders: {r:?}");
+        assert!(r.contains("Dhan login"), "component line renders: {r:?}");
         assert!(!r.contains("tickvault starting"), "no false boot claim");
         assert!(!r.contains("Boot finishing"), "no broken promise footer");
         assert!(!r.contains("updates itself"), "no broken promise footer");
@@ -3639,7 +3511,7 @@ mod tests {
                 close: false
             }
         );
-        assert!(cl2.mini && cl2.groww_connected.is_some() && cl2.dhan_auth);
+        assert!(cl2.mini && cl2.dhan_auth);
         reg.mark_boot_delivered();
         // The mini bubble retires on the idle window despite never seeing
         // `Complete` — no permanently-stuck bubble.
@@ -3709,11 +3581,11 @@ mod tests {
         let reg = EpisodeRegistry::new();
         let cfg = episode_config_for(EpisodeFamily::Boot);
         reg.set_boot_flavor(true, "a1b2c3d", NOW);
-        reg.set_boot_expectations(true, true, NOW);
+        reg.set_boot_expectations(true, NOW);
         let (d1, cl1) = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW + 100, &cfg);
         assert_eq!(d1.action, EpisodeAction::SendFirstPage);
         assert!(cl1.new_code && cl1.build_sha_short == "a1b2c3d");
-        assert_eq!(cl1.expectations, Some((true, true)));
+        assert_eq!(cl1.expectations, Some(true));
         assert!(cl1.dirty);
         reg.record_sent(BOOT_EPISODE_KEY, Some(64), NOW + 100);
         reg.mark_boot_delivered();

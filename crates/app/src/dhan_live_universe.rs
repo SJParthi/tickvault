@@ -580,6 +580,60 @@ mod tests {
     /// Dedup is on the I-P1-11 composite pair, not the bare id — two real
     /// instruments can share a numeric id across segments, and collapsing them
     /// would silently drop one.
+    /// The mapping artifact carries ONE ROW PER `(index, symbol)` PAIR, so a
+    /// stock in a dozen NSE index lists appears a dozen times. This is the
+    /// test that says what the feed does with that.
+    ///
+    /// It exists because the row count has twice been read as a subscription
+    /// count -- once into a scope-lock rule file as "4,565 SIDs in the live
+    /// set", and once into a sizing argument as "the boot pass already spends
+    /// ~4,565 slots". Neither is what happens: `select_live_universe` dedups on
+    /// the I-P1-11 composite key across the WHOLE master, so 4,565 rows of
+    /// roughly 750 NIFTY Total Market stocks plus ~120 indices subscribe about
+    /// 870 instruments and take ONE main-feed connection, not the whole pool.
+    ///
+    /// A number that is five times the truth decides the wrong thing about
+    /// capacity, so this is pinned rather than left to be re-derived.
+    #[test]
+    fn a_stock_repeated_across_many_index_lists_is_subscribed_once() {
+        // 750 distinct stocks, each appearing in 6 index lists -> 4,500 rows,
+        // plus 65 index rows: the artifact shape, in miniature.
+        let mut master = Vec::new();
+        for list in 0..6u64 {
+            for stock in 0..750u64 {
+                let _ = list;
+                master.push(MasterEntry {
+                    security_id: 100_000 + stock,
+                    exchange_segment_code: 1, // NSE_EQ
+                });
+            }
+        }
+        for idx in 0..65u64 {
+            master.push(MasterEntry {
+                security_id: 1_000 + idx,
+                exchange_segment_code: 0, // IDX_I
+            });
+        }
+        assert_eq!(master.len(), 4_565, "the artifact row count under audit");
+
+        let sel = select_live_universe(&[], Some(&master), 25_000);
+        assert_eq!(
+            sel.instruments.len(),
+            815,
+            "750 stocks + 65 indices -- the number of instruments actually dialed"
+        );
+        assert_eq!(
+            sel.deduped, 3_750,
+            "every repeat is COUNTED, so the gap between rows and instruments is \
+             visible rather than inferred"
+        );
+        assert_eq!(
+            sel.instruments.len() + sel.deduped,
+            master.len(),
+            "rows in == instruments + dedups; nothing is lost silently"
+        );
+    }
+
     #[test]
     fn test_select_live_universe_dedups_on_the_composite_pair_not_the_bare_id() {
         // 13/IdxI duplicates an index entry; 13/NseEquity is a DIFFERENT

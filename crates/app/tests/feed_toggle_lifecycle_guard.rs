@@ -23,20 +23,11 @@ fn feed_runtime_lane_flag_round_trips_idempotently() {
     // deletion (the /feeds page + the 409 Dhan-enable refusal still read it), so
     // BOTH feeds' flag round-trips stay pinned here.
     let state = FeedRuntimeState::default();
-    for feed in [Feed::Dhan, Feed::Groww] {
+    for feed in [Feed::Dhan] {
         // Start NOT running (default mirrors prod for both lanes).
         assert!(!state.lane_running(feed));
     }
-    // Groww: true, true (idempotent), false, false (idempotent).
-    state.set_groww_lane_running(true);
-    assert!(state.is_groww_lane_running());
-    state.set_groww_lane_running(true);
-    assert!(state.is_groww_lane_running(), "repeat-true is idempotent");
-    state.set_groww_lane_running(false);
-    assert!(!state.is_groww_lane_running());
-    state.set_groww_lane_running(false);
-    assert!(!state.is_groww_lane_running(), "repeat-false is idempotent");
-    // Dhan: same round-trip (flag only — no reconciler exists since PR-C2).
+    // Dhan round-trip (flag only — no reconciler exists since PR-C2).
     state.set_dhan_lane_running(true);
     assert!(state.is_dhan_lane_running());
     state.set_dhan_lane_running(true);

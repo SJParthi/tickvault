@@ -157,7 +157,7 @@ fn order_leg_pnl_ilp_http_conf(host: &str, http_port: u16) -> String {
 pub struct OrderLegPnlRecord {
     /// IST wall-clock nanoseconds — the designated timestamp.
     pub ts_ist_nanos: i64,
-    /// Feed tag (`Feed::as_str()` — e.g. "groww" / "dhan").
+    /// Feed tag (`Feed::as_str()` — "dhan" today).
     pub feed: &'static str,
     /// Contract security id (exchange token domain).
     pub security_id: i64,
@@ -380,7 +380,7 @@ mod tests {
     fn sample_record() -> OrderLegPnlRecord {
         OrderLegPnlRecord {
             ts_ist_nanos: 1_770_000_900_000_000_000,
-            feed: "groww",
+            feed: "dhan",
             security_id: 12_345,
             segment: "NSE_FNO",
             event_seq: 7,
@@ -467,7 +467,7 @@ mod tests {
         let buf = writer.buffer_utf8();
         assert!(buf.starts_with(ORDER_LEG_PNL_TABLE));
         for token in [
-            "feed=groww",
+            "feed=dhan",
             "segment=NSE_FNO",
             "event_kind=mark",
             "underlying=NIFTY",

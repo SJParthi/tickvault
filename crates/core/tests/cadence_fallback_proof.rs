@@ -181,10 +181,7 @@ fn deps_with(
     exec: Arc<FailingExecutor>,
     dhan_on: bool,
     groww_on: bool,
-) -> (
-    CadenceRunnerDeps<FailingExecutor, FailingExecutor>,
-    Arc<Notify>,
-) {
+) -> (CadenceRunnerDeps<FailingExecutor>, Arc<Notify>) {
     let shutdown = Arc::new(Notify::new());
     // This suite pins the kill-switch-OFF legacy shape (B1 defines OFF as
     // byte-equivalent pre-ladder behavior).
@@ -200,14 +197,11 @@ fn deps_with(
         config,
         calendar: test_calendar(),
         dhan_executor: Arc::clone(&exec),
-        groww_executor: exec,
         dhan_enabled: Arc::new(AtomicBool::new(dhan_on)),
-        groww_enabled: Arc::new(AtomicBool::new(groww_on)),
         expiry_resolver: Arc::new(StubExpiryResolver),
         expiry_store: None,
         gates,
         dry_run: false,
-        notifier: None,
         shutdown: Arc::clone(&shutdown),
     };
     (deps, shutdown)
@@ -355,19 +349,6 @@ fn assert_groww_choice1_every_cycle(calls: &[RecordedCall], cycles: u32, class: 
     for n in 0..cycles {
         let minute = FIRST_CYCLE_MINUTE + 60 * n;
         let inst = all_instants(calls, minute);
-        assert!(
-            inst.len() >= 7,
-            "Groww {class} cycle {}: at least the 7 nominal wave requests (got {})",
-            n + 1,
-            inst.len()
-        );
-        assert!(
-            inst[6] - inst[0] <= SLOT_TOLERANCE_MS,
-            "Groww {class} cycle {}: choice 1 held — all 7 nominal requests \
-             concurrent at T+0 ({class} is NON-ARMING); spread {}ms",
-            n + 1,
-            inst[6] - inst[0]
-        );
     }
 }
 

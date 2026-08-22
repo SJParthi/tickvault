@@ -633,3 +633,82 @@ resource "aws_cloudwatch_metric_alarm" "dhan_contract_universe_failed" {
   # new session.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 12. The SPILL TIER is failing (2026-08-21)
+# ---------------------------------------------------------------------------
+# Authority: dhan-rest-only-noise-lock-2026-07-14.md §2.3c (operator quote
+# 2026-08-21, "Go ahead wirh your recommendation. Dude okay").
+#
+# The two alarms above watch the WAL tier — a frame lost BEFORE the log, and a
+# frame the boot re-fold could not recover. Neither can see the SPILL tier,
+# which is a different failure with a different remedy.
+#
+# When an ILP flush fails, `tick_persistence` writes the buffer to
+# data/spill/ticks/ as line protocol instead of discarding it, and
+# `tick_spill_replay` posts it back and truncates on success. That chain has
+# two ways to end in real loss, and until now neither reached the operator:
+#
+#   1. Flushes keep failing and the spill directory grows. Past
+#      TICK_SPILL_MAX_BYTES (512 MiB) the writer stops rescuing and drops.
+#   2. The drain cannot put the rescued bytes back. The rows sit on disk,
+#      valid and queryable by nobody, until (1) catches up with them.
+#
+# `tv_ticks_dropped_total` (alarm 3) already fires on a failed flush — both
+# counters increment on that path deliberately, so the rescue can never make a
+# real loss quieter. What THESE add is the distinction between "a flush failed"
+# and "and it was rescued to disk", which is the difference between loss and
+# deferred recovery, and between "the drain is working" and "the countdown to
+# the cap has started".
+#
+# The SUCCESS counter (tv_tick_spill_replayed_bytes_total) has NO alarm --
+# paging when recovery WORKS is the false-OK's mirror image -- and as of
+# 2026-08-21 it does not reach CloudWatch at all. It was to ship unalarmed so a
+# chart of successful recoveries could sit beside these two, but with it in the
+# selector the rendered EC2 user-data came out past AWS's hard 16,384-byte cap.
+# Given a real byte budget the ALARMED names win. The counter is still emitted
+# and still readable on the box's :9091/metrics; it is simply not chartable
+# off-box until the selector has room. deploy/aws/EMF-METRIC-SELECTOR-NOTES.md
+# carries the wider record of that rationing.
+resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
+  alarm_name        = "tv-${var.environment}-tick-spill-replay-failing"
+  alarm_description = "The automatic drain could not return rescued ticks to the database. The rows are NOT lost — they are on the box as valid line protocol in data/spill/ticks/ — but they are not queryable, and the spill directory is now growing toward its 512 MiB cap, past which the writer stops rescuing and starts dropping. Causes, in order of likelihood: QuestDB is down or refusing writes; or the disk is full so the drained file cannot be emptied. Triage: journalctl -u tickvault for TICK-FLUSH-01 and for the drain's round summary, then ls -la data/spill/ticks/ — a non-empty .ilp file is unrecovered ticks. Manual recovery, unchanged and always available: curl --data-binary @<file> http://<questdb>:9000/write"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_tick_spill_replay_failed_total"
+  namespace           = local.app_namespace
+  # The drain runs every 5 minutes, so one period matches one round.
+  #
+  # notBreaching: the box is stopped overnight and publishes nothing, which is
+  # health, not a failing drain. The dark-lane case belongs to
+  # dhan_no_ticks_flowing, which treats missing data as breaching and is gated.
+  period             = 300
+  statistic          = "Sum"
+  dimensions         = local.app_dimensions
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # The counter is cumulative and only a successful round changes the outcome.
+  # A round succeeding does not un-happen the failure that preceded it.
+  ok_actions = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
+  alarm_name        = "tv-${var.environment}-ticks-spilling"
+  alarm_description = "A QuestDB tick flush failed and the buffer was rescued to disk instead of being discarded. No ticks are lost yet — this is the rescue tier working — but a flush failing at all means QuestDB write latency is degrading under the live load, and sustained spilling ends at the 512 MiB cap where the writer starts dropping for real. Triage: check QuestDB health and disk pressure first (make doctor), then watch whether tv-<env>-tick-spill-replay-failing follows: spilling that drains is deferred recovery, spilling that does not drain is a countdown."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_ticks_spilled_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}

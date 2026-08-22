@@ -52,8 +52,6 @@ pub mod muhurat;
 // open-price fallback (already a REMOVE class in
 // no-rest-except-live-feed-2026-06-27.md §3; zero refs outside the pair).
 pub mod order_types;
-// Dead-code batch 2 (2026-07-18): `phase` DELETED — zero refs.
-pub mod portfolio_types;
 pub mod price_precision;
 pub mod sanitize;
 pub mod segment;

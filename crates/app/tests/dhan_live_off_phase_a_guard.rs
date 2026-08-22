@@ -137,20 +137,19 @@ fn test_configs_lock_dhan_live_ws_on() {
              updated in the same PR."
         );
     }
-    // 2026-07-15: the Groww LIVE feed is retired too — prod is REST-only.
-    // (Supersedes the 2026-07-13 "Groww stays THE live feed" pin.)
+    // 2026-07-15 retired the second live feed; 2026-08-21 REMOVED it (dated
+    // authorization in websocket-connection-scope-lock.md, "2026-08-21 (THIRD
+    // quote of the day)"). The pin here used to assert its enable key was
+    // present-and-false. `FeedsConfig` now has no field to bind that key to,
+    // and there is no `deny_unknown_fields`, so serde would silently ignore a
+    // line that still reads like a live switch. Pin ABSENCE instead, in either
+    // direction — strictly stronger than the pair it replaces.
     let prod = strip_line_comments(&read("config/production.toml"));
     assert!(
-        prod.contains("groww_enabled = false"),
-        "config/production.toml must carry `groww_enabled = false` — the \
-         Groww live feed is retired (operator directive 2026-07-15; the \
-         REST-only boot emits tv_boot_completed directly)"
-    );
-    assert!(
-        !prod.contains("groww_enabled = true"),
-        "config/production.toml must NOT carry `groww_enabled = true` — \
-         re-enabling the retired Groww live lane requires a fresh dated \
-         operator quote + updating this guard in the same PR"
+        !prod.contains("groww_enabled"),
+        "config/production.toml must not carry an enable key for the removed \
+         feed — it binds to no FeedsConfig field, so serde ignores it while \
+         the line still reads as a switch that controls something"
     );
 }
 
@@ -223,32 +222,12 @@ fn test_overlay_and_gate_and_suppression_warn_exist() {
         "feed_state_persist.rs lost the dhan_overlay_suppressed predicate — \
          the boot-site suppression warn depends on it"
     );
-    // 2026-07-15 (Groww live-feed retirement): the Groww overlay is
-    // narrow-only too — a stale persisted groww_enabled=true (written while
-    // Groww WAS the live feed) must never resurrect the retired feed over
-    // the production.toml flip.
-    assert!(
-        persist_src.contains("groww_enabled: config.groww_enabled && p.groww_enabled"),
-        "feed_state_persist.rs lost the Groww overlay AND-gate — a stale \
-         data/feed-state.json with groww_enabled=true could resurrect the \
-         retired Groww live feed (operator directive 2026-07-15)"
-    );
-    assert!(
-        persist_src.contains("pub fn groww_overlay_suppressed("),
-        "feed_state_persist.rs lost the groww_overlay_suppressed predicate — \
-         the boot-site suppression warn depends on it"
-    );
 
     let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
     assert!(
         main_src.contains("dhan_overlay_suppressed("),
         "main.rs must consult dhan_overlay_suppressed at the overlay \
          application site (the one-shot boot warn)"
-    );
-    assert!(
-        main_src.contains("groww_overlay_suppressed("),
-        "main.rs must consult groww_overlay_suppressed at the overlay \
-         application site (the 2026-07-15 one-shot boot warn)"
     );
     assert!(
         main_src.contains("overlay SUPPRESSED"),

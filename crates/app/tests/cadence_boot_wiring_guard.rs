@@ -126,7 +126,6 @@ fn test_cadence_boot_module_gate_guard_and_real_executors() {
         // other boot path able to retry; failures are HTTP-CLIENT-01
         // loud, never a Client::new() panic fallback.
         "DhanCadenceExecutor::new(",
-        "GrowwCadenceExecutor::new(",
         // The executors are the SOLE table authors under RS3 — the
         // ensure-DDL duty for their three tables lives HERE now.
         "ensure_spot_1m_rest_table",
@@ -138,7 +137,6 @@ fn test_cadence_boot_module_gate_guard_and_real_executors() {
         // config (feeds.* = false, runtime enable 409'd) the old
         // feed_runtime gating parked both lanes forever.
         "AtomicBool::new(config.cadence.dhan_lane)",
-        "AtomicBool::new(config.cadence.groww_lane)",
         // The supervised runner spawn.
         "spawn_supervised_cadence_runner",
         // Real executors = real coded degrade levels (F10 semantics).
@@ -161,7 +159,7 @@ fn test_cadence_boot_module_gate_guard_and_real_executors() {
     // lanes again (fix round 2026-07-17): feeds.dhan_enabled /
     // feeds.groww_enabled are FALSE in shipped config and runtime
     // enable is 409'd — gating on them means zero market-data capture.
-    for banned in ["dhan_flag()", "groww_flag()"] {
+    for banned in ["dhan_flag()"] {
         assert!(
             !src.contains(banned),
             "cadence_boot.rs must NOT gate the cadence lanes on the \
@@ -252,13 +250,7 @@ fn test_cadence_base_toml_enabled_and_legacy_legs_stood_down() {
         section_enabled_line(&toml, "[cadence]").contains("enabled = true"),
         "[cadence] must ship enabled = true (real executors, 2026-07-17)."
     );
-    for legacy in [
-        "[spot_1m_rest]",
-        "[option_chain_1m]",
-        "[groww_spot_1m]",
-        "[groww_option_chain_1m]",
-        "[groww_contract_1m]",
-    ] {
+    for legacy in ["[spot_1m_rest]", "[option_chain_1m]"] {
         assert!(
             section_enabled_line(&toml, legacy).contains("enabled = false"),
             "{legacy} must ship enabled = false (stood down under the RS3 \
@@ -278,10 +270,7 @@ fn test_cadence_deps_lane_assignment_is_pinned() {
     //     silently cross-wire the lanes past pin (a).
     let stripped = strip_line_comments(&app_src("src/cadence_boot.rs"));
     let flat = normalize_ws(&stripped);
-    for binding in [
-        "let dhan_executor = match DhanCadenceExecutor::new(",
-        "let groww_executor = match GrowwCadenceExecutor::new(",
-    ] {
+    for binding in ["let dhan_executor = match DhanCadenceExecutor::new("] {
         assert!(
             flat.contains(binding),
             "cadence_boot.rs must construct the lane binding `{binding}` — \
@@ -293,14 +282,14 @@ fn test_cadence_deps_lane_assignment_is_pinned() {
         .find("CadenceRunnerDeps {")
         .expect("cadence_boot.rs must construct CadenceRunnerDeps");
     let window = &flat[deps_at..(deps_at + 1500).min(flat.len())];
-    for field in ["dhan_executor,", "groww_executor,"] {
+    for field in ["dhan_executor,"] {
         assert!(
             window.contains(field),
             "the CadenceRunnerDeps construction must wire `{field}` via \
              field shorthand (the pinned lane bindings)."
         );
     }
-    for rebind in ["dhan_executor:", "groww_executor:"] {
+    for rebind in ["dhan_executor:"] {
         assert!(
             !window.contains(rebind),
             "the CadenceRunnerDeps construction must NOT rebind \

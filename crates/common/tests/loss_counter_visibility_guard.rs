@@ -123,10 +123,6 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_chain1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
-    (
-        "tv_cross_fill_audit_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
     // REMOVED 2026-08-14: `tv_dhan_feed_ingest_refused_total` is now in the EMF
     // selector, so the "periodic report is good enough" exemption no longer
     // applies — it ships and is checked like any other loss counter.
@@ -159,10 +155,6 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
-        "tv_groww_push_sink_dropped_total",
-        "groww_orders feature — compiled out of the deploy build, cannot emit",
-    ),
-    (
         "tv_groww_spot1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
@@ -188,10 +180,6 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_spot1m_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
-    (
-        "tv_spot_xverify_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (

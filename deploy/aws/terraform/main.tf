@@ -187,14 +187,11 @@ resource "aws_security_group" "tv_app" {
 # IAM
 # ---------------------------------------------------------------------------
 
-# Customer-managed KMS key for the Groww shared-token SSM parameters. Created
-# and owned by the bruteX repo's groww-token-minter terraform (operator lock
-# 2026-07-02, .claude/rules/project/groww-shared-token-minter-2026-07-02.md §1)
-# — referenced here read-only so the instance role can be granted kms:Decrypt
-# on exactly this one key (least privilege; no wildcard key access).
-data "aws_kms_key" "tickvault_groww" {
-  key_id = "alias/tickvault-groww"
-}
+# 2026-08-21: the read-only lookup of the customer-managed key
+# alias/tickvault-groww was REMOVED with the Groww feed. It existed only so the
+# instance role could decrypt /tickvault/<env>/groww/access-token, and nothing
+# reads that parameter now. The alias is owned by another repository, so a dead
+# lookup here would also fail `terraform plan` the day that repository retires it.
 
 resource "aws_iam_role" "tv_instance" {
   name = "tv-${var.environment}-instance-role"
@@ -234,9 +231,8 @@ resource "aws_iam_role_policy" "tv_instance" {
           #      so a second minter would invalidate ours and start a re-mint
           #      war. Contract: groww-shared-token-minter-2026-07-02.md §9.
           # No extra KMS grant is needed for that param: it is written as a
-          # SecureString under the DEFAULT aws/ssm key. (The kms:Decrypt
-          # statement below is specific to the Groww param, which uses the
-          # customer-managed alias/tickvault-groww CMK owned by bruteX.)
+          # SecureString under the DEFAULT aws/ssm key. This role holds no
+          # kms:Decrypt statement at all since 2026-08-21 -- see the note below.
           "ssm:PutParameter",
           # DeleteParameter needed for graceful release of the
           # dual-instance lock at shutdown — see PR #764
@@ -253,28 +249,11 @@ resource "aws_iam_role_policy" "tv_instance" {
           "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
         ]
       },
-      {
-        # Groww shared-token decrypt (sidecar crash-loop fix, 2026-07-02):
-        # /tickvault/prod/groww/access-token is a SecureString encrypted with
-        # the CUSTOMER-MANAGED key alias/tickvault-groww (owned by the bruteX
-        # groww-token-minter terraform). Unlike AWS-managed aws/ssm keys, a
-        # CMK-encrypted param needs kms:Decrypt in THIS identity policy in
-        # addition to the ssm:GetParameter grant above — without it the
-        # GetParameter(WithDecryption=true) decrypt leg is denied, which
-        # crash-looped the Groww sidecar (CloudWatch 15:03-15:14 IST,
-        # 2026-07-02). Scoped to exactly that one key AND only via SSM
-        # (mirrors the telegram-webhook-lambda.tf ViaService pattern).
-        Effect = "Allow"
-        Action = [
-          "kms:Decrypt",
-        ]
-        Resource = data.aws_kms_key.tickvault_groww.arn
-        Condition = {
-          StringEquals = {
-            "kms:ViaService" = "ssm.${var.aws_region}.amazonaws.com"
-          }
-        }
-      },
+      # 2026-08-21: a kms:Decrypt statement on alias/tickvault-groww lived here.
+      # It existed for exactly one read -- the CMK-encrypted Groww access-token
+      # parameter -- and that reader is gone with the Groww feed. Removed rather
+      # than left in place: a standing decrypt grant on a key this role never
+      # uses is privilege it no longer needs.
       {
         Effect = "Allow"
         Action = [
@@ -308,11 +287,11 @@ resource "aws_iam_role_policy" "tv_instance" {
         # S3 cold-bucket access for the box. Consumers (2026-07-13 audit):
         #   - partition manager S3 archival (partitions/* — the designed >90d
         #     cold-tier leg; STORAGE-GAP-04)
-        #   - BruteX cross-verify CSV read (crossverify/* — §37 KEEP class)
-        #   - Groww NDJSON capture archival (groww-capture/* — added 2026-07-13
-        #     with the disk-retention hardening PR; s3:PutObject + s3:GetObject
-        #     for head-object verification are ALREADY covered by this
-        #     whole-bucket statement, so no new statement was needed)
+        #   (the BruteX cross-verify CSV read and the Groww NDJSON capture
+        #    archival were the other two consumers; both left with the Groww
+        #    feed on 2026-08-21. This grant is whole-bucket, so their departure
+        #    narrows nothing by itself -- recorded so the next reader does not
+        #    hunt for writers that no longer exist.)
         Effect = "Allow"
         Action = [
           "s3:GetObject",

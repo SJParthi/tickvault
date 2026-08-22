@@ -1251,10 +1251,25 @@ the bare discard. One function, one file.
 New counter `tv_ticks_spilled_total{feed}`, pre-registered at 0 in
 `register_drop_baseline` for the same delta-baseline reason the drop counter is
 — a rescue episode is rare, so its first increment would otherwise be consumed
-as the baseline and go unreported. **Honestly flagged: it is NOT EMF-selected
-and has NO alarm**, matching the neighbouring counters; shipping it to
-CloudWatch is a ~$0.30/mo decision that belongs with the alarm that would read
-it. Today it is visible on `/metrics` and in the coded `error!`.
+as the baseline and go unreported.
+
+**CORRECTED 2026-08-21, same day, by the failure audit.** The first version of
+this item said the new counter being unalarmed was fine, "matching the
+neighbouring counters". That justification was FALSE, and its wrongness is
+exactly what concealed a regression: `tv_ticks_dropped_total` — the counter the
+rescue diverts traffic AWAY from — IS EMF-selected and IS alarmed
+(`dhan_ticks_dropped`, `live-lane-alarms.tf`). So the change was not "one more
+unwatched counter"; it was a DIVERSION that took the common flush failure off
+the only pager watching it. Net paging coverage went DOWN, and a reader of the
+original note would have concluded nothing changed.
+
+Fixed by incrementing BOTH on the rescue arm. The alarmed counter is also the
+semantically correct one there: it means "rows left the buffer without reaching
+QuestDB", which is true of a rescued row. `tv_ticks_spilled_total` is the
+narrower "and it is recoverable". Pinned by
+`the_rescue_path_still_increments_the_alarmed_counter`, a source-scan ratchet
+chosen over a recorder assertion because what must never regress is the ALARMED
+NAME, and a recorder test would still pass against a different unalarmed name.
 
 ## Item 24 Honest envelope
 
@@ -1267,3 +1282,604 @@ in QuestDB until someone runs the documented curl, and past the 512 MiB cap
 they still drop. **NOT claimed: that the flush timeouts stop** — the cause is
 QuestDB write latency under the live load and is untouched here; this bounds
 the consequence, not the cause.
+
+## ITEM 25 (added 2026-08-21) — operator: "go ahead with the recommendation" + "one and only RUST O(1) in the entire workspace"
+
+**Scope authority:** no scope change — no socket, no universe, no `dry_run`, no
+§28 edit, no new Telegram page. Three defects and two documentation corrections,
+all found by a three-agent audit run in parallel.
+
+## Item 25 Design
+
+**A. The never-traded sentinel timestamp (`row_timestamp_ist_nanos`).**
+Measured live: **959,671 rows/session** carried `exchange_timestamp = 315,532,800`
+(1980-01-01, Dhan's never-traded sentinel) or a literal `0`, stamping them into
+permanent `1980-01-01` / `1970-01-01` partitions where **no time-range query can
+reach them**.
+
+The first recommendation was to DROP these rows. **That was wrong and the
+verification caught it:** 99.2% of them carry a real `total_buy_qty` (max
+8,397,000), `total_sell_qty` (max 9,019,000) and previous `close` (max 73,186.8).
+They are contracts with a live order book that have not traded yet — the drain
+keeps them deliberately, and the existing code comment saying discarding them
+"costs the packet's open interest and bid/ask" is correct.
+
+So the row is KEPT and its designated timestamp is taken from the RECEIPT time,
+which is the only real time such an observation has. The raw sentinel survives
+in `exchange_timestamp`, so "never traded" stays recoverable. The plausibility
+floor is SHARED with the aggregator (`MIN_PLAUSIBLE_EXCHANGE_TS_SECS`) so the
+candle refusal and the timestamp fallback cannot drift apart. Convention-safe by
+construction: both inputs are already IST-epoch, so the function only CHOOSES
+between two values in one space and can never introduce the `+19800` sign error
+that `data-integrity.md` calls the single most critical rule.
+
+**B. The alarm regression Item 24 introduced (`discard_pending`).**
+Item 24's spill rescue incremented ONLY `tv_ticks_spilled_total`, which is
+neither EMF-selected nor alarmed, and thereby DIVERTED the common flush failure
+off `dhan_ticks_dropped` — the only pager watching it. Net paging coverage went
+DOWN. Item 24's own note called that acceptable "matching the neighbouring
+counters"; that justification was FALSE and its wrongness is what concealed the
+regression. Fixed by incrementing BOTH; that Observability section is corrected
+in place.
+
+**C. Two now-false operator-facing claims** in `dhan_feed_stack`: the flush
+`error!` still said the rows were "a counted loss", "nothing re-inserts them"
+and "boot replay DROPS live-feed frames (there is no re-fold path)". All three
+are false — the rescue exists and `refold_wal_frames` exists — so two ERROR
+lines fired for one event with OPPOSITE verdicts, telling the operator recovery
+was impossible when two recoveries work.
+
+**D. Rust-only.** The audit found **zero executing violations** workspace-wide.
+Two mentions fixed: an operator runbook (ours, not vendor reference, so outside
+every carve-out) carried two Python blocks instructing a human to run them —
+re-expressed as `curl` with identical headers and cookie warm-up; and a launcher
+comment claimed a parity harness "re-materializes" a deleted interpreted server,
+which was retired 2026-08-01. One mention KEPT deliberately: a third-party PyPI
+package named in a REJECTED-options table, where removing the name would make
+the table unable to say what was rejected.
+
+**E. CLAUDE.md honesty.** The codebase map's `pipeline/` row named a
+tick-processor module that does not exist and said 21 timeframes where
+`TF_COUNT` is 24. Four unbounded-growth paths were missing from the O(1) table.
+
+Files: `crates/storage/src/tick_persistence.rs`,
+`crates/app/src/dhan_feed_stack.rs`, `CLAUDE.md`,
+`docs/operator/nse-trading-calendar-2026.md`,
+`scripts/mcp-servers/tickvault-logs-launch.sh`.
+
+## Item 25 Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Plausible LTT | Exchange time kept — unchanged for every normal row |
+| LTT exactly AT the floor | Plausible, kept (boundary pinned) |
+| LTT one second below | Sentinel, falls back |
+| Sentinel LTT **and** no receipt time | Sentinel kept — a guess is worse than a visibly wrong value |
+| Spill succeeds | BOTH counters fire, so the alarm still pages |
+| Spill fails | Drop counter only, as before |
+
+## Item 25 Failure Modes
+
+| Failure | Result |
+|---|---|
+| Fallback wrongly applied to a real tick | Every price stamped with receipt time instead of trade time — pinned against by the plausible-LTT test |
+| Someone re-diverts the rescue off the alarmed counter | `the_rescue_path_still_increments_the_alarmed_counter` fails the build |
+| Floor drifts from the aggregator's | Impossible — the constant is shared, and pinned at the boundary |
+
+## Item 25 Test Plan
+
+Seven new tests, 38 green in `tick_persistence` (46 storage suites, 65 common,
+1,533 app lib). **Bite-proven twice:** removing the timestamp fallback fails 4;
+the alarm ratchet is a source-scan chosen over a recorder assertion because what
+must never regress is the ALARMED NAME, and a recorder test would still pass
+against a different unalarmed name.
+
+Also demonstrated: the first draft of the CLAUDE.md correction NAMED the missing
+module and `claude_md_codebase_map_guard` REJECTED it — the guard bites on
+corrective prose too, which is the right behaviour.
+
+## Item 25 Rollback
+
+Each part is independent: drop the `row_timestamp_ist_nanos` call to restore
+sentinel stamping; drop one `metrics::counter!` to restore Item 24's behaviour;
+the rest are documentation.
+
+## Item 25 Observability
+
+No new metric. The change RESTORES `dhan_ticks_dropped` paging on the rescue
+path. Sentinel rows become visible to time-range queries for the first time —
+which will raise apparent tick counts by ~3%; those are real observations, and
+consumers wanting traded ticks only should filter `ltp > 0`.
+
+## Item 25 Honest envelope
+
+100% inside the tested envelope, with bite-proven ratcheted coverage. **NOT
+claimed:** that the flush timeouts stop — their cause is QuestDB write latency,
+untouched here, though removing ~950k out-of-order writes per session should
+reduce the pressure and that is a hypothesis, not a measurement. **NOT claimed:**
+that the spill is automatically replayed — it still needs one curl, which does
+not meet the zero-manual-intervention bar and remains open. **NOT claimed:** that
+the audit was exhaustive — it found this table incomplete for the fourth time,
+which is itself evidence that a source scan finds what it is pointed at.
+
+---
+
+## ITEM 26 (added 2026-08-21) — operator: "Go ahead wirh your recommendation"
+
+**Status:** VERIFIED
+
+### Design
+
+Close the silent-loss hole between `confirm_replayed` and the WAL re-fold.
+
+`main.rs` skips its own drop-and-log for recovered live-feed frames whenever
+`dhan_lane_will_refold` is true, then calls `confirm_replayed`, which MOVES the
+staged segments into the archive so they can never be offered again. Only after
+that does the Dhan lane spawn and re-fold. The gate reads config plus one env
+var — it is the same gate the lane uses, so the two can never disagree about
+ENABLEMENT, and that is exactly why the hole is invisible: it opens on RUNTIME
+refusal, which the gate cannot see.
+
+Six bring-up paths return before the re-fold: an unplannable pool, a
+`[rest_candle_fold]` collision, missing cross-verify deps, a missing WAL, a
+token manager that never registered, and a duplicate spawn. Each returns loudly
+about ITSELF and says nothing about the frames it was handed. So captured ticks
+disappeared with no line anywhere — the silent-loss class the whole
+capture-at-receipt chain exists to prevent.
+
+`report_unfolded_wal_frames(frames, refusal)` is called at all six. It emits the
+same `WS-GAP-03`-coded error and increments the SAME
+`tv_ws_frame_wal_reinjected_dropped_total{ws_type="live_feed"}` counter that
+`main.rs` uses for its own drop path, so the two paths sum into one number
+instead of two. The gate-disabled return in `spawn_dhan_feed_stack` deliberately
+does NOT call it: `main.rs` reads the identical gate and has already logged
+those frames, and reporting again would double-count them.
+
+### Edge Cases
+
+- **Empty batch** — the normal boot. Returns without logging; a loss line
+  printed every morning is a loss line nobody reads.
+- **Gate disabled** — covered by `main.rs`, deliberately not covered here
+  (double-count).
+- **Duplicate spawn** — production has one call site and `FEED_STACK_SPAWNED`
+  makes a second impossible, so this is test-only today. Covered anyway,
+  because "impossible today" is how the other five started.
+- **A seventh refusal added later** — the ratchet fails the build.
+
+### Failure Modes
+
+What this does NOT fix, stated plainly: it buys VISIBILITY, not recovery. The
+raw frames stay in the WAL archive and still need a manual replay, which is the
+same open item ITEM 24 records. Moving the confirm after the fold would buy
+recovery, but the lane is a spawned task the boot path cannot await, and not
+confirming at all re-stages the segments every boot forever (the WS-REINJECT-01
+growth-storm class). That trade is recorded at the confirm site rather than
+silently taken.
+
+### Test Plan
+
+- `report_unfolded_wal_frames_is_silent_on_an_empty_batch`
+- `report_unfolded_wal_frames_names_the_refusal_it_was_given` — pins the
+  structured field AND that the counter matches `main.rs`'s
+- `every_lane_refusal_before_the_refold_reports_its_unfolded_frames` — the
+  ratchet. Scans `run_dhan_feed_stack` up to the re-fold call and fails if any
+  `return;` is not immediately preceded by a report. Bite-proven: removing the
+  `wal_missing` call turns it red and names the offending line. Carries a
+  non-vacuity assertion so a collapsed scan window cannot pass silently.
+
+Verification: 1,536 app lib tests ok; 42 integration guard binaries that scan
+`dhan_feed_stack.rs` or `main.rs` all ok; `cargo fmt --check` clean; CI-equivalent
+`cargo clippy --workspace --no-deps -- -D warnings` clean.
+
+### Rollback
+
+Revert the commit. The reporter is additive — removing it restores the previous
+(silent) behaviour exactly; no data path changes.
+
+### Observability
+
+`tv_ws_frame_wal_reinjected_dropped_total{ws_type="live_feed"}` — existing
+counter, now incremented from six previously-silent paths. **FLAGGED, not
+fixed:** this counter has no CloudWatch alarm, so the loss is now *loggable and
+countable* but still not *pageable*. It joins the ~8 metrics absent from the EMF
+selectors that ITEM 25's audit recorded; alarming it is its own change with its
+own cost line.
+
+### Rider — a stated property that had become false
+
+`alive_connection_guard_tests` carried a comment claiming its tests were
+"serialized ... by running both assertions here". That was true when the module
+held one test and became false the moment a second one was added beside it: both
+mutate the process-global `ALIVE_CONNECTIONS` and assert EXACT values, so under
+`cargo test` (one process, many threads) they race. Adding tests to the same
+binary shifted the scheduling and exposed it — 2 failures that vanish under
+`--test-threads=1`.
+
+Fixed the way this repo already fixed the identical class in
+`tv_api_token_prod_guard.rs` (recorded in `merge-gate-lock-2026-07-04.md` §3.2):
+a module-scoped `Mutex` with poisoning recovered rather than propagated, since
+one of these tests raises a panic deliberately. The false comment is replaced by
+one that says why the lock exists. nextest gives each test its own process,
+which is why CI never showed this.
+
+### Per-Item Guarantee Matrix
+
+Carried by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+(15-row + 7-row). Rows specific to this item:
+
+- **Zero ticks lost** — no new drop path; this item makes an EXISTING silent
+  drop audible. Honest: it does not recover the frames.
+- **Logging** — every new path uses `error!` with
+  `code = ErrorCode::WsGapConnectionState.code_str()`.
+- **Extreme check** — the ratchet fails the build on a seventh unguarded return,
+  bite-proven in both directions.
+- **O(1)** — the reporter is O(1): a length read, one log, one counter
+  increment. No allocation beyond the log record itself, and it runs only on a
+  refusal path, never on the hot path.
+
+---
+
+## ITEM 27 (added 2026-08-21) — operator: "Go ahead wirh your recommendation"
+
+**Status:** VERIFIED
+
+### Design
+
+Drain the tick spill automatically, so the rescue tier stops depending on a
+human running curl.
+
+ITEM 24 gave live ticks a spill tier: on a flush failure the ILP buffer is
+written to `data/spill/ticks/ticks-{feed}-{hour}.ilp` instead of being
+discarded. That converted a permanent in-memory loss into a replayable file —
+and then stopped, because replay was a documented `curl` command. A rescue
+whose recovery step needs a human fails the operator's standing
+no-manual-intervention mandate, and worse, it fails it SILENTLY: the file sits
+on disk looking like success.
+
+This is not a new invention. `crates/storage/src/tick_spill_drain` existed and
+was deleted in the 2026-07-17 stage-2 sweep with the rest of the dead Dhan tick
+chain (`lib.rs` records it). The rescue came back in ITEM 24; its drain did not.
+
+`tick_spill_replay` reinstates it:
+
+- **Pure core, fully testable:** `ilp_chunk_ranges(payload, max)` splits an ILP
+  body into line-aligned chunks. ILP is newline-delimited, so a chunk boundary
+  that lands mid-line would corrupt two rows. A single line longer than the cap
+  becomes its own oversized chunk — never split, never dropped, never
+  truncated. Bounding the POST matters because a spill file may be up to
+  `TICK_SPILL_MAX_BYTES` (512 MiB) and one 512 MiB body is exactly the write
+  pressure that caused the spill.
+- **Truncate on success, never delete.** This matches the seal precedent
+  exactly: `prune_spill_files` distinguishes `deleted` (aged-out EMPTY) from
+  `deleted_non_empty`, and fires `SPILL-RETENTION-01` on the latter with "the
+  replay path has been broken for longer than the retention window". A drained
+  file must therefore be EMPTY, not absent, or that distinction stops working.
+- **Crash-safe by idempotency, not by bookkeeping.** A crash between the POST
+  and the truncate re-POSTs the file next round. That is harmless because the
+  `ticks` DEDUP key carries `capture_seq`, so a replayed row UPSERTs onto
+  itself. No offset file, no state to corrupt.
+- **A failing round stops the round.** The spill exists because QuestDB was
+  already slow; hammering it with the backlog is how a bounded tick loss
+  becomes an unbounded outage. First non-2xx or transport error ends the file
+  AND the round.
+
+### Edge Cases
+
+- **Empty file** — skipped, left for the age-based pruner. Truncating an
+  already-empty file every round would rewrite mtime forever and the file would
+  never age out.
+- **A line longer than the chunk cap** — emitted whole as an oversized chunk.
+  Splitting it would corrupt a row; dropping it would be the silent loss this
+  exists to end.
+- **Payload with no trailing newline** — the final chunk runs to end-of-buffer.
+- **Partial success** (chunks 1..k succeed, k+1 fails) — the file is NOT
+  truncated and is re-POSTed whole next round. Re-writing the already-accepted
+  prefix is safe (DEDUP) and is strictly better than rewriting the file
+  mid-recovery.
+- **Non-`.ilp` files / subdirectories** — ignored, never read.
+- **Directory absent** — a no-op, not an error. A box that never spilled has no
+  such directory.
+
+### Failure Modes
+
+- QuestDB down → every round fails, nothing is truncated, files accumulate to
+  the 512 MiB cap and then the writer drops-and-counts as before. Degrades to
+  exactly ITEM 24's behaviour; never worse.
+- Disk full → the truncate fails; counted, and the file is re-POSTed next round.
+  Duplicate writes are absorbed by DEDUP.
+- **NOT fixed:** the flush timeouts themselves. Their cause is QuestDB write
+  latency under live load and is untouched here. This closes the recovery gap,
+  not the cause.
+
+### Test Plan
+
+Pure-core tests (no I/O, no QuestDB):
+- chunk boundaries land only on newlines
+- an over-long single line survives whole
+- a payload with no trailing newline loses nothing
+- chunk ranges concatenate back to the exact input (the zero-loss property)
+- an empty payload yields no chunks
+
+I/O tests against a temp dir (no QuestDB): file discovery ignores non-`.ilp`,
+an empty file is skipped rather than truncated, a missing directory is a no-op.
+
+The POST itself is NOT unit-testable without a live QuestDB and is honestly
+flagged rather than faked with a mock that would prove only that the mock was
+called.
+
+### Rollback
+
+The spawn site is one call. Removing it restores ITEM 24 behaviour exactly:
+files accumulate and wait for the documented curl. No data path changes, no
+schema changes.
+
+### Observability
+
+`tv_tick_spill_replayed_bytes_total` and `tv_tick_spill_replay_failed_total`,
+both pre-registered at 0 so a first increment is not consumed as the CloudWatch
+delta baseline. **FLAGGED, not fixed:** neither is EMF-selected and neither has
+an alarm — the same open item ITEM 26 records. Adding a Dhan-scoped alarm needs
+a dated operator row in `dhan-rest-only-noise-lock-2026-07-14.md` §2 first, and
+no such quote exists, so this change deliberately does not add one.
+
+### Per-Item Guarantee Matrix
+
+Carried by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+(15-row + 7-row). Rows specific to this item:
+
+- **Zero ticks lost** — this is the item that makes ITEM 24's rescue actually
+  recover. Honest bound: rows land only when QuestDB accepts them; past the
+  512 MiB cap the writer still drops and counts.
+- **O(1)** — the chunker is a single forward pass over the payload, O(n) in
+  bytes with no allocation per line and no backtracking; it is a cold-path
+  recovery routine, never on the tick hot path. Flagged as O(n), not relabelled
+  O(1), per the standing rule.
+- **Extreme check** — the concatenation property test fails the build if the
+  chunker ever loses or duplicates a byte.
+
+### ITEM 27 rider — TICK-FLUSH-01 is revived, and its runbook said otherwise
+
+The drain supervisor needs a coded error, and `TICK-FLUSH-01` already means
+exactly "the off-thread tick ILP flush worker died and the supervisor respawned
+it". Its original emit site was deleted in the 2026-07-17 sweep and the variant
+was retained for crossref, so it was dormant rather than gone. Reusing it beats
+inventing a near-duplicate whose only distinction would be *which* tick-ILP
+worker died — a distinction the log line already carries in `path` and `reason`.
+
+Reviving it meant two documents were now wrong and are corrected in the same
+change: the runbook's title asserted `[RETIRED 2026-07-17]`, and the ErrorCode
+docstring described only the deleted worker. Both now carry dated revival notes.
+Leaving them would have been the same false-claim class this branch has been
+correcting all along — a document asserting a code is dead while it pages.
+
+**Verification:** 928 storage lib tests · 45 storage integration binaries ·
+1,536 app lib tests · 65 common suites — all ok, zero failures. `cargo fmt
+--check` clean; CI-equivalent clippy clean; plan-gate, banned-pattern,
+data-integrity, pub-fn-test, pub-fn-wiring all PASS. The chunker's zero-loss
+property is bite-proven: a one-byte off-by-one turns three tests red.
+
+### ITEM 27 rider 2 — the banned-pattern scanner can be blinded by a brace in a string
+
+Writing `body.find("\n}\n")` inside this module's test block made the
+pre-commit gate reject ten `.expect()` calls that are all inside
+`#[cfg(test)]`. The cause is in `banned-pattern-scanner.sh`: it strips test
+code by tracking brace DEPTH, counting `{` and `}` per line with `gsub`, which
+cannot tell a brace in code from a brace inside a string or a comment. One
+unmatched `}` drops the depth to zero, the skip block ends early, and every
+line after it is scanned as production.
+
+The direction I hit is the SAFE one — it scans too much and produces false
+positives, which is loud and self-correcting. The dangerous direction is the
+mirror image: an unmatched `{` inside a test-block string would leave the depth
+permanently above zero, and every line after it — including real production
+code — would be skipped silently. That is a guard reading green because it
+stopped looking.
+
+**Surveyed, and it does not occur today.** A sweep over every `crates/*/src`
+`.rs` file for "a skip block that opens and never closes while production lines
+follow" returned zero hits. So this is recorded as a known fragility with a
+clean current state, not an open defect.
+
+Fixed locally by writing the brace as `\u{7d}` (which balances in source) with
+a comment saying why — and the comment itself had to avoid a bare brace for the
+same reason, which is a fair measure of how easy this is to trip. Hardening the
+scanner to ignore braces inside string and comment tokens is a real improvement
+and a separate change to a hook; it is deliberately not bundled here.
+
+---
+
+## ITEM 28 (added 2026-08-21) — operator: "Go ahead wirh your recommendation… check this every nook and corner with assurance and guarantee"
+
+**Status:** VERIFIED
+
+### Design
+
+Four parallel audits (Rust-only, O(1)/uniqueness/dedup, hot-path allocation,
+common-runtime/scalable) plus the two fixes and the alarms they justified.
+
+**1. The spill tier becomes visible (alarms).** Authorized by the dated §2.3c row
+in `dhan-rest-only-noise-lock-2026-07-14.md`. Three metrics join the EMF selector
+(both copies, byte-identical); two carry market-hours-gated alarms;
+`replayed_bytes` ships without one deliberately — it is the SUCCESS signal, and a
+chart of recoveries makes the two failure alarms interpretable without adding a
+third pager. ~$1.10/mo.
+
+**2. A gap I invented, corrected.** The message asking for that authorization
+claimed `tv_ws_frame_wal_reinjected_dropped_total` was "not EMF-selected and has
+no alarm". **Both halves were false** — it is in the selector, and
+`live-lane-alarms.tf:354` pages on it at threshold 1. So ITEM 26's six refusal
+paths already feed a counter that ships and pages, which is a better outcome than
+was claimed. Recorded in §2.3c rather than quietly enjoyed: an over-stated gap
+sends the next session hunting for something that is not there.
+
+**3. Hot path — the DHAT gate did not measure production.** Every existing gate
+built a **Quote** (code 4, 50 B) packet with **no depth sink**. Production is
+`FeedMode::Full` (code 8, 162 B, five depth levels) and the boot site wires
+`with_inline_depth` unconditionally — so the branch doing the most per-packet work
+was measured by nothing. That is the `record_ws_lag` failure mode exactly: that
+path allocated twice per tick for months while three correct comments warned
+against it, and a DHAT test, not a comment, is what caught it.
+`full_mode_frame_with_inline_depth_does_not_allocate_per_tick` closes it.
+**MEASURED: 19 allocation blocks over 10,000 ticks and 100,000 depth-row appends**
+— the depth fold is allocation-free at production scale, which was previously
+unknown rather than known. Ceiling set at 500, not a round 60,000: a per-tick
+allocation would land at 10,000+, and a slack ceiling is a gate that passes while
+the thing it guards regresses.
+
+**4. Rust-only hole SEVEN.** `is_command_position` asked whether the prefix ENDED
+WITH one of nine strings. `run: npx`, `RUN npm ci`, `ExecStart=/usr/bin/node`,
+`sudo`, `exec`, `env` end with none of them — and it is the ONLY detector for
+eleven runtimes, so all eleven were invisible in the dominant CI, Docker and
+systemd forms simultaneously. Replaced with a prefix PARSER: the question moved
+from "does it end with a known separator?" to "is the prefix entirely made of
+things that precede a command?". The second has a bounded answer; the first has
+the endless list that has now been wrong seven times. Live tree was and is clean.
+
+### Edge Cases
+
+- `echo "SSM managed node"` must NOT count — `echo` is deliberately not a command
+  introducer. Six must-NOT-count fixtures pin this; the false-positive half is the
+  half that matters, because a guard whose first act is a false positive teaches
+  the reader to allowlist it.
+- `node_modules` is not `node` — a fixture that started on the must-count list by
+  mistake, where the guard was right and the test was wrong. Moved to the
+  must-NOT-count list, where it is a genuinely useful assertion.
+- A depth packet of all zeros could be short-circuited, so the DHAT fixture fills
+  every level with non-zero values and asserts the EXACT row count
+  (`FRAMES × 4 × 10`), not `> 0`.
+
+### Failure Modes
+
+- **HONEST LIMIT, recorded not papered over:** an env-var prefix
+  (`FOO=bar node app.js`) is still not covered. After the `=` split the remainder
+  is a bare word, and accepting bare words makes `managed node` a hit. A miss is a
+  false negative; the alternative is a false-positive engine.
+- The browser guard counts `<script` TAGS, not JavaScript — so §0.1's claim that
+  it "pins browser code inside `.rs`" overstates it. Verified clean today.
+- The lockfile check lists native BUILD systems, not embedded INTERPRETERS
+  (`pyo3`, `mlua`, `rhai`, `deno_core`, …), which would ship an interpreter inside
+  the Rust binary with nothing to detect. Verified: zero present today.
+
+### Test Plan
+
+- `full_mode_frame_with_inline_depth_does_not_allocate_per_tick` — measured, tight
+  ceiling, exact-row-count non-vacuity.
+- SCOPE FIX #10: eleven must-count forms, six must-NOT-count forms. **Bite-proven
+  both ways** — deleting one introducer turns `RUN npm ci` red; restoring it green.
+- EMF name-count ratchet updated 73 → 76 with a dated cost note, as that guard
+  requires; it caught the change exactly as designed.
+
+Verification: 65 common suites · 928 storage lib · 1,536 app lib · the four app
+guards touching changed files — all ok. fmt clean; CI-equivalent clippy clean.
+
+### Rollback
+
+Every part is additive and independently revertible: the alarms are two terraform
+resources plus three selector names; the DHAT gate is one test; the parser is one
+function with its fixtures.
+
+### Observability
+
+Three metrics now ship; two page. See §2.3c for the cost line and the deliberate
+no-alarm-on-success decision.
+
+### Per-Item Guarantee Matrix
+
+Cross-referenced to `.claude/rules/project/per-wave-guarantee-matrix.md`. Rows
+specific to this item:
+
+- **Monitoring** — the spill tier goes from log-only to shipped-and-paged.
+- **Code performance** — the production packet shape is now DHAT-gated and
+  measured at 19 blocks / 10,000 ticks.
+- **Security hardening** — the interpreter ban now detects the invocation forms
+  that dominate CI, Docker and systemd.
+- **Extreme check** — three ratchets, all bite-proven; the EMF count ratchet
+  proved itself by refusing the change until the cost note was written.
+- **O(1)** — four new table rows, each with REACHABILITY stated, because a
+  complexity number without reachability is not a decision.
+
+### ITEM 27 rider 3 — CI caught the coverage dilution, and the fix is tests
+
+`Coverage & Perf` failed on head `659c2499`: **storage 90.03% against a 90.1%
+floor**, short by 0.07 percentage points. The cause is exactly what a new
+621-line module does to a ratcheted per-crate average when its async I/O paths
+have no tests: `tick_spill_replay`'s success arm, its refuse arm, the
+supervisor and the error-kind mapper were all uncovered.
+
+**The floor was NOT lowered.** `quality/crate-coverage-thresholds.toml` records
+that floors only ever move up, and lowering one to admit undertested code is the
+ratchet-weakening move this repo has explicitly refused before. Six tests were
+added instead.
+
+The one that mattered is the SUCCESS arm — the arm that truncates the file and
+reports bytes as recovered. It is tested against a real `TcpListener` answering
+`204 No Content`, not a mock: a mock would prove only that the mock was called,
+whereas twenty lines of raw socket exercise the real `reqwest` round trip, the
+real status check and the real truncate, with no QuestDB and no new dependency.
+The others cover a 4xx refusal (bytes arrived and were rejected — the file must
+still survive), the stop-the-round rule (the SECOND file must not even be
+attempted), the multi-file drain, both reachable `describe_send_error` kinds via
+genuine connect-refused and timeout failures, and the supervisor's entry path.
+
+**Measured locally rather than pushed speculatively.** `cargo-llvm-cov` was
+installed for the purpose: `tick_spill_replay.rs` now sits at **387/428 =
+90.42%**, above the crate's own 90.1% floor — so the module lifts the average
+instead of diluting it. `lines.count` is invariant to which tests run, so the
+crate denominator (~21,759) is the same figure CI used: clearing 90.1% needed
+about **+15** covered lines, and the six tests cover roughly **60**.
+
+Honest note on the local measurement: the full lib+tests coverage run could not
+complete — the instrumented build tree exhausted the container's disk twice.
+The per-file number above is from the lib-only run and is the decisive one; the
+crate total is derived, not observed. CI is the confirmation.
+
+### ITEM 28 — the last audit failure: a budget pinned to one machine
+
+The four-agent audit returned three passes and one failure. `Scalable ❌` rested
+on a single line: `RAM_STORE_SPOT_CAPACITY_BUDGET_BYTES = 10 GiB`, whose own doc
+comment said *"sized against the r8g.xlarge 32 GiB host"*. That is the same
+shape the frame ring was repaired for — correct only while the host never
+changes, and silently wrong the moment it does, in both directions: too generous
+on a smaller box (the projection check under-reports and the operator is not
+warned), needlessly tight on a larger one.
+
+**The budget is now derived**: an exact 5/16 fraction of
+`min(/proc/meminfo MemTotal, cgroup limit)`, resolved once into a `OnceLock` so
+every read is O(1) and the enforcement can never disagree with the log line.
+
+Three decisions carry the weight.
+
+**5/16 rather than a percentage.** 5/16 of 32 GiB is 10 GiB *to the byte*, so
+the live box's budget is unchanged by this refactor. The percentage form is
+31.25%, and the moment someone rounds it to 31% the live budget silently
+tightens by 80 MiB while appearing to preserve it. A fraction cannot be rounded
+by accident.
+
+**The minimum of machine RAM and the cgroup limit**, not just `/proc/meminfo`.
+Both bind, and the smaller is what the OOM killer actually enforces. This is
+what makes it the same code on the AWS box (no container limit) and in a Docker
+dev run (limit set) — the common-runtime property a constant cannot have. Both
+cgroup dialects are handled, and "unlimited" is recognised in both: v2 writes
+the literal `max`, v1 saturates near `i64::MAX`. Reading either as a real limit
+would produce an astronomical budget and disable the check entirely.
+
+**Refuse rather than guess.** An unrecognised `/proc/meminfo` shape returns
+`None` and falls back to the 10 GiB figure with a coded `warn!`. A guessed
+memory figure produces a wrong budget that looks authoritative, which is worse
+than an honest fallback that says so.
+
+Seven tests. The bite-proof is the interesting part: reintroducing the bug — a
+`budget_from_host_bytes` that ignores its argument — turns exactly two of them
+red, and **`the_reference_host_reproduces_the_operator_budget_exactly` stays
+GREEN**, because the bug returns 10 GiB which is the right answer on that one
+host. Had that been the only test, it would have certified the defect. The test
+that bites is `the_budget_tracks_the_host_up_and_down`: half the host must halve
+the budget. A test written against the reference configuration cannot catch a
+bug whose whole nature is that it only shows up off the reference configuration.
+
+**What this does NOT fix, and the row in CLAUDE.md says so.** It still fails
+LOUD rather than closed — the install proceeds after the `error!` — and the
+documented remediation is still the operator lowering `spot_days`. Deriving a
+ceiling does not enforce it. What changes is that the breach point is no longer
+a fixed ~10,600 instruments: it now scales with the machine, which is what the
+word "scalable" was failing on.

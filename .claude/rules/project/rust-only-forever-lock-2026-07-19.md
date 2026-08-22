@@ -339,3 +339,90 @@ omits `.plist`, `.xml`, `.alloy`, `.conf`, `.timer`, `.service` and
 `.config/nextest.toml`. The guard covers all seven
 (`rust_only_guard.rs:251-269`, `:1329`); the PROSE under-states real coverage.
 The opposite of the usual failure, and worth saying so.
+
+## §0.3. 2026-08-21 — SCOPE FIX #10: hole SEVEN, and it was the same shape again
+
+Operator directive (2026-08-21, typed directly in-session — preserve EXACTLY,
+typos included):
+
+> "Ensure to use one and only RUST O(1) in the entire workspace codebase except frontend alone so check this every nook and corner with assurance and guarantee"
+
+A fresh adversarial sweep, told to assume the previous six fixes had missed
+something, found the seventh. **It is the same shape as all six before it**, and
+this time it was in the fix that closed hole four.
+
+### The hole
+
+The 2026-08-15 node-family fix (§0.1 item 4) deliberately scanned **command
+position** rather than free text, so that `scripts/aws-autopilot.sh`'s three
+"SSM managed node" prose lines would not become three false positives. That
+reasoning was right and is preserved. The IMPLEMENTATION was not:
+`is_command_position` asked whether the text before the token **ended with** one
+of nine strings — `|`, `&&`, `||`, `;`, `$(`, `(`, backtick, `"command":`, `"`.
+
+Every one of these ends with none of them, and each was verified to count **0**:
+
+| Form | Where it is the DOMINANT form |
+|---|---|
+| `run: npx -y pkg` | GitHub Actions single-line step |
+| `RUN npm ci` | Dockerfile |
+| `ExecStart=/usr/bin/node /opt/app.js` | systemd unit |
+| `sudo npm install -g pkg` | provisioning script |
+| `exec node app.js` | container entrypoint |
+| `env node app.js` | shell wrapper |
+
+`is_command_position` is the **only** detector for eleven runtimes (`node`,
+`npx`, `npm`, `yarn`, `pnpm`, `deno`, `bun`, `ruby`, `gem`, `php`, `lua`) — the
+python family gets a free-text scan instead. So those eleven were invisible in
+CI, Docker and systemd simultaneously, and the self-test's false-negative half
+contained none of the six forms, so it proved nothing about them.
+
+**The live tree was and is CLEAN** — zero occurrences of any form. This was a
+latent scope hole, not an active violation.
+
+### The fix, and why it is a different KIND of fix
+
+The question changed from *"does the prefix end with a known separator?"* to
+**"is the prefix ENTIRELY made of things that precede a command?"**. The second
+question has a bounded answer; the first has an endless list, which is precisely
+why the list has now been wrong seven times.
+
+`is_command_position` now PARSES the prefix: it splits at the last shell
+separator (`=` included, for the systemd form), then repeatedly consumes a YAML
+list marker, a key ending in `:`, an assignment, an opening quote, a
+[`COMMAND_INTRODUCERS`] word, or a binary path — and returns true only when
+nothing is left. `echo` is deliberately NOT an introducer: a printer is how this
+check would start reporting sentences.
+
+**SCOPE FIX #10 pins eleven must-count forms and six must-NOT-count forms.** The
+false-positive half is the half that matters — a guard whose first act is a
+false positive teaches the reader that the cheapest fix is an allowlist, which
+is how three anchors in this branch were weakened before. Bite-proven both ways:
+deleting one introducer turns `RUN npm ci` red; restoring it turns it green.
+
+### HONEST LIMIT, recorded rather than papered over
+
+An env-var PREFIX (`FOO=bar node app.js`) is **not** covered. After the `=`
+split the remainder is `bar`, a bare word, and accepting bare words would make
+`managed node` a hit. A miss there is a false negative; accepting it would make
+this a false-positive engine, and this guard survives only while its first act
+is never a false positive.
+
+### Two findings from the same sweep, NOT fixed here
+
+1. **The browser guard counts `<script` TAGS, not JavaScript** — so §0.1 item 5's
+   claim that it "pins browser code inside `.rs`" overstates it. A budget-1
+   surface can grow from 20 to 20,000 lines of JS inside one tag with the count
+   unchanged, and JS carrying no `<script` (an inline `onclick=`, a route
+   serving `application/javascript`) is uncounted entirely. **Verified clean
+   today**: zero `application/javascript`, zero `on*=` handlers, `<script` counts
+   match the budget exactly across 10 files.
+2. **The lockfile check lists native BUILD systems, not embedded INTERPRETERS.**
+   A crate like `pyo3`, `mlua`, `rhai`, `deno_core`, `boa_engine`, `rquickjs` or
+   `rustpython` ships an interpreter INSIDE the Rust binary: no banned file, no
+   banned token, no builder match — green everywhere. **Verified: zero present
+   in `Cargo.lock` today.**
+
+Both are recorded as known gaps with a clean current state. Closing them is a
+separate change; leaving them undocumented would repeat exactly the mistake this
+section exists to record.

@@ -202,11 +202,11 @@ fn ratchet_dhan_spot_and_chain_legs_emit_rest_fetch_audit() {
 
 /// GAP-11b: `ok` forensics rows are HELD until the DATA-table flush ACK
 /// and stamped there (`stamp_held_ok_rows` AFTER `writer.flush()` in
-/// source order, per fire/sweep region, all three Dhan/Groww legs) — a
+/// source order, per fire/sweep region, across the surviving legs) — a
 /// pre-flush ok append would fabricate an ok row for a lost minute.
 #[test]
 fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
-    let cases: [(&str, &[&str]); 3] = [
+    let cases: [(&str, &[&str]); 2] = [
         (
             "src/spot_1m_rest_boot.rs",
             &[
@@ -218,7 +218,6 @@ fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
                 "async fn sweep_sids_above_watermark(",
             ],
         ),
-        ("src/groww_spot_1m_boot.rs", &["async fn fire_one_minute("]),
         (
             "src/option_chain_1m_boot.rs",
             &["async fn fire_one_chain_minute("],
@@ -280,10 +279,7 @@ fn ratchet_ok_audit_rows_stamp_after_data_flush_ack() {
 ///   terminal-429 ladder classifies `rate_limited` (never a generic
 ///   `error` while the scoreboard digest sums 0 rate-limit hits).
 /// - MEDIUM 1: Dhan spot missed boundaries land queryable
-///   `outcome=skipped` forensics rows (the Groww spot / Dhan chain shape).
-/// - MEDIUM 2: the Groww spot BACKFILL recovery holds an `ok` audit row
-///   (cross-feed symmetry — a backfill-repaired Groww minute must not
-///   read "failed, never recovered" in the digest forever).
+///   `outcome=skipped` forensics rows (the chain-leg shape).
 #[test]
 fn ratchet_gap11_review_fixes_stay_wired() {
     let spot_src = read_app_src("src/spot_1m_rest_boot.rs");
@@ -304,21 +300,8 @@ fn ratchet_gap11_review_fixes_stay_wired() {
              (real rate-limit facts + queryable skipped boundaries)"
         );
     }
-    let groww_src = read_app_src("src/groww_spot_1m_boot.rs");
-    let groww = production_region(&groww_src);
-    let fire = fn_region(
-        groww,
-        "async fn fire_one_minute(",
-        "src/groww_spot_1m_boot.rs",
-    );
-    let backfill_pos = fire
-        .find("tv_groww_spot1m_backfilled_total")
-        .expect("groww fire_one_minute lost its backfill-Ok arm");
-    assert!(
-        fire[backfill_pos..].contains("held_ok_rows.push(build_fetch_audit_row("),
-        "groww_spot_1m_boot.rs fire_one_minute: the backfill-Ok arm must \
-         HOLD an ok audit row for the repaired minute (GAP-11 review \
-         MEDIUM 2) — without it a backfill-repaired Groww minute reads \
-         'failed, never recovered' in the digest forever"
-    );
+    // MEDIUM 2's other half — the retired feed's spot BACKFILL holding an
+    // `ok` audit row so a repaired minute stops reading "failed, never
+    // recovered" — went with that leg on 2026-08-21. The surviving legs'
+    // own hold-then-stamp ordering is pinned above.
 }

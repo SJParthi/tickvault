@@ -150,28 +150,6 @@ fn dhan_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms() {
 }
 
 #[test]
-fn groww_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms() {
-    let src = read_source("crates/app/src/groww_spot_1m_boot.rs");
-    let prod = production_region(&src);
-
-    assert_eq!(
-        count_occurrences(
-            prod,
-            "rest_candle_fold::send_confirmed_bars(&confirmed_bars)"
-        ),
-        2,
-        "the Groww spot leg must hand off confirmed bars at EXACTLY two sites \
-         (the fire flush-ok arm + the sweep flush-ok arm)"
-    );
-    assert_eq!(
-        count_occurrences(prod, "ConfirmedBar::from_minute_candle("),
-        3,
-        "the Groww spot leg must stage bars at the 3 append-ok arms \
-         (fire own-minute, fire backfill, sweep)"
-    );
-}
-
-#[test]
 fn fold_module_keeps_load_bearing_pieces() {
     let src = read_source("crates/app/src/rest_candle_fold.rs");
     let prod = production_region(&src);

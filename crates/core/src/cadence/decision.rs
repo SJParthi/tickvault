@@ -349,11 +349,11 @@ mod tests {
         assert!(latch.try_latch(Feed::Dhan, 35_940));
         assert!(!latch.try_latch(Feed::Dhan, 35_940), "no double decision");
         // The OTHER lane's latch is independent for the same cycle.
-        assert!(latch.try_latch(Feed::Groww, 35_940));
-        assert!(!latch.try_latch(Feed::Groww, 35_940));
+        assert!(latch.try_latch(Feed::Truedata, 35_940));
+        assert!(!latch.try_latch(Feed::Truedata, 35_940));
         // The next cycle re-arms both lanes.
         assert!(latch.try_latch(Feed::Dhan, 36_000));
-        assert!(latch.try_latch(Feed::Groww, 36_000));
+        assert!(latch.try_latch(Feed::Truedata, 36_000));
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         // side effects). F10: dry_run=true demotes the skip to info!;
         // dry_run=false keeps the coded CADENCE-02 error!.
         let snap = DecisionSnapshot {
-            lane: Feed::Groww,
+            lane: Feed::Truedata,
             cycle_minute_ist: 35_940,
             outcome: DecisionOutcome::Skipped(SkipReason::BothSourcesDead),
             vix_missing: true,

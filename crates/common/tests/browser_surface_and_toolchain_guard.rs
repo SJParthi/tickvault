@@ -109,9 +109,7 @@ const SCRIPT_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/feeds_page.rs", 1),
     ("crates/api/src/handlers/board_page.rs", 1),
     // --- NOT frontend: XSS fixtures + vendor-body parsing ---
-    ("crates/api/src/handlers/brutex_crossverify.rs", 6),
     ("crates/api/src/middleware.rs", 1),
-    ("crates/app/src/brutex_crossverify_compare.rs", 1),
     ("crates/aws-lambdas/src/operator_control.rs", 3),
     ("crates/core/src/notification/events.rs", 12),
     ("crates/trading/src/oms/api_client.rs", 1),

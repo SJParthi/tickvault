@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(bars[2].close, 2.0);
         // Unknown slot → empty, never a panic.
         let other = SlotKey {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             security_id: 99,
             exchange_segment_code: 0,
         };
@@ -852,7 +852,7 @@ mod tests {
         let store = SpotBarStore::new(1);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let groww_key = SlotKey {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             security_id: 4_611_686_018_427_387_913,
             exchange_segment_code: 0,
         };
@@ -861,9 +861,9 @@ mod tests {
         let stats = store.stats();
         assert_eq!(stats.slots, 2);
         assert_eq!(stats.bars_resident_per_feed[Feed::Dhan.index()], 1);
-        assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
+        assert_eq!(stats.bars_resident_per_feed[Feed::Truedata.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
-        assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
+        assert_eq!(stats.min_depth_days_per_feed[Feed::Truedata.index()], 1);
         // Two slots × 1 day × 831 bars × 48 B of pre-allocated capacity
         // (385-min session; 618 -> 831 on 2026-08-10 with M2/M30/M60).
         assert_eq!(stats.estimated_bytes, 2 * 831 * 48);
@@ -941,7 +941,7 @@ mod tests {
         };
         // Same id, same segment, DIFFERENT feed — the third key axis.
         let groww_idx = SlotKey {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             security_id: 27,
             exchange_segment_code: 0,
         };
@@ -1078,7 +1078,7 @@ mod tests {
                             "a resident slot must stay readable across concurrent inserts"
                         );
                         let churn = SlotKey {
-                            feed: Feed::Groww,
+                            feed: Feed::Truedata,
                             security_id: 42,
                             exchange_segment_code: 0,
                         };
@@ -1100,7 +1100,7 @@ mod tests {
                 }
                 store.append_sealed(
                     SlotKey {
-                        feed: Feed::Groww,
+                        feed: Feed::Truedata,
                         security_id: 42,
                         exchange_segment_code: 0,
                     },

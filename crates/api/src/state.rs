@@ -134,13 +134,18 @@ impl SystemHealthStatus {
 
     /// Whether ANY producer has ever pushed a websocket connection count.
     ///
-    /// `false` means "no writer exists" — the live market-data WebSocket
-    /// feeds were retired (Dhan 2026-07-13, Groww 2026-07-15) and the Dhan
-    /// pool watchdog was deleted with the lane, so nothing calls
-    /// [`SystemHealthStatus::set_websocket_connections`] today. `/health`
-    /// renders that as `retired`, never as `disconnected`, and
+    /// `false` means "no writer exists". `/health` renders that as `retired`,
+    /// never as `disconnected`, and
     /// [`SystemHealthStatus::overall_status`] skips the connection-count
     /// predicate while it holds.
+    ///
+    /// **The producer exists again as of 2026-08-22.** It died with the Dhan
+    /// live lane (retired 2026-07-13, Groww 2026-07-15) and the revival
+    /// (2026-08-09, default ON 2026-08-11) did not replace it, so for eleven
+    /// days a box running sixteen sockets still answered `retired` here.
+    /// `dhan_feed_stack::publish_alive_connections` now pushes the live count
+    /// on every socket transition, which arms this flag on the first dial.
+    /// A dhan-off boot still reads `false`, which is the truth on that boot.
     pub fn websocket_reported(&self) -> bool {
         self.websocket_reported.load(Ordering::Relaxed)
     }
@@ -598,7 +603,7 @@ mod tests {
         use tickvault_common::config::FeedsConfig;
         let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: true,
+            truedata_enabled: true,
             ..Default::default()
         }));
         let state = SharedAppState::new_with_feed_runtime(
@@ -614,10 +619,10 @@ mod tests {
             Arc::clone(&fr),
         );
         // The accessor returns the SAME shared runtime instance we injected.
-        assert!(state.feed_runtime().is_enabled(Feed::Groww));
-        fr.set_enabled(Feed::Groww, false);
+        assert!(state.feed_runtime().is_enabled(Feed::Truedata));
+        fr.set_enabled(Feed::Truedata, false);
         assert!(
-            !state.feed_runtime().is_enabled(Feed::Groww),
+            !state.feed_runtime().is_enabled(Feed::Truedata),
             "AppState shares the one Arc — a flip is observed through it"
         );
     }

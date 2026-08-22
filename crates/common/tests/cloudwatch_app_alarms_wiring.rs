@@ -683,6 +683,26 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // COST: one additional EMF metric, ~$0.30/mo, plus its alarm at ~$0.10/mo.
     // One series, since the reason label folds. Authorization for the alarm is
     // the dated §2.3b row in dhan-rest-only-noise-lock-2026-07-14.md.
+    // 2026-08-21 — 73 -> 76: the SPILL TIER becomes visible.
+    //
+    // tv_ticks_spilled_total, tv_tick_spill_replay_failed_total and
+    // tv_tick_spill_replayed_bytes_total. The rescue tier had NO CloudWatch
+    // presence at all: an ILP flush failing and being rescued to disk, and the
+    // automatic drain failing to put it back, were both visible only in the
+    // box's own log. A spill that is never drained becomes a real tick loss at
+    // the 512 MiB cap, and nothing outside the box would have said so.
+    //
+    // Two carry alarms (tv-<env>-ticks-spilling, tv-<env>-tick-spill-replay-failing,
+    // both market-hours gated); replayed_bytes ships WITHOUT one deliberately —
+    // it is the SUCCESS signal, and a chart of recoveries belongs beside the two
+    // failure alarms without adding a third pager. That is the one exception to
+    // this ratchet's own "a metric with nothing watching it is the
+    // paid-for-and-unwatched shape" rule, and it is exercised knowingly: the
+    // success series is what makes the two failure alarms interpretable.
+    //
+    // +3 names ~= $0.90/mo, +2 alarms ~= $0.20/mo => ~$1.10/mo against the $130
+    // kill-ceiling (90% action line $117). Authorization: the dated §2.3c row in
+    // dhan-rest-only-noise-lock-2026-07-14.md.
     //
     // 2026-08-21, SAME DAY, on the merge with the operator-lock branch:
     // 73 -> 76. Net +3, from four additions and one removal.
@@ -719,6 +739,31 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // make room for them. deploy/aws/EMF-METRIC-SELECTOR-NOTES.md carries the
     // full record, including the append-config restructure that ends the
     // rationing and why it was not attempted blind.
+    // 2026-08-21, ON THE MERGE of the two blocks above: 77.
+    //
+    // They were written in parallel against the same list. This branch added
+    // the three SPILL-TIER names; main added four (last_tick_age, two depth
+    // loss counters, the ILP retention bound) and removed one
+    // (tv_order_fill_lag_seconds, zero emit sites). This branch also removed
+    // the two Groww REST persist-error counters with the feed that wrote
+    // them -- see the note in the failure message below.
+    //
+    // 76 (main) - 2 (Groww) + 2 (spill) = 76. Two notes on that arithmetic:
+    //
+    // tv_order_fill_lag_seconds is NOT restored -- main's removal was
+    // deliberate and its Phase-1 arming contract in order-side-alarms.tf
+    // still holds.
+    //
+    // And only TWO of the three spill names ship, not three. The block above
+    // argued for shipping tv_tick_spill_replayed_bytes_total without an alarm
+    // because a chart of successful recoveries makes the two failure alarms
+    // interpretable. That argument loses to a hard wall: with all three the
+    // rendered user-data came out 16 bytes past the guard's 512-byte margin
+    // under AWS's 16,384-byte cap. Given a real byte budget, the ALARMED
+    // names win and the unalarmed one is the one that goes -- which is this
+    // ratchet's own stated rule applied to its own exception. The counter is
+    // still emitted and still on the box's /metrics; only its CloudWatch
+    // series is gone, and live-lane-alarms.tf records that.
     assert_eq!(
         names.len(),
         76,
@@ -759,7 +804,16 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          explicitly forbids), the two unalarmed names were cut. That is the consistent call, \
          not a byte workaround: a metric shipped to CloudWatch with nothing watching it is \
          the paid-for-and-unwatched shape these very alarms were added to end. Both remain \
-         on /metrics for the operator console to scrape.); \
+         on /metrics for the operator console to scrape. \
+         \
+         2026-08-21, MINUS 2: tv_groww_spot1m_persist_errors_total and \
+         tv_groww_chain1m_persist_errors_total left the selector with the feed that \
+         wrote them. Both were persist-error counters on the Groww REST 1m legs, which \
+         the operator ordered removed entirely; with no producer they would have become \
+         permanently-empty paid series and two flat-zero dashboard lines that read as \
+         proof of health. Removed in lockstep with the two dashboard.tf widget rows and \
+         the /health runtime-subsystem rows, per the dated authorization in \
+         websocket-connection-scope-lock.md. -$0.60/mo.); \
          found {}: \
          {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
          budget actions STOP the prod box at 90% — update this count deliberately, \
@@ -802,7 +856,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         // a partial revert of the widening fails loudly instead of silently
         // shrinking the operator's only metric sink:
         "tv_spot1m_persist_errors_total", // Dhan REST leg persist failure
-        "tv_groww_chain1m_persist_errors_total", // Groww REST leg persist failure
+        "tv_chain1m_persist_errors_total", // Dhan chain leg persist failure
         "tv_cadence_ladder_exhausted_total", // retry ladder gave up = minute lost
         "tv_questdb_wal_suspended_tables", // QuestDB silently stops accepting writes
         "tv_order_audit_rows_discarded_total", // SEBI 5-yr audit row loss

@@ -38,7 +38,6 @@ futures-util = "=0.3.34"
 # ---- Section 3: Data Pipeline ----
 papaya = "=0.2.4"
 crossbeam-channel = "=0.5.16"
-rtrb = "=0.3.4"
 # ringbuf removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers — hot-path ring buffers use rtrb + crossbeam-channel.
 # Wave 6 Sub-PR #1 (2026-05-10): per-cell mutex for the multi-TF
@@ -61,7 +60,6 @@ questdb-rs = { version = "=6.1.0", features = ["chrono_timestamp"] }
 # ---- Section 5: Observability — Metrics ----
 metrics = "=0.24.6"
 metrics-exporter-prometheus = "=0.18.3"
-quanta = "=0.12.6"
 
 # ---- Section 5: Observability — OpenTelemetry ----
 # The 4 otel crates are a MATCHED SET: tracing-opentelemetry 0.33.0 depends on
@@ -130,16 +128,12 @@ sha2 = "=0.11.0"
 # and should NOT target core 0 — that core services network interrupts, so
 # pinning the decoder there puts it in contention with the softirq work it
 # depends on. See the dated correction in operator-charter-forever.md.
-memmap2 = "=0.9.11"
 notify = "=8.2.0"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
 # declares it with { workspace = true } (via machete ignore list) for a
 # Windows-only code path we might enable later.
-signal-hook = "=0.4.4"
-sd-notify = "=0.5.0"
 ahash = "=0.8.12"
-nohash-hasher = "=0.2.0"
 arrayvec = "=0.7.8"
 
 # ---- Section 14: Security & Secrets ----
@@ -255,20 +249,17 @@ percent-encoding = "=2.3.2"
 form_urlencoded = "=1.2.2"
 
 # ---- Section 16: CLI ----
-clap = { version = "=4.6.6", features = ["derive"] }
 
 # ---- Section 17: Unique IDs ----
 uuid = { version = "=1.24.1", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
-teloxide = { version = "=0.17.0", features = ["macros"] }
 
 # ---- Section 13: Dev/Test Dependencies ----
 criterion = { version = "=0.8.2", features = ["html_reports"] }
 proptest = "=1.11.0"
 loom = "=0.7.2"
 dhat = "=0.3.3"
-tokio-test = "=0.4.5"
 
 # Build Profiles
 

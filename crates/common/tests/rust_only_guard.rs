@@ -760,27 +760,123 @@ const NODE_FAMILY: &[&str] = &[
     "node", "npx", "npm", "yarn", "pnpm", "deno", "bun", "ruby", "gem", "php", "lua",
 ];
 
+/// Words that INTRODUCE a command without being one, so whatever follows them
+/// is still in command position.
+///
+/// `sudo`/`exec`/`env`/`command`/`time`/`nohup`/`xargs` are shell wrappers;
+/// `RUN`/`CMD`/`ENTRYPOINT`/`SHELL` are Dockerfile verbs. `echo` is
+/// deliberately ABSENT — `echo "SSM managed node"` is prose, and treating a
+/// printer as a wrapper is how this check would start reporting sentences.
+const COMMAND_INTRODUCERS: &[&str] = &[
+    "sudo",
+    "exec",
+    "env",
+    "command",
+    "time",
+    "nohup",
+    "xargs",
+    "RUN",
+    "CMD",
+    "ENTRYPOINT",
+    "SHELL",
+];
+
 /// Does `token` start a COMMAND at byte offset `at` within `line`?
 ///
 /// Command position is what separates an invocation from a mention. Checking it
 /// is why this guard can ban a runtime that the word "node" also names in
 /// ordinary English prose about AWS.
+///
+/// # Why this PARSES the prefix instead of listing suffixes
+///
+/// It used to ask whether the text before the token ENDED WITH one of nine
+/// strings (`|`, `&&`, `||`, `;`, `$(`, `(`, backtick, `"command":`, `"`).
+/// That is the same enumerate-the-known-shapes design that this lock's §0.1
+/// and §0.2 record failing six times, and it failed here too: `run: npx …`
+/// (the dominant single-line CI form), `RUN npm ci` (Dockerfile),
+/// `ExecStart=/usr/bin/node …` (systemd), and `sudo`/`exec`/`env` prefixes all
+/// end with none of the nine — so eleven runtimes whose ONLY detector this is
+/// were invisible in every one of those forms.
+///
+/// So the question changed from "does the prefix end with a known separator?"
+/// to "is the prefix ENTIRELY made of things that precede a command?". The
+/// second question has a bounded answer; the first has an endless list.
+///
+/// Consumed, repeatedly, until nothing is left (⇒ command position) or
+/// something unrecognised is (⇒ prose):
+/// - a YAML list marker (`- `)
+/// - a key ending in `:` — `run:`, `command:`, `"command":`, `entrypoint:` —
+///   rejecting anything containing `//` so a URL is never mistaken for a key
+/// - an assignment ending in `=` — `ExecStart=`, `FOO=bar`
+/// - an opening quote
+/// - a [`COMMAND_INTRODUCERS`] word
+/// - a trailing PATH (`/usr/bin/`, `./node_modules/.bin/`) — an absolute or
+///   relative path to a binary is an invocation, not a mention
 fn is_command_position(line: &str, at: usize) -> bool {
     let before = line[..at].trim_end();
     if before.is_empty() {
         return true;
     }
-    // JSON `"command": "npx"` — the invocation form in `.mcp.json`.
-    if before.ends_with("\"command\":") || before.ends_with('"') && before.contains("\"command\"") {
-        return true;
+
+    // Start from the LAST shell separator: everything after it is a fresh
+    // command, whatever came before.
+    // `=` is a separator so `ExecStart=/usr/bin/node` resolves: the systemd
+    // form puts the binary after an assignment, and everything after the last
+    // `=` is a fresh command line.
+    //
+    // HONEST LIMIT: an env-var PREFIX (`FOO=bar node app.js`) is NOT covered —
+    // after the split the remainder is `bar`, a bare word, and accepting bare
+    // words would make `managed node` a hit. A miss here is a false negative;
+    // accepting it would be a false-positive engine, and this guard survives
+    // only while its first act is never a false positive.
+    let sep_end = ["|", "&&", "||", ";", "$(", "(", "`", "=", "\n"]
+        .iter()
+        .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
+        .max()
+        .unwrap_or(0);
+    let mut seg = before[sep_end..].trim();
+
+    // Bounded: every arm strictly shortens `seg`, and the loop returns the
+    // moment it cannot.
+    loop {
+        if seg.is_empty() {
+            return true;
+        }
+        let next = if let Some(rest) = seg.strip_prefix("- ") {
+            rest
+        } else if seg.ends_with('"') || seg.ends_with('\'') {
+            // The token's OWN opening quote: `"command": "` before `npx`.
+            &seg[..seg.len() - 1]
+        } else if let Some(rest) = seg.strip_prefix(['"', '\'']) {
+            rest
+        } else if seg.ends_with(':') && !seg.contains("//") {
+            ""
+        } else if seg.ends_with('=') {
+            ""
+        } else if seg.ends_with('/') && seg.starts_with(['/', '.', '~']) {
+            // A path to a binary: `/usr/bin/`, `./node_modules/.bin/`.
+            ""
+        } else if let Some(word) = COMMAND_INTRODUCERS
+            .iter()
+            // `r.is_empty()` matters: `before` is trim_end()'d, so a wrapper
+            // that is the WHOLE prefix — `RUN` in `RUN npm ci`, `sudo` in
+            // `sudo npm install` — arrives with no trailing space.
+            .find(|w| {
+                seg.strip_prefix(**w)
+                    .is_some_and(|r| r.is_empty() || r.starts_with(' '))
+            })
+        {
+            &seg[word.len()..]
+        } else {
+            return false;
+        };
+        let trimmed = next.trim();
+        if trimmed.len() >= seg.len() {
+            // Defensive: never spin on an arm that failed to shorten.
+            return false;
+        }
+        seg = trimmed;
     }
-    before.ends_with('|')
-        || before.ends_with("&&")
-        || before.ends_with("||")
-        || before.ends_with(';')
-        || before.ends_with("$(")
-        || before.ends_with('(')
-        || before.ends_with('`')
 }
 
 /// Count node-family invocations in COMMAND POSITION on non-comment lines.
@@ -1504,6 +1600,58 @@ fn guard_self_test() {
             0,
             "self-test: `{prose}` MENTIONS a node-family word without invoking one — \
              counting it would make this guard a false-positive engine"
+        );
+    }
+
+    // SCOPE FIX #10 (2026-08-21) — the six forms the SUFFIX LIST could not see.
+    //
+    // `is_command_position` used to ask whether the prefix ENDED WITH one of
+    // nine strings. Every form below ends with none of them, so eleven runtimes
+    // whose only detector this is were invisible in the DOMINANT CI form, the
+    // Dockerfile form, and the systemd form simultaneously. Each was verified
+    // to count 0 before the parser replaced the list, and 1 after.
+    for invocation in [
+        "        run: npx -y @scope/pkg",
+        "        run: node build.js",
+        "      - run: npm ci",
+        "RUN npm ci",
+        "CMD node server.js",
+        "ExecStart=/usr/bin/node /opt/app.js",
+        "sudo npm install -g pkg",
+        "exec node app.js",
+        "env node app.js",
+        "  command: yarn start",
+    ] {
+        assert_eq!(
+            count_node_invocations(invocation),
+            1,
+            "self-test: `{invocation}` is a node-family INVOCATION in command \
+             position and must be counted — this is the class the old suffix \
+             list missed for eleven runtimes at once"
+        );
+    }
+
+    // The false-POSITIVE half of the SAME fix. Widening command position is
+    // exactly how a guard starts reporting sentences, and a guard whose first
+    // act is a false positive teaches the reader to allowlist it. `echo` is
+    // deliberately not a command introducer for this reason.
+    for prose in [
+        "echo \"SSM managed node online\"",
+        "  printf 'the node is healthy'",
+        "# ExecStart would run node here",
+        "  description: the node pool scales",
+        "  see https://example.com/node/docs",
+        "let x = deno_ish_variable;",
+        // `node_modules` is not `node`: the whole-word check must reject a
+        // path that merely CONTAINS the runtime name. This fixture started
+        // life on the must-count list by mistake, and the guard was right.
+        "./node_modules/.bin/tool",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: `{prose}` MENTIONS a node-family word without invoking \
+             one — the parser must not widen into prose"
         );
     }
 
