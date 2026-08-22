@@ -1285,7 +1285,7 @@ fn main() {
     // How many DISTINCT files the codes actually resolve to. Far fewer than the
     // files on disk, because many codes share a runbook -- so "90 runbooks"
     // never meant "90 destinations", and the page said it did.
-    let runbook_targets = {
+    let runbook_target_paths: Vec<String> = {
         let mut t: Vec<&str> = error_code_src
             .match_indices("\"docs/")
             .filter_map(|(i, _)| {
@@ -1297,7 +1297,49 @@ fn main() {
             .collect();
         t.sort_unstable();
         t.dedup();
-        t.len()
+        t.into_iter().map(str::to_string).collect()
+    };
+    let runbook_targets = runbook_target_paths.len();
+
+    // Do the runbooks a REACHABLE code points to still name files that exist?
+    //
+    // Scoped to reachable codes on purpose. Plenty of runbooks cover retired
+    // subsystems and legitimately name deleted modules in their retirement
+    // notes -- that is correct history, not rot. What matters is the runbook an
+    // operator is sent to at 3am by a code that can still fire.
+    //
+    // Reported, NOT gated. The citations are a mix of live pointers, dated
+    // history ("previously logged this"), and machine-read frontmatter, and
+    // telling them apart needs judgement. A blanket assertion would fail on
+    // correct retirement notes, and a guard whose first act is a false positive
+    // gets allowlisted within a week. So this row makes the number visible
+    // every run and leaves the cleanup a deliberate decision.
+    let (runbook_citations_total, runbook_citations_live) = {
+        let mut seen: Vec<String> = Vec::new();
+        let mut live = 0usize;
+        for rb in &runbook_target_paths {
+            let Ok(body) = std::fs::read_to_string(rb) else {
+                continue;
+            };
+            let mut rest = body.as_str();
+            while let Some(i) = rest.find("crates/") {
+                let after = &rest[i..];
+                let end = after
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
+                    })
+                    .unwrap_or(after.len());
+                let cand = &after[..end];
+                if cand.ends_with(".rs") && !seen.iter().any(|s| s == cand) {
+                    seen.push(cand.to_string());
+                    if std::path::Path::new(cand).exists() {
+                        live += 1;
+                    }
+                }
+                rest = &after[end.max(1)..];
+            }
+        }
+        (seen.len(), live)
     };
 
     let tf = std::fs::read_dir("deploy/aws/terraform")
@@ -1404,6 +1446,12 @@ fn main() {
             Verdict::Guaranteed,
             format!("{runbook_targets}"),
             "many codes share one runbook — files on disk is not destinations",
+        ),
+        Row::new(
+            "Distinct source paths cited in runbooks",
+            Verdict::Bounded,
+            format!("{runbook_citations_live} of {runbook_citations_total}"),
+            "in every runbook a code points to — the rest name deleted files",
         ),
         Row::new(
             "Metrics shipped to CloudWatch",
