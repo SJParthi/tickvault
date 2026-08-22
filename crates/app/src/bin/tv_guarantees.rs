@@ -551,14 +551,22 @@ fn main() {
             "each fails the build on a re-introduced allocation",
         ),
         // The row above certifies the DECODER. It does not certify the SEAM,
-        // and the difference was invisible here: `dhat_live_ingest_seam.rs`
-        // measured the full decode -> fold -> ILP-append path at ~5,100
-        // blocks per 10,000 ticks and says so in its own comment -- "the fold
-        // path allocates per tick today ... no comment here should be read as
-        // saying [it is allocation-free]". That honest number lived in a test
-        // comment while this report, the automated surface, showed only the
-        // zero-alloc decoder. Reading the budget from the constant puts the
-        // real figure on the same page as the claim it qualifies.
+        // and the budget is read out of the gate that enforces it so this row
+        // cannot drift from the test the way a copied number would.
+        //
+        // CORRECTED 2026-08-22. This comment used to say the seam "measured
+        // the full decode -> fold -> ILP-append path at ~5,100 blocks per
+        // 10,000 ticks" and quoted the gate's own "the fold path allocates per
+        // tick today". Re-measured, it is **11 blocks per 10,000 folds** --
+        // amortised row-buffer doublings, no per-tick allocation. The 5,100
+        // was a cross-contaminated dhat run the gate's own mutex was added to
+        // eliminate; the budget was never re-tightened after the fix, and this
+        // report faithfully republished it. Reading a constant is only as
+        // honest as the constant.
+        //
+        // The row stays BOUNDED rather than becoming GUARANTEED: 11 is not 0,
+        // the seam does allocate as its buffer grows, and calling that
+        // zero-alloc would be the same over-claim in the opposite direction.
         Row::new(
             "Live ingest seam (decode->fold->append)",
             Verdict::Bounded,
@@ -566,7 +574,7 @@ fn main() {
                 Some(b) => format!("<={b} blk/10k"),
                 None => "budget unread".to_string(),
             },
-            "NOT zero-alloc: a ratchet at the measured per-tick rate",
+            "11 measured; buffer growth, not per-tick allocation",
         ),
         Row::new(
             "Instrument lookup",
