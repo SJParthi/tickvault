@@ -4406,15 +4406,39 @@ pub const DEPTH_ATTACH_RETRY_SECS: u64 = 60;
 /// 09:11:20 with a `:50`-phase grid is dialed at **09:12:50**, past the line,
 /// for no reason but the sleep.
 ///
-/// Five seconds removes the grid as a failure mode: readiness now trails data
-/// availability by at most 5s instead of 60s, inside a 15-minute window that
-/// runs once a day. The cost is ~180 QuestDB reads spread over that window
-/// against the ~38 a normal morning already does — a cold-path read of a
-/// LATEST-ON query, off the tick path entirely.
+/// Fifteen seconds removes the grid as a failure mode: readiness now trails
+/// data availability by at most 15s instead of 59s. Data ready at 09:11:20 is
+/// on the wire by 09:11:35 — inside the line — where the 60s grid could have
+/// dialed at 09:12:50.
+///
+/// # Why 15 and not 5 (corrected before merge)
+///
+/// This constant was first written as 5, costed as "~180 QuestDB reads — a
+/// LATEST-ON query, off the tick path". That costing was wrong, and the error
+/// is worth recording because it is the shape that matters: I priced the
+/// cheapest thing an attempt does and ignored the expensive one.
+///
+/// Each attempt re-reads and re-parses the DAILY CONTRACT ARTIFACT —
+/// `contracts_in_artifact: 121674` in the 2026-08-21 production log, roughly
+/// 11 MB of JSON (Estimated: ~90 B/row; the file is not on this machine) — and
+/// the contract half of the SAME iteration parses it a second time, plus the
+/// ~4,600-row mapping artifact. So an attempt is two large JSON parses, not a
+/// database read. At 5s that is ~360 full parses inside the 15-minute window,
+/// competing for CPU with the drain that is folding pre-open ticks on a 4-vCPU
+/// box. 15s cuts that by two-thirds while still clearing 09:12 with margin.
+///
+/// # The real fix, deliberately not taken here
+///
+/// The artifact is immutable once written and keyed by date, so it should be
+/// parsed ONCE per day and shared, not per attempt — which would make even a
+/// 5s cadence nearly free. That means threading a cache through two loaders
+/// that each read the file internally, which is a wider change than the one
+/// this commit is making, and it should be measured rather than assumed.
 ///
 /// Deliberately NOT applied all session: after 09:15 nothing is racing a
-/// deadline, and a 5s poll would turn a benign all-day wait into 4,500 reads.
-pub const DEPTH_ATTACH_PREOPEN_RETRY_SECS: u64 = 5;
+/// deadline, and a fast poll would turn a benign all-day wait into thousands
+/// of parses.
+pub const DEPTH_ATTACH_PREOPEN_RETRY_SECS: u64 = 15;
 
 /// IST second-of-day past which the depth late-attach gives up for the session.
 ///
