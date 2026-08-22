@@ -495,10 +495,39 @@ Operator set a **hard maximum of $125/month on the AWS bill**. This is a
 SPENDING constraint, and it is recorded here before any terraform change per
 the rule-file-first law.
 
-**Where the bill actually stands.** The Quote 17 envelope puts the high-side
-estimate at **$112.72/mo** (pre-GST, the basis every §7 bill uses). So the
-constraint is **MET today** with $12.28 of room — nothing is over budget and
-nothing needs cutting to comply.
+**Where the bill actually stands — MEASURED 2026-08-22, not estimated.** The
+live account was read rather than the planning envelope trusted, because this
+file's own history shows an unverified assumption becoming a recorded fact
+(the 2026-08-12 "no AWS credentials" entry, which was false).
+
+| Reading | Value | Source |
+|---|---|---|
+| July 2026, full month | **$28.96** | `ce get-cost-and-usage` — the OLD box; the r8g.xlarge recreate was 2026-08-12 |
+| August 1–22 actual | **$39.80** | `budgets describe-budget` ActualSpend |
+| AWS forecast, August | **$65.13** | same — LOW because August is mostly pre-upgrade |
+| Aug 18 (weekday, pre-upgrade) | $2.50 | daily granularity |
+| Aug 19 (weekday, pre-upgrade) | $2.62 | " |
+| Aug 20 (IOPS raise applied mid-day) | $3.48 | " |
+| **Aug 21 (Fri — first FULL weekday on the new disk)** | **$4.06** | " |
+| Budget health | HEALTHY, limit $130 | `describe-budget` |
+
+The $1.56/day step between 19 and 21 August matches the Quote 16/17 list-price
+delta plus GST almost exactly ($1.26 × 1.18 = $1.49), which is what makes the
+$4.06 trustworthy as the new steady-state weekday rate rather than a spike.
+
+**Projected first FULL month on the current configuration:** 22 weekdays ×
+$4.06 + ~8 weekend days × ~$2.76 (the weekday rate less EC2 compute and the
+in-window Cost-Explorer polling, neither of which bills on a stopped box) =
+**~$111–113/month, tax included**.
+
+So the cap is **MET**, with roughly $12–14 of room. And the Quote 17 planning
+figure of $112.72 turns out to have been **accurate**, not inflated — which
+matters, because an intermediate draft of this section claimed the live data
+showed it overstated the bill by ~$16 and used that to justify flipping the
+ceiling to $125. That draft was wrong: it scaled the pre-upgrade month-to-date
+forward instead of the post-upgrade daily rate, and AWS's own $65.13 forecast
+looks reassuring for exactly the same reason. The terraform change was written,
+caught by re-deriving from the daily series, and reverted before it was pushed.
 
 **⚠ The trap, and why the ceiling was NOT flipped to 125 in the same breath.**
 `limit_amount` is not a reporting threshold. The budget's AUTOMATIC actions are
@@ -507,7 +536,7 @@ nothing needs cutting to comply.
 | limit_amount | 90% action line | vs the $112.72 high side |
 |---|---|---|
 | $130 (live) | $117.00 | $4.28 of room |
-| **$125** | **$112.50** | **$0.22 BELOW the bill — the box gets stopped mid-month** |
+| **$125** | **$112.50** | **AT or just under the projected $111–113 bill — the box gets stopped mid-month** |
 
 Setting the ceiling to the operator's cap would arm an automatic shutdown of
 the trading box inside a NORMAL high-side month. That is the exact reasoning
@@ -538,13 +567,20 @@ it; raises `limit_amount` above 125 without a fresh dated quote superseding
 this one; or changes the ceiling in fewer than the three lockstep sites
 (`budget.tf` + `budget-guards.tf` + `budget_digest.rs`).
 
-**⚠ UNRESOLVED, carried forward from Quotes 13 and 17 and NOT fixed by this
-record:** the 2026-07-31 ruling found BOTH `STOP_EC2_INSTANCES` actions in
-`EXECUTION_FAILURE`, and neither the 2026-08-12 nor this check could re-read
-them — `budgets:DescribeBudgetActionsForBudget` returns `AccessDeniedException`
-for `user/claude-code-agent`. If those actions are still failing, every ceiling
-number above is arithmetic about a switch that does not throw. That needs an
-identity with budgets read access, and it is the single most important open
+**⚠ RE-TESTED LIVE 2026-08-22 and STILL BLOCKED — carried forward from Quotes 13
+and 17:** the 2026-07-31 ruling found BOTH `STOP_EC2_INSTANCES` actions in
+`EXECUTION_FAILURE`, and this session ATTEMPTED the read rather than
+repeating the claim. The denial is verbatim: `User:
+arn:aws:iam::208384284948:user/claude-code-agent is not authorized to perform:
+budgets:DescribeBudgetActionsForBudget ... because no identity-based policy
+allows the ... action`.
+
+That wording matters. It is an IAM POLICY gap, not a missing credential — the
+same identity successfully ran `sts get-caller-identity`, `budgets
+describe-budget` and `ce get-cost-and-usage` minutes earlier. So the fix is one
+action added to the agent's policy, not new keys. If those two actions are
+still in `EXECUTION_FAILURE`, every ceiling number above is arithmetic about a
+switch that does not throw, and this remains the single most important open
 item on this whole surface.
 
 ---
