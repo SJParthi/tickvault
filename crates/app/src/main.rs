@@ -2223,6 +2223,18 @@ async fn async_main() -> Result<()> {
     )
     .await;
 
+    // Give the lane the `/health` websocket reporter BEFORE it dials, so the
+    // first socket that comes up is the one that arms the row.
+    //
+    // Without this the endpoint answered "retired — live feeds retired
+    // 2026-07-13/15" on a box running the REVIVED lane: `SystemHealthStatus`
+    // gates that row on whether any producer has ever pushed a count, the
+    // producer died with the old lane, and the revival never replaced it. A
+    // dead lane and a healthy one rendered identically on the endpoint whose
+    // whole job is telling them apart. The API side needed no change — its
+    // own doc calls the flag "arm-on-arrival"; this is the arrival.
+    tickvault_app::dhan_feed_stack::install_health_reporter(std::sync::Arc::clone(&health_status));
+
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
