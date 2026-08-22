@@ -767,7 +767,18 @@ resource "aws_cloudwatch_metric_alarm" "preopen_ready_late" {
   # so absent data is the normal off-hours state. A lane that never attaches at
   # all is a DIFFERENT alarm (dhan-no-ticks-flowing, breaching + gated).
   treat_missing_data = "notBreaching"
-  alarm_actions      = [aws_sns_topic.alerts.arn]
-  ok_actions         = [aws_sns_topic.alerts.arn]
-  tags               = local.common_tags
+  # `local.app_alarm_actions`, the same indirection every alarm in this repo
+  # uses — NOT a direct topic reference. The first draft wrote
+  # `aws_sns_topic.alerts.arn`, a resource that does not exist (the topic is
+  # `tv_alerts`, and nothing outside app-alarms.tf references it directly).
+  # Terraform plan caught it; `terraform validate` could not run locally
+  # because the provider registry is 403-blocked from the dev sandbox.
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions, deliberately — the discrete-emitter precedent set by the
+  # ok_recovery = false codes above. This metric is SPARSE: one datapoint per
+  # session. With treat_missing_data = notBreaching the alarm would flip back
+  # to OK about an hour after that datapoint ages out, which is not a
+  # recovery — nothing has been re-measured, and the next attach is a day
+  # away. A "recovered" page on that transition is the Rule-11 false-OK the
+  # locals comment above describes.
 }
