@@ -2066,6 +2066,22 @@ pub enum OmsError {
     )]
     OrderBookFull { tracked: usize, max: usize },
 
+    /// A broker-documented order tier (per-minute, per-hour, per-day) is spent.
+    ///
+    /// Added 2026-08-22. The vendor publishes four order ceilings -- 10/sec,
+    /// 250/min, 1000/hr, 7000/day -- and until now only the per-second one was
+    /// enforced. Never retried: these are the vendor.s limits, and exceeding
+    /// them is a regulatory risk rather than a transient failure.
+    #[error(
+        "order budget exhausted: the per-{tier} ceiling of {limit} is spent; \
+         {retry_after_secs}s until that window rolls. No order was sent."
+    )]
+    OrderBudgetExhausted {
+        tier: &'static str,
+        limit: u32,
+        retry_after_secs: u64,
+    },
+
     /// Circuit breaker is open (Dhan API unreachable).
     #[error("circuit breaker open: Dhan API temporarily unavailable")]
     CircuitBreakerOpen,
