@@ -612,6 +612,33 @@ locals {
       # crates/common/tests/error_code_paging_filter_drift_guard.rs.
       desc = "RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING from instruments it subscribed. The 30s silence scan found instruments quiet beyond their own learned cadence, or that never ticked at all - the second is the serious one, because a subscribe that silently did not take leaves NO other trace: no payload, no parse failure, no error, and every loss counter reads a healthy zero. Once per episode, session-gated so the legitimately-silent pre-open never pages. Triage on the dashboard live-lane row: never_ticked climbing means subscriptions are not taking (check tv_dhan_ws_subscribe_failed_total and the subscribe batches in the app log); silent climbing while never_ticked stays 0 is usually a thin universe on a quiet day, not a fault. Runbook: .claude/rules/project/gap-enforcement.md"
     }
+
+    # 2026-08-22 (operator: "Fix and resolve wvrytni fdude okay", given in direct
+    # response to a message naming this fix, its cost and that it needed his go —
+    # the §2.3c dated authorization).
+    #
+    # The pattern carries THREE conditions, not the usual two, and that is the
+    # whole design. WS-GAP-03 is the WebSocket connection-state code with ~50
+    # emit sites — every dial failure, reconnect and pool event uses it — so a
+    # bare `$.code = "WS-GAP-03"` filter would page on ordinary connection
+    # churn. That is the RISK-GAP-03 noise trap (25 pages in one session) with
+    # 50x the surface. `$.source = "fell_back_to_indices"` appears on exactly
+    # one ERROR emit: the universe-collapse arm in dhan_live_universe.rs. The
+    # sibling emits on that path are `info!`, so `$.level = "ERROR"` already
+    # excludes them; the source condition excludes the other 49 sites.
+    #
+    # ok_recovery = false, matching the discrete-event precedent above: the
+    # universe is chosen ONCE per boot, so an auto-OK an hour later means the
+    # datapoint aged out, never that the next session widened correctly.
+    "ws-gap-03-universe-collapse" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"fell_back_to_indices\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # chosen once per boot - an auto-OK means the datapoint aged out, not that the next session widened
+      desc = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 - a 99.98% loss of market data - and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
   }
 }
 

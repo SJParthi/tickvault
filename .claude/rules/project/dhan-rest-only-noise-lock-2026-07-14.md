@@ -550,3 +550,45 @@ falling below a floor during market hours. (b) Cheaper and rule-cheaper: add
 `WS-GAP-03` to the existing metric-filter set in `error-code-alarms.tf` — it reuses
 the log-filter machinery already in place, costs ~$0.10/mo, and needs no user-data
 byte. Either way the alarm itself needs the §3 dated quote first.
+
+#### §2.3c-i — 2026-08-22 AUTHORIZED AND SHIPPED (the dated quote §3 requires)
+
+**The verbatim operator authorization (2026-08-22, typed directly in-session):**
+
+> "Fix and resolve wvrytni fdude okay"
+
+Given in DIRECT response to a message that named this fix, priced it, and stated
+plainly that it needed his go: *"the cheaper fix — adding `WS-GAP-03` to the
+existing metric-filter set — is ~$0.10/mo, needs no user-data byte… Say the word
+and it's a small, contained change."* This row is the §3 dated quote, recorded
+BEFORE the terraform, per the rule-file-first law.
+
+**⚠ The fix that shipped is NOT the fix that quote authorized, and the difference
+matters.** The recommendation said "add WS-GAP-03 to the metric-filter set". Acting
+on it revealed that recommendation was WRONG: `WS-GAP-03` has **~50 emit sites** —
+every dial failure, reconnect and pool-supervisor event in the WebSocket layer
+carries it. A bare `$.code = "WS-GAP-03"` filter would page on ordinary connection
+churn, which is the RISK-GAP-03 noise trap this file records (25 pages in one
+session) with fifty times the surface. Recorded rather than quietly corrected,
+because the executor proposed it and the operator approved it on that description.
+
+**What shipped instead:** a THREE-condition pattern —
+`{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "fell_back_to_indices" }`.
+The `source` label appears on exactly one ERROR emit, the universe-collapse arm in
+`dhan_live_universe.rs`; the sibling emits on that path are `info!` and are already
+excluded by the level condition. So the alarm fires on the collapse and on nothing
+else. `ok_recovery = false`, matching the discrete-event precedent: the universe is
+chosen once per boot, so an auto-OK an hour later means the datapoint aged out, not
+that the next session widened correctly.
+
+**Family (5) therefore gains a SEVENTH signal.** Cost: one log-filter alarm on an
+existing metric-filter lane, ~$0.10/mo, no new EMF name and no user-data byte —
+which is why this route was taken over shipping the gauge (that path is still
+blocked at 33 bytes over the user-data budget, per §2.3c).
+
+**What this does NOT fix, and is not claimed:** the collapse is now PAGED, not
+PREVENTED. The 400–1,427-instrument margin, the UNCAPPED index chains, and the
+four-month-old measurement behind the "it fits" verdict are all unchanged. An
+operator woken by this alarm still has to decide whether to raise the cap or
+narrow the set. The gauge remains unshipped, so there is still no way to watch the
+number CREEP toward the cap — only to be told after it crossed.
