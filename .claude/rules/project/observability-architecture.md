@@ -57,7 +57,7 @@ migration (#O1/#O2/#O3) — the 2026-07-06 zero-page incident is why this list
 now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
-DH-901, DH-906 (term-match tripwire — no coded emit site
+**WS-GAP-03/universe-collapse (added 2026-08-22** — the universe-collapse arm ONLY, matched by a three-condition pattern including `$.source = "fell_back_to_indices"`; the bare code has ~50 connection-state emit sites and filtering on it alone would page on ordinary reconnect churn. Closes the gap where a fall back from ~24,600 instruments to 4 reported nothing: the 4 indices keep ticking, so the no-ticks alarm stays green. See `dhan-rest-only-noise-lock-2026-07-14.md` §2.3c**), DH-901, DH-906 (term-match tripwire — no coded emit site
 exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
 2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
 watchdog, died with the Groww live feed; see "Retired paging entries" below),
