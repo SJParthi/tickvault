@@ -706,11 +706,27 @@ pub fn should_keep_degraded_outcome(
 /// boot-synthesized deaths (a real crash day must never skip its restart
 /// floor) and never applies the latch to forced
 /// (`TICKVAULT_SCOREBOARD_NOW`) runs.
+///
+/// # The feed list is derived, never written out
+///
+/// This read `["dhan", "groww"]` until 2026-08-22. `Feed::ALL` had already
+/// become `[Dhan, Truedata]`, and the daily rows are keyed by
+/// `Feed::as_str()`, so the lookup asked for a key production can no longer
+/// contain. `is_some_and` on a missing key is `false`, so the whole predicate
+/// was `false` on every call and the latch was permanently dead -- re-running
+/// an already-vouched day and re-sending the duplicate Telegram card that the
+/// round-5 fix above exists to prevent.
+///
+/// The unit test asserted on `"groww"` keys too, so it stayed green while the
+/// function it covers could not fire. Both are now driven off `Feed::ALL`,
+/// which is what that constant's own doc has always demanded: "Build every
+/// iteration / allowed-list from this -- never a hand-written `[Feed::Dhan]`
+/// literal -- so a future feed cannot be silently dropped from a list."
 #[must_use]
 pub fn catchup_rerun_is_redundant(existing_outcomes: &BTreeMap<String, String>) -> bool {
-    ["dhan", "groww"].iter().all(|feed| {
+    tickvault_common::feed::Feed::ALL.iter().all(|feed| {
         existing_outcomes
-            .get(*feed)
+            .get(feed.as_str())
             .is_some_and(|o| o == "complete" || o == "feed_off")
     })
 }
@@ -6302,15 +6318,30 @@ mod tests {
         // latch permanently dead on single-feed profiles (every day is a
         // feed-off day there) and re-sent a duplicate card every evening
         // boot.
-        let both: BTreeMap<String, String> = [
-            ("dhan".to_string(), "complete".to_string()),
-            ("groww".to_string(), "complete".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        //
+        // 2026-08-22: every key below is derived from `Feed::ALL`. They were
+        // hand-written `"dhan"` / `"groww"` literals, so when `Feed::Groww`
+        // was removed this test kept passing on a key production can no
+        // longer produce -- while the function it covers returned `false` on
+        // every real call. A fixture that agrees with a deleted enum proves
+        // nothing about the code that ships.
+        let feeds: Vec<&str> = tickvault_common::feed::Feed::ALL
+            .iter()
+            .map(|f| f.as_str())
+            .collect();
+        assert!(
+            feeds.len() >= 2,
+            "this test needs at least two feeds to distinguish 'both terminal' \
+             from 'one terminal'"
+        );
+        let (first, second) = (feeds[0], feeds[1]);
+        let both: BTreeMap<String, String> = feeds
+            .iter()
+            .map(|f| ((*f).to_string(), "complete".to_string()))
+            .collect();
         assert!(catchup_rerun_is_redundant(&both));
         let mut single_feed = both.clone();
-        single_feed.insert("groww".to_string(), "feed_off".to_string());
+        single_feed.insert(second.to_string(), "feed_off".to_string());
         assert!(
             catchup_rerun_is_redundant(&single_feed),
             "{{complete, feed_off}} is terminal — the single-feed-profile \
@@ -6318,25 +6349,22 @@ mod tests {
         );
         for worse in ["partial", "degraded"] {
             let mut m = both.clone();
-            m.insert("groww".to_string(), worse.to_string());
+            m.insert(second.to_string(), worse.to_string());
             assert!(
                 !catchup_rerun_is_redundant(&m),
                 "{worse} days must re-run (partial may improve; degraded is \
                  keep-better-protected)"
             );
         }
-        let mixed: BTreeMap<String, String> = [
-            ("dhan".to_string(), "partial".to_string()),
-            ("groww".to_string(), "feed_off".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        let mut mixed = both.clone();
+        mixed.insert(first.to_string(), "partial".to_string());
+        mixed.insert(second.to_string(), "feed_off".to_string());
         assert!(
             !catchup_rerun_is_redundant(&mixed),
             "{{partial, feed_off}} still re-runs — the partial side may improve"
         );
         let mut one = both.clone();
-        one.remove("dhan");
+        one.remove(first);
         assert!(!catchup_rerun_is_redundant(&one), "a missing row re-runs");
         assert!(!catchup_rerun_is_redundant(&BTreeMap::new()));
     }
