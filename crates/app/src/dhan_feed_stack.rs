@@ -214,12 +214,50 @@ impl Drop for AliveConnectionGuard {
     }
 }
 
-/// Publish the alive-socket count.
+/// Where the lane reports its live socket count, so `/health` can answer
+/// "is the feed alive?" instead of "that subsystem was retired".
+///
+/// `SystemHealthStatus` gates its websocket row on whether ANY producer has
+/// ever pushed a count. That gate was added on 2026-08-09 for a good reason —
+/// with the lane deleted, the count sat at 0 forever and `/health` returned
+/// `degraded` on every single request, which is a verdict carrying no
+/// information. Its doc says the flag is "arm-on-arrival": the moment the
+/// revived lane pushes a count, the row reports for real with no edit needed
+/// on the API side.
+///
+/// The lane was revived (operator quotes 2026-08-09, default ON 2026-08-11)
+/// and never pushed. So on a box with `dhan_enabled = true` and sixteen
+/// sockets dialing, `/health` still rendered:
+///
+/// ```json
+/// "websocket": { "status": "retired", "detail": "live feeds retired 2026-07-13/15" }
+/// ```
+///
+/// A dead lane and a healthy lane rendered identically, on the endpoint
+/// scripts poll to tell them apart. This installs the missing producer.
+static HEALTH_REPORTER: std::sync::OnceLock<tickvault_api::state::SharedHealthStatus> =
+    std::sync::OnceLock::new();
+
+/// Install the `/health` websocket reporter. Returns `false` if one was
+/// already installed — first writer wins, same shape as
+/// [`install_crossverify_deps`].
+pub fn install_health_reporter(health: tickvault_api::state::SharedHealthStatus) -> bool {
+    HEALTH_REPORTER.set(health).is_ok()
+}
+
+/// Publish the alive-socket count -- to the gauge AND to `/health`.
+///
+/// Both edges of [`AliveConnectionGuard`] land here, so wiring the health push
+/// into this one function tracks every transition with no extra timer and no
+/// second source of truth to drift.
 fn publish_alive_connections(alive: usize) {
     // `u32::try_from` then `f64::from`: lossless by construction (bounded by
     // the 16-socket lock) and no lossy `as` cast to justify.
     metrics::gauge!(ALIVE_CONNECTIONS_GAUGE)
         .set(f64::from(u32::try_from(alive).unwrap_or(u32::MAX)));
+    if let Some(health) = HEALTH_REPORTER.get() {
+        health.set_websocket_connections(u64::try_from(alive).unwrap_or(u64::MAX));
+    }
 }
 
 /// Process-global once-guard: two feed stacks would fight over the same
@@ -5498,6 +5536,22 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
         report_unfolded_wal_frames(&params.wal_replay_live_feed, "duplicate_spawn");
         return None;
     }
+    // ARM the `/health` websocket row with the count as it stands right now
+    // (zero -- no socket has dialed yet).
+    //
+    // Without this the row only arms on the FIRST successful dial, so a lane
+    // that is enabled and dials NOTHING -- empty universe, every endpoint
+    // refused, credentials rejected -- reads `retired`: the same answer a box
+    // with the feature switched off gives. That is the worst permutation of
+    // the three, because it is the one where something is actually wrong.
+    // Armed here it reads `disconnected` with a count of 0, and
+    // `overall_status` degrades, which is the truth.
+    //
+    // Deliberately routed through `publish_alive_connections` rather than
+    // pushing 0 directly: one function owns the health push, so there is no
+    // second path to drift.
+    publish_alive_connections(ALIVE_CONNECTIONS.load(Ordering::SeqCst));
+
     // Installed BEFORE the bring-up task is spawned, so neither the silence
     // detector nor the 15:31 cross-verification can ever observe an empty cell
     // and fall back to its fail-open branch on a real trading day.
