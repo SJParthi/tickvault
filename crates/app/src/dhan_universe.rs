@@ -75,7 +75,15 @@ const RESPAWN_COUNTER: &str = "tv_dhan_universe_respawn_total";
 const BUILD_COUNTER: &str = "tv_dhan_universe_builds_total";
 
 /// Constituents resolved in the last successful build.
+///
+/// One row per `(index, symbol)` PAIR, so a stock in twelve index lists counts
+/// twelve times. Read [`DISTINCT_INSTRUMENTS_GAUGE`] for the number that
+/// decides how many instruments the feed subscribes.
 const RESOLVED_GAUGE: &str = "tv_dhan_universe_resolved_constituents";
+
+/// Distinct instruments in the last successful build — the number the live
+/// subscription actually dials, after I-P1-11 dedup.
+const DISTINCT_INSTRUMENTS_GAUGE: &str = "tv_dhan_universe_distinct_instruments";
 
 /// Unresolved fraction of the last successful build, in `[0, 1]`.
 ///
@@ -227,6 +235,23 @@ struct MappingArtifact {
     resolved: usize,
     unresolved: usize,
     unresolved_fraction: f64,
+    /// Distinct `(security_id, exchange_segment)` pairs across ALL mappings —
+    /// i.e. how many instruments the live feed will actually SUBSCRIBE.
+    ///
+    /// This is NOT `resolved` and the difference is large. `join_constituents`
+    /// dedups on `(index_name, security_id, segment)`, so a stock that belongs to
+    /// twelve NSE index lists produces TWELVE resolved rows. Summed over the 46
+    /// downloaded lists that inflates a real universe of roughly 750 NIFTY Total
+    /// Market stocks plus ~120 NSE indices into a `mappings` array of several
+    /// thousand entries.
+    ///
+    /// The subscribe path then dedups on the I-P1-11 composite key
+    /// (`dhan_live_universe::select_live_universe`), so the number of sockets and
+    /// instruments the lane opens has always followed THIS count, not `resolved`.
+    /// Nothing published it, so the only figure available to a reader was the
+    /// inflated one — and it was read, and recorded in a rule file, as "SIDs in
+    /// the live set". A count that is five times the truth is worse than no count.
+    distinct_instruments: usize,
     /// Every unresolved constituent, BY NAME. §31.1 item 4 requires the
     /// operator can see which security failed, not merely how many did.
     unresolved_detail: Vec<String>,
@@ -240,6 +265,20 @@ struct MappingEntry {
     isin: String,
     security_id: u64,
     exchange_segment: u8,
+}
+
+/// Distinct `(security_id, exchange_segment)` pairs in a mapping array.
+///
+/// The subscribe path (`dhan_live_universe::select_live_universe`) dedups on
+/// exactly this key, so this is the count of instruments the live feed will
+/// dial — the answer to "how many will actually be subscribed?", available at
+/// 08:30 from the artifact rather than only after the sockets come up.
+fn distinct_instrument_count(mappings: &[MappingEntry]) -> usize {
+    mappings
+        .iter()
+        .map(|m| (m.security_id, m.exchange_segment))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 /// Every NSE index in the master, as mapping entries.
@@ -724,6 +763,9 @@ fn write_mapping_atomic(
         resolved: outcome.resolved.len(),
         unresolved: outcome.unresolved.len(),
         unresolved_fraction: outcome.unresolved_fraction(),
+        // Filled below, once the NSE index entries have been appended: the
+        // count must cover the WHOLE mappings array, not just the join half.
+        distinct_instruments: 0,
         unresolved_detail: outcome
             .unresolved
             .iter()
@@ -756,6 +798,8 @@ fn write_mapping_atomic(
     let indices = nse_index_mappings(master);
     let index_count = indices.len();
     artifact.mappings.extend(indices);
+    artifact.distinct_instruments = distinct_instrument_count(&artifact.mappings);
+    metrics::gauge!(DISTINCT_INSTRUMENTS_GAUGE).set(artifact.distinct_instruments as f64);
     std::fs::create_dir_all(MAPPING_DIR)?;
     let path = mapping_artifact_path(date);
     let tmp = path.with_extension("json.tmp");
@@ -767,6 +811,7 @@ fn write_mapping_atomic(
         unresolved = artifact.unresolved,
         nse_indices = index_count,
         mappings = artifact.mappings.len(),
+        distinct_instruments = artifact.distinct_instruments,
         "instrument mapping written"
     );
     Ok(())
@@ -1213,6 +1258,49 @@ mod tests {
         use tickvault_core::instrument::master_csv::InstrumentClass;
         let master = vec![master_row(500, "RELIANCE", "NSE", InstrumentClass::Equity)];
         assert!(nse_index_mappings(&master).is_empty());
+    }
+
+    #[test]
+    fn distinct_instrument_count_collapses_a_stock_that_sits_in_many_indices() {
+        // The real shape: one stock (id 2885, NSE_EQ) is a member of three of
+        // the 46 downloaded index lists, so the join emits three rows for it.
+        let e = |index: &str, id: u64, seg: u8| MappingEntry {
+            index_name: index.to_owned(),
+            symbol: "RELIANCE".to_owned(),
+            isin: "INE002A01018".to_owned(),
+            security_id: id,
+            exchange_segment: seg,
+        };
+        let mappings = vec![
+            e("Nifty 50", 2885, 1),
+            e("Nifty 100", 2885, 1),
+            e("Nifty Total Market", 2885, 1),
+            e("NSE_INDEX", 13, 0),
+        ];
+        assert_eq!(
+            mappings.len(),
+            4,
+            "the artifact really does carry one row per (index, symbol) pair"
+        );
+        assert_eq!(
+            distinct_instrument_count(&mappings),
+            2,
+            "one stock plus one index — this is what the feed subscribes"
+        );
+    }
+
+    #[test]
+    fn distinct_instrument_count_keeps_one_id_that_appears_in_two_segments() {
+        // I-P1-11: the same numeric id in two segments is two instruments, and
+        // collapsing them would under-count the subscription.
+        let e = |id: u64, seg: u8| MappingEntry {
+            index_name: "x".to_owned(),
+            symbol: "x".to_owned(),
+            isin: String::new(),
+            security_id: id,
+            exchange_segment: seg,
+        };
+        assert_eq!(distinct_instrument_count(&[e(27, 0), e(27, 1)]), 2);
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! CREATE TABLE IF NOT EXISTS ws_event_audit (
 //!     ts                TIMESTAMP,  -- when the event happened (IST nanos)
 //!     trading_date_ist  TIMESTAMP,  -- the trading day (IST midnight)
+//!     feed              SYMBOL,     -- which broker feed the socket belongs to
 //!     ws_type           SYMBOL,     -- main_feed / depth_20 / depth_200 / order_update
 //!     connection_index  LONG,       -- 0..pool_size-1
 //!     pool_size         LONG,       -- configured conns of this ws_type (1 today, up to 5 later)
@@ -28,7 +29,7 @@
 //!     attempts          LONG,       -- reconnect attempts (0 otherwise)
 //!     market_hours      BOOLEAN     -- inside [09:00,15:30) IST
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, trading_date_ist, ws_type, connection_index, event_kind);
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed, ws_type, connection_index, event_kind);
 //! ```
 //!
 //! DEDUP key carries the designated timestamp `ts` (2026-04-28 regression rule)
