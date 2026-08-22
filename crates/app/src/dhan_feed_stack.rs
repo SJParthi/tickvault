@@ -4627,6 +4627,33 @@ pub const PREOPEN_READY_GAUGE: &str = "tv_dhan_preopen_ready_secs";
 /// and a contract re-selection running all day for nothing.
 pub const CONTRACT_TOPUP_CUTOFF_IST_SECS: u32 = 9 * 3_600 + 30 * 60;
 
+/// The most contracts ONE newly-priced underlying can legitimately add:
+/// ATM ± 25 strikes, both legs.
+///
+/// # The permutation this bounds — ATM DRIFT (found by audit 2026-08-22)
+///
+/// The top-up re-runs the whole contract selection, and that selection
+/// re-reads spot prices. A stock whose price crossed a strike boundary since
+/// the dial gets a *slid* ATM window: new strikes enter at one edge, and they
+/// are not in `sent_contracts`, so they look exactly like a late-priced
+/// stock's options to a plain set difference.
+///
+/// Between the 09:08-ish dial and 09:15 the market OPENS, which is precisely
+/// when prices jump — so on a normal Monday this is not a corner case, it is
+/// the expected state. Hundreds of already-subscribed stocks can each
+/// contribute a strike or two, and the resulting delta would spend the
+/// ~2,000 spare slots on re-centering nobody asked for, leaving nothing for
+/// the handful of stocks that have NO options at all.
+///
+/// Re-centering may well be desirable; it is not what #1797 was authorized to
+/// do, it was never measured, and it changes capacity behaviour on a loop
+/// that has never run in production. So the top-up refuses outright when the
+/// delta is bigger than the newly-priced underlyings can account for, and
+/// says so with the real numbers. The worst case is that it declines to act —
+/// which is exactly the behaviour before #1797, never worse.
+pub const MAX_CONTRACTS_PER_LATE_UNDERLYING: usize =
+    (2 * tickvault_common::constants::STOCK_OPTION_ATM_STRIKES_EACH_SIDE + 1) * 2;
+
 /// IST second-of-day past which the depth late-attach gives up for the session.
 ///
 /// 10:00 IST — 44 minutes after the option-chain leg's first fire. Past this,
@@ -4753,13 +4780,47 @@ fn top_up_late_contracts(
         usize,
     )],
     attempts: u32,
+    budget: usize,
 ) -> usize {
-    let delta: Vec<_> = selection
+    let candidate: Vec<_> = selection
         .iter()
         .filter(|i| !sent.contains(&contract_identity(i)))
         .copied()
         .collect();
-    if delta.is_empty() {
+    if candidate.is_empty() {
+        return 0;
+    }
+    // A SECOND dedup layer, matching the pool dial. `select_contract_universe`
+    // already dedups at source (its `chosen` set), and the pool path gets
+    // `dedup_subscribe_set` inside `build_feed_stack_plan` on top of that —
+    // but the top-up bypasses the planner and goes straight to `try_extend`,
+    // so without this it would run on ONE layer where the dial runs on two.
+    // A duplicate inside one payload is a double-subscribe the `sent` filter
+    // cannot see, because neither copy is on the wire yet.
+    let (delta, duplicates) = dedup_subscribe_set(&candidate);
+    if duplicates > 0 {
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            attempts,
+            duplicates,
+            "the contract selection produced duplicate instruments inside one top-up payload \
+             — deduped before the wire. This should be impossible (the selection dedups at \
+             source), so treat it as a selection regression, not a top-up quirk."
+        );
+    }
+    // ATM-DRIFT REFUSAL. See `MAX_CONTRACTS_PER_LATE_UNDERLYING`.
+    if delta.len() > budget {
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            attempts,
+            delta = delta.len(),
+            budget,
+            "REFUSING the whole late top-up: the delta is larger than the newly-priced \
+             underlyings can account for, which means it is dominated by ATM windows that \
+             SLID as prices moved, not by stocks that had no options at all. Subscribing it \
+             would spend the remaining slots on re-centering. Nothing was sent; the session \
+             keeps exactly what it dialed."
+        );
         return 0;
     }
     let mut cursor = 0usize;
@@ -4801,15 +4862,31 @@ fn top_up_late_contracts(
     }
     let unplaced = delta.len().saturating_sub(placed);
     if unplaced > 0 {
+        // TWO causes, one message until 2026-08-22 — and they send triage in
+        // opposite directions. An EMPTY `slots` means no connection ever
+        // registered a top-up channel at all: every dial failed, or the
+        // contract half was marked done without leaving a sender behind. That
+        // is a wiring failure with nothing to do with capacity, and blaming
+        // the 5 x 5,000 budget for it sends the operator hunting an overflow
+        // that does not exist. Found by the 2026-08-22 permutation sweep,
+        // which asked what this line says when there is nothing to send to.
+        let cause = if slots.is_empty() {
+            "no live connection ever registered a top-up channel — a WIRING failure, not a \
+             capacity one: the contract half reported done without leaving a sender behind"
+        } else {
+            "every main-feed connection is at its cap, which means the authorized universe no \
+             longer fits the 5 x 5,000 budget"
+        };
         error!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
             attempts,
             delta = delta.len(),
             placed,
             unplaced,
+            connections = slots.len(),
+            cause,
             "late-priced contracts had no room on any live connection — they are NOT \
-             subscribed this session. Every main-feed connection is at its cap, which means \
-             the authorized universe no longer fits the 5 x 5,000 budget."
+             subscribed this session"
         );
     } else {
         info!(
@@ -5047,6 +5124,10 @@ async fn attach_depth_when_available(
     // `return` that used to guarantee it.
     let mut readiness_published = false;
     let mut late_topped_up = 0usize;
+    // How many underlyings had NO spot price at the moment contracts dialed.
+    // The top-up's budget is derived from how far this figure has since
+    // fallen — see `MAX_CONTRACTS_PER_LATE_UNDERLYING`.
+    let mut dial_without_spot: Option<usize> = None;
     let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
@@ -5415,6 +5496,7 @@ async fn attach_depth_when_available(
                         for instrument in pool_contracts {
                             sent_contracts.insert(contract_identity(instrument));
                         }
+                        dial_without_spot = Some(contracts.underlyings_without_spot);
                         // Make them VISIBLE to the silence detector, at the
                         // moment they reach the wire and not before. Seeding a
                         // set that failed to dial would report silence for
@@ -5564,12 +5646,22 @@ async fn attach_depth_when_available(
         // Runs only on an iteration that did NOT dial contracts, so the very
         // attempt that fills `sent_contracts` never also scans it.
         if contracts_done && !dial_contracts && !contracts.instruments.is_empty() {
-            late_topped_up = late_topped_up.saturating_add(top_up_late_contracts(
-                &contracts.instruments,
-                &mut sent_contracts,
-                &mut live_topups,
-                attempts,
-            ));
+            // The budget is what the underlyings that NEWLY priced can
+            // account for. If none has priced since the dial there is nothing
+            // legitimate to add, and any delta present is drift — so the
+            // top-up does not even look.
+            let newly_priced = dial_without_spot
+                .unwrap_or(0)
+                .saturating_sub(contracts.underlyings_without_spot);
+            if newly_priced > 0 {
+                late_topped_up = late_topped_up.saturating_add(top_up_late_contracts(
+                    &contracts.instruments,
+                    &mut sent_contracts,
+                    &mut live_topups,
+                    attempts,
+                    newly_priced.saturating_mul(MAX_CONTRACTS_PER_LATE_UNDERLYING),
+                ));
+            }
         }
 
         // The ONLY success return.
@@ -7239,7 +7331,7 @@ mod tests {
             inst(3, ExchangeSegment::NseFno),
         ];
 
-        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 1, "only the instrument nobody has been told about");
         let got = rx.try_recv().expect("the delta must reach the channel");
@@ -7259,11 +7351,11 @@ mod tests {
         let selection = [inst(7, ExchangeSegment::NseFno)];
 
         assert_eq!(
-            top_up_late_contracts(&selection, &mut sent, &mut slots, 1),
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000),
             1
         );
         assert_eq!(
-            top_up_late_contracts(&selection, &mut sent, &mut slots, 2),
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 2, 10_000),
             0,
             "the loop re-selects every attempt; a second send of the same set is the exact \
              804 hazard this function exists to prevent"
@@ -7287,7 +7379,7 @@ mod tests {
             inst(42, ExchangeSegment::BseFno),
         ];
 
-        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(
             placed, 1,
@@ -7307,7 +7399,7 @@ mod tests {
         let mut slots = [(tx, 100)];
         let selection = [inst(9, ExchangeSegment::NseFno)];
 
-        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 0);
         assert!(
@@ -7327,7 +7419,7 @@ mod tests {
             .map(|id| inst(id, ExchangeSegment::NseFno))
             .collect();
 
-        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 5);
         assert_eq!(rx_first.try_recv().expect("first").len(), 2, "its room");
@@ -7344,11 +7436,185 @@ mod tests {
         let selection = [inst(11, ExchangeSegment::NseFno)];
 
         assert_eq!(
-            top_up_late_contracts(&selection, &mut sent, &mut slots, 1),
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000),
             0
         );
         assert!(sent.is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// No connection registered a top-up channel at all.
+    ///
+    /// Distinct from "every connection is at its cap" and NOT interchangeable
+    /// with it: this is a wiring failure, and until 2026-08-22 both produced
+    /// the same message blaming the 5 x 5,000 capacity budget. Pinned because
+    /// the two send triage in opposite directions.
+    #[test]
+    fn top_up_late_contracts_survives_no_registered_connection() {
+        let mut sent = std::collections::HashSet::new();
+        let mut slots: [(
+            tokio::sync::mpsc::Sender<
+                Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+            >,
+            usize,
+        ); 0] = [];
+        let selection = [inst(11, ExchangeSegment::NseFno)];
+
+        assert_eq!(
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000),
+            0,
+            "nothing can be placed with nowhere to place it"
+        );
+        assert!(
+            sent.is_empty(),
+            "and nothing may be recorded as subscribed — recording here would lock these \
+             contracts out of every later attempt"
+        );
+    }
+
+    /// The unplaced diagnostic must name WHICH of its two causes applies.
+    ///
+    /// A source scan rather than a log capture: the value under test is the
+    /// operator-facing wording, and a behavioural assertion on `tracing`
+    /// output would pin the harness rather than the message.
+    #[test]
+    fn top_up_unplaced_error_separates_wiring_from_capacity() {
+        // The test module is scanned OUT before searching. `include_str!`
+        // embeds this whole file, so a needle spelled here matches ITSELF and
+        // the guard can never fail. Written that way first, on 2026-08-22,
+        // and caught only because the bite-proof was actually run: collapsing
+        // the branch to `if false` left the test green.
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+        assert!(
+            src.contains("let cause = if slots.is_empty()"),
+            "the unplaced error must branch on whether any connection exists"
+        );
+        assert!(
+            src.contains("a WIRING failure, not a"),
+            "the empty-slots branch must say it is NOT a capacity problem"
+        );
+        assert!(
+            src.contains("every main-feed connection is at its cap"),
+            "the genuine capacity branch must survive"
+        );
+    }
+
+    #[test]
+    fn top_up_late_contracts_refuses_a_delta_that_atm_drift_would_explain() {
+        // One underlying priced since the dial, so at most 102 contracts are
+        // legitimate. A 500-instrument delta means the ATM windows of already
+        // subscribed stocks SLID as the market opened — subscribing it would
+        // spend the remaining slots on re-centering nobody authorized.
+        let mut sent = std::collections::HashSet::new();
+        let (slot, mut rx) = topup_slot(10_000);
+        let mut slots = [slot];
+        let selection: Vec<_> = (1..=500)
+            .map(|id| inst(id, ExchangeSegment::NseFno))
+            .collect();
+
+        let placed = top_up_late_contracts(
+            &selection,
+            &mut sent,
+            &mut slots,
+            1,
+            MAX_CONTRACTS_PER_LATE_UNDERLYING,
+        );
+
+        assert_eq!(placed, 0, "refused whole, never partially");
+        assert!(
+            sent.is_empty(),
+            "a refused top-up must leave the session exactly as it dialed"
+        );
+        assert!(rx.try_recv().is_err(), "nothing may reach the wire");
+    }
+
+    #[test]
+    fn top_up_late_contracts_accepts_a_delta_inside_the_late_underlying_budget() {
+        let mut sent = std::collections::HashSet::new();
+        let (slot, _rx) = topup_slot(10_000);
+        let mut slots = [slot];
+        let selection: Vec<_> = (1..=MAX_CONTRACTS_PER_LATE_UNDERLYING as u64)
+            .map(|id| inst(id, ExchangeSegment::NseFno))
+            .collect();
+
+        let placed = top_up_late_contracts(
+            &selection,
+            &mut sent,
+            &mut slots,
+            1,
+            MAX_CONTRACTS_PER_LATE_UNDERLYING,
+        );
+
+        assert_eq!(
+            placed, MAX_CONTRACTS_PER_LATE_UNDERLYING,
+            "exactly at the budget is legitimate, not refused"
+        );
+    }
+
+    #[test]
+    fn top_up_late_contracts_dedups_within_one_payload() {
+        // The `sent` filter cannot catch this: neither copy is on the wire
+        // yet, so both survive the set difference. The pool dial gets a
+        // second dedup layer from the planner; the top-up bypasses it.
+        let mut sent = std::collections::HashSet::new();
+        let (slot, mut rx) = topup_slot(100);
+        let mut slots = [slot];
+        let selection = [
+            inst(5, ExchangeSegment::NseFno),
+            inst(5, ExchangeSegment::NseFno),
+            inst(6, ExchangeSegment::NseFno),
+        ];
+
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
+
+        assert_eq!(placed, 2, "the repeat must not reach the wire");
+        let got = rx.try_recv().expect("a send");
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.iter().filter(|i| i.security_id == 5).count(),
+            1,
+            "a duplicate inside one payload is a double-subscribe, which Dhan answers with \
+             804 by dropping the connection"
+        );
+    }
+
+    #[test]
+    fn max_contracts_per_late_underlying_is_the_atm_window_on_both_legs() {
+        assert_eq!(
+            MAX_CONTRACTS_PER_LATE_UNDERLYING,
+            (2 * tickvault_common::constants::STOCK_OPTION_ATM_STRIKES_EACH_SIDE + 1) * 2
+        );
+        assert_eq!(
+            MAX_CONTRACTS_PER_LATE_UNDERLYING, 102,
+            "ATM +/- 25, CE + PE"
+        );
+    }
+
+    #[test]
+    fn the_top_up_budget_is_derived_from_underlyings_that_newly_priced() {
+        // Source scan: the budget must come from the FALL in
+        // `underlyings_without_spot` since the dial. Deriving it from
+        // anything else (the raw count, a constant, the delta itself) makes
+        // the drift refusal vacuous.
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+        assert!(
+            src.contains("let newly_priced = dial_without_spot")
+                && src.contains(".saturating_sub(contracts.underlyings_without_spot)"),
+            "the budget must be the FALL in underlyings_without_spot since the dial"
+        );
+        assert!(
+            src.contains("if newly_priced > 0 {"),
+            "no underlying priced since the dial means nothing legitimate to add — the \
+             top-up must not even look, because any delta present is pure drift"
+        );
+        assert!(
+            src.contains("newly_priced.saturating_mul(MAX_CONTRACTS_PER_LATE_UNDERLYING)"),
+            "the budget is per-underlying, so it must scale with how many priced"
+        );
     }
 
     #[test]
