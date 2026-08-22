@@ -176,6 +176,65 @@ fn count_third_party_actions() -> usize {
     seen.len()
 }
 
+/// `(total ErrorCode variants, how many have a real emit site)`.
+///
+/// Both halves, because they are different claims. "173 typed error codes"
+/// reads as 173 failure modes the system can report; 68 of them are residue
+/// from deleted subsystems (the Groww sidecar, the depth writers, the Dhan
+/// data-API family) and can never fire. Reporting only the total is the same
+/// mistake the alarm row made until 2026-08-22: counting declarations and
+/// calling it a measurement.
+///
+/// A dead variant is NOT a defect on its own — it costs nothing at runtime and
+/// `error_code_rule_file_crossref` still holds it to a documented runbook. It
+/// becomes one only if something ALARMS on it, and the paging drift guard
+/// already fails the build for exactly that ("a CODED tf entry with ZERO real
+/// emit sites"). Measured 2026-08-22: none of the 68 is alarmed.
+fn error_code_liveness(root: &Path) -> (usize, usize) {
+    let enum_src =
+        std::fs::read_to_string(root.join("crates/common/src/error_code.rs")).unwrap_or_default();
+    // Variant lines are exactly four-space-indented `Name,` inside the enum.
+    let variants: Vec<String> = enum_src
+        .lines()
+        .filter_map(|l| {
+            let t = l.strip_prefix("    ")?.strip_suffix(',')?;
+            let first = t.chars().next()?;
+            (first.is_ascii_uppercase() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .then(|| t.to_string())
+        })
+        .collect();
+
+    // Every Rust source EXCEPT the enum's own file: `Self::X =>` arms inside
+    // error_code.rs are the definition, not a place that reports a failure.
+    fn slurp(dir: &Path, acc: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                slurp(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_none_or(|n| n != "error_code.rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                acc.push_str(&text);
+                acc.push('\n');
+            }
+        }
+    }
+    let mut sources = String::new();
+    slurp(&root.join("crates"), &mut sources);
+
+    let live = variants
+        .iter()
+        .filter(|v| sources.contains(&format!("ErrorCode::{v}")))
+        .count();
+    (variants.len(), live)
+}
 /// Count occurrences of a needle across a directory tree of `.rs` files.
 ///
 /// Walks with `std::fs` rather than shelling out to a search tool, so the
@@ -1414,6 +1473,8 @@ fn main() {
         .unwrap_or(0);
     let emitted = distinct_tv_names(Path::new("crates"));
 
+    let (total_codes, live_codes) = error_code_liveness(Path::new("."));
+
     let observability = vec![
         Row::new(
             "Typed error codes",
@@ -1432,7 +1493,13 @@ fn main() {
             "the rest are searchable but cannot fire — measured, not deleted",
         ),
         Row::new(
-            "Runbook files on disk",
+            "Error codes that can actually fire",
+            Verdict::Bounded,
+            format!("{live_codes} of {total_codes}"),
+            "the rest are retired-subsystem residue with no emit site; NONE is alarmed",
+        ),
+        Row::new(
+            "Written runbooks",
             if runbooks > 0 {
                 Verdict::Guaranteed
             } else {
