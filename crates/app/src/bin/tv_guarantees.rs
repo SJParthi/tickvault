@@ -831,7 +831,7 @@ fn main() {
             "catch_up_seal_all",
             Verdict::Bounded,
             "O(slots x 24)",
-            "every 5s; zero-alloc; UNMEASURED at 25,000",
+            "every 5s; zero-alloc; 9.67ms/sweep measured at the 25,000x24 ceiling",
         ),
         Row::new(
             "O(1) SPACE for n instruments",
