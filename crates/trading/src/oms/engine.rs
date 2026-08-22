@@ -252,6 +252,60 @@ struct HaltInfo {
 }
 
 impl OrderManagementSystem {
+    /// Hard ceiling on orders tracked in memory for one trading day.
+    ///
+    /// # Why this exists (added 2026-08-22)
+    ///
+    /// `orders`, `super_orders` and `verify_states` had no cap, and the daily
+    /// bound both `CLAUDE.md` and the workspace O(1) table attributed to them
+    /// -- "bounded by the 7,000/day order GCRA" -- **does not exist**.
+    /// `OrderRateLimiter::check` enforces orders-per-SECOND only, and
+    /// `DailyRequestTracker`, named in the OMS-GAP-04 rule text as the
+    /// 5,000-orders/day enforcer, has zero occurrences in this workspace.
+    ///
+    /// So the real bound was `reset_daily()` plus the box being switched off
+    /// at 17:30. At the per-second limit that is on the order of 324,000
+    /// tracked orders across a nine-hour session, each holding an owned
+    /// `String` id and a `ManagedOrder`. The re-index on
+    /// `handle_order_update` can hold a second entry for the same order, so
+    /// the true figure is worse than the count of orders placed.
+    ///
+    /// # Why refusal is correct here, unlike the risk engine
+    ///
+    /// `RiskEngine` records a fill for a position we already HOLD, so
+    /// refusing there would hide a real leg and it halts instead. An order
+    /// placement is different: refusing happens BEFORE the order exists, so
+    /// nothing is held that the book has not recorded. Refusal is therefore
+    /// the strictly safe direction, and it is checked beside the existing
+    /// rate-limit gate rather than at the insert, so no API call is made.
+    ///
+    /// Set to 25,000 -- the same figure every other per-entity ceiling in this
+    /// workspace uses, and comfortably above any legitimate day.
+    pub const MAX_TRACKED_ORDERS: usize = 25_000;
+
+    /// Refuses a placement once the day's order book is full.
+    ///
+    /// Called beside `rate_limiter.check()` on every placement path so a
+    /// refusal costs no API call and creates no order.
+    fn check_order_book_capacity(&self) -> Result<(), OmsError> {
+        let tracked = self.orders.len();
+        if tracked >= Self::MAX_TRACKED_ORDERS {
+            metrics::counter!("tv_oms_order_book_full_total").increment(1);
+            tracing::error!(
+                tracked,
+                max = Self::MAX_TRACKED_ORDERS,
+                "OMS order book is FULL for today - refusing the placement. No \
+                 order was sent, so nothing is held that the book has not \
+                 recorded. Cleared by the daily reset."
+            );
+            return Err(OmsError::OrderBookFull {
+                tracked,
+                max: Self::MAX_TRACKED_ORDERS,
+            });
+        }
+        Ok(())
+    }
+
     /// Creates a new OMS in **dry-run mode** (default).
     ///
     /// In dry-run mode, no HTTP calls are ever made to Dhan. All orders
@@ -595,6 +649,8 @@ impl OrderManagementSystem {
         validate_order_fields(&request)?;
 
         // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
+        self.check_order_book_capacity()?;
+
         if let Err(err) = self.rate_limiter.check() {
             self.fire_alert(OmsAlert::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
@@ -852,6 +908,8 @@ impl OrderManagementSystem {
         validate_disclosed_quantity(request.quantity, request.disclosed_quantity)
             .map_err(|reason| OmsError::RiskRejected { reason })?;
 
+        self.check_order_book_capacity()?;
+
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
 
@@ -958,6 +1016,8 @@ impl OrderManagementSystem {
                 status: order.status.as_str().to_owned(),
             });
         }
+
+        self.check_order_book_capacity()?;
 
         self.rate_limiter.check()?;
         self.circuit_breaker.check()?;
@@ -2660,6 +2720,7 @@ impl OrderManagementSystem {
         }
 
         // Step 1: the probe consumes the shared GCRA — dry-run included.
+        self.check_order_book_capacity()?;
         self.rate_limiter.check()?;
 
         // ---- DRY-RUN: tracked paper order ⇒ deterministic verdict, no HTTP ----
@@ -2795,6 +2856,8 @@ impl OrderManagementSystem {
     /// Steps 1+2 of the pinned skeleton: rate limiter then circuit breaker,
     /// with the place_order alert semantics.
     fn check_order_gates(&self) -> Result<(), OmsError> {
+        self.check_order_book_capacity()?;
+
         if let Err(err) = self.rate_limiter.check() {
             self.fire_alert(OmsAlert::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
@@ -8523,5 +8586,77 @@ mod tests {
         assert!(oms.super_order("PAPER-SO-1").is_none());
         assert!(oms.verify_states.is_empty());
         assert!(oms.all_orders().is_empty());
+    }
+
+    // -- 2026-08-22: the order book is bounded -------------------------------
+
+    fn capacity_test_oms() -> OrderManagementSystem {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        )
+    }
+
+    #[test]
+    fn order_book_capacity_refuses_before_any_api_call() {
+        // The daily bound two documents attributed to these maps did not
+        // exist: OrderRateLimiter is per-SECOND, and DailyRequestTracker has
+        // zero occurrences anywhere in this workspace. This is the bound that
+        // actually does, and it refuses BEFORE the placement so no order can
+        // exist that the book has not recorded.
+        let mut oms = capacity_test_oms();
+        for i in 0..OrderManagementSystem::MAX_TRACKED_ORDERS {
+            oms.orders.insert(
+                format!("O{i}"),
+                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
+            );
+        }
+        match oms.check_order_book_capacity() {
+            Err(OmsError::OrderBookFull { tracked, max }) => {
+                assert_eq!(tracked, OrderManagementSystem::MAX_TRACKED_ORDERS);
+                assert_eq!(max, OrderManagementSystem::MAX_TRACKED_ORDERS);
+            }
+            other => panic!("expected OrderBookFull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_book_below_the_ceiling_admits_normally() {
+        let mut oms = capacity_test_oms();
+        oms.orders.insert(
+            "O1".to_owned(),
+            make_reconcile_order("O1", OrderStatus::Pending),
+        );
+        assert!(oms.check_order_book_capacity().is_ok());
+    }
+
+    #[test]
+    fn the_daily_reset_reopens_a_full_book() {
+        // The ceiling is per trading day, not per process.
+        let mut oms = capacity_test_oms();
+        for i in 0..OrderManagementSystem::MAX_TRACKED_ORDERS {
+            oms.orders.insert(
+                format!("O{i}"),
+                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
+            );
+        }
+        assert!(oms.check_order_book_capacity().is_err());
+        oms.reset_daily();
+        assert!(
+            oms.check_order_book_capacity().is_ok(),
+            "the daily reset must clear the book"
+        );
+    }
+
+    #[test]
+    fn the_order_ceiling_agrees_with_every_other_per_entity_ceiling() {
+        assert_eq!(OrderManagementSystem::MAX_TRACKED_ORDERS, 25_000);
     }
 }

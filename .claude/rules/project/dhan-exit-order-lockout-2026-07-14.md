@@ -229,7 +229,7 @@ A future operator-enable PR sequence MUST, in order:
    edits the ratchet without the dated quote here fails review per §5.
 5. **Pre-live prerequisites (flagged, not shipped in Cluster B):** the
    reserved protective-op rate lane (cancel/SL-modify never denied by a
-   probe burst), the 7,000/day `DailyRequestTracker` budget tracker, and
+   probe burst), a 7,000/day budget tracker (**2026-08-22: the `DailyRequestTracker` named here has zero occurrences in the workspace — it was never implemented; the interim bound is `OrderManagementSystem::MAX_TRACKED_ORDERS`**), and
    a **SPAWNED exit executor** (H3, 2026-07-14 hostile review — the
    enabled dispatcher currently runs INLINE on the strategy task, which
    blocks the pipeline select loop up to ~`mpp_verify_deadline_secs` of

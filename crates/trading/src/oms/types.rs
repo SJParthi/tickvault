@@ -2050,6 +2050,22 @@ pub enum OmsError {
     #[error("rate limited: SEBI order rate exceeded")]
     RateLimited,
 
+    /// The in-memory order book reached its hard ceiling for the day.
+    ///
+    /// Added 2026-08-22. The order maps had no ceiling and no daily bound:
+    /// `OrderRateLimiter` enforces orders-PER-SECOND only, and the
+    /// `DailyRequestTracker` two documents named as the daily bound does not
+    /// exist anywhere in this workspace. At the per-second limit that is
+    /// roughly 324,000 tracked orders across one session.
+    ///
+    /// Refusing the placement is safe in a way refusing a FILL is not: no
+    /// order is created, so nothing is held that the book does not know about.
+    #[error(
+        "order book full: {tracked} orders tracked today, ceiling {max} - \
+         placement refused so the book can never hold an order it did not record"
+    )]
+    OrderBookFull { tracked: usize, max: usize },
+
     /// Circuit breaker is open (Dhan API unreachable).
     #[error("circuit breaker open: Dhan API temporarily unavailable")]
     CircuitBreakerOpen,

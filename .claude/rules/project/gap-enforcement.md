@@ -325,7 +325,7 @@ Tests: `order_observability::tests::test_reconcile_verdict_*`.
 - `OrderRateLimiter::new(0)` must panic (fail-fast at config time)
 - SEBI limit: max 10 orders/sec enforced via GCRA algorithm
 - Burst capacity exhausted → `OmsError::RateLimited` (no retry — regulatory risk)
-- `DailyRequestTracker`: 5,000 orders/day, 100,000 data API calls/day
+- ~~`DailyRequestTracker`: 5,000 orders/day, 100,000 data API calls/day~~ — **CORRECTED 2026-08-22: this type does not exist.** A workspace scan returns zero occurrences of `DailyRequestTracker` anywhere. `OrderRateLimiter::check` enforces the per-SECOND burst only; there has never been a daily order budget in this codebase, and two documents (this rule and the exit-order lockout) named one as the bound on the OMS order maps. Those maps are now bounded by `OrderManagementSystem::MAX_TRACKED_ORDERS` (25,000, refused at placement). Implementing a real daily budget remains open work, not a claim to be repeated.
 - Counter must NOT exceed limit (saturating decrement on rejection)
 - `reset()` clears all counters to 0
 - Test: all `rate_limiter::tests::*` + integration `oms_rate_limiter::*`
