@@ -511,76 +511,56 @@ the cumulative reading pages correctly on the FIRST loss and then latches, so a 
 episode in the same session is silent — but milder is not fixed, and it is a separate
 piece of work rather than something this note closed.
 
-### §2.3c — 2026-08-21: the SPILL tier joins family (5); and one gap this file was told about did not exist
+### §2.3c — 2026-08-22 FINDING (no authorization claimed): the universe can collapse 24,600 → 4 with every signal green
 
-**The verbatim operator authorization (2026-08-21, typed directly in-session — preserve
-EXACTLY, typos included):**
+**This section authorizes NOTHING.** It records a verified defect found by an
+adversarial permutation sweep, and the reason it was NOT fixed in the same pass.
+Adding the alarm it argues for still requires a fresh dated operator quote, per
+§3. It is written here because §2.3a/§2.3b are where this file records what is
+measured-but-unpageable, and this is the sharper case: measured, and not even
+shipped.
 
-> "Go ahead wirh your recommendation. Dude okay"
+**The defect.** `select_live_universe` (`dhan_live_universe.rs:252`) falls back to
+the 4-instrument index universe on EITHER of two triggers: the resolved set
+exceeding the capacity envelope, or a master that produced "no usable widening"
+(unreadable/absent/empty artifact). The fallback is correct and deliberate —
+fail-soft beats a dark lane. What is wrong is that nobody is told.
 
-Given in DIRECT response to a message that ended: *"Making these losses actually page you
-is a decision only you can authorize — say the word and I'll draft the dated row and the
-alarm together, with its cost line."* This dated row is that draft, recorded BEFORE the
-terraform, per §3.
-
-#### First, a correction to what that message claimed (Rule 11 — an over-stated gap is
-#### still a false claim, and it manufactures work)
-
-The message asked for authorization partly on the grounds that
-`tv_ws_frame_wal_reinjected_dropped_total` was "not EMF-selected and has no alarm". **Both
-halves are FALSE.** Verified by source scan the same day: the metric IS in the EMF selector
-(`cloudwatch-agent.json`), and `live-lane-alarms.tf:354` carries
-`tv-<env>-wal-frames-not-recovered` on it at `threshold = 1`,
-`GreaterThanOrEqualToThreshold`, one evaluation period — it pages on the FIRST unrecovered
-frame.
-
-So the WAL half of the work was already done, and the six refusal paths wired on 2026-08-21
-feed a counter that already ships and already pages. That is a better outcome than was
-claimed, and it is recorded here rather than quietly enjoyed: an executor that over-states a
-gap sends the next session hunting for something that is not there, which is the same waste
-a stale O(1)-table row causes in the other direction.
-
-#### What IS genuinely dark, and what this row authorizes
-
-The SPILL tier — not the WAL tier — has no CloudWatch presence at all:
-
-| Metric | EMF-selected? | Alarmed? |
+| # | Verified fact | Evidence |
 |---|---|---|
-| `tv_ticks_spilled_total` | **no** | no |
-| `tv_tick_spill_replay_failed_total` | **no** (new 2026-08-21) | no |
-| `tv_tick_spill_replayed_bytes_total` | **no** (new 2026-08-21) | no |
+| 1 | Fallback lands on 4 instruments | `dhan_live_universe.rs:252` |
+| 2 | It logs `error!` + counter + gauge | `:483`, `record_master_sourcing_fallback` |
+| 3 | `tv_dhan_live_universe_instruments` is in **0** deploy files | not in either EMF selector copy, not on the dashboard, not alarmed |
+| 4 | `WS-GAP-03` is **not** among the 14 metric-filter-alarmed codes | `error-code-alarms.tf` |
+| 5 | The §2.3b tick-flow alarm CANNOT catch it | it reads flow, and 4 indices still tick — the gauge stays healthy |
 
-That matters because the two tiers fail differently. The WAL tier's counter means "frames
-we could not re-fold" — a discrete, already-pageable loss. The spill tier's counters mean
-"an ILP flush failed and we rescued the buffer to disk" and "the automatic drain could not
-put it back". A spill that is never drained becomes a real tick loss at the 512 MiB cap, and
-today nothing outside the box's own log would say so.
+Net: a **99.98% loss of market data** (24,600 → 4) presents to the operator as a
+normal session. Every dashboard line is green, no page fires, and the sole trace
+is one ERROR line in a log sink nothing watches. That is the false-OK class this
+file exists to prevent, with a larger blast radius than most of what IS alarmed.
 
-**Family (5) therefore gains two members:**
+**Why it is not merely theoretical.** The margin is thin and shrinking from the
+outside: `websocket-connection-scope-lock.md` (2026-08-21) puts the authorized set
+at ~24,600 against a 25,000 cap — 400 to 1,427 spare — while the SAME section
+rules index option chains **UNCAPPED**, and records vendor-controlled chain depth
+observed at 542 and at 2,037 for three indices. That section also states plainly
+that its "fits" verdict rests on a 2026-04-25 measurement. A volatile expiry week
+that adds strikes is an ordinary event, not an exotic one.
 
-| Alarm | Fires when | Why it is not noise |
-|---|---|---|
-| `tv-<env>-tick-spill-replay-failing` | `tv_tick_spill_replay_failed_total >= 1` in a period | The drain is the recovery arm. If it cannot put rescued ticks back, the rescue is a countdown to the cap, not a save. |
-| `tv-<env>-ticks-spilling` | `tv_ticks_spilled_total >= 1` in a period | An ILP flush failed. Distinct from `tv_ticks_dropped_total`, which both counters now increment: the drop alarm says "a flush failed"; this says "and it went to disk", which is the difference between loss and deferred recovery. |
+**Why it was not fixed in the finding pass (the honest blocker).** The fix is to
+ship the gauge in both EMF selector copies. That was attempted and REVERTED:
+`user_data_size_guard` failed at **15,905 bytes against a 15,872 budget — 33 over**
+(AWS hard limit 16,384, 512 reserved). The metric name is 33 bytes. The guard's own
+message forbids the cheap workaround verbatim — "DO NOT fix this by shaving
+comments off unrelated blocks" — and prescribes moving content to a file `cp`'d in
+after the Step 5 repo clone. That is a change to the prod boot path whose failure
+mode (clone fails ⇒ agent gets no config ⇒ NO metrics at all) is worse than the gap
+it closes, and it cannot be tested from a dev container. Doing it blind was
+refused deliberately.
 
-**Both are market-hours gated**, joining the `market_hours_liveness_gate` Lambda's
-`ALARM_NAMES` list in the same change. Without the gate they page every evening and all
-weekend, which this file's own §2.3a calls the fastest way to train an operator to ignore an
-alarm.
-
-**Cost:** +3 EMF metric names ≈ $0.90/mo, +2 alarms ≈ $0.20/mo ⇒ **~$1.10/mo** against the
-$130 kill-ceiling whose 90% action line is $117. `tv_tick_spill_replayed_bytes_total` is
-shipped without an alarm deliberately — it is the SUCCESS signal, and a chart of successful
-recoveries is worth having beside the two failure alarms without adding a third pager.
-
-**⚠ What this does NOT do (Rule 11).** An alarm on a spill does not stop the flush timeouts
-that cause spills; their cause is QuestDB write latency under live load and is untouched. It
-converts a loss visible only in the box's own log into one that reaches the operator — that
-is the entire claim.
-
-**What a PR that violates §2.3c looks like (REJECT):** adds either alarm without the
-market-hours gate membership in the same change; adds an alarm on the SUCCESS counter
-(`replayed_bytes`), which would page on recovery working; adds a per-INSTRUMENT dimension to
-any of the three (the §2.3 cardinality rule stands — 4,565 per-instrument metrics ≈
-$1,369/mo against a budget whose automatic action stops the trading box); or re-states the
-corrected claim above as though the WAL counter were unalarmed.
+**The two candidate fixes, for whoever takes this up.** (a) Free the 33 bytes by
+the architectural route the guard prescribes, then ship the gauge and alarm on it
+falling below a floor during market hours. (b) Cheaper and rule-cheaper: add
+`WS-GAP-03` to the existing metric-filter set in `error-code-alarms.tf` — it reuses
+the log-filter machinery already in place, costs ~$0.10/mo, and needs no user-data
+byte. Either way the alarm itself needs the §3 dated quote first.
