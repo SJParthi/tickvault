@@ -184,7 +184,7 @@ pub const STATUS_UNWIRED: &str = "unwired";
 /// |--------------------|------------------|----------------------------------------------|
 /// | `websocket`        | live since 22 Aug | the revived Dhan lane pushes its socket count |
 /// | `pipeline`         | `retired`        | `spawn_trading_pipeline` has no call site    |
-/// | `tick_persistence` | `retired`        | `tick_persistence.rs` deleted 2026-07-17     |
+/// | `tick_persistence` | live since 22 Aug | the lane reports each flush outcome            |
 /// | `order_update`     | live             | wired 2026-08-10 — see below                 |
 ///
 /// The `order_update` row WAS the one genuine wiring gap: `dhan_rest_stack`
@@ -322,7 +322,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_RETIRED,
-            detail: Some("tick writer deleted 2026-07-17".to_string()),
+            detail: Some("no writer reporting".to_string()),
         }
     };
 

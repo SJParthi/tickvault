@@ -169,3 +169,46 @@ fn a_disabled_lane_never_arms_the_row() {
          fault where there is only a switch in the off position"
     );
 }
+
+/// The sibling row, same defect, found by walking the other three gates.
+///
+/// `SystemHealthStatus` has four "arm-on-arrival" gates — websocket, pipeline,
+/// tick_persistence, order_update. Two were correct (`pipeline` really has no
+/// caller; `order_update` was wired 2026-08-10). Two were stale claims left by
+/// the revival:
+///
+/// | row | claimed | true |
+/// |---|---|---|
+/// | `websocket` | retired 2026-07-13/15 | revived 2026-08-09, ON 2026-08-11 |
+/// | `tick_persistence` | writer deleted 2026-07-17 | file exists; lane writes every tick |
+///
+/// Checking one gate and not its siblings is how the second one survives.
+#[test]
+fn the_lane_reports_tick_persistence_flush_outcomes() {
+    let stack = read(&app_src("dhan_feed_stack.rs"));
+    assert!(
+        stack.contains("report_tick_persistence(true)"),
+        "a successful flush must report tick persistence as connected"
+    );
+    assert!(
+        stack.contains("report_tick_persistence(false)"),
+        "a FAILED flush must report it as not connected — reporting only the \
+         success side is how a broken writer keeps rendering healthy"
+    );
+    assert!(
+        stack.contains("set_tick_persistence_connected("),
+        "the reporter must call the setter that arms the row"
+    );
+}
+
+#[test]
+fn health_no_longer_claims_the_tick_writer_was_deleted() {
+    let health =
+        read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../api/src/handlers/health.rs"));
+    let production = health.split("#[cfg(test)]").next().unwrap_or(&health);
+    assert!(
+        !production.contains("tick writer deleted 2026-07-17"),
+        "crates/storage/src/tick_persistence.rs exists and the lane writes \
+         through it — the detail must not assert a deletion that was reversed"
+    );
+}
