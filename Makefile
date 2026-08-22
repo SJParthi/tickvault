@@ -448,6 +448,9 @@ doctor: ## Total-system health check (one command — every section explicit pas
 guarantees: ## Rust-only + O(1) + automation report, every number measured now
 	@cargo run -q -p tickvault-app --bin tv-guarantees
 
+guarantees-html: ## the same measurements as a self-contained page (see also: make guarantees)
+	@cargo run -q -p tickvault-app --bin tv-guarantees -- --html
+
 mcp-doctor: ## Probe every endpoint the tickvault-logs MCP server reads (4 checks)
 	@bash scripts/mcp-doctor.sh
 
