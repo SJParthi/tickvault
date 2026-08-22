@@ -101,7 +101,7 @@ fn truthy(v: &Value) -> bool {
 /// deviation for composites: the legacy runtime rendered dict/list via repr (single
 /// quotes); here they render as their JSON text — no test or wire consumer
 /// touches that arm (API-GW v2 query/header values are strings).
-fn py_str(v: &Value) -> String {
+fn legacy_str(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Bool(true) => "True".to_string(),
@@ -117,7 +117,7 @@ fn py_str(v: &Value) -> String {
 /// fail-closed and documented: unicode digits are rejected (the legacy runtime accepted
 /// them), and integers beyond i128 fail (the legacy runtime was arbitrary-precision) —
 /// every caller maps `None` onto the legacy `ValueError` path.
-fn py_int(s: &str) -> Option<i128> {
+fn legacy_int(s: &str) -> Option<i128> {
     let t = s.trim();
     let (neg, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -149,7 +149,7 @@ fn py_int(s: &str) -> Option<i128> {
 
 /// Legacy `urllib.parse.quote_plus` — percent-encode everything outside
 /// `[A-Za-z0-9_.\-~]`, space → `+`, non-ASCII via UTF-8 %XX (uppercase hex).
-fn py_quote_plus(s: &str) -> String {
+fn legacy_quote_plus(s: &str) -> String {
     use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
     // NON_ALPHANUMERIC minus the legacy-safe chars, minus space (handled
     // by the literal `+` substitution below).
@@ -167,10 +167,10 @@ fn py_quote_plus(s: &str) -> String {
 /// Legacy `urllib.parse.urlencode(dict)` — `k=v` pairs joined with `&`,
 /// quote_plus on both sides, INSERTION order preserved (the callers build
 /// their pair lists in the exact legacy dict-insertion order).
-fn py_urlencode(pairs: &[(String, String)]) -> String {
+fn legacy_urlencode(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
-        .map(|(k, v)| format!("{}={}", py_quote_plus(k), py_quote_plus(v)))
+        .map(|(k, v)| format!("{}={}", legacy_quote_plus(k), legacy_quote_plus(v)))
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -308,11 +308,11 @@ pub fn cap_sql_rows(query: &str) -> String {
 
 /// Clamp the console's `limit` pagination param (`n` or `lo,hi`) so a
 /// single page can never exceed the row cap. Malformed → the cap.
-/// Legacy `_clamp_limit_param` parity (`int()` semantics via [`py_int`]).
+/// Legacy `_clamp_limit_param` parity (`int()` semantics via [`legacy_int`]).
 pub fn clamp_limit_param(raw: &str) -> String {
     let cap = i128::from(SQL_MAX_ROWS);
     if let Some((lo_s, hi_s)) = raw.split_once(',') {
-        return match (py_int(lo_s), py_int(hi_s)) {
+        return match (legacy_int(lo_s), legacy_int(hi_s)) {
             (Some(lo), Some(mut hi)) => {
                 if hi - lo > cap {
                     hi = lo + cap;
@@ -322,7 +322,7 @@ pub fn clamp_limit_param(raw: &str) -> String {
             _ => cap.to_string(),
         };
     }
-    match py_int(raw) {
+    match legacy_int(raw) {
         Some(n) if n >= 0 => n.min(cap).to_string(),
         Some(_) => raw.to_string(), // negative → the ORIGINAL raw string
         None => cap.to_string(),
@@ -376,7 +376,7 @@ pub fn verify_signed(secret: &str, prefix: &str, value: &str, now_epoch: i128) -
         Some(parts) => parts,
         None => return false,
     };
-    let exp = match py_int(exp_s) {
+    let exp = match legacy_int(exp_s) {
         Some(e) => e,
         None => return false,
     };
@@ -397,9 +397,9 @@ fn http_method(event: &Value) -> String {
         .and_then(|rc| rc.get("http"))
         .and_then(|h| h.get("method"));
     match nested {
-        Some(m) => py_str(m).to_uppercase(),
+        Some(m) => legacy_str(m).to_uppercase(),
         None => match event.get("httpMethod") {
-            Some(m) => py_str(m).to_uppercase(),
+            Some(m) => legacy_str(m).to_uppercase(),
             None => "POST".to_string(),
         },
     }
@@ -412,7 +412,7 @@ fn path_of(event: &Value) -> String {
         if let Some(v) = event.get(key)
             && truthy(v)
         {
-            return py_str(v);
+            return legacy_str(v);
         }
     }
     "/".to_string()
@@ -425,7 +425,7 @@ fn cookie_get(event: &Value, name: &str) -> String {
     let mut out = String::new();
     if let Some(Value::Array(cookies)) = event.get("cookies") {
         for c in cookies {
-            let s = py_str(c);
+            let s = legacy_str(c);
             let (k, v) = s.split_once('=').unwrap_or((s.as_str(), ""));
             if !k.is_empty() && k.trim() == name {
                 out = v.to_string();
@@ -453,7 +453,10 @@ fn authenticated(event: &Value, now_epoch: i128, secret: &str) -> bool {
         return false; // fail closed — no secret => nobody gets in
     }
     let headers = headers_of(event);
-    let auth = headers.get("authorization").map(py_str).unwrap_or_default();
+    let auth = headers
+        .get("authorization")
+        .map(legacy_str)
+        .unwrap_or_default();
     if let Some(rest) = auth.strip_prefix("Bearer ")
         && ct_eq(rest, secret)
     {
@@ -556,7 +559,7 @@ pub fn build_sql_raw_query(
 ) -> Result<(String, String), Value> {
     // API-GW v2 already URL-decodes queryStringParameters values.
     let q = match params.get("query") {
-        Some(v) if truthy(v) => py_str(v),
+        Some(v) if truthy(v) => legacy_str(v),
         _ => String::new(),
     };
     if q.trim().is_empty() {
@@ -583,7 +586,7 @@ pub fn build_sql_raw_query(
         if let Some(v) = params.get(k)
             && !v.is_null()
         {
-            let s = py_str(v);
+            let s = legacy_str(v);
             let s = if k == "limit" {
                 clamp_limit_param(&s)
             } else {
@@ -596,7 +599,7 @@ pub fn build_sql_raw_query(
         // Same belt-and-braces operator-control uses.
         fwd.push(("limit".to_string(), SQL_MAX_ROWS.to_string()));
     }
-    Ok((capped, py_urlencode(&fwd)))
+    Ok((capped, legacy_urlencode(&fwd)))
 }
 
 /// Forward ONLY a whitelisted param set on static / /chk / console paths —
@@ -608,10 +611,10 @@ pub fn build_static_query(params: &Map<String, Value>) -> String {
             params
                 .get(k)
                 .filter(|v| !v.is_null())
-                .map(|v| (k.to_string(), py_str(v)))
+                .map(|v| (k.to_string(), legacy_str(v)))
         })
         .collect();
-    py_urlencode(&fwd)
+    legacy_urlencode(&fwd)
 }
 
 // ------------------------------------------------------------------ back relay
@@ -695,7 +698,7 @@ async fn relay<D: FrontDeps>(
         }
     }
     let body_b64 = match back.get("body_b64") {
-        Some(v) if truthy(v) => py_str(v),
+        Some(v) if truthy(v) => legacy_str(v),
         _ => String::new(),
     };
     if body_b64.len() > MAX_BODY_BYTES * 4 / 3 + 8 {
@@ -714,7 +717,7 @@ async fn relay<D: FrontDeps>(
             .as_i64()
             .or_else(|| n.as_f64().map(|f| f as i64))
             .unwrap_or(200),
-        Some(Value::String(s)) => py_int(s).map(|n| n as i64).unwrap_or(200),
+        Some(Value::String(s)) => legacy_int(s).map(|n| n as i64).unwrap_or(200),
         Some(_) => 200,
     };
     json!({
@@ -751,7 +754,7 @@ fn log_req(path: &str, method: &str, outcome: &str, status: i64, sql_head: &str)
 /// Rust decoder rejects them — both land on the same fail-closed `""`.
 fn body_text(event: &Value) -> String {
     let raw = match event.get("body") {
-        Some(v) if truthy(v) => py_str(v),
+        Some(v) if truthy(v) => legacy_str(v),
         _ => String::new(),
     };
     let is_b64 = event.get("isBase64Encoded").map(truthy).unwrap_or(false);
@@ -772,7 +775,7 @@ fn login_key(body: &str, ctype: &str) -> String {
         match serde_json::from_str::<Value>(text) {
             // Legacy `.get("key", "")` then `str(...)`: a missing key is
             // `""`; a present non-string renders via `str` (null → "None").
-            Ok(Value::Object(o)) => o.get("key").map(py_str).unwrap_or_default(),
+            Ok(Value::Object(o)) => o.get("key").map(legacy_str).unwrap_or_default(),
             // Non-object JSON RAISED in the legacy runtime (a 500) — documented
             // deviation: fail closed to "" (a 401, never a crash).
             Ok(_) => String::new(),
@@ -809,7 +812,7 @@ pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mu
     // ---- unauthenticated endpoints: /open (link token) + /login (paste key)
     if method == "GET" && path == "/open" {
         let tok = match params.get("tok") {
-            Some(v) if truthy(v) => py_str(v),
+            Some(v) if truthy(v) => legacy_str(v),
             _ => String::new(),
         };
         if !secret.is_empty() && verify_signed(&secret, "qdblink", &tok, now_epoch) {
@@ -825,7 +828,7 @@ pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mu
         let ctype = headers_of(event)
             .get("content-type")
             .filter(|v| truthy(v))
-            .map(py_str)
+            .map(legacy_str)
             .unwrap_or_default()
             .to_lowercase();
         let key = login_key(&body, &ctype);
@@ -866,8 +869,8 @@ pub async fn handle_core<D: FrontDeps>(event: &Value, now_epoch: i128, deps: &mu
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 // Legacy `str(params.get("query", ""))[:200]` — a present
-                // null renders "None" (py_str), a missing key "".
-                let head = params.get("query").map(py_str).unwrap_or_default();
+                // null renders "None" (legacy_str), a missing key "".
+                let head = params.get("query").map(legacy_str).unwrap_or_default();
                 log_req(&path, &method, "denied_sql", status, &head);
                 return rejection;
             }
@@ -1102,7 +1105,7 @@ mod tests {
         json!({
             "requestContext": {"http": {"method": method}},
             "rawPath": path,
-            "rawQueryString": py_urlencode(&qs_pairs),
+            "rawQueryString": legacy_urlencode(&qs_pairs),
             "queryStringParameters": qsp,
             "headers": hdrs,
             "cookies": cookies.unwrap_or(&[]),
@@ -1583,7 +1586,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_post_right_key_sets_cookie() {
         let mut deps = FakeDeps::new();
-        let body = py_urlencode(&[("key".to_string(), SECRET.to_string())]);
+        let body = legacy_urlencode(&[("key".to_string(), SECRET.to_string())]);
         let ev = event_full(
             "POST",
             "/login",
@@ -1601,7 +1604,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_post_wrong_key_401() {
         let mut deps = FakeDeps::new();
-        let body = py_urlencode(&[("key".to_string(), "wrong".to_string())]);
+        let body = legacy_urlencode(&[("key".to_string(), "wrong".to_string())]);
         let ev = event_full("POST", "/login", None, None, None, Some(&body), false);
         let r = run(&ev, &mut deps).await;
         assert_eq!(status_of(&r), 401);

@@ -1,5 +1,5 @@
 //! tickvault-logs MCP server (Rust port of
-//! scripts/mcp-servers/tickvault-logs/server.py) — THIN binary; all
+//! the retired reference implementation, formerly under scripts/mcp-servers/tickvault-logs/) — THIN binary; all
 //! logic lives in the library (`tickvault_logs_mcp`).
 
 fn main() {

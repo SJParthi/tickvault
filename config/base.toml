@@ -704,6 +704,69 @@ retry_backoff_cap_secs = 300
 # NOT in effect. Reversible by setting this back to false + a restart.
 live_subscription_from_master = true
 
+# Narrow the SPOT half of that master-sourced set to NSE indices + the F&O
+# stock underlyings, dropping the ~4,200 cash equities that carry no
+# derivatives. Operator quote 2026-08-21 ("Go ahead and fix evrfhbrin fuxd
+# eokay?"), recorded verbatim in
+# `.claude/rules/project/websocket-connection-scope-lock.md` BEFORE this key
+# existed.
+#
+# Why it exists: the authorized contract set (NIFTY+BANKNIFTY full current
+# -expiry chains, F&O stock options at ATM +/- 25, all futures expiries) is
+# ~23,820 instruments. Against a 4,565-instrument spot universe that totals
+# ~28,400 and does NOT fit the 25,000 envelope; against the narrowed ~335 it
+# totals ~23,573-24,231 and does. The spot half is the only lever, because
+# the contract shape is what the operator specified.
+#
+# Honest cost: every NSE cash equity that is not an F&O underlying loses its
+# live spot subscription. Their per-minute REST legs are unaffected.
+#
+# OFF here and OFF in the serde default, so it takes a deliberate flip.
+# Fail-soft in the SAFE direction: an unreadable/unparseable F&O artifact
+# falls THROUGH to the full master-sourced set with a coded error — the
+# session subscribes more than was asked for, never less.
+spot_universe_fno_underlyings_only = false
+
+# Narrow the SPOT half to NSE indices + the NIFTY TOTAL MARKET constituents.
+# Operator quote 2026-08-22 ("pcik only nifty toal marjet stcoks and enitre nse
+# indices aloen" + "why the fuck you didnt do the crsoss ebrificatione ntorley
+# with nse india real nse idncies csv fiels downlaod"), recorded verbatim in
+# `.claude/rules/project/websocket-connection-scope-lock.md` BEFORE this key
+# existed.
+#
+# The cross-verification he asked about was ALREADY running: the daily rider
+# downloads all 49 niftyindices lists — ind_niftytotalmarket_list among them —
+# and joins each constituent to the Dhan master BY ISIN, fail-closed at a 2%
+# unresolved tolerance and a 10% failed-list ceiling. What was missing was a
+# selector for that ONE list: the join dedupes per (index_name, security_id,
+# segment), so the artifact holds the UNION of all 49 and the live selector
+# dedupes it to the ~4,565 SIDs he kept being shown. The NTM rows were
+# resolved, tagged, and never picked out.
+#
+# Expected size ~119 indices + ~750 constituents = ~869. Against the ~23,820
+# authorized contracts that totals ~24,689 inside the 25,000 cap — ~311 spare,
+# thinner than the F&O-underlyings option and stated as such.
+#
+# Takes precedence over spot_universe_fno_underlyings_only when both are true
+# (later dated instruction). Serde default stays false.
+#
+# Fail-soft in the SAFE direction: an unreadable/unparseable NTM artifact falls
+# THROUGH to the full master-sourced set with a coded error — the session
+# subscribes MORE than was asked for, never less.
+spot_universe_ntm_only = true
+
+# ===========================================================================
+# Daily timeframe-consistency verifier (operator directive 2026-07-13 —
+# "how will you guarantee that all our defined timeframes internally are
+# correct — how do you identify whether any miscalculation or data
+# issues"). At 15:40 IST every trading day, recompute every sealed
+# higher-timeframe candle (3m..15m) from its stored 1-minute constituents
+# and compare exactly — verifying TODAY, which is stable after the
+# 15:30:05 close seal. Findings land in the tf_consistency_audit table +
+# one Telegram summary (TF-VERIFY-01/02). Cold path; the live candle
+# pipeline is untouched. An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch.
+# ===========================================================================
 [tf_consistency]
 enabled = true
 

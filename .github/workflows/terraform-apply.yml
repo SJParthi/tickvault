@@ -76,8 +76,20 @@ on:
         default: 'no'
 
 concurrency:
-  group: terraform-apply-prod
-  cancel-in-progress: false # never interrupt a running apply
+  # PRs get their OWN per-branch group; every apply-capable event keeps the
+  # single global one. Rationale (2026-08-22): the global group was shared by
+  # PR plans and applies alike with cancel-in-progress false, so GitHub keeps
+  # only the most recent PENDING run per group and rapid pushes CANCELLED the
+  # queued plan — 3 of 6 consecutive commits had their terraform run cancelled,
+  # and because this lane is path-filtered it is not part of All Green, so a
+  # .tf change reached a green PR validated by nothing.
+  #
+  # The safety property is UNCHANGED: "never two terraform apply at once" is
+  # about APPLIES, and every event that can reach the apply job (push to main,
+  # workflow_dispatch, schedule) still serialises on terraform-apply-prod. A
+  # pull_request can never reach that job — see the Job 3 `if:` below.
+  group: ${{ github.event_name == 'pull_request' && format('terraform-plan-{0}', github.ref) || 'terraform-apply-prod' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # a superseded PR plan is worthless; an apply is never interrupted
 
 permissions:
   id-token: write   # OIDC for AWS role assumption

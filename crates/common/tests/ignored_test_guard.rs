@@ -53,6 +53,14 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/trading/src/candles/multi_tf_aggregator.rs",
         "catch_up_seal_all_sweep_cost_at_the_authorized_ceiling",
     ),
+    // Added 2026-08-22 with the fold-CPU measurement it belongs to: same
+    // shape as the sweep harness above -- a wall-clock number on a shared CI
+    // runner is a flake, and a flaky gate teaches people to ignore gates. It
+    // is run deliberately in release, never as a merge condition.
+    (
+        "crates/trading/src/candles/multi_tf_aggregator.rs",
+        "fold_cost_at_the_authorized_ceiling",
+    ),
     (
         "crates/core/src/pipeline/tick_gap_detector.rs",
         "scan_silence_sweep_cost_at_the_authorized_ceiling",
