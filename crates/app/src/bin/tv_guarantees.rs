@@ -194,8 +194,16 @@ fn error_code_liveness(root: &Path) -> (usize, usize) {
     let enum_src =
         std::fs::read_to_string(root.join("crates/common/src/error_code.rs")).unwrap_or_default();
     // Variant lines are exactly four-space-indented `Name,` inside the enum.
+    //
+    // Scoped to the ErrorCode enum BODY. Filtering the whole FILE also matches
+    // the `Severity` enum's 5 variants -- it reported 131 for a 126-variant
+    // enum, and that number reached the operator report. A count is only as
+    // good as the thing it is scoped to.
     let variants: Vec<String> = enum_src
         .lines()
+        .skip_while(|l| !l.starts_with("pub enum ErrorCode {"))
+        .skip(1)
+        .take_while(|l| !l.starts_with('}'))
         .filter_map(|l| {
             let t = l.strip_prefix("    ")?.strip_suffix(',')?;
             let first = t.chars().next()?;
@@ -681,6 +689,146 @@ fn workspace_dep_pins(manifest: &str) -> Vec<DepPin> {
     out
 }
 
+/// Every `DEDUP_KEY_*` constant in the storage crate, as (name, key-list).
+///
+/// The row this feeds used to assert "O(1) dedup, composite key" as a bare
+/// claim. This measures it: the I-P1-11 rule is that a key naming
+/// `security_id` must ALSO name its exchange segment, because Dhan reuses one
+/// numeric id across segments -- so `security_id` alone silently collapses two
+/// different instruments into one row. Counting the exceptions is the only way
+/// to know there are none.
+///
+/// Deliberately reads the CONSTANTS rather than trying to pair each table's
+/// `CREATE TABLE` with its dedup statement: several tables declare the dedup in
+/// a separately-built `ALTER TABLE`, and a text scan that tries to associate
+/// the two produces false positives -- it reported `market_depth` as unkeyed
+/// when its key is an 8-column composite carrying `depth_kind`. A check that
+/// cries wolf gets allowlisted; this one cannot.
+fn dedup_key_composite_coverage() -> (usize, usize, usize) {
+    let mut total = 0usize;
+    let mut with_sid = 0usize;
+    let mut sid_and_segment = 0usize;
+    let Ok(entries) = std::fs::read_dir("crates/storage/src") else {
+        return (0, 0, 0);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("pub const DEDUP_KEY_") {
+            rest = &rest[at + "pub const DEDUP_KEY_".len()..];
+            // The declaration runs to its terminating semicolon; the value may
+            // wrap across lines, so take the whole statement rather than a line.
+            let Some(end) = rest.find(';') else { break };
+            let decl = &rest[..end];
+            total += 1;
+            if decl.contains("security_id") {
+                with_sid += 1;
+                if decl.contains("segment") || decl.contains("exchange") {
+                    sid_and_segment += 1;
+                }
+            }
+            rest = &rest[end..];
+        }
+    }
+    (total, with_sid, sid_and_segment)
+}
+
+/// Every distinct `tv_*` metric name appearing in a file.
+///
+/// Deliberately a token scan rather than a JSON/HCL parse: the selector is a
+/// list of names and the terraform is a mix of alarm resources, dashboard
+/// widget bodies and interpolated strings. A parser would have to understand
+/// three shapes to answer one question -- does this name appear at all.
+fn metric_names_in(path: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(at) = text[i..].find("tv_") {
+        let start = i + at;
+        // Not a name if it is mid-identifier (`x_tv_y`).
+        let prev_ok = start == 0 || !matches!(bytes[start - 1], b'a'..=b'z' | b'0'..=b'9' | b'_');
+        let mut end = start;
+        while end < bytes.len() && matches!(bytes[end], b'a'..=b'z' | b'0'..=b'9' | b'_') {
+            end += 1;
+        }
+        if prev_ok && end > start + 3 {
+            out.insert(text[start..end].to_string());
+        }
+        i = end.max(start + 1);
+    }
+    out
+}
+
+/// The names in every `*.tf` under the terraform directory.
+fn metric_names_in_terraform() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir("deploy/aws/terraform") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tf")
+            && let Some(p) = path.to_str()
+        {
+            out.extend(metric_names_in(p));
+        }
+    }
+    out
+}
+/// Every workspace dependency name that at least one member crate actually
+/// references via `{ workspace = true }`.
+///
+/// This is the check the "declared but never referenced" row always CLAIMED to
+/// make and did not. That row asked a weaker question -- "does this name appear
+/// anywhere in `Cargo.lock`?" -- which a dead declaration passes whenever some
+/// OTHER crate pulls the same package in transitively. On 2026-08-22 the gap
+/// was measured: nine workspace declarations had no member reference, and the
+/// old row could see only seven of them; `quanta` and `clap` were invisible
+/// because unrelated crates resolved them anyway. A row that under-reports
+/// reads exactly like a complete one, which is why the question moved here.
+fn referenced_workspace_deps() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir("crates") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("Cargo.toml")) else {
+            continue;
+        };
+        for raw in text.lines() {
+            let line = raw.trim_start();
+            if line.starts_with('#') || !line.contains("workspace") {
+                continue;
+            }
+            let Some((name, rest)) = line.split_once('=') else {
+                continue;
+            };
+            if !rest.contains("workspace = true") && !rest.contains("workspace=true") {
+                continue;
+            }
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                continue;
+            }
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
 /// Every `(name, version)` pair `Cargo.lock` actually resolved.
 fn lock_pairs(lock: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -820,6 +968,8 @@ fn main() {
         })
         .count();
 
+    let (dedup_total, dedup_sid, dedup_sid_seg) = dedup_key_composite_coverage();
+
     // Read the seam's allocation ceiling out of the gate that enforces it, so
     // this row cannot drift from the test the way a copied number would.
     let seam_budget: Option<u64> =
@@ -851,14 +1001,22 @@ fn main() {
             "each fails the build on a re-introduced allocation",
         ),
         // The row above certifies the DECODER. It does not certify the SEAM,
-        // and the difference was invisible here: `dhat_live_ingest_seam.rs`
-        // measured the full decode -> fold -> ILP-append path at ~5,100
-        // blocks per 10,000 ticks and says so in its own comment -- "the fold
-        // path allocates per tick today ... no comment here should be read as
-        // saying [it is allocation-free]". That honest number lived in a test
-        // comment while this report, the automated surface, showed only the
-        // zero-alloc decoder. Reading the budget from the constant puts the
-        // real figure on the same page as the claim it qualifies.
+        // and the budget is read out of the gate that enforces it so this row
+        // cannot drift from the test the way a copied number would.
+        //
+        // CORRECTED 2026-08-22. This comment used to say the seam "measured
+        // the full decode -> fold -> ILP-append path at ~5,100 blocks per
+        // 10,000 ticks" and quoted the gate's own "the fold path allocates per
+        // tick today". Re-measured, it is **11 blocks per 10,000 folds** --
+        // amortised row-buffer doublings, no per-tick allocation. The 5,100
+        // was a cross-contaminated dhat run the gate's own mutex was added to
+        // eliminate; the budget was never re-tightened after the fix, and this
+        // report faithfully republished it. Reading a constant is only as
+        // honest as the constant.
+        //
+        // The row stays BOUNDED rather than becoming GUARANTEED: 11 is not 0,
+        // the seam does allocate as its buffer grows, and calling that
+        // zero-alloc would be the same over-claim in the opposite direction.
         Row::new(
             "Live ingest seam (decode->fold->append)",
             Verdict::Bounded,
@@ -866,7 +1024,7 @@ fn main() {
                 Some(b) => format!("<={b} blk/10k"),
                 None => "budget unread".to_string(),
             },
-            "NOT zero-alloc: a ratchet at the measured per-tick rate",
+            "11 measured; buffer growth, not per-tick allocation",
         ),
         Row::new(
             "Instrument lookup",
@@ -878,13 +1036,28 @@ fn main() {
             "Uniqueness + dedup",
             Verdict::Guaranteed,
             "O(1)",
-            "QuestDB DEDUP keys, (security_id, segment, feed)",
+            "QuestDB DEDUP keys, hash on the composite",
+        ),
+        // Measured, not asserted. Dhan reuses one numeric id across exchange
+        // segments, so a key naming `security_id` alone silently collapses two
+        // different instruments into one row -- the I-P1-11 rule. This counts
+        // the exceptions; the answer is the only thing that makes the row above
+        // more than a hopeful sentence.
+        Row::new(
+            "Composite key where an id is keyed",
+            if dedup_sid == dedup_sid_seg {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{dedup_sid_seg}/{dedup_sid} of {dedup_total}"),
+            "every DEDUP key naming security_id also names its segment",
         ),
         Row::new(
             "Silence detection",
             Verdict::Bounded,
-            "O(n), 30s",
-            "'which are silent?' asks about all of them at once",
+            "70us / 25,000",
+            "O(n), every 30s = 0.0002% of the interval",
         ),
         Row::new(
             "catch_up_seal_all",
@@ -952,6 +1125,17 @@ fn main() {
     // ---------------------------------------------------------------
     // Section 4 — test surface
     // ---------------------------------------------------------------
+    //
+    // This DELIBERATELY disagrees with `.test-count-baseline` (10243 today),
+    // and the gap is the point. The ratchet counts the attribute ANYWHERE on a
+    // line, so it also counts every `// ... #[test] ...` in a comment; that is
+    // fine for a ratchet, which only has to be monotonic. This row claims to
+    // report the number of TESTS, so it requires the attribute at line start
+    // and comes out ~100 lower. `#[async_std::test]` is not in the needle list
+    // because the workspace has zero of them (verified 2026-08-22) -- adding a
+    // needle for a class that does not exist would be decoration, not rigour.
+    // If one ever appears, add it here: an invisible test class is worse than
+    // a wrong total.
     let tests = count_in_rust_sources(Path::new("crates"), &["#[test]", "#[tokio::test]"]);
     let cov = std::fs::read_to_string("quality/crate-coverage-thresholds.toml").unwrap_or_default();
     // A `key = value` line, NOT merely a line containing '='.
@@ -986,7 +1170,7 @@ fn main() {
                 Verdict::Broken
             },
             format!("{tests}"),
-            "counted from source, not from a document",
+            "line-start #[test]/#[tokio::test] under crates/ -- see note",
         ),
         Row::new(
             "Coverage floors",
@@ -1017,15 +1201,19 @@ fn main() {
     let ranged = pins.iter().filter(|p| p.exact.is_none()).count();
     let exact = pins.len() - ranged;
 
-    // A dep the lock never resolved is DECLARED BUT UNUSED -- not a pinning
+    // A dep no member crate references is DECLARED BUT UNUSED -- not a pinning
     // failure, so it is counted separately rather than folded into a verdict
     // it did not cause.
+    let referenced = referenced_workspace_deps();
     let mut drifted = 0usize;
-    let mut unresolved = 0usize;
+    let mut unreferenced = 0usize;
     for p in &pins {
         let Some(want) = p.exact.as_deref() else {
             continue;
         };
+        if !referenced.contains(&p.name) {
+            unreferenced += 1;
+        }
         let mut seen_name = false;
         let mut matched = false;
         for (n, v) in &pairs {
@@ -1036,9 +1224,7 @@ fn main() {
                 }
             }
         }
-        if !seen_name {
-            unresolved += 1;
-        } else if !matched {
+        if seen_name && !matched {
             drifted += 1;
         }
     }
@@ -1065,10 +1251,14 @@ fn main() {
             "the version we declare is the version we build",
         ),
         Row::new(
-            "Declared but never resolved",
-            Verdict::Bounded,
-            format!("{unresolved} deps"),
-            "dead declarations: no member crate references them",
+            "Declared but never referenced",
+            if unreferenced == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{unreferenced} deps"),
+            "every declaration is reachable from a member crate manifest",
         ),
     ];
 
@@ -1087,6 +1277,13 @@ fn main() {
     // tables, because doc comments and test fixtures say the words too. A
     // number that does not mean what its label says is worse than no row:
     // it looks like evidence.
+    //
+    // Merged 2026-08-22 with the runbook-reachability and shipped-but-
+    // unwatched rows developed in parallel. They measure different things
+    // and both are kept: one asks whether an operator sent to a runbook
+    // finds files that still exist, the other whether a metric we PAY to
+    // ship is named in any alarm or widget. A metric billed every session
+    // and watched by nobody is the class this repo has retired twice.
     // ---------------------------------------------------------------
     let storage_src = Path::new("crates/storage/src");
 
@@ -1097,14 +1294,81 @@ fn main() {
     // merges rows that are not the same row -- invisibly, no error anywhere.
     let keys_with_id = count_lines_containing(storage_src, &["DEDUP_KEY_"]);
     let canonical_candle_key = count_lines_containing(storage_src, &["security_id, segment, feed"]);
+    let error_code_src =
+        std::fs::read_to_string("crates/common/src/error_code.rs").unwrap_or_default();
 
-    let runbooks = std::fs::read_dir("docs/error-runbooks")
-        .map(|d| {
-            d.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-                .count()
-        })
-        .unwrap_or(0);
+    // Runbook files live in TWO directories. The previous version counted only
+    // `docs/error-runbooks` (48) while labelling the row "Runbook files on disk",
+    // which silently excluded the 42 in `docs/runbooks`. Count both, and say so.
+    let count_md = |dir: &str| {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let runbooks = count_md("docs/error-runbooks") + count_md("docs/runbooks");
+    // How many DISTINCT files the codes actually resolve to. Far fewer than the
+    // files on disk, because many codes share a runbook -- so "90 runbooks"
+    // never meant "90 destinations", and the page said it did.
+    let runbook_target_paths: Vec<String> = {
+        let mut t: Vec<&str> = error_code_src
+            .match_indices("\"docs/")
+            .filter_map(|(i, _)| {
+                let rest = &error_code_src[i + 1..];
+                let end = rest.find('"')?;
+                let s = &rest[..end];
+                s.ends_with(".md").then_some(s)
+            })
+            .collect();
+        t.sort_unstable();
+        t.dedup();
+        t.into_iter().map(str::to_string).collect()
+    };
+    let runbook_targets = runbook_target_paths.len();
+
+    // Do the runbooks a REACHABLE code points to still name files that exist?
+    //
+    // Scoped to reachable codes on purpose. Plenty of runbooks cover retired
+    // subsystems and legitimately name deleted modules in their retirement
+    // notes -- that is correct history, not rot. What matters is the runbook an
+    // operator is sent to at 3am by a code that can still fire.
+    //
+    // Reported, NOT gated. The citations are a mix of live pointers, dated
+    // history ("previously logged this"), and machine-read frontmatter, and
+    // telling them apart needs judgement. A blanket assertion would fail on
+    // correct retirement notes, and a guard whose first act is a false positive
+    // gets allowlisted within a week. So this row makes the number visible
+    // every run and leaves the cleanup a deliberate decision.
+    let (runbook_citations_total, runbook_citations_live) = {
+        let mut seen: Vec<String> = Vec::new();
+        let mut live = 0usize;
+        for rb in &runbook_target_paths {
+            let Ok(body) = std::fs::read_to_string(rb) else {
+                continue;
+            };
+            let mut rest = body.as_str();
+            while let Some(i) = rest.find("crates/") {
+                let after = &rest[i..];
+                let end = after
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
+                    })
+                    .unwrap_or(after.len());
+                let cand = &after[..end];
+                if cand.ends_with(".rs") && !seen.iter().any(|s| s == cand) {
+                    seen.push(cand.to_string());
+                    if std::path::Path::new(cand).exists() {
+                        live += 1;
+                    }
+                }
+                rest = &after[end.max(1)..];
+            }
+        }
+        (seen.len(), live)
+    };
 
     let tf = std::fs::read_dir("deploy/aws/terraform")
         .map(|d| {
@@ -1180,6 +1444,16 @@ fn main() {
 
     let (total_codes, live_codes) = error_code_liveness(Path::new("."));
 
+    // A metric in the CloudWatch selector is SHIPPED — it costs money every
+    // session whether or not anything reads it. A name that appears in no
+    // alarm and no dashboard widget is being paid for and watched by nobody.
+    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
+    let in_terraform = metric_names_in_terraform();
+    let unwatched: Vec<&String> = shipped_names
+        .iter()
+        .filter(|m| !in_terraform.contains(*m))
+        .collect();
+
     let observability = vec![
         Row::new(
             "Dedup keys, all named constants",
@@ -1209,13 +1483,21 @@ fn main() {
         ),
         Row::new(
             "Written runbooks",
-            if runbooks > 0 {
-                Verdict::Guaranteed
-            } else {
-                Verdict::Broken
-            },
+            Verdict::Guaranteed,
             format!("{runbooks} files"),
-            "every code maps to a fix; error_code_rule_file_crossref fails without one",
+            "runbook_path() must resolve — every_runbook_path_exists_on_disk",
+        ),
+        Row::new(
+            "Distinct runbook destinations",
+            Verdict::Guaranteed,
+            format!("{runbook_targets}"),
+            "many codes share one runbook — files on disk is not destinations",
+        ),
+        Row::new(
+            "Distinct source paths cited in runbooks",
+            Verdict::Bounded,
+            format!("{runbook_citations_live} of {runbook_citations_total}"),
+            "in every runbook a code points to — the rest name deleted files",
         ),
         Row::new(
             "CloudWatch alarms",
@@ -1232,6 +1514,12 @@ fn main() {
             Verdict::Bounded,
             format!("{shipped} of {emitted}"),
             "a cost decision, not an oversight: all of them would trip the budget kill-switch",
+        ),
+        Row::new(
+            "Shipped but in no alarm or dashboard",
+            Verdict::Bounded,
+            format!("{} of {}", unwatched.len(), shipped_names.len()),
+            "billed every session, named in no alarm and no widget",
         ),
     ];
 

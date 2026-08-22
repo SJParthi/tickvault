@@ -8,5 +8,3 @@
 //! only, no code pulled — and reuses the same WAL/ring/spill/DLQ/aggregator
 //! chain as Dhan. It is **default OFF** (`feeds.groww_enabled`); nothing here
 //! runs unless the operator enables it, so the Dhan path is unchanged.
-
-pub mod groww;

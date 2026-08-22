@@ -53,6 +53,19 @@ fn rs_files_named_in_table_rows(claude_md: &str) -> BTreeSet<String> {
             // whitespace and slashes so each filename is checked.
             for token in span.split(['/', ' ', ',']) {
                 let token = token.trim();
+                // Strip a `::member` suffix before the `.rs` test.
+                //
+                // 2026-08-21: without this the guard was blind to its OWN most
+                // common citation style. The non-O(1) table cites
+                // `path/to/file.rs::field`, and that token does not END with
+                // ".rs" -- so all 22 such citations were skipped, including two
+                // rows naming modules deleted hours earlier. The guard reported
+                // a clean run while pointing at code that was gone, which is
+                // precisely the failure it exists to catch, in its own scanner.
+                let token = match token.find("::") {
+                    Some(at) => &token[..at],
+                    None => token,
+                };
                 if !token.ends_with(".rs") || token.is_empty() {
                     continue;
                 }
@@ -159,6 +172,36 @@ fn scanner_detects_a_planted_ghost_row() {
         found_prose.is_empty(),
         "scanner must IGNORE prose mentions (dated history names deleted files \
          on purpose), but extracted: {found_prose:?}"
+    );
+}
+
+/// A `path.rs::member` citation must be extracted, not skipped.
+///
+/// This is the guard's OWN dominant citation style: the non-O(1) table in
+/// CLAUDE.md names 22 paths that way. Until 2026-08-21 the scanner tested
+/// `token.ends_with(".rs")` on the whole token, and `file.rs::field` does not
+/// end with ".rs" -- so every one of them was silently skipped. Two rows
+/// naming modules deleted the same day passed a green run.
+///
+/// The negative half matters as much: a `::member` suffix must not become a
+/// way to smuggle a ghost path past the guard.
+#[test]
+fn scanner_sees_through_a_member_suffix() {
+    let row = "| `crates/trading/src/candles/seal_ring.rs::push` | a real file |\n";
+    let found = rs_files_named_in_table_rows(row);
+    assert!(
+        found.contains("seal_ring.rs"),
+        "a `path.rs::member` citation must yield the filename: {found:?}"
+    );
+
+    // Bite proof: the same shape naming a file that does NOT exist must be
+    // extracted too, so `every_rs_file_named_in_claude_md_table_exists` fails
+    // on it rather than waving it through.
+    let ghost = "| `crates/app/src/definitely_not_a_real_module_xyz.rs::field` | ghost |\n";
+    let found_ghost = rs_files_named_in_table_rows(ghost);
+    assert!(
+        found_ghost.contains("definitely_not_a_real_module_xyz.rs"),
+        "a ghost path with a `::member` suffix must still be caught: {found_ghost:?}"
     );
 }
 

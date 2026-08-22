@@ -27,12 +27,10 @@
 use std::path::PathBuf;
 
 /// The five `/exec` completeness-probe files.
-const PROBE_FILES: [&str; 5] = [
+const PROBE_FILES: [&str; 3] = [
     "rest_candle_fold.rs",
     "tf_consistency_boot.rs",
     "market_ram_store_boot.rs",
-    "spot_crossverify_boot.rs",
-    "groww_spot_1m_boot.rs",
 ];
 
 fn app_src(file: &str) -> String {
@@ -89,7 +87,7 @@ fn banned_needles() -> [&'static str; 3] {
 /// Positive pins: every probe site fetches `cap + 1`.
 #[test]
 fn probe_sites_fetch_limit_plus_one() {
-    let pins: [(&str, &[&str]); 5] = [
+    let pins: [(&str, &[&str]); 3] = [
         (
             "rest_candle_fold.rs",
             &["let fetch_limit = limit.saturating_add(1);"],
@@ -103,11 +101,6 @@ fn probe_sites_fetch_limit_plus_one() {
             ],
         ),
         ("market_ram_store_boot.rs", &["limit.saturating_add(1)"]),
-        ("spot_crossverify_boot.rs", &["SPOT_XVERIFY_ROW_LIMIT + 1"]),
-        (
-            "groww_spot_1m_boot.rs",
-            &["GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1"],
-        ),
     ];
     for (file, needles) in pins {
         let prod = stripped_production(file);
@@ -125,7 +118,7 @@ fn probe_sites_fetch_limit_plus_one() {
 /// Positive pins: every probe parser flags strictly OVER the cap.
 #[test]
 fn probe_sites_flag_strictly_over_limit() {
-    let pins: [(&str, &[&str]); 5] = [
+    let pins: [(&str, &[&str]); 3] = [
         (
             "rest_candle_fold.rs",
             &["let truncated = dataset.len() > limit;"],
@@ -138,11 +131,6 @@ fn probe_sites_flag_strictly_over_limit() {
             "market_ram_store_boot.rs",
             &["let truncated = dataset.len() > limit;"],
         ),
-        (
-            "spot_crossverify_boot.rs",
-            &["let truncated = rows.len() > limit;"],
-        ),
-        ("groww_spot_1m_boot.rs", &["if rows.len() > cap {"]),
     ];
     for (file, needles) in pins {
         let prod = stripped_production(file);

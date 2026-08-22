@@ -97,6 +97,7 @@ pub mod console_views;
 // panic fallback (Client::new() panics on TLS/resolver/fd init failure —
 // a silent tokio-task death).
 pub mod http_client;
+pub mod ilp_flush_reconnect;
 pub mod ilp_overflow;
 // SP5 (parity plan, operator directive 2026-06-02 narrowed cross-verify): ONE
 // unified post-market live-vs-backtest 1m parity audit table + writer + CSV
@@ -105,16 +106,6 @@ pub mod ilp_overflow;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
-/// BruteX↔TickVault daily cross-verification (operator 2026-07-11): the two
-/// forensic tables — one row per divergent CELL + one per-day summary row
-/// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
-/// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
-pub mod brutex_crossverify_persistence;
-/// Cadence cross-fill visibility (operator 2026-07-20): one forensic row per
-/// cross-fill / Groww-fallback event with the precise minute + latency —
-/// the "every day, week, month, precisely at what time" system-of-record.
-/// See `.claude/rules/project/cadence-error-codes.md` §4 (CADENCE-04).
-pub mod cross_fill_audit_persistence;
 /// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification audit (the revived
 /// Dhan live feed's ONLY ground truth — the wire carries no sequence number,
 /// so Dhan's own 1m tape is the only packet-loss proxy available). Cell-level
@@ -162,13 +153,6 @@ pub mod resource_monitor;
 // questdb_health check reachability/connection, not per-table apply).
 pub mod wal_auto_resume;
 pub mod wal_suspension_watcher;
-// Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
-// schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
-// `daily_universe_fetcher` per
-// `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
-// Groww second-feed live-tick persistence (operator lock 2026-06-19 §32).
-// Isolated `groww_*` namespace; the Dhan path is untouched.
-pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
 // (SP5) The Groww live-vs-backtest 1m parity audit writer was merged into a
 // unified `feed_parity_1m_audit_persistence` module, then DELETED 2026-07-15
@@ -250,7 +234,6 @@ pub mod shadow_seal_columns;
 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
 // SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
 pub mod spot_1m_rest_persistence;
-pub mod spot_crossverify_persistence;
 // Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
@@ -284,6 +267,11 @@ pub mod rest_fetch_audit_persistence;
 // second).
 pub mod depth_persistence;
 pub mod tick_persistence;
+// Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
+// ILP bodies back to QuestDB's /write endpoint and truncates on success, so
+// the ITEM 24 rescue recovers without a human running curl. Reinstates the
+// `tick_spill_drain` deleted in the 2026-07-17 stage-2 sweep (see above).
+pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;

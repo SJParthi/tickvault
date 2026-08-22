@@ -63,8 +63,8 @@ use tickvault_storage::feed_episode_audit_persistence::{
 };
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_GROWW, LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES,
-    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables,
+    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
+    ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
 use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 
@@ -706,11 +706,27 @@ pub fn should_keep_degraded_outcome(
 /// boot-synthesized deaths (a real crash day must never skip its restart
 /// floor) and never applies the latch to forced
 /// (`TICKVAULT_SCOREBOARD_NOW`) runs.
+///
+/// # The feed list is derived, never written out
+///
+/// This read `["dhan", "groww"]` until 2026-08-22. `Feed::ALL` had already
+/// become `[Dhan, Truedata]`, and the daily rows are keyed by
+/// `Feed::as_str()`, so the lookup asked for a key production can no longer
+/// contain. `is_some_and` on a missing key is `false`, so the whole predicate
+/// was `false` on every call and the latch was permanently dead -- re-running
+/// an already-vouched day and re-sending the duplicate Telegram card that the
+/// round-5 fix above exists to prevent.
+///
+/// The unit test asserted on `"groww"` keys too, so it stayed green while the
+/// function it covers could not fire. Both are now driven off `Feed::ALL`,
+/// which is what that constant's own doc has always demanded: "Build every
+/// iteration / allowed-list from this -- never a hand-written `[Feed::Dhan]`
+/// literal -- so a future feed cannot be silently dropped from a list."
 #[must_use]
 pub fn catchup_rerun_is_redundant(existing_outcomes: &BTreeMap<String, String>) -> bool {
-    ["dhan", "groww"].iter().all(|feed| {
+    tickvault_common::feed::Feed::ALL.iter().all(|feed| {
         existing_outcomes
-            .get(*feed)
+            .get(feed.as_str())
             .is_some_and(|o| o == "complete" || o == "feed_off")
     })
 }
@@ -1030,57 +1046,18 @@ pub fn parse_minute_set(body: &str) -> Option<HashSet<String>> {
     Some(out)
 }
 
-/// Feed-level minute overlap: `(a_only, b_only, both)`. Pure, O(minutes ≤ 375).
-#[must_use]
-pub fn compute_minute_overlap(a: &HashSet<String>, b: &HashSet<String>) -> (i64, i64, i64) {
-    let both = a.intersection(b).count();
-    let to_i64 = |v: usize| i64::try_from(v).unwrap_or(i64::MAX);
-    (
-        to_i64(a.len().saturating_sub(both)),
-        to_i64(b.len().saturating_sub(both)),
-        to_i64(both),
-    )
-}
-
-/// Step 5: stamp each feed's `unique_win_minutes` / `both_minutes` from
-/// the two session minute sets — UNLESS the PARTNER feed was off for the
-/// day, in which case the comparison columns take the `-1` sentinel
-/// (round 5, 2026-07-10 — MEDIUM): exclusive-vs-nothing is not a
-/// measurement, and the running feed's ~375 "unique win" minutes on a
-/// one-horse day flowed straight into the month verdict's headline
-/// `sum(unique_win_minutes)` (the runbook's row-level
-/// `outcome != 'feed_off'` filter removed only the OFF feed's row). The
-/// DB row itself must not carry a fabricated competitive win — the `-1`
-/// is skipped by the runbook's sentinel-guarded sums, and the month SQL
-/// additionally excludes the whole day (day-level subquery, runbook §2).
-/// Pure.
-pub fn apply_minute_overlap_and_feed_off_sentinels(
-    feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
-    minute_sets: &BTreeMap<&'static str, Option<HashSet<String>>>,
-    feed_off: &BTreeMap<&'static str, bool>,
-) {
-    if let (Some(Some(dhan_set)), Some(Some(groww_set))) =
-        (minute_sets.get("dhan"), minute_sets.get("groww"))
-    {
-        let (dhan_only, groww_only, both) = compute_minute_overlap(dhan_set, groww_set);
-        if let Some(n) = feed_numbers.get_mut("dhan") {
-            n.unique_win_minutes = dhan_only;
-            n.both_minutes = both;
-        }
-        if let Some(n) = feed_numbers.get_mut("groww") {
-            n.unique_win_minutes = groww_only;
-            n.both_minutes = both;
-        }
-    }
-    for (feed, partner) in [("dhan", "groww"), ("groww", "dhan")] {
-        if feed_off.get(partner).copied().unwrap_or(false)
-            && let Some(n) = feed_numbers.get_mut(feed)
-        {
-            n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-            n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        }
-    }
-}
+// Feed-vs-feed contest math — RETIRED 2026-08-21 (second-feed removal).
+// `compute_minute_overlap` and `apply_minute_overlap_and_feed_off_sentinels`
+// stamped each feed's `unique_win_minutes` / `both_minutes` from the two
+// session minute sets, and blanked them to the sentinel when the PARTNER feed
+// was off. Both are comparative by definition and had already gone
+// unreachable: `minute_sets` and `feed_off` are keyed from `Feed::ALL`, so the
+// removed feed's lookups always missed and neither branch could fire. The two
+// columns therefore already carried the -1 unavailable sentinel every run —
+// which is what they carry now, unchanged, and what the runbook's
+// sentinel-guarded `sum(unique_win_minutes)` already skips. The columns stay
+// in the schema and are still round-tripped from an existing row on a
+// catch-up rerun; nothing computes them while one feed is live.
 
 // Scoreboard PR-D presence-coverage fold — RETIRED 2026-07-18 (stage-4
 // dead-producer sweep): `apply_presence_coverage`,
@@ -2721,13 +2698,13 @@ pub fn build_rest_leg_score_lines(
             },
         }
     };
-    const CANONICAL: [(&str, &str); 4] = [
-        ("dhan", "spot_1m"),
-        ("dhan", "chain_1m"),
-        ("groww", "spot_1m"),
-        ("groww", "chain_1m"),
-    ];
-    let mut out = Vec::with_capacity(summaries.len().max(4));
+    // 2026-08-21: was 4 pairs (Dhan x the removed second feed). Its two
+    // rows rendered every single day carrying the -1 "absent" sentinels,
+    // and `unmeasured_canonical_rest_pairs` then named them "not measured
+    // today" in the operator digest — which reads as a leg that should
+    // have run and did not, never as a feed that no longer exists.
+    const CANONICAL: [(&str, &str); 2] = [("dhan", "spot_1m"), ("dhan", "chain_1m")];
+    let mut out = Vec::with_capacity(summaries.len().max(CANONICAL.len()));
     for (feed, leg) in CANONICAL {
         let s = summaries.iter().find(|s| s.feed == feed && s.leg == leg);
         out.push(to_line(feed, leg, s));
@@ -2800,15 +2777,13 @@ pub fn log_rest_leg_measurement_gaps(summaries: &[RestLegDaySummary]) {
     }
 }
 
-/// The four canonical card pairs (display names) the §2b contract names.
-const CANONICAL_DISPLAY: [(&str, &str); 4] = [
-    ("Dhan", "spot candles"),
-    ("Dhan", "option chain"),
-    ("Groww", "spot candles"),
-    ("Groww", "option chain"),
-];
+/// The canonical card pairs (display names) the §2b contract names.
+///
+/// 2026-08-21: two, not four — the second feed was removed, and its pair
+/// names must not keep appearing in the digest as legs awaiting data.
+const CANONICAL_DISPLAY: [(&str, &str); 2] = [("Dhan", "spot candles"), ("Dhan", "option chain")];
 
-/// The CANONICAL card pairs (Dhan/Groww × spot candles/option chain) with
+/// The CANONICAL card pairs (Dhan x spot candles/option chain) with
 /// NOTHING measured today — no pull counts AND no latency samples. Pure so
 /// the F3 not-measured logging is unit-testable.
 ///
@@ -2927,7 +2902,6 @@ impl FeedDayNumbers {
 pub struct ScoreboardSummary {
     pub trading_date_ist: String,
     pub dhan: FeedDayNumbers,
-    pub groww: FeedDayNumbers,
     pub session_minutes: i64,
     /// A data SOURCE was unavailable mid-run (read/parse/flush failure) —
     /// distinct from `early_run` so the Telegram footnotes stay honest
@@ -2946,8 +2920,7 @@ pub struct ScoreboardSummary {
     /// stamps the distinct 'feed_off' outcome and the card says "no
     /// contest" instead of declaring a one-horse winner.
     pub dhan_feed_off: bool,
-    /// Groww was switched OFF for the day (round 4, 2026-07-10).
-    pub groww_feed_off: bool,
+
     /// REST 1m pull digest aggregates per (feed, leg) — the Quote-2 daily
     /// answer (Groww REST plan PR-5). Empty on days with no measurable
     /// pull records (pre-deploy days / read failure — see the flag below).
@@ -3366,7 +3339,6 @@ pub async fn run_feed_scoreboard(
     // 4. Per-feed tick / instrument / minute coverage (SQL over the day's
     //    ticks partition — flagged O(day-rows), server-side, cold).
     let mut feed_numbers: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-    let mut minute_sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         let mut n = FeedDayNumbers::unavailable();
@@ -3395,7 +3367,6 @@ pub async fn run_feed_scoreboard(
         if n.ticks < 0 || n.instruments < 0 || set.is_none() {
             sources_complete = false;
         }
-        minute_sets.insert(label, set);
         feed_numbers.insert(label, n);
     }
 
@@ -3500,12 +3471,9 @@ pub async fn run_feed_scoreboard(
         feed_off.insert(label, inferred || kept);
     }
 
-    // 5c. Feed-level unique-win / both minutes from the two minute sets —
-    //     with the `-1` sentinel on the PARTNER's comparison columns on a
-    //     feed-off day (round 5, 2026-07-10 — MEDIUM: exclusive-vs-nothing
-    //     is not a measurement; the phantom ~375 unique minutes skewed the
-    //     month verdict's headline sum).
-    apply_minute_overlap_and_feed_off_sentinels(&mut feed_numbers, &minute_sets, &feed_off);
+    // 5c. Feed-level unique-win / both minutes — RETIRED 2026-08-21 with the
+    //     second feed; see the dated note beside `parse_minute_set`. The two
+    //     columns keep the -1 unavailable sentinel they already carried.
 
     // 5d. Per-instrument presence drain — RETIRED 2026-07-18 (stage-4
     //     dead-producer sweep): the in-memory presence registry was deleted
@@ -3852,7 +3820,6 @@ pub async fn run_feed_scoreboard(
             lag_samples: n.lag_samples,
             lag_floor_ms: match *feed {
                 tickvault_common::feed::Feed::Dhan => LAG_FLOOR_MS_DHAN,
-                tickvault_common::feed::Feed::Groww => LAG_FLOOR_MS_GROWW,
                 tickvault_common::feed::Feed::Truedata => LAG_FLOOR_MS_TRUEDATA,
             },
             disconnects_market: n.disconnects_market,
@@ -3935,18 +3902,19 @@ pub async fn run_feed_scoreboard(
         .get("dhan")
         .copied()
         .unwrap_or_else(FeedDayNumbers::unavailable);
-    let groww = feed_numbers
-        .get("groww")
-        .copied()
-        .unwrap_or_else(FeedDayNumbers::unavailable);
     // Total blackout (nothing measured at all) → the caller pages Aborted.
-    if dhan.ticks < 0 && groww.ticks < 0 && tallies.is_none() {
+    //
+    // 2026-08-21: the second feed dropped out of this condition with the feed
+    // itself. Its `feed_numbers` lookup always missed, so its `ticks` was the
+    // -1 unavailable sentinel on every run and the `&&` term was already
+    // vacuously true — the check has always been the Dhan-and-no-tallies one
+    // it now says it is.
+    if dhan.ticks < 0 && tallies.is_none() {
         return Err("every data source was unreachable — nothing measured".to_string());
     }
     Ok(ScoreboardSummary {
         trading_date_ist: trading_date_label,
         dhan,
-        groww,
         session_minutes: SCOREBOARD_SESSION_MINUTES,
         partial_coverage,
         degraded,
@@ -3955,7 +3923,6 @@ pub async fn run_feed_scoreboard(
         // partial while the card rendered no restart caveat).
         restart_partial: restart_day_floor,
         dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
-        groww_feed_off: feed_off.get("groww").copied().unwrap_or(false),
         rest_legs,
         rest_legs_read_failed,
     })
@@ -4247,19 +4214,6 @@ mod tests {
         assert_eq!(rows[2].feed, "groww");
         // Unparsable body → None (caller records sentinels).
         assert_eq!(parse_ws_events("not json"), None);
-    }
-
-    #[test]
-    fn test_compute_minute_overlap() {
-        let a: HashSet<String> = ["09:15", "09:16", "09:17"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let b: HashSet<String> = ["09:16", "09:17", "09:18", "09:19"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        assert_eq!(compute_minute_overlap(&a, &b), (1, 2, 2));
     }
 
     #[test]
@@ -6290,49 +6244,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_minute_overlap_and_feed_off_sentinels() {
-        // Round-5 MEDIUM: on a feed-off day the PARTNER's comparison
-        // columns take the -1 sentinel — exclusive-vs-nothing is not a
-        // measurement, and the phantom ~375 unique minutes skewed the
-        // month verdict's headline sum.
-        let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
-        let dhan_set: HashSet<String> = [minute(9, 15), minute(9, 16), minute(9, 17)]
-            .into_iter()
-            .collect();
-        let mk = |dhan_set: HashSet<String>, groww_set: HashSet<String>| {
-            let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-            nums.insert("dhan", FeedDayNumbers::unavailable());
-            nums.insert("groww", FeedDayNumbers::unavailable());
-            let mut sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
-            sets.insert("dhan", Some(dhan_set));
-            sets.insert("groww", Some(groww_set));
-            (nums, sets)
-        };
-        // Normal dual-feed day: real overlap, no sentinels.
-        let (mut nums, sets) = mk(dhan_set.clone(), [minute(9, 15)].into_iter().collect());
-        let both_on: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", false)].into_iter().collect();
-        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &both_on);
-        assert_eq!(nums["dhan"].unique_win_minutes, 2);
-        assert_eq!(nums["dhan"].both_minutes, 1);
-        assert_eq!(nums["groww"].unique_win_minutes, 0);
-        // Groww-off day: dhan's "3 exclusive minutes vs nothing" is NOT a
-        // measurement — sentinel, never a phantom month-sum win.
-        let (mut nums, sets) = mk(dhan_set, HashSet::new());
-        let groww_off: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", true)].into_iter().collect();
-        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &groww_off);
-        assert_eq!(
-            nums["dhan"].unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL,
-            "the RUNNING feed's row on a feed-off day carries no phantom win"
-        );
-        assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
-        // The OFF feed's own measured zeros stay (its row is feed_off and
-        // excluded day-level by the runbook SQL anyway).
-        assert_eq!(nums["groww"].unique_win_minutes, 0);
-    }
-
-    #[test]
     fn test_should_keep_feed_off_outcome_evening_rerun_preserves_no_contest() {
         // Round-5 HIGH (erasure facet) topology: a config-off day stamped
         // feed_off, then a same-day EVENING boot with the feed re-enabled
@@ -6407,15 +6318,30 @@ mod tests {
         // latch permanently dead on single-feed profiles (every day is a
         // feed-off day there) and re-sent a duplicate card every evening
         // boot.
-        let both: BTreeMap<String, String> = [
-            ("dhan".to_string(), "complete".to_string()),
-            ("groww".to_string(), "complete".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        //
+        // 2026-08-22: every key below is derived from `Feed::ALL`. They were
+        // hand-written `"dhan"` / `"groww"` literals, so when `Feed::Groww`
+        // was removed this test kept passing on a key production can no
+        // longer produce -- while the function it covers returned `false` on
+        // every real call. A fixture that agrees with a deleted enum proves
+        // nothing about the code that ships.
+        let feeds: Vec<&str> = tickvault_common::feed::Feed::ALL
+            .iter()
+            .map(|f| f.as_str())
+            .collect();
+        assert!(
+            feeds.len() >= 2,
+            "this test needs at least two feeds to distinguish 'both terminal' \
+             from 'one terminal'"
+        );
+        let (first, second) = (feeds[0], feeds[1]);
+        let both: BTreeMap<String, String> = feeds
+            .iter()
+            .map(|f| ((*f).to_string(), "complete".to_string()))
+            .collect();
         assert!(catchup_rerun_is_redundant(&both));
         let mut single_feed = both.clone();
-        single_feed.insert("groww".to_string(), "feed_off".to_string());
+        single_feed.insert(second.to_string(), "feed_off".to_string());
         assert!(
             catchup_rerun_is_redundant(&single_feed),
             "{{complete, feed_off}} is terminal — the single-feed-profile \
@@ -6423,25 +6349,22 @@ mod tests {
         );
         for worse in ["partial", "degraded"] {
             let mut m = both.clone();
-            m.insert("groww".to_string(), worse.to_string());
+            m.insert(second.to_string(), worse.to_string());
             assert!(
                 !catchup_rerun_is_redundant(&m),
                 "{worse} days must re-run (partial may improve; degraded is \
                  keep-better-protected)"
             );
         }
-        let mixed: BTreeMap<String, String> = [
-            ("dhan".to_string(), "partial".to_string()),
-            ("groww".to_string(), "feed_off".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        let mut mixed = both.clone();
+        mixed.insert(first.to_string(), "partial".to_string());
+        mixed.insert(second.to_string(), "feed_off".to_string());
         assert!(
             !catchup_rerun_is_redundant(&mixed),
             "{{partial, feed_off}} still re-runs — the partial side may improve"
         );
         let mut one = both.clone();
-        one.remove("dhan");
+        one.remove(first);
         assert!(!catchup_rerun_is_redundant(&one), "a missing row re-runs");
         assert!(!catchup_rerun_is_redundant(&BTreeMap::new()));
     }
@@ -6804,7 +6727,7 @@ mod tests {
     fn test_build_rest_leg_score_lines_canonical_order_and_extras() {
         let summaries = vec![
             RestLegDaySummary {
-                feed: "groww".to_string(),
+                feed: "dhan".to_string(),
                 leg: "spot_1m".to_string(),
                 ok_fetches: 1_496,
                 failed_fetches: 4,
@@ -6818,7 +6741,7 @@ mod tests {
                 close_samples: 1_494,
             },
             RestLegDaySummary {
-                feed: "groww".to_string(),
+                feed: "dhan".to_string(),
                 leg: "contract_1m".to_string(),
                 ok_fetches: 10,
                 failed_fetches: 0,
@@ -6842,21 +6765,22 @@ mod tests {
             vec![
                 ("Dhan".to_string(), "spot candles".to_string()),
                 ("Dhan".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "spot candles".to_string()),
-                ("Groww".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "option contracts".to_string()),
+                ("Dhan".to_string(), "option contracts".to_string()),
             ]
         );
         // The measured pair carries its numbers; an absent pair carries
         // the honest -1 sentinels everywhere.
-        let groww_spot = &lines[2];
-        assert_eq!(groww_spot.ok_fetches, 1_496);
-        assert_eq!(groww_spot.close_p99_ms, 3_200);
+        let dhan_spot = &lines[0];
+        assert_eq!(dhan_spot.ok_fetches, 1_496);
+        assert_eq!(dhan_spot.close_p99_ms, 3_200);
         let dhan_chain = &lines[1];
         assert_eq!(dhan_chain.ok_fetches, -1);
         assert_eq!(dhan_chain.close_samples, -1);
-        // Empty summaries still render the four canonical placeholders.
-        assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
+        // Empty summaries still render every canonical placeholder.
+        assert_eq!(
+            build_rest_leg_score_lines(&[]).len(),
+            CANONICAL_DISPLAY.len()
+        );
     }
 
     #[test]
@@ -6866,7 +6790,7 @@ mod tests {
         // helper names exactly the canonical pairs with no measured pull
         // source (the §2b always-render contract's log-side leg).
         let summaries = vec![RestLegDaySummary {
-            feed: "groww".to_string(),
+            feed: "dhan".to_string(),
             leg: "spot_1m".to_string(),
             ok_fetches: 1_496,
             failed_fetches: 4,
@@ -6882,15 +6806,11 @@ mod tests {
         let lines = build_rest_leg_score_lines(&summaries);
         assert_eq!(
             unmeasured_canonical_rest_pairs(&lines),
-            vec![
-                ("Dhan".to_string(), "spot candles".to_string()),
-                ("Dhan".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "option chain".to_string()),
-            ]
+            vec![("Dhan".to_string(), "option chain".to_string())]
         );
         // Every canonical pair measured → nothing to log.
         let all = ["spot_1m", "chain_1m"];
-        let full: Vec<RestLegDaySummary> = ["dhan", "groww"]
+        let full: Vec<RestLegDaySummary> = ["dhan"]
             .iter()
             .flat_map(|f| {
                 all.iter().map(|l| RestLegDaySummary {
@@ -6911,10 +6831,10 @@ mod tests {
             .collect();
         let lines = build_rest_leg_score_lines(&full);
         assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
-        // Empty build → all four pairs named.
+        // Empty build → every canonical pair named.
         assert_eq!(
             unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
-            4
+            CANONICAL_DISPLAY.len()
         );
     }
 
@@ -6945,8 +6865,8 @@ mod tests {
             !unmeasured.contains(&("Dhan".to_string(), "spot candles".to_string())),
             "a latency-only pair must never be logged 'not measured': {unmeasured:?}"
         );
-        // The other three canonical pairs stay honestly unmeasured.
-        assert_eq!(unmeasured.len(), 3);
+        // The remaining canonical pair stays honestly unmeasured.
+        assert_eq!(unmeasured.len(), CANONICAL_DISPLAY.len() - 1);
         // ...and the latency-only classifier names exactly this pair.
         assert_eq!(
             latency_only_canonical_rest_pairs(&lines),

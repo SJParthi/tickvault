@@ -60,7 +60,6 @@ questdb-rs = { version = "=6.1.0", features = ["chrono_timestamp"] }
 # ---- Section 5: Observability — Metrics ----
 metrics = "=0.24.6"
 metrics-exporter-prometheus = "=0.18.3"
-quanta = "=0.12.6"
 
 # ---- Section 5: Observability — OpenTelemetry ----
 # The 4 otel crates are a MATCHED SET: tracing-opentelemetry 0.33.0 depends on
@@ -250,7 +249,6 @@ percent-encoding = "=2.3.2"
 form_urlencoded = "=1.2.2"
 
 # ---- Section 16: CLI ----
-clap = { version = "=4.6.6", features = ["derive"] }
 
 # ---- Section 17: Unique IDs ----
 uuid = { version = "=1.24.1", features = ["v4", "serde"] }

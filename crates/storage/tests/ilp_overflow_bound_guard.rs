@@ -27,7 +27,13 @@ const AGENT_JSON: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json
 const USER_DATA: &str = include_str!("../../../deploy/aws/terraform/user-data.sh.tftpl");
 
 /// Every writer that propagates a flush error while keeping its buffer.
-const BOUNDED_WRITERS: [(&str, &str); 4] = [
+///
+/// 2026-08-21: this list held FOUR. `brutex_crossverify_persistence` was
+/// removed along with the BruteX cross-verify comparator itself -- that
+/// comparator read a table only the Groww feed could fill, so with one broker
+/// it could only ever compare against nothing. A retention bound on a writer
+/// that no longer exists is not coverage.
+const BOUNDED_WRITERS: [(&str, &str); 3] = [
     (
         "ws_event_audit_persistence",
         include_str!("../src/ws_event_audit_persistence.rs"),
@@ -39,10 +45,6 @@ const BOUNDED_WRITERS: [(&str, &str); 4] = [
     (
         "feed_scoreboard_persistence",
         include_str!("../src/feed_scoreboard_persistence.rs"),
-    ),
-    (
-        "brutex_crossverify_persistence",
-        include_str!("../src/brutex_crossverify_persistence.rs"),
     ),
 ];
 

@@ -34,24 +34,11 @@ pub enum WsType {
     Depth200,
     /// `wss://api-order-update.dhan.co` order-update feed (always 1 conn).
     OrderUpdate,
-    /// The Groww second feed (operator §32) — NOT a Dhan binary WS but a
-    /// legacy-sidecar NDJSON tail bridge. A distinct `ws_type` keeps the broker
-    /// meaning of the SYMBOL honest: a `where ws_type='groww_bridge'` query reads
-    /// cleanly, and re-using a Dhan label (`main_feed`/`order_update`) would
-    /// silently mix two brokers in operator filters. Pairs with `feed='groww'`.
-    GrowwBridge,
-    /// The Groww order/position PUSH channel (Stage A, 2026-07-16) — the
-    /// receive-only NATS-over-WS order/position-update session. A distinct
-    /// `ws_type` keeps the broker + purpose meaning of the SYMBOL honest:
-    /// `where ws_type='groww_order_update'` reads cleanly and never mixes
-    /// with the Dhan `order_update` label or the retired market-data
-    /// `groww_bridge` rows. Pairs with `feed='groww'`.
-    GrowwOrderUpdate,
     /// The TrueData live-tick feed (feed #4, operator lock 2026-07-24) —
     /// the `wss://push.truedata.in` binary-tick market-data WebSocket. A
     /// distinct `ws_type` keeps the broker meaning of the SYMBOL honest:
     /// `where ws_type='truedata_feed'` reads cleanly and never mixes with
-    /// a Dhan/Groww label. Pairs with `feed='truedata'`.
+    /// a Dhan label. Pairs with `feed='truedata'`.
     TruedataFeed,
 }
 
@@ -64,8 +51,6 @@ impl WsType {
             Self::Depth20 => "depth_20",
             Self::Depth200 => "depth_200",
             Self::OrderUpdate => "order_update",
-            Self::GrowwBridge => "groww_bridge",
-            Self::GrowwOrderUpdate => "groww_order_update",
             Self::TruedataFeed => "truedata_feed",
         }
     }
@@ -73,14 +58,12 @@ impl WsType {
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness
     /// without drifting from the enum.
     #[must_use]
-    pub const fn all() -> [WsType; 7] {
+    pub const fn all() -> [WsType; 5] {
         [
             Self::MainFeed,
             Self::Depth20,
             Self::Depth200,
             Self::OrderUpdate,
-            Self::GrowwBridge,
-            Self::GrowwOrderUpdate,
             Self::TruedataFeed,
         ]
     }
@@ -166,8 +149,8 @@ pub struct WsEventAuditRow {
     pub event_ts_ist_nanos: i64,
     /// The trading day — IST midnight nanoseconds.
     pub trading_date_ist_nanos: i64,
-    /// Broker feed source (`dhan` / `groww`). Per-feed identity (2026-06-23):
-    /// a Dhan and a Groww connection can share `(ws_type, connection_index)`,
+    /// Broker feed source (`dhan`). Per-feed identity (2026-06-23):
+    /// two connections can share `(ws_type, connection_index)`,
     /// so `feed` is part of the audit's DEDUP key — their lifecycle events are
     /// distinct rows, never collapsed.
     pub feed: crate::feed::Feed,
@@ -209,8 +192,6 @@ mod tests {
                 "depth_20",
                 "depth_200",
                 "order_update",
-                "groww_bridge",
-                "groww_order_update",
                 "truedata_feed"
             ]
         );
@@ -246,7 +227,7 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 7);
+        assert_eq!(WsType::all().len(), 5);
         assert_eq!(WsEventKind::all().len(), 7);
     }
 

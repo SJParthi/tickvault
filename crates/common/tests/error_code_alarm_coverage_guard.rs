@@ -204,8 +204,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "BAR-MISMATCH-02",
     "BAR-MISMATCH-03",
     "BOOT-01",
-    "BRUTEX-XVERIFY-01",
-    "BRUTEX-XVERIFY-02",
     "CADENCE-01",
     "CADENCE-02",
     "CHAIN-03",
@@ -225,32 +223,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "FOLD-01",
     "FUTIDX-01",
     "FUTIDX-02",
-    "GROWW-MARG-01",
-    "GROWW-MARG-02",
-    "GROWW-MARG-03",
-    "GROWW-MARG-04",
-    "GROWW-OCO-01",
-    "GROWW-OCO-02",
-    "GROWW-OCO-03",
-    "GROWW-OCO-05",
-    "GROWW-ORD-01",
-    "GROWW-ORD-02",
-    "GROWW-ORD-03",
-    "GROWW-ORD-04",
-    "GROWW-ORD-06",
-    "GROWW-ORD-09",
-    "GROWW-ORD-10",
-    "GROWW-PORT-01",
-    "GROWW-PORT-02",
-    "GROWW-PORT-03",
-    "GROWW-PORT-04",
-    "GROWW-PUSH-01",
-    "GROWW-PUSH-02",
-    "GROWW-PUSH-04",
-    "GROWW-SCALE-01",
-    "GROWW-SCALE-02",
-    "GROWW-SCALE-03",
-    "GROWW-SCALE-05",
     "HTTP-CLIENT-01",
     "I-P0-03",
     "INDEX-OHLC-02",
@@ -264,6 +236,16 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "ORDER-READY-01",
     "ORPHAN-POSITION-01",
     "PREVCLOSE-03",
+    // DHAN-LIVE-XVERIFY-01 is log-sink-only TODAY, and that is a recorded
+    // choice rather than a comfortable one. It reports the daily
+    // live-vs-REST comparison degrading or going blind — the ONLY ground
+    // truth the revived Dhan feed has, since the India feed carries no
+    // sequence number. Its predecessor was blind for the entire life of
+    // the feature and nobody was woken, precisely because nothing paged.
+    // An alarm is a terraform + EMF change and, per the Dhan noise lock
+    // §3, needs a dated operator row before any new Dhan-scoped page —
+    // so it is exempted here and flagged, not silently left undecided.
+    "DHAN-LIVE-XVERIFY-01",
     "RAMSTORE-01",
     "RESILIENCE-01",
     "RESILIENCE-03",
@@ -273,8 +255,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "RISK-GAP-01",
     "RISK-GAP-02",
     "SELFTEST-02",
-    "SPOT-XVERIFY-01",
-    "SPOT-XVERIFY-02",
     "SPOT1M-02",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
@@ -397,10 +377,23 @@ so in a dated rule-file note and lower this floor deliberately. Found: {alarmed:
         alarmed.len()
     );
 
+    // 2026-08-21: floor lowered 100 -> 81 -> 74 DELIBERATELY. The entire
+    // Groww feed was ordered removed (websocket-connection-scope-lock.md,
+    // "2026-08-21 (THIRD quote of the day)"). First the 28 order-side
+    // variants whose only emit sites lived in crates/trading/src/oms/groww/**
+    // were RETIRED — 21 of them High/Critical (100 -> 81). Then the two
+    // Groww-scoped cross-broker comparators went, taking BRUTEX-XVERIFY-01/02
+    // and SPOT-XVERIFY-01/02 with them, while the SURVIVING live-vs-REST
+    // comparator gained DHAN-LIVE-XVERIFY-01 (81 -> 74, net -7 across the
+    // whole sweep).
+    //
+    // This is a real drop in what CAN page, recorded rather than absorbed: no
+    // surviving code was re-graded downward, and every retired variant ceased
+    // to exist along with the machinery it described.
     let hc = high_or_critical();
     assert!(
-        hc.len() >= 100,
-        "only {} High/Critical variants seen; 102 existed on 2026-08-10. Either \
+        hc.len() >= 74,
+        "only {} High/Critical variants seen; 74 existed on 2026-08-21. Either \
 ErrorCode::all() has shrunk or severity() was re-graded downward — both change \
 what pages an operator and neither should happen silently",
         hc.len()

@@ -479,11 +479,11 @@ mod tests {
         // Slot isolation: the Groww NIFTY slot is untouched.
         assert!(
             store
-                .minute_snapshot(Feed::Groww, ChainUnderlying::Nifty, m1)
+                .minute_snapshot(Feed::Truedata, ChainUnderlying::Nifty, m1)
                 .is_none()
         );
         assert_eq!(store.minutes_resident(Feed::Dhan), 2);
-        assert_eq!(store.minutes_resident(Feed::Groww), 0);
+        assert_eq!(store.minutes_resident(Feed::Truedata), 0);
     }
 
     #[test]
@@ -493,26 +493,26 @@ mod tests {
         let m_yday = minute_on_day(day, 700);
         let m_today = minute_on_day(day + 1, 556);
         assert_eq!(
-            store.record_live(snap(Feed::Groww, ChainUnderlying::Banknifty, m_yday, 2)),
+            store.record_live(snap(Feed::Truedata, ChainUnderlying::Banknifty, m_yday, 2)),
             ChainRecordOutcome::Recorded
         );
-        assert_eq!(store.minutes_resident(Feed::Groww), 1);
+        assert_eq!(store.minutes_resident(Feed::Truedata), 1);
         // A NEWER-day publish rolls the slot: yesterday cleared.
         assert_eq!(
-            store.record_live(snap(Feed::Groww, ChainUnderlying::Banknifty, m_today, 2)),
+            store.record_live(snap(Feed::Truedata, ChainUnderlying::Banknifty, m_today, 2)),
             ChainRecordOutcome::Recorded
         );
         assert!(
             store
-                .minute_snapshot(Feed::Groww, ChainUnderlying::Banknifty, m_yday)
+                .minute_snapshot(Feed::Truedata, ChainUnderlying::Banknifty, m_yday)
                 .is_none()
         );
         assert!(
             store
-                .minute_snapshot(Feed::Groww, ChainUnderlying::Banknifty, m_today)
+                .minute_snapshot(Feed::Truedata, ChainUnderlying::Banknifty, m_today)
                 .is_some()
         );
-        assert_eq!(store.minutes_resident(Feed::Groww), 1);
+        assert_eq!(store.minutes_resident(Feed::Truedata), 1);
     }
 
     #[test]
@@ -564,7 +564,7 @@ mod tests {
         for i in 0..MAX_MINUTES_PER_SLOT {
             assert_eq!(
                 store2.record_live(snap(
-                    Feed::Groww,
+                    Feed::Truedata,
                     ChainUnderlying::Nifty,
                     minute_on_day(day, i as i64),
                     1
@@ -574,7 +574,7 @@ mod tests {
         }
         assert_eq!(
             store2.record_live(snap(
-                Feed::Groww,
+                Feed::Truedata,
                 ChainUnderlying::Nifty,
                 minute_on_day(day, MAX_MINUTES_PER_SLOT as i64),
                 1
@@ -584,7 +584,7 @@ mod tests {
         // An EXISTING minute still updates at the cap (not a new key).
         assert_eq!(
             store2.record_live(snap(
-                Feed::Groww,
+                Feed::Truedata,
                 ChainUnderlying::Nifty,
                 minute_on_day(day, 0),
                 2
@@ -640,7 +640,7 @@ mod tests {
         for i in 0..5 {
             assert_eq!(
                 store.record_live(snap(
-                    Feed::Groww,
+                    Feed::Truedata,
                     ChainUnderlying::Sensex,
                     minute_on_day(day, 556 + i),
                     1
@@ -648,15 +648,15 @@ mod tests {
                 ChainRecordOutcome::Recorded
             );
         }
-        let latest = store.latest_minutes(Feed::Groww, ChainUnderlying::Sensex, 3);
+        let latest = store.latest_minutes(Feed::Truedata, ChainUnderlying::Sensex, 3);
         assert_eq!(latest.len(), 3);
         assert_eq!(latest[0].minute_ts_ist_nanos, minute_on_day(day, 560));
         assert_eq!(latest[1].minute_ts_ist_nanos, minute_on_day(day, 559));
         assert_eq!(latest[2].minute_ts_ist_nanos, minute_on_day(day, 558));
         // Asking for more than resident returns all, newest first.
-        let all = store.latest_minutes(Feed::Groww, ChainUnderlying::Sensex, 99);
+        let all = store.latest_minutes(Feed::Truedata, ChainUnderlying::Sensex, 99);
         assert_eq!(all.len(), 5);
-        assert_eq!(store.minutes_resident(Feed::Groww), 5);
+        assert_eq!(store.minutes_resident(Feed::Truedata), 5);
         assert_eq!(store.minutes_resident(Feed::Dhan), 0);
         assert!(
             store
@@ -693,7 +693,7 @@ mod tests {
         ));
         let stats = store.stats();
         assert_eq!(stats.minutes_resident_per_feed[Feed::Dhan.index()], 2);
-        assert_eq!(stats.minutes_resident_per_feed[Feed::Groww.index()], 0);
+        assert_eq!(stats.minutes_resident_per_feed[Feed::Truedata.index()], 0);
         assert_eq!(stats.rows_resident, 10);
         let expected = 2 * header + 10 * std::mem::size_of::<SnapshotRow>() as u64;
         assert_eq!(stats.estimated_bytes, expected);
@@ -718,7 +718,7 @@ mod tests {
         ));
         assert_eq!(store.day(Feed::Dhan, ChainUnderlying::Nifty), day);
         // Slot isolation: other slots still read unset.
-        assert_eq!(store.day(Feed::Groww, ChainUnderlying::Nifty), 0);
+        assert_eq!(store.day(Feed::Truedata, ChainUnderlying::Nifty), 0);
         // Day roll advances the resident day; a stale drop never regresses it.
         store.record_live(snap(
             Feed::Dhan,

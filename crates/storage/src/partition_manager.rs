@@ -181,7 +181,6 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // handful of rows/day by construction (one per degraded lane per
     // cycle); same DAY partitioning + SEBI audit retention class as the
     // audit tables above. `lane` is the per-feed identity in its DEDUP key.
-    "cross_fill_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

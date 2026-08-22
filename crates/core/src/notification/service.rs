@@ -1126,10 +1126,10 @@ impl NotificationService {
     /// Declares which feed lines the boot checklist shows as ⏳-pending
     /// from the first page. Called by both boot lanes right after the
     /// notifier is constructed. No-op when the bubble lane is off.
-    pub fn set_boot_expectations(&self, dhan_enabled: bool, groww_enabled: bool) {
+    pub fn set_boot_expectations(&self, dhan_enabled: bool) {
         if self.episode_mode && self.boot_bubble {
             self.episodes
-                .set_boot_expectations(dhan_enabled, groww_enabled, epoch_ms_now());
+                .set_boot_expectations(dhan_enabled, epoch_ms_now());
         }
     }
 
@@ -4674,12 +4674,12 @@ mod tests {
         let base_url = start_scripted_telegram_server().await;
         let service = make_scripted_service(base_url);
         assert!(service.boot_bubble_enabled(), "boot bubble defaults ON");
-        service.set_boot_expectations(true, true);
+        service.set_boot_expectations(true);
         let cl = service
             .episodes
             .boot_checklist()
             .expect("expectations create the checklist");
-        assert_eq!(cl.expectations, Some((true, true)));
+        assert_eq!(cl.expectations, Some(true));
     }
 
     #[test]

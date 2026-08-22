@@ -38,14 +38,7 @@ pub use tickvault_common::feed::Feed;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeedStatus {
     pub dhan_enabled: bool,
-    pub groww_enabled: bool,
     /// Whether the Groww lane (the bridge task) was actually SPAWNED this process.
-    /// The bridge only spawns when `groww_enabled` is true AT BOOT. So if you
-    /// flip `groww_enabled` ON via the API but this is `false`, the toggle is
-    /// recorded but NO lane acts on it — set `groww_enabled=true` in config and
-    /// RESTART to start the lane (the API toggle is pause/resume for a *running*
-    /// lane). Exposing this avoids a misleading "enabled but nothing happens".
-    pub groww_lane_running: bool,
     /// PR-E: whether the Dhan main-feed lane was spawned this process (Dhan
     /// enabled at boot). Mirrors `groww_lane_running` for honest reporting.
     pub dhan_lane_running: bool,
@@ -67,7 +60,6 @@ pub struct FeedStatus {
 /// never the manager's contents — so no secret can leak through a debug format.
 pub struct FeedRuntimeState {
     dhan: Arc<AtomicBool>,
-    groww: Arc<AtomicBool>,
     /// TrueData (feed #4) runtime enable flag, seeded from
     /// `feeds.truedata_enabled` (default OFF). `Arc<AtomicBool>` so the SAME
     /// atomic can be handed to the future `core` TrueData WS loop (which
@@ -93,10 +85,6 @@ pub struct FeedRuntimeState {
     /// config-ON boot with a misleading "config change + restart" message
     /// (breaking the PR-E disable→restart→re-enable round trip).
     dhan_config_enabled: bool,
-    /// Set once by the boot wiring when the Groww bridge task is actually
-    /// spawned (i.e. `groww_enabled` was true at boot). Read by the API to tell
-    /// the operator honestly whether a runtime toggle will take effect.
-    groww_lane_running: AtomicBool,
     /// PR-E: set once by the boot wiring when the Dhan main-feed pool is spawned.
     dhan_lane_running: AtomicBool,
     /// PR-E: gate on the Dhan *disable* direction (orders-live safety). Seeded
@@ -153,7 +141,6 @@ impl FeedRuntimeState {
     ) -> Self {
         Self {
             dhan: Arc::new(AtomicBool::new(feeds.dhan_enabled)),
-            groww: Arc::new(AtomicBool::new(feeds.groww_enabled)),
             // TrueData (feed #4): seed the runtime flag from config (default
             // OFF); the lane is not wired yet so it never runs this process.
             truedata: Arc::new(AtomicBool::new(feeds.truedata_enabled)),
@@ -163,7 +150,6 @@ impl FeedRuntimeState {
             // retired lane (raw config-off is authoritative; round-2 FIX A).
             dhan_config_enabled: dhan_config_enabled_raw,
             // The lane is not running until the boot wiring spawns it.
-            groww_lane_running: AtomicBool::new(false),
             dhan_lane_running: AtomicBool::new(false),
             // No pool until the inline Dhan boot spine spawns one (boot-ON only).
             dhan_disable_allowed: AtomicBool::new(true),
@@ -261,29 +247,12 @@ impl FeedRuntimeState {
         }
     }
 
-    /// Set the Groww lane-running flag both ways. The activation watcher
-    /// (`groww_activation`) sets it `true` on the enable rising-edge once the
-    /// tables + watch-list are ready, and `false` on the disable falling-edge —
-    /// so the feed page reports "running" iff the lane is actually live, never a
-    /// false-OK and never a stale DEGRADED after a runtime cold-start.
-    pub fn set_groww_lane_running(&self, running: bool) {
-        // Relaxed: UI-status-only flag; no ordering dependency with other shared state.
-        self.groww_lane_running.store(running, Ordering::Relaxed);
-    }
-
-    /// Whether the Groww bridge task was spawned this process (see [`FeedStatus`]).
-    #[must_use]
-    pub fn is_groww_lane_running(&self) -> bool {
-        self.groww_lane_running.load(Ordering::Relaxed)
-    }
-
     /// Generic per-feed lane-running accessor (Feed::ALL-driven — the health
     /// endpoint iterates feeds). Exhaustive match → a new feed forces an arm here.
     #[must_use]
     pub fn lane_running(&self, feed: Feed) -> bool {
         match feed {
             Feed::Dhan => self.is_dhan_lane_running(),
-            Feed::Groww => self.is_groww_lane_running(),
             // TrueData lane not yet wired — never running this process.
             Feed::Truedata => self.truedata_lane_running.load(Ordering::Relaxed),
         }
@@ -295,7 +264,6 @@ impl FeedRuntimeState {
     pub fn is_enabled(&self, feed: Feed) -> bool {
         match feed {
             Feed::Dhan => self.dhan.load(Ordering::Relaxed),
-            Feed::Groww => self.groww.load(Ordering::Relaxed),
             Feed::Truedata => self.truedata.load(Ordering::Relaxed),
         }
     }
@@ -305,7 +273,6 @@ impl FeedRuntimeState {
     pub fn set_enabled(&self, feed: Feed, enabled: bool) -> bool {
         match feed {
             Feed::Dhan => self.dhan.store(enabled, Ordering::Relaxed),
-            Feed::Groww => self.groww.store(enabled, Ordering::Relaxed),
             Feed::Truedata => self.truedata.store(enabled, Ordering::Relaxed),
         }
         enabled
@@ -316,8 +283,6 @@ impl FeedRuntimeState {
     pub fn snapshot(&self) -> FeedStatus {
         FeedStatus {
             dhan_enabled: self.is_enabled(Feed::Dhan),
-            groww_enabled: self.is_enabled(Feed::Groww),
-            groww_lane_running: self.is_groww_lane_running(),
             dhan_lane_running: self.is_dhan_lane_running(),
             dhan_disable_allowed: self.can_disable_dhan(),
         }
@@ -335,9 +300,7 @@ impl std::fmt::Debug for FeedRuntimeState {
             .map_or(true, |slot| slot.is_some());
         f.debug_struct("FeedRuntimeState")
             .field("dhan", &self.dhan)
-            .field("groww", &self.groww)
             .field("dhan_config_enabled", &self.dhan_config_enabled)
-            .field("groww_lane_running", &self.groww_lane_running)
             .field("dhan_lane_running", &self.dhan_lane_running)
             .field("dhan_disable_allowed", &self.dhan_disable_allowed)
             .field(
@@ -363,11 +326,10 @@ mod tests {
 
     #[test]
     fn test_feed_as_str_and_parse_round_trip() {
-        for feed in [Feed::Dhan, Feed::Groww] {
+        for feed in [Feed::Dhan] {
             assert_eq!(Feed::parse(feed.as_str()), Some(feed));
         }
         assert_eq!(Feed::parse("DHAN"), None, "parse is case-sensitive");
-        assert_eq!(Feed::parse("groww_live"), None);
         assert_eq!(Feed::parse(""), None);
     }
 
@@ -375,7 +337,6 @@ mod tests {
     fn test_both_feeds_runtime_toggleable_after_pr_e() {
         // PR-E (2026-06-21): Dhan is now runtime-toggleable too (operator-
         // authorized); the Dhan-disable direction is safety-gated separately.
-        assert!(Feed::Groww.is_runtime_toggleable());
         assert!(Feed::Dhan.is_runtime_toggleable());
     }
 
@@ -383,12 +344,12 @@ mod tests {
     fn test_from_config_seeds_atomics() {
         let feeds = FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: true,
+            truedata_enabled: true,
             ..Default::default()
         };
         let state = FeedRuntimeState::from_config(&feeds);
         assert!(state.is_enabled(Feed::Dhan));
-        assert!(state.is_enabled(Feed::Groww));
+        assert!(state.is_enabled(Feed::Truedata));
         assert!(state.is_dhan_config_enabled());
     }
 
@@ -399,7 +360,6 @@ mod tests {
         // API refusal gate reads.
         let feeds = FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         };
         let state = FeedRuntimeState::from_config(&feeds);
@@ -423,7 +383,6 @@ mod tests {
         // refusal gate must stay open (pre-Phase-A round trip restored).
         let effective_off = FeedsConfig {
             dhan_enabled: false,
-            groww_enabled: true,
             ..Default::default()
         };
         let state = FeedRuntimeState::from_config_with_dhan_config(&effective_off, true);
@@ -470,7 +429,7 @@ mod tests {
             !state.is_enabled(Feed::Dhan),
             "an absent config must not enable a live feed"
         );
-        assert!(!state.is_enabled(Feed::Groww));
+        assert!(!state.is_enabled(Feed::Truedata));
     }
 
     #[test]
@@ -506,36 +465,36 @@ mod tests {
         let state = FeedRuntimeState::default();
         state.set_enabled(Feed::Dhan, true);
         assert!(state.is_enabled(Feed::Dhan));
-        assert!(!state.is_enabled(Feed::Groww));
-        state.set_enabled(Feed::Groww, true);
-        assert!(state.is_enabled(Feed::Groww));
+        assert!(!state.is_enabled(Feed::Truedata));
+        state.set_enabled(Feed::Truedata, true);
+        assert!(state.is_enabled(Feed::Truedata));
     }
 
     #[test]
     fn test_set_enabled_flips_and_returns_new_value() {
         let state = FeedRuntimeState::default();
-        assert!(!state.is_enabled(Feed::Groww));
-        assert!(state.set_enabled(Feed::Groww, true));
-        assert!(state.is_enabled(Feed::Groww));
-        assert!(!state.set_enabled(Feed::Groww, false));
-        assert!(!state.is_enabled(Feed::Groww));
+        assert!(!state.is_enabled(Feed::Truedata));
+        assert!(state.set_enabled(Feed::Truedata, true));
+        assert!(state.is_enabled(Feed::Truedata));
+        assert!(!state.set_enabled(Feed::Truedata, false));
+        assert!(!state.is_enabled(Feed::Truedata));
     }
 
     #[test]
-    fn test_toggling_groww_does_not_touch_dhan() {
+    fn test_toggling_a_second_feed_does_not_touch_dhan() {
         // Dhan set explicitly — the property under test is INDEPENDENCE of
         // the two flags, which needs a known starting value, not a default.
         let state = FeedRuntimeState::default();
         state.set_enabled(Feed::Dhan, true);
-        state.set_enabled(Feed::Groww, true);
+        state.set_enabled(Feed::Truedata, true);
         assert!(
             state.is_enabled(Feed::Dhan),
-            "Dhan unchanged by Groww toggle"
+            "Dhan unchanged by the other feed toggle"
         );
         state.set_enabled(Feed::Dhan, false);
         assert!(
-            state.is_enabled(Feed::Groww),
-            "Groww unchanged by Dhan toggle"
+            state.is_enabled(Feed::Truedata),
+            "the other feed unchanged by Dhan toggle"
         );
     }
 
@@ -551,21 +510,17 @@ mod tests {
             state.snapshot(),
             FeedStatus {
                 dhan_enabled: false,
-                groww_enabled: false,
-                groww_lane_running: false,
                 dhan_lane_running: false,
                 dhan_disable_allowed: true,
             }
         );
-        state.set_enabled(Feed::Groww, true);
+        state.set_enabled(Feed::Truedata, true);
         assert_eq!(
             state.snapshot(),
             FeedStatus {
                 // Still false — flipping Groww must not move Dhan, and the
                 // default is now OFF (2026-08-11).
                 dhan_enabled: false,
-                groww_enabled: true,
-                groww_lane_running: false,
                 dhan_lane_running: false,
                 dhan_disable_allowed: true,
             }
@@ -575,7 +530,6 @@ mod tests {
     #[test]
     fn test_dhan_is_runtime_toggleable_after_pr_e() {
         assert!(Feed::Dhan.is_runtime_toggleable());
-        assert!(Feed::Groww.is_runtime_toggleable());
     }
 
     #[test]
@@ -602,22 +556,6 @@ mod tests {
         state.set_dhan_lane_running(false);
         assert!(!state.is_dhan_lane_running(), "set false => stopped");
         assert!(!state.snapshot().dhan_lane_running);
-    }
-
-    #[test]
-    fn test_set_groww_lane_running_toggles_both_ways() {
-        // The activation watcher sets the flag true on the enable rising edge
-        // (after the watch-list builds) and false on the disable falling edge.
-        // Both directions must round-trip — the disable path is what clears a
-        // stale "running" so the feed page never lies after a teardown.
-        let state = FeedRuntimeState::default();
-        assert!(!state.is_groww_lane_running(), "default not running");
-        state.set_groww_lane_running(true);
-        assert!(state.is_groww_lane_running(), "set true => running");
-        assert!(state.snapshot().groww_lane_running);
-        state.set_groww_lane_running(false);
-        assert!(!state.is_groww_lane_running(), "set false => stopped");
-        assert!(!state.snapshot().groww_lane_running);
     }
 
     // ---------------------------------------------------------------------

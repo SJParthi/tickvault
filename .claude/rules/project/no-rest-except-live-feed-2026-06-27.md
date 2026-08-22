@@ -188,6 +188,23 @@ Per that relayed directive (rooted in the operator's standing 2026-07-12 §8.0 g
 
 # §9. Groww per-minute REST pipeline — scheduled-pull KEEP class (operator authorization 2026-07-13)
 
+> **⚠ §9 IS RETIRED 2026-08-21 — the entire Groww REST pipeline is REMOVED by operator
+> directive.** Verbatim: *"Dude along with all these see clealry note whqtber is entirely
+> related to groww feed remove everything entilrey dude okay? Do you understand what I'm
+> asking dude"*. Full dated authorization + REJECT list:
+> `websocket-connection-scope-lock.md` §"2026-08-21 (THIRD quote of the day)". Effects:
+> every §9 KEEP row (the Groww spot-1m candles pull, the Groww option-chain pull, the
+> bounded per-contract 1m pull) moves KEEP → **REMOVED**, and the matching §3 inventory
+> rows are annotated rather than deleted, per house convention. The §10 Groww ORDER-SIDE
+> KEEP-GATED rows are RETIRED with them (the gates never opened; no live Groww order was
+> ever placed). **§8 — the DHAN spot-1m + option-chain KEEP class — is UNTOUCHED and
+> still binds**, as does §11's re-assertion that those two Dhan legs are enabled classes.
+> The §1/§2 market-data-REST ban is otherwise unchanged, and the shared tables
+> (`spot_1m_rest`, `option_chain_1m`, `rest_fetch_audit`) survive as Dhan-only writers —
+> they are feed-generic by design and the `feed` column stays in every DEDUP key so the
+> historical `feed='groww'` rows remain readable. Sections below are retained as
+> historical audit; where they conflict with this banner, the banner wins.
+
 ## §9.0 The verbatim operator demand (preserve exactly, do not paraphrase — typos included)
 
 **Quote 1 (2026-07-13, the directive — relayed verbatim via the coordinator session):**

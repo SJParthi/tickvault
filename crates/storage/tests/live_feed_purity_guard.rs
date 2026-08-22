@@ -165,10 +165,18 @@ fn live_feed_purity_no_tick_writer_in_historical_flow() {
 
     // Anti-vacuity: a guard that scanned nothing must FAIL, not pass. This is the
     // assertion whose absence let the guard sleep.
+    //
+    // 2026-08-21: the floor moved 10 -> 7 when the four Groww REST modules
+    // (groww_spot_1m_boot, groww_option_chain_1m_boot, groww_contract_1m_boot,
+    // option_contract_1m_rest_persistence) were deleted with the Groww feed,
+    // taking the discovered set from 12 to 8. The floor is deliberately still
+    // BELOW the real count, because its job is to catch discovery breaking,
+    // not to pin an exact inventory -- but it is close enough that losing a
+    // second module fails loudly instead of quietly shrinking the scan.
     assert!(
-        scanned_files >= 10,
+        scanned_files >= 7,
         "LIVE-FEED-PURITY guard scanned only {scanned_files} REST/historical \
-         module(s). 12 exist today, so anything below 10 means discovery broke \
+         module(s). 8 exist today, so anything below 7 means discovery broke \
          or the naming convention changed — either way the guard is no longer \
          covering the flow it claims to. Fix historical_flow_paths()."
     );

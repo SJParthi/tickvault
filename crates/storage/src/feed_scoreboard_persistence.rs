@@ -41,6 +41,23 @@
 //!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed);
 //! ```
 //!
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS feed_coverage_daily (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP,
+//!     security_id LONG, exchange_segment SYMBOL, feed SYMBOL,
+//!     symbol_name SYMBOL,
+//!     dhan_minutes LONG, groww_minutes LONG,
+//!     dhan_only_minutes LONG, groww_only_minutes LONG, both_minutes LONG,
+//!     mapped BOOLEAN, partial_coverage BOOLEAN
+//! ) timestamp(ts) PARTITION BY DAY
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, security_id, exchange_segment, feed);
+//! ```
+//!
+//! The `groww_*` columns are RETAINED after the 2026-08-21 Groww removal:
+//! historical rows carry real values in them and the SEBI never-delete rule
+//! makes those rows permanent, so dropping the columns would make committed
+//! history unreadable. Nothing writes them any more.
+//!
 //! `feed_scoreboard_daily` is per-RUN-per-feed (no instrument key) so
 //! I-P1-11's `(security_id, exchange_segment)` pair is N/A there — it IS in
 //! `feed_coverage_daily`'s key (the per-instrument table).
@@ -77,10 +94,6 @@ pub const SCOREBOARD_UNAVAILABLE_SENTINEL: i64 = -1;
 /// Dhan lag measurement floor: LTT is whole IST seconds (live-market-feed
 /// rule 6) ⇒ sub-second lag is unmeasurable; healthy p99 reads ~1-2s.
 pub const LAG_FLOOR_MS_DHAN: i64 = 1000;
-
-/// Groww lag measurement floor: `tsInMillis` is true milliseconds (the
-/// receipt clock is the sidecar callback capture — one hop downstream).
-pub const LAG_FLOOR_MS_GROWW: i64 = 1;
 
 /// TrueData lag measurement floor: the v2.6 binary tick carries a whole-second
 /// `Timestamp(i32)` (precision UNVERIFIED-LIVE per the scope lock), so sub-second
@@ -766,7 +779,6 @@ mod tests {
         // (≥1s floor); Groww tsInMillis is true-ms; -1 = never a
         // fabricated zero (Rule 11).
         assert_eq!(LAG_FLOOR_MS_DHAN, 1000);
-        assert_eq!(LAG_FLOOR_MS_GROWW, 1);
         assert_eq!(SCOREBOARD_UNAVAILABLE_SENTINEL, -1);
         assert_eq!(SCOREBOARD_SESSION_MINUTES, 375);
     }

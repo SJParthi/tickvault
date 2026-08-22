@@ -214,12 +214,81 @@ impl Drop for AliveConnectionGuard {
     }
 }
 
-/// Publish the alive-socket count.
+/// Where the lane reports its live socket count, so `/health` can answer
+/// "is the feed alive?" instead of "that subsystem was retired".
+///
+/// `SystemHealthStatus` gates its websocket row on whether ANY producer has
+/// ever pushed a count. That gate was added on 2026-08-09 for a good reason —
+/// with the lane deleted, the count sat at 0 forever and `/health` returned
+/// `degraded` on every single request, which is a verdict carrying no
+/// information. Its doc says the flag is "arm-on-arrival": the moment the
+/// revived lane pushes a count, the row reports for real with no edit needed
+/// on the API side.
+///
+/// The lane was revived (operator quotes 2026-08-09, default ON 2026-08-11)
+/// and never pushed. So on a box with `dhan_enabled = true` and sixteen
+/// sockets dialing, `/health` still rendered:
+///
+/// ```json
+/// "websocket": { "status": "retired", "detail": "live feeds retired 2026-07-13/15" }
+/// ```
+///
+/// A dead lane and a healthy lane rendered identically, on the endpoint
+/// scripts poll to tell them apart. This installs the missing producer.
+static HEALTH_REPORTER: std::sync::OnceLock<tickvault_api::state::SharedHealthStatus> =
+    std::sync::OnceLock::new();
+
+/// Install the `/health` websocket reporter. Returns `false` if one was
+/// already installed — first writer wins, same shape as
+/// [`install_crossverify_deps`].
+pub fn install_health_reporter(health: tickvault_api::state::SharedHealthStatus) -> bool {
+    HEALTH_REPORTER.set(health).is_ok()
+}
+
+/// Report whether the tick writer reached the database, for `/health`.
+///
+/// Sibling of the websocket row and the same defect: `/health` rendered
+///
+/// ```json
+/// "tick_persistence": { "status": "retired", "detail": "tick writer deleted 2026-07-17" }
+/// ```
+///
+/// while `crates/storage/src/tick_persistence.rs` exists (it came back with
+/// the 2026-08-09 revival) and the lane appends every tick through it. The
+/// setter had zero production callers, so the row's gate never armed.
+///
+/// # What this deliberately does NOT do
+///
+/// It does not arm the row at spawn. Before the first flush there is nothing
+/// TRUE to report: constructing a `TickWriter` proves a client was built, not
+/// that the database answered, and ILP is lazy enough that the two are
+/// genuinely different facts. Reporting `connected` on that basis would be the
+/// same over-claim this row is being fixed for, pointed the other way.
+///
+/// The residual is therefore real and stated: a lane that is up but has not
+/// yet flushed a single row still reads `retired`. `LiveIngest::flush` returns
+/// early when nothing is pending, so on a session with no ticks at all that
+/// window never closes. What changed is that the retired branch no longer
+/// asserts a deletion that was reversed, and that the row tells the truth from
+/// the first row written onward.
+fn report_tick_persistence(connected: bool) {
+    if let Some(health) = HEALTH_REPORTER.get() {
+        health.set_tick_persistence_connected(connected);
+    }
+}
+/// Publish the alive-socket count -- to the gauge AND to `/health`.
+///
+/// Both edges of [`AliveConnectionGuard`] land here, so wiring the health push
+/// into this one function tracks every transition with no extra timer and no
+/// second source of truth to drift.
 fn publish_alive_connections(alive: usize) {
     // `u32::try_from` then `f64::from`: lossless by construction (bounded by
     // the 16-socket lock) and no lossy `as` cast to justify.
     metrics::gauge!(ALIVE_CONNECTIONS_GAUGE)
         .set(f64::from(u32::try_from(alive).unwrap_or(u32::MAX)));
+    if let Some(health) = HEALTH_REPORTER.get() {
+        health.set_websocket_connections(u64::try_from(alive).unwrap_or(u64::MAX));
+    }
 }
 
 /// Process-global once-guard: two feed stacks would fight over the same
@@ -921,10 +990,12 @@ impl LiveIngest {
         match self.writer.flush() {
             Ok(()) => {
                 counters().flush_ok.increment(1);
+                report_tick_persistence(true);
                 covered
             }
             Err(err) => {
                 counters().flush_failed.increment(1);
+                report_tick_persistence(false);
                 // 2026-08-12 — the second sentence of this message used to
                 // read "The raw frames remain in the write-ahead log and are
                 // recoverable by replay." That was wrong in a way that
@@ -955,17 +1026,34 @@ impl LiveIngest {
                 //   are absent from QuestDB.
                 // So a flush failure is deferred loss if the process later
                 // restarts, and standing loss if it does not.
+                //
+                // AMENDED 2026-08-21. The INTRA-SESSION half above is no
+                // longer true, and this is the third dated correction to this
+                // one block — which is itself the point the block makes.
+                // `TickWriter::discard_pending` now rescues the failed batch
+                // to a tick spill file holding the ILP verbatim, so the rows
+                // are replayable WITHOUT a restart by one curl against
+                // QuestDB's /write, idempotently (the dedup key carries
+                // `capture_seq`). So there is no longer a "standing loss"
+                // case while the process lives: the honest statement is that
+                // the rows are absent from the database until someone replays
+                // the file or the box reboots, and BOTH recoveries exist.
+                // The `error!` below was rewritten in the same change — it
+                // still said recovery was impossible, which contradicted the
+                // WS-GAP-03 line printed beside it for the same event.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     %err,
                     rows = covered,
-                    "live tick flush to QuestDB FAILED — the buffered rows were discarded by \
-                     the writer contract and are a counted loss: these ticks are NOT in the \
-                     database and nothing re-inserts them WHILE THIS PROCESS LIVES. The raw \
-                     frames ARE preserved in the write-ahead log, and the next boot re-folds \
-                     them into the database automatically — so a restart recovers this window, \
-                     idempotently. Fix the database first; the restart is what recovers the \
-                     ticks."
+                    "live tick flush to QuestDB FAILED — these rows are NOT in the database. \
+                     They are NOT lost, and there are TWO recoveries. Immediately: the writer \
+                     rescues the failed batch to a tick spill file (the WS-GAP-03 line beside \
+                     this one names the exact path) and it re-ingests with a single curl, \
+                     safely repeatable. Failing that, the raw frames are in the write-ahead \
+                     log and the next boot re-folds them idempotently, \
+                     so a restart recovers this window. \
+                     Fix the database first, then replay the spill file."
+
                 );
                 0
             }
@@ -1766,7 +1854,8 @@ pub struct DrainCounters {
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
     abandoned_bytes: metrics::Counter,
-    xverify_ran: metrics::Counter,
+    xverify_measured: metrics::Counter,
+    xverify_vacuous: metrics::Counter,
     xverify_failed: metrics::Counter,
     xverify_no_token: metrics::Counter,
 }
@@ -1828,15 +1917,30 @@ pub fn counters() -> &'static DrainCounters {
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
-        xverify_ran: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "ran"),
+        xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
+        xverify_vacuous: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "vacuous"),
         xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
         xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
     })
 }
 
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
-/// `ran` means the session's captured candles were never checked against
+/// `measured` means the session's captured candles were never checked against
 /// Dhan's own record.
+///
+/// # Why `vacuous` is its own label and not folded into `ran`
+///
+/// It WAS folded in, and the doc above said "anything other than `ran`" while
+/// a run that compared ZERO minutes counted as `ran`. So the one label an
+/// operator would read as "we checked" was also what a run that proved nothing
+/// reported -- the comment promised a guarantee the label could not deliver.
+///
+/// That matters more here than almost anywhere else: this comparison is the
+/// revived feed's ONLY ground truth, the `compared == 0` case is the exact
+/// false-OK this repository has retired twice, and the comparator itself is
+/// scrupulous about it -- `Blind` is a first-class outcome, `is_pass()` is
+/// false for it, and a vacuous run fires a coded `error!`. The gap was never
+/// the detection; it was that every DELIVERY surface flattened the distinction.
 pub const XVERIFY_RUNS_COUNTER: &str = "tv_dhan_feed_xverify_runs_total";
 
 /// Counter: sealed candles handed to the process-wide seal writer.
@@ -5716,6 +5820,55 @@ pub struct WalRefoldOutcome {
     /// Frames whose bytes could not be parsed at all.
     pub unparseable: u64,
 }
+/// Reports live-feed frames the lane recovered from the write-ahead log but
+/// will never fold, because bring-up refused before reaching the re-fold.
+///
+/// # Why this has to exist
+///
+/// `main.rs` decides whether to drop-and-log these frames itself by asking
+/// `feed_stack_gate` whether the lane will run. That gate reads config and one
+/// env var — it is the same gate the lane uses, so the two can never disagree
+/// about *enablement*. What it cannot see is a RUNTIME refusal: an unplannable
+/// pool, a `[rest_candle_fold]` collision, missing cross-verify deps, a missing
+/// WAL, or a token manager that never registered. On any of those, `main.rs`
+/// has already skipped its own drop-and-log (it believed the lane would fold),
+/// and `confirm_replayed` has already MOVED the segments into the archive so
+/// they cannot re-stage next boot.
+///
+/// The frames are therefore gone from the replay path with nobody saying so —
+/// captured ticks, silently unrecoverable-by-automation. A silent loss is the
+/// one outcome this whole capture chain exists to prevent, so every refusal
+/// path that returns before the re-fold calls this first.
+///
+/// This does not save the frames. The raw bytes remain on disk in the WAL
+/// archive (`confirm_replayed` moves, never deletes) and can be recovered by
+/// hand; what this restores is the operator's ability to KNOW that is needed.
+///
+/// The gate-disabled path in `spawn_dhan_feed_stack` deliberately does NOT call
+/// this: `main.rs` reads the identical gate and has already logged the drop
+/// itself, so reporting again would double-count the same frames.
+pub fn report_unfolded_wal_frames(frames: &[(u64, bytes::Bytes)], refusal: &str) {
+    if frames.is_empty() {
+        return;
+    }
+    let dropped = frames.len() as u64;
+    error!(
+        code = ErrorCode::WsGapConnectionState.code_str(),
+        frames = dropped,
+        refusal,
+        "{dropped} live-feed frame(s) were recovered from the write-ahead log but will NOT be \
+         folded — the live lane refused to start ({refusal}), and the write-ahead log segments \
+         were already archived, so they will not be offered again on the next boot. The ticks \
+         and candles they contain are NOT in the database. The raw frames are preserved in the \
+         write-ahead log archive and can be recovered manually. If this session followed an \
+         unclean stop during market hours, this is real data loss for that window."
+    );
+    metrics::counter!(
+        "tv_ws_frame_wal_reinjected_dropped_total",
+        "ws_type" => "live_feed"
+    )
+    .increment(dropped);
+}
 
 /// Re-folds live-feed frames recovered from the write-ahead log.
 ///
@@ -5835,8 +5988,25 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
              stacks would share one sixteen-socket budget and Dhan answers an over-limit \
              pool by silently killing its OLDEST socket."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "duplicate_spawn");
         return None;
     }
+    // ARM the `/health` websocket row with the count as it stands right now
+    // (zero -- no socket has dialed yet).
+    //
+    // Without this the row only arms on the FIRST successful dial, so a lane
+    // that is enabled and dials NOTHING -- empty universe, every endpoint
+    // refused, credentials rejected -- reads `retired`: the same answer a box
+    // with the feature switched off gives. That is the worst permutation of
+    // the three, because it is the one where something is actually wrong.
+    // Armed here it reads `disconnected` with a count of 0, and
+    // `overall_status` degrades, which is the truth.
+    //
+    // Deliberately routed through `publish_alive_connections` rather than
+    // pushing 0 directly: one function owns the health push, so there is no
+    // second path to drift.
+    publish_alive_connections(ALIVE_CONNECTIONS.load(Ordering::SeqCst));
+
     // Installed BEFORE the bring-up task is spawned, so neither the silence
     // detector nor the 15:31 cross-verification can ever observe an empty cell
     // and fall back to its fail-open branch on a real trading day.
@@ -5873,6 +6043,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 %err,
                 "Dhan live-feed stack could not be planned — no socket opened this session"
             );
+            report_unfolded_wal_frames(&params.wal_replay_live_feed, "plan_failed");
             return;
         }
     };
@@ -5909,6 +6080,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              cross-verification compare the REST record against itself and always agree. \
              Turn OFF [rest_candle_fold] to run the live lane, or leave the live lane off."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "rest_candle_fold_collision");
         return;
     }
 
@@ -5943,6 +6115,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              from a quiet one. Call install_crossverify_deps() during boot, before this stack \
              spawns."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "crossverify_deps_missing");
         return;
     };
     // Held for the lane's lifetime so the comparator cannot be dropped while
@@ -5962,6 +6135,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              any socket. Capture-at-receipt is the durability floor; without it a process kill \
              would silently erase every frame received since the last flush."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "wal_missing");
         return;
     };
 
@@ -6011,6 +6185,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
              socket. The Dhan REST stack registers the manager after authentication — this \
              means authentication did not complete in time (check AUTH-GAP-* and DH-901)."
         );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "token_manager_missing");
         return;
     };
 
@@ -6592,8 +6767,14 @@ pub fn spawn_daily_crossverify(
             .await
             {
                 Ok(report) => {
-                    counters().xverify_ran.increment(1);
                     let c = &report.comparison;
+                    // Split BEFORE the log line, so the counter and the
+                    // `vacuous = ` field below can never disagree.
+                    if c.is_vacuous() {
+                        counters().xverify_vacuous.increment(1);
+                    } else {
+                        counters().xverify_measured.increment(1);
+                    }
                     // THE VERDICT AS FIELDS, not as a debug dump.
                     //
                     // 2026-08-20, measured on the box: this emitted `?report`,
@@ -8427,6 +8608,61 @@ mod tests {
             ingest.seq_refused(),
             0,
             "a representable sequence must not be refused"
+        );
+    }
+
+    /// The cross-verification counter must be able to tell "we checked" from
+    /// "we ran and proved nothing".
+    ///
+    /// This comparison is the revived Dhan feed's ONLY ground truth, and a
+    /// `compared == 0` day is the exact false-OK this repository has retired
+    /// twice. The comparator detects it properly -- `Blind` is a first-class
+    /// outcome, `is_pass()` is false for it, and a vacuous run fires a coded
+    /// `error!`. What was missing was DELIVERY: every surface flattened the
+    /// distinction.
+    ///
+    ///   * the counter counted a vacuous run as `ran`, under a doc comment
+    ///     that read "anything other than `ran` means the candles were never
+    ///     checked" -- a promise the label could not keep;
+    ///   * `WS-GAP-03`, the code the vacuous `error!` carries, is not one of
+    ///     the 18 alarmed error codes, so the line pages nobody;
+    ///   * the two audit tables it writes have no console query, no QuestDB
+    ///     view, no dashboard widget and no runbook mention -- their only
+    ///     other reader is `partition_manager`, which DELETES their
+    ///     partitions on retention.
+    ///
+    /// The label split is the part that costs nothing: no new metric name, no
+    /// new alarm, no operator quote. The remaining surfaces are recorded above
+    /// rather than quietly fixed, because an alarm needs a dated operator
+    /// quote per `dhan-rest-only-noise-lock-2026-07-14.md` §3.
+    #[test]
+    fn xverify_counter_separates_a_measured_run_from_a_vacuous_one() {
+        let src = include_str!("dhan_feed_stack.rs");
+
+        assert!(
+            src.contains("\"outcome\" => \"vacuous\""),
+            "the vacuous label must exist -- without it a run that compared zero \
+             minutes is indistinguishable from one that checked the whole day"
+        );
+        assert!(
+            src.contains("\"outcome\" => \"measured\""),
+            "the success label must say `measured`, not `ran`: a vacuous run also ran"
+        );
+        assert!(
+            !src.contains("\"outcome\" => \"ran\""),
+            "the ambiguous `ran` label must not come back"
+        );
+
+        // The split must be DRIVEN by is_vacuous(), not by anything a later
+        // edit could let drift from the logged `vacuous =` field.
+        let at = src
+            .find("counters().xverify_vacuous.increment(1)")
+            .expect("the vacuous arm must exist");
+        let window = &src[at.saturating_sub(200)..at];
+        assert!(
+            window.contains("c.is_vacuous()"),
+            "the vacuous counter must be gated on is_vacuous(), so the counter and \
+             the log field cannot disagree"
         );
     }
 
@@ -11022,27 +11258,39 @@ mod contract_attach_tests {
 #[cfg(test)]
 mod alive_connection_guard_tests {
     use super::{ALIVE_CONNECTIONS, AliveConnectionGuard};
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// Serializes the tests in this module.
+    /// Serializes every test in this module.
     ///
-    /// `ALIVE_CONNECTIONS` is a process-global `AtomicUsize`, and both tests
-    /// read a `base` and then assert an exact `base + 1`. Run on parallel
-    /// threads they interleave and either can fail for a reason that has
-    /// nothing to do with what it checks — which is worse than a plain bug,
-    /// because a test that fails at random teaches people to re-run CI
-    /// instead of reading it.
+    /// `ALIVE_CONNECTIONS` is process-global and these tests read EXACT values
+    /// around it (`base`, `base + 1`), so two of them on parallel threads see
+    /// each other's increments and fail for a reason unrelated to what they
+    /// check. `cargo test` shares one process across threads, so the race is
+    /// real there; nextest gives each test its own process, which is why CI
+    /// never showed it.
     ///
-    /// The same class was fixed the same way in `tv_api_token_prod_guard.rs`
-    /// after PR #1411 merged red on it (merge-gate-lock §3.2). Poisoning is
-    /// absorbed rather than propagated: one test panicking on purpose — which
-    /// the unwind case below does — must not convert every sibling into a
-    /// poisoned-lock failure.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
+    /// Fixed independently on `main` the same day with an inline
+    /// `static SERIALIZE: Mutex<()>`; the two are equivalent and this side's
+    /// helper is kept because the test bodies here already call it. The same
+    /// class was fixed the same way in `tv_api_token_prod_guard.rs` after
+    /// PR #1411 merged red on it (merge-gate-lock section 3.2).
+    ///
+    /// This replaces a comment that CLAIMED the tests were "serialized ... by
+    /// running both assertions here" — true when this module held one test,
+    /// and quietly false from the moment a second one was added beside it.
+    /// Poisoning is recovered rather than propagated: a panic inside one test
+    /// (which one of them raises deliberately) must not convert every other
+    /// test in the module into a spurious failure.
+    fn serial() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     #[test]
     fn the_count_comes_back_down_on_a_panic_not_only_on_a_clean_return() {
+        let _serial = serial();
         // The defect this exists for: the increment happens OUTSIDE the socket
         // task, so a decrement written as a plain statement at the end of the
         // task body is skipped when the body unwinds. The gauge then reports N
@@ -11054,8 +11302,7 @@ mod alive_connection_guard_tests {
         // "serialized ... by running both assertions here". It was not — the
         // second test below mutates the same global, so the two raced, and the
         // comment asserting safety is exactly what stopped anyone looking.
-        // The real serialization is the mutex above.
-        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        // The real serialization is the `serial()` guard taken above.
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
 
         // Clean path.
@@ -11081,11 +11328,11 @@ mod alive_connection_guard_tests {
 
     #[test]
     fn release_disarms_so_drop_cannot_double_count() {
+        let _serial = serial();
         // `release` consumes the guard and `Drop` still runs on the moved-out
         // value. If it did not disarm, every clean exit would decrement twice
         // and the gauge would read LOW — the opposite failure, equally wrong,
         // and the one a naive guard introduces while fixing the first.
-        let _lock = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
         let base = ALIVE_CONNECTIONS.load(Ordering::SeqCst);
         let g = AliveConnectionGuard::acquire();
         let remaining = g.release();
@@ -11602,6 +11849,82 @@ mod late_seed_tests {
             frame_arm < seed_arm,
             "the frame arm must come FIRST under `biased;` — seeding must never \
              preempt draining queued frames"
+        );
+    }
+
+    #[test]
+    fn report_unfolded_wal_frames_is_silent_on_an_empty_batch() {
+        // A boot with nothing to recover is the normal case. Reporting there
+        // would make the loss line meaningless by printing it every morning.
+        report_unfolded_wal_frames(&[], "plan_failed");
+    }
+
+    #[test]
+    fn report_unfolded_wal_frames_names_the_refusal_it_was_given() {
+        // The refusal string is the whole diagnostic value of the line: it is
+        // what separates "the pool could not be planned" from "authentication
+        // did not finish", which need different responses from the operator.
+        let frames = vec![(1u64, bytes::Bytes::from_static(&[8, 0, 0, 0]))];
+        report_unfolded_wal_frames(&frames, "token_manager_missing");
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("pub fn report_unfolded_wal_frames")
+            .nth(1)
+            .expect("report_unfolded_wal_frames must exist");
+        let decl = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            decl.contains("refusal,"),
+            "the refusal must be a structured field, not only interpolated prose"
+        );
+        assert!(
+            decl.contains("tv_ws_frame_wal_reinjected_dropped_total"),
+            "the report must increment the same counter main.rs uses for its own \
+             drop path, so the two paths sum into one number instead of two"
+        );
+    }
+
+    #[test]
+    fn every_lane_refusal_before_the_refold_reports_its_unfolded_frames() {
+        // THE RATCHET. `main.rs` skips its own drop-and-log whenever
+        // `feed_stack_gate` says the lane will run, and `confirm_replayed`
+        // archives the segments immediately — before this lane has folded
+        // anything. So a refusal that returns before the re-fold without
+        // reporting makes captured ticks disappear with no line anywhere.
+        //
+        // Five such refusals existed and none of them reported. This test
+        // fails the build if a sixth is added the same way.
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("async fn run_dhan_feed_stack")
+            .nth(1)
+            .expect("run_dhan_feed_stack must exist");
+        let upto = body
+            .find("let outcome = refold_wal_frames(")
+            .expect("the re-fold call must exist — it is what these returns precede");
+        let before_refold = &body[..upto];
+
+        let mut unguarded = Vec::new();
+        let mut previous = "";
+        for (idx, raw) in before_refold.lines().enumerate() {
+            let line = raw.trim();
+            if line == "return;" && !previous.contains("report_unfolded_wal_frames(") {
+                unguarded.push(format!("{}: {previous}", idx + 1));
+            }
+            if !line.is_empty() {
+                previous = line;
+            }
+        }
+        assert!(
+            unguarded.is_empty(),
+            "every early return before the WAL re-fold must first call \
+             report_unfolded_wal_frames — otherwise frames main.rs handed over, and \
+             whose segments are already archived, vanish with no log line. Unguarded: {unguarded:?}"
+        );
+
+        // Non-vacuous: the scan must actually be looking at real returns.
+        assert!(
+            before_refold.matches("return;").count() >= 5,
+            "the scan window collapsed — it should span every bring-up refusal"
         );
     }
 }

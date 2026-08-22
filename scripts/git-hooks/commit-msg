@@ -5,8 +5,13 @@
 # Enforces conventional commit format from CLAUDE.md:
 #   <type>(<scope>): <description>
 #
-# Valid types: feat, fix, refactor, test, docs, chore, perf, security
-# Optional [Phase N] prefix allowed.
+# Valid types: feat, fix, refactor, test, docs, chore, perf, security, ci,
+#              build, style, bench, revert
+#
+# This pattern is a VERBATIM COPY of the merge gate in .github/workflows/ci.yml
+# (the "Commit Lint" job). It is pinned by crates/common/tests/commit_subject_pattern_lockstep_guard.rs:
+# a local hook that disagrees with the merge gate either blocks work CI accepts
+# or waves through work CI rejects. Both happened before that guard existed.
 # Install: git config core.hooksPath scripts/git-hooks
 # =============================================================================
 
@@ -22,8 +27,10 @@ fi
 
 # Conventional commit pattern: type(scope): description
 # Also allows type: description (without scope) for simple commits
-# Optional [Phase N] prefix per CLAUDE.md convention
-PATTERN="^(\[Phase [0-9]+\] )?(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+"
+# Kept byte-identical to ci.yml. Note: no [Phase N] prefix and no "!" breaking
+# marker -- the merge gate accepts neither, so accepting them here would pass a
+# commit locally that CI then rejects.
+PATTERN='^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/,-]+\))?: .+'
 
 if ! echo "$FIRST_LINE" | head -1 | grep -qE "$PATTERN"; then
     echo "" >&2
@@ -32,7 +39,7 @@ if ! echo "$FIRST_LINE" | head -1 | grep -qE "$PATTERN"; then
     echo "╚══════════════════════════════════════════════╝" >&2
     echo "" >&2
     echo "  Expected: <type>(<scope>): <description>" >&2
-    echo "  Types:    feat, fix, refactor, test, docs, chore, perf, security" >&2
+    echo "  Types:    feat, fix, refactor, test, docs, chore, perf, security, ci, build, style, bench, revert" >&2
     echo "" >&2
     echo "  Examples:" >&2
     echo "    feat(websocket): implement Dhan V2 binary frame parser" >&2

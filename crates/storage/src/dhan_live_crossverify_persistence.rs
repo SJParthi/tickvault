@@ -393,7 +393,7 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
             )
             .increment(1);
             error!(
-                code = ErrorCode::SpotXverify02RunDegraded.code_str(),
+                code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
                 comparator = "dhan_live_vs_dhan_rest",
                 stage = "ensure_client_build",
                 ?err,
@@ -420,7 +420,7 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
                 )
                 .increment(1);
                 error!(
-                    code = ErrorCode::SpotXverify02RunDegraded.code_str(),
+                    code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
                     comparator = "dhan_live_vs_dhan_rest",
                     stage = "ensure_ddl",
                     %status,
@@ -437,7 +437,7 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
                 )
                 .increment(1);
                 error!(
-                    code = ErrorCode::SpotXverify02RunDegraded.code_str(),
+                    code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
                     comparator = "dhan_live_vs_dhan_rest",
                     stage = "ensure_ddl",
                     ?err,

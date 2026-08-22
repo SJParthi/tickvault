@@ -128,16 +128,6 @@ pub const LIVE_RUNTIME_SUBSYSTEMS: &[RuntimeSubsystem] = &[
         metric: "tv_chain1m_persist_errors_total",
     },
     RuntimeSubsystem {
-        name: "groww_spot_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_groww_spot1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
-        name: "groww_option_chain_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_groww_chain1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
         name: "seal_writer",
         status: STATUS_UNWIRED,
         metric: "tv_seal_writer_drain_total",
@@ -192,9 +182,9 @@ pub const STATUS_UNWIRED: &str = "unwired";
 ///
 /// | field              | today            | why                                          |
 /// |--------------------|------------------|----------------------------------------------|
-/// | `websocket`        | `retired`        | live feeds retired 2026-07-13 / 2026-07-15   |
+/// | `websocket`        | live since 22 Aug | the revived Dhan lane pushes its socket count |
 /// | `pipeline`         | `retired`        | `spawn_trading_pipeline` has no call site    |
-/// | `tick_persistence` | `retired`        | `tick_persistence.rs` deleted 2026-07-17     |
+/// | `tick_persistence` | live since 22 Aug | the lane reports each flush outcome            |
 /// | `order_update`     | live             | wired 2026-08-10 — see below                 |
 ///
 /// The `order_update` row WAS the one genuine wiring gap: `dhan_rest_stack`
@@ -251,7 +241,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             // scripts that read a bounded body (the api contract test caps
             // at 1 KiB), and the full explanation lives in this handler's
             // doc comment where it costs no bytes on the wire.
-            detail: Some("live feeds retired 2026-07-13/15".to_string()),
+            detail: Some("no feed lane reporting".to_string()),
         }
     };
 
@@ -332,7 +322,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_RETIRED,
-            detail: Some("tick writer deleted 2026-07-17".to_string()),
+            detail: Some("no writer reporting".to_string()),
         }
     };
 
@@ -592,14 +582,24 @@ mod tests {
 
         // 2026-08-09: an unreported websocket explains WHY there is no count
         // instead of printing a made-up "0 connections".
+        //
+        // CORRECTED 2026-08-22: this asserted the detail contains the word
+        // "retired". It did -- "live feeds retired 2026-07-13/15" -- and that
+        // sentence had been false since the operator revived the lane on
+        // 2026-08-09. The STATUS is still `retired` on a boot where nothing
+        // reports, which is true and is what this asserts now; the DETAIL
+        // explains the absence without asserting a retirement that was
+        // reversed. A test pinning stale copy keeps the copy, not the
+        // invariant.
+        assert_eq!(response.subsystems.websocket.status, "retired");
         let ws_detail = response
             .subsystems
             .websocket
             .detail
-            .expect("retired websocket must explain itself");
+            .expect("an unreported websocket must explain itself");
         assert!(
-            ws_detail.contains("retired"),
-            "websocket detail must name the retirement, got: {ws_detail}"
+            !ws_detail.is_empty(),
+            "websocket detail must say why there is no count, got: {ws_detail}"
         );
         // Subsystems with real writers still carry no detail when idle.
         assert!(response.subsystems.questdb.detail.is_none());
