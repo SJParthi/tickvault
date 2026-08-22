@@ -143,6 +143,13 @@ pub struct DepthCandidate {
     pub spot: f64,
     /// `CE` or `PE`.
     pub leg: String,
+    /// `true` for an INDEX option (`OPTIDX`), `false` for a stock option.
+    ///
+    /// Carried rather than re-derived from `underlying`, because re-deriving
+    /// is exactly the bug this field closes: asking a six-entry index map
+    /// "do you know this name?" answers "is it an index?" only by accident,
+    /// and reports the miss as if the name were unrecognisable.
+    pub is_index_option: bool,
 }
 
 /// The chosen depth sets, plus an honest account of everything refused.
@@ -197,7 +204,39 @@ pub struct DepthSelection {
     /// that looks exactly like a quiet book.
     pub refused_zero_id: usize,
     /// Rows whose underlying has no known contract segment.
+    ///
+    /// After 2026-08-22 this means what it says. Before it, STOCK options
+    /// landed here — all ~20,000 of them, every attempt — because
+    /// `contract_segment_for_underlying` only maps the six INDEX underlyings
+    /// and returns `None` for RELIANCE, TCS and every other F&O stock. The
+    /// counter therefore read five figures of "unknown underlying" on a
+    /// perfectly healthy morning, which is indistinguishable from a broken
+    /// instrument master. See [`DepthSelection::refused_stock_option`].
     pub refused_unknown_underlying: usize,
+    /// Stock options, which this lane deliberately does not give depth to.
+    ///
+    /// # Why they are refused at all
+    ///
+    /// `depth_candidates_from_master` accepts `OPTSTK` explicitly, so ~20,000
+    /// stock-option candidates reach the selector. Only the six index
+    /// underlyings have a segment mapping, so every one of them was dropped —
+    /// correctly, since 250 depth-20 slots cannot cover 20,000 contracts and
+    /// ranking them purely by distance from at-the-money would let stock
+    /// strikes crowd NIFTY and BANKNIFTY off the list entirely.
+    ///
+    /// # Why it is its own counter
+    ///
+    /// The DROP is a design choice; reporting it as "unknown underlying" was
+    /// not. An operator reading 20,000 unknown-underlying refusals would
+    /// reasonably conclude the daily master had failed, and go looking for a
+    /// data problem that does not exist. Naming the real reason costs one
+    /// field and removes a five-figure false alarm from every session.
+    ///
+    /// Giving stock options depth is a COVERAGE decision, not a bug fix, and
+    /// needs the operator's word: the honest shape is reserve-and-rank (hold
+    /// N slots for index legs, award the rest by ATM distance), not simply
+    /// mapping the segment and letting the ranking decide.
+    pub refused_stock_option: usize,
     /// Rows whose contract segment cannot carry market depth AT ALL.
     ///
     /// Dhan's Full Market Depth is NSE-only —
@@ -339,7 +378,17 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             continue;
         }
         let Some(segment) = contract_segment_for_underlying(&c.underlying) else {
-            out.refused_unknown_underlying += 1;
+            // Ask the RIGHT question. A stock option failing an index-name
+            // lookup is not an unrecognised instrument — it is a stock, and
+            // this lane does not give stocks depth. Only a candidate that
+            // claims to be an INDEX option and still has no mapping is
+            // genuinely unknown, which would mean a new index the six-entry
+            // map has not been taught.
+            if c.is_index_option {
+                out.refused_unknown_underlying += 1;
+            } else {
+                out.refused_stock_option += 1;
+            }
             continue;
         };
         if !segment_supports_depth(segment) {
@@ -601,6 +650,13 @@ pub fn parse_depth_candidates_dataset(body: &str) -> Result<Vec<DepthCandidate>,
             expiry_micros,
             strike,
             spot,
+            // The chain leg pulls NIFTY / BANKNIFTY / SENSEX only — index
+            // underlyings by construction, never a stock. Asserted rather
+            // than assumed by `chain_sourced_candidates_are_all_index_options`,
+            // because if the chain leg's scope ever widens, a stock arriving
+            // here would be mislabelled an index and its refusal would read
+            // as an unknown index rather than a stock we chose not to cover.
+            is_index_option: true,
             leg: leg.to_owned(),
         });
     }
@@ -702,6 +758,7 @@ pub fn depth_candidates_from_master(
             strike: r.s as f64 / 100.0,
             spot: spot as f64 / 100.0,
             leg: r.l.clone(),
+            is_index_option: r.c == "OPTIDX",
         });
     }
     out
@@ -947,6 +1004,7 @@ pub async fn load_depth_universe(
             candidates = candidates.len(),
             refused_zero_id = selection.refused_zero_id,
             refused_unknown_underlying = selection.refused_unknown_underlying,
+            refused_stock_option = selection.refused_stock_option,
             refused_bad_price = selection.refused_bad_price,
             refused_depth_ineligible_segment = selection.refused_depth_ineligible_segment,
             "depth universe is EMPTY — depth-20 and depth-200 will open ZERO sockets \
@@ -962,6 +1020,7 @@ pub async fn load_depth_universe(
             candidates = candidates.len(),
             refused_zero_id = selection.refused_zero_id,
             refused_unknown_underlying = selection.refused_unknown_underlying,
+            refused_stock_option = selection.refused_stock_option,
             refused_bad_price = selection.refused_bad_price,
             refused_depth_ineligible_segment = selection.refused_depth_ineligible_segment,
             "depth universe selected from the option chain"
@@ -982,6 +1041,10 @@ mod tests {
             strike,
             spot: 100.0,
             leg: leg.to_owned(),
+            // Index by default: every pre-existing test in this module uses an
+            // index-shaped underlying, so this keeps their meaning unchanged.
+            // The stock case sets it explicitly.
+            is_index_option: true,
         }
     }
 
@@ -1067,6 +1130,61 @@ mod tests {
     /// the id — subscribing it sends a well-formed request for a nonexistent
     /// instrument and receives silence that reads exactly like a quiet book.
     #[test]
+    /// The finding this closes: `contract_segment_for_underlying` maps only
+    /// the six INDEX underlyings, so every one of the ~20,000 stock-option
+    /// candidates was counted as `refused_unknown_underlying`. Five figures of
+    /// "unknown underlying" on a healthy morning is indistinguishable from a
+    /// broken instrument master, and would send an operator hunting a data
+    /// problem that does not exist.
+    ///
+    /// The DROP is deliberate and unchanged — 250 depth-20 slots cannot cover
+    /// 20,000 contracts. Only the REASON moves.
+    #[test]
+    fn stock_options_are_refused_as_stock_options_not_as_unknown_underlyings() {
+        let mut stock = candidate("RELIANCE", 5001, 2_500.0, "CE");
+        stock.is_index_option = false;
+        let sel = select_depth_universe(&[stock]);
+        assert_eq!(sel.refused_stock_option, 1, "a stock option must say so");
+        assert_eq!(
+            sel.refused_unknown_underlying, 0,
+            "a stock is not an unknown underlying — that label is what made a healthy \
+             session look like a broken master"
+        );
+        assert!(sel.depth_20.is_empty() && sel.depth_200.is_empty());
+    }
+
+    /// The other half: a genuinely unmapped INDEX still reports as unknown.
+    /// Without this, the fix above would silently swallow a new NSE index the
+    /// six-entry map has not been taught — turning a real gap into a
+    /// deliberate-looking skip.
+    #[test]
+    fn an_unmapped_index_option_still_counts_as_an_unknown_underlying() {
+        let mut idx = candidate("NIFTYNXT50", 6001, 2_500.0, "CE");
+        idx.is_index_option = true;
+        let sel = select_depth_universe(&[idx]);
+        assert_eq!(
+            sel.refused_unknown_underlying, 1,
+            "an index with no mapping is a real gap and must stay visible"
+        );
+        assert_eq!(sel.refused_stock_option, 0);
+    }
+
+    /// The chain leg hardcodes `is_index_option: true`. That is correct only
+    /// while the chain pulls index underlyings alone — if its scope widens, a
+    /// stock arriving through it would be mislabelled an index and its refusal
+    /// would read as an unknown index rather than a stock we chose not to
+    /// cover. Pinned so the widening has to face this.
+    #[test]
+    fn chain_sourced_candidates_are_all_index_options() {
+        let body = r#"{"dataset":[["NIFTY",101,1900000000000000,25000.0,25000.0,"CE"]]}"#;
+        let got = parse_depth_candidates_dataset(body).expect("valid dataset");
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].is_index_option,
+            "the chain leg's candidates are index options by construction"
+        );
+    }
+
     fn test_select_depth_universe_refuses_and_counts_zero_contract_ids() {
         let rows = vec![
             candidate("NIFTY", 0, 100.0, "CE"),
