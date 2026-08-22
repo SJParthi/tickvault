@@ -1433,3 +1433,84 @@ and at the top of the measured index-chain range the margin is already under
 800. `scripts/count-current-expiry-universe.sh` exists to replace April's
 number with a measured one; until it has been run on the box, **this section's
 "fits" verdict rests on a four-month-old measurement** and is stated as such.
+
+### 2026-08-22 — SPOT UNIVERSE = NSE INDICES + NIFTY TOTAL MARKET ONLY (supersedes the 2026-08-21 F&O-underlyings narrowing)
+
+**The verbatim operator demand (2026-08-22, typed directly in-session — preserve EXACTLY, expletives and typos included):**
+
+> "what the fick i clelayrl otld you o skip bse and aske dyout uckign pcik only nifty toal marjet stcoks and enitre nse indices aloen rigth mtoehrfucker then whyt he fuck stills truggligj motherufcke rhwy ? see emanhwiel why the fuck you didnt do the crsoss ebrificatione ntorley with nse india real nse idncies svcsv fiels downlaod becuase onl ywhen yo uhave thsoe aloen only then you cna do the cross verifictaion of each and eveyr data to preicsley fidn nifty total amrket symbsols repsectively rigtnh dude do yoir elaly udnerstand dude because if im not worn nse idnices woudl comeb anywhere between 120 and nifty total amrket would be aorudn 750 or 755 right dude then whyt he fuck still tehse are msisin dud ehwy if you dont do that then always you mtoehrukcxer wil lawlays tell me 4500 spots onl ywrist do thes emtoherucke rokay?"
+
+This is the dated quote the rule-file-first law requires, recorded BEFORE the
+code change it authorizes.
+
+#### What was already true, and what was actually missing
+
+The operator's two premises were checked against source before anything moved.
+One was already satisfied; the other was not, and he is right that it was not.
+
+| Premise | Verdict |
+|---|---|
+| "skip BSE" | **ALREADY DONE.** The spot path is NSE-only by construction — `nse_index_mappings` and `fno_underlying_mappings` both filter `row.exch_id != "NSE"`, and two tests pin it (`"NSE cash equities only: no BSE rows, no index legs"`, `"SENSEX is BSE — the operator narrowed to NSE alone"`). |
+| "you didn't do the cross-verification with the real NSE India index CSVs" | **HALF TRUE, and the half that is false matters less than the half that is true.** The download and the ISIN join DO exist and DO run: `build_once` fetches all **49** `INDEX_CONSTITUENCY_SLUGS` from `niftyindices.com` — `ind_niftytotalmarket_list` among them — and joins every constituent to the Dhan master **by ISIN** through `join_constituents`, fail-closed at a 2% unresolved tolerance and a 10% failed-list ceiling. So the cross-verification is built and gated. |
+| "then why do you still tell me 4,500 spots" | **THE REAL DEFECT.** The join's dedup key is `(index_name, security_id, segment)` — scoped PER LIST. The artifact therefore carries the **UNION of all 49 lists**, and `select_live_universe` dedupes that to the recorded **~4,565** SIDs. Nifty Total Market's ~750 rows are IN there, tagged `index_name = "Nifty Total Market"`, and **nothing ever selected them**. The data was resolved and then thrown into a pile. |
+
+So the machinery he asked for exists; what never existed is a selector that
+takes the ONE list he named out of the pile.
+
+#### What this quote changes
+
+| Surface | Before | After |
+|---|---|---|
+| Spot set, as configured | union of all 49 index lists (~4,565) | **NSE indices + Nifty Total Market constituents only (~869)** |
+| 2026-08-21 narrowing (indices + F&O underlyings, ~335) | the only narrowing that existed; OFF | **SUPERSEDED as the default choice**, key retained and still honoured when NTM is off |
+| BSE | excluded | excluded (unchanged) |
+| Contract shape | NIFTY+BANKNIFTY full current-expiry chains, stock options ATM ±25, all futures expiries | **unchanged — this quote does not touch it** |
+
+Precedence when both narrowing keys are on: **NTM wins**, because it is the
+later dated instruction. Stated in the config and pinned by a test rather than
+left to the order of two `if` blocks.
+
+#### The arithmetic this fixes (the reason the operator kept hitting a wall)
+
+| Spot set | Spot | Contracts authorized | Total vs the 25,000 cap |
+|---|---|---|---|
+| Union of 49 lists (today) | ~4,565 | ~23,820 | **~28,385 — OVER by ~3,385** |
+| Indices + F&O underlyings (2026-08-21) | ~335 | ~23,820 | ~24,155 — fits, 845 spare |
+| **Indices + NTM (this quote)** | **~869** | ~23,820 | **~24,689 — fits, ~311 spare** |
+
+The margin is thinner than the F&O-underlyings option and that is stated
+plainly: at the top of the measured index-chain range (2,037 legs for two
+underlyings) the total breaches the cap and `plan_pool` refuses the WHOLE pool
+fail-closed rather than truncating. That refusal is loud and is the correct
+failure — but it is a session-ending one, so the headroom here is real and
+small.
+
+#### Honest envelope
+
+- **~119 indices and ~750 NTM constituents are EXPECTED, not measured.** The
+  index count comes from the master's NSE `INDEX` rows and the NTM count from
+  whatever `ind_niftytotalmarket_list` serves on the day. Neither is a constant
+  in this repository and neither can be verified from a dev container. The
+  operator's own figures (~120 and ~750–755) match the expectation.
+- **Nothing here makes the feed work.** It changes which instruments are asked
+  for. A non-zero `compared` from the 15:31 cross-verification remains the only
+  evidence this repository can offer that ticks arrive at all.
+- **Fail-soft direction is UNCHANGED and deliberate:** an unreadable or
+  unparseable NTM artifact falls THROUGH to the full master-sourced set with a
+  coded error — the session subscribes MORE than was asked for, never less. A
+  silent narrowing would drop ~3,700 instruments with nothing to say so.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Sources the NTM set from anything other than `ind_niftytotalmarket_list`
+  joined to the Dhan master **by ISIN** (symbol-alone joins are banned by
+  §31.1 of `daily-universe-scope-expansion-2026-05-27.md` — tickers are reused
+  and renamed).
+- Hardcodes an NTM constituent list (it rebalances; a hardcoded list goes
+  stale and breaches the standing no-manual-intervention mandate).
+- Re-admits BSE to the spot set.
+- Lets an unreadable NTM artifact produce a SILENT fallback, or an empty spot
+  set.
+- Changes the contract shape (chain scope, ATM ±25, futures expiries) under
+  cover of this quote — it says nothing about contracts.
+- Flips `dry_run`, touches the §28 frozen area, or arms live order fire.
