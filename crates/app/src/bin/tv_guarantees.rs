@@ -622,6 +622,56 @@ fn workspace_dep_pins(manifest: &str) -> Vec<DepPin> {
     out
 }
 
+/// Every `DEDUP_KEY_*` constant in the storage crate, as (name, key-list).
+///
+/// The row this feeds used to assert "O(1) dedup, composite key" as a bare
+/// claim. This measures it: the I-P1-11 rule is that a key naming
+/// `security_id` must ALSO name its exchange segment, because Dhan reuses one
+/// numeric id across segments -- so `security_id` alone silently collapses two
+/// different instruments into one row. Counting the exceptions is the only way
+/// to know there are none.
+///
+/// Deliberately reads the CONSTANTS rather than trying to pair each table's
+/// `CREATE TABLE` with its dedup statement: several tables declare the dedup in
+/// a separately-built `ALTER TABLE`, and a text scan that tries to associate
+/// the two produces false positives -- it reported `market_depth` as unkeyed
+/// when its key is an 8-column composite carrying `depth_kind`. A check that
+/// cries wolf gets allowlisted; this one cannot.
+fn dedup_key_composite_coverage() -> (usize, usize, usize) {
+    let mut total = 0usize;
+    let mut with_sid = 0usize;
+    let mut sid_and_segment = 0usize;
+    let Ok(entries) = std::fs::read_dir("crates/storage/src") else {
+        return (0, 0, 0);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("pub const DEDUP_KEY_") {
+            rest = &rest[at + "pub const DEDUP_KEY_".len()..];
+            // The declaration runs to its terminating semicolon; the value may
+            // wrap across lines, so take the whole statement rather than a line.
+            let Some(end) = rest.find(';') else { break };
+            let decl = &rest[..end];
+            total += 1;
+            if decl.contains("security_id") {
+                with_sid += 1;
+                if decl.contains("segment") || decl.contains("exchange") {
+                    sid_and_segment += 1;
+                }
+            }
+            rest = &rest[end..];
+        }
+    }
+    (total, with_sid, sid_and_segment)
+}
+
 /// Every workspace dependency name that at least one member crate actually
 /// references via `{ workspace = true }`.
 ///
@@ -806,6 +856,8 @@ fn main() {
         })
         .count();
 
+    let (dedup_total, dedup_sid, dedup_sid_seg) = dedup_key_composite_coverage();
+
     // Read the seam's allocation ceiling out of the gate that enforces it, so
     // this row cannot drift from the test the way a copied number would.
     let seam_budget: Option<u64> =
@@ -872,7 +924,22 @@ fn main() {
             "Uniqueness + dedup",
             Verdict::Guaranteed,
             "O(1)",
-            "QuestDB DEDUP keys, (security_id, segment, feed)",
+            "QuestDB DEDUP keys, hash on the composite",
+        ),
+        // Measured, not asserted. Dhan reuses one numeric id across exchange
+        // segments, so a key naming `security_id` alone silently collapses two
+        // different instruments into one row -- the I-P1-11 rule. This counts
+        // the exceptions; the answer is the only thing that makes the row above
+        // more than a hopeful sentence.
+        Row::new(
+            "Composite key where an id is keyed",
+            if dedup_sid == dedup_sid_seg {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{dedup_sid_seg}/{dedup_sid} of {dedup_total}"),
+            "every DEDUP key naming security_id also names its segment",
         ),
         Row::new(
             "Silence detection",
