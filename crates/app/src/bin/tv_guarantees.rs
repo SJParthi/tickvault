@@ -329,12 +329,6 @@ fn count_lines_containing(root: &Path, needles: &[&str]) -> usize {
     acc
 }
 
-/// Render one section as a fixed-width table.
-///
-/// Deliberately plain text. The operator's standing deliverable rule is
-/// "plain tables readable by anyone — never HTML", and a report that needs a
-/// browser to be read is not one an operator checks at 09:20 on a phone.
-
 /// Page shell for [`render_html`] — fonts, tokens, layout.
 ///
 /// Inlined rather than linked: the artifact host blocks every external origin
@@ -495,6 +489,19 @@ permanently red gate is an ignored gate.</p></footer></div>"#
     );
     s
 }
+/// Render one section as a fixed-width table.
+///
+/// Deliberately plain text, and it stays the DEFAULT. The operator's standing
+/// deliverable rule is "plain tables readable by anyone — never HTML", and a
+/// report that needs a browser to be read is not one an operator checks at
+/// 09:20 on a phone.
+///
+/// 2026-08-22: [`render_html`] was added alongside it — not in place of it —
+/// after the operator asked three times for an "automated table level
+/// comparison view". That rule governs the ANSWER given in chat, which is
+/// still this text; the page is an extra surface for the artifact gallery,
+/// generated from the same rows so it cannot drift from what this prints.
+/// A bare `tv-guarantees` behaves exactly as before.
 fn render(title: &str, rows: &[Row]) -> String {
     let w_what = rows.iter().map(|r| r.what.len()).max().unwrap_or(4).max(4);
     let w_verd = rows
