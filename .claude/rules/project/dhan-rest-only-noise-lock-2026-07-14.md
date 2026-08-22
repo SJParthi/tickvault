@@ -592,3 +592,36 @@ four-month-old measurement behind the "it fits" verdict are all unchanged. An
 operator woken by this alarm still has to decide whether to raise the cap or
 narrow the set. The gauge remains unshipped, so there is still no way to watch the
 number CREEP toward the cap — only to be told after it crossed.
+
+#### §2.3c-ii — 2026-08-22 MEASURED: the user-data template has ZERO bytes free
+
+§2.3c records the headroom gauge as blocked "33 bytes over the budget", which
+reads like a shortfall specific to that one metric. Measured today, it is not:
+
+| | bytes |
+|---|---|
+| `user-data.sh.tftpl` renders to | **15,872** |
+| Guard budget (16,384 AWS limit − 512 reserved) | **15,872** |
+| **Free margin** | **0** |
+
+Method: appending a known 63-byte block made the guard report "renders to 15,935
+… (63 over)", so the unmodified render is exactly 15,872 — the budget, to the
+byte. (A 1-byte append passes, because a trailing character with no newline is
+trimmed before measurement; that near-miss is why this was measured rather than
+inferred.)
+
+**The consequence is not about one gauge.** EVERY future addition to user-data
+is blocked: one more metric in the EMF selector, one environment variable, one
+line of boot script. The next person to try will read "33 bytes over" in §2.3c,
+assume their smaller change fits, and discover it does not.
+
+**Two routes remain, and the cheap-looking one was rejected on evidence.** The
+EMF selector is a regex alternation in which 13 metrics share `tv_dhan_feed_`
+and 10 share `tv_dhan_ws_`, so mechanical prefix factoring would free well over
+100 bytes. It was NOT taken: that regex is the live shipping path for 76 metrics
+which 65 alarms depend on, its failure mode is silent (metrics simply stop
+arriving), and it cannot be tested from a dev container. Restructuring it to
+ship one gauge is the wrong trade even with a strong equivalence proof. The
+guard's own prescription — move content to a file `cp`'d in after the Step 5
+repo clone — remains the correct fix, and remains a prod boot-path change that
+needs someone who can watch a real instance boot.
