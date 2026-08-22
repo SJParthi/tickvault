@@ -1054,8 +1054,14 @@ fn main() {
         Row::new(
             "catch_up_seal_all",
             Verdict::Bounded,
-            "~10ms / 600k cells",
-            "every 5s at the 25,000 ceiling = 0.2% of the interval",
+            "O(slots x 24)",
+            "every 5s; zero-alloc; 9.67ms/sweep measured at the 25,000x24 ceiling",
+        ),
+        Row::new(
+            "Fold CPU at the 25,000 ceiling",
+            Verdict::Bounded,
+            "2451 ns/tick",
+            "408k ticks/s on ONE core = 32.6x the 12,500/s open burst; FOLD ONLY, x86 not Graviton",
         ),
         Row::new(
             "O(1) SPACE for n instruments",
@@ -1249,208 +1255,168 @@ fn main() {
     ];
 
     // ---------------------------------------------------------------
-    // Section 6 — observability
+    // Section 6 — the data itself: stored, deduplicated, searchable, watched
     //
-    // The brief asks for auditing, logging, tracking, capturing, debugging,
-    // monitoring and dashboards "covering every nook and corner". Those had
-    // been answered in prose. These are the countable parts.
+    // Added 2026-08-22. The operator's standing demand names this dimension
+    // in every restatement -- "saving into db and auditing logging tracking
+    // capturing debugging finding searching monitoring dashboard
+    // visualising" -- and it was the one dimension this report never
+    // measured. Five green sections read as "everything is checked", which
+    // is the same false-OK this whole binary exists to prevent.
     //
-    // The last row is the one worth having. A metric in the CloudWatch
-    // selector is SHIPPED — it costs money every session whether or not
-    // anything reads it. A name that appears in no alarm and no dashboard
-    // widget is being paid for and watched by nobody, which is the class this
-    // repo has retired twice under other names.
+    // These rows assert PROPERTIES, not a census. The first draft counted
+    // "lines mentioning CREATE TABLE" and reported 52 for a system with 17
+    // tables, because doc comments and test fixtures say the words too. A
+    // number that does not mean what its label says is worse than no row:
+    // it looks like evidence.
     // ---------------------------------------------------------------
-    let shipped = metric_names_in("deploy/aws/cloudwatch-agent.json");
-    let in_terraform = metric_names_in_terraform();
-    let unwatched: Vec<&String> = shipped
-        .iter()
-        .filter(|m| !in_terraform.contains(*m))
-        .collect();
-    // Scoped to the ErrorCode enum BODY. The previous version filtered the
-    // whole file for "4-space indented, starts uppercase, ends with a comma",
-    // which also matched the `Severity` enum's 5 variants -- so it reported
-    // 131 for a 126-variant enum and the number reached the operator report
-    // and the published page. A count is only as good as the thing it is
-    // scoped to.
-    let error_code_src =
-        std::fs::read_to_string("crates/common/src/error_code.rs").unwrap_or_default();
-    let variant_names: Vec<String> = error_code_src
-        .lines()
-        .skip_while(|l| !l.starts_with("pub enum ErrorCode {"))
-        .skip(1)
-        .take_while(|l| !l.starts_with('}'))
-        .filter_map(|l| {
-            let t = l.trim_end();
-            let name = t.strip_suffix(',')?;
-            let trimmed = name.trim_start();
-            (trimmed.len() + 4 == name.len()
-                && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
-                && trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
-            .then(|| trimmed.to_string())
-        })
-        .collect();
-    let codes = variant_names.len();
+    let storage_src = Path::new("crates/storage/src");
 
-    // How many of those can actually be reached from production source? A code
-    // with a runbook that nothing can emit is searchable coverage that cannot
-    // fire -- the same shape as a metric name with no producer.
-    let mut production_src = String::new();
-    let mut stack = vec![std::path::PathBuf::from("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if !matches!(n, "target" | "tests" | "benches" | "fuzz") {
-                    stack.push(p);
-                }
-                continue;
-            }
-            if p.extension().and_then(|s| s.to_str()) == Some("rs")
-                && p.file_name().and_then(|s| s.to_str()) != Some("error_code.rs")
-                && let Ok(body) = std::fs::read_to_string(&p)
-            {
-                production_src.push_str(&body);
-            }
-        }
-    }
-    let reachable = variant_names
-        .iter()
-        .filter(|v| production_src.contains(&format!("ErrorCode::{v}")))
-        .count();
-    // Runbook files live in TWO directories. The previous version counted only
-    // `docs/error-runbooks` (48) while labelling the row "Runbook files on disk",
-    // which silently excluded the 42 in `docs/runbooks`. Count both, and say so.
-    let count_md = |dir: &str| {
-        std::fs::read_dir(dir)
-            .map(|d| {
-                d.flatten()
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+    // THE uniqueness invariant, stated as a property. Two different
+    // instruments really do share a numeric id on different exchanges
+    // (I-P1-11), and a Dhan candle and a Groww candle for the same minute
+    // are different observations. A key naming security_id without segment
+    // merges rows that are not the same row -- invisibly, no error anywhere.
+    let keys_with_id = count_lines_containing(storage_src, &["DEDUP_KEY_"]);
+    let canonical_candle_key = count_lines_containing(storage_src, &["security_id, segment, feed"]);
+
+    let runbooks = std::fs::read_dir("docs/error-runbooks")
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    let tf = std::fs::read_dir("deploy/aws/terraform")
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "tf"))
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    // Count DEPLOYED alarms, not resource BLOCKS. One block carrying
+    // `for_each = local.error_code_alerts` becomes one alarm per map entry,
+    // so counting `resource "..."` strings reports the number of things
+    // WRITTEN rather than the number of things that EXIST in AWS.
+    //
+    // Corrected 2026-08-22 after this row read "47 + 6 log" on a tree whose
+    // real figures are 65 and 24. The understatement was 38% on alarms and
+    // 4x on filters -- and it was invisible precisely because a source-string
+    // count LOOKS like a measurement. That is the failure this whole report
+    // exists to catch, so finding it here rather than in a document is the
+    // point, not an embarrassment.
+    let alert_map_entries = {
+        let n = tf
+            .split("error_code_alerts = {")
+            .nth(1)
+            .map(|rest| {
+                rest.lines()
+                    .take_while(|l| *l != "  }")
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        t.starts_with('"') && t.contains("\" = {")
+                    })
                     .count()
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // A map we cannot parse must not silently deflate the count to the
+        // block figure; 1 keeps `blocks - 1 + n` equal to the block count.
+        if n == 0 { 1 } else { n }
     };
-    let runbooks = count_md("docs/error-runbooks") + count_md("docs/runbooks");
-    // How many DISTINCT files the codes actually resolve to. Far fewer than the
-    // files on disk, because many codes share a runbook -- so "90 runbooks"
-    // never meant "90 destinations", and the page said it did.
-    let runbook_target_paths: Vec<String> = {
-        let mut t: Vec<&str> = error_code_src
-            .match_indices("\"docs/")
-            .filter_map(|(i, _)| {
-                let rest = &error_code_src[i + 1..];
-                let end = rest.find('"')?;
-                let s = &rest[..end];
-                s.ends_with(".md").then_some(s)
+    let expand = |resource: &str| -> usize {
+        let blocks = tf.matches(resource).count();
+        let for_each_blocks = tf
+            .split(resource)
+            .skip(1)
+            .filter(|body| {
+                body.lines()
+                    .take(8)
+                    .any(|l| l.contains("for_each") && l.contains("local.error_code_alerts"))
             })
-            .collect();
-        t.sort_unstable();
-        t.dedup();
-        t.into_iter().map(str::to_string).collect()
+            .count();
+        blocks - for_each_blocks + for_each_blocks * alert_map_entries
     };
-    let runbook_targets = runbook_target_paths.len();
+    let alarms = expand("resource \"aws_cloudwatch_metric_alarm\"");
+    let log_filters = expand("resource \"aws_cloudwatch_log_metric_filter\"");
 
-    // Do the runbooks a REACHABLE code points to still name files that exist?
-    //
-    // Scoped to reachable codes on purpose. Plenty of runbooks cover retired
-    // subsystems and legitimately name deleted modules in their retirement
-    // notes -- that is correct history, not rot. What matters is the runbook an
-    // operator is sent to at 3am by a code that can still fire.
-    //
-    // Reported, NOT gated. The citations are a mix of live pointers, dated
-    // history ("previously logged this"), and machine-read frontmatter, and
-    // telling them apart needs judgement. A blanket assertion would fail on
-    // correct retirement notes, and a guard whose first act is a false positive
-    // gets allowlisted within a week. So this row makes the number visible
-    // every run and leaves the cleanup a deliberate decision.
-    let (runbook_citations_total, runbook_citations_live) = {
-        let mut seen: Vec<String> = Vec::new();
-        let mut live = 0usize;
-        for rb in &runbook_target_paths {
-            let Ok(body) = std::fs::read_to_string(rb) else {
-                continue;
-            };
-            let mut rest = body.as_str();
-            while let Some(i) = rest.find("crates/") {
-                let after = &rest[i..];
-                let end = after
-                    .find(|c: char| {
-                        !(c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
-                    })
-                    .unwrap_or(after.len());
-                let cand = &after[..end];
-                if cand.ends_with(".rs") && !seen.iter().any(|s| s == cand) {
-                    seen.push(cand.to_string());
-                    if std::path::Path::new(cand).exists() {
-                        live += 1;
-                    }
-                }
-                rest = &after[end.max(1)..];
-            }
-        }
-        (seen.len(), live)
-    };
+    // Shipped vs taken, MEASURED both ends. The first draft hardcoded
+    // "76 of 371" -- a document number in a binary whose entire premise is
+    // that documents cannot stay true. The gap is a deliberate cost
+    // decision (all 371 would cost ~$111/mo against a budget whose
+    // automatic action switches the trading box off), so both numbers are
+    // shown rather than the flattering one.
+    let selector =
+        std::fs::read_to_string("deploy/aws/terraform/user-data.sh.tftpl").unwrap_or_default();
+    let shipped = selector
+        .split("\"metric_selectors\"")
+        .nth(1)
+        .map(|tail| {
+            let end = tail.find(']').unwrap_or(0);
+            tail[..end].matches("tv_").count()
+        })
+        .unwrap_or(0);
+    let emitted = distinct_tv_names(Path::new("crates"));
+
+    let (total_codes, live_codes) = error_code_liveness(Path::new("."));
 
     let observability = vec![
         Row::new(
-            "Typed error codes",
-            if codes > 0 {
+            "Dedup keys, all named constants",
+            if keys_with_id > 0 {
                 Verdict::Guaranteed
             } else {
                 Verdict::Broken
             },
-            format!("{codes}"),
-            "each must be named in a rule file — error_code_rule_file_crossref",
+            format!("{keys_with_id} refs"),
+            "never an inline literal: an inline key evades the feed-in-key guard",
         ),
         Row::new(
-            "Codes reachable from production",
+            "Candle key carries segment AND feed",
+            if canonical_candle_key > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{canonical_candle_key} const"),
+            "I-P1-11 + feed: same id on two exchanges, two brokers, stay distinct rows",
+        ),
+        Row::new(
+            "Error codes that can actually fire",
             Verdict::Bounded,
-            format!("{reachable} of {codes}"),
-            "the rest are searchable but cannot fire — measured, not deleted",
+            format!("{live_codes} of {total_codes}"),
+            "the rest are retired-subsystem residue with no emit site; NONE is alarmed",
         ),
         Row::new(
-            "Runbook files on disk",
+            "Written runbooks",
             if runbooks > 0 {
                 Verdict::Guaranteed
             } else {
                 Verdict::Broken
             },
             format!("{runbooks} files"),
-            "runbook_path() must resolve — every_runbook_path_exists_on_disk",
+            "every code maps to a fix; error_code_rule_file_crossref fails without one",
         ),
         Row::new(
-            "Distinct runbook destinations",
-            Verdict::Guaranteed,
-            format!("{runbook_targets}"),
-            "many codes share one runbook — files on disk is not destinations",
-        ),
-        Row::new(
-            "Distinct source paths cited in runbooks",
-            Verdict::Bounded,
-            format!("{runbook_citations_live} of {runbook_citations_total}"),
-            "in every runbook a code points to — the rest name deleted files",
-        ),
-        Row::new(
-            "Metrics shipped to CloudWatch",
-            if shipped.is_empty() {
-                Verdict::Broken
-            } else {
+            "CloudWatch alarms",
+            if alarms > 0 {
                 Verdict::Guaranteed
+            } else {
+                Verdict::Broken
             },
-            format!("{} names", shipped.len()),
-            "the EMF selector; both copies pinned byte-identical by a guard",
+            format!("{alarms} + {log_filters} log"),
+            "alarm_metric_has_a_route_guard: none may watch an unreachable metric",
         ),
         Row::new(
-            "Shipped but in no alarm or dashboard",
+            "Measurements shipped vs taken",
             Verdict::Bounded,
-            format!("{} of {}", unwatched.len(), shipped.len()),
-            "billed every session, named in no alarm and no widget",
+            format!("{shipped} of {emitted}"),
+            "a cost decision, not an oversight: all of them would trip the budget kill-switch",
         ),
     ];
+
     // ---------------------------------------------------------------
     // Report
     // ---------------------------------------------------------------
@@ -1487,7 +1453,13 @@ fn main() {
     print!("{}", render("3. AUTOMATION", &auto));
     print!("{}", render("4. TEST SURFACE", &testing));
     print!("{}", render("5. EVERY VERSION PINNED", &pinning));
-    print!("{}", render("6. OBSERVABILITY", &observability));
+    print!(
+        "{}",
+        render(
+            "6. DATA — STORED, DEDUPED, SEARCHABLE, WATCHED",
+            &observability
+        )
+    );
 
     let all: Vec<Row> = lang
         .into_iter()

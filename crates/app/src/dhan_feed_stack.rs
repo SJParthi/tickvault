@@ -4602,6 +4602,31 @@ pub const PREOPEN_READY_DEADLINE_IST_SECS: u32 = 9 * 3_600 + 12 * 60;
 /// would read as a met deadline.
 pub const PREOPEN_READY_GAUGE: &str = "tv_dhan_preopen_ready_secs";
 
+/// IST second-of-day past which a late-priced stock's options stop being
+/// chased — 09:30:00.
+///
+/// # The gap this exists to close (MEASURED, 2026-08-21, not inferred)
+///
+/// The contract half dials ONCE and then never re-selects. Live that morning:
+///
+/// ```text
+/// 09:08:14  priced_underlyings: 725   without_spot: 8
+///           stock_options: 19442      atm_window: 25   dropped_for_capacity: 0
+/// ```
+///
+/// Eight F&O underlyings had not printed a trade yet, so their ~780 options
+/// were absent for the whole session — and nothing ever went back for them.
+/// The dial fired on the 60% pricing quorum (725 of 733 is 98.9%), so this
+/// predates the 09:12 readiness deadline rather than being caused by it: the
+/// deadline changes WHEN the first dial happens, never whether a second look
+/// occurs. There was no second look at all.
+///
+/// 09:30 rather than the session close: an F&O underlying that has not traded
+/// in the first fifteen minutes is not going to make its options worth a
+/// subscription slot, and an unbounded chase would keep two QuestDB queries
+/// and a contract re-selection running all day for nothing.
+pub const CONTRACT_TOPUP_CUTOFF_IST_SECS: u32 = 9 * 3_600 + 30 * 60;
+
 /// IST second-of-day past which the depth late-attach gives up for the session.
 ///
 /// 10:00 IST — 44 minutes after the option-chain leg's first fire. Past this,
@@ -4689,6 +4714,114 @@ fn ist_second_of_day_now() -> u32 {
 /// Depth must never be held by it: depth does not read spot prices, so waiting
 /// for a stock to print cannot make the option chain arrive any sooner.
 #[must_use]
+/// The I-P1-11 composite identity, as a hashable key.
+///
+/// `security_id` ALONE is not unique — that is the whole point of I-P1-11 —
+/// and a set keyed on it would treat an index and an option that happen to
+/// share a number as the same instrument, silently withholding one of them
+/// from a top-up forever.
+fn contract_identity(
+    instrument: &tickvault_core::websocket::pool_supervisor::SubscribeInstrument,
+) -> (u64, u8) {
+    (instrument.security_id, instrument.segment.binary_code())
+}
+
+/// Subscribe contracts that appeared in a LATER selection onto connections
+/// that are already live, and return how many reached the wire.
+///
+/// # Why a set difference is the load-bearing part
+///
+/// [`SubscribeGuard::try_extend`] is fail-closed only PAST the per-connection
+/// cap; BELOW it, a second send of an instrument the socket already holds is a
+/// silent double-subscribe, and Dhan answers an over-limit subscribe with 804
+/// by dropping the connection. So the safety of this whole path rests on
+/// `delta` being provably disjoint from everything already sent — which a set
+/// difference over the composite key gives exactly, not approximately. Nothing
+/// here is heuristic: an instrument is sent if and only if no connection has
+/// ever been told about it.
+///
+/// The room figures are the callers' own accounting, decremented as sends
+/// succeed. They are an optimisation, not the safety property — a wrong room
+/// number costs a refusal from `try_extend`, which leaves the guard untouched.
+fn top_up_late_contracts(
+    selection: &[tickvault_core::websocket::pool_supervisor::SubscribeInstrument],
+    sent: &mut std::collections::HashSet<(u64, u8)>,
+    slots: &mut [(
+        tokio::sync::mpsc::Sender<
+            Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+        >,
+        usize,
+    )],
+    attempts: u32,
+) -> usize {
+    let delta: Vec<_> = selection
+        .iter()
+        .filter(|i| !sent.contains(&contract_identity(i)))
+        .copied()
+        .collect();
+    if delta.is_empty() {
+        return 0;
+    }
+    let mut cursor = 0usize;
+    let mut placed = 0usize;
+    for (tx, room) in slots.iter_mut() {
+        if cursor >= delta.len() {
+            break;
+        }
+        if *room == 0 {
+            continue;
+        }
+        let take = (*room).min(delta.len() - cursor);
+        let chunk = delta[cursor..cursor + take].to_vec();
+        match tx.try_send(chunk) {
+            Ok(()) => {
+                for instrument in &delta[cursor..cursor + take] {
+                    sent.insert(contract_identity(instrument));
+                }
+                *room = room.saturating_sub(take);
+                placed = placed.saturating_add(take);
+                cursor += take;
+            }
+            Err(err) => {
+                // NOT recorded as sent, and deliberately: a refused send means
+                // the socket never heard about these, so the next attempt must
+                // be free to offer them again. Recording them here is the one
+                // mistake that would turn a transient full channel into a
+                // permanent hole.
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    attempts,
+                    offered = take,
+                    %err,
+                    "a live connection would not accept a late contract top-up — trying the \
+                     next connection. Nothing was marked subscribed."
+                );
+            }
+        }
+    }
+    let unplaced = delta.len().saturating_sub(placed);
+    if unplaced > 0 {
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            attempts,
+            delta = delta.len(),
+            placed,
+            unplaced,
+            "late-priced contracts had no room on any live connection — they are NOT \
+             subscribed this session. Every main-feed connection is at its cap, which means \
+             the authorized universe no longer fits the 5 x 5,000 budget."
+        );
+    } else {
+        info!(
+            attempts,
+            placed,
+            "late-priced contracts subscribed on the live connections — these are the \
+             options of underlyings that had not traded when the contract half first dialed"
+        );
+    }
+    placed
+}
+
 fn outstanding_halves(
     depth_resolved: bool,
     contracts_resolved: bool,
@@ -4889,6 +5022,31 @@ async fn attach_depth_when_available(
     // instruments on a live socket, and Dhan answers an over-limit subscribe
     // with 804 and drops the connection.
     let mut spot_topup_used = false;
+    // Every contract instrument that has REACHED THE WIRE, by I-P1-11
+    // composite key. This is what makes a later top-up safe: see
+    // `top_up_late_contracts` for why a set difference, and not a heuristic,
+    // is the only thing standing between a late subscribe and an 804.
+    let mut sent_contracts: std::collections::HashSet<(u64, u8)> = std::collections::HashSet::new();
+    // Top-up channels for connections that are already live, with the room
+    // left on each. Populated by the contract dial and by the spot
+    // connection's leftover after the initial overflow.
+    let mut live_topups: Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)> =
+        Vec::new();
+    // The contract capacity budget, FROZEN at the first selection.
+    //
+    // Recomputing it per attempt would be wrong the moment contracts dial:
+    // `main_feed_connections_used` grows by the connections they took, so
+    // `remaining_main_feed_capacity` collapses from ~24,000 to ~4,000 and
+    // `fit_atm_window` would size a completely different (far narrower)
+    // window for the top-up selection. The delta would then be computed
+    // against a set that never existed, and strikes already on the wire would
+    // read as ones to add.
+    let mut contract_capacity: Option<usize> = None;
+    // The readiness gauge and its deadline verdict fire ONCE per session. The
+    // loop can now outlive that moment, so it needs a latch rather than the
+    // `return` that used to guarantee it.
+    let mut readiness_published = false;
+    let mut late_topped_up = 0usize;
     let started = Instant::now();
     loop {
         // The deadline gates RETRIES, never the FIRST attempt.
@@ -4994,15 +5152,27 @@ async fn attach_depth_when_available(
         // The chain remains the FALLBACK, not a rival: the artifact is
         // written by a separate daily rider, and if that rider had a bad
         // morning, late depth beats no depth.
-        let selection = match crate::dhan_depth_universe::load_depth_universe_from_master(
-            &questdb,
-            &today_date,
-            ymd_from_ist_date(&today_date),
-        )
-        .await
-        {
-            Some(from_artifact) => from_artifact,
-            None => crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await,
+        //
+        // Skipped entirely once depth is on the wire. The loop can now linger
+        // past both halves to chase late-priced stocks, and re-running two
+        // QuestDB queries a minute for a set that is already subscribed buys
+        // nothing. `outstanding_halves` already gates on `depth_done`, so an
+        // empty selection here cannot change a decision.
+        let selection = if depth_done {
+            crate::dhan_depth_universe::DepthSelection::default()
+        } else {
+            match crate::dhan_depth_universe::load_depth_universe_from_master(
+                &questdb,
+                &today_date,
+                ymd_from_ist_date(&today_date),
+            )
+            .await
+            {
+                Some(from_artifact) => from_artifact,
+                None => {
+                    crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await
+                }
+            }
         };
 
         // The contract universe rides the SAME retry loop, and that is not a
@@ -5020,8 +5190,10 @@ async fn attach_depth_when_available(
             // ~4,150 already-paid-for slots, and the ATM window silently
             // shrinks to fit a budget that is smaller than the one the
             // operator authorized.
-            remaining_main_feed_capacity(main_feed_connections_used)
-                .saturating_add(spot_topup.as_ref().map_or(0, |(_, spare)| *spare)),
+            *contract_capacity.get_or_insert_with(|| {
+                remaining_main_feed_capacity(main_feed_connections_used)
+                    .saturating_add(spot_topup.as_ref().map_or(0, |(_, spare)| *spare))
+            }),
         )
         .await;
 
@@ -5145,7 +5317,7 @@ async fn attach_depth_when_available(
                 // over-limit subscribe with 804 and drops the connection.
                 if !overflow.is_empty() && !spot_topup_used {
                     match spot_topup.as_ref() {
-                        Some((tx, _)) => {
+                        Some((tx, spare)) => {
                             // A bounded send that CANNOT block the attach: the
                             // connection task may be mid-frame, and waiting on
                             // it here would stall the depth dial behind a
@@ -5153,6 +5325,21 @@ async fn attach_depth_when_available(
                             match tx.try_send(overflow.to_vec()) {
                                 Ok(()) => {
                                     spot_topup_used = true;
+                                    for instrument in overflow {
+                                        sent_contracts.insert(contract_identity(instrument));
+                                    }
+                                    // Whatever this connection still holds
+                                    // after the overflow is real, already-paid
+                                    // room. Offering it to the late top-up is
+                                    // what retires `spot_topup_used` as a
+                                    // one-shot hack: the guard existed only
+                                    // because a second send could not be
+                                    // proven disjoint from the first, and now
+                                    // it can be.
+                                    let left = spare.saturating_sub(overflow.len());
+                                    if left > 0 {
+                                        live_topups.push((tx.clone(), left));
+                                    }
                                     info!(
                                         overflow = overflow.len(),
                                         pool_contracts = pool_contracts.len(),
@@ -5202,10 +5389,16 @@ async fn attach_depth_when_available(
                                 main_feed_budget: &main_feed_budget,
                                 depth_budget: &depth_budget,
                                 ws_audit_tx: Some(&ws_audit_tx),
-                                // The attach dials its own connections with
-                                // their FINAL set — nothing is added to them
-                                // later, so they need no top-up channel.
-                                out_topups: None,
+                                // Retained since 2026-08-22. These connections
+                                // are NOT dialed with their final set: eight
+                                // F&O underlyings had not traded when this
+                                // fired on 2026-08-21, so ~780 of their
+                                // options were absent for the whole session
+                                // and nothing ever went back for them. Keeping
+                                // the senders is what makes going back
+                                // possible; `top_up_late_contracts` is what
+                                // makes it safe.
+                                out_topups: Some(&mut live_topups),
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -5214,6 +5407,14 @@ async fn attach_depth_when_available(
                         // per-attempt emit would page every healthy morning.
                         crate::dhan_contract_universe::record_contract_verdict(&contracts);
                         contracts_done = true;
+                        // Only what the POOL carried. The overflow records
+                        // itself at its own send site, because it can fail
+                        // there — recording the whole selection here would
+                        // claim a refused overflow was subscribed and lock
+                        // those contracts out of every later top-up.
+                        for instrument in pool_contracts {
+                            sent_contracts.insert(contract_identity(instrument));
+                        }
                         // Make them VISIBLE to the silence detector, at the
                         // moment they reach the wire and not before. Seeding a
                         // set that failed to dial would report silence for
@@ -5319,7 +5520,7 @@ async fn attach_depth_when_available(
             // The ONLY success return. Both halves, or keep waiting — the
             // single `return` that used to sit in one shared Ok arm is exactly
             // what left depth dark once contracts won the race.
-            if contracts_done && depth_done {
+            if contracts_done && depth_done && !readiness_published {
                 // The readiness SECOND, not the attempt count. Published here
                 // and nowhere else: this is the only point at which both
                 // halves are provably on the wire, and it is reached at most
@@ -5354,6 +5555,44 @@ async fn attach_depth_when_available(
                          Everything dialed, just late."
                     );
                 }
+                readiness_published = true;
+            }
+        }
+
+        // ---- late top-up: the options of stocks that had not yet traded ----
+        //
+        // Runs only on an iteration that did NOT dial contracts, so the very
+        // attempt that fills `sent_contracts` never also scans it.
+        if contracts_done && !dial_contracts && !contracts.instruments.is_empty() {
+            late_topped_up = late_topped_up.saturating_add(top_up_late_contracts(
+                &contracts.instruments,
+                &mut sent_contracts,
+                &mut live_topups,
+                attempts,
+            ));
+        }
+
+        // The ONLY success return.
+        //
+        // It used to sit inside the dial block above and fire the instant both
+        // halves were on the wire. It now waits out the top-up window — but
+        // ONLY when there is a named reason to wait. On a session where every
+        // F&O underlying priced before the contract dial,
+        // `underlyings_without_spot` is 0 and this returns on exactly the same
+        // iteration it always did, having done nothing extra. The loop lingers
+        // only to chase instruments it can name.
+        if contracts_done && depth_done {
+            let chasing = contracts.underlyings_without_spot > 0
+                && ist_second_of_day_now() < CONTRACT_TOPUP_CUTOFF_IST_SECS;
+            if !chasing {
+                info!(
+                    attempts,
+                    late_topped_up,
+                    underlyings_without_spot = contracts.underlyings_without_spot,
+                    subscribed_contracts = sent_contracts.len(),
+                    "late-attach finished: both halves on the wire and the late top-up window \
+                     is closed"
+                );
                 return;
             }
         }
@@ -6971,6 +7210,179 @@ mod tests {
             security_id: SecurityId::from(id),
             segment: seg,
         }
+    }
+
+    // -- late top-up of contracts whose underlying priced after the dial -----
+
+    /// A channel wide enough that a refusal in these tests always means the
+    /// code refused, never that the buffer happened to be full.
+    fn topup_slot(
+        room: usize,
+    ) -> (
+        (tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize),
+        tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        ((tx, room), rx)
+    }
+
+    #[test]
+    fn top_up_late_contracts_sends_only_what_is_not_already_on_the_wire() {
+        let mut sent = std::collections::HashSet::new();
+        sent.insert(contract_identity(&inst(1, ExchangeSegment::NseFno)));
+        sent.insert(contract_identity(&inst(2, ExchangeSegment::NseFno)));
+        let (slot, mut rx) = topup_slot(100);
+        let mut slots = [slot];
+        let selection = [
+            inst(1, ExchangeSegment::NseFno),
+            inst(2, ExchangeSegment::NseFno),
+            inst(3, ExchangeSegment::NseFno),
+        ];
+
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+
+        assert_eq!(placed, 1, "only the instrument nobody has been told about");
+        let got = rx.try_recv().expect("the delta must reach the channel");
+        assert_eq!(
+            got,
+            vec![inst(3, ExchangeSegment::NseFno)],
+            "re-sending an already-live instrument is a silent double-subscribe, and Dhan \
+             answers an over-limit subscribe with 804 by dropping the connection"
+        );
+    }
+
+    #[test]
+    fn top_up_late_contracts_is_idempotent_across_attempts() {
+        let mut sent = std::collections::HashSet::new();
+        let (slot, mut rx) = topup_slot(100);
+        let mut slots = [slot];
+        let selection = [inst(7, ExchangeSegment::NseFno)];
+
+        assert_eq!(
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 1),
+            1
+        );
+        assert_eq!(
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 2),
+            0,
+            "the loop re-selects every attempt; a second send of the same set is the exact \
+             804 hazard this function exists to prevent"
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "the second attempt must put NOTHING on the channel"
+        );
+    }
+
+    #[test]
+    fn top_up_late_contracts_keys_on_the_composite_not_the_id_alone() {
+        // I-P1-11: the same numeric id in two segments is two instruments.
+        let mut sent = std::collections::HashSet::new();
+        sent.insert(contract_identity(&inst(42, ExchangeSegment::NseFno)));
+        let (slot, mut rx) = topup_slot(100);
+        let mut slots = [slot];
+        let selection = [
+            inst(42, ExchangeSegment::NseFno),
+            inst(42, ExchangeSegment::BseFno),
+        ];
+
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+
+        assert_eq!(
+            placed, 1,
+            "keying on security_id alone would withhold the BSE_FNO contract forever"
+        );
+        assert_eq!(
+            rx.try_recv().expect("a send"),
+            vec![inst(42, ExchangeSegment::BseFno)]
+        );
+    }
+
+    #[test]
+    fn top_up_late_contracts_does_not_mark_a_refused_send_as_subscribed() {
+        let mut sent = std::collections::HashSet::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(1);
+        drop(rx); // the connection task is gone: every send is refused
+        let mut slots = [(tx, 100)];
+        let selection = [inst(9, ExchangeSegment::NseFno)];
+
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+
+        assert_eq!(placed, 0);
+        assert!(
+            sent.is_empty(),
+            "recording a REFUSED send as subscribed turns a transient failure into a \
+             permanent hole — the instrument could never be offered again"
+        );
+    }
+
+    #[test]
+    fn top_up_late_contracts_spills_across_connections_by_room() {
+        let mut sent = std::collections::HashSet::new();
+        let (first, mut rx_first) = topup_slot(2);
+        let (second, mut rx_second) = topup_slot(10);
+        let mut slots = [first, second];
+        let selection: Vec<_> = (1..=5)
+            .map(|id| inst(id, ExchangeSegment::NseFno))
+            .collect();
+
+        let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1);
+
+        assert_eq!(placed, 5);
+        assert_eq!(rx_first.try_recv().expect("first").len(), 2, "its room");
+        assert_eq!(rx_second.try_recv().expect("second").len(), 3, "the rest");
+        assert_eq!(slots[0].1, 0, "room is decremented as sends succeed");
+        assert_eq!(slots[1].1, 7);
+    }
+
+    #[test]
+    fn top_up_late_contracts_places_nothing_when_every_connection_is_full() {
+        let mut sent = std::collections::HashSet::new();
+        let (slot, mut rx) = topup_slot(0);
+        let mut slots = [slot];
+        let selection = [inst(11, ExchangeSegment::NseFno)];
+
+        assert_eq!(
+            top_up_late_contracts(&selection, &mut sent, &mut slots, 1),
+            0
+        );
+        assert!(sent.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn contract_topup_cutoff_sits_after_the_readiness_deadline_and_the_open() {
+        assert!(
+            CONTRACT_TOPUP_CUTOFF_IST_SECS > PREOPEN_READY_DEADLINE_IST_SECS,
+            "chasing a late-priced stock only makes sense AFTER the first dial, which the \
+             readiness deadline bounds"
+        );
+        assert!(
+            u64::from(CONTRACT_TOPUP_CUTOFF_IST_SECS) > CONTINUOUS_SESSION_START_SECS_OF_DAY_IST,
+            "a stock that has not traded by 09:15 is exactly the case this chases"
+        );
+        assert_eq!(CONTRACT_TOPUP_CUTOFF_IST_SECS, 34_200, "09:30:00 IST");
+    }
+
+    #[test]
+    fn contract_dial_retains_its_top_up_channels() {
+        // Source scan: `out_topups: None` on the contract dial is what left
+        // ~780 late-priced options unsubscribed every session, and it is a
+        // one-word regression to reintroduce.
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+        assert!(
+            src.contains("out_topups: Some(&mut live_topups)"),
+            "the contract half must keep its senders so a late top-up can reach those sockets"
+        );
+        assert_eq!(
+            src.matches("out_topups: None").count(),
+            1,
+            "exactly ONE dial legitimately has nothing to add later: depth, whose sets are \
+             final. If this is 2, the contract dial lost its channels again."
+        );
     }
 
     #[test]
@@ -10614,10 +11026,23 @@ mod contract_attach_tests {
         let emit = src
             .find("metrics::gauge!(PREOPEN_READY_GAUGE)")
             .expect("emit site");
+        // The arm gained a `!readiness_published` latch on 2026-08-22: the
+        // loop can now outlive the both-halves moment to chase stocks that
+        // priced after the contract dial, so the `return` no longer guarantees
+        // one publication per session. The latch does. Anchoring on the FULL
+        // condition is deliberate — anchoring on the prefix would silently
+        // match the terminal return block further down and invert this
+        // assertion, which is exactly how this test first failed.
         let arm = src
-            .find("if contracts_done && depth_done {")
+            .find("if contracts_done && depth_done && !readiness_published {")
             .expect("success arm");
         assert!(emit > arm, "the gauge is published outside the success arm");
+        assert_eq!(
+            src.matches("readiness_published = true;").count(),
+            1,
+            "one latch set, inside that arm — a second would let a lingering loop republish \
+             the readiness second and overwrite a met deadline with a later one"
+        );
         // Measured AFTER the dials, not from the top of the iteration — the
         // dials take real time and the earlier reading would flatter it.
         assert!(
