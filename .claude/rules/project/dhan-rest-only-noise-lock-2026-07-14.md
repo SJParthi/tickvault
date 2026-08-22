@@ -578,9 +578,132 @@ that cause spills; their cause is QuestDB write latency under live load and is u
 converts a loss visible only in the box's own log into one that reaches the operator — that
 is the entire claim.
 
-**What a PR that violates §2.3c looks like (REJECT):** adds either alarm without the
-market-hours gate membership in the same change; adds an alarm on the SUCCESS counter
-(`replayed_bytes`), which would page on recovery working; adds a per-INSTRUMENT dimension to
-any of the three (the §2.3 cardinality rule stands — 4,565 per-instrument metrics ≈
-$1,369/mo against a budget whose automatic action stops the trading box); or re-states the
-corrected claim above as though the WAL counter were unalarmed.
+> "Fix and resolve wvrytni fdude okay"
+
+Given in DIRECT response to a message that named this fix, priced it, and stated
+plainly that it needed his go: *"the cheaper fix — adding `WS-GAP-03` to the
+existing metric-filter set — is ~$0.10/mo, needs no user-data byte… Say the word
+and it's a small, contained change."* This row is the §3 dated quote, recorded
+BEFORE the terraform, per the rule-file-first law.
+
+**⚠ The fix that shipped is NOT the fix that quote authorized, and the difference
+matters.** The recommendation said "add WS-GAP-03 to the metric-filter set". Acting
+on it revealed that recommendation was WRONG: `WS-GAP-03` has **~50 emit sites** —
+every dial failure, reconnect and pool-supervisor event in the WebSocket layer
+carries it. A bare `$.code = "WS-GAP-03"` filter would page on ordinary connection
+churn, which is the RISK-GAP-03 noise trap this file records (25 pages in one
+session) with fifty times the surface. Recorded rather than quietly corrected,
+because the executor proposed it and the operator approved it on that description.
+
+**What shipped instead:** a THREE-condition pattern —
+`{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "fell_back_to_indices" }`.
+The `source` label appears on exactly one ERROR emit, the universe-collapse arm in
+`dhan_live_universe.rs`; the sibling emits on that path are `info!` and are already
+excluded by the level condition. So the alarm fires on the collapse and on nothing
+else. `ok_recovery = false`, matching the discrete-event precedent: the universe is
+chosen once per boot, so an auto-OK an hour later means the datapoint aged out, not
+that the next session widened correctly.
+
+**Family (5) therefore gains a SEVENTH signal.** Cost: one log-filter alarm on an
+existing metric-filter lane, ~$0.10/mo, no new EMF name and no user-data byte —
+which is why this route was taken over shipping the gauge (that path is still
+blocked at 33 bytes over the user-data budget, per §2.3c).
+
+**What this does NOT fix, and is not claimed:** the collapse is now PAGED, not
+PREVENTED. The 400–1,427-instrument margin, the UNCAPPED index chains, and the
+four-month-old measurement behind the "it fits" verdict are all unchanged. An
+operator woken by this alarm still has to decide whether to raise the cap or
+narrow the set. The gauge remains unshipped, so there is still no way to watch the
+number CREEP toward the cap — only to be told after it crossed.
+
+#### §2.3c-ii — 2026-08-22 MEASURED: the user-data template has ZERO bytes free
+
+§2.3c records the headroom gauge as blocked "33 bytes over the budget", which
+reads like a shortfall specific to that one metric. Measured today, it is not:
+
+| | bytes |
+|---|---|
+| `user-data.sh.tftpl` renders to | **15,872** |
+| Guard budget (16,384 AWS limit − 512 reserved) | **15,872** |
+| **Free margin** | **0** |
+
+Method: appending a known 63-byte block made the guard report "renders to 15,935
+… (63 over)", so the unmodified render is exactly 15,872 — the budget, to the
+byte. (A 1-byte append passes, because a trailing character with no newline is
+trimmed before measurement; that near-miss is why this was measured rather than
+inferred.)
+
+**The consequence is not about one gauge.** EVERY future addition to user-data
+is blocked: one more metric in the EMF selector, one environment variable, one
+line of boot script. The next person to try will read "33 bytes over" in §2.3c,
+assume their smaller change fits, and discover it does not.
+
+**Two routes remain, and the cheap-looking one was rejected on evidence.** The
+EMF selector is a regex alternation in which 13 metrics share `tv_dhan_feed_`
+and 10 share `tv_dhan_ws_`, so mechanical prefix factoring would free well over
+100 bytes. It was NOT taken: that regex is the live shipping path for 76 metrics
+which 65 alarms depend on, its failure mode is silent (metrics simply stop
+arriving), and it cannot be tested from a dev container. Restructuring it to
+ship one gauge is the wrong trade even with a strong equivalence proof. The
+guard's own prescription — move content to a file `cp`'d in after the Step 5
+repo clone — remains the correct fix, and remains a prod boot-path change that
+needs someone who can watch a real instance boot.
+
+### §2.3d — 2026-08-22: the pre-open readiness deadline joins family (5)
+
+**The verbatim operator demand (2026-08-22, typed directly in-session, repeated
+four times across the day — preserve EXACTLY, typos included):**
+
+> "9.13 am evryhtign dude okay?"
+
+> "see i said 9.13 am eveyrhtign shdou lbe entiltey conencted an subscribe of entire around 25k instruemnts right dude okay?"
+
+> "see i ened at 9.13 am it shdu lebe ntirely subscribed conencted rigth dude"
+
+> "solvign and fixing due okay?"
+
+This is the dated quote the rule-file-first law requires, recorded BEFORE the
+terraform.
+
+**What it answers.** `PREOPEN_READY_DEADLINE_IST_SECS = 09:12:00` landed in
+`6f328c99` and forces the contract dial rather than waiting on the 60% pricing
+quorum (whose only previous escape was `out_of_time` — **10:00 IST**). The
+deadline is enforced in code. Whether it is MET on a given morning was, until
+this row, invisible to every operator surface.
+
+**The gap this closes, and it is one I created.** The commit publishes
+`tv_dhan_preopen_ready_secs`, and I described the requirement as "now
+measurable". It is not, on its own: the EMF selector is an EXPLICIT LIST, the
+gauge is not in it, and the user-data template renders at **exactly** its
+15,872-byte budget with **zero** free (measured 2026-08-22, §2.3c-ii) — so the
+name cannot be added without the boot-path restructure that section defers. The
+gauge reaches the local exporter and stops there.
+
+**The route that costs no user-data byte.** A CloudWatch metric filter can
+extract a NUMERIC JSON field as the metric value — `value = "$.field"` rather
+than the `value = "1"` every existing filter in `error-code-alarms.tf` uses. The
+readiness ERROR line already carries `ready_at_ist_secs`, so the same log
+stream yields both the page and the trendable number, through the metric-filter
+lane that is already in place.
+
+**Family (5) therefore gains an EIGHTH signal**: a session that finishes its
+attach after 09:12. `notBreaching` on missing data and deliberately so — the
+box is stopped overnight and does not attach on weekends, so no-data is the
+normal off-hours state; this alarm reports a LATE attach, never a silent one.
+The dark-lane case is already owned by `dhan-no-ticks-flowing` (§2.3b-i).
+
+**Cost:** one metric filter + one alarm on an existing log stream ≈ **$0.10/mo**,
+no new EMF name, no user-data byte. Against the $130 kill-ceiling whose 90%
+action line is $117.
+
+**⚠ What this does NOT do (Rule 11).** An alarm on lateness does not make the
+attach early. It converts "did we make 09:12?" from unanswerable into a page,
+which is the entire claim. The deadline itself can still be missed for reasons
+outside this lane — pre-open prices arriving late is the exchange's business —
+and depth has still never faced a market open (§2.3b's residual stands).
+
+**What a PR that violates this section looks like (REJECT):** alarms the gauge
+instead of the log field (the gauge does not reach CloudWatch); makes the
+filter `breaching` on missing data (pages every night and weekend); adds the
+EMF name without the byte-budget restructure §2.3c-ii describes; or reports the
+deadline as met on the strength of a dial rather than a completed attach.
