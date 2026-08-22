@@ -149,7 +149,7 @@ crates/
 | `pipeline/` | `chain_day_store`, `chain_snapshot`, `feed_lag_monitor`, `tick_gap_detector`. **CORRECTED 2026-08-21** (found by the O(1) audit): this row said "Tick processor (SPSC 65K buffer), candle aggregator (21 timeframes from ticks)". Neither is here — no tick-processor module exists anywhere in the tree, and the aggregator lives under `crates/trading/src/candles/`, where `TF_COUNT` is **24**, not 21. Same failure mode as the storage table, which named seven deleted files. `gap-enforcement.md` still cites a pipeline tick-processor path as a live enforcement site and is stale for the same reason. *(The first draft of this correction NAMED the missing file and `claude_md_codebase_map_guard` rejected it — the guard bites on corrective prose too, which is the right behaviour.)* |
 | `historical/` | Candle fetcher (Dhan REST, 90-day chunks), cross-verification |
 | `network/` | IP monitor, IP verifier (static IP for order APIs) |
-| `notification/` | Telegram alerts (teloxide), event types |
+| `notification/` | Telegram alert EVENTS + severity types. **Corrected 2026-08-22: this said "(teloxide)". That crate has zero uses anywhere and its declaration is removed — Telegram delivery is SNS to a Lambda, not an in-process bot client.** |
 | `index_constituency/` | NSE index composition download, caching, mapping |
 
 ### crates/trading — Order Management & Strategy
@@ -354,7 +354,6 @@ Branch protection ON: **All Green** (the ci.yml fan-in over the ENTIRE PR suite)
 | Config | figment + toml | 0.10.19 / 1.1.0 |
 | Concurrent map | papaya | 0.2.4 |
 | Rate limiting | governor | 0.10.2 |
-| CLI | clap | 4.6.0 |
 
 ## BANNED
 
