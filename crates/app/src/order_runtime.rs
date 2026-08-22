@@ -787,6 +787,7 @@ impl BookState {
         if tracked >= Self::MAX_TRACKED_SIDS {
             metrics::counter!("tv_order_runtime_sid_refused_total").increment(1);
             error!(
+                code = ErrorCode::RiskGapPositionPnl.code_str(),
                 security_id = sid,
                 tracked,
                 max = Self::MAX_TRACKED_SIDS,

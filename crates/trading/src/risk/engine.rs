@@ -111,6 +111,10 @@ pub struct RiskEngine {
     /// power-of-two log throttle, so a NaN storm reports at 1, 2, 4, 8 ...
     /// rather than once per tick.
     marks_rejected: u64,
+    /// Edge latch for the mark-capacity refusal below: the map only grows and
+    /// is only emptied by `reset_daily`, so once full it stays full. One line
+    /// per day, not one per refused mark (audit Rule 4: edge-triggered).
+    mark_capacity_reported: bool,
     halted: bool,
     /// The breach that caused the halt (if any).
     halt_reason: Option<RiskBreach>,
@@ -187,6 +191,7 @@ impl RiskEngine {
             market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             non_flat: HashSet::with_capacity(POSITIONS_INITIAL_CAPACITY),
             marks_rejected: 0,
+            mark_capacity_reported: false,
             total_realized_pnl: 0.0,
             halted: false,
             halt_reason: None,
@@ -571,6 +576,20 @@ impl RiskEngine {
             && !self.positions.contains_key(&key)
         {
             metrics::counter!("tv_risk_mark_capacity_refused_total").increment(1);
+            if !self.mark_capacity_reported {
+                self.mark_capacity_reported = true;
+                tracing::warn!(
+                    code = ErrorCode::RiskGapPositionPnl.code_str(),
+                    security_id,
+                    segment = segment.as_str(),
+                    tracked = self.market_prices.len(),
+                    max = Self::MAX_TRACKED_POSITIONS,
+                    "mark map is FULL - refusing marks for instruments with NO \
+                     position. Held positions are unaffected and still marked, \
+                     so the daily-loss halt keeps reading fresh prices for \
+                     everything we own. Edge-latched: one line per daily reset."
+                );
+            }
             return;
         }
         self.market_prices.insert(key, current_price);
@@ -671,6 +690,7 @@ impl RiskEngine {
         // from 1 again rather than inheriting yesterday's power-of-two stride,
         // which after a bad session would suppress the first several hundred.
         self.marks_rejected = 0;
+        self.mark_capacity_reported = false;
         self.total_rejections = 0;
         info!("risk engine daily state reset");
     }
@@ -2332,5 +2352,27 @@ mod tests {
         // Five ceilings, one number. A per-map figure invented locally is how
         // a fleet of "bounds" ends up disagreeing about what the box holds.
         assert_eq!(RiskEngine::MAX_TRACKED_POSITIONS, 25_000);
+    }
+
+    #[test]
+    fn the_mark_capacity_warning_is_edge_latched_and_rearms_on_reset() {
+        // The map only grows and is only emptied by reset_daily, so once full
+        // it stays full — an un-latched warning would fire on every refused
+        // mark for the rest of the day.
+        let mut engine = make_engine();
+        for i in 0..RiskEngine::MAX_TRACKED_POSITIONS as u64 {
+            engine.update_market_price_in_segment(i, ExchangeSegment::NseFno, 10.0);
+        }
+        assert!(!engine.mark_capacity_reported, "not yet refused anything");
+
+        let unheld = RiskEngine::MAX_TRACKED_POSITIONS as u64 + 1;
+        engine.update_market_price_in_segment(unheld, ExchangeSegment::NseFno, 5.0);
+        assert!(engine.mark_capacity_reported, "the first refusal reports");
+
+        engine.reset_daily();
+        assert!(
+            !engine.mark_capacity_reported,
+            "the daily reset re-arms the latch — a new day gets its own line"
+        );
     }
 }
