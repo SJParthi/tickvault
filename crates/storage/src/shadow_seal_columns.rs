@@ -25,24 +25,32 @@ use tickvault_common::price_precision::round_to_2dp;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::candles::BufferedSeal;
 
-/// Typed row record matching the plain `candles_<tf>` DDL columns
-/// emitted by [`crate::shadow_persistence::ensure_shadow_candle_tables`]:
+/// Typed row record for the `candles_<tf>` tables written by
+/// [`crate::shadow_persistence::ensure_shadow_candle_tables`].
 ///
-/// ```sql
-/// CREATE TABLE candles_<TF> (
-///     segment       SYMBOL,           -- segment_code_to_str
-///     security_id   INT,              -- u32 → i64 widening
-///     ts            TIMESTAMP,        -- IST nanoseconds
-///     open          DOUBLE,
-///     high          DOUBLE,
-///     low           DOUBLE,
-///     close         DOUBLE,
-///     volume        LONG,             -- u64 → i64 (saturating)
-///     oi            LONG,             -- already i64
-///     tick_count    INT               -- u32 → i64 widening
-/// ) timestamp(ts) PARTITION BY DAY
-///   DEDUP UPSERT KEYS(ts, security_id, segment);
-/// ```
+/// **The DDL is deliberately NOT reproduced here.** It used to be, as a
+/// twenty-line SQL sketch, and by 2026-08-22 that sketch was wrong in four
+/// separate ways at once: it omitted the `feed` column entirely, it still
+/// showed `security_id INT` from before the u64 widening, it showed
+/// `tick_count INT`, and it predated the `*_pct_from_prev_day` columns. Worst
+/// of it, the sketch stated the dedup key as `(ts, security_id, segment)` —
+/// no `feed` — while a doc comment thirty lines below it in this same file
+/// correctly stated `(ts, security_id, segment, feed)`.
+///
+/// That is not a cosmetic problem. A dedup key without `feed` means a Dhan
+/// candle and a Groww candle for the same instrument and minute collide, and
+/// one silently overwrites the other. A reader trusting the sketch would
+/// conclude the system had exactly that bug. An automated sweep on
+/// 2026-08-22 flagged precisely this line as a suspected live defect and
+/// cost real time proving it was only the comment that was wrong — the same
+/// way a stale row in CLAUDE.md's own complexity table manufactured a false
+/// finding on 2026-08-12.
+///
+/// So this doc cites SYMBOLS instead of copying values, because a symbol
+/// survives every edit above it and a copied snapshot does not:
+///
+/// - column list and types → `ensure_shadow_candle_tables`
+/// - dedup key → [`crate::shadow_persistence::DEDUP_KEY_CANDLES`]
 ///
 /// All numeric fields are pre-widened to the questdb-rs ILP API's
 /// expected types (`i64` for INT/LONG columns, `f64` for DOUBLE) so
@@ -455,7 +463,9 @@ mod tests {
         // I-P1-11: same security_id with different segments MUST
         // produce composite-key-distinct rows (different `segment`
         // string). The DEDUP UPSERT KEYS on the candle tables
-        // (ts, security_id, segment) rely on this.
+        // (see `shadow_persistence::DEDUP_KEY_CANDLES` -- not restated here,
+        // because the copy at the top of this file drifted for months) rely
+        // on this.
         let row_idx =
             ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
         let row_eq =
