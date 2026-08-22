@@ -245,6 +245,37 @@ pub fn install_health_reporter(health: tickvault_api::state::SharedHealthStatus)
     HEALTH_REPORTER.set(health).is_ok()
 }
 
+/// Report whether the tick writer reached the database, for `/health`.
+///
+/// Sibling of the websocket row and the same defect: `/health` rendered
+///
+/// ```json
+/// "tick_persistence": { "status": "retired", "detail": "tick writer deleted 2026-07-17" }
+/// ```
+///
+/// while `crates/storage/src/tick_persistence.rs` exists (it came back with
+/// the 2026-08-09 revival) and the lane appends every tick through it. The
+/// setter had zero production callers, so the row's gate never armed.
+///
+/// # What this deliberately does NOT do
+///
+/// It does not arm the row at spawn. Before the first flush there is nothing
+/// TRUE to report: constructing a `TickWriter` proves a client was built, not
+/// that the database answered, and ILP is lazy enough that the two are
+/// genuinely different facts. Reporting `connected` on that basis would be the
+/// same over-claim this row is being fixed for, pointed the other way.
+///
+/// The residual is therefore real and stated: a lane that is up but has not
+/// yet flushed a single row still reads `retired`. `LiveIngest::flush` returns
+/// early when nothing is pending, so on a session with no ticks at all that
+/// window never closes. What changed is that the retired branch no longer
+/// asserts a deletion that was reversed, and that the row tells the truth from
+/// the first row written onward.
+fn report_tick_persistence(connected: bool) {
+    if let Some(health) = HEALTH_REPORTER.get() {
+        health.set_tick_persistence_connected(connected);
+    }
+}
 /// Publish the alive-socket count -- to the gauge AND to `/health`.
 ///
 /// Both edges of [`AliveConnectionGuard`] land here, so wiring the health push
@@ -959,10 +990,12 @@ impl LiveIngest {
         match self.writer.flush() {
             Ok(()) => {
                 counters().flush_ok.increment(1);
+                report_tick_persistence(true);
                 covered
             }
             Err(err) => {
                 counters().flush_failed.increment(1);
+                report_tick_persistence(false);
                 // 2026-08-12 — the second sentence of this message used to
                 // read "The raw frames remain in the write-ahead log and are
                 // recoverable by replay." That was wrong in a way that
