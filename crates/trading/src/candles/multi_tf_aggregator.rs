@@ -1621,17 +1621,42 @@ mod tests {
             assert!(!s.folded(), "{s:?} must not report as folded");
         }
     }
-    /// MEASUREMENT (not a CI gate — `#[ignore]`d, run on demand):
+    /// MEASUREMENT (not a CI gate -- `#[ignore]`d, run on demand):
     /// what does the 5-second `catch_up_seal_all` sweep actually cost at the
     /// authorized 25,000-instrument ceiling?
     ///
-    /// CLAUDE.md's O(1) table records this path as O(slots x TF_COUNT) with no
-    /// early exit, running on the frame drain's OWN task, and states plainly
-    /// that it is "UNMEASURED at the 25,000-instrument target". This turns that
-    /// into a number. Ignored rather than asserted because a wall-clock bound
-    /// on a shared CI runner is a flake, and a flaky gate is worse than none.
+    /// CLAUDE.md's O(1) table recorded this path as O(slots x TF_COUNT) with no
+    /// early exit, running on the frame drain's OWN task, and stated plainly
+    /// that it was "UNMEASURED at the 25,000-instrument target". This turns
+    /// that into a number. Ignored rather than asserted because a wall-clock
+    /// bound on a shared CI runner is a flake, and a flaky gate is worse than
+    /// none.
     ///
-    ///     cargo test -p tickvault-trading --release \
+    /// RESULT, `--release`, x86 dev container, two runs a day apart:
+    ///
+    /// ```text
+    /// 2026-08-21:  600000 cells, 0 sealed,  9.67ms (16.1 ns/cell)
+    /// 2026-08-22:  600000 cells, 0 sealed, 10.14ms (16.9 ns/cell)
+    /// ```
+    ///
+    /// Both are recorded rather than one, because a single figure written into
+    /// a document invites the next reader to treat run-to-run variance as
+    /// drift. CLAUDE.md carries the 2026-08-21 number; this is the same
+    /// measurement, ~5% apart on a shared container.
+    ///
+    /// Against the 5,000 ms cadence that is **0.20% of the interval**, so the
+    /// sweep is not a threat to the drain at the authorized ceiling. Two
+    /// qualifications keep that from being read as more than it is:
+    ///
+    /// 1. It is the PURE-TRAVERSAL shape -- cutoff in the past, zero seals --
+    ///    which is what ~99% of sweeps do. A sweep that actually seals pays the
+    ///    per-bar emit cost on top, and that cost scales with how many buckets
+    ///    ended, not with slot count.
+    /// 2. It was measured HERE, not on the box. Production is r8g.xlarge
+    ///    (Graviton4); this figure is an order-of-magnitude answer, not a
+    ///    per-instruction one. Re-run it on the box to claim otherwise.
+    ///
+    ///     cargo test -p tickvault-trading --release --lib \
     ///       catch_up_seal_all_sweep_cost -- --ignored --nocapture
     #[test]
     #[ignore = "measurement harness, not a gate — see doc comment"]

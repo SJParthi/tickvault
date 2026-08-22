@@ -583,14 +583,14 @@ fn main() {
         Row::new(
             "Silence detection",
             Verdict::Bounded,
-            "O(n), 30s",
-            "'which are silent?' asks about all of them at once",
+            "70us / 25,000",
+            "O(n), every 30s = 0.0002% of the interval",
         ),
         Row::new(
             "catch_up_seal_all",
             Verdict::Bounded,
-            "O(slots x 24)",
-            "every 5s; zero-alloc; UNMEASURED at 25,000",
+            "~10ms / 600k cells",
+            "every 5s at the 25,000 ceiling = 0.2% of the interval",
         ),
         Row::new(
             "O(1) SPACE for n instruments",
