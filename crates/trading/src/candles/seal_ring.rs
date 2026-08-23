@@ -368,7 +368,8 @@ mod tests {
         // ring must hold an entire `force_seal_all` burst without evicting.
         //
         // The old form asserted `== 200_000` while `force_seal_all` emits
-        // AGGREGATOR_MAX_SLOTS × TF_COUNT = 525,000 — so the ratchet was
+        // AGGREGATOR_MAX_SLOTS × TF_COUNT (525,000 when that was written at
+        // TF_COUNT=21; 600,000 today) — so the ratchet was
         // actively PINNING a capacity 2.6× too small and reading as a safety
         // guarantee. Asserting the property instead of the number means
         // raising either input can never silently outgrow the ring again.
