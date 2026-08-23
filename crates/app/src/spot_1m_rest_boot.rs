@@ -913,6 +913,20 @@ struct SidServedState {
 /// machine — unit-tested without a clock. State is per scheduler run
 /// (session-scoped, same envelope as [`FailureEdge`] — a task respawn
 /// restarts the streak).
+///
+/// # Why the key is a bare `SecurityId` and not the I-P1-11 composite
+///
+/// `security-id-uniqueness.md` rule 2 permits a single-id key only where the
+/// caller can PROVE every entry belongs to one segment, and requires that
+/// proof be stated here rather than assumed. It holds by construction: the
+/// only thing that ever reaches `record_minute` is the fixed
+/// [`SPOT_1M_REST_INDICES`] array — 4 entries, every one an `IDX_I` index —
+/// so the segment half of the composite is a constant, and a pair would add
+/// a field that cannot vary. The same fact bounds the map: it is not merely
+/// session-scoped, it can never hold more than those 4 keys.
+///
+/// If a future change ever feeds this tracker a SID from another segment,
+/// this comment stops being true and the key must widen to the composite.
 #[derive(Debug, Default)]
 pub struct SidServedTracker {
     per_sid: HashMap<SecurityId, SidServedState>,
