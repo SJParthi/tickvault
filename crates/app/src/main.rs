@@ -361,6 +361,63 @@ const TOKIO_WORKER_THREADS_ENV: &str = "TICKVAULT_TOKIO_WORKER_THREADS";
 /// outage, so the parse clamps rather than trusts.
 const MAX_TOKIO_WORKER_THREADS: usize = 64;
 
+/// Runtime-sizing facts resolved in `main`, where no subscriber exists yet.
+///
+/// `main` runs before the tracing subscriber is installed and the direct-print
+/// macros are banned house-wide, so the derivation is stashed here and emitted by
+/// `async_main` as a real `info!` once logging is up.
+static TOKIO_RUNTIME_SIZING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Host-derived floor and ceiling for the resolved worker count.
+///
+/// The clamp is the point: a 1-core dev container must not get 2 (that
+/// oversubscribes), and a larger host must not silently widen the runtime past
+/// what the CPU isolation intends. `worker_threads(0)` panics the tokio
+/// builder, so the floor of 1 is a boot-safety bound, not a preference.
+const MIN_TOKIO_WORKER_THREADS: usize = 1;
+const HOST_DERIVED_WORKER_CEILING: usize = 4;
+
+/// How many CPUs this PROCESS may actually use, and where that answer came
+/// from.
+///
+/// Memory is already derived this way in two places — `market_ram_store_boot`
+/// reads `/proc/meminfo` AND the cgroup limit and takes the smaller, and the
+/// frame ring reads `/proc/meminfo` for its 2%. CPU was the one resource still
+/// answered by a constant chosen for one machine, which is the gap this closes.
+///
+/// Order matters. The cgroup quota is asked FIRST because it is what the
+/// systemd unit's `AllowedCPUs` actually confines this process to;
+/// `available_parallelism` reports the MACHINE, which on a confined process is
+/// the wrong, larger number.
+fn host_cpu_allowance() -> (usize, &'static str) {
+    // cgroup v2: "$MAX $PERIOD", where $MAX is "max" for unlimited.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut it = s.split_whitespace();
+        if let (Some(max), Some(period)) = (it.next(), it.next())
+            && let (Ok(m), Ok(p)) = (max.parse::<u64>(), period.parse::<u64>())
+            && p > 0
+        {
+            // Round UP: a 1.5-core quota should get 2 workers, not 1.
+            let cores = m.div_ceil(p);
+            if cores >= 1 {
+                return (cores as usize, "cgroup");
+            }
+        }
+    }
+    match std::thread::available_parallelism() {
+        Ok(n) => (n.get(), "parallelism"),
+        Err(_) => (DEFAULT_TOKIO_WORKER_THREADS, "fallback"),
+    }
+}
+
+/// Clamp a host allowance into the runtime width actually used.
+///
+/// Pure so the boundaries are testable without a machine: 0 and absurd values
+/// both land inside `[MIN, CEILING]`, and there is no input that returns
+/// something `worker_threads()` would reject.
+fn clamp_worker_threads(host: usize) -> usize {
+    host.clamp(MIN_TOKIO_WORKER_THREADS, HOST_DERIVED_WORKER_CEILING)
+}
 /// Resolve the runtime width from the raw environment value.
 ///
 /// Fail-SAFE by construction: absent, empty, non-numeric, zero, or absurd all
@@ -368,19 +425,31 @@ const MAX_TOKIO_WORKER_THREADS: usize = 64;
 /// this return something the runtime builder would reject, because a process
 /// that refuses to boot over a malformed tuning hint is strictly worse than
 /// one that boots on the default.
-fn resolve_tokio_worker_threads(raw: Option<&str>) -> usize {
+fn resolve_tokio_worker_threads(raw: Option<&str>, host_derived: usize) -> usize {
     match raw.map(str::trim) {
         Some(v) if !v.is_empty() => match v.parse::<usize>() {
             Ok(n) if (1..=MAX_TOKIO_WORKER_THREADS).contains(&n) => n,
-            _ => DEFAULT_TOKIO_WORKER_THREADS,
+            _ => host_derived,
         },
-        _ => DEFAULT_TOKIO_WORKER_THREADS,
+        _ => host_derived,
     }
 }
 
 fn main() -> Result<()> {
     let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
-    let worker_threads = resolve_tokio_worker_threads(raw.as_deref());
+    let (host_cpus, cpu_source) = host_cpu_allowance();
+    let host_derived = clamp_worker_threads(host_cpus);
+    let worker_threads = resolve_tokio_worker_threads(raw.as_deref(), host_derived);
+    // Stashed, not written to stdout: the direct-print macros are banned
+    // house-wide and the tracing subscriber does not exist yet at this point
+    // in `main`. `async_main` emits this as a real `info!` once logging is up.
+    // The SOURCE travels with the value — a derived number nobody can trace
+    // back to its input is the thing this change set out to remove.
+    let _ = TOKIO_RUNTIME_SIZING.set(format!(
+        "workers={worker_threads} host_cpus={host_cpus} source={cpu_source} \
+         clamped={host_derived} override={}",
+        raw.as_deref().unwrap_or("unset")
+    ));
 
     // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
     // Named threads so `top -H` / `perf` on the box can tell a runtime worker
@@ -1393,6 +1462,14 @@ async fn async_main() -> Result<()> {
         tracing_enabled = config.observability.tracing_enabled,
         "tickvault starting"
     );
+
+    // ITEM 11a: the runtime width was resolved in `main`, before any
+    // subscriber existed. Emit it now — a derived number nobody can trace back
+    // to its input is exactly the thing this change set out to remove, so the
+    // line carries the host allowance and its SOURCE, not just the answer.
+    if let Some(sizing) = TOKIO_RUNTIME_SIZING.get() {
+        info!(sizing = %sizing, "tokio runtime sizing");
+    }
 
     // Log trading day status — critical for operational awareness.
     let is_trading = trading_calendar.is_trading_day_today();
@@ -3667,28 +3744,104 @@ mod tests {
         );
     }
 
-    // ── resolve_tokio_worker_threads (CPU isolation, Quote 17b 2026-08-19) ──
+    // ── runtime sizing (CPU isolation, Quote 17b 2026-08-19; host-derived
+    //    ITEM 11a 2026-08-23) ──
     //
-    // The runtime width is no longer `num_cpus`, so the parse that decides it
-    // is now on the boot path. Every one of these cases must yield a width the
-    // runtime builder accepts — a malformed tuning hint must never be able to
-    // stop the app from starting.
+    // The runtime width is no longer `num_cpus` NOR a constant chosen for one
+    // machine: it is derived from what this process may actually use, then
+    // clamped. Every case below must yield a width the runtime builder
+    // accepts — a malformed tuning hint, or an unreadable host, must never be
+    // able to stop the app from starting.
 
     #[test]
-    fn test_resolve_tokio_worker_threads_defaults_when_unset() {
+    fn test_clamp_worker_threads_never_returns_zero() {
+        // `Builder::worker_threads(0)` PANICS. A host that reports 0 — an
+        // unreadable cgroup line, a parse that lands on nothing — must still
+        // boot, so the floor is a safety bound and not a preference.
+        assert_eq!(clamp_worker_threads(0), MIN_TOKIO_WORKER_THREADS);
+        for host in 0..=64usize {
+            assert!(
+                clamp_worker_threads(host) >= 1,
+                "host allowance {host} produced a zero width"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clamp_worker_threads_holds_the_ceiling() {
+        // A bigger host must not silently widen the runtime past what the CPU
+        // isolation intends — the ceiling is the whole point of deriving
+        // rather than trusting.
         assert_eq!(
-            resolve_tokio_worker_threads(None),
-            DEFAULT_TOKIO_WORKER_THREADS,
-            "an absent override must fall back to the partition-consistent default"
+            clamp_worker_threads(64),
+            HOST_DERIVED_WORKER_CEILING,
+            "a 64-core host must still be clamped to the isolation ceiling"
+        );
+        assert_eq!(
+            clamp_worker_threads(HOST_DERIVED_WORKER_CEILING),
+            HOST_DERIVED_WORKER_CEILING,
+            "the boundary itself is legal"
         );
     }
 
     #[test]
+    fn test_clamp_worker_threads_passes_through_inside_the_band() {
+        // The 1-core dev container and the 4-vCPU prod box are the two shapes
+        // this actually runs on; both must come out as themselves.
+        for host in MIN_TOKIO_WORKER_THREADS..=HOST_DERIVED_WORKER_CEILING {
+            assert_eq!(
+                clamp_worker_threads(host),
+                host,
+                "a host allowance inside the band must pass through untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_cpu_allowance_is_always_usable() {
+        // Runs on whatever machine the suite is on — CI container, dev box,
+        // the prod host. The assertion is deliberately about the CONTRACT and
+        // not a number: whatever the host says, the result must be a width
+        // that boots, and its source must be one of the three we can produce.
+        let (cpus, source) = host_cpu_allowance();
+        assert!(
+            cpus >= 1,
+            "host allowance {cpus} is unusable — clamp would be papering over it"
+        );
+        assert!(
+            ["cgroup", "parallelism", "fallback"].contains(&source),
+            "unexpected allowance source {source:?}"
+        );
+        assert!(
+            clamp_worker_threads(cpus) >= 1,
+            "the clamped host allowance must be a width Builder::worker_threads accepts"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_defaults_to_the_host_derivation() {
+        // The fallback is the HOST-derived width, not a constant. This is the
+        // behaviour ITEM 11a exists for: an absent override on a 1-core box
+        // must not hand out the 4-vCPU box's answer.
+        for host_derived in 1..=HOST_DERIVED_WORKER_CEILING {
+            assert_eq!(
+                resolve_tokio_worker_threads(None, host_derived),
+                host_derived,
+                "an absent override must fall back to what the host allows"
+            );
+        }
+    }
+
+    #[test]
     fn test_resolve_tokio_worker_threads_honours_a_valid_override() {
-        assert_eq!(resolve_tokio_worker_threads(Some("4")), 4);
-        assert_eq!(resolve_tokio_worker_threads(Some("1")), 1);
+        // The operator's rollback path: an explicit value wins over the
+        // derivation, including a value ABOVE the host-derived clamp — that is
+        // the documented way to restore the pre-2026-08-19 behaviour without
+        // a rebuild.
+        assert_eq!(resolve_tokio_worker_threads(Some("4"), 1), 4);
+        assert_eq!(resolve_tokio_worker_threads(Some("1"), 4), 1);
         assert_eq!(
-            resolve_tokio_worker_threads(Some("  3  ")),
+            resolve_tokio_worker_threads(Some("  3  "), 2),
             3,
             "systemd Environment= values routinely carry surrounding whitespace"
         );
@@ -3697,25 +3850,26 @@ mod tests {
     #[test]
     fn test_resolve_tokio_worker_threads_is_fail_safe_on_garbage() {
         // Zero would make `Builder::worker_threads(0)` PANIC, which is the one
-        // outcome this function exists to make unreachable.
+        // outcome this function exists to make unreachable. Garbage falls back
+        // to the host derivation — never propagates, never refuses to boot.
         for bad in ["", "   ", "0", "-1", "two", "2.5", "99999999999999999999"] {
             assert_eq!(
-                resolve_tokio_worker_threads(Some(bad)),
-                DEFAULT_TOKIO_WORKER_THREADS,
-                "{bad:?} must fall back to the default, never propagate"
+                resolve_tokio_worker_threads(Some(bad), 2),
+                2,
+                "{bad:?} must fall back to the host derivation, never propagate"
             );
         }
     }
 
     #[test]
-    fn test_resolve_tokio_worker_threads_clamps_absurd_values_to_the_default() {
+    fn test_resolve_tokio_worker_threads_clamps_absurd_values() {
         assert_eq!(
-            resolve_tokio_worker_threads(Some("65")),
-            DEFAULT_TOKIO_WORKER_THREADS,
+            resolve_tokio_worker_threads(Some("65"), 2),
+            2,
             "above MAX_TOKIO_WORKER_THREADS the value is a typo, not a request"
         );
         assert_eq!(
-            resolve_tokio_worker_threads(Some(&MAX_TOKIO_WORKER_THREADS.to_string())),
+            resolve_tokio_worker_threads(Some(&MAX_TOKIO_WORKER_THREADS.to_string()), 2),
             MAX_TOKIO_WORKER_THREADS,
             "the boundary itself is legal"
         );
@@ -3723,15 +3877,19 @@ mod tests {
 
     #[test]
     fn test_resolve_tokio_worker_threads_never_returns_zero() {
-        // Property-ish sweep: no byte string in this space may produce 0.
-        for n in 0..=300u32 {
-            let s = n.to_string();
-            assert!(
-                resolve_tokio_worker_threads(Some(&s)) >= 1,
-                "input {s:?} produced a zero width — Builder::worker_threads(0) panics"
-            );
+        // Property-ish sweep over the whole reachable input space: no byte
+        // string, at any host derivation, may produce 0.
+        for host_derived in 1..=HOST_DERIVED_WORKER_CEILING {
+            for n in 0..=300u32 {
+                let s = n.to_string();
+                assert!(
+                    resolve_tokio_worker_threads(Some(&s), host_derived) >= 1,
+                    "input {s:?} produced a zero width — Builder::worker_threads(0) panics"
+                );
+            }
         }
     }
+
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 
