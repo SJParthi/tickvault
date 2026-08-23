@@ -465,8 +465,16 @@ impl<'a> TruedataRecordList<'a> {
     #[inline]
     #[must_use]
     pub const fn record_count(&self) -> usize {
-        // Exact division — the constructor rejected a ragged body.
-        self.body.len() / self.kind.record_len()
+        // Exact division — the constructor rejected a ragged body, and every
+        // `record_len()` arm is a non-zero constant. `checked_div` states that
+        // in a form the COMPILER verifies rather than a comment asserting it:
+        // the `None` arm is unreachable by construction, and making it so is
+        // what lets this whole module DENY unguarded arithmetic instead of
+        // carrying a hand-written exception for one line.
+        match self.body.len().checked_div(self.kind.record_len()) {
+            Some(n) => n,
+            None => 0,
+        }
     }
 
     /// Iterates the `add_symbol` records of an `S` or `L` frame.
