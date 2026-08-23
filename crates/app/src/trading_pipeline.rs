@@ -4060,7 +4060,8 @@ threshold = 65.0
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
 
         // Send 60 ticks with steadily decreasing prices to push RSI down.
-        // Use security_id = 5 (must be < MAX_INDICATOR_INSTRUMENTS = 200).
+        // Use security_id = 5 — must be < MAX_INDICATOR_INSTRUMENTS (read the
+        // constant; a literal here goes stale the moment the cap moves).
         for i in 0..60_u32 {
             let mut tick = ParsedTick::default();
             tick.security_id = 5;
