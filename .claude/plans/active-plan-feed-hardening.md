@@ -630,3 +630,121 @@ proof); (b) that any bucket AFTER the first gains accuracy — none does, by des
 source and no field can return them; (d) whether Dhan's `day_high` includes the
 09:00–09:15 pre-open auction — Dhan does not document it, `docs/dhan-ref/` was searched,
 and both answers are handled correctly by construction (C3 rows 9–10).
+
+---
+
+## ITEM 11 — DESIGN ADDENDUM (added 2026-08-23, operator: "see now fix and resoleve and emreg and deploy evrythign dude okay?")
+
+Two findings from the 2026-08-23 workspace sweep. Both belong to this plan rather than
+a new one: the CPU claim is already in this plan's own "Believed vs Measured" table, and
+the price finding is the data-correctness layer this plan's audit enumerated. Neither is
+a live defect; both are latent, and both were left for the operator until this quote.
+
+### 11a — Worker threads are pinned to one machine; memory is not
+
+**Design.** `DEFAULT_TOKIO_WORKER_THREADS = 2` is a constant chosen for the r8g.xlarge's
+4-core partition. Nothing in the workspace reads the host's CPU allowance — no
+`/sys/fs/cgroup/cpu.max`, no `available_parallelism()`. Memory got the derive-from-host
+fix twice (`market_ram_store_boot` reads `/proc/meminfo` AND the cgroup limit and takes
+the min; the frame ring reads `/proc/meminfo` for 2%). CPU never did.
+
+Derive the default the same way: read the cgroup CPU quota, fall back to
+`available_parallelism()`, clamp to `[1, 4]`. **On the prod box this must still yield 2**
+— the systemd unit confines the process to a 2-core cpuset, so the quota reads 2 and the
+operator's Quote 17b value is preserved exactly. The env override stays the rip-cord.
+
+**Why it is not a Quote-17b reversal.** 17b authorized "an explicit tokio worker-thread
+count" as part of CPU isolation. Deriving from the cpuset that the isolation itself sets
+IMPLEMENTS that intent on any host, rather than hard-coding the answer for one host.
+
+### 11b — A price narrowed to f32 for a wire format that no longer exists
+
+**Design.** `MarkUpdate.price` is `f32`, documented as "f32 as delivered — the runtime
+widens for math". That premise is dead: the same struct's doc records the per-tick
+live-bridge source dying with #1581, and both remaining callers are REST legs delivering
+`f64` (`candle.close`; `leg.last_price`, parsed by `val_f64`). Both narrow with `as f32`
+at the call site. The far end, `update_market_price_in_segment`, takes `f64` — and its
+own doc says it "feeds `daily_loss_state`, which feeds the daily-loss auto-halt".
+
+So the chain is f64 → f32 → f64 on the kill-switch input, for no wire.
+
+Widen the field to `f64`, delete both casts, drop the now-pointless `f32_to_f64_clean`
+round trip, and correct two stale doc claims on the same struct (the "as delivered"
+premise, and a `security_id` doc still describing the removed Groww token space).
+
+**Honest magnitude.** NOT a live defect. The widening is currently done correctly
+(`f32_to_f64_clean`, not the banned `f64::from`), and every price that flows is below the
+cliff. The cliff is computable: f32's step is 0.0078 below 131,072 (finer than a paisa)
+and 0.0156 above it (coarser). Nothing forwards an equity mark today; the universe was
+just widened to ~24,600 instruments, and the next change that forwards one crosses that
+line with no error, no counter, and no comment saying the line exists.
+
+## Edge Cases (Item 11)
+
+- Unreadable `/proc` or cgroup → fall back to `available_parallelism()`, then to 2.
+  Never zero: `worker_threads(0)` panics the runtime at boot.
+- A 1-core container → clamps to 1, not 2 (today it would oversubscribe).
+- A host larger than the partition → clamps to 4, so a bigger box cannot silently
+  widen the runtime past what the CPU isolation intends.
+- f64→f64 mark path: values already flowing are unchanged bit-for-bit, because every
+  current price round-tripped losslessly through f32 anyway.
+
+## Failure Modes (Item 11)
+
+- Derivation returns a wrong-but-plausible number → the boot log names the source and
+  the resolved value, so it is readable rather than inferred.
+- The env override still wins, so any surprise is one restart from reversed.
+- Widening the price field cannot lose data: f64 is a superset of the f32 it replaces.
+
+## Test Plan (Item 11)
+
+- Unit tests for the CPU derivation: quota present, quota absent, unlimited, zero,
+  oversized, and the clamp boundaries.
+- Existing `order_runtime` mark tests continue to pass unchanged (they assert values,
+  not the type's width).
+- Full app-crate suite; `tv-guarantees` exit 0.
+
+## Rollback (Item 11)
+
+- 11a: set `TICKVAULT_TOKIO_WORKER_THREADS` in the systemd unit — config, no rebuild.
+- 11b: revert the commit; no schema, no wire, no persisted format is involved.
+
+## Observability (Item 11)
+
+- 11a: the existing boot log line reports the resolved worker count and now also its
+  source (cgroup / parallelism / fallback).
+- 11b: no new metric. The existing `tv_mark_forward_dropped_total` is unchanged.
+
+## Measured results (Item 11, recorded 2026-08-23 after implementation)
+
+Evidence, not claims — every line below is a real number from this tree.
+
+| What | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --workspace --no-deps -- -D warnings` (the CI gate) | clean |
+| `cargo test -p tickvault-app` | 83 suites, **0 failures** (1,367 lib + integration) |
+| `dhat_mark_forward_hot_arms_zero_allocation` | pass — the widened payload is still zero-alloc |
+| `order_gate/mark_forward_disarmed` | **2.49 ns** (budget 100 ns) |
+| `order_gate/mark_forward_armed_full` | **9.24 ns** (budget 100 ns) |
+| `order_gate/mark_forward_armed_accept` | **69.9 ns** (budget 100 ns) |
+
+**One test changed, and it is worth naming rather than burying.**
+`test_mark_update_is_copy_and_small` pinned `size_of::<MarkUpdate>() <= 16` and FAILED:
+`u64 + u8 + f64` pads to 24. That ratchet did its job — the widening has a real cost and
+it refused to let it pass unnoticed. The bound moved to 24 only after the cost was
+computed: the mark channel is bounded at `mark_channel_capacity` (default 8,192, config
+max 65,536), so 8 extra bytes per slot is **+64 KiB at the default, +512 KiB at the
+ceiling**, on a 32 GiB host. The contract the test exists to protect — a `Copy` payload
+passed by value with no heap behind it — is intact; only the byte count moved.
+
+**Deviation from the Test Plan above, stated plainly.** That plan predicted "existing
+`order_runtime` mark tests continue to pass unchanged". One did not. The prediction was
+wrong about a size assertion, and the record says so rather than being edited to match
+the outcome.
+
+**What Item 11 does NOT deliver (Rule 11).** 11a makes the runtime width follow the host
+instead of a constant; it does not measure whether 2, 3 or 4 workers is the right width
+for this workload — the first live session at scale is still that measurement, and the
+env override is still how it gets acted on. 11b removes a latent precision class above
+131,072; no price flowing today reaches it, so nothing observable changes.

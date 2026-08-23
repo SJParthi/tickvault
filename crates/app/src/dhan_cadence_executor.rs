@@ -623,11 +623,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                 // minutes late is exactly the staleness the decision-freshness
                 // gate forbids.
                 if let Some(forwarder) = self.mark_forwarder.as_ref() {
-                    forwarder.mark_forward(
-                        security_id,
-                        EXCHANGE_SEGMENT_IDX_I,
-                        candle.close as f32,
-                    );
+                    forwarder.mark_forward(security_id, EXCHANGE_SEGMENT_IDX_I, candle.close);
                 }
             }
             metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
@@ -991,7 +987,7 @@ impl CadenceExecutor for DhanCadenceExecutor {
                                 refused_zero_id += 1;
                                 continue;
                             };
-                            forwarder.mark_forward(contract_id, seg_code, leg.last_price as f32);
+                            forwarder.mark_forward(contract_id, seg_code, leg.last_price);
                         }
                         if refused_zero_id > 0 {
                             metrics::counter!(
