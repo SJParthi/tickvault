@@ -133,12 +133,23 @@ const HOUSEKEEPING_TICK_SECS: u64 = 1;
 /// tokio mpsc's AMORTIZED block-reuse alloc profile, see [`MarkForwarder`]).
 #[derive(Clone, Copy, Debug)]
 pub struct MarkUpdate {
-    /// Feed-native security id (Groww exchange_token space; bit-62 indices).
+    /// Feed-native security id — Dhan `security_id` today. The Groww token
+    /// space this doc used to name went with the feed (PR #1796).
     pub security_id: u64,
     /// Numeric `ExchangeSegment` code of the tick.
     pub segment_code: u8,
-    /// Last traded price (f32 as delivered — the runtime widens for math).
-    pub price: f32,
+    /// Last traded price.
+    ///
+    /// `f64`, matching BOTH ends of the pipe. It was `f32` on the premise
+    /// "f32 as delivered" — true while a live WS bridge delivered f32 ticks,
+    /// and false since that source died with #1581. Every remaining caller is
+    /// a REST leg delivering `f64` (`candle.close`; `leg.last_price`), and the
+    /// far end, `RiskEngine::update_market_price_in_segment`, takes `f64` and
+    /// feeds the daily-loss auto-halt. Narrowing in between bought nothing and
+    /// cost precision above 131,072, where f32's step (0.0156) is coarser than
+    /// a paisa. No current price reaches that, so widening removes a latent
+    /// class rather than fixing a live defect.
+    pub price: f64,
 }
 
 /// The hot-path-grade side of the mark bridge, cloned into the Groww
@@ -178,7 +189,7 @@ impl MarkForwarder {
     /// per-minute REST legs' persist-confirm points; alloc profile per the
     /// struct-level honesty note).
     #[inline]
-    pub fn mark_forward(&self, security_id: u64, segment_code: u8, price: f32) {
+    pub fn mark_forward(&self, security_id: u64, segment_code: u8, price: f64) {
         if !self.marks_wanted.load(Ordering::Relaxed) {
             return;
         }
@@ -1412,11 +1423,13 @@ async fn process_mark(
     if !book.tripwire_ok(mark.security_id, mark.segment_code) {
         return;
     }
-    // C14: shortest-decimal widening — plain `f64::from(f32)` carries the
-    // IEEE 754 artifact (10.2f32 → 10.19999980926514) into every paper
-    // fill price and P&L log line. Cold path (the runtime side, not the
-    // bridge tap).
-    let price = tickvault_common::price_precision::f32_to_f64_clean(mark.price);
+    // No widening step: the mark is `f64` end to end. Until 2026-08-23 this
+    // read `f32_to_f64_clean(mark.price)` — correct for an f32 field (plain
+    // `f64::from` carries the IEEE 754 artifact, 10.2f32 → 10.19999980926514,
+    // into every paper fill and P&L line) and pointless once the field stopped
+    // being f32. The C14 rule it served still binds wherever an f32 genuinely
+    // arrives from a wire.
+    let price = mark.price;
 
     // Self-test sid pick: the first usable INDEX-SPOT mark starts the
     // cycle. E4: restricted to IDX_I (segment 0) — index spots tick ~1/s,
@@ -2095,11 +2108,27 @@ mod tests {
     }
 
     /// MarkUpdate stays a small Copy payload (the zero-alloc contract).
+    ///
+    /// The bound moved 16 → 24 on 2026-08-23 when `price` widened `f32` → `f64`
+    /// (ITEM 11b): `u64 + u8 + f64` pads to 24. What this test protects is the
+    /// CONTRACT — a `Copy` payload small enough to pass by value with no heap
+    /// behind it — and that is intact; only the byte count moved, and it moved
+    /// for a reason recorded at the field.
+    ///
+    /// The cost is measured, not waved through. The mark channel is bounded at
+    /// `mark_channel_capacity` (default 8,192, config max 65,536), so 8 extra
+    /// bytes per slot is +64 KiB at the default and +512 KiB at the ceiling —
+    /// against a 32 GiB host, and against the alternative of narrowing every
+    /// price to f32 and back on a path that is f64 at both ends.
     #[test]
     fn test_mark_update_is_copy_and_small() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<MarkUpdate>();
-        assert!(std::mem::size_of::<MarkUpdate>() <= 16);
+        assert!(
+            std::mem::size_of::<MarkUpdate>() <= 24,
+            "MarkUpdate is {} bytes — it must stay a small by-value payload",
+            std::mem::size_of::<MarkUpdate>()
+        );
     }
 
     // -------------------------------------------------------------------
