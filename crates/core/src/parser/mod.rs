@@ -20,6 +20,28 @@
 //! `split_depth_frame()` + `dispatch_depth_packet()` — NEVER by
 //! `dispatch_frame()`, whose 8-byte header would mis-read every field.
 
+// ---------------------------------------------------------------------------
+// Unguarded arithmetic is DENIED for this module and every child of it.
+//
+// Why here and not workspace-wide: the release profile pairs
+// `overflow-checks = true` with `panic = "abort"`, so an integer overflow
+// does not wrap and does not unwind — it KILLS the process. On this module,
+// which decodes every packet off the wire, the input is attacker-shaped by
+// definition: whatever the vendor sends is what we parse. An overflow here
+// is the shortest path from a malformed frame to a dead trading process.
+//
+// A 2026-08-23 audit found this check switched off everywhere. The codebase
+// was nonetheless disciplined about it — 764 guarded calls, and this whole
+// module needed exactly ONE line changed to satisfy the lint — but that was
+// convention, not enforcement, and a new `a + b` here would have compiled
+// clean and passed CI. It no longer will.
+//
+// Scope is deliberate. The rest of the workspace has several hundred sites
+// and turning it on globally is a separate, deliberate piece of work; this
+// locks the path where the consequence is worst and the cost was one line.
+// ---------------------------------------------------------------------------
+#![deny(clippy::arithmetic_side_effects)]
+
 // PR #4 (2026-05-19): `deep_depth` + `market_depth` parser modules DELETED.
 // 2026-08-09: `depth` re-added for the depth-20 / depth-200 revival — a
 // clean-room rebuild against `docs/dhan-ref/04-full-market-depth-websocket.md`,
