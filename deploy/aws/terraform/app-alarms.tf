@@ -645,8 +645,45 @@ resource "aws_cloudwatch_metric_alarm" "questdb_wal_suspended" {
   ok_actions          = []
 }
 
+
+# The WAL-suspension alarm above reads a GAUGE. This alarm watches the PRODUCER
+# of that gauge, and it exists because the gauge could once lie.
+#
+# Before #1816, `parse_wal_tables_response` returned Ok(vec![]) when every row
+# was skipped, and `emit_wal_delta` turned that into a confident 0 - "no tables
+# suspended" - while tables were in fact suspended and dropping rows. A QuestDB
+# upgrade rendering `suspended` as the string "true" produces exactly that: the
+# header is intact, so MissingColumn never fires and nothing looks wrong.
+#
+# #1816 made that path fail LOUD (WalProbeFailure::AllRowsSkipped) instead of
+# fail open. This alarm is the other half: without it the probe reports its own
+# failure to a counter nobody reads, and the gauge simply stops updating - which
+# on `notBreaching` reads as health. An alarm whose input can silently stop is
+# not an alarm, and shipping the loud failure without a route to the operator
+# would have left tv-<env>-questdb-wal-suspended blind in the one scenario it
+# was built for.
+#
+# ok_actions is deliberately empty: this counter ages out of its 5-minute window
+# on its own, so a return to OK means the last failure fell off the edge, never
+# that the probe was repaired.
+resource "aws_cloudwatch_metric_alarm" "questdb_wal_probe_failed" {
+  alarm_name          = "tv-${var.environment}-questdb-wal-probe-failed"
+  alarm_description   = "The QuestDB WAL-suspension PROBE is failing, so tv_questdb_wal_suspended_tables is stale or absent and tv-<env>-questdb-wal-suspended cannot see a suspension. This is a blind-detector alarm, not a data-loss alarm - but the detector it guards is the ONLY thing that can see a suspended table silently ACKing and discarding ILP writes. Triage: grep the app log for WAL-SUSPEND-PROBE and read the failure reason. all_rows_skipped means QuestDB changed the shape of wal_tables() - most likely the `suspended` column now renders as a string rather than a boolean after an upgrade - and parse_wal_tables_response needs its accessor widened; the gauge is NOT to be trusted until it is. Other reasons are transport: check QuestDB is reachable on the health port. Verify by hand meanwhile: SELECT name, suspended FROM wal_tables() WHERE suspended = true."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_wal_suspension_probe_failed_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = []
+}
+
 output "app_cloudwatch_alarms" {
-  description = "14 application-level alarms in THIS file (12 + the 2026-08-25 spill-dir-free-low and questdb-wal-suspended pair, §2.3g) (10 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm RETIRED 2026-07-15 — their gauge/counter producers, the Groww bridge + sidecar stall watchdog, were deleted with the Groww live feed); 2 more silent-feed alarms live in silent-feed-alarms.tf (the Groww lag mirror also retired 2026-07-15). Cost note: the 2026-07-15 Groww live retirement removes 3 alarms + the feed-stall-restarts counter pager + 4 EMF series and adds 1 (tv_rest_1m_fire_heartbeat) — dated note in aws-budget.md; still well inside the $55 budget cap."
+  description = "15 application-level alarms in THIS file (12 + the 2026-08-25 spill-dir-free-low and questdb-wal-suspended pair, §2.3g, + questdb-wal-probe-failed, §2.3h — the blind-detector guard on the pair above) (10 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm RETIRED 2026-07-15 — their gauge/counter producers, the Groww bridge + sidecar stall watchdog, were deleted with the Groww live feed); 2 more silent-feed alarms live in silent-feed-alarms.tf (the Groww lag mirror also retired 2026-07-15). Cost note: the 2026-07-15 Groww live retirement removes 3 alarms + the feed-stall-restarts counter pager + 4 EMF series and adds 1 (tv_rest_1m_fire_heartbeat) — dated note in aws-budget.md; still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
@@ -667,6 +704,7 @@ output "app_cloudwatch_alarms" {
     # QuestDB tables suspended themselves, and NEITHER gauge had an alarm.
     aws_cloudwatch_metric_alarm.spill_dir_free_low.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_wal_suspended.alarm_name,
+    aws_cloudwatch_metric_alarm.questdb_wal_probe_failed.alarm_name,
     # late_tick_after_boundary retired 2026-07-18 (stage-4 unit A).
   ]
 }

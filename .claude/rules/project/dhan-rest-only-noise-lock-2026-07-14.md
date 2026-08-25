@@ -1005,3 +1005,99 @@ same zero-byte budget, recorded rather than papered over.
 - Makes either `breaching` on missing data (pages every night and weekend).
 - Alarms the WAL gauge while leaving the probe able to fail open.
 - Adds a per-INSTRUMENT dimension to either (the §2.3 cardinality rule stands).
+
+### §2.3h — 2026-08-25: the byte budget that blocked three counters was already freed, and one of them guards an alarm shipped hours earlier
+
+**The verbatim operator authorization (2026-08-25, typed directly in-session):**
+
+> "Yes go ahead fix and resolve everything"
+
+Given in DIRECT response to a message that named exactly this work, its cost, and
+the correction that unblocked it: *"the follow-up is now genuinely available, and
+it's small: EMF-select the four counters — the three that make your per-minute
+high/low recovery visible (firing 2,632 times a session today, currently with no
+way to alarm if it stops) and `tv_wal_suspension_probe_failed_total`."* This
+dated row is recorded BEFORE the terraform and the selector edit, per the
+rule-file-first law.
+
+#### ⚠ First, the correction that makes this possible — I said this was blocked, four times
+
+§2.3d-ii records the user-data template rendering at **exactly 15,872 of 15,872
+bytes, zero free**, and names that as the reason `tv_wal_suspension_probe_failed_total`
+could not be EMF-selected. §2.3g repeats it. I repeated it again in three separate
+session check-ins, each time citing the one before rather than re-measuring.
+
+**It stopped being true on 2026-08-25**, when #1815 performed the exact
+restructure the guard's own message prescribes — moving the EMF selector OUT of
+the boot template and into `deploy/aws/cloudwatch-agent.json`, `cp`'d into place
+after the Step 5 repo clone. Measured across commits:
+
+| commit | rendered user-data |
+|---|---:|
+| `18aebcfb1~1` (before #1815) | **15,841** — 31 bytes free |
+| `18aebcfb1` (#1815) | **13,869** |
+| `cacea254d` (#1817) | 13,869 |
+
+So ~2,000 bytes were freed, and better than that: `cw_agent_selector_lockstep_guard`
+now **forbids** a second copy in the boot template, so adding an EMF name costs
+**zero** user-data bytes rather than 33. The blocker is not merely relieved, it is
+structurally gone.
+
+**The reusable lesson is the one this file keeps re-learning:** a measurement
+carries a date, and a measurement quoted from a quote is not a measurement. The
+byte figure was correct when first taken and stale within three days, and it was
+propagated by citation four times without anyone re-running the one command that
+settles it.
+
+#### What this authorizes
+
+| Metric | Why | Alarm? |
+|---|---|---|
+| `tv_wal_suspension_probe_failed_total` | The §2.3g `questdb-wal-suspended` alarm reads a GAUGE whose producer can fail. Before #1816 that producer could fail OPEN — return a confident 0 while tables were suspended. #1816 made it fail loud, but the counter that says so reached nothing. Without this, an alarm shipped hours earlier can be silently blind. | **YES** — `>= 1` |
+| `tv_candle_session_high_recovered_total` | The operator asked about per-minute high/low specifically. This is the count of minute-highs widened to the exchange's own running day high — prints we never received a tick for. 2,632 today. | no — see below |
+| `tv_candle_session_low_recovered_total` | Same, for lows. 247 today. | no |
+
+#### Deliberately NOT shipped, and why the omission is the judgment
+
+**`tv_candle_day_high_adopted_total` and `day_low_adopted_total` are LEFT OUT.**
+They fire on the first bucket of a session only — today they read **0 and 3**
+against the session counters' 2,632 and 247. They are a subset signal of the same
+mechanism at ~1% of the resolution, and each EMF name is ~$0.30/mo. Shipping five
+names to carry three names' worth of signal is the "paid for and unwatched" shape
+§2.3b was written to end.
+
+**The two session counters are shipped as METRICS but deliberately NOT ALARMED.**
+An alarm on "recovery stopped" would fire on a quiet market: a flat session
+legitimately sets no new day highs, so zero recoveries is a NORMAL reading, not a
+broken fold. That is precisely the noise trap this file records repeatedly — a
+pager that cries on an ordinary day teaches the operator to ignore it. They are
+charted so the mechanism is observable, and the thing that would actually indicate
+breakage (the fold refusing input) is already covered by
+`tv_indicator_tick_rejected_total`.
+
+#### Honest cost
+
+3 EMF names ≈ **$0.90/mo**, 1 alarm ≈ **$0.10/mo** ⇒ **~$1.00/mo**, zero
+user-data bytes.
+
+**Against the budget, stated rather than absorbed:** §2.3c put a maximal month at
+**$118.28** against a 90% `STOP_EC2_INSTANCES` line of **$117.00** at the live
+`limit_amount` of $130 — already **$1.28 over**, and this takes it to ~$2.28 over.
+The live account is nowhere near it (MTD **$48.87**, forecast **$61.51**, measured
+2026-08-25), so no stop is imminent — but the maximal-month arithmetic crosses the
+automatic action line and that gap widens with every addition. The levers remain
+the already-approved Quote 10 EIP release (−$3.60/mo, execution bundled with an
+instance recreate) or an operator decision on `limit_amount`, which Quote 18
+forbids raising above 125 and which cannot be set to 125 because 90% of that is
+$112.50, below the bill. Neither is taken here.
+
+#### What a PR that violates §2.3h looks like (REJECT)
+
+- Alarms `tv_candle_session_high_recovered_total` or `session_low_recovered_total`
+  (fires on a quiet market — the noise trap named above).
+- Re-adds a second copy of the EMF selector to `user-data.sh.tftpl` (the guard
+  forbids it, and it is what consumed the 2,000 bytes in the first place).
+- Cites the "15,872 with zero free" figure without re-measuring it.
+- Adds an EMF name whose producer does not exist (`emf_selector_producer_guard`).
+- Gives the probe-failed alarm `ok_actions` — a counter aging out of its window is
+  not a repair.

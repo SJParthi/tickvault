@@ -784,10 +784,34 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // ratchet's own stated rule applied to its own exception. The counter is
     // still emitted and still on the box's /metrics; only its CloudWatch
     // series is gone, and live-lane-alarms.tf records that.
+    //
+    // 2026-08-25 (§2.3h), 76 -> 79. Three names, ~+$0.90/mo, and ZERO
+    // user-data bytes -- the constraint that blocked this until today is gone.
+    // #1815 moved the selector OUT of user-data.sh.tftpl into
+    // deploy/aws/cloudwatch-agent.json (cp'd in after the Step 5 clone), which
+    // cw_agent_selector_lockstep_guard now FORBIDS duplicating, so the 33-byte
+    // cost per name no longer exists. The "15,872 of 15,872, zero free" figure
+    // recorded in the noise lock §2.3d-ii was measured 2026-08-22 and was
+    // repeated by citation four times after it stopped being true; the template
+    // renders 13,869 today.
+    //
+    //   tv_wal_suspension_probe_failed_total    -- ALARMED (§2.3h). Guards the
+    //     WAL gauge, whose producer could once fail open.
+    //   tv_candle_session_high_recovered_total  -- metric only, deliberately
+    //   tv_candle_session_low_recovered_total   -- NOT alarmed: a flat session
+    //     legitimately sets no new day high, so zero recoveries is a NORMAL
+    //     reading. A pager that fires on a quiet market is the noise trap this
+    //     file records repeatedly. Charted so the mechanism is observable;
+    //     breakage of the fold itself is covered by tv_indicator_tick_rejected_total.
+    //
+    // NOT shipped: tv_candle_day_high_adopted_total and day_low_adopted_total.
+    // First-bucket-only -- 0 and 3 today against the session counters' 2,632
+    // and 247. Same mechanism at ~1% of the resolution; two more paid series
+    // for no added signal.
     assert_eq!(
         names.len(),
-        76,
-        "Z+ L2 VERIFY ratchet: expected exactly 76 names in the MAIN EMF \
+        79,
+        "Z+ L2 VERIFY ratchet: expected exactly 79 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -1420,10 +1444,19 @@ fn test_app_alarms_count_is_seven() {
     // silently discarding rows, so no other alarm in the tree could see it.
     // Cost: +2 alarms (~+$0.20/mo), NO new EMF name and no user-data byte --
     // dated note in aws-budget.md (COST NOTE 2026-08-25).
+    //
+    // 2026-08-25 (§2.3h), 7 -> 8: questdb-wal-probe-failed. The alarm above
+    // reads a GAUGE whose PRODUCER could once fail open -- parse_wal_tables_
+    // response returned Ok(vec![]) when every row was skipped, and the gauge
+    // then published a confident 0 while tables were suspended. #1816 made
+    // that fail loud; this alarm is the other half, because a loud failure
+    // reported to a counter nobody reads leaves the gauge simply not updating,
+    // which on notBreaching reads as health. An alarm whose input can silently
+    // stop is not an alarm. Cost: +1 alarm (~+$0.10/mo) + 1 EMF name below.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 7,
-        "Z+ L2 VERIFY ratchet: expected exactly 7 app-level CloudWatch alarm \
+        count, 8,
+        "Z+ L2 VERIFY ratchet: expected exactly 8 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \

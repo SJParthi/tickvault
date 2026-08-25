@@ -1104,3 +1104,44 @@ recorded in `EXECUTION_FAILURE` on 2026-07-31 still fail is **Unknown**. If
 they are broken the $117 line is arithmetic about a switch that does not
 throw; if they are fixed the box gets stopped mid-month. A broken safety net
 is never a reason to cross a threshold.
+
+## COST NOTE 2026-08-25 (THIRD, same day) — the byte budget that blocked three counters was already freed (+~$1.00/mo)
+
+Authorization: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3h, operator quote
+2026-08-25 ("Yes go ahead fix and resolve everything"), recorded before the
+change per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_wal_suspension_probe_failed_total` EMF name | $0.30 |
+| `tv_candle_session_high_recovered_total` EMF name | $0.30 |
+| `tv_candle_session_low_recovered_total` EMF name | $0.30 |
+| `tv-<env>-questdb-wal-probe-failed` alarm | $0.10 |
+| **Total** | **~$1.00/mo** |
+
+**Zero user-data bytes**, which is the part worth recording. Every prior note on
+this surface priced an EMF name at 33 bytes against a template with none to
+spare — §2.3d-ii measured it at exactly 15,872 of 15,872 on 2026-08-22. #1815
+then moved the selector OUT of `user-data.sh.tftpl` into
+`deploy/aws/cloudwatch-agent.json`, `cp`'d in after the Step 5 clone, and
+`cw_agent_selector_lockstep_guard` now FORBIDS a second copy. The template
+renders **13,869** today. The byte cost of an EMF name is now nil, and the
+figure that said otherwise was repeated by citation four times after it stopped
+being true.
+
+**Two names deliberately NOT shipped**, saving $0.60/mo:
+`tv_candle_day_high_adopted_total` and `day_low_adopted_total` fire on the first
+bucket of a session only — 0 and 3 today against the session counters' 2,632 and
+247. Same mechanism at ~1% of the resolution.
+
+**Budget position, stated rather than absorbed.** The COST NOTE above (SECOND,
+same day) put a maximal month at **$118.28** against the 90%
+`STOP_EC2_INSTANCES` line of **$117.00** at the live `limit_amount` of $130 —
+already $1.28 over. This takes it to **~$119.28**, about $2.28 over. The live
+account is far below that (MTD **$48.87**, forecast **$61.51**, both measured
+2026-08-25), so no stop is imminent, but the maximal-month arithmetic crosses
+the automatic action line and widens with each addition. The levers are
+unchanged and neither is taken here: the already-approved Quote 10 EIP release
+(−$3.60/mo, bundled with an instance recreate), or an operator decision on
+`limit_amount` — which Quote 18 forbids raising above 125, and which cannot be
+set to 125 because 90% of that is $112.50, below the bill.
