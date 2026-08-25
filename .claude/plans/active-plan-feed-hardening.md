@@ -2250,3 +2250,153 @@ preserved and pinned — a tracked instrument is still never evicted.
   number and skips a slow consumer forward, so ticks discarded on their side
   are invisible to every counter we own. The 15:31 cross-verification remains
   the only ground truth for that class.
+
+---
+
+> **MERGE NOTE 2026-08-25 (second occurrence).** Two items were appended to
+> this file in parallel and the numbering collided again — main's silence-detector
+> item is numbered 15 while the audit-findings item below is numbered 23. Both
+> are kept verbatim; neither is renumbered, for the same reason the 2026-08-25
+> note above the two "Item 12" sections gives: a plan file is an audit trail,
+> and renumbering a landed item breaks every reference to it. Read them by
+> title, not by number.
+
+## ITEM 23 — The nine audit findings, fixed (2026-08-25, operator: "fix and resolve evrythignd dude okay? meanhwiel ensure to pull the latest merged changes and only then do ti dude okay? i mean fix and resolve all of them dude okay?")
+
+The 2026-08-25 five-agent audit produced nine verified findings. This item
+closes all nine. Seven of them were the SAME defect: a table, a constant or a
+comment that was declared, given a schema or a doc, and never wired to
+anything — invisible precisely because it looks finished.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 01 | The 15:41 cross-verify — the feed's only proof of correctness — was logged and discarded. Both writers and the DDL had ZERO callers, and a comment claimed the opposite | WIRED + comment retracted |
+| 02 | `instrument_lifecycle_audit`, the 5-year regulatory chain, had no writer | WIRED |
+| 03 | The disk alert was a fixed 10 GiB justified as "~10% of the 100 GB volume"; the volume is 300 GB | DERIVED from the measured volume |
+| 04 | 22,996 of 25,000 slots used; overflow refuses the WHOLE subscription | HEADROOM WARNING added |
+| 05 | Fourteen tables stopped applying rows on 2026-08-25 and the alarm stayed silent | LAG DETECTOR + BLIND SENTINEL |
+| 06 | 305 of 381 metrics never leave the box; blocked at 0 free user-data bytes | 2,515 BYTES FREED |
+| 07 | Array indexing was not lint-blocked on the packet-decode path | DENIED, 23 reviewed allows |
+| 08 | `MAX_DAILY_UNIVERSE_SIZE` had zero production readers | READ, with a drift warning |
+| 09 | The reset command destroys the SEBI tables with no export | EXPORT-OR-ABORT added |
+
+## Design (Item 23)
+
+Each fix is the smallest change that makes the declared thing true, and every
+one is pinned by a test that fails the build if it is undone.
+
+**01** — `CrossverifyDeps` gains the ILP write config; `persist_xverify_report`
+writes findings + a daily row after every run, INCLUDING vacuous ones ("we
+could not measure today" is a fact about the feed). `ensure_dhan_live_crossverify_tables`
+is called at boot beside the ticks/depth DDL, so ILP cannot auto-create either
+table without its DEDUP key.
+
+**02** — `KnownInstrument` carries the full prior `LifecycleState`, not just a
+boolean. `classify_lifecycle_transition` is a NEW classifier rather than a
+reuse of `lifecycle_reconciler::classify_transition`, deliberately: that one
+answers "is the row present in today's CSV?", and the Dhan master keeps expired
+contracts IN the file with a past expiry date — so the reconciler returns
+`None` for the single most common transition in the product.
+
+**03** — `spill_disk_free_critical_threshold(total)` = `max(10 GiB, total/10)`.
+The floor means the threshold can only move UP relative to today.
+
+**04/08** — `report_universe_headroom` warns below 10% free and cross-checks
+the caller's capacity against `MAX_DAILY_UNIVERSE_SIZE`, which had no reader.
+
+**05** — `WalLagTracker` flags tables whose apply lag is above a floor AND
+non-decreasing for five consecutive polls. Growth, not magnitude: this repo has
+never measured a normal session's peak lag, and guessing an absolute number is
+the failure being corrected. Separately, five consecutive probe failures set
+the suspended-tables gauge to −1 instead of leaving a stale `0` standing.
+
+**06** — user-data writes a minimal host-only agent config and copies
+`deploy/aws/cloudwatch-agent.json` into place after the Step 5 clone. One copy
+cannot drift from itself, and the lockstep guard inverts to pin the new shape.
+
+**07** — `deny(clippy::indexing_slicing)` on the nine Dhan parser modules,
+`cfg_attr(not(test))` like the existing unwrap/expect bans. 23 reviewed allows.
+
+**09** — Both destructive actions export the four SEBI tables to a directory
+outside the volume before touching it, and ABORT if a table exists and cannot
+be exported.
+
+## Edge Cases (Item 23)
+
+- Vacuous/blind cross-verify run → still persisted, stamped from the run, not `now()`.
+- No findings → daily row still written, no fabricated timestamp.
+- Rerun of either writer → UPSERTs, because both DEDUP keys carry the run stamp.
+- Unchanged instrument → NO audit row (else the chain becomes a 150,000-row daily snapshot).
+- `Delisted` → never auto-audited; it is an operator-set terminal state.
+- Small dev disk → keeps the 10 GiB floor; degenerate `total = 0` cannot disarm the alarm.
+- Busy-but-healthy table with oscillating lag → never pages (asserted with ten oscillating samples).
+- Missing `writerTxn`/`sequencerTxn` → no lag verdict, never a fabricated zero.
+- QuestDB unreachable during a reset → export skipped LOUDLY and the reset proceeds; it is also the remedy for a wedged QuestDB.
+- Clone fails → host metrics still flow from the fallback config.
+
+## Failure Modes (Item 23)
+
+| If this breaks | Consequence | Bound |
+|---|---|---|
+| xverify persist fails | today's comparison exists only in the log | pages via the alarmed `xverify_failed` label |
+| lifecycle audit write fails | today's history missing; STATE unaffected | logged + counted, never fails the state write |
+| lag detector threshold wrong | false pages, or a missed stall | edge-latched; growth-based, so a catching-up table clears it |
+| blind sentinel wrong | gauge reads −1 while healthy | one successful probe clears it |
+| SEBI export wrong | a reset destroys regulatory data | ABORTS rather than proceeding |
+| CW agent copy fails | app metrics absent | host metrics still flow; two WARNING lines say which |
+
+## Test Plan (Item 23)
+
+`derived_threshold_scales_with_the_volume` (5 cases + monotonicity) ·
+`growing_lag_fires_on_a_stuck_table_and_stays_quiet_on_a_busy_one` (the
+2026-08-25 shape replayed, plus ten healthy oscillations) ·
+`a_recovered_table_can_page_again_on_a_second_episode` ·
+`the_blind_gauge_sentinel_can_never_collide_with_a_real_reading` ·
+`the_daily_row_carries_every_comparison_total` (distinct values per field so a
+transposition cannot pass) · `the_cross_verification_findings_are_actually_persisted` ·
+`the_audit_chain_records_every_state_change_and_nothing_else` ·
+`a_delisted_instrument_is_never_audited_automatically` ·
+`the_documented_universe_ceiling_is_actually_read_and_matches_its_derivation` ·
+`destructive_actions_export_the_sebi_tables_before_destroying_the_volume`
+(asserts ORDER, not just presence) · `user_data_carries_no_second_copy_of_the_selector` ·
+`the_deployed_agent_config_is_the_repo_file_and_has_no_second_copy`.
+The indexing deny is bite-proven: removing one allow produces 8 errors.
+
+## Rollback (Item 23)
+
+Every change is additive or a guard inversion; `git revert` restores the prior
+behaviour with no schema migration. The two new tables are `CREATE TABLE IF NOT
+EXISTS` and are never read by anything else, so leaving them behind costs
+nothing. The user-data change is the only one that touches the boot path: the
+fallback config means a revert is never required to keep host metrics flowing.
+
+## Observability (Item 23)
+
+New: `tv_dhan_feed_xverify_rows_total`, `tv_dhan_feed_xverify_persist_errors_total`,
+`tv_instrument_lifecycle_audit_rows_total` — all local-only, deliberately NOT
+EMF-selected. Each already pages through an existing log filter, and a metric
+shipped with nothing watching it is the paid-for-and-unwatched shape these
+alarms were added to end. One new CloudWatch alarm,
+`tv-<env>-wal-suspension-probe-blind`, on a gauge that is already selected:
+~$0.10/mo, no new metric name, no user-data byte.
+
+### Per-Item Guarantee Matrix (Item 23)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +
+7-row). Coverage: 12 new tests across 5 crates; audit coverage: two tables that
+had no writer now have one; performance: no hot-path change (the indexing deny
+generates identical code); security: no new external surface, the SEBI export
+writes locally with no credentials; O(1): the lag tracker is O(tables) on a
+60s timer over ~30 rows, the threshold derivation is O(1), the audit builder is
+O(rows) with one hash lookup each — all cold path.
+
+**Honest envelope:** 100% inside the tested envelope, with ratcheted regression
+coverage. NOT claimed: that the WAL-suspension silence of 2026-08-25 is now
+explained — the recorded txn evidence is consistent with the lag path and the
+blind-probe path, and the day cannot be replayed, so BOTH are fixed rather than
+one being declared the cause. NOT claimed: that the lag threshold is calibrated
+— no normal-session baseline exists, which is why the signal is growth and not
+magnitude; the first session with real lag data is what validates it. NOT
+claimed: that the user-data restructure is live-verified — no instance has
+booted with it, and the fallback exists precisely because that is unproven.
+

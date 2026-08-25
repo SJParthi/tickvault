@@ -46,17 +46,50 @@
 // 2026-08-09: `depth` re-added for the depth-20 / depth-200 revival — a
 // clean-room rebuild against `docs/dhan-ref/04-full-market-depth-websocket.md`,
 // not a restore of the deleted modules.
+// ---------------------------------------------------------------------------
+// Array-bounds panics are DENIED on the Dhan decode path (added 2026-08-25).
+//
+// Every crate in this workspace bans `unwrap` and `expect` outside tests. None
+// banned direct indexing — and indexing is the one remaining way to panic on a
+// path that reads a network buffer at fixed byte offsets by design. A panic
+// here does not corrupt one tick; it kills the drain task that owns every
+// socket.
+//
+// The deny does not change a single byte of generated code. What it changes is
+// that every indexing site on this path is now an explicit, commented decision
+// with its length precondition named, instead of an invisible default. Each
+// `#[allow]` below its guard is that decision, and a NEW parser cannot index
+// without making one.
+//
+// `cfg_attr(not(test), ...)` mirrors the existing unwrap/expect bans: test code
+// indexes fixtures freely and a panic there is a failing test, not an outage.
+//
+// The TrueData modules are deliberately NOT covered. That feed is default-OFF
+// and has never run; sweeping it in would mean auditing preconditions on a
+// wire format nobody has seen live, which is how a review becomes a rubber
+// stamp. Recorded rather than quietly skipped.
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod depth;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod disconnect;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod dispatcher;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod full_packet;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod header;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod market_status;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod oi;
 pub mod order_update;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod previous_close;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod quote;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 mod read_helpers;
+#[cfg_attr(not(test), deny(clippy::indexing_slicing))]
 pub mod ticker;
 pub mod truedata;
 pub mod truedata_aux;

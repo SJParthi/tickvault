@@ -1,15 +1,30 @@
 //! Ratchet: every metric named in `deploy/aws/terraform/app-alarms.tf`
 //! must be emitted somewhere in the Rust codebase, AND must be present
-//! in the CloudWatch agent's prometheus EMF metric_declaration filter
-//! in `deploy/aws/terraform/user-data.sh.tftpl`.
+//! in the CloudWatch agent's prometheus EMF metric_declaration filter.
 //!
 //! Three-way drift check:
 //!   1. alarm metric_name → has matching `counter!` / `gauge!` call in crates/
-//!   2. alarm metric_name → appears in user-data EMF filter list
+//!   2. alarm metric_name → appears in the EMF filter list
 //!   3. EMF filter list metric → appears in at least one alarm
 //!
 //! Without this guard, renaming a Rust metric (or dropping it from the
 //! EMF filter) silently breaks the alarm — operator gets no Telegram.
+//!
+//! # 2026-08-25: where "deployed" now lives
+//!
+//! Until 2026-08-25 the agent config was embedded in
+//! `deploy/aws/terraform/user-data.sh.tftpl` AND duplicated in
+//! `deploy/aws/cloudwatch-agent.json`, with a separate lockstep guard keeping
+//! the two byte-identical. That duplicate was ~1.6 KB and it pinned the
+//! user-data template at EXACTLY its 15,872-byte budget with zero bytes free,
+//! which blocked every further boot-script change.
+//!
+//! The template now writes a minimal host-only fallback and copies the repo
+//! file into place after the Step 5 clone, so `deploy/aws/cloudwatch-agent.json`
+//! IS the deployed config — there is one copy and it cannot drift from
+//! itself. Every check below therefore reads that file. That the template
+//! still installs it (and no longer embeds a selector of its own) is pinned
+//! separately by `cw_agent_selector_lockstep_guard.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +41,14 @@ fn read(rel: &str) -> String {
     let p = workspace_root().join(rel);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())) // APPROVED: test
 }
+
+/// The CloudWatch agent config the box actually loads.
+///
+/// Copied into `/opt/aws/amazon-cloudwatch-agent/etc/` by user-data Step
+/// 5b-ii, after the repo clone. Before 2026-08-25 this content was embedded in
+/// the user-data template and this constant pointed there; see the module
+/// header for why it moved.
+const DEPLOYED_CW_AGENT_CONFIG: &str = "deploy/aws/cloudwatch-agent.json";
 
 /// Pull every `metric_name = "tv_..."` literal out of the app-level alarm
 /// terraform files. 2026-07-06 (silent-feed incident hardening): scope
@@ -236,7 +259,7 @@ fn test_every_alarm_metric_has_a_rust_emit_site() {
 
 #[test]
 fn test_every_alarm_metric_is_in_emf_filter_list() {
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read(DEPLOYED_CW_AGENT_CONFIG);
     let names = alarm_metric_names();
     let mut missing = Vec::new();
     for name in &names {
@@ -326,10 +349,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
     // references a REAL label (`host`, stamped by prometheus.yaml's
     // static_configs) with `label_matcher` pinned to its literal value;
     // `metric_selectors` alone filters metric NAMES.
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             body.contains("\"source_labels\": [\"host\"]"),
@@ -562,7 +582,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // need the market-hours window gate's ALARM_NAMES list (its own terraform
     // change) and a sustained baseline these series do not yet have. Recorded
     // here rather than left to be discovered from a quiet dashboard.
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read(DEPLOYED_CW_AGENT_CONFIG);
     let names = emf_declared_names(&user_data, "metric_selectors");
     // 2026-08-14: 64 -> 65. ONE name added, `tv_dhan_ws_lag_excluded_total`,
     // alongside the first live-socket delivery-lag measurement. Cost ~$0.30/mo
@@ -882,10 +902,7 @@ fn test_boundary_catchup_emf_declaration_stays_retired() {
     // declaration was a dead selector. Negative pin: neither agent config
     // may re-declare the metric (re-adding it without a live writer would
     // ship a permanently-empty paid series).
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             !body.contains("tv_boundary_catchup_total"),
@@ -948,7 +965,7 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
     // 2026-07-06: union across ALL metric_declaration entries. (2026-07-17:
     // the per-feed [host,feed] boundary-catchup declaration + its alarm
     // retired with the stage-3 tick-aggregator deletion.)
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read(DEPLOYED_CW_AGENT_CONFIG);
     let declared = emf_all_declared_names(&user_data);
     let alarms = alarm_metric_names();
     let missing: Vec<&String> = alarms.iter().filter(|a| !declared.contains(a)).collect();
@@ -961,50 +978,38 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
 }
 
 #[test]
-fn test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration() {
-    // Drift-guard: `deploy/aws/cloudwatch-agent.json` is a REFERENCE copy of
-    // the DEPLOYED inline config in user-data.sh.tftpl (the file that
-    // `amazon-cloudwatch-agent-ctl -a fetch-config` actually loads). The
-    // grafana-cloud README cites the reference file as ground truth, so it
-    // must not drift. Pin the two EMF declarations to the same name-set.
+fn the_deployed_agent_config_is_the_repo_file_and_has_no_second_copy() {
+    // RETIRED-AND-REPLACED 2026-08-25.
+    //
+    // This test used to compare the EMF name-set in `cloudwatch-agent.json`
+    // against a byte-identical duplicate embedded in `user-data.sh.tftpl`.
+    // That duplicate is gone: the template now writes a minimal host-only
+    // fallback and copies the repo file into place after the Step 5 clone, so
+    // there is exactly ONE declaration and a drift comparison would be the
+    // file against itself — vacuously green, which is worse than absent.
+    //
+    // What replaces it is the property that actually has to hold now: the
+    // template must not re-embed a selector, and it must still install the
+    // repo file. Dropping the install while the selector stays absent would
+    // leave every box on the host-only fallback publishing no app metrics at
+    // all — a much quieter failure than drift ever was, so it needs a pin.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
-    let reference = read("deploy/aws/cloudwatch-agent.json");
-    let deployed_names = emf_declared_names(&user_data, "metric_selectors");
-    let reference_names = emf_declared_names(&reference, "metric_selectors");
+    let reference_names = emf_declared_names(&read(DEPLOYED_CW_AGENT_CONFIG), "metric_selectors");
     assert!(
         !reference_names.is_empty(),
-        "ratchet self-check: could not parse metric_selectors from cloudwatch-agent.json"
+        "ratchet self-check: could not parse metric_selectors from {DEPLOYED_CW_AGENT_CONFIG}"
     );
-    assert_eq!(
-        deployed_names,
-        reference_names,
-        "Z+ L3 RECONCILE drift-guard: the reference deploy/aws/cloudwatch-agent.json EMF \
-         name-set has drifted from the DEPLOYED user-data.sh.tftpl EMF name-set. The \
-         grafana-cloud README cites the reference file, so it must stay byte-in-sync with \
-         what the box actually loads.\n  deployed-only: {:?}\n  reference-only: {:?}",
-        deployed_names
-            .iter()
-            .filter(|n| !reference_names.contains(n))
-            .collect::<Vec<_>>(),
-        reference_names
-            .iter()
-            .filter(|n| !deployed_names.contains(n))
-            .collect::<Vec<_>>(),
+    assert!(
+        emf_declared_names(&user_data, "metric_selectors").is_empty(),
+        "the EMF metric-selector list is back inside user-data.sh.tftpl. Two copies means \
+         two things to keep in sync, and the ~1.6 KB duplicate is what pinned that template \
+         at exactly 0 bytes free under the EC2 16 KiB cap."
     );
-    // 2026-07-06: compare the union across ALL declarations in both files.
-    // (2026-07-17, stage-3 dead-WS sweep: the per-feed
-    // tv_boundary_catchup_total declaration retired with the tick
-    // aggregator — the union check now covers whatever declarations remain,
-    // and the boundary-catchup-must-exist assert died with the declaration;
-    // its stays-retired negative pin lives in
-    // test_boundary_catchup_emf_declaration_stays_retired.)
-    let deployed_all = emf_all_declared_names(&user_data);
-    let reference_all = emf_all_declared_names(&reference);
-    assert_eq!(
-        deployed_all, reference_all,
-        "Z+ L3 RECONCILE drift-guard: the UNION of EMF-declared names (all \
-         metric_declaration entries) has drifted between the deployed \
-         user-data.sh.tftpl and the reference cloudwatch-agent.json."
+    assert!(
+        user_data.contains(DEPLOYED_CW_AGENT_CONFIG) && user_data.contains("fetch-config"),
+        "user-data must copy {DEPLOYED_CW_AGENT_CONFIG} into place after the clone AND \
+         apply it with amazon-cloudwatch-agent-ctl -a fetch-config. Without both, the box \
+         runs the host-only fallback forever and no app metric reaches CloudWatch."
     );
 }
 
@@ -1013,10 +1018,7 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     // The alarms in app-alarms.tf all key on namespace="Tickvault/Prod".
     // If the agent's emf_processor.metric_namespace ever changes, every
     // metric lands in a namespace no alarm reads → silent 0 datapoints.
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             body.contains("\"metric_namespace\": \"Tickvault/Prod\""),
@@ -1082,10 +1084,7 @@ fn test_cw_agent_collects_machine_log_paths() {
     // 0-byte machine/app.log placeholder, tailing only real rotated files.
     let errors_glob = format!("/opt/tickvault/{errors_dir}/errors.jsonl.2*");
     let app_glob = format!("/opt/tickvault/{app_dir}/app.2*");
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             body.contains(&errors_glob),

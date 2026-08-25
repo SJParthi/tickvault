@@ -31,7 +31,11 @@ use tickvault_app::dhan_feed_stack::{LAST_TICK_AGE_GAUGE, last_tick_age_gauge_va
 
 const ALARM_TF: &str = include_str!("../../../deploy/aws/terraform/live-lane-alarms.tf");
 const AGENT_JSON: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json");
-const USER_DATA: &str = include_str!("../../../deploy/aws/terraform/user-data.sh.tftpl");
+/// The deployed CloudWatch-agent config. Was embedded in
+/// `user-data.sh.tftpl` until 2026-08-25; that duplicate pinned the template
+/// at zero free bytes under the EC2 16 KiB cap and was removed, so user-data
+/// now copies this file into place after the Step 5 clone.
+const USER_DATA: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json");
 const DRAIN_SRC: &str = include_str!("../src/dhan_feed_stack.rs");
 
 /// The alarm's own resource block, bounded at its closing brace so a later
@@ -112,7 +116,7 @@ fn the_no_ticks_alarm_keeps_its_name_so_the_market_hours_gate_still_arms_it() {
 fn the_gauge_is_shipped_by_both_emf_selector_copies() {
     for (label, src) in [
         ("deploy/aws/cloudwatch-agent.json", AGENT_JSON),
-        ("deploy/aws/terraform/user-data.sh.tftpl", USER_DATA),
+        ("deploy/aws/cloudwatch-agent.json", USER_DATA),
     ] {
         assert!(
             src.contains(LAST_TICK_AGE_GAUGE),

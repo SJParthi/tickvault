@@ -46,7 +46,13 @@ fn read(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("dashboard visibility guard: {rel} must be readable: {e}"))
 }
 
-const USER_DATA: &str = "deploy/aws/terraform/user-data.sh.tftpl";
+/// The CloudWatch agent config the box actually loads.
+///
+/// Was `deploy/aws/terraform/user-data.sh.tftpl` until 2026-08-25, when the
+/// ~1.6 KB duplicate of this file was removed from that template (it pinned
+/// user-data at exactly its 15,872-byte budget with zero bytes free). The
+/// template now copies this file into place after the Step 5 clone.
+const USER_DATA: &str = "deploy/aws/cloudwatch-agent.json";
 const DASHBOARD: &str = "deploy/aws/terraform/dashboard.tf";
 
 /// Lane metrics that are EMF-published but intentionally not on the dashboard.

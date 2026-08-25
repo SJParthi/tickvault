@@ -24,7 +24,11 @@
 
 const OVERFLOW_SRC: &str = include_str!("../src/ilp_overflow.rs");
 const AGENT_JSON: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json");
-const USER_DATA: &str = include_str!("../../../deploy/aws/terraform/user-data.sh.tftpl");
+/// The deployed CloudWatch agent config (was embedded in
+/// `user-data.sh.tftpl` until 2026-08-25 — that duplicate pinned the template
+/// at zero free bytes and was removed; user-data now copies this file after the
+/// Step 5 clone).
+const USER_DATA: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json");
 
 /// Every writer that propagates a flush error while keeping its buffer.
 ///
@@ -97,7 +101,7 @@ fn the_loss_counters_reach_cloudwatch_via_both_selector_copies() {
     ] {
         for (label, src) in [
             ("deploy/aws/cloudwatch-agent.json", AGENT_JSON),
-            ("deploy/aws/terraform/user-data.sh.tftpl", USER_DATA),
+            ("deploy/aws/cloudwatch-agent.json", USER_DATA),
         ] {
             assert!(
                 src.contains(metric),
