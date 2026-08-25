@@ -1713,3 +1713,97 @@ decision, not an executor one, and the honest options are: keep seconds as a rol
 (what the code does today), retain seconds for a bounded instrument subset, or move to a host
 where the arithmetic closes. Recorded here so the next session decides deliberately rather
 than discovering it at the OOM.
+
+---
+
+## Item 20 — RAM residency: MEASURED, and three of my own numbers were wrong
+
+**Status:** measured 2026-08-25 08:40 IST against the live box
+(`i-0c3fe906dad5492fc`) over the **full 2026-08-24 session** — read-only
+QuestDB queries via SSM. Supersedes every RAM figure this repo has carried.
+
+The operator's instruction was explicit: *"Then without a real proof don't
+tell me tgese dude okay"*. The 12 GB / 42 GB / 175 GB figures were all
+unproven. These are readings.
+
+### What one full session actually contains (2026-08-24, Monday)
+
+| Term | Measured | Instruments |
+|---|---:|---:|
+| Ticks | 64,349,753 | 18,097 |
+| Peak ticks in ONE second | **92,131** | — |
+| Second bars (1s/5s/10s/15s/30s) | 22,336,216 | 10,199 |
+| Minute+ bars (1m..1d) | 3,154,318 | 10,199 |
+| Depth rows d5 | 601,944,729 | 21,374 |
+| Depth rows d20 | 745,434,920 | 248 |
+| Depth rows d200 | 183,272,000 | 9 |
+| **Depth rows total** | **1,530,651,649** | — |
+
+### Three corrections to my own earlier claims
+
+1. **"11 unrequested second-scale timeframes are 58% of the bars."** FALSE.
+   Measured: `candles_2s,3s,4s,6s..9s,11s..14s` all wrote **ZERO rows**. Only
+   the five frames the operator asked for are populated. The module header
+   already said so — capacity-1 placeholders, 768 B/slot — and I did not read
+   it before claiming otherwise. There is nothing to remove.
+2. **"32 B per tick."** FALSE — that was in my own measurement script's
+   header, unproven. `size_of::<ParsedTick>()` is **112 bytes**, measured. A
+   32 B compact record is a DESIGN TARGET that does not exist in this
+   codebase. Every figure below uses 112.
+3. **Depth is 24x the tick volume**, not a rounding term. 1.53 billion rows
+   against 64 million. At the depth table's 72 B/row that is ~110 GB/day,
+   which is the write-amplification source Item 15 was hunting.
+
+### The answer to the operator's question
+
+`RamBar` = 48 B (test-pinned, `spot_bar_store.rs:678`). `ParsedTick` = 112 B
+(measured). Latest-book widths: d5 168 B, d20 648 B, d200 6,400 B.
+
+| What you hold | At today's 18,097 | Scaled to 24,600 |
+|---|---:|---:|
+| Ticks | 7.21 GB | 9.81 GB |
+| All bars | 1.22 GB | 1.66 GB |
+| Depth — CURRENT book only | 0.004 GB | 0.004 GB |
+| **Subtotal (decision path)** | **8.4 GB** | **11.5 GB** |
+| Depth — full-day HISTORY | 25.1 GB | 28.9 GB |
+| **Total with depth history** | **33.6 GB** | **40.4 GB** |
+
+Host is 32 GiB = 34.4 GB, and QuestDB wants 8-16 GB of it.
+
+**So: everything the operator asked for FITS — ticks, all seconds, all
+minutes, and the live book for every instrument — at ~11.5 GB.** What does
+NOT fit is retaining every historical depth SNAPSHOT in RAM, which is 28.9 GB
+on its own and is not what an entry/exit decision reads.
+
+### Scaling honesty
+
+24,600/18,097 = 1.36x on ticks and bars; 24,600/21,374 = 1.15x on depth.
+Stated as an assumption and an UPPER bound: today's set is indices and cash
+stocks, which tick MORE than the option strikes that would make up the
+remainder. Note depth already covers 21,374 instruments — MORE than the
+18,097 that ticked, because a book can quote without trading.
+
+### NOT claimed
+
+The 92,131-tick peak second is measured but not attributed — it may be an
+open burst or a boot replay, and which one changes the ring sizing argument.
+Not measured: RSS of the running process, which is the only number that
+proves the arithmetic above against reality.
+
+### The finding that matters more than the arithmetic
+
+The RAM store is **allocated at boot and has no live writer.**
+
+- `dhan_feed_stack.rs` — the live lane — contains **zero** references to
+  `SpotBarStore` or `append_sealed` (grep, whole file).
+- The only production `append_sealed` call site in the workspace is
+  `rest_candle_fold.rs:1514`, and `config/base.toml [rest_candle_fold]
+  enabled = false`.
+- `market_ram_store_boot::install_market_ram_stores` runs at boot
+  (`main.rs:3141`) and `spawn_ram_store_stats_task` publishes residency
+  gauges for a store nothing fills.
+
+So the live path today is tick -> fold -> ILP -> QuestDB. Nothing lands in
+RAM for a decision to read. The arithmetic above proves the budget is
+comfortable; it does **not** prove the capability exists. Wiring the live
+seal into `append_sealed` is a real change with its own design, not a flag.
