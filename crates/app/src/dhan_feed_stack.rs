@@ -919,6 +919,45 @@ impl LiveIngest {
         self
     }
 
+    /// Sizes the silence detector's slot table independently of the fold's
+    /// pre-size.
+    ///
+    /// # The blind spot this exists to close (MEASURED live, 2026-08-25)
+    ///
+    /// `new`'s `capacity` is a SOFT pre-size for the fold and a HARD cap for
+    /// the detector — `TickGapDetector::with_capacity` never grows and never
+    /// reallocates. That asymmetry is invisible at the call site, and it is
+    /// the whole defect: the boot site computes `capacity` from the
+    /// main-feed set as it stands BEFORE any socket opens, which is the SPOT
+    /// universe. The ~22,000 contracts arrive minutes later, through
+    /// `run_contract_attach`. Live that day:
+    ///
+    /// ```text
+    /// 08:31:09  refused: 1,276,658  tracked: 865
+    /// 12:37:47  refused: 1,211,764  tracked: 865
+    /// ```
+    ///
+    /// 865 is exactly the spot universe. Every contract tick was refused a
+    /// slot, so `scan_silence`'s `silent` and `never_ticked` counts described
+    /// 865 instruments while reading as though they described all ~23,000 —
+    /// the detector's own edge-latched error says precisely this, and it fired
+    /// every session. A contract that was silently never subscribed could not
+    /// be reported by anything.
+    ///
+    /// Sizing at the authorized ceiling rather than at a boot-time count is
+    /// the point: the ceiling does not depend on WHEN the universe is counted,
+    /// so this cannot silently re-break the next time instruments are added
+    /// after boot. Cost is ~2 MB of slots plus its index, against a 32 GiB
+    /// host.
+    ///
+    /// Must be called during construction, before any [`Self::seed`] — it
+    /// REPLACES the detector, discarding whatever it had learned.
+    #[must_use]
+    pub fn with_detector_capacity(mut self, capacity: usize) -> Self {
+        self.detector = TickGapDetector::with_capacity(capacity.max(1), DetectorConfig::default());
+        self
+    }
+
     /// Builds the fold, pre-sized for `capacity` instruments so the slot table
     /// and the detector index never realloc mid-session.
     #[must_use]
@@ -6687,6 +6726,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
     )
+    // The fold keeps the boot-time pre-size above; the DETECTOR gets the
+    // authorized ceiling, because its capacity is a hard cap and the universe
+    // grows ~26x after boot when contracts attach. See
+    // `with_detector_capacity` for the 1.2M refusals this fixes.
+    .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb));
 
     // Seed BEFORE any socket opens, so an instrument that never delivers a
@@ -10255,6 +10299,99 @@ mod tests {
     /// growing set — so a full detector returns a small, calm number that
     /// reads exactly like health. This accessor is the only way a caller can
     /// tell "nothing is silent" from "I can no longer see".
+    /// The detector must be sized for the universe the lane will EVER carry,
+    /// not for the one that exists at boot.
+    ///
+    /// MEASURED live 2026-08-25: `refused: 1,276,658` against `tracked: 865`.
+    /// 865 is exactly the spot universe — the ~22,000 contracts attach minutes
+    /// after boot, and every one of their ticks was refused a detector slot,
+    /// so the silence counts described 4% of the subscribed set while reading
+    /// as though they described all of it.
+    #[test]
+    fn the_detector_outlives_the_boot_time_universe_when_given_the_ceiling() {
+        // Boot-time pre-size of 2 — the shape `new` is handed at construction.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 2)
+            .with_detector_capacity(super::AGGREGATOR_MAX_SLOTS);
+
+        // Seed far more instruments than the boot-time figure: this is the
+        // late-attach growth that used to hit the hard cap.
+        let mut seeded = 0usize;
+        for sid in 0..5_000u64 {
+            if ingest.seed(sid, ExchangeSegment::NseFno, 1_000) {
+                seeded += 1;
+            }
+        }
+
+        assert_eq!(
+            seeded, 5_000,
+            "every instrument past the boot-time pre-size must still get a slot"
+        );
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "a detector sized at the ceiling turns nobody away below the ceiling"
+        );
+        assert_eq!(ingest.tracked_instruments(), 5_000);
+    }
+
+    /// The ceiling is still a ceiling — this is a re-size, not an uncapping.
+    ///
+    /// Fail-closed is the deliberate shape here (evicting a tracked instrument
+    /// would silently reset its gap state and hide the next gap), so past the
+    /// bound it must still refuse and still count.
+    #[test]
+    fn a_detector_at_its_ceiling_still_refuses_and_still_counts() {
+        let mut ingest =
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 1).with_detector_capacity(3);
+
+        for sid in 0..3u64 {
+            assert!(ingest.seed(sid, ExchangeSegment::NseFno, 1_000));
+        }
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "nothing refused under the cap"
+        );
+
+        assert!(
+            !ingest.seed(99, ExchangeSegment::NseFno, 1_000),
+            "the instrument past the cap must be refused, not silently accepted"
+        );
+        assert_eq!(
+            ingest.detector_refused(),
+            1,
+            "and the refusal must be counted — a blind detector that says nothing \
+             is the failure this whole path exists to make visible"
+        );
+        assert_eq!(
+            ingest.tracked_instruments(),
+            3,
+            "a tracked instrument is never evicted to make room"
+        );
+    }
+
+    /// The boot site must hand the detector the CEILING, not the boot-time
+    /// count — the fix is worthless if only the builder exists.
+    #[test]
+    fn the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling() {
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        assert_eq!(
+            src.matches(".with_detector_capacity(").count(),
+            1,
+            "exactly one production call site — a second would make the detector's size \
+             depend on which one ran last"
+        );
+        assert!(
+            src.contains(".with_detector_capacity(AGGREGATOR_MAX_SLOTS)"),
+            "the detector must be sized at the authorized ceiling, never at the boot-time \
+             universe: `capacity` is computed before any socket opens, so it counts the spot \
+             set and misses every contract that attaches later"
+        );
+    }
+
     #[test]
     fn detector_refused_separates_a_quiet_universe_from_a_blind_detector() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 2);
