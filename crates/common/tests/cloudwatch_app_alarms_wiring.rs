@@ -1420,3 +1420,367 @@ fn test_app_alarms_count_is_twenty_two() {
          AND this guard."
     );
 }
+
+// ---------------------------------------------------------------------------
+// FULL-CORPUS, CONST-AWARE DEAD-MONITOR CHECK (added 2026-08-25)
+//
+// `test_every_alarm_metric_has_a_rust_emit_site` above is the original
+// dead-monitor ratchet and it is NOT weakened here — it stays exactly as it
+// was. What it cannot do was measured on 2026-08-25 and is worth stating
+// precisely, because the shape is the one this repository has now been caught
+// by eight times: THE GUARD DECIDES WHAT TO READ FROM A HARDCODED LIST.
+//
+//   * its corpus is two files, named literally at `alarm_metric_names()` —
+//     and one of them (`silent-feed-alarms.tf`) has held zero alarms since its
+//     retirement, so the effective corpus is ONE file. The tree has 20 files
+//     declaring 55 alarm resources; it inspects 5 metric names, about 11% of
+//     the ~45 distinct `tv_*` alarm metrics;
+//   * its parser is line-wise, so a `metric_name` nested inside a
+//     `metric_query { metric { … } }` is invisible — three alarms in the one
+//     file it does read are unexamined for that reason;
+//   * its needle is `counter!("name"` — LITERAL ONLY. Nine of the fourteen
+//     metrics in `live-lane-alarms.tf` are emitted through a `const`
+//     (`gauge!(FEED_STACK_UP_GAUGE)`), so merely widening the file list would
+//     have produced ~11 false "missing emit site" failures on perfectly
+//     healthy metrics — which is why the widening had to come WITH the
+//     const resolution, not before it.
+//
+// The hole that mattered most is none of those three individually. It is that
+// a metric name can be declared as a `const`, listed in the EMF selector, and
+// alarmed on — and NEVER PASSED TO AN EMIT MACRO. `emf_selector_producer_guard`
+// matches the const DECLARATION literal and is satisfied;
+// `alarm_metric_has_a_route_guard` checks the TRANSPORT and is satisfied; and
+// the ratchet above cannot see consts at all. Three guards, all green, over a
+// metric nothing writes.
+//
+// This test closes that. It reads every `.tf` in the terraform directory,
+// takes every `tv_*` metric name (nesting included, since it is not line-
+// scoped), and requires each to reach ONE of four honest routes.
+// ---------------------------------------------------------------------------
+
+/// Every `metric_name = "tv_..."` in every terraform file, nesting included.
+///
+/// Deliberately NOT block-scoped to alarm resources: a name declared by a
+/// `metric_transformation` is classified as log-derived below and passes
+/// trivially, so including it costs nothing and removes a parser that could
+/// drift. Terraform-interpolated names (`tv_errcode_${each.key}`) are skipped —
+/// they are a template, not a metric.
+fn every_tf_metric_name() -> Vec<String> {
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        panic!("terraform directory unreadable: {}", dir.display());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in strip_line_comments(&body).lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("metric_name") else {
+                continue;
+            };
+            if !rest.trim_start().starts_with('=') {
+                continue;
+            }
+            if let Some(start) = rest.find('"')
+                && let Some(end) = rest[start + 1..].find('"')
+            {
+                let name = &rest[start + 1..start + 1 + end];
+                if name.starts_with("tv_") && !name.contains("${") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Names a `metric_transformation` block publishes — i.e. metrics CloudWatch
+/// derives from a log filter, which legitimately have no Rust emit macro.
+fn log_filter_derived_names() -> Vec<String> {
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let stripped = strip_line_comments(&body);
+        // A `metric_transformation` block is short; 400 bytes covers its
+        // name/namespace/value/default_value without reaching the next
+        // resource.
+        //
+        // The attribute is `name`, NOT `metric_name` — that is the terraform
+        // spelling, and getting it wrong made three genuinely log-derived
+        // metrics (`tv_seal_writer_drain_dropped_total`,
+        // `tv_orders_placed_delta_total`, `tv_errcode_hot_path_02`) look like
+        // dead monitors on the first run of this guard. `namespace` also
+        // begins with "name", so the `=` check below is what separates them.
+        for (at, _) in stripped.match_indices("metric_transformation") {
+            let end = (at + 400).min(stripped.len());
+            for line in stripped[at..end].lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix("name") else {
+                    continue;
+                };
+                if !rest.trim_start().starts_with('=') {
+                    continue;
+                }
+                if let Some(start) = rest.find('"')
+                    && let Some(stop) = rest[start + 1..].find('"')
+                {
+                    let name = &rest[start + 1..start + 1 + stop];
+                    // A terraform-interpolated name (`tv_errcode_${...}`) is a
+                    // template; record the literal PREFIX so the concrete
+                    // alarm names it expands to are recognised as derived.
+                    let literal = name.split("${").next().unwrap_or(name);
+                    if literal.starts_with("tv_") {
+                        out.push(literal.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Production Rust sources only — `tests/`, `benches/` and `fuzz/` excluded.
+///
+/// The ratchet above walks all of `crates/`, so an emit-shaped string inside a
+/// test file satisfies it. That is the difference between "someone wrote this
+/// metric" and "the running binary writes this metric", and only the second
+/// one keeps an alarm from being green over nothing.
+fn production_sources() -> Vec<(PathBuf, String)> {
+    let mut paths = Vec::new();
+    collect_rs_sources(&workspace_root().join("crates"), &mut paths);
+    paths
+        .into_iter()
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            !s.contains("/tests/") && !s.contains("/benches/") && !s.contains("/fuzz/")
+        })
+        .filter_map(|p| {
+            fs::read_to_string(&p).ok().map(|body| {
+                let code_only = strip_line_comments(&body);
+                let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
+                (p, compact)
+            })
+        })
+        .collect()
+}
+
+/// Identifiers bound to `name` by a `const IDENT: &str = "name";` declaration.
+///
+/// Both `&str` and `&'static str` compact to something ending in `str=` before
+/// the literal, so the search anchors on the literal and walks BACK to the
+/// `const` keyword — which is stable under either spelling and under any
+/// visibility modifier.
+fn const_aliases_for(name: &str, sources: &[(PathBuf, String)]) -> Vec<String> {
+    let literal = format!("=\"{name}\";");
+    let mut out = Vec::new();
+    for (_, compact) in sources {
+        for (at, _) in compact.match_indices(&literal) {
+            let back = &compact[at.saturating_sub(200)..at];
+            let Some(kw) = back.rfind("const") else {
+                continue;
+            };
+            let after = &back[kw + "const".len()..];
+            let Some(colon) = after.find(':') else {
+                continue;
+            };
+            let ident = &after[..colon];
+            if !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.push(ident.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Is `arg` a reference to `ident`, allowing any path prefix?
+///
+/// `counter!(NAME)`, `counter!(self::NAME)` and `counter!(crate::a::b::NAME)`
+/// are all the same emit; matching on the bare identifier alone would miss the
+/// qualified forms, and matching on a substring would let `OTHER_NAME` pass.
+fn arg_names(arg: &str, ident: &str) -> bool {
+    arg == ident || arg.ends_with(&format!("::{ident}"))
+}
+
+/// Does any production source pass `ident` (or `"literal"`) as the FIRST
+/// argument of a metrics emit macro?
+fn is_emitted_as(first_arg_matches: &dyn Fn(&str) -> bool, sources: &[(PathBuf, String)]) -> bool {
+    for macro_name in ["counter!(", "gauge!(", "histogram!("] {
+        for (_, compact) in sources {
+            for (at, _) in compact.match_indices(macro_name) {
+                let rest = &compact[at + macro_name.len()..];
+                // The first argument ends at the first `,` or the closing `)`.
+                let stop = rest
+                    .find(|c| c == ',' || c == ')')
+                    .unwrap_or(rest.len().min(120));
+                if first_arg_matches(&rest[..stop]) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn every_alarm_metric_reaches_an_emit_or_a_declared_route() {
+    let sources = production_sources();
+    assert!(
+        sources.len() > 50,
+        "ratchet self-check: production source walk returned {} files — the \
+         crates/ walk or the tests/ filter is broken, and a guard that reads \
+         nothing passes everything",
+        sources.len()
+    );
+
+    let names = every_tf_metric_name();
+    assert!(
+        names.len() >= 30,
+        "ratchet self-check: only {} tv_* metric names found across the \
+         terraform tree — the previous measurement was ~45, so the parser or \
+         the directory walk has regressed",
+        names.len()
+    );
+
+    let log_derived = log_filter_derived_names();
+
+    // Metrics published by a Lambda through PutMetricData rather than by the
+    // app through a metrics macro. Scoped to the lambda crate so an ordinary
+    // app metric can never be excused this way.
+    let lambda_sources: Vec<(PathBuf, String)> = sources
+        .iter()
+        .filter(|(p, _)| p.to_string_lossy().contains("/aws-lambdas/"))
+        .cloned()
+        .collect();
+
+    // DORMANT: alarmed on purpose ahead of its producer. Each entry needs a
+    // reason, and the anti-drift assertions below delete it the moment the
+    // reason stops being true.
+    let dormant: &[(&str, &str)] = &[(
+        "tv_order_fill_lag_seconds",
+        "order fill lag — the order path is paper-mode; declared dormant in \
+         alarm_metric_has_a_route_guard.rs and cloudwatch_dormant_alarms_guard.rs",
+    )];
+
+    let mut missing = Vec::new();
+    for name in &names {
+        // An entry ending in `_` came from a terraform-interpolated name, so it
+        // is a PREFIX covering every concrete metric that template expands to
+        // (`tv_errcode_` → `tv_errcode_hot_path_02`, and every other coded
+        // error). Anything else must match exactly — a full metric name used
+        // as a prefix would silently excuse its neighbours.
+        if log_derived
+            .iter()
+            .any(|d| d == name || (d.ends_with('_') && name.starts_with(d.as_str())))
+        {
+            continue;
+        }
+        if dormant.iter().any(|(d, _)| d == name) {
+            continue;
+        }
+        let literal = format!("\"{name}\"");
+        if is_emitted_as(&|arg: &str| arg == literal, &sources) {
+            continue;
+        }
+        let aliases = const_aliases_for(name, &sources);
+        if aliases
+            .iter()
+            .any(|ident| is_emitted_as(&|arg: &str| arg_names(arg, ident), &sources))
+        {
+            continue;
+        }
+        if lambda_sources
+            .iter()
+            .any(|(_, compact)| compact.contains(&literal))
+        {
+            continue;
+        }
+        missing.push(name.clone());
+    }
+
+    assert!(
+        missing.is_empty(),
+        "DEAD MONITOR: these terraform metrics have no emit macro (literal or \
+         const), are not log-filter-derived, are not published by a Lambda, and \
+         are not declared dormant. An alarm on such a metric sits permanently \
+         green over a signal nothing writes — the exact false-OK this \
+         repository has retired twice. Missing: {missing:?}"
+    );
+
+    // Anti-drift on the dormant list: an entry that gained a producer, or whose
+    // alarm was deleted, must be removed rather than left as a standing excuse.
+    for (name, reason) in dormant {
+        assert!(
+            names.iter().any(|n| n == name),
+            "dormant entry `{name}` is no longer a terraform metric — delete it \
+             from this list ({reason})"
+        );
+        let literal = format!("\"{name}\"");
+        assert!(
+            !is_emitted_as(&|arg: &str| arg == literal, &sources),
+            "dormant entry `{name}` has a live emit site now — delete it from \
+             this list ({reason})"
+        );
+    }
+}
+
+#[test]
+fn the_dead_monitor_check_resolves_consts_not_just_literals() {
+    // Anti-vacuity. `tv_dhan_feed_stack_up` is emitted ONLY through the const
+    // `FEED_STACK_UP_GAUGE`; if const resolution silently stopped working, the
+    // test above would report it (and ten of its neighbours) as dead monitors
+    // rather than passing — a loud failure, but for the wrong reason. This
+    // pins the mechanism itself, so a resolution regression is diagnosed here
+    // instead of read as eleven real defects.
+    let sources = production_sources();
+
+    let literal = "\"tv_dhan_feed_stack_up\"".to_string();
+    assert!(
+        !is_emitted_as(&|arg: &str| arg == literal, &sources),
+        "tv_dhan_feed_stack_up is expected to be emitted through a const, not a \
+         literal — if it gained a literal emit, pick another const-only metric \
+         for this self-test"
+    );
+
+    let aliases = const_aliases_for("tv_dhan_feed_stack_up", &sources);
+    assert!(
+        !aliases.is_empty(),
+        "const resolution found no identifier bound to tv_dhan_feed_stack_up — \
+         the declaration parser has regressed"
+    );
+    assert!(
+        aliases
+            .iter()
+            .any(|ident| is_emitted_as(&|arg: &str| arg_names(arg, ident), &sources)),
+        "const resolution found {aliases:?} but none is passed to an emit macro \
+         — the macro-argument matcher has regressed"
+    );
+
+    // A name nothing declares must resolve to nothing, or the parser is
+    // matching on something other than the name.
+    assert!(
+        const_aliases_for("tv_guard_vacuity_sentinel_comment_only_total", &sources).is_empty(),
+        "const resolution invented an alias for a metric that is not declared"
+    );
+}
