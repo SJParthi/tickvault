@@ -441,6 +441,21 @@ impl AggregatorCell {
             self.last_observed_ts = tick.exchange_timestamp;
         }
 
+        // A packet claiming a session high BELOW its own session low is
+        // internally impossible, so it is evidence the frame is corrupt. The
+        // monotone marks below already make it harmless — neither value can
+        // win its comparison against a mark on the correct side — but harmless
+        // is not the same as seen. Without this the only self-contradictory
+        // signal the feed can produce leaves no trace anywhere, and a rising
+        // rate of it (a decode drift, a vendor change) would be invisible
+        // until something downstream broke for a reason nobody could name.
+        if usable_exchange_price(tick.day_high)
+            && usable_exchange_price(tick.day_low)
+            && tick.day_high < tick.day_low
+        {
+            metrics::counter!("tv_candle_session_extremes_inverted_total").increment(1);
+        }
+
         if usable_exchange_price(tick.day_high) {
             if tick.day_high > self.last_seen_day_high {
                 // A first observation has `last_seen_day_high == 0.0`, so it
@@ -1116,12 +1131,32 @@ fn fold_in_bucket(
     if price < state.low {
         state.low = price;
     }
-    state.close = price;
-    state.close_ts_ist_secs = tick.exchange_timestamp;
-    // saturating_sub guards the rare out-of-order tick whose cumulative is
-    // below the bucket-start snapshot.
-    state.volume = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
-    state.oi = i64::from(tick.open_interest);
+    // ORDER GUARD (2026-08-25, permutation sweep). `fold_late_hlc` — the
+    // SEALED-bucket path — has always had this test; the OPEN-bucket path did
+    // not, so an out-of-order packet arriving inside a still-open bucket
+    // overwrote `close` with an EARLIER price and moved `close_ts` backwards.
+    // Two paths, two policies, and only one of them was right.
+    //
+    // The damage scaled with the bucket: on a 1-minute bar the window is 60
+    // seconds, but on the daily bar it is the whole session, so ANY reordered
+    // packet could rewrite the day's close — making it whichever packet
+    // arrived last rather than the one that traded last. `>=` is deliberate:
+    // many packets share one LTT second, and within a second last-write-wins
+    // is the pre-existing, correct behaviour.
+    if tick.exchange_timestamp >= state.close_ts_ist_secs {
+        state.close = price;
+        state.close_ts_ist_secs = tick.exchange_timestamp;
+        // Open interest is a point-in-time reading, so it belongs to the same
+        // "latest packet" question as the close. A stale packet's OI is simply
+        // an older reading, never news.
+        state.oi = i64::from(tick.open_interest);
+    }
+    // Exchange cumulative volume only ever rises, so a bucket's traded volume
+    // is monotone too. `saturating_sub` alone bounded the arithmetic but still
+    // let a stale packet SHRINK the bar's volume below a figure we had already
+    // observed. Taking the maximum keeps the highest cumulative actually seen.
+    let bucket_volume = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
+    state.volume = state.volume.max(bucket_volume);
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
     // baseline captured earlier in the session. The widened fields are `0.0`
@@ -2728,5 +2763,155 @@ mod permutation_regression_tests {
             "a silent packet must not license attribution it cannot support"
         );
         let _ = DAY;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open-bucket ordering (2026-08-25)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod open_bucket_ordering_tests {
+    use super::tests::{OPEN, tick_at};
+    use super::*;
+
+    /// Feeds a tick straight into one timeframe, as a caller with no session
+    /// extremes to report would.
+    fn fold(cell: &mut AggregatorCell, tf: TfIndex, tick: &ParsedTick, cum: u64) {
+        cell.consume_tick(tf, tick, 0, FeedStrategy::DEFAULT, cum);
+    }
+
+    #[test]
+    fn an_out_of_order_packet_inside_an_open_bucket_cannot_rewrite_the_close() {
+        // `fold_late_hlc` — the SEALED-bucket path — has always refused to let
+        // an earlier packet clobber a later close. The OPEN-bucket path did
+        // not, so a reordered packet arriving before its bucket sealed
+        // overwrote `close` with a stale price and moved `close_ts` backwards.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 40, 110.0, 30), 30);
+        // Reordered: an EARLIER tick arrives after the later one.
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 20, 101.0, 15), 15);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.close,
+            f32_to_f64_clean(110.0),
+            "the close must be the LATEST traded price, not the last packet to arrive"
+        );
+        assert_eq!(
+            s.close_ts_ist_secs,
+            OPEN + 40,
+            "and its timestamp must never move backwards"
+        );
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(110.0),
+            "the stale packet's price still counts toward the range"
+        );
+    }
+
+    #[test]
+    fn the_daily_bars_close_survives_reordering_across_the_whole_session() {
+        // The same defect, at the scale where it hurt most. A 1-minute bucket
+        // gives a reordered packet a 60-second window to do damage; the daily
+        // bucket gives it the entire session, so ANY reordered packet could
+        // rewrite the day's close.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::D1, &tick_at(OPEN, 100.0, 10), 10);
+        fold(
+            &mut cell,
+            TfIndex::D1,
+            &tick_at(OPEN + 5 * 3600, 250.0, 900),
+            900,
+        );
+        // Fifty minutes stale, arriving last.
+        fold(
+            &mut cell,
+            TfIndex::D1,
+            &tick_at(OPEN + 4 * 3600, 180.0, 700),
+            700,
+        );
+
+        let s = cell.snapshot(TfIndex::D1);
+        assert_eq!(
+            s.close,
+            f32_to_f64_clean(250.0),
+            "the day's close must be the last TRADE, not the last delivery"
+        );
+    }
+
+    #[test]
+    fn a_stale_packet_cannot_shrink_a_bars_volume() {
+        // Exchange cumulative volume only rises, so a bar's traded volume is
+        // monotone. `saturating_sub` bounded the arithmetic but still let a
+        // stale packet overwrite the bar with a SMALLER figure than one we had
+        // already observed.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 40, 110.0, 90), 90);
+        assert_eq!(cell.snapshot(TfIndex::M1).volume, 90, "fixture baseline");
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 20, 101.0, 40), 40);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            90,
+            "a stale cumulative must never reduce volume already observed"
+        );
+    }
+
+    #[test]
+    fn an_in_order_packet_still_advances_everything_it_should() {
+        // The positive control: the guard must NARROW behaviour, not freeze it.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        let mut later = tick_at(OPEN + 40, 110.0, 90);
+        later.open_interest = 4_242;
+        fold(&mut cell, TfIndex::M1, &later, 90);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.close, f32_to_f64_clean(110.0), "close advances");
+        assert_eq!(s.close_ts_ist_secs, OPEN + 40, "close timestamp advances");
+        assert_eq!(s.volume, 90, "volume advances");
+        assert_eq!(s.oi, 4_242, "open interest advances");
+        assert_eq!(s.tick_count, 2, "both ticks counted");
+    }
+
+    #[test]
+    fn two_packets_sharing_one_second_keep_last_write_wins() {
+        // LTT is whole seconds and many packets share one. `>=` preserves the
+        // pre-existing behaviour inside a second; `>` would have silently
+        // frozen the close at the first packet of every second.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 103.0, 20), 20);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).close,
+            f32_to_f64_clean(103.0),
+            "within one second the later-arriving packet is the close"
+        );
+    }
+
+    #[test]
+    fn a_self_contradictory_session_range_is_counted_rather_than_ignored() {
+        // A packet whose session high sits BELOW its own session low is
+        // internally impossible. The monotone marks make it harmless, but
+        // harmless is not the same as seen.
+        let mut cell = AggregatorCell::empty();
+
+        let mut inverted = tick_at(OPEN + 10, 100.0, 10);
+        inverted.day_high = 50.0;
+        inverted.day_low = 150.0;
+        let delta = cell.observe_session_extremes(&inverted);
+        assert!(
+            delta.is_empty(),
+            "an inverted pair must never produce a widening"
+        );
     }
 }
