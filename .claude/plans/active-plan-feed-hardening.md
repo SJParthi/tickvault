@@ -1212,3 +1212,126 @@ exactly its 15,872-byte budget with **ZERO free** (measured, `dhan-rest-only-noi
 §2.3d-ii). Until the boot-path restructure that section describes, backpressure visibility
 must go via the metric-filter/log route (the §2.3d-i precedent), or the queue grows unseen
 — which for a backpressure queue is the worst possible blind spot.
+
+## ITEM 15 — MEASURED HOST TELEMETRY, and two corrections to my own earlier claims (2026-08-25)
+
+Operator challenged the depth of the audit: *"how did you check the entire memory as how much GB
+it is used and did you query from db and did you start the instance"*. He was right — memory had
+NOT been measured. It has now. Two things I previously reported are **WRONG** and are corrected
+here rather than quietly amended.
+
+### 15a — CORRECTION: the CPU is NOT idle. I read the wrong meter.
+
+Items 12-14 repeatedly state "CPU idles at 13-27%" and build the argument
+"this is I/O-bound, not CPU-bound" on it. That number is `AWS/EC2 CPUUtilization` — the
+HYPERVISOR view averaged across all 4 vCPUs. The in-guest CloudWatch agent, same window,
+same 300 s period, `CWAgent cpu_usage_active{cpu=cpu-total}`:
+
+| 2026-08-24 UTC | AWS/EC2 (hypervisor) | CWAgent (in-guest) |
+|---|---|---|
+| 04:00 | 40.9% | **66.7%** |
+| 04:30 | 23.4% | **67.7%** |
+| 04:45 | 19.9% | **69.7%** |
+| 04:55 | 21.1% | **67.9%** |
+
+The app and QuestDB are confined to a **2-core cpuset of 4 vCPUs** (`docker-compose.yml`
+`cpuset: "2,3"`, plus the systemd confinement), so the hypervisor average roughly halves the
+number the workload actually experiences. **Real sustained CPU is ~67%, not 13-27%.**
+
+This does not overturn the disk finding — the volume is still pinned at its 500 MiB/s ceiling —
+but it DOES overturn the framing. The box is near-saturated on **both** CPU and disk, and any
+claim of the form "there is CPU headroom, so the fix is X" must be re-derived. Recorded loudly
+because this repository's own O(1) table has twice recorded a stale number manufacturing a false
+finding, and this is the same class committed by me, in this plan, three times.
+
+### 15b — THE FINDING NOBODY HAD MEASURED: the disk reaches 80% every session
+
+`CWAgent disk_used_percent{path=/, device=nvme0n1p1, fstype=xfs}`, 2026-08-24:
+
+| IST | Used | % of 200 GB |
+|---|---|---|
+| 08:30 (boot) | 9 GB | 4.5% |
+| 11:30 | 82 GB | 41.1% |
+| 14:00 | 136 GB | 68.0% |
+| **15:00** | **160 GB** | **80.1%** |
+| 16:00 (post-retention) | 146 GB | 72.8% |
+| 20:00 | 160 GB | 79.9% |
+
+**~151 GB consumed in ONE nine-hour session**, with `depth_hot_days = 1` and
+`intraday_hot_days = 1` already at their FLOOR — there is no retention lever left to pull.
+
+At the authorized 24,600 instruments (~3x today's 8,315) this projects to **~450 GB against a
+200 GB volume**, i.e. **ENOSPC mid-session**. That is not a capacity inconvenience: on ENOSPC the
+`ws_frame_spill` append fails, `WalRingSink::accept` returns `WalDropped`, and **the frame is
+gone BEFORE the ring and BEFORE parse** — the durable floor is the first thing a full disk
+removes. Unrecoverable tick loss, which is precisely what the whole architecture exists to
+prevent.
+
+This also cross-checks the amplification: 4,744 GB written against ~151 GB retained is **~31x**,
+consistent with the ~25x derived independently in Item 13.
+
+### 15c — Memory is genuinely fine, and that is the answer to the operator's question
+
+| Measure | Value | Source |
+|---|---|---|
+| Host memory used | **3.00-4.07 GiB of 32 GiB (9.4-12.7%)** | `CWAgent mem_used_percent{InstanceId}` |
+| App process RSS | **0.31 GB** flat all session | `Tickvault/Prod tv_process_rss_bytes` |
+| Projected live structures at 24,600 | ~527 MB | space audit, Item 15e |
+
+Memory is NOT a constraint and is not close to being one. The r8g.xlarge's 32 GiB was bought for
+the 13-timeframe requirement and is barely touched.
+
+**Method note worth keeping:** the first query returned NOTHING and looked like "the CW agent
+publishes no host metrics" — a false finding I nearly reported. CloudWatch
+`get-metric-statistics` requires an EXACT dimension match; querying without `--dimensions` looks
+for a zero-dimension metric that does not exist. The metrics were there all along.
+
+### 15d — Observability: the operator cannot see 80% of what the system measures
+
+| Measure | Count | Source |
+|---|---|---|
+| `tv_*` metric names with a production producer | **373** | source scan |
+| Present in the CloudWatch EMF selector | **76** | `cloudwatch-agent.json` + `user-data.sh.tftpl`, byte-identical (lockstep holds) |
+| **Never reach the operator** | **~297 (80%)** | difference |
+
+Invisible today: universe health (`tv_dhan_universe_*`, `tv_dhan_live_universe_instruments`), the
+15:31 cross-verify outcome, indicator poisoning/slot exhaustion, order-budget refusals, load-shed
+transitions, seal rescue pressure. All are on the box's own `:9090/metrics` and nowhere else —
+and no new EMF name can ship until the `user-data.sh.tftpl` zero-byte-budget restructure.
+
+**EIGHT permanently-green dead monitors** — alarms or dashboard widgets whose metric has NO
+producer anywhere in `crates/*/src/`: `tv_order_fill_lag_seconds`, `tv_orders_placed_delta_total`,
+`tv_seal_writer_drain_dropped_total`, `tv_dlq_ticks_total`, `tv_spill_dropped_total`,
+`tv_websocket_pool_all_dead`, `tv_websocket_failed_connections_count`,
+`tv_aggregator_seals_emitted_total` (the live name is `tv_dhan_feed_seals_emitted_total` — a
+rename that orphaned its alarm). Every one reads as health.
+
+**~29 selected metrics carry a label whose distinction EMF destroys** (dimensions are
+`[["host"]]`, so labels are summed away). `tv_dhan_feed_drain_frames_total` merges TEN outcomes —
+folded, unparseable, write_failed, depth_unconsumed, truncated — into one number. The alarm fires
+and can never say why.
+
+### 15e — Two more space/storage findings from the same pass
+
+- **The SIXTH omission in the CLAUDE.md non-O(1) table: `oms/engine.rs:191 order_no_aliases`.**
+  `HashMap<String, String>`, `with_capacity(64)` (a PRE-SIZE, not a bound), inserted per broker
+  `order_no` on every re-index, cleared only by `reset_daily`. `MAX_TRACKED_ORDERS = 25_000`
+  counts `self.orders.len()` ONLY and never consults the alias map. **It was created by the very
+  2026-08-22 repair that added that cap**, and the table's row lists only
+  `{orders, super_orders, verify_states}`. Live in paper mode. Sixth time, same pattern: the
+  newest per-entity map is the one with no row.
+- **Depth has NO flush-failure rescue tier.** `ticks` gained a spill rescue after losing 1,377
+  ticks on 2026-08-21; `market_depth` did not — its own comment says *"These levels are gone from
+  the table"* (`depth_persistence.rs:584`). At 250 x 40 rows/s a single ILP timeout drops ~10k
+  rows. The raw frames survive in the WAL, but **nothing re-folds depth from them**.
+- **`candles_<tf>` DEDUP is `ts, security_id, segment, feed` with NO source discriminator**
+  (`shadow_persistence.rs:114`). Two writers stamping `feed='dhan'` silently upsert over each
+  other; this ALREADY happened (live lane vs `rest_candle_fold`), and the only thing preventing
+  it today is `enabled = false` in config — a config accident, not a key.
+
+### 15f — Still NOT done, stated plainly
+
+The instance has NOT been started and the database has NOT been queried. Every number above is
+CloudWatch or source. The DB questions — rows per table, whether `ticks.ts` is out of order,
+whether the refused ticks are the indices — remain open and are answered in one command by
+`scripts/diagnose-write-amplification.sh` once the box is up (08:30 IST, or on operator request).
