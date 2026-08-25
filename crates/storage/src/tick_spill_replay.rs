@@ -333,23 +333,29 @@ async fn run_replay_loop(dir: PathBuf, url: String) {
     // first round, and that ordering cost 1,695,983 ticks on the live box this
     // morning — permanently, in a single event.
     //
-    // The reconstructed sequence, from the box's own log and counters:
+    // The sequence, from the box's own log and counters:
     //
-    // | 08:32:12 | process starts; the boot WAL replay fills the tick buffer |
-    // | 08:33:44 | the flush fails; `discard_pending` tries to rescue; the
-    //              spill dir is refused with "at or past its 536870912-byte
-    //              cap"; **1,695,983 ticks dropped, `tv_ticks_spilled_total`
-    //              stays 0**, i.e. no rescue happened |
-    // | ~08:37:12 | this loop finally wakes and drains 544 MB — more than the
-    //              cap, so it had ample room to free, three and a half minutes
-    //              too late |
+    // | 08:31:09 | boot #1's WAL-replay flush fails; 1,774,802 rows are
+    //              RESCUED, writing 544,034,728 bytes — one rescue that alone
+    //              exceeds the 512 MiB ceiling |
+    // | 08:31:56 | the deploy swaps the binary; the process restarts, and this
+    //              loop's 300s timer restarts with it |
+    // | 08:33:44 | boot #2's flush fails; the rescue is REFUSED, "at or past
+    //              its 536870912-byte cap"; 1,695,983 ticks dropped and
+    //              `tv_ticks_spilled_total` stays 0 |
+    // | ~08:37:12 | this loop finally wakes and drains that 544 MB — two and a
+    //              half minutes after the room it would have freed was needed |
     //
-    // Boot is the WORST possible moment to be asleep: a backlog on disk at
-    // boot is not a coincidence, it is the DEFINING case — yesterday's
-    // undrained spill is sitting there by construction, and the boot WAL
-    // replay is simultaneously the largest single flush the process ever
-    // attempts. So the one moment the dir is most likely to be at cap is the
-    // one moment the drainer had guaranteed itself to be idle.
+    // Note what the backlog actually WAS: not yesterday's leftover, but the
+    // first boot's own successful rescue, 2.5 minutes earlier. A restart
+    // during boot therefore produces two large rescues in quick succession
+    // while this timer is resetting through both of them.
+    //
+    // Boot is the WORST possible moment to be asleep. The boot WAL replay is
+    // the largest single flush the process ever attempts, so it is both the
+    // most likely rescue to be needed AND the one most likely to find the
+    // directory already occupied — and a deploy restart, which is exactly when
+    // boots happen twice, resets this timer each time.
     //
     // The interval is unchanged and its reasoning still holds: a spill exists
     // because QuestDB was already too slow, so steady-state draining stays
@@ -614,15 +620,18 @@ mod tests {
     #[test]
     fn the_drain_loop_replays_before_it_sleeps() {
         // 2026-08-25. This loop slept `REPLAY_INTERVAL_SECS` BEFORE its first
-        // round, and that ordering cost 1,695,983 ticks on the live box in a
-        // single event: the process started 08:32:12, the boot WAL replay's
-        // flush failed at 08:33:44, the rescue was refused with "tick spill
-        // dir at or past its 536870912-byte cap", and this loop woke at
-        // ~08:37:12 and freed 544 MB — three and a half minutes too late.
+        // round, and that ordering contributed to losing 1,695,983 ticks on
+        // the live box in a single event: boot #1's WAL-replay flush was
+        // rescued at 08:31:09, writing 544 MB; the deploy restarted the
+        // process at 08:31:56, resetting this timer; boot #2's flush at
+        // 08:33:44 was then REFUSED with "tick spill dir at or past its
+        // 536870912-byte cap"; and this loop woke at ~08:37:12 and freed that
+        // same 544 MB, minutes after the room was needed.
         //
-        // Boot is precisely when a backlog is GUARANTEED to be on disk
-        // (yesterday's undrained spill) and when the largest single flush of
-        // the process is attempted. Sleeping through it is exactly backwards.
+        // Boot is precisely when the largest single flush of the process is
+        // attempted, and a deploy restart makes boots happen twice in quick
+        // succession while this timer resets through both. Sleeping through
+        // that is exactly backwards.
         //
         // Swap the two statements back and this test fails.
         let src = include_str!("tick_spill_replay.rs");
