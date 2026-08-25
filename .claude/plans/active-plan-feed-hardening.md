@@ -67,12 +67,49 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Tests: `boot_limit_assertion_guard.rs`
 
 - [ ] **Item 3 — Empty-subscription + partial-subscribe detectors (scenario #75, #62)**
-  - At T+90s after subscribe, assert `frames_received > 0` **per instrument class**;
-    force-cycle the slot and page if a class is dead.
-  - Maintain `expected: HashSet<(sid, segment)>`; at T+120s diff against first-seen.
-    Auto-resubscribe the delta on a spare slot, max 3 rounds, then page **with the list**.
-  - Files: `crates/core/src/websocket/pool_supervisor.rs`
-  - Tests: `subscribe_ack_reconciliation_guard.rs`
+  — **HALF DONE 2026-08-25.** Split below rather than ticked whole: the detection
+  half shipped, the auto-remediation half did not, and one tick on the parent
+  would claim both.
+
+  - [x] **3a — dead-instrument-CLASS detector (DONE 2026-08-25)**
+    - Folds a per-`ExchangeSegment` liveness tally into the silence sweep that
+      already runs every 30s — no second O(n) pass. A segment where every
+      non-sparse instrument is still never-ticked past its warmup window emits
+      `tv_dhan_feed_dead_instrument_class_total{segment}` + the
+      `tv_dhan_feed_dead_instrument_classes` gauge, edge-latched once per
+      episode.
+    - Catches the **2026-08-21 incident directly**: 119 NSE indices subscribed,
+      zero ticks all session, 8,868 tradeables flowing normally. The
+      per-instrument gauge read 119-of-~9,000 — under 1.5%, indistinguishable
+      from thin-instrument quiet — and nothing paged. A human found it.
+    - Files: `crates/app/src/dhan_feed_stack.rs`
+    - Tests: 9 in `dhan_feed_stack::tests` (7 unit on `ClassLiveness`, 1 tally
+      invariant, 1 end-to-end through the live sweep).
+    - **Log-sink-only.** No Telegram page: the Dhan alert family is fixed at
+      four items by `dhan-rest-only-noise-lock-2026-07-14.md` §2 and a fifth
+      needs a dated operator quote there FIRST. The counter and gauge are what
+      an alarm would later read.
+    - **Two findings recorded from bite-testing, both corrections to my own
+      claims:** (1) the `pending == 0` term in `is_dead` is REDUNDANT —
+      implied by `never == eligible` given the fold — so mutating it away
+      changes no verdict; kept for intent, with a test pinning the invariant
+      it rests on. (2) The healthy-class test does NOT guard the
+      `counts_toward_alarm()` denominator trap as its first comment claimed;
+      `a_single_ticking_instrument_keeps_its_class_alive` is the test that
+      actually bites on it. Both comments corrected.
+
+  - [ ] **3b — expected-vs-first-seen delta + auto-resubscribe (NOT DONE)**
+    - Maintain `expected: HashSet<(sid, segment)>`; at T+120s diff against
+      first-seen. Auto-resubscribe the delta on a spare slot, max 3 rounds,
+      then page **with the list**.
+    - **Deliberately deferred, not forgotten.** 3a is pure observation over an
+      existing sweep. This half CHANGES LIVE SUBSCRIBE BEHAVIOUR — it dials a
+      spare slot, so it interacts with the 16-connection budget, `plan_pool`'s
+      fail-closed whole-pool refusal, and the 09:12 pre-open deadline. That
+      deserves its own design pass and its own PR rather than riding along
+      with a detector.
+    - Files: `crates/core/src/websocket/pool_supervisor.rs`
+    - Tests: `subscribe_ack_reconciliation_guard.rs`
 
 - [ ] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
   - Restart at 80% memory, before the kernel's killer decides.
