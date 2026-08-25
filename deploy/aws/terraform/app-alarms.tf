@@ -372,7 +372,7 @@ resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "disk_fill_rate_high" {
   alarm_name          = "tv-${var.environment}-disk-fill-rate-high"
-  alarm_description   = "Root volume is FILLING at more than 4 percentage points per day, sustained across two consecutive 6-hour windows (~12h). This is the early warning: at this rate the headroom below the 90% ceiling is gone inside about a working week, so grow the volume in a maintenance window rather than mid-session. FIRST check whether retention is running at all - the 2026-08-25 state was 1,000 archive attempts, all failed, zero partitions ever dropped, which is a fill trend with a fixable cause: SELECT outcome, count() FROM partition_archive_audit. If archival is healthy and the trend is real ingest growth, grow gp3 online (scripts/aws-upgrade-instance.sh --ebs-size N, then growpart + xfs_growfs) - it can never shrink, so go up in steps. Companion ceiling alarm: tv-<env>-disk-used-high."
+  alarm_description   = "Root volume is FILLING at more than 4 percentage points per day, sustained across two consecutive 1-hour windows (~2h). This is the early warning: at this rate the headroom below the 90% ceiling is gone inside about a working week, so grow the volume in a maintenance window rather than mid-session. FIRST check whether retention is running at all - the 2026-08-25 state was 1,000 archive attempts, all failed, zero partitions ever dropped, which is a fill trend with a fixable cause: SELECT outcome, count() FROM partition_archive_audit. If archival is healthy and the trend is real ingest growth, grow gp3 online (scripts/aws-upgrade-instance.sh --ebs-size N, then growpart + xfs_growfs) - it can never shrink, so go up in steps. Companion ceiling alarm: tv-<env>-disk-used-high."
   comparison_operator = "GreaterThanThreshold"
   threshold           = 4
   evaluation_periods  = 2
@@ -385,9 +385,28 @@ resource "aws_cloudwatch_metric_alarm" "disk_fill_rate_high" {
   # the volume is still fuller than it was (Rule 11, no false recovery).
   ok_actions = []
 
+  # PERIOD IS CAPPED BY AWS, NOT CHOSEN (2026-08-25).
+  #
+  # This alarm shipped in #1805 with period = 21600 (6h) x 2 evaluations = 12h,
+  # and EVERY terraform apply since has failed on it:
+  #
+  #   ValidationError: MetricsInsights monitors cannot be checked across
+  #   more than 3 hours
+  #
+  # A Metrics Insights alarm (the `SELECT ... FROM "CWAgent"` expression below)
+  # is capped at a 3-hour evaluation range. 1h x 2 = 2h is safely under it.
+  #
+  # The failure was invisible before it shipped, and that is the reusable part:
+  # `terraform plan` VALIDATED this resource fine. A Metrics Insights window is
+  # checked only by the real PutMetricAlarm call at APPLY time - the same shape
+  # as a CloudWatch filter PATTERN, which plan also treats as an opaque string.
+  # So the apply lane was red from the moment #1805 merged, and every terraform
+  # change merged after it sat on main UNDEPLOYED, because terraform stops at
+  # the first failing resource. Pinned by
+  # `metrics_insights_alarms_stay_inside_the_three_hour_cap`.
   metric_query {
     id          = "disk_pct"
-    period      = 21600
+    period      = 3600
     return_data = false
     expression  = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}' AND path = '/'"
   }
