@@ -293,7 +293,32 @@ impl OrderManagementSystem {
     /// Called beside `rate_limiter.check()` on every placement path so a
     /// refusal costs no API call and creates no order.
     fn check_order_book_capacity(&self) -> Result<(), OmsError> {
-        let tracked = self.orders.len();
+        // Counts the alias map TOO, not just `orders`.
+        //
+        // The constant's own doc above says the re-index "can hold a second
+        // entry for the same order, so the true figure is worse than the count
+        // of orders placed" -- and then the check counted `orders` alone, so
+        // the ceiling it advertised was never the ceiling it enforced.
+        // `order_no_aliases` is inserted per broker `order_no` on the
+        // `handle_order_update` re-index path and cleared only by
+        // `reset_daily`, exactly like `orders`, so it grows on the same axis
+        // and belongs in the same bound.
+        //
+        // Summing both makes the advertised bound truthful. It does NOT
+        // meaningfully narrow the usable book: the vendor's daily ceiling is
+        // 7,000 orders (`OrderBudget`), and an order contributes at most one
+        // alias, so a legitimate day reaches ~14,000 entries against 25,000 --
+        // the refusal still cannot fire before the vendor's own limit does.
+        //
+        // Refusing the PLACEMENT (rather than the alias insert) stays the
+        // correct direction for the reason the doc above gives: no order
+        // exists yet to be lost. Refusing an alias insert would be strictly
+        // worse -- a later update arriving under the broker's new `order_no`
+        // would fail to resolve to its tracked order.
+        let tracked = self
+            .orders
+            .len()
+            .saturating_add(self.order_no_aliases.len());
         if tracked >= Self::MAX_TRACKED_ORDERS {
             metrics::counter!("tv_oms_order_book_full_total").increment(1);
             tracing::error!(
@@ -8650,6 +8675,65 @@ mod tests {
             make_reconcile_order("O1", OrderStatus::Pending),
         );
         assert!(oms.check_order_book_capacity().is_ok());
+    }
+
+    #[test]
+    fn the_alias_map_counts_toward_the_order_book_ceiling() {
+        // MAX_TRACKED_ORDERS' own doc says the re-index "can hold a second
+        // entry for the same order, so the true figure is worse than the count
+        // of orders placed" -- and the check counted `orders` alone, so the
+        // ceiling it advertised was not the ceiling it enforced.
+        //
+        // `order_no_aliases` is inserted per broker `order_no` on the
+        // `handle_order_update` re-index path and cleared only by
+        // `reset_daily`, so it grows on the SAME axis as `orders`. Half the
+        // ceiling in each map must therefore refuse, exactly as a full
+        // `orders` map does.
+        let mut oms = capacity_test_oms();
+        let half = OrderManagementSystem::MAX_TRACKED_ORDERS / 2;
+        for i in 0..half {
+            oms.orders.insert(
+                format!("O{i}"),
+                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
+            );
+            oms.order_no_aliases
+                .insert(format!("BROKER{i}"), format!("O{i}"));
+        }
+
+        // Neither map is individually at the ceiling -- the OLD check passed here.
+        assert!(oms.orders.len() < OrderManagementSystem::MAX_TRACKED_ORDERS);
+        assert!(oms.order_no_aliases.len() < OrderManagementSystem::MAX_TRACKED_ORDERS);
+
+        match oms.check_order_book_capacity() {
+            Err(OmsError::OrderBookFull { tracked, max }) => {
+                assert_eq!(tracked, half * 2, "both maps must be counted");
+                assert_eq!(max, OrderManagementSystem::MAX_TRACKED_ORDERS);
+            }
+            other => panic!("expected OrderBookFull once the SUM reaches the cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_legitimate_vendor_capped_day_never_trips_the_summed_ceiling() {
+        // The summed bound must not narrow the usable book. The vendor's daily
+        // ceiling is 7,000 orders, and an order contributes at most one alias,
+        // so the worst legitimate day is ~14,000 entries against 25,000. If
+        // this ever fails, the refusal would fire before the vendor's own
+        // limit does, which would be a regression rather than a safeguard.
+        let mut oms = capacity_test_oms();
+        const VENDOR_DAILY_ORDER_CEILING: usize = 7_000;
+        for i in 0..VENDOR_DAILY_ORDER_CEILING {
+            oms.orders.insert(
+                format!("O{i}"),
+                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
+            );
+            oms.order_no_aliases
+                .insert(format!("BROKER{i}"), format!("O{i}"));
+        }
+        assert!(
+            oms.check_order_book_capacity().is_ok(),
+            "a full vendor-capped day must still be admitted"
+        );
     }
 
     #[test]
