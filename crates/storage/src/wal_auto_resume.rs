@@ -416,9 +416,8 @@ mod tests {
         assert_eq!(build_resume_sql("has-dash"), None);
         assert_eq!(build_resume_sql("1leading_digit"), None);
         assert_eq!(build_resume_sql(&"x".repeat(129)), None);
-        assert_eq!(
+        assert!(
             build_resume_sql(&"x".repeat(128)).is_some(),
-            true,
             "the bound is inclusive"
         );
     }

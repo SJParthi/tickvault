@@ -23,6 +23,14 @@
 #   2 = regression breach (>max_regression_pct, CI-lower-bound confident) —
 #       wins over 1 when both breach, so a regressed run can never be
 #       mistaken for a mere hardware-calibration misfit.
+#   3 = NOTHING WAS MEASURED (2026-08-24, fail-closed) — either no Criterion
+#       estimates were found at all, or none of the benches found matched a
+#       budget key, so ZERO absolute latency budgets were enforced. Distinct
+#       from 1 and 2 so the bench.yml baseline-ratchet condition
+#       (gate_rc != 2) is unchanged, while the run still fails loudly.
+#       Both shapes previously exited 0 and printed a success line — the
+#       false-OK class audit-findings Rule 11 forbids. Bite-proven in both
+#       directions by scripts/bench-gate.selftest.sh cases H and I.
 #
 # Regression semantics: a benchmark FAILS the regression arm only when the
 # LOWER bound of Criterion's 95% confidence interval for the mean change
@@ -115,8 +123,17 @@ echo ""
 ESTIMATE_FILES=$(find "$CRITERION_DIR" -name "estimates.json" -path "*/new/*" 2>/dev/null || true)
 
 if [ -z "$ESTIMATE_FILES" ]; then
-  echo "INFO: No benchmark estimates found — skipping."
-  exit 0
+  # FAIL-CLOSED (2026-08-24, audit): an empty Criterion tree means the benches
+  # never ran or never produced output, so NO latency budget was enforced.
+  # Exiting 0 here reported success from a measurement that did not happen —
+  # the false-OK class audit-findings Rule 11 forbids. The sibling gate
+  # scripts/coverage-gate.sh was fixed this way on 2026-07-10 (adversarial
+  # review, HIGH) with self-test case 4; the fix was never propagated here.
+  echo "ERROR: No benchmark estimates found under $CRITERION_DIR."
+  echo "       ZERO latency budgets were enforced — this run proves nothing."
+  echo "       Likely causes: cargo bench did not run, failed to build, or its"
+  echo "       Criterion output was not restored into the expected directory."
+  exit 3
 fi
 
 
@@ -345,8 +362,19 @@ $1 == "C" {
 }
 END {
   if (died) exit 1
-  if (checked == 0)
-    print "  INFO: No benchmarks matched budget entries — gate passed (no violations)."
+  # FAIL-CLOSED (2026-08-24, audit): checked counts benches that matched a
+  # budget key. At zero, NO absolute latency budget was enforced, so the run
+  # proves nothing. The pre-fix behaviour printed an INFO line and fell
+  # through to exit 0 — a green verdict from an empty comparison. Exit 3 is
+  # deliberately distinct from 1 (absolute breach) and 2 (regression), so the
+  # bench.yml baseline-ratchet condition (gate_rc != 2) is unchanged while the
+  # run still fails loudly.
+  if (checked == 0) {
+    print "  ERROR: No benchmark matched any budget key in quality/benchmark-budgets.toml."
+    print "         ZERO absolute latency budgets were enforced — this run proves nothing."
+    print "         Likely cause: a Criterion bench id drifted away from its budget key."
+    exit 3
+  }
 
   # ---- hardware-drift classification (2026-08-07) --------------------------
   # A CODE regression hits a FEW RELATED benchmarks. A runner/toolchain change

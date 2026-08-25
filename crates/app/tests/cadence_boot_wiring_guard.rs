@@ -159,7 +159,8 @@ fn test_cadence_boot_module_gate_guard_and_real_executors() {
     // lanes again (fix round 2026-07-17): feeds.dhan_enabled /
     // feeds.groww_enabled are FALSE in shipped config and runtime
     // enable is 409'd — gating on them means zero market-data capture.
-    for banned in ["dhan_flag()"] {
+    {
+        let banned = "dhan_flag()";
         assert!(
             !src.contains(banned),
             "cadence_boot.rs must NOT gate the cadence lanes on the \
@@ -270,7 +271,8 @@ fn test_cadence_deps_lane_assignment_is_pinned() {
     //     silently cross-wire the lanes past pin (a).
     let stripped = strip_line_comments(&app_src("src/cadence_boot.rs"));
     let flat = normalize_ws(&stripped);
-    for binding in ["let dhan_executor = match DhanCadenceExecutor::new("] {
+    {
+        let binding = "let dhan_executor = match DhanCadenceExecutor::new(";
         assert!(
             flat.contains(binding),
             "cadence_boot.rs must construct the lane binding `{binding}` — \
@@ -282,14 +284,16 @@ fn test_cadence_deps_lane_assignment_is_pinned() {
         .find("CadenceRunnerDeps {")
         .expect("cadence_boot.rs must construct CadenceRunnerDeps");
     let window = &flat[deps_at..(deps_at + 1500).min(flat.len())];
-    for field in ["dhan_executor,"] {
+    {
+        let field = "dhan_executor,";
         assert!(
             window.contains(field),
             "the CadenceRunnerDeps construction must wire `{field}` via \
              field shorthand (the pinned lane bindings)."
         );
     }
-    for rebind in ["dhan_executor:"] {
+    {
+        let rebind = "dhan_executor:";
         assert!(
             !window.contains(rebind),
             "the CadenceRunnerDeps construction must NOT rebind \

@@ -1,6 +1,10 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["fuzz", "crates/frontend-wasm"]
+# `crates/frontend-wasm` was removed from this list on 2026-08-24: the path does
+# not exist and carries zero tracked files, so the entry excluded nothing. A stale
+# exclusion is the same class as a stale rule-file row -- it reads as a live
+# carve-out to anyone auditing the Rust-only boundary.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

@@ -2285,7 +2285,8 @@ mod tests {
         // the routed emitters are once-per-episode edge-latched, so an
         // event-less Down bubble here is a STILL-FAILING incident. Only a
         // Resolve edge may close it while the envelope holds.
-        for family in [EpisodeFamily::DhanRest] {
+        {
+            let family = EpisodeFamily::DhanRest;
             let k = EpisodeKey { family, conn: 1 };
             let reg = EpisodeRegistry::new();
             let opened = ist_ms(9, 30);
