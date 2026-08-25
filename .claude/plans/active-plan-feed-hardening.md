@@ -877,6 +877,65 @@ overturn conclusions the source audit reached.
 
 | Reading | Value |
 |---|---|
+| Instance | `i-0c3fe906dad5492fc`, r8g.xlarge, ap-south-1b, stopped at time of read |
+| Peak memory | **12.7% of 32 GiB ≈ 4.1 GB** — retires the long-standing UNMEASURED memory flag |
+| Peak CPU | 46%, session average 13–23% |
+| Free spill disk | 208.8 GB |
+| WebSocket connections alive | **15** |
+| Ticks dropped / WAL frames dropped / seals dropped | **0 / 0 / 0** |
+| Candles sealed | **1,002,896** |
+| Depth rows | 2,883,880 |
+| Instruments never ticked | 0 (745 went silent later — normal for illiquid strikes) |
+| **Ticks REFUSED by the aggregator** | **49,112**, and a 120-episode sample shows **100% timestamp refusals** — `refused_price = 0`, `refused_slot_exhausted = 0` |
+| `AGGREGATOR-DROP-01` episodes | **713** in one session — roughly one every 30s, all day |
+
+**The refusal finding is the important one and it is new.** `MIN_PLAUSIBLE_EXCHANGE_TS_SECS`
+(1_600_000_000) refuses any tick whose exchange timestamp is below 2020-09-13, which is what
+a never-traded instrument's `LTT = 0` sentinel looks like. So ~49k packets per session are
+dropped before the fold and never become a candle.
+
+The persistence layer disagrees with the aggregator about the same packet:
+`row_timestamp_ist_nanos` deliberately falls back to the RECEIPT time for a sentinel LTT and
+stores the row, while the aggregator refuses it outright. **The tick is kept; the candle is
+not.** That is one packet, two policies, and it is a coherent explanation for OHLC gaps on
+illiquid instruments — which is exactly the symptom the operator reported independently.
+
+Also live-verified: **23 of the 76 EMF-declared metrics have never published a datapoint**,
+and two alarms (`tv-prod-ticks-lost-spill`, `tv-prod-wal-frames-not-recovered`) sit on
+metrics with no series — they read OK because nothing has ever arrived, not because
+something was checked. `mem_used_percent` publishes under CWAgent with an `InstanceId`
+dimension; `tv_process_rss_bytes` does not publish at all.
+
+---
+
+## ⚠ MERGE NOTE 2026-08-25 — TWO different sections were both numbered "Item 12"
+
+`main` and the feed-hardening branch each appended an **Item 12** on
+consecutive days, to different work. Both are kept, in date order, and
+NEITHER is renumbered — the body text inside each block cross-references its
+own item numbers, so renumbering the headings alone would leave every one of
+those references pointing at the wrong section, which is worse than the
+collision it would fix.
+
+| Which | Dated | Subject | Where |
+|---|---|---|---|
+| **Item 12 (gates)** | 2026-08-24 | "Close the gates that could pass while measuring nothing" — 12b arming deferred, 12f live-box readings | the block ABOVE this note |
+| **ITEM 12 (disk/O(1))** | 2026-08-25 | the ~25× write-amplification finding, the zero-timestamp false tick-loss page, and the O(1) track that continues into ITEMs 13–16 | the block BELOW this note |
+
+**Reading rule:** inside each block, "Item 12" means THAT block's Item 12.
+ITEMs 13, 14, 15 and 16 are unambiguous — they exist only in the lower block
+and continue from ITEM 12 (disk/O(1)).
+
+---
+## ITEM 12 — DESIGN ADDENDUM (added 2026-08-25, operator: "yes fix and resolve evrythgi. see what the fuk is this bro when we have only 200 GB but how come this is comign around thsi much dude still i cant beleieve bro liek 4 tb how bro how can we resolve this dude?")
+
+Two findings from the 2026-08-24 live-AWS sweep. Both are LIVE defects on the running
+lane, not latent ones, which is what separates this item from Item 11.
+
+### The measurement that opened it (Verified, live CloudWatch, session 2026-08-24)
+
+| Reading | Value |
+|---|---|
 | `VolumeWriteBytes`, 03:00–12:00 UTC | **4,744 GB** |
 | `VolumeReadBytes`, same window | 672 GB |
 | Sustained throughput 09:30–15:30 IST | **495–500 MB/s** against a 500 MiB/s ceiling |

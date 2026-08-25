@@ -1166,39 +1166,56 @@ fn fold_in_bucket(
     if price < state.low {
         state.low = price;
     }
-    state.close = price;
-    state.close_ts_ist_secs = tick.exchange_timestamp;
-    // MONOTONIC WITHIN THE BUCKET — this was LAST-WRITE-WINS and that was a
-    // live data-corruption defect (measured 2026-08-24).
+    // ORDER GUARD (2026-08-25, permutation sweep). `fold_late_hlc` — the
+    // SEALED-bucket path — has always had this test; the OPEN-bucket path did
+    // not, so an out-of-order packet arriving inside a still-open bucket
+    // overwrote `close` with an EARLIER price and moved `close_ts` backwards.
+    // Two paths, two policies, and only one of them was right.
     //
-    // `saturating_sub` guarded the SUBTRACTION against underflow, which is
-    // not the same thing as guarding the BAR. An out-of-order tick inside an
-    // open bucket carries a SMALLER day-cumulative, so the difference is
-    // smaller too, and the assignment dragged the bar's already-correct
-    // volume back down. The bar then sealed under-reporting, while the next
-    // bar (opening on the monotonic slot baseline) reported the gap — the
-    // volume moved between buckets instead of staying put.
-    //
-    // Widening only is the same shape `high` / `low` two blocks up already
-    // use, and the same shape `prev_day_close` / `session_open` below use
-    // (last NON-ZERO wins, with a comment about not clobbering a real
-    // baseline). The pattern was known here and applied to four fields; these
-    // two were the ones it was never applied to.
-    let candidate = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
-    if candidate > state.volume {
-        state.volume = candidate;
-    } else if candidate < state.volume {
-        metrics::counter!("tv_candle_volume_regression_suppressed_total").increment(1);
+    // The damage scaled with the bucket: on a 1-minute bar the window is 60
+    // seconds, but on the daily bar it is the whole session, so ANY reordered
+    // packet could rewrite the day's close — making it whichever packet
+    // arrived last rather than the one that traded last. `>=` is deliberate:
+    // many packets share one LTT second, and within a second last-write-wins
+    // is the pre-existing, correct behaviour.
+    if tick.exchange_timestamp >= state.close_ts_ist_secs {
+        state.close = price;
+        state.close_ts_ist_secs = tick.exchange_timestamp;
+        // MERGE 2026-08-25: the order guard above and the non-zero guard here
+        // fix DIFFERENT halves of the same field, and OI needs BOTH.
+        //
+        // The order guard answers "is this packet newer?". It cannot answer
+        // "does this packet carry an OI reading at all". `0` is the ABSENT
+        // sentinel — a Ticker-mode packet has no OI field and an equity never
+        // has one — so a NEWER blank packet passes the order guard and would
+        // still erase a real OI that an earlier tick in the SAME bucket had
+        // established. Order alone does not make a blank field into news.
+        //
+        // Last NON-ZERO wins, exactly like `prev_day_close` / `session_open`
+        // below, which carry the same reasoning for the same reason.
+        if tick.open_interest != 0 {
+            state.oi = i64::from(tick.open_interest);
+        } else if state.oi != 0 {
+            metrics::counter!("tv_candle_oi_zero_ignored_total").increment(1);
+        }
     }
-    // Last NON-ZERO wins, exactly like `prev_day_close` / `session_open`
-    // below. `0` is the ABSENT sentinel for open interest — a Ticker-mode
-    // packet carries no OI field at all, and an equity has none ever — so
-    // writing it unconditionally let a blank packet erase a real OI that an
-    // earlier tick in the SAME bucket had already established.
-    if tick.open_interest != 0 {
-        state.oi = i64::from(tick.open_interest);
-    } else if state.oi != 0 {
-        metrics::counter!("tv_candle_oi_zero_ignored_total").increment(1);
+    // Exchange cumulative volume only ever rises, so a bucket's traded volume
+    // is monotone too. `saturating_sub` bounded the ARITHMETIC against
+    // underflow, which is not the same thing as bounding the BAR: a stale
+    // packet carries a smaller day-cumulative, so the difference is smaller
+    // too, and the assignment dragged an already-correct volume back down.
+    // The bar then sealed under-reporting while the NEXT bar reported the gap
+    // — the volume moved between buckets instead of staying put.
+    //
+    // Widening only, kept as an explicit compare rather than `.max()` so the
+    // suppressed case is COUNTED. A silent `.max()` is correct and tells you
+    // nothing: the regression RATE is what says whether this guard is
+    // load-bearing today or dormant, and that is worth a counter.
+    let bucket_volume = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
+    if bucket_volume > state.volume {
+        state.volume = bucket_volume;
+    } else if bucket_volume < state.volume {
+        metrics::counter!("tv_candle_volume_regression_suppressed_total").increment(1);
     }
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
