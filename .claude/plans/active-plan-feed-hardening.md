@@ -1757,3 +1757,80 @@ fix is a DESIGN decision with real consequences — it changes what range
 scans mean and interacts with the DEDUP key `(ts, security_id, segment,
 capture_seq, feed)`. Recorded as the measured cause, not as an authorized
 change.
+
+---
+
+## Item 22 — QUEUED REQUIREMENT: the full day resident in RAM, at full subscription
+
+**Operator, 2026-08-25 (verbatim, typos preserved):** *"see always ensure to
+maximsie 25 k instruemnts with full mdoe for dpeth 5 and 250 isntuments for
+depoth 20 and 5 isntuents for dpeth 200 and order websocket udpate conenctiosn
+ticks alwys so all tehs eof the ucrrent daya shdou lbe alwuas in ram also
+ensure woth rela time lvie rpoven gauarneted assure dsoltuion dud eokay?"*
+
+### Half of this is already true — measured live 09:48 IST 2026-08-25
+
+| Requirement | Live now | Verdict |
+|---|---:|---|
+| 16 WebSocket connections | 15 market-data + 1 order-update | **MET, exact** |
+| Full mode + depth-5, target 25,000 | 21,498 | 86% — gap is master resolution, not connectivity |
+| depth-20, target 250 | 248 | **MET** |
+| depth-200, target 5 | 5 | **MET, exact** |
+| Order-update channel | connected | **MET** |
+
+### The half that is NOT true, and it is the whole ask
+
+**Nothing writes the RAM store.** Verified: `dhan_feed_stack.rs` contains ZERO
+references to `SpotBarStore` or `append_sealed`; the only production
+`append_sealed` call site in the workspace is `rest_candle_fold.rs:1514`, and
+`config/base.toml [rest_candle_fold] enabled = false`. Boot installs the store
+(`main.rs:3141`) and publishes residency gauges for something nothing fills.
+
+Independent confirmation: app RSS was **1.62 GB** after 69 minutes of uptime.
+If the store were filling, RSS would already be climbing.
+
+So today the path is tick -> fold -> ILP -> QuestDB, and a decision has nothing
+in RAM to read.
+
+### The budget, measured not estimated (2026-08-24 full session)
+
+Widths from source: `RamBar` = 48 B (test-pinned, `spot_bar_store.rs:678`);
+`ParsedTick` = **112 B** (compiled and printed, NOT the 32 B an earlier note
+assumed).
+
+| Term | At today's 18,097 | Scaled to 24,600 |
+|---|---:|---:|
+| 64,349,753 ticks | 7.21 GB | 9.81 GB |
+| 22,336,216 second bars + 3,154,318 minute+ bars | 1.22 GB | 1.66 GB |
+| Live book, every instrument (d5 168 B / d20 648 B / d200 6,400 B) | 0.004 GB | 0.004 GB |
+| **TOTAL** | **8.4 GB** | **11.5 GB** |
+
+Host is 32 GiB = 34.4 GB; QuestDB wants 8-16 GB. **It fits, with room.**
+
+What does NOT fit is retaining every historical depth SNAPSHOT — 1,530,651,649
+rows/session = 25.1 GB today, 28.9 GB scaled. A decision reads the CURRENT
+book, not the 60 million books before it. Current books cost 4 MB.
+
+### What the work actually is
+
+1. Wire the live lane's sealed bars into `SpotBarStore::append_sealed` — the
+   store, the ring shape and the eviction already exist and are tested; what is
+   missing is the call.
+2. Decide tick residency. The store holds BARS. Holding 64.3M raw ticks needs
+   its own structure, and at 112 B/tick a compact record is worth designing —
+   the 32 B figure quoted earlier in this plan was never measured and is
+   withdrawn.
+3. `spot_bar_store.rs:131` SKIPS second-scale timeframes (`if
+   tf.is_second_scale() { continue; }`). The operator's five second frames
+   (1s/5s/10s/15s/30s) are exactly what that skip excludes. This is
+   load-bearing and currently unstated at the call site.
+4. Keep the current book per instrument — cheap (4 MB) and the only depth term
+   a decision needs.
+
+### Proof obligation before this can be called done
+
+Not "the arithmetic fits". The live gauge `tv_process_rss_bytes` must be shown
+climbing to and holding near the projected figure across a full session, and a
+read from the store must be shown returning the current day's bars. Until an
+RSS reading exists at scale, every number above is arithmetic — correct
+arithmetic, from measured inputs, but not a running system.

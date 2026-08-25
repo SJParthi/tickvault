@@ -142,6 +142,111 @@ pub const RING_BYTES_FULL_METRIC: &str = "tv_dhan_ws_ring_bytes_full_total";
 pub const WAL_DROP_METRIC: &str = "tv_dhan_ws_wal_dropped_total";
 
 // ---------------------------------------------------------------------------
+// Subscribe dispatch pacing (WS-GAP-02)
+// ---------------------------------------------------------------------------
+
+/// Delay inserted BETWEEN consecutive subscribe messages on one connection.
+///
+/// # Why a paced dispatch exists at all
+///
+/// A throttled or rate-limited subscribe does not come back as an error. Dhan's
+/// live-feed protocol has NO per-subscribe acknowledgement and NO sequence
+/// number (`docs/dhan-ref/03-live-market-feed-websocket.md`), so a message the
+/// vendor silently declines is indistinguishable from an instrument that simply
+/// has not traded. Measured 2026-08-25: 21,498 instruments subscribed for depth,
+/// 17,241 ever ticked — and nothing in the system can say which part of that gap
+/// is illiquidity and which is a lost subscribe. Bursting 50 messages back to
+/// back is therefore not merely impolite; it is the one failure mode this
+/// codebase cannot observe after the fact.
+///
+/// # Where the number comes from — and what is NOT documented
+///
+/// Dhan documents the SIZE limits precisely: 5 connections, 5,000 instruments
+/// per connection, and **100 instruments per JSON subscribe message**
+/// (`03-live-market-feed-websocket.md` §"Connection Limits" and note 8;
+/// depth-20 permits all 50 of its instruments in one message,
+/// `04-full-market-depth-websocket.md`). Those are already enforced by
+/// [`SubscribeGuard`].
+///
+/// **Dhan documents NO message RATE for the WebSocket.** The published
+/// rate-limit table (`01-introduction-and-rate-limits.md` §3 — Order 10/s,
+/// Data 5/s, Quote 1/s, Non-Trading 20/s) is explicitly a REST-API table and
+/// says nothing about WS control frames. This interval is therefore CHOSEN, not
+/// cited, and is justified below against the only hard constraint that exists —
+/// the pre-open deadline. It is deliberately far slower than an unbounded burst
+/// and far faster than the deadline requires.
+///
+/// # The deadline arithmetic (see `subscribe_dispatch_fits_the_preopen_budget`)
+///
+/// Worst case for the whole authorized pool, if every connection dispatched
+/// SERIALLY (they do not — each runs in its own task):
+///
+/// | Endpoint | Instruments | Per message | Messages |
+/// |---|---|---|---|
+/// | main feed | 5 × 5,000 | 100 | 250 |
+/// | depth-20  | 5 × 50    | 50  | 5   |
+/// | depth-200 | 5 × 1     | 1   | 5   |
+/// | **total** | | | **260** |
+///
+/// 260 messages × 25 ms ≈ **6.5 s**, against a pre-open attach budget of
+/// **720 s** (09:00 → 09:12 IST). That is under 1 % of the budget in the
+/// pessimistic serial case, and ~1.25 s per connection in the real concurrent
+/// one. The pacing cannot be what misses the deadline.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const SUBSCRIBE_BATCH_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Mirror of `tickvault_app::dhan_feed_stack::PREOPEN_READY_DEADLINE_IST_SECS`
+/// (09:12:00 IST) — the moment the contract attach must be complete.
+///
+/// Duplicated rather than imported because the dependency flow is
+/// `common ← core ← trading ← storage ← api ← app`: this crate cannot see the
+/// app crate. The value is asserted literally in
+/// `subscribe_dispatch_fits_the_preopen_budget` so a silent drift in either
+/// copy shows up as a failing arithmetic test rather than as a missed deadline.
+pub const PREOPEN_READY_DEADLINE_IST_SECS: u32 = 9 * 3_600 + 12 * 60;
+
+/// Earliest IST second the pre-open attach can begin dialing — the 09:00
+/// persistence window open. The span between this and
+/// [`PREOPEN_READY_DEADLINE_IST_SECS`] is the whole budget the dispatch shares
+/// with dialing, the pricing quorum, and contract selection.
+pub const PREOPEN_ATTACH_WINDOW_OPEN_IST_SECS: u32 = 9 * 3_600;
+
+/// Counter: one subscribe message was written to the socket. Labels:
+/// `endpoint`.
+///
+/// # What this can and cannot prove
+///
+/// It counts messages this process WROTE, not messages Dhan ACCEPTED. The
+/// protocol offers no acknowledgement, so an accepted-message counter cannot
+/// honestly exist and is not invented here. What it does give is the missing
+/// half of an existing question: compared against
+/// [`SubscribeGuard::batch_count`] for the same connection, a shortfall means
+/// instruments that were never even ASKED for — which is a different diagnosis
+/// from "subscribed and never ticked", and until now the two were the same
+/// number.
+pub const SUBSCRIBE_BATCH_METRIC: &str = "tv_dhan_ws_subscribe_batches_total";
+
+/// Counter: instruments covered by the subscribe messages actually written.
+/// Labels: `endpoint`. The instrument-level companion to
+/// [`SUBSCRIBE_BATCH_METRIC`], and the number that lines up directly against a
+/// tick-gap detector's seeded set.
+pub const SUBSCRIBE_INSTRUMENTS_METRIC: &str = "tv_dhan_ws_subscribe_instruments_total";
+
+/// Counter: a subscribe dispatch stopped part-way — a message failed to write
+/// and every batch after it was abandoned. Labels: `endpoint`.
+///
+/// Loss-shaped by name, and genuinely loss-shaped in effect: the instruments in
+/// the abandoned tail are not subscribed, and without this the only trace was a
+/// per-message `warn!` in `connection.rs` that says nothing about how much of
+/// the set never went out.
+pub const SUBSCRIBE_DISPATCH_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_failed_total";
+
+/// Gauge: wall-clock milliseconds the last full subscribe dispatch took on this
+/// connection. Labels: `endpoint`. Exists so the 09:12 margin is WATCHED rather
+/// than assumed — the arithmetic above is a bound, this is the measurement.
+pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms";
+
+// ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
 // ---------------------------------------------------------------------------
 
@@ -1944,14 +2049,17 @@ where
             }
 
             SupervisorAction::Subscribe => {
-                let mut failed = false;
-                for batch in guard.batches() {
-                    if socket.send_subscribe(batch).await.is_err() {
-                        failed = true;
-                        break;
-                    }
-                }
-                if failed {
+                let slot = supervisor.slot();
+                let outcome =
+                    dispatch_subscribe(&mut socket, &guard, slot.endpoint, slot.pool_index).await;
+                if outcome.stopped_early() {
+                    // `mark_confirmed` is deliberately NOT reached: the guard
+                    // still reads `needs_resubscribe`, so the retained set is
+                    // replayed WHOLE on the next connect rather than resuming
+                    // from a remembered offset. Resuming would be wrong twice
+                    // over — the socket is about to be torn down, and a partial
+                    // in-memory "confirmed" would claim instruments the wire
+                    // never carried.
                     action = supervisor.on_event(ConnEvent::SubscribeFailed, Instant::now());
                     continue;
                 }
@@ -1980,6 +2088,163 @@ where
             }
         }
     }
+}
+
+/// What a paced subscribe dispatch actually got onto the wire.
+///
+/// # Why an outcome type rather than a `bool`
+///
+/// The old dispatch returned nothing but "did any send fail". That answer is
+/// unusable for the question an operator actually has when instruments are
+/// silent — *were they even asked for?* — because a failure part-way through
+/// leaves an arbitrary prefix subscribed and an arbitrary tail not, and the
+/// boolean erases the split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeDispatch {
+    /// Subscribe messages successfully written to the socket.
+    pub batches_sent: usize,
+    /// Subscribe messages the set required.
+    pub batches_total: usize,
+    /// Instruments covered by the messages written.
+    pub instruments_sent: usize,
+    /// Instruments the set contained.
+    pub instruments_total: usize,
+    /// Wall-clock time the dispatch took, pacing included.
+    pub elapsed: Duration,
+}
+
+impl SubscribeDispatch {
+    /// Whether a send failed and the remaining batches were abandoned.
+    ///
+    /// True only for a genuine short write — an EMPTY set dispatches zero of
+    /// zero batches and is a legal no-op, not a failure.
+    #[must_use]
+    pub const fn stopped_early(&self) -> bool {
+        self.batches_sent < self.batches_total
+    }
+
+    /// Instruments in the abandoned tail: named on the in-memory set, never
+    /// written to the socket, and therefore NOT subscribed.
+    ///
+    /// This is the number that separates "subscribed and never ticked" from
+    /// "not subscribed". It is exact, because it is counted on our own side of
+    /// the wire — unlike vendor acceptance, which this protocol never reports.
+    #[must_use]
+    pub const fn instruments_undispatched(&self) -> usize {
+        self.instruments_total.saturating_sub(self.instruments_sent)
+    }
+}
+
+/// Writes a connection's subscription to the socket, one message per
+/// [`SubscribeGuard::batches`] chunk, spaced by [`SUBSCRIBE_BATCH_INTERVAL`].
+///
+/// # Why the spacing is between messages and not before the first
+///
+/// The first message is the one the pre-open deadline is waiting on, and there
+/// is nothing before it to be polite to. Pacing `n` messages therefore costs
+/// `(n - 1)` intervals, which is also what the deadline arithmetic in
+/// [`SUBSCRIBE_BATCH_INTERVAL`] assumes.
+///
+/// # Mid-loop failure
+///
+/// A failed write ends the dispatch immediately rather than pressing on. Two
+/// reasons: the transport is already reporting itself broken, so the remaining
+/// messages would be written into a socket that is about to be torn down; and
+/// continuing would make the subscribed set a function of WHICH sends happened
+/// to fail, which is the un-diagnosable shape this function exists to remove.
+/// The caller must not `mark_confirmed` on an early stop — the whole set is
+/// replayed on the next connect.
+///
+/// Zero heap allocation in the loop: batches are borrowed slices, and both
+/// counters are resolved once before the first send rather than per message.
+async fn dispatch_subscribe<S>(
+    socket: &mut S,
+    guard: &SubscribeGuard,
+    endpoint: DhanEndpointType,
+    pool_index: u8,
+) -> SubscribeDispatch
+where
+    S: DhanFeedSocket,
+{
+    let endpoint_label = endpoint.as_str();
+    let batches_metric = metrics::counter!(SUBSCRIBE_BATCH_METRIC, "endpoint" => endpoint_label);
+    let instruments_metric =
+        metrics::counter!(SUBSCRIBE_INSTRUMENTS_METRIC, "endpoint" => endpoint_label);
+
+    let batches_total = guard.batch_count();
+    let instruments_total = guard.len();
+    // `tokio::time::Instant`, not `std::time::Instant`: identical in
+    // production, but it also advances with the test clock, so the pacing
+    // above is asserted as an EXACT duration rather than as a wall-clock
+    // approximation that would be flaky under load.
+    let started = tokio::time::Instant::now();
+
+    let mut batches_sent = 0_usize;
+    let mut instruments_sent = 0_usize;
+
+    for (index, batch) in guard.batches().enumerate() {
+        if index > 0 {
+            // Paced BETWEEN messages. See `SUBSCRIBE_BATCH_INTERVAL` for why a
+            // burst is dangerous rather than merely rude, and for the
+            // arithmetic showing this cannot miss the 09:12 deadline.
+            tokio::time::sleep(SUBSCRIBE_BATCH_INTERVAL).await;
+        }
+        if socket.send_subscribe(batch).await.is_err() {
+            break;
+        }
+        batches_sent = batches_sent.saturating_add(1);
+        instruments_sent = instruments_sent.saturating_add(batch.len());
+        batches_metric.increment(1);
+        instruments_metric.increment(batch.len() as u64);
+    }
+
+    let outcome = SubscribeDispatch {
+        batches_sent,
+        batches_total,
+        instruments_sent,
+        instruments_total,
+        elapsed: started.elapsed(),
+    };
+
+    // Published on EVERY dispatch, success or not, so the 09:12 margin is a
+    // measurement rather than an assumption — and so a dispatch that stalls
+    // (a slow socket, a retrying write) is visible even when nothing failed.
+    metrics::gauge!(SUBSCRIBE_DISPATCH_MS_METRIC, "endpoint" => endpoint_label)
+        .set(outcome.elapsed.as_millis() as f64);
+
+    if outcome.stopped_early() {
+        metrics::counter!(SUBSCRIBE_DISPATCH_FAILED_METRIC, "endpoint" => endpoint_label)
+            .increment(1);
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            endpoint = endpoint_label,
+            pool_index,
+            batches_sent = outcome.batches_sent,
+            batches_total = outcome.batches_total,
+            instruments_sent = outcome.instruments_sent,
+            instruments_undispatched = outcome.instruments_undispatched(),
+            "subscribe dispatch stopped part-way — the instruments in the abandoned tail were \
+             never written to the socket, so they are NOT subscribed and will never tick. This \
+             is deliberately reported as a count rather than as vendor acceptance: the Dhan \
+             live-feed protocol acknowledges no subscribe, so what we CAN prove is what we \
+             sent. The whole set is replayed on the next connect."
+        );
+    } else {
+        info!(
+            endpoint = endpoint_label,
+            pool_index,
+            batches = outcome.batches_total,
+            instruments = outcome.instruments_total,
+            dispatch_ms = outcome.elapsed.as_millis(),
+            interval_ms = SUBSCRIBE_BATCH_INTERVAL.as_millis(),
+            "subscribe dispatch complete — every batch written. Written, not acknowledged: the \
+             protocol carries no per-subscribe ack, so an instrument that stays silent after \
+             this line is either illiquid or was declined upstream, and only the tick-gap \
+             detector can narrow that further."
+        );
+    }
+
+    outcome
 }
 
 /// The drain loop. Returns as soon as the supervisor asks for anything other
@@ -4109,6 +4374,189 @@ mod tests {
         FakeSocket {
             state: std::sync::Arc::clone(state),
         }
+    }
+    // -- subscribe dispatch pacing (WS-GAP-02) ------------------------------
+
+    /// The defect: batches went out back to back with no spacing, and a
+    /// throttled subscribe is INVISIBLE — no error, no ack, no sequence
+    /// number, just an instrument that never ticks.
+    ///
+    /// Pacing is between messages, so `n` batches cost `n - 1` intervals.
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_batches_are_paced_by_the_named_interval() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let mut sock = fake(&st);
+        // 250 main-feed instruments = 3 messages at the documented 100/message.
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..250).map(si).collect())
+            .unwrap();
+        assert_eq!(guard.batch_count(), 3, "documented 100 instruments/message");
+
+        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+
+        assert_eq!(out.batches_sent, 3);
+        assert_eq!(out.instruments_sent, 250);
+        assert!(!out.stopped_early());
+        assert_eq!(out.instruments_undispatched(), 0);
+        // The bite: before pacing this was ~0. Two gaps for three messages.
+        assert_eq!(
+            out.elapsed,
+            SUBSCRIBE_BATCH_INTERVAL * 2,
+            "three batches must be spaced by exactly two intervals"
+        );
+        assert_eq!(st.lock().unwrap().subscribes, 3);
+    }
+
+    /// A one-batch set is not paced at all: there is nothing before the first
+    /// message to be polite to, and the deadline is waiting on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_single_batch_dispatch_pays_no_pacing_cost() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let mut sock = fake(&st);
+        let guard =
+            SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..40).map(si).collect()).unwrap();
+
+        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+
+        assert_eq!(out.batches_sent, 1);
+        assert_eq!(out.elapsed, Duration::ZERO);
+    }
+
+    /// An empty set dispatches zero of zero and is a legal no-op, NOT a
+    /// failure — otherwise the order-update socket, which carries no
+    /// instruments, would park itself on every connect.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_set_is_a_no_op_not_an_early_stop() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let mut sock = fake(&st);
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, Vec::new()).unwrap();
+
+        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+
+        assert!(!out.stopped_early());
+        assert_eq!(out.batches_total, 0);
+        assert_eq!(st.lock().unwrap().subscribes, 0);
+    }
+
+    /// The silent half of the defect: a send that fails part-way leaves a tail
+    /// that was never written. Before this, the loop returned a bare `bool`
+    /// and the size of that tail was unrecorded — indistinguishable from
+    /// instruments that were subscribed and merely quiet.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_loop_send_failure_counts_the_undispatched_tail() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            // batch 1 ok, batch 2 fails; batch 3 must never be attempted.
+            subscribe_results: VecDeque::from(vec![true, false]),
+            ..FakeState::default()
+        }));
+        let mut sock = fake(&st);
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..250).map(si).collect())
+            .unwrap();
+
+        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+
+        assert!(out.stopped_early(), "a short write must be reported");
+        assert_eq!(out.batches_sent, 1);
+        assert_eq!(out.batches_total, 3);
+        assert_eq!(out.instruments_sent, 100);
+        assert_eq!(
+            out.instruments_undispatched(),
+            150,
+            "150 instruments were named on the set and never written to the socket"
+        );
+        assert_eq!(
+            st.lock().unwrap().subscribes,
+            2,
+            "the dispatch must STOP at the failure, not press on into a broken socket"
+        );
+    }
+
+    /// A failed dispatch must not leave the guard claiming a subscription the
+    /// wire never carried — the next connect replays the WHOLE set.
+    #[tokio::test(start_paused = true)]
+    async fn an_early_stop_leaves_the_guard_unconfirmed_for_a_whole_replay() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            subscribe_results: VecDeque::from(vec![false]),
+            ..FakeState::default()
+        }));
+        let mut sock = fake(&st);
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..250).map(si).collect())
+                .unwrap();
+
+        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+        // Mirrors the caller: `mark_confirmed` is reached only on a full send.
+        if !out.stopped_early() {
+            guard.mark_confirmed();
+        }
+
+        assert!(guard.needs_resubscribe());
+        assert_eq!(guard.generation(), 0);
+        assert_eq!(
+            guard.batch_count(),
+            3,
+            "the retained set is replayed whole, never resumed from an offset"
+        );
+    }
+
+    /// The deadline this pacing must not threaten, proven arithmetically
+    /// against the named constants rather than by wall clock.
+    #[test]
+    fn subscribe_dispatch_fits_the_preopen_budget() {
+        // Pin the mirrored deadline so a drift from the app crate's own
+        // `PREOPEN_READY_DEADLINE_IST_SECS` fails HERE.
+        assert_eq!(PREOPEN_READY_DEADLINE_IST_SECS, 9 * 3_600 + 12 * 60);
+        assert_eq!(PREOPEN_ATTACH_WINDOW_OPEN_IST_SECS, 9 * 3_600);
+        let budget_ms =
+            u128::from(PREOPEN_READY_DEADLINE_IST_SECS - PREOPEN_ATTACH_WINDOW_OPEN_IST_SECS)
+                * 1_000;
+        assert_eq!(budget_ms, 720_000, "09:00 -> 09:12 IST");
+
+        // Worst case per endpoint: a FULL pool, every connection at its
+        // documented instrument cap, batched at its documented per-message cap.
+        let mut worst_case_messages = 0_u128;
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+        ] {
+            let per_conn = u128::from(endpoint.max_instruments_per_connection());
+            let per_msg = u128::from(endpoint.max_instruments_per_subscribe_message()).max(1);
+            let msgs_per_conn = per_conn.div_ceil(per_msg);
+            worst_case_messages += msgs_per_conn * u128::from(endpoint.max_connections());
+        }
+        assert_eq!(
+            worst_case_messages, 260,
+            "5x50 main-feed + 5x1 depth-20 + 5x1 depth-200 messages"
+        );
+
+        // Pacing is BETWEEN messages, so n messages cost n-1 intervals. Costed
+        // as if every connection dispatched serially — they do not, each runs
+        // in its own task, so this is a ceiling on the real cost.
+        let interval_ms = SUBSCRIBE_BATCH_INTERVAL.as_millis();
+        let worst_case_ms = (worst_case_messages - 1) * interval_ms;
+        assert_eq!(worst_case_ms, 6_475, "260 messages, 25 ms apart");
+
+        // The pacing may not consume more than 5% of the pre-open budget: it
+        // shares that window with dialing, the pricing quorum and contract
+        // selection, so "merely under the deadline" is not the bar.
+        assert!(
+            worst_case_ms * 20 < budget_ms,
+            "paced dispatch {worst_case_ms} ms must stay under 5% of the {budget_ms} ms \
+             pre-open budget"
+        );
+    }
+
+    /// One connection's worst case — the number that actually matters, since
+    /// connections dispatch concurrently.
+    #[test]
+    fn one_full_main_feed_connection_dispatches_in_about_a_second() {
+        let e = DhanEndpointType::MainFeed;
+        let msgs = u128::from(e.max_instruments_per_connection())
+            .div_ceil(u128::from(e.max_instruments_per_subscribe_message()));
+        assert_eq!(msgs, 50, "5,000 instruments at 100 per message");
+        let ms = (msgs - 1) * SUBSCRIBE_BATCH_INTERVAL.as_millis();
+        assert_eq!(ms, 1_225);
+        assert!(ms < 2_000);
     }
 
     #[tokio::test(start_paused = true)]

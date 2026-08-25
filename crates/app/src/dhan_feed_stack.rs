@@ -1183,7 +1183,32 @@ impl LiveIngest {
             return IngestOutcome::SeqUnrepresentable;
         };
 
-        // Gap detector observes unconditionally — see the type docs on order.
+        // The gap detector observes BEFORE the fold, and deliberately so.
+        //
+        // (Until 2026-08-25 this comment said "see the type docs on order".
+        // Those docs say nothing about ordering — they cover segment mapping.
+        // The pointer was to a justification that did not exist, so here is
+        // the real one.)
+        //
+        // `observe` answers "is the feed still delivering PACKETS for this
+        // instrument", not "is this instrument producing usable data". A tick
+        // that arrives and is then refused by the aggregator — a poisoned
+        // timestamp, a non-finite price — is still proof the socket is alive
+        // for that security. Moving the call below the refusal would silently
+        // change the question, and would re-open the crying-wolf class this
+        // module documents at `SilenceVerdict::Warming`: a legitimately sparse
+        // contract would then page every session open.
+        //
+        // KNOWN RESIDUAL, recorded rather than papered over: an instrument
+        // whose ticks ALL arrive and are ALL refused therefore reads healthy
+        // to the silence detector while producing nothing. That is a real
+        // unmonitored state. It is NOT fixed by reordering — it needs its own
+        // signal, and one that stays O(1) in space: a per-instrument refusal
+        // map is exactly the unbounded-growth shape this codebase keeps
+        // finding and removing. The refusal counters (`refused_price`,
+        // `refused_timestamp`, `refused_slot_exhausted`) already carry the
+        // aggregate, and AGGREGATOR-DROP-01's 30-second delta report is where
+        // a systemic refusal rate surfaces today.
         if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
             let _assessment = self.detector.observe(obs);
         }
