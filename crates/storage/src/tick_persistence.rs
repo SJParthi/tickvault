@@ -639,6 +639,17 @@ pub const TICK_SPILL_DIR: &str = "data/spill/ticks";
 /// and as the fallback when the volume cannot be measured.
 pub const TICK_SPILL_MIN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Free bytes a tick-spill write must leave behind, after its own payload.
+///
+/// 2 GiB. The spill tier shares this volume with QuestDB and the frame WAL, so
+/// a rescue that fills the disk converts a bounded tick loss into an unbounded
+/// outage of every table on the box — the exact trade the ceiling exists to
+/// prevent, arrived at from the other direction. Sized against the measured
+/// trough: free space on the prod volume cycles down to ~1.94 GB while QuestDB
+/// stages and releases files, so this refuses precisely in the window where a
+/// half-gigabyte write is most dangerous.
+pub const SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Fraction of the volume the spill tier may occupy: one thirty-second.
 ///
 /// Not a round number chosen for looks. It has to satisfy two bounds at once:
@@ -742,6 +753,43 @@ fn spill_failed_ilp(
             std::io::ErrorKind::StorageFull,
             format!("tick spill dir at or past its {ceiling}-byte ceiling"),
         ));
+    }
+    // LIVE FREE-SPACE GUARD (2026-08-25). The ceiling above is derived from
+    // the volume's TOTAL size, which is the right bound for "how much of this
+    // disk may the spill tier own" — and the wrong question to ask a disk that
+    // is nearly full RIGHT NOW.
+    //
+    // Measured on the prod box the day this landed: free space cycling between
+    // 1.94 GB and 12.9 GB on a 200 GB volume, because QuestDB stages large
+    // files and releases them. A 544 MB rescue — the real observed size —
+    // landing in a 1.94 GB trough would take the disk to under 1.4 GB and can
+    // take QuestDB down with it, which is the outage this whole tier exists to
+    // avoid trading a bounded tick loss for.
+    //
+    // So the write is refused when it would leave less than
+    // `SPILL_MIN_FREE_HEADROOM_BYTES` behind. This is deliberately NOT
+    // memoised, unlike the ceiling: free space is a moving quantity, and a
+    // cached value would be answering a question about a disk that no longer
+    // exists. One `df` per rescue is free — a rescue only happens when a flush
+    // already failed.
+    //
+    // A refusal here is still an honest counted drop, not a silent one: the
+    // caller's `Err` arm logs HOT-PATH-02 naming this reason.
+    if let crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } =
+        crate::disk_health_watcher::probe_disk_free_bytes(dir)
+    {
+        let needed = (payload.len() as u64).saturating_add(SPILL_MIN_FREE_HEADROOM_BYTES);
+        if free_bytes < needed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte tick spill: only {free_bytes} bytes free, and the \
+                     write must leave {SPILL_MIN_FREE_HEADROOM_BYTES} bytes of headroom so \
+                     it cannot take QuestDB down with it",
+                    payload.len()
+                ),
+            ));
+        }
     }
 
     // One file per feed per hour: bounded file count, and an operator replaying
