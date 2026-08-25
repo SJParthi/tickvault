@@ -274,10 +274,14 @@ fn the_emf_declaration_still_folds_labels_to_host() {
     // and this guard should force that to be thought about rather than
     // discovered from a quiet alarm.
     let root = repo_root();
-    for rel in [
-        "deploy/aws/cloudwatch-agent.json",
-        "deploy/aws/terraform/user-data.sh.tftpl",
-    ] {
+    // 2026-08-25: ONE file, not two. `user-data.sh.tftpl` used to embed a
+    // byte-identical copy of the agent config, and that ~1.6 KB duplicate
+    // pinned the template at exactly its 15,872-byte EC2 budget with zero
+    // bytes free. It now writes a minimal host-only fallback and copies this
+    // file into place after the Step 5 clone, so this IS the config the box
+    // loads. That the copy still happens is pinned by
+    // `cw_agent_selector_lockstep_guard.rs`.
+    for rel in ["deploy/aws/cloudwatch-agent.json"] {
         let text = fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
         let declarations = text.matches("\"dimensions\":").count();
         assert_eq!(
@@ -304,10 +308,14 @@ fn both_counters_are_in_the_emf_allowlist_or_the_alarms_watch_nothing() {
     // files that must agree — the committed config and the terraform template
     // that actually lands on the box.
     let root = repo_root();
-    for rel in [
-        "deploy/aws/cloudwatch-agent.json",
-        "deploy/aws/terraform/user-data.sh.tftpl",
-    ] {
+    // 2026-08-25: ONE file, not two. `user-data.sh.tftpl` used to embed a
+    // byte-identical copy of the agent config, and that ~1.6 KB duplicate
+    // pinned the template at exactly its 15,872-byte EC2 budget with zero
+    // bytes free. It now writes a minimal host-only fallback and copies this
+    // file into place after the Step 5 clone, so this IS the config the box
+    // loads. That the copy still happens is pinned by
+    // `cw_agent_selector_lockstep_guard.rs`.
+    for rel in ["deploy/aws/cloudwatch-agent.json"] {
         let text = fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
         for metric in ["tv_dhan_ws_park_total", "tv_ticks_dropped_total"] {
             assert!(
