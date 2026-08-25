@@ -7263,8 +7263,38 @@ pub fn spawn_daily_crossverify(
                     if c.is_vacuous() {
                         // A run that compared nothing proves nothing, and the
                         // outcome field alone does not say so loudly enough.
+                        //
+                        // `source` is what makes this line REACHABLE by an
+                        // alarm. `WS-GAP-03` has 25 emit sites in this file
+                        // alone — ordinary dial failures, reconnects and pool
+                        // supervisor events all carry it — so a filter keyed
+                        // on the code alone would page on connection churn,
+                        // which is the noise trap
+                        // `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d-i
+                        // records (a bare-code filter was proposed there,
+                        // approved, and then found wrong for exactly this
+                        // reason). The shape that works is the three-condition
+                        // one that section settled on:
+                        // `{ $.code = "WS-GAP-03" && $.level = "ERROR" &&
+                        //    $.source = "xverify_vacuous" }` — and it cannot
+                        // be written at all until the field exists here.
+                        //
+                        // Adding the field is NOT adding a page: nothing
+                        // filters on it yet. The alarm itself still needs a
+                        // dated operator quote per that file's §3, and the
+                        // metric route is blocked by ONE BYTE, measured
+                        // 2026-08-25: the EMF selector lives in a user-data
+                        // template whose render is 15,841 of a 15,872-byte
+                        // budget, so 31 bytes are free — and
+                        // `tv_dhan_feed_xverify_runs_total` is 31 characters,
+                        // which with its separating pipe needs 32. So the
+                        // counter is in neither selector copy and never
+                        // reaches CloudWatch, and it cannot be added without
+                        // first removing something or moving the selector out
+                        // of user-data entirely.
                         error!(
                             code = ErrorCode::WsGapConnectionState.code_str(),
+                            source = "xverify_vacuous",
                             targets = targets.len(),
                             missing_live = c.missing_live,
                             missing_rest = c.missing_rest,
@@ -7278,6 +7308,7 @@ pub fn spawn_daily_crossverify(
                     counters().xverify_failed.increment(1);
                     error!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "xverify_failed",
                         %err,
                         "Dhan live-feed cross-verification FAILED to run — the day's captured \
                          candles are UNVERIFIED, never assume they are clean"
@@ -9316,6 +9347,105 @@ mod tests {
             window.contains("c.is_vacuous()"),
             "the vacuous counter must be gated on is_vacuous(), so the counter and \
              the log field cannot disagree"
+        );
+    }
+
+    /// The two cross-verify `error!` lines carry a `source` DISCRIMINATOR.
+    ///
+    /// Without it these lines are unreachable by any alarm and unfindable by
+    /// any triage query. `WS-GAP-03` is emitted from 25 sites in this file —
+    /// dial failures, reconnects, pool-supervisor events — so the only filter
+    /// shape that can single one out is the three-condition
+    /// code + level + source form that
+    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d-i settled on after a
+    /// bare-code filter was approved and then found wrong. That section is
+    /// the precedent; this test is what stops the field being dropped by a
+    /// later edit, which would silently un-write a future alarm.
+    ///
+    /// The values must also be DISTINCT: "the check ran and measured nothing"
+    /// and "the check could not run" have different causes and different
+    /// remedies, and collapsing them to one label would merge two independent
+    /// failures into one series — the same defect
+    /// `fold_counters::the_two_labelled_extremes_are_separate_handles`
+    /// guards on the metric side.
+    ///
+    /// This test does NOT claim an alarm exists. None does — the alarm needs
+    /// a dated operator quote per §3 of that file, and the counter route is
+    /// blocked separately (the metric is in neither EMF selector copy). What
+    /// is asserted here is only that the field a future alarm must match on
+    /// is present and unambiguous.
+    #[test]
+    fn the_xverify_error_lines_carry_a_source_an_alarm_can_match_on() {
+        let src = include_str!("dhan_feed_stack.rs");
+
+        for (marker, label) in [
+            ("counters().xverify_vacuous.increment(1)", "xverify_vacuous"),
+            ("counters().xverify_failed.increment(1)", "xverify_failed"),
+        ] {
+            assert!(
+                src.contains(marker),
+                "the {label} counter arm must exist — the log field is only half \
+                 the signal"
+            );
+
+            // Anchor on the EMITTED field, not on a byte distance from the
+            // counter. The two are ~70 lines apart in the vacuous arm and
+            // adjacent in the failed one, so any fixed forward window is a
+            // number that has to be re-tuned every time the prose above the
+            // emit grows — and a window that silently became too short would
+            // pass by finding nothing to check.
+            let field = format!("source = \"{label}\"");
+            let at = src
+                .match_indices(&field)
+                // Skip the filter-shape comment, which spells the same field
+                // as `$.source = "…"` inside a CloudWatch pattern.
+                .find(|(i, _)| !src[..*i].ends_with("$."))
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the {label} error! must carry `source = \"{label}\"` — \
+                         WS-GAP-03 has 25 emit sites in this file, so a filter \
+                         keyed on the code alone would page on ordinary \
+                         connection churn"
+                    )
+                });
+
+            // `code =` sits directly above `source =` in a tracing field list.
+            // 200 bytes is one or two field lines, so this cannot drift into a
+            // neighbouring emit and pass on someone else's code field.
+            let above = &src[at.saturating_sub(200)..at];
+            assert!(
+                above.contains("ErrorCode::WsGapConnectionState.code_str()"),
+                "the {label} source must sit on the SAME emit as the coded error \
+                 a filter pairs it with — a source field on an uncoded line \
+                 matches no three-condition filter"
+            );
+        }
+
+        // Distinct values, not one shared label.
+        assert_ne!(
+            src.matches("source = \"xverify_vacuous\"").count(),
+            0,
+            "the vacuous label must be present"
+        );
+        assert_ne!(
+            src.matches("source = \"xverify_failed\"").count(),
+            0,
+            "the failed label must be present"
+        );
+        // Exactly two REAL emissions. The needle also matches the `$.source =`
+        // inside the filter-shape comment above the vacuous arm, so that one is
+        // subtracted rather than the needle being narrowed — a narrower needle
+        // (say, a fixed indentation prefix) would stop biting the moment
+        // rustfmt moved the line, which is the failure mode this file's own
+        // O(1) table records five separate times about line numbers.
+        let emitted = src.matches("source = \"xverify_").count()
+            - src.matches("$.source = \"xverify_").count();
+        assert_eq!(
+            emitted, 2,
+            "exactly two xverify source labels are expected — a third would mean a \
+             new emit site landed without its own dated review, and a merged one \
+             would mean two independent failures now share a series"
         );
     }
 
