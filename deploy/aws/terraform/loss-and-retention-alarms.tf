@@ -347,3 +347,44 @@ resource "aws_cloudwatch_metric_alarm" "durable_floor_breach" {
 # fourth name for a condition that is already paged. Revisit either only with
 # evidence that the existing route missed a real episode.
 # =============================================================================
+
+# ---------------------------------------------------------------------------
+# WAL-suspension monitoring is BLIND (added 2026-08-25).
+#
+# `tv_questdb_wal_suspended_tables` normally reports 0..n. When the
+# wal_tables() probe fails for WAL_PROBE_BLIND_AFTER_FAILURES consecutive
+# polls the watcher sets it to -1 instead of letting the last reading stand.
+#
+# That distinction is the whole point. A failed probe used to leave the gauge
+# holding its previous value and log at `debug!` — so a stale `0` read as "no
+# tables are suspended" while the watcher could no longer see anything. On
+# 2026-08-25 fourteen tables stopped applying rows during a disk-full episode
+# and the operator found out by asking why an order was missing.
+#
+# No new metric name: the gauge is already EMF-selected, so this costs one
+# alarm (~$0.10/mo) and no user-data byte.
+#
+# `treat_missing_data = "notBreaching"`: the box is stopped outside market
+# hours and publishes nothing then. A dark lane is owned by
+# tv-<env>-dhan-no-ticks-flowing; this alarm reports a monitor that is running
+# and cannot see, which is a different condition.
+#
+# No ok_actions: the sentinel clears the moment one probe succeeds, and a
+# "recovered" page for a monitor that was briefly blind is noise. The recovery
+# signal is the info! line the watcher emits on its first good poll.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "wal_suspension_probe_blind" {
+  alarm_name          = "tv-${var.environment}-wal-suspension-probe-blind"
+  alarm_description   = "WAL-SUSPENSION MONITORING IS BLIND. The per-table wal_tables() probe has failed for several consecutive polls, so the suspended-tables gauge is reporting UNKNOWN (-1) rather than a stale reading. Tables may be WAL-suspended right now with nothing able to say so - ILP keeps ACKing rows while they stop becoming visible. DO: (1) df -h /data first, a full volume causes both this and real suspensions; (2) check QuestDB answers http://127.0.0.1:9000/exec; (3) once it answers, the gauge returns to a live count on the next poll and the WAL-SUSPEND-01 filter resumes paging on real suspensions. Runbook: docs/error-runbooks/wal-suspension-error-codes.md"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_questdb_wal_suspended_tables"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Minimum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = []
+}

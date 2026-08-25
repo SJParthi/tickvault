@@ -20,6 +20,7 @@ pub struct PreviousCloseData {
 /// # Performance
 /// O(1) — two `from_le_bytes` reads.
 #[inline]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by PREVIOUS_CLOSE_PACKET_SIZE check
 pub fn parse_previous_close_packet(
     raw: &[u8],
@@ -52,6 +53,7 @@ pub fn parse_previous_close_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets
 mod tests {
     use super::*;
