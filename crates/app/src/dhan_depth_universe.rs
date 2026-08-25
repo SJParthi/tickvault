@@ -1125,11 +1125,6 @@ mod tests {
         );
     }
 
-    /// The chain parser defaults a missing `contract_security_id` to 0, and the
-    /// field is "added v2.5" upstream. A zero means the vendor did not tell us
-    /// the id — subscribing it sends a well-formed request for a nonexistent
-    /// instrument and receives silence that reads exactly like a quiet book.
-    #[test]
     /// The finding this closes: `contract_segment_for_underlying` maps only
     /// the six INDEX underlyings, so every one of the ~20,000 stock-option
     /// candidates was counted as `refused_unknown_underlying`. Five figures of
@@ -1185,6 +1180,19 @@ mod tests {
         );
     }
 
+    /// The chain parser defaults a missing `contract_security_id` to 0, and the
+    /// field is "added v2.5" upstream. A zero means the vendor did not tell us
+    /// the id — subscribing it sends a well-formed request for a nonexistent
+    /// instrument and receives silence that reads exactly like a quiet book.
+    ///
+    /// This doc comment and the `#[test]` below it were STRANDED ~55 lines
+    /// above, separated from this function by a later test that was inserted
+    /// between them. The attribute therefore landed on that other test as a
+    /// duplicate, and this function was left with none — so it compiled as
+    /// dead code and has never run. `cargo` said so on every build
+    /// ("duplicated attribute", "function is never used"); nothing failed,
+    /// because a test that does not run cannot fail.
+    #[test]
     fn test_select_depth_universe_refuses_and_counts_zero_contract_ids() {
         let rows = vec![
             candidate("NIFTY", 0, 100.0, "CE"),

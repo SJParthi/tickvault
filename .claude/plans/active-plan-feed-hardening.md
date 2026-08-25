@@ -2049,3 +2049,67 @@ climbing to and holding near the projected figure across a full session, and a
 read from the store must be shown returning the current day's bars. Until an
 RSS reading exists at scale, every number above is arithmetic — correct
 arithmetic, from measured inputs, but not a running system.
+
+---
+
+## Item 13 — the archive worklist starved the heaviest table (2026-08-25)
+
+**Status: DONE.** Found by tracing why the prod volume kept filling after the
+spill-ceiling fix in #1804 landed.
+
+- [x] **Fair-share the per-run archive budget across tables**
+  - Files: `crates/storage/src/partition_archive.rs`
+  - Tests: `fair_share_tests::the_heaviest_table_is_not_starved_by_an_older_backlog`,
+    `each_table_is_still_processed_oldest_first`,
+    `a_zero_cap_means_no_cap_and_keeps_every_item`,
+    `a_cap_smaller_than_the_table_count_still_reaches_more_than_one_table`,
+    `the_output_is_deterministic_across_runs`,
+    `an_empty_worklist_is_empty_and_does_not_hang`
+- [x] **Count list failures in the cycle summary** (a silently unswept table
+      was indistinguishable from a healthy one)
+  - Files: `crates/storage/src/partition_archive.rs`
+- [x] **Resurrect a test that had never run**
+  - Files: `crates/app/src/dhan_depth_universe.rs`
+
+### What was measured, not inferred
+
+| fact | value | source |
+|---|---|---|
+| `market_depth` share of QuestDB | 174 GB of 196 GB | `du` on the box |
+| its partition size | ~17 GB per HOUR | `du` per partition |
+| its archive attempts in 12 h | **0** | CloudWatch, untruncated |
+| `ticks` archive attempts, same window | 87 | same |
+| `ticks` eligible partitions | 185, oldest `2026-07-30` | QuestDB `table_partitions()` |
+| `market_depth` eligible partitions | 4, oldest `2026-08-24` | same |
+| `max_partitions_per_run` | 200 | `config/base.toml` |
+
+### The defect
+
+`archive_and_drop_old_partitions` sorted the whole worklist by partition name —
+a global date order across every table — then truncated to the per-run cap.
+Older-backlog tables therefore consume the entire budget before a newer-backlog
+table gets a single slot. With stuck `2026-06-02` candle partitions at the head
+(they fail `s3_conflict` every run and are re-listed the next one) plus 185
+`ticks` entries, the 200 slots were spent before `market_depth` was reached.
+Deterministic, every run: the one table that could relieve disk pressure was the
+one table guaranteed never to be archived.
+
+### Honest envelope
+
+- Fair-sharing makes `market_depth` reachable. It does **not** make the archiver
+  keep up: ~8 partitions/day at ~17 GB is ~136 GB/day to gzip, upload and
+  SHA-256 verify. Whether one session's budget clears one session's production
+  is UNMEASURED and is the next question.
+- The `s3_conflict` partitions still never converge. They no longer block other
+  tables, but they still fail every run.
+- Depth volume itself (~110 GB/day into a 300 GB volume) is a capacity decision,
+  not an executor's.
+
+### A test flaw the bite-proof caught
+
+The first version of the headline test used 185 + 4 = 189 entries against a cap
+of 200, so nothing was truncated and it passed under the OLD algorithm too —
+i.e. it proved nothing. The reproduction now includes the June candle partitions
+that pushed prod over the cap, and asserts `worklist.len() > 200` so it can
+never silently become vacuous again. Bite-proven both directions: reverted, it
+fails with `market_depth scheduled: 0`.

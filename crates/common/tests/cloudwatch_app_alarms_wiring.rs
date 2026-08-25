@@ -2113,3 +2113,160 @@ fn ws_gap_03_discriminator_guard_self_test() {
     let bare = "      pattern     = \"{ $.code = \\\"WS-GAP-03\\\" && $.level = \\\"ERROR\\\" }\"";
     assert!(bare.contains("WS-GAP-03") && !bare.contains("$.source"));
 }
+
+// ---------------------------------------------------------------------------
+// A Metrics Insights alarm must fit inside AWS's 3-hour evaluation cap
+// (2026-08-25 — found by reading the terraform APPLY log after PR #1809
+//  merged, not by any PR check.)
+//
+// `aws_cloudwatch_metric_alarm.disk_fill_rate_high` shipped in #1805 with
+// `period = 21600` (6h) x `evaluation_periods = 2` = 12 hours. AWS caps a
+// Metrics Insights alarm — one whose metric_query uses a `SELECT ... FROM`
+// expression — at a 3-hour evaluation range, and rejected it:
+//
+//     ValidationError: MetricsInsights monitors cannot be checked across
+//     more than 3 hours
+//
+// `terraform validate` and `terraform plan` both PASSED it. The window is
+// checked only by the real PutMetricAlarm call at APPLY time — exactly like a
+// CloudWatch filter PATTERN, which plan also treats as an opaque string.
+//
+// The consequence is the part worth pinning. Terraform stops at the first
+// failing resource, so from the moment #1805 merged the apply lane was red and
+// EVERY terraform change merged after it sat on main UNDEPLOYED — including
+// the eight alarms from #1809, which were green, merged, and doing nothing.
+// A red apply lane is not one broken alarm; it is a silent freeze on all
+// infrastructure delivery, and nothing in the PR gates can see it.
+// ---------------------------------------------------------------------------
+
+/// AWS's documented ceiling for a Metrics Insights alarm's evaluation range.
+const METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS: u64 = 3 * 60 * 60;
+
+/// Pull `(name, period, evaluation_periods, is_metrics_insights)` for every
+/// alarm resource in the terraform directory.
+///
+/// Block-scoped for the same reason as the Lambda guard: the three facts sit
+/// on separate lines and pairing them by proximity would mis-associate
+/// adjacent alarms.
+fn alarm_eval_windows(bodies: &[(String, String)]) -> Vec<(String, u64, u64, bool)> {
+    let mut out = Vec::new();
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("resource \"aws_cloudwatch_metric_alarm\"") {
+                inside = true;
+                block.clear();
+            }
+            if !inside {
+                continue;
+            }
+            block.push_str(line);
+            block.push('\n');
+            if line != "}" {
+                continue;
+            }
+            inside = false;
+
+            // A Metrics Insights alarm is one whose expression is a query.
+            let is_insights = block.contains("SELECT ") && block.contains(" FROM ");
+            if !is_insights {
+                continue;
+            }
+
+            let name = block
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("resource \"aws_cloudwatch_metric_alarm\" \"")
+                        .and_then(|r| r.find('"').map(|e| r[..e].to_string()))
+                })
+                .unwrap_or_else(|| "<unnamed>".to_string());
+
+            let num = |key: &str| -> Option<u64> {
+                block.lines().find_map(|l| {
+                    let t = l.trim();
+                    let rest = t.strip_prefix(key)?;
+                    let rest = rest.trim_start();
+                    let rest = rest.strip_prefix('=')?;
+                    rest.trim().split_whitespace().next()?.parse::<u64>().ok()
+                })
+            };
+
+            // `period` lives inside the metric_query block; evaluation_periods
+            // at the alarm level. A missing period means the query inherits a
+            // default, which cannot exceed the cap on its own.
+            let period = num("period").unwrap_or(0);
+            let evals = num("evaluation_periods").unwrap_or(1);
+            out.push((name, period, evals, true));
+        }
+    }
+    out
+}
+
+#[test]
+fn metrics_insights_alarms_stay_inside_the_three_hour_cap() {
+    let bodies = terraform_bodies();
+    let windows = alarm_eval_windows(&bodies);
+
+    assert!(
+        !windows.is_empty(),
+        "no Metrics Insights alarm found — this guard would pass vacuously. \
+         If the last one was removed, delete this test deliberately."
+    );
+
+    for (name, period, evals, _) in &windows {
+        let range = period.saturating_mul(*evals);
+        assert!(
+            range <= METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS,
+            "Metrics Insights alarm `{name}` evaluates across {range}s \
+             (period {period} x {evals} periods), over AWS's {}s cap.\n\
+             PutMetricAlarm will REJECT it with `MetricsInsights monitors cannot be \
+             checked across more than 3 hours` — and terraform plan will NOT catch \
+             that, so the whole apply lane goes red and every later terraform change \
+             stops deploying.\n\
+             Fix: shrink `period` (and/or `evaluation_periods`) so their product is \
+             at most {}s.",
+            METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS,
+            METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS
+        );
+    }
+}
+
+#[test]
+fn metrics_insights_window_guard_self_test() {
+    // The extractor must find the query, the period and the evaluation count,
+    // and must ignore a NON-Insights alarm (which has no such cap).
+    let over = r#"
+resource "aws_cloudwatch_metric_alarm" "too_wide" {
+  evaluation_periods = 2
+  metric_query {
+    id          = "q"
+    period      = 21600
+    expression  = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE path = '/'"
+  }
+}
+"#;
+    let bodies = vec![("f.tf".to_string(), over.to_string())];
+    let w = alarm_eval_windows(&bodies);
+    assert_eq!(w.len(), 1, "the Insights alarm must be found");
+    assert_eq!(w[0].0, "too_wide");
+    assert_eq!(w[0].1 * w[0].2, 43200, "12h must be computed as 12h");
+    assert!(w[0].1 * w[0].2 > METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS);
+
+    // A plain metric alarm has no Insights cap and must not be collected —
+    // otherwise every long-window alarm in the tree becomes a false failure.
+    let plain = r#"
+resource "aws_cloudwatch_metric_alarm" "plain" {
+  evaluation_periods = 24
+  period             = 21600
+  metric_name        = "Errors"
+  namespace          = "AWS/Lambda"
+}
+"#;
+    let bodies = vec![("f.tf".to_string(), plain.to_string())];
+    assert!(
+        alarm_eval_windows(&bodies).is_empty(),
+        "a non-Insights alarm must not be subject to the Insights cap"
+    );
+}
