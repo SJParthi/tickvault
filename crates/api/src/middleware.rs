@@ -463,6 +463,7 @@ fn sanitize_forwarded_peer(forwarded: &str) -> String {
 ///
 /// # Usage
 /// Applied via `axum::middleware::from_fn_with_state` on protected routes.
+// WIRING-EXEMPT: axum middleware — passed as a VALUE to `from_fn_with_state(.., require_bearer_auth)` at crates/api/src/lib.rs:166 and :209, never called with parens, so the guard's call-site pattern cannot see it. Verified wired, not dormant.
 pub async fn require_bearer_auth(
     axum::extract::State(config): axum::extract::State<ApiAuthConfig>,
     request: Request,
@@ -552,13 +553,104 @@ pub async fn require_bearer_auth(
 // Request Tracing Middleware (L5)
 // ---------------------------------------------------------------------------
 
+/// Maps an HTTP method to a STATIC label. Total function — an
+/// attacker-controlled method can only ever produce one of ten fixed
+/// `&'static str` values.
+///
+/// # Why this exists: unbounded, remotely-driven metric cardinality
+///
+/// This label was `method.to_string()`. `http::Method` accepts ANY RFC-7230
+/// token as an extension method, so `curl -X ANYTHINGATALL` minted a brand-new
+/// label set — and `metrics_exporter_prometheus` is configured with no
+/// `idle_timeout` (`observability.rs`), so its registry NEVER evicts. Each
+/// distinct method permanently allocated a histogram plus its full bucket
+/// vector, at request rate.
+///
+/// Three things made it reachable rather than theoretical:
+/// `request_tracing` is the OUTERMOST `.layer()` in `build_router_with_auth`,
+/// so it records BEFORE `require_bearer_auth` rejects — unauthenticated;
+/// it sits OUTSIDE `public_rate_limit`, which is a `route_layer` scoped to
+/// two routes — unthrottled; and the API is publicly funnelled on 3001.
+///
+/// The failure shape is worse than memory: every new series enlarges the
+/// `/metrics` scrape body, and a scrape that times out takes EVERY live-lane
+/// alarm blind while the feed still looks healthy. Cardinality abuse of the
+/// observability layer to blind the observability layer.
+///
+/// NORMALISATION, not eviction, and not a cap. An `idle_timeout` would
+/// silently drop legitimate low-traffic series — hiding real data to bound
+/// fake data. A cap would start refusing real methods once poisoned. Folding
+/// to a fixed set means the attack produces exactly one extra series
+/// (`other`) forever. This mirrors `public_guard::endpoint_label`, which
+/// already got this right for paths.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::TRACE => "TRACE",
+        axum::http::Method::CONNECT => "CONNECT",
+        _ => "other",
+    }
+}
+
+/// Maps a status code to a STATIC label.
+///
+/// Status is inherently bounded (a `u16`), so unlike the method it was never a
+/// cardinality risk — but `status.to_string()` still allocated a `String` on
+/// EVERY request, on a path whose own doc claimed it did not allocate.
+///
+/// The codes this API actually returns are enumerated exactly; anything else
+/// folds to its class. That is a deliberate, stated trade: an unusual code
+/// keeps its class rather than its exact value, which is strictly more useful
+/// than the allocation it replaces and cannot surprise a dashboard reading the
+/// enumerated set.
+fn status_label(status: u16) -> &'static str {
+    match status {
+        200 => "200",
+        201 => "201",
+        202 => "202",
+        204 => "204",
+        304 => "304",
+        400 => "400",
+        401 => "401",
+        403 => "403",
+        404 => "404",
+        405 => "405",
+        408 => "408",
+        409 => "409",
+        413 => "413",
+        429 => "429",
+        500 => "500",
+        502 => "502",
+        503 => "503",
+        504 => "504",
+        100..=199 => "1xx",
+        203 | 205..=299 => "2xx",
+        300..=303 | 305..=399 => "3xx",
+        402 | 404..=428 | 430..=499 => "4xx",
+        501 | 505..=599 => "5xx",
+        _ => "other",
+    }
+}
+
 /// Request tracing middleware — logs every HTTP request with method, path,
 /// status code, and duration. Emits `tv_api_request_duration_ms` histogram
 /// for Prometheus/Grafana dashboards.
 ///
 /// # Performance
 /// O(1) per request — one `Instant::now()` + one histogram observe.
-/// No allocation beyond what axum already does for request routing.
+///
+/// Both histogram labels are `&'static str` (see [`method_label`] and
+/// [`status_label`]), so the label set is bounded by construction and the
+/// emit allocates nothing. The `path` below IS still allocated, but it goes
+/// only to the structured log, never to a metric label — logs are
+/// rotated and size-bounded; a metric registry is not.
+// WIRING-EXEMPT: axum middleware — passed as a VALUE to `from_fn(request_tracing)` at crates/api/src/lib.rs:314, never called with parens, so the guard's call-site pattern cannot see it. Verified wired, not dormant.
 pub async fn request_tracing(request: Request, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().clone();
@@ -571,8 +663,8 @@ pub async fn request_tracing(request: Request, next: Next) -> Response {
 
     // Emit histogram for Grafana dashboards (P99 latency, throughput, etc.)
     metrics::histogram!("tv_api_request_duration_ms",
-        "method" => method.to_string(),
-        "status" => status.to_string(),
+        "method" => method_label(&method),
+        "status" => status_label(status),
     )
     .record(duration_ms);
 
@@ -2046,5 +2138,111 @@ mod tests {
             StatusCode::OK,
             "a rejected SSM value must never lock the operator out"
         );
+    }
+}
+
+#[cfg(test)]
+mod metric_label_cardinality_tests {
+    use super::{method_label, status_label};
+    use axum::http::Method;
+
+    /// THE ATTACK: an arbitrary extension method must not mint a new series.
+    ///
+    /// `http::Method` accepts any RFC-7230 token, and the recorder has no
+    /// `idle_timeout`, so before the fix each of these permanently allocated a
+    /// histogram plus its bucket vector — unauthenticated (the layer runs
+    /// before bearer auth) and unthrottled (it sits outside the rate limiter).
+    #[test]
+    fn an_attacker_supplied_method_can_never_mint_a_new_label() {
+        for raw in [
+            "ANYTHINGATALL",
+            "X",
+            "BLAH",
+            "PROPFIND",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\u{1}TOKEN",
+        ] {
+            let Ok(method) = Method::from_bytes(raw.as_bytes()) else {
+                continue; // not a legal token; hyper rejects it earlier
+            };
+            assert_eq!(
+                method_label(&method),
+                "other",
+                "every non-standard method must fold to the single `other` \
+                 bucket — one extra series forever, not one per attacker string"
+            );
+        }
+    }
+
+    /// The nine real methods keep their own identity, or the fix would have
+    /// bought boundedness by destroying the metric's usefulness.
+    #[test]
+    fn every_standard_method_keeps_its_own_label() {
+        let standard = [
+            (Method::GET, "GET"),
+            (Method::POST, "POST"),
+            (Method::PUT, "PUT"),
+            (Method::DELETE, "DELETE"),
+            (Method::HEAD, "HEAD"),
+            (Method::OPTIONS, "OPTIONS"),
+            (Method::PATCH, "PATCH"),
+            (Method::TRACE, "TRACE"),
+            (Method::CONNECT, "CONNECT"),
+        ];
+        for (method, expected) in &standard {
+            assert_eq!(method_label(method), *expected);
+        }
+        // Distinctness: a fold that collapsed two real methods together would
+        // pass the loop above only if the table were wrong in both rows, so
+        // assert the set size directly.
+        let mut labels: Vec<&str> = standard.iter().map(|(m, _)| method_label(m)).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            9,
+            "the nine standard methods must stay distinct"
+        );
+    }
+
+    /// Total over the whole u16 space — no status can escape the fold.
+    ///
+    /// Exhaustive rather than sampled: the match has range arms that are easy
+    /// to leave a hole in, and a hole would fall through to a panic-free but
+    /// unlabelled path only if the wildcard were removed. This proves every
+    /// one of 65,536 inputs lands on a static label.
+    #[test]
+    fn status_label_is_total_over_every_u16() {
+        for code in 0..=u16::MAX {
+            let label = status_label(code);
+            assert!(!label.is_empty(), "status {code} produced an empty label");
+        }
+    }
+
+    /// The label space is small and FIXED — the property that actually bounds
+    /// the registry.
+    #[test]
+    fn the_status_label_space_is_bounded_and_small() {
+        let mut seen: Vec<&str> = (0..=u16::MAX).map(status_label).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(
+            seen.len() <= 32,
+            "status labels must stay a small fixed set; got {} distinct values",
+            seen.len()
+        );
+        // The codes this API actually returns keep their exact identity.
+        for code in [200u16, 401, 404, 429, 500, 503] {
+            assert_eq!(status_label(code), code.to_string().as_str());
+        }
+    }
+
+    /// Both labels are `&'static str`, which is what makes the emit
+    /// allocation-free — the property the doc comment used to claim falsely.
+    #[test]
+    fn both_labels_are_static_str_so_the_emit_allocates_nothing() {
+        let m: &'static str = method_label(&Method::GET);
+        let s: &'static str = status_label(200);
+        assert_eq!((m, s), ("GET", "200"));
     }
 }
