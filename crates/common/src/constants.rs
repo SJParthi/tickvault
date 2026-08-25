@@ -4668,6 +4668,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod cadence_native_retry_hedge_tests {
-    use super::*;
-}
+mod cadence_native_retry_hedge_tests {}

@@ -73,8 +73,8 @@ use tickvault_core::cadence::decision::{DecisionLatch, DecisionOutcome, SkipReas
 use tickvault_core::cadence::executor::{CadenceFetchError, SpotTarget};
 use tickvault_core::cadence::gate::{DhanGates, GateVerdict};
 use tickvault_core::cadence::ladder::{
-    DHAN_SHAPE_MAX_STEP, GROWW_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder,
-    failure_arms_ladder, may_retry_in_cycle, min_spot_step_for_cap,
+    DHAN_SHAPE_MAX_STEP, SPOT_CONCURRENCY_MAX_STEP, StreakLadder, failure_arms_ladder,
+    may_retry_in_cycle, min_spot_step_for_cap,
 };
 use tickvault_core::cadence::runner::{CycleAction, build_cycle_events};
 use tickvault_core::cadence::schedule::{
@@ -911,11 +911,7 @@ fn test_minute_boundary_race_no_double_fire() {
     );
     // Past the burst instant, T has begun → skip to the next boundary.
     assert_eq!(
-        next_joinable_boundary(
-            t_ms + i64::from(cfg.dhan_burst_offset_ms),
-            Some(t - 60),
-            &cfg
-        ),
+        next_joinable_boundary(t_ms + cfg.dhan_burst_offset_ms, Some(t - 60), &cfg),
         Some(t + 60)
     );
     // An instant-completing cycle AT T never re-selects T.

@@ -703,6 +703,16 @@ impl MultiTfAggregator {
     }
 }
 
+#[cfg(test)]
+impl MultiTfAggregator {
+    /// Test-only: shrink the effective slot ceiling so the fail-closed
+    /// exhaustion path can be exercised without allocating
+    /// [`AGGREGATOR_MAX_SLOTS`] cells (~135 MB).
+    fn force_capacity_for_test(&mut self, cap: usize) {
+        self.test_capacity_override = Some(cap);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1759,15 +1769,5 @@ mod tests {
              decode + ILP append are NOT included)",
             ticks_per_sec / envelope
         );
-    }
-}
-
-#[cfg(test)]
-impl MultiTfAggregator {
-    /// Test-only: shrink the effective slot ceiling so the fail-closed
-    /// exhaustion path can be exercised without allocating
-    /// [`AGGREGATOR_MAX_SLOTS`] cells (~135 MB).
-    fn force_capacity_for_test(&mut self, cap: usize) {
-        self.test_capacity_override = Some(cap);
     }
 }

@@ -748,3 +748,160 @@ instead of a constant; it does not measure whether 2, 3 or 4 workers is the righ
 for this workload — the first live session at scale is still that measurement, and the
 env override is still how it gets acted on. 11b removes a latent precision class above
 131,072; no price flowing today reaches it, so nothing observable changes.
+
+---
+
+## Item 12 — Close the gates that could pass while measuring nothing (2026-08-24 audit)
+
+**Authorization.** Operator, 2026-08-24, verbatim: *"fix and resolve evrything dude okay?"* —
+given in direct response to a message that enumerated the open findings of an 8-agent
+workspace audit as a ranked table. Same authorization shape §28.2/§28.3 of
+`daily-universe-scope-expansion-2026-05-27.md` already accept: a general go-ahead that
+selects work the preceding message listed. Added to THIS plan rather than a new file
+because the tree sits at exactly `PLAN_GATE_MAX_ACTIVE` (5) and a sixth `active-plan*.md`
+would BLOCK every `crates/*/src/**.rs` push (V7) — the same slot constraint this plan's
+own header records. Per `plan-enforcement.md` rule 5, items may be added to an approved
+plan during implementation.
+
+### Design
+
+The audit's highest-value finding was not a bug in trading logic — it was a **gate that
+reported success without measuring anything**, which is the false-OK class
+`audit-findings` Rule 11 forbids and the class this repository has already retired twice.
+Item 12 closes that class wherever the sweep found it, and adds the ratchets that stop it
+returning.
+
+- [x] **12a — `bench-gate.sh` fails closed on an empty comparison.** Two paths printed a
+  success line and exited 0 while enforcing ZERO of the 11 absolute latency budgets: an
+  empty Criterion tree, and benches whose ids had drifted away from their budget keys.
+  Both now exit 3 with a named cause. Exit 3 is distinct from 1 (absolute breach) and 2
+  (regression) so `bench.yml`'s baseline-ratchet condition (`gate_rc != '2'`) is
+  unchanged. **Bite-proven in both directions** — against the pre-fix script the two new
+  self-test cases return exit 0, against the fixed script exit 3, and all 7 pre-existing
+  cases pass unchanged in both runs. The sibling `coverage-gate.sh` was fixed against this
+  exact class on 2026-07-10 with a self-test; the fix had never been propagated.
+  *(Landed 905155c.)*
+
+- [ ] **12b — Arm the clippy gate on test targets, with the measurement CI asked for.**
+  `ci.yml`'s clippy step carries a comment stating `--all-targets` is "deliberately
+  omitted... its true warning count is UNMEASURED. Arming it is separate work with its own
+  measurement". This item IS that work. Measured on this tree: 93 lints, all inside inline
+  `#[cfg(test)]` modules — `cargo clippy --workspace --no-deps -- -D warnings` (what CI
+  runs) is already clean, and the terminating error names `tickvault-app (lib test)`. Fix
+  the test-target lints, add `--all-targets`, and extend
+  `rust_only_guard.rs::ci_clippy_gate_stays_armed` to pin the new flag so it cannot be
+  dropped silently.
+
+- [x] **12c — Ratchet the dependency-graph interpreter class (scope hole EIGHT).**
+  `rust_only_guard.rs` scans `Cargo.lock` for native BUILD systems
+  (`KNOWN_NATIVE_BUILDERS`) and for nothing else. No test anywhere scans the graph for an
+  embedded scripting runtime, so `rhai = "1"` in a crate manifest plus a script carried as
+  an `include_str!` string would pass every existing guard green: no banned extension, no
+  shebang, no spawn literal, no invocation token. Verified absent today (pyo3, mlua, rlua,
+  rhai, deno_core, boa_engine, rquickjs, rustpython, v8, quickjs, duktape, wasmtime,
+  wasmer, neon — none in the lockfile). This is the eighth time the guard has been found
+  scoped to a surface rather than a question, which is the recurring shape its own §0.3
+  records.
+
+- [x] **12d — Back off the WAL no-segment retry arm.** `persist_record_resilient`'s
+  `open_segment_resilient` failure path emits one `error!` per record and retries
+  immediately. Its two siblings — the flush arm and the `write_record` arm — both sleep
+  `WAL_WRITER_IO_RETRY_BACKOFF` first. On a full disk at the ~5,000 frame/s envelope that
+  is ~5,000 open() syscalls and ~5,000 ERROR lines per second written to the disk that is
+  already full. Disk-full DOES page (`WS-SPILL-01` has a live metric-filter alarm, checked
+  in source), so this is amplification of a detected failure, not a silent one.
+
+- [x] **12e — Drop the stale `crates/frontend-wasm` workspace exclusion.** The path does
+  not exist and carries zero tracked files, so the entry excluded nothing while reading as
+  a live carve-out to anyone auditing the Rust-only boundary. `cargo metadata` resolves
+  identically without it.
+
+### Edge Cases
+
+Exit 3 must not collide with `bench.yml`'s baseline-save condition (`gate_rc != '2'`) — it
+does not, and a run that measured nothing should still save whatever Criterion produced
+rather than starve the cache (the deadlock the rc=1 comment already records). Arming
+`--all-targets` must not break the calibration harnesses that legitimately print: the
+`print_stdout` hit is handled at its site rather than by weakening the lint globally. The
+lockfile scan must fail closed on an unreadable `Cargo.lock` rather than passing vacuously
+— the exact defect 12a fixes elsewhere.
+
+### Failure Modes
+
+A future crate legitimately needing a sandboxed expression evaluator would trip 12c. That
+is the intended behaviour: it forces a dated decision instead of an accident. The list is
+a shrink-only allowlist in the established shape, so adding one is a visible diff.
+
+### Test Plan
+
+`bash scripts/bench-gate.selftest.sh` (9 cases, bite-proven both directions);
+`cargo clippy --workspace --all-targets -- -D warnings` exits 0;
+`cargo test -p tickvault-common --test rust_only_guard`;
+`cargo test -p tickvault-storage`;
+`cargo test --workspace` stays at 0 failures.
+
+### Rollback
+
+Every item is an independent revert. 12a/12d are localised to one function each; 12b is a
+flag on one CI line plus test-module edits with no production reach; 12c is an additive
+test; 12e is a manifest comment.
+
+### Observability
+
+12a and 12d change what an operator SEES on a failing run — a named cause instead of a
+success line, and a legible error rate instead of a flood. No new metric, no new alarm, no
+new `NotificationEvent`; the Dhan 4-item Telegram family is untouched.
+
+#### 12b outcome — MEASURED, PARTIALLY DONE, arming DEFERRED (2026-08-24)
+
+The measurement CI asked for is complete, and the auto-fixable half landed. The flag is
+NOT armed, because arming it today would make Build & Verify fail on the first PR.
+
+| | |
+|---|---|
+| Measured before any change | **93 lints, 102 error lines, exit 101**; all in inline `#[cfg(test)]` modules; the two hits resolving to production files were `note: the lint level is defined here`, i.e. the `#![deny(...)]` attribute lines |
+| Fixed | 70 `inconsistent_digit_grouping` + needless borrows + `while let` on an iterator + `assert_eq!(x, true)` — all semantically neutral, verified by a **pure-reorder / identical-literal** diff check and a full suite re-run |
+| Remaining | **13**, all pre-existing, none auto-fixable: 10 × `assertions_on_constants`, 1 × `field assignment outside of initializer`, 1 × `nonminimal_bool`, 1 × `unused mut` |
+| Locations | `common/src/ingest_shed.rs` ×4, `common/src/constants.rs` ×3, `common/src/broker_order_events.rs` ×3, `common/src/config.rs` ×2, `common/tests/core_affinity_claim_guard.rs` ×1 |
+| Fix shape | The 10 constant assertions want `const _: () = assert!(...)`, which this repo already uses (`constants.rs:3010`) and which is STRONGER — it moves the check from test-time to build-time. The `nonminimal_bool` one is `!(!a && b)`; simplifying it would make a deliberately-readable guard message harder to read, so it wants a justified `#[allow]`, not a rewrite. |
+
+Arming is therefore one small, self-contained follow-up: fix 13, flip the flag, restore the
+`--all-targets` assertion in `ci_clippy_gate_stays_armed`. Both were written and reverted in
+this session rather than shipped red — a gate that fails on arrival teaches people to
+bypass it.
+
+#### 12f — What the LIVE box says (2026-08-24 session, read from AWS)
+
+Source analysis cannot answer "is it working". These are live readings, and two of them
+overturn conclusions the source audit reached.
+
+| Reading | Value |
+|---|---|
+| Instance | `i-0c3fe906dad5492fc`, r8g.xlarge, ap-south-1b, stopped at time of read |
+| Peak memory | **12.7% of 32 GiB ≈ 4.1 GB** — retires the long-standing UNMEASURED memory flag |
+| Peak CPU | 46%, session average 13–23% |
+| Free spill disk | 208.8 GB |
+| WebSocket connections alive | **15** |
+| Ticks dropped / WAL frames dropped / seals dropped | **0 / 0 / 0** |
+| Candles sealed | **1,002,896** |
+| Depth rows | 2,883,880 |
+| Instruments never ticked | 0 (745 went silent later — normal for illiquid strikes) |
+| **Ticks REFUSED by the aggregator** | **49,112**, and a 120-episode sample shows **100% timestamp refusals** — `refused_price = 0`, `refused_slot_exhausted = 0` |
+| `AGGREGATOR-DROP-01` episodes | **713** in one session — roughly one every 30s, all day |
+
+**The refusal finding is the important one and it is new.** `MIN_PLAUSIBLE_EXCHANGE_TS_SECS`
+(1_600_000_000) refuses any tick whose exchange timestamp is below 2020-09-13, which is what
+a never-traded instrument's `LTT = 0` sentinel looks like. So ~49k packets per session are
+dropped before the fold and never become a candle.
+
+The persistence layer disagrees with the aggregator about the same packet:
+`row_timestamp_ist_nanos` deliberately falls back to the RECEIPT time for a sentinel LTT and
+stores the row, while the aggregator refuses it outright. **The tick is kept; the candle is
+not.** That is one packet, two policies, and it is a coherent explanation for OHLC gaps on
+illiquid instruments — which is exactly the symptom the operator reported independently.
+
+Also live-verified: **23 of the 76 EMF-declared metrics have never published a datapoint**,
+and two alarms (`tv-prod-ticks-lost-spill`, `tv-prod-wal-frames-not-recovered`) sit on
+metrics with no series — they read OK because nothing has ever arrived, not because
+something was checked. `mem_used_percent` publishes under CWAgent with an `InstanceId`
+dimension; `tv_process_rss_bytes` does not publish at all.

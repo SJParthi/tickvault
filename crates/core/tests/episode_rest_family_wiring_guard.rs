@@ -184,14 +184,15 @@ fn guard_chain_slot_map_per_underlying_and_distinct_catch_all() {
         ("MIDCPNIFTY", 7),
         ("", 7),
     ] {
-        for (label, key) in [(
-            "Chain1mUnderlyingNotServed",
-            NotificationEvent::Chain1mUnderlyingNotServed {
-                underlying,
-                empty_minutes: 10,
-            }
-            .episode_key(),
-        )] {
+        {
+            let (label, key) = (
+                "Chain1mUnderlyingNotServed",
+                NotificationEvent::Chain1mUnderlyingNotServed {
+                    underlying,
+                    empty_minutes: 10,
+                }
+                .episode_key(),
+            );
             let key = key.unwrap_or_else(|| panic!("{label}({underlying}) must be routed"));
             assert_eq!(
                 key.conn, slot,
@@ -348,7 +349,8 @@ fn guard_no_routed_rest_event_is_critical_and_first_page_severity_shape() {
 
 #[test]
 fn guard_rest_family_snapshot_labels_round_trip() {
-    for (family, label) in [(EpisodeFamily::DhanRest, "dhan_rest")] {
+    {
+        let (family, label) = (EpisodeFamily::DhanRest, "dhan_rest");
         assert_eq!(family.snapshot_label(), label);
         assert_eq!(EpisodeFamily::from_snapshot_label(label), Some(family));
     }
@@ -487,7 +489,8 @@ fn guard_rest_slot_descs_match_the_routing_slot_table() {
 fn guard_rest_family_config_is_default() {
     // EpisodeConfig carries no PartialEq — Debug-compare pins the values.
     let default = format!("{:?}", EpisodeConfig::default());
-    for family in [EpisodeFamily::DhanRest] {
+    {
+        let family = EpisodeFamily::DhanRest;
         assert_eq!(
             format!("{:?}", episode_config_for(family)),
             default,

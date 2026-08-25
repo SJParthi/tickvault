@@ -666,6 +666,24 @@ fn persist_record_resilient(
             "stage" => "no_segment"
         )
         .increment(1);
+        // BACKOFF (2026-08-24, audit): the two SIBLING I/O failure arms — the
+        // flush arm and the `write_record` arm below — both sleep
+        // `WAL_WRITER_IO_RETRY_BACKOFF` before returning. This one did not, and
+        // it is the arm that fires on a FULL DISK: `open_segment_resilient`
+        // emits one coded `error!` per record while no segment can be opened,
+        // so at the ~5,000 frame/s envelope the writer spun through ~5,000
+        // `open()` syscalls and ~5,000 ERROR lines PER SECOND, written to the
+        // disk that is already full. The failure is detected either way
+        // (WS-SPILL-01 has a live metric-filter alarm), so this is not a
+        // silence fix — it stops a detected failure from amplifying itself and
+        // starving the very disk the operator has to recover.
+        //
+        // The sleep is the writer thread's own, exactly as in the sibling arms:
+        // this runs on the dedicated WAL writer, never on the hot path. Frames
+        // continue to reach the broadcast and the ring→spill→DLQ while it
+        // backs off — the durable-WAL belt is what is degraded, and it is
+        // already degraded by the full disk.
+        thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
         return 0;
     };
     match write_record(w, r) {
@@ -2421,7 +2439,7 @@ mod tests {
         let dir = tmp_dir("ceil-foreign");
         seed_archive(&dir, 2, 1000);
         let foreign = &dir.join(ARCHIVE_SUBDIR).join("operator-notes.txt");
-        std::fs::write(&foreign, vec![0_u8; 100_000]).expect("write foreign");
+        std::fs::write(foreign, vec![0_u8; 100_000]).expect("write foreign");
         let out = prune_archived_segments_at(&dir, u64::MAX, 1500, SystemTime::now());
         assert!(foreign.exists(), "foreign file must survive");
         assert_eq!(out.size_deleted, 1, "only .wal segments are candidates");
@@ -2438,7 +2456,7 @@ mod tests {
         let out = prune_archived_segments_at(&dir, u64::MAX, 0, SystemTime::now());
         assert_eq!((out.deleted, out.size_deleted, out.bytes_after), (0, 0, 0));
         // present but empty
-        std::fs::create_dir_all(&dir.join(ARCHIVE_SUBDIR)).expect("mkdir");
+        std::fs::create_dir_all(dir.join(ARCHIVE_SUBDIR)).expect("mkdir");
         let out = prune_archived_segments_at(&dir, u64::MAX, 0, SystemTime::now());
         assert_eq!((out.deleted, out.size_deleted, out.bytes_after), (0, 0, 0));
     }

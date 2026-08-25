@@ -924,12 +924,12 @@ mod tests {
 
         // Roll into the next minute; day_open is on the wire now, but this
         // bucket is NOT the day's first and must open at its own price.
-        let mut second = tick_at(OPEN + 60, 24_055.50, 20);
+        let mut second = tick_at(OPEN + 60, 24_055.5, 20);
         second.day_open = 24_000.25;
         cell.consume_tick(TfIndex::M1, &second, 0, strategy, 20);
         assert_eq!(
             cell.snapshot(TfIndex::M1).open,
-            f32_to_f64_clean(24_055.50),
+            f32_to_f64_clean(24_055.5),
             "every bucket after the first opens at its OWN first traded price"
         );
     }
