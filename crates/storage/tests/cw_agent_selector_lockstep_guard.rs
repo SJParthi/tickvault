@@ -63,24 +63,71 @@ fn extract_selector_regex(content: &str, name: &str) -> String {
     tail[..end + 2].to_string()
 }
 
+/// INVERTED 2026-08-25. There is no second copy any more, and that is the fix.
+///
+/// This guard used to require the EMF metric-selector alternation in
+/// `user-data.sh.tftpl` to stay byte-identical to the one in
+/// `deploy/aws/cloudwatch-agent.json`. Keeping two copies in sync is exactly
+/// the kind of obligation a ratchet can enforce and a design should not
+/// create: the duplicate was ~1.6 KB, and it pushed the user-data template to
+/// EXACTLY its 15,872-byte budget with ZERO bytes free — measured, not
+/// estimated — which blocked every subsequent addition to the boot script,
+/// including the EMF names the observability audit wanted.
+///
+/// The template now emits a MINIMAL host-only fallback and copies the repo
+/// file into place after the Step 5 clone. One copy cannot drift from itself.
+///
+/// What this test pins is that the arrangement stays that way: no selector
+/// re-embedded in the template, and the post-clone install still present. If
+/// the install were dropped while the selector stayed absent, every box would
+/// silently run host-metrics-only — a far quieter failure than drift ever was.
 #[test]
-fn cw_agent_selector_copies_are_byte_identical() {
+fn user_data_carries_no_second_copy_of_the_selector() {
     let root = repo_root();
+    let boot = read(&root.join("deploy/aws/terraform/user-data.sh.tftpl"));
+
+    assert!(
+        !boot.contains("\"metric_selectors\""),
+        "the EMF metric-selector list is back inside user-data.sh.tftpl. It is ~1.6 KB \
+         and the template's byte budget has no room for it (it sat at exactly 0 bytes \
+         free before this duplication was removed). The single source of truth is \
+         deploy/aws/cloudwatch-agent.json, copied into place after the Step 5 clone."
+    );
+
+    // The repo copy must still be the real thing.
     let live = extract_selector_regex(
         &read(&root.join("deploy/aws/cloudwatch-agent.json")),
         "deploy/aws/cloudwatch-agent.json",
     );
-    let boot = extract_selector_regex(
-        &read(&root.join("deploy/aws/terraform/user-data.sh.tftpl")),
-        "deploy/aws/terraform/user-data.sh.tftpl",
+    assert!(
+        live.starts_with("^(tv_") && live.ends_with(")$"),
+        "deploy/aws/cloudwatch-agent.json must still carry the anchored exact-name \
+         alternation — a prefix wildcard would publish every metric the app has and \
+         the budget auto-stops the box at 90%"
     );
-    assert_eq!(
-        live, boot,
-        "cw-agent metric_selectors drifted between deploy/aws/cloudwatch-agent.json \
-         (live, per-deploy) and deploy/aws/terraform/user-data.sh.tftpl (first-boot) — \
-         the two copies MUST stay byte-identical or a fresh instance selects a \
-         different metric set than a deployed one"
+
+    // And the boot script must actually install it, or the fallback becomes
+    // the permanent config and no app metric ever reaches CloudWatch.
+    assert!(
+        boot.contains("deploy/aws/cloudwatch-agent.json"),
+        "user-data must copy the repo CloudWatch agent config after the clone; without \
+         it every box runs the host-only fallback and publishes no app metrics at all"
     );
+    assert!(
+        boot.contains("fetch-config"),
+        "the copied config must be applied with amazon-cloudwatch-agent-ctl -a fetch-config, \
+         otherwise the file is written and the running agent never reads it"
+    );
+
+    // The fallback must keep the signals the budget and disk alarms read — a
+    // fallback that reports nothing is the same as no fallback.
+    for measurement in ["used_percent", "mem_used_percent", "cpu_usage_active"] {
+        assert!(
+            boot.contains(measurement),
+            "the host-only fallback must still collect `{measurement}` — it is what the \
+             budget guard and the disk alarms read when the clone has failed"
+        );
+    }
 }
 
 #[test]

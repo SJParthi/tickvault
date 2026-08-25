@@ -8,6 +8,7 @@
 //! directly into the slice for zero-overhead parsing on the hot path.
 
 /// Reads a little-endian f32 from a byte slice at the given offset.
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 pub(super) fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
@@ -20,6 +21,7 @@ pub(super) fn read_f32_le(raw: &[u8], offset: usize) -> f32 {
 }
 
 /// Reads a little-endian u32 from a byte slice at the given offset.
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 pub(super) fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
@@ -32,6 +34,7 @@ pub(super) fn read_u32_le(raw: &[u8], offset: usize) -> u32 {
 }
 
 /// Reads a little-endian u16 from a byte slice at the given offset.
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 pub(super) fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
@@ -45,6 +48,7 @@ pub(super) fn read_u16_le(raw: &[u8], offset: usize) -> u16 {
 /// 90-byte Trade Binary layout (Market Data API v2.6 p.16), unlike Dhan's
 /// unsigned convention — so the signed reader is a distinct helper rather
 /// than a cast at the call site.
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 pub(super) fn read_i32_le(raw: &[u8], offset: usize) -> i32 {
@@ -60,6 +64,7 @@ pub(super) fn read_i32_le(raw: &[u8], offset: usize) -> i32 {
 ///
 /// TrueData `Tot Volume`, `OI` and `Prev OI` are 8-byte signed longs
 /// (v2.6 p.16).
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 pub(super) fn read_i64_le(raw: &[u8], offset: usize) -> i64 {
@@ -80,6 +85,7 @@ pub(super) fn read_i64_le(raw: &[u8], offset: usize) -> i64 {
 /// TrueData `Turnover` is an 8-byte double (v2.6 p.16). Note this is the
 /// ONLY f64 on the TrueData trade frame — every price field is f32 and
 /// MUST be widened via `f32_to_f64_clean` (STORAGE-GAP-02), never `as f64`.
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: caller validates buffer length before invoking
 #[inline(always)]
 pub(super) fn read_f64_le(raw: &[u8], offset: usize) -> f64 {

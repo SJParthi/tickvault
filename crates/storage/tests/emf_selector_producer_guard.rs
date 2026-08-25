@@ -139,8 +139,8 @@ fn every_shipped_metric_name_has_a_production_producer() {
 
     let mut orphans = Vec::new();
     for name in selector_names(
-        &read("deploy/aws/terraform/user-data.sh.tftpl"),
-        "user-data.sh.tftpl",
+        &read("deploy/aws/cloudwatch-agent.json"),
+        "cloudwatch-agent.json",
     ) {
         if !producers.contains(&name) {
             orphans.push(name);
@@ -156,7 +156,7 @@ fn every_shipped_metric_name_has_a_production_producer() {
          holds budget that a live counter gets refused for -- which is exactly \
          what happened to tv_tick_spill_replayed_bytes_total.\n\
          Either restore the producer, or remove the name from BOTH selector \
-         copies (cloudwatch-agent.json and user-data.sh.tftpl) and record why in \
+         copy (cloudwatch-agent.json, the file user-data installs after the clone) and record why in \
          deploy/aws/EMF-METRIC-SELECTOR-NOTES.md.",
         orphans.join("\n  ")
     );
@@ -167,10 +167,10 @@ fn the_refusal_counter_that_lost_its_shipping_is_shipped() {
     // Regression pin for the specific defect. Named rather than left implicit,
     // because the general test above would also pass if someone deleted this
     // name instead of restoring it.
-    let tftpl = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let tftpl = read("deploy/aws/cloudwatch-agent.json");
     let agent = read("deploy/aws/cloudwatch-agent.json");
     for (what, body) in [
-        ("user-data.sh.tftpl", &tftpl),
+        ("cloudwatch-agent.json (2nd read)", &tftpl),
         ("cloudwatch-agent.json", &agent),
     ] {
         assert!(

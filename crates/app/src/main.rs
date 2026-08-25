@@ -2298,6 +2298,12 @@ async fn async_main() -> Result<()> {
                 })
             }),
             config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
+            // The ILP WRITE side, added 2026-08-25 with the persistence
+            // wiring. Same server as `questdb_exec_url` above, different
+            // protocol: that one READS the live candles, this one WRITES the
+            // comparison's findings so the feed's only ground-truth check
+            // leaves a record instead of a log line.
+            questdb: config.questdb.clone(),
         },
     );
     if !crossverify_installed {
@@ -3108,6 +3114,26 @@ async fn build_shared_infra(
     // Awaited INLINE, before the first depth ILP row can exist, for exactly
     // the reason the two DDLs above are.
     tickvault_storage::depth_persistence::ensure_market_depth_table(&config.questdb).await;
+
+    // --- Dhan live-vs-REST cross-verification audit tables ---
+    //
+    // Third instance of the identical defect, found by the 2026-08-25 audit.
+    // `ensure_dhan_live_crossverify_tables` had ZERO production callers, and
+    // so did the two writers it exists for — so the tables did not exist, the
+    // 15:41 comparison's findings were never written, and a comment in
+    // `dhan_feed_stack` claimed the opposite.
+    //
+    // This one matters more than the two above rather than less: the India
+    // feed carries no sequence number and no snapshot-on-subscribe, so this
+    // comparison against Dhan's own official tape is the ONLY evidence that
+    // the captured data is real. Awaited inline, before any run can fire, so
+    // ILP cannot auto-create either table without its DEDUP key — the
+    // cell table's key carries `field` and `kind` precisely so a diverged and
+    // a missing finding on the same minute both survive.
+    tickvault_storage::dhan_live_crossverify_persistence::ensure_dhan_live_crossverify_tables(
+        &config.questdb,
+    )
+    .await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
