@@ -748,3 +748,378 @@ instead of a constant; it does not measure whether 2, 3 or 4 workers is the righ
 for this workload — the first live session at scale is still that measurement, and the
 env override is still how it gets acted on. 11b removes a latent precision class above
 131,072; no price flowing today reaches it, so nothing observable changes.
+
+## ITEM 12 — DESIGN ADDENDUM (added 2026-08-25, operator: "yes fix and resolve evrythgi. see what the fuk is this bro when we have only 200 GB but how come this is comign around thsi much dude still i cant beleieve bro liek 4 tb how bro how can we resolve this dude?")
+
+Two findings from the 2026-08-24 live-AWS sweep. Both are LIVE defects on the running
+lane, not latent ones, which is what separates this item from Item 11.
+
+### The measurement that opened it (Verified, live CloudWatch, session 2026-08-24)
+
+| Reading | Value |
+|---|---|
+| `VolumeWriteBytes`, 03:00–12:00 UTC | **4,744 GB** |
+| `VolumeReadBytes`, same window | 672 GB |
+| Sustained throughput 09:30–15:30 IST | **495–500 MB/s** against a 500 MiB/s ceiling |
+| Write latency, pre-open → mid-session | **0.86 ms → 2.30 ms** (2.7x) |
+| `VolumeQueueLength` at market open | **7.3 avg**, 8.5 max |
+| CPU over the same window | **13–27%** |
+
+The disk is pinned at exactly its provisioned ceiling for the whole session while the CPU
+idles. **This is not an O(1) problem and no hot-path work can fix it** — the decode path is
+O(1), zero-alloc and DHAT-gated, and it is not the bottleneck. Recorded explicitly because
+the operator asked for the O(1) guarantee in the same breath as the slowness, and the
+honest answer is that the guarantee holds AND is irrelevant to this symptom.
+
+### 12a — Commit cadence, not data volume, is producing the traffic
+
+**Design.** `FLUSH_INTERVAL_MILLIS = 500` (`dhan_feed_stack.rs`) commits **7,200 times per
+hour** into `PARTITION BY HOUR` tables that carry DEDUP UPSERT KEYS and grow to several GB
+within the hour. QuestDB's per-commit rewrite cost scales with the **partition size**, not
+with the batch size, so committing 10x more often costs ~10x the disk traffic for byte-identical
+data. Measured real data is ~60-80 GB/session (depth 5.3 GB/hr measured 2026-08-18, ticks
+~2.5 GB/day, plus candles) against 4,744 GB written — a ~60-80x amplification.
+
+Raise `FLUSH_INTERVAL_MILLIS` 500 -> 5,000 and re-measure. Expected ~10x traffic reduction,
+to ~470 GB/session (~20 MB/s average), which is far inside the existing 500 MiB/s ceiling.
+
+**Why this cannot lose a tick.** Capture-at-receipt is the durability floor and it runs
+BEFORE the fold and before any ILP flush (`dhan_feed_stack.rs`: "Capture-at-receipt is the
+durability floor"). The WAL already holds the frame when the flush timer fires, so batching
+changes only how long a row waits before becoming visible in QuestDB — never whether it was
+captured. Per operator Quote 4 (2026-07-24, RAM-first absolute) no strategy, indicator or
+risk path may read from the DB at all, so added DB visibility latency cannot reach a
+trading decision by construction.
+
+**Buffer bound.** questdb-rs enforces a 100 MiB `max_buf_size` and exceeding it wedges every
+subsequent flush permanently (recorded at `seal_writer_task.rs` and `shadow_candle_writer.rs`).
+At the measured ~3.6 MB/s of real depth rows a 5 s batch is ~18 MB, ~18% of the cap. The
+implementation MUST assert the chosen interval against a measured worst-case row rate and
+fail closed rather than approach the cap.
+
+**HYPOTHESIS, not yet measured — stated as such.** The amplification MECHANISM above is
+derived from the constants and the QuestDB commit model, not from a controlled experiment;
+the box was stopped when this was written, so no live A/B was possible. The verification is
+named and cheap: `VolumeWriteBytes` for the identical 03:00-12:00 window, one session before
+and one session after the change, same universe size. If the traffic does not fall ~10x the
+hypothesis is WRONG and the DEDUP-merge path is the next suspect, not the flush cadence.
+
+### 12b — A zero timestamp is charged as tick loss and pages the operator
+
+**Design.** `MultiTfAggregator::consume` refuses any tick whose `exchange_timestamp` falls
+outside `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]` (2020-09-13 ..
+2050-01-01) and counts it as `refused_timestamp`, which feeds `AGGREGATOR-DROP-01` — a
+PAGING code whose text reads "These ticks were NOT folded into any candle and NOT written."
+Measured 2026-08-24: **17,931 refusals in one session**, 14,775 of them in the first hour,
+then a steady ~400-580/hour; `refused_price` and `refused_slot_exhausted` were both ZERO.
+
+The inconsistency is that the sibling case is already handled the opposite way: `p == 0.0`
+is classified `untraded_sentinel` — a benign "this instrument has not traded" marker, not a
+drop. A zero LTT is the same statement from the same packet, and `ws_lag_ms` already treats
+a sub-plausible stamp as "a zero or garbage stamp" rather than corruption.
+
+Split the single refusal into two: an explicit `ltt == 0` untraded sentinel (counted,
+NOT charged as a drop, NOT paged) and a genuinely out-of-range stamp (kept as a hard
+refusal, still paged, since that is the hostile-packet case the absolute bound was written
+for — see the watermark-poisoning finding recorded at that constant).
+
+**The gap that must be closed FIRST, before either branch is written.** The aggregator today
+records only a COUNT, never the offending value, so nothing in the repository proves the
+refused stamps are zero. That is an assumption and it is labelled one. Item 12b therefore
+lands the observability half first — a throttled record of the actual refused value (min /
+max / one sample, power-of-two throttled, zero-alloc) — and the classification half only
+after a live session has SHOWN what the values are. Shipping the split on the assumption
+would be exactly the false-OK this plan exists to prevent: if the stamps are not zero, a
+benign-sentinel branch would silently swallow real corruption.
+
+### What Item 12 deliberately does NOT do
+
+- **No EBS throughput raise.** 500 -> 1000 MiB/s (+$20/mo) would hide the amplification
+  rather than remove it, and 12a is expected to put traffic ~10x under the existing ceiling.
+  It also requires a fresh dated operator quote under the daily-universe lock §7 Rule 3,
+  which this quote is not: the operator asked how to RESOLVE the 4 TB, not to buy more pipe.
+  If 12a's measurement shows the traffic still at the ceiling, the raise returns as its own
+  quoted decision with the measured number behind it.
+- **No DEDUP key change.** `capture_seq` in the `ticks` and `market_depth` keys is what makes
+  WAL replay idempotent; removing it to cheapen the merge would trade a measured slowness for
+  duplicate rows after any crash recovery. If 12a proves insufficient, the correct next step
+  is a cheaper idempotence mechanism, designed on its own — never dropping the key.
+- **No retention/window change.** `depth_hot_days = 1` and `intraday_hot_days = 1` are already
+  at their floors and are not implicated: this is write TRAFFIC, not stored volume.
+
+### ITEM 12 — CORRECTION (2026-08-25, same day, BEFORE any code was written)
+
+Four parallel adversarial agents were run against 12a on the operator's instruction
+("I dont need any hallucination or illusion... Try to attack evrythign"). **They killed
+it.** The correction is recorded here rather than by editing 12a, per house convention,
+because the ERROR is the durable lesson: 12a named a mechanism correctly and then blamed
+the wrong constant, and had it shipped it would have changed nothing while being reported
+as a fix.
+
+**12a's named fix is WRONG (Verified, two agents independently).** `FLUSH_ROW_THRESHOLD
+= 1_000` (`dhan_feed_stack.rs:3282`) is evaluated PER FRAME at `:2840`, BEFORE the timer
+arm at `:2905`. The size and time triggers cross at 2,000 ticks/s; the envelope is
+~5,000/s (12,500 at open). So the timer contributes ~0 flushes at open, and raising
+`FLUSH_INTERVAL_MILLIS` 500 -> 5000 would move tick commits from ~5/s to ~5/s. The
+constant's own doc comment already said so ("combined with the 500 ms time trigger it
+caps depth at ~5 flushes/second") and 12a did not read it. **No flush-interval change is
+authorized by this item.**
+
+**The real data volume was also understated.** Inline 5-level depth (`DEPTH_KIND_5`) is
+LIVE and unconditional at the production boot site (`dhan_feed_stack.rs:6332`,
+`.with_inline_depth`), emitting up to 10 rows per Full-mode tick (`:3649`, `:3717`,
+`:3735`) — ~50,000 d5 rows/s ON TOP of the measured 21,300 dedicated depth rows/s. At
+72 B/row that is ~190 GB/session logical, not the 60-80 GB 12a assumed. True
+amplification is therefore ~25x, not ~60-80x. Still large; smaller than claimed.
+
+**Two surviving candidate causes, both O(partition rewrite), neither fixed by 12a:**
+
+- **Candidate A — the candle path has NO batch valve at all.** `SEAL_DRAIN_INTERVAL_MS
+  = 100` (`seal_writer_loop.rs:74`) is a bare timer; `drain_once`
+  (`seal_writer_task.rs:122-235`) short-circuits only on an EMPTY ring and otherwise
+  flushes unconditionally — there is no row-count threshold anywhere on this path, unlike
+  ticks and depth. One flush carries rows for every timeframe table touched that cycle,
+  and `tf_index.rs` enumerates **24** candle tables. Up to ~864,000 table-commits/hour.
+  Worse, `candles_*` are `PARTITION BY DAY` (`shadow_persistence.rs:228`) while ticks and
+  depth were deliberately given `PARTITION BY HOUR` for volume — so the highest-commit
+  path in the system runs against partitions with 24x the merge surface.
+- **Candidate B — `ticks.ts` is out-of-order by hours, structurally.**
+  `tick_persistence.rs:428` stamps the row with `row_timestamp_ist_nanos(
+  tick.exchange_timestamp, ..)` — the exchange LAST-TRADE time, not receipt. For a
+  thin option at 11:00 whose last trade was 09:47, the row lands in an already-CLOSED
+  hourly partition, forcing a reopen and merge-rewrite. `market_depth` stamps
+  `received_at` (`:3685`) and is in-order. So on this reading depth is the VOLUME and
+  ticks is the AMPLIFICATION.
+
+**Uncounted writers on the same root volume** (none of which 12a accounted for):
+QuestDB's own WAL (every byte at least twice), the `ws_frame_spill` raw-frame WAL
+(~26 GB/session, `BufWriter`, no fsync), Loki (30-day retention), `errors.jsonl`, and the
+`tv-questdb-data` docker named volume which lives on root.
+
+**NOT ESTABLISHED and not to be asserted:** QuestDB 9.3.5's exact WAL+DEDUP apply cost.
+No agent could source it from this repository and none invented it. Every statement above
+about rewrite cost scaling with partition size is INFERRED from the columnar-rewrite model
+and is labelled as such.
+
+### ITEM 12 — THE THREE DECISIVE EXPERIMENTS (all require the box; none can run from a dev container)
+
+Ordered cheapest-first. Each is one measurement that discriminates between live candidates.
+No code fix may be proposed under Item 12 until at least E1 or E2 has returned.
+
+- **E1 (settles Candidate B, zero risk, read-only):**
+  `SELECT count() FROM ticks WHERE ts < dateadd('h', -1, received_at)`. A non-trivial
+  count proves ticks are landing in closed partitions and the designated timestamp — not
+  any flush constant — is the amplifier.
+- **E2 (settles Candidate A, one constant, one session):** raise `SEAL_DRAIN_INTERVAL_MS`
+  100 -> 2000 for a single session and compare EBS `VolumeWriteBytes` over the identical
+  03:00-12:00 UTC window. Commit count falls 20x; row count is unchanged. If writes fall
+  roughly proportionally, commit amplification is confirmed and the fix is a row-count
+  valve plus HOUR partitioning on `candles_*`. If writes barely move, the candle path is
+  exonerated.
+- **E3 (settles 12b, read-only, minutes):** the raw frames of every refused tick are
+  already on disk — capture-at-receipt WALs the frame BEFORE parse
+  (`dhan_feed_stack.rs:1149`, `ws_frame_spill`, `data/spill/`). Decode one segment and
+  read the actual LTT values and their `security_id`s. This ends the guessing entirely.
+
+### ITEM 12b — SUPERSEDING FINDINGS (the refusal is worse than 12b described)
+
+- **Most likely cause: `IDX_I` index packets, newly arriving.** `IDX_I_FEED_MODE =
+  FeedMode::Quote` (`connection.rs:506`) landed 2026-08-21; the same file records that
+  BEFORE that flip indices produced ZERO packets and `never_ticked` equalled the index
+  count exactly. The measurement is 2026-08-24 — three days later. An index has no trades,
+  so "last TRADE time" is meaningless for it while LTP is a real number: precisely the
+  price-sane / timestamp-insane shape that reaches this gate. **Unknown:** nothing in the
+  repo states Dhan's LTT for `IDX_I`, and `docs/dhan-support/2026-05-18-idx-i-quote-full-mode-support.md`
+  asked Dhan exactly this and NO ANSWER IS RECORDED. 119 indices also do not obviously
+  produce 17,931 refusals, so the cause may be only partly this.
+- **A refused instrument is INVISIBLE, not merely undercounted.** The gap detector
+  observes at `:1188`, BEFORE `consume_tick` at `:1203`, unconditionally. So an instrument
+  whose every tick is refused gets no candle and no `ticks` row, and is simultaneously NOT
+  silent to `scan_silence` / RISK-GAP-03 — it reads as healthy. It is indistinguishable
+  from an instrument that simply never traded. This is a false-OK of the exact class the
+  charter forbids and it is LIVE today.
+- **The `reason` label never reaches CloudWatch.** EMF dimensions are `[["host"]]`
+  (`cloudwatch-agent.json:23`), so `tv_aggregator_tick_refused_total{reason}` is summed
+  across reasons and the operator cannot separate a timestamp refusal from a price or
+  slot-exhaustion refusal at all.
+- **The page the operator receives describes a different failure.** The alarm firing on
+  `AGGREGATOR-DROP-01` (`error-code-alarms.tf:244`) carries a description about
+  SEAL-drop, not tick refusal — so the runbook text does not match the event.
+- **A legitimately tradeable tick can be refused.** The order is
+  `price -> untraded_sentinel(p==0.0) -> timestamp -> session`, so a tick with a REAL
+  price and a bad stamp is refused whole and never reaches the sentinel escape hatch.
+
+### ITEM 12b — SECURITY REVIEW RESULT (2026-08-25): the sentinel must NOT be write-through
+
+An adversarial security pass found a defect in 12b as drafted. Recorded before any code.
+
+**The trap.** 12b reasoned by analogy to `untraded_sentinel` (`p == 0.0`). That analogy is
+WRONG in the one way that matters. Verified at `dhan_feed_stack.rs:1305-1367`: a
+`hard_refusal` (today's `refused_timestamp`) returns at `:1333` BEFORE
+`append_tick_with_seq` at `:1337`, so no row is written; a `candle_only_refusal` (which is
+where `untraded_sentinel` sits) DOES write the tick row, stamped
+`ts = exchange_timestamp * 1e9`.
+
+So routing an `ltt == 0` sentinel the same way as the price sentinel would persist rows
+with **`ts = 0`, i.e. 1970-01-01**. For the price sentinel the corrupt field is the VALUE
+and the timestamp is sound; here the corrupt field IS the timestamp. The file's own comment
+(`:1296-1304`) already calls writing a garbage designated timestamp "worse than losing it".
+
+**And it would be unbounded.** Every `ltt == 0` packet carries a distinct `capture_seq`, so
+the DEDUP key never collapses them: a corrupt or hostile zero-LTT stream would grow a single
+1970 partition without limit — while being UNPAGED, because the whole point of the change is
+to stop it paging. That is a strictly worse outcome than the current behaviour, arrived at
+while trying to fix it.
+
+**Binding correction.** The `ltt == 0` case must become a FOURTH category: counted, benign,
+NOT paged, and still **row-refused** — never a copy of `untraded_sentinel`'s write-through
+path. A PR that routes it write-through is a REJECT.
+
+**Other findings from the same pass (all Verified):**
+- `multi_tf_aggregator.rs` is OUTSIDE the frozen area (`FROZEN_DIRS` = `indicator/`,
+  `strategy/` only, per `operator_boundary_indicator_strategy_guard.rs:36-37,49`). **No §28
+  lift is required** for Item 12 — good, because a §28 lift would need its own dated quote.
+- No attack path to the watermark IF and ONLY IF the split is scoped to `ltt == 0` exactly:
+  `0` can never exceed `watermark_secs`, and the ~2106 poisoning vector lives at the MAX
+  bound, which stays untouched. Any widening of the MIN bound instead of an exact-zero case
+  WOULD reopen it.
+- `test_watermark_cannot_be_poisoned_by_an_all_ones_timestamp`
+  (`multi_tf_aggregator.rs:1368-1402`) asserts `ts == 0` must be `refused_timestamp`. It
+  must be EDITED, never gutted: `0xFFFFFFFF`, `MAX+1` and `1` must all remain refused.
+- `ConsumeStats::folded()` (`:173-190`) must gain the new field — required for correctness,
+  not a weakening.
+- The observability half must EXTEND the existing throttled 30s delta report
+  (`dhan_feed_stack.rs:2977-3009`). It must NOT add a per-tick log line (flood at ~18k
+  events/session) and MUST NOT add a per-instrument metric label (the cardinality ban:
+  per-instrument CloudWatch series were priced at ~$1,369/mo against a budget whose
+  automatic action stops the trading box).
+- Change (A), the batching/commit-rate work, is LOW risk: capture-at-receipt precedes the
+  fold and flush, and flush failure is DEDUP-idempotent via spill + WAL replay. Larger
+  batches widen only the VISIBILITY-latency window, never the loss window. No secret flows
+  through an ILP buffer.
+
+## ITEM 13 — THE O(1) DEFECT, AND WHAT MONEY CANNOT BUY (2026-08-25, operator: "i just need always O(1) dude i dotn need any slowness ddue irrespective of any situaitons" + "even if we need to reach the max 150 usd also let su gfo ahead dude but ensure to achieve alwyas O(1)")
+
+Five parallel adversarial agents were run on the operator's instruction to attack
+everything. Budget authorization to $150/mo is recorded as Quote 19 in
+`daily-universe-scope-expansion-2026-05-27.md`. **It is deliberately unspent — see 13d.**
+
+### 13a — THE defect: the ILP flush runs ON the drain task (Verified, CRITICAL)
+
+`flush_and_record` (`dhan_feed_stack.rs:2564-2578`) is a **synchronous blocking
+ILP-over-HTTP round trip** executed inside `block_in_place` (`:2524`) **on the frame-drain
+task** — the same `tokio::select!` loop (`:2705`) that carries frame ingest, the 5 s
+catch-up seal and the 30 s silence scan.
+
+So while a flush is in flight, **no frames are drained**. That is the causal chain from a
+saturated disk to LOST TICKS, and it is the reason the operator sees "slowness" that no
+amount of hot-path O(1) work can remove:
+
+    disk saturated -> flush RTT grows -> drain stalls -> ring/socket buffer fills
+      -> Dhan skips a slow consumer forward to "latest available state"
+      -> intermediate ticks are dropped VENDOR-SIDE, with no sequence number to detect it
+
+**This is the single highest-value fix in this plan and it costs nothing.** Decoupling the
+flush from the drain (own task + bounded channel) removes the coupling entirely. Until it
+is decoupled, no O(1) guarantee can honestly be given for the END-TO-END path, however
+O(1) the decode is.
+
+### 13b — Flush RATE is the axis, and the tick threshold was never re-sized (Verified, HIGH)
+
+`FLUSH_ROW_THRESHOLD = 1_000` (`:3282`) is evaluated per frame. Measured emission is
+~1.44 rows/sec per continuously-ticking instrument (derived in 13c), so:
+
+| Instruments | rows/sec | flushes/sec @1,000 | drain blocked @5 ms RTT |
+|---|---|---|---|
+| 8,315 (today) | ~11,900 | ~12 | ~6% |
+| 24,600 (authorized) | ~35,300 | ~35 | ~18% |
+
+`DEPTH_FLUSH_ROW_THRESHOLD` was raised 10x to 10,000 for exactly this reason, and its own
+comment says so verbatim: *"Payload is the wrong axis here; FLUSH RATE is"* (`:3285-3306`).
+The TICK threshold sat at 1,000 through that reasoning and through the 21 -> 24 TF append.
+Raising it is the cheap mitigation; 13a is the real fix.
+
+### 13c — A hostile finding, CORRECTED before it was acted on (Verified)
+
+An agent reported the row rate as **3.39/sec/instrument** (28,200 today, 83,400 at target,
+42% drain blocked), computed as the harmonic sum over all sixteen second-scale frames
+S1..S15 + S30. **That is wrong by 2.4x**, and acting on it would have justified far more
+drastic surgery than the system needs.
+
+`TfIndex::is_operator_requested()` (`tf_index.rs:388`) gates ROW EMISSION to the operator's
+**thirteen** frames (S1 S5 S10 S15 S30 + M1 M2 M3 M5 M15 M30 M60 + D1), with three live
+production call sites (`dhan_feed_stack.rs:1227`, `:1424`, `:1679`). The eleven unrequested
+frames (S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14) fold but never emit. True rate is
+1 + 0.2 + 0.1 + 0.0667 + 0.0333 + minute frames = **~1.44 rows/sec**.
+
+**And this closes off a comfortable answer.** That gate has been live since 2026-08-18
+(#1768), so it was ALREADY ACTIVE during the 2026-08-24 session that wrote 4,744 GB. The
+row rate therefore does NOT explain the amplification, and no further timeframe trimming
+will. Recorded because the agent's number was plausible, alarming, and would have sent the
+next session cutting capability the operator explicitly paid for.
+
+### 13d — Why the $150 authorization is NOT being spent yet
+
+Quote 19 authorizes up to $150/mo (live: $48.87 actual, $61.51 forecast, $130 limit — the
+widest margin this account has had). The EBS raise 500 -> 1000 MiB/s is +$20/mo and fits.
+It is held anyway, on three grounds:
+
+1. **It does not deliver the thing asked for.** The requirement is O(1) with no slowness.
+   13a is a *coupling* defect: a faster disk shortens the stall, it does not remove the
+   drain from the flush's critical path. The $0 fix is the one that gives the guarantee.
+2. **~25x amplification is still unexplained** (13c removed the row-count explanation).
+   Doubling throughput against a 25x inefficiency buys one doubling and leaves the defect;
+   at 24,600 instruments the same wall returns.
+3. **The newest prime suspect is a config value, not a capacity one:**
+   `QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE = 16777216` (16 MiB) in
+   `deploy/docker/docker-compose.yml`, across 24 tables x ~17 columns. If page granularity
+   is the amplifier the fix is an env var at $0. Also newly noted from the same file:
+   `QDB_CAIRO_O3_MAX_LAG = 60000000` (60 s) — a tick whose last-trade time is 90 minutes
+   stale falls FAR outside that window and forces a hard partition merge, which strengthens
+   the out-of-order candidate rather than the commit-rate one.
+
+The raise is taken the moment a measurement shows traffic still at the ceiling after the
+amplification fix — with a number behind it, not a guess.
+
+### 13e — Scale cliffs found by the same pass (recorded, not yet fixed)
+
+- **HIGH — ring-full drops are unrecoverable within the session.** `pool_supervisor.rs:127-160`:
+  a full ring counts and DROPS the frame. It is in the WAL, but `dhan_feed_stack.rs:1007-1021`
+  states the re-fold path needs a LIVE ring, so recovery is *"the next boot re-folds them"*.
+  A mid-session backpressure episode is therefore silent tick loss until tomorrow.
+- **HIGH — the measured `catch_up_seal_all` cost is the EMPTY case.** `multi_tf_aggregator.rs:1676-1679`
+  measures "none seals"; the 9.67 ms figure is pure traversal. At a minute boundary with
+  24,600 slots the sweep must EMIT, and each emission runs the absorption chain. The
+  recorded number does not bound the real one. Unknown.
+- **MEDIUM — subscribe dispatch is unpaced.** 24,600/100 = 246 messages sent back-to-back
+  (`connection.rs:794-850`, no delay). Dhan's subscribe rate limit is Unknown; a throttled
+  subscribe produces no error, only absence — and the 09:12 readiness deadline would miss
+  silently.
+- **LOW — memory is fine.** `AggregatorCell` 6.2 KB x 24,600 = 153 MB; seal ring 86 MB;
+  all per-instrument maps cap fail-closed at 25,000. 32 GiB holds it comfortably.
+- **No locks on the drain hot path** — single-owner `&mut`, verified.
+
+### 13f — The honest O(1) verdict (audited stage by stage)
+
+**Per PACKET the path IS O(1) and effectively zero-allocation, and it is PROVEN, not
+claimed:** fixed-offset `from_le_bytes` decode, one O(1)-average composite-key lookup, 24
+scalar folds, one bounded `try_send`, one ILP append — with `dhat_allocation.rs`,
+`dhat_multi_tf_fold.rs` (exactly 0 allocations over 10,000 folds), `dhat_ws_lag.rs` and
+`dhat_ws_reader_zero_alloc.rs` gating every PR. No banned pattern appears on the per-tick
+path.
+
+**Three stages break strict O(1) and must never be described otherwise:**
+1. **The ILP flush** — O(rows) AND blocking AND on the drain task (13a). The real defect.
+2. **Slot allocation** on an instrument's first tick — a `Vec` growth step is O(n) and
+   unbounded; mitigated by boot pre-sizing, not eliminated.
+3. **Seal-refusal escalation** (`:4192`) — writes to disk INLINE on the tick thread when
+   the seal channel is full.
+
+**Per FRAME it is not O(1)** either: `drain_main_feed_frame` walks every stacked packet,
+bounded only by `MAX_PACKETS_PER_FRAME = 70,000`.
+
+**Correction to CLAUDE.md, found by this audit:** the codebase map credits this path with a
+`papaya` concurrent-map lookup. There is **zero `papaya` on the live tick path** —
+`multi_tf_aggregator.rs:348` is a plain `HashMap<CompositeKey, u32>` into a dense `Vec`
+index. Still O(1) average; the claim was wrong about the type, exactly as the
+`instrument_registry` row in that same table was wrong in 2026-08-07.
