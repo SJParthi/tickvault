@@ -1830,7 +1830,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     /// The budget must DEFER, never DROP.
     ///
     /// The whole safety of `WAL_REPLAY_MAX_BYTES` rests on one thing: a
