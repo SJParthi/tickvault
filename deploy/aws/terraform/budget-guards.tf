@@ -259,7 +259,7 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # fire at 90%/100%, so a $100 ceiling would put the 90% line at $90, BELOW
       # the new bill, and stop the trading box mid-session. $130 puts it at $117 —
       # $4.28 of room, thinner than the $7.28 this change was called in to fix.)
-      BUDGET_KILL_USD = "130"
+      BUDGET_KILL_USD = "150"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"
@@ -359,4 +359,101 @@ resource "aws_cloudwatch_metric_alarm" "daily_budget_digest_errors" {
   # NO ok_actions (round-14): a post-ALARM auto-OK only means the Errors
   # datapoint aged out of the lookback, never that anything was fixed.
   ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 — "did the kill-switch RUN?" (the gap behind four rule-file rows)
+#
+# CORRECTION FIRST, because the record has been scarier than the code for a
+# month. budget.tf, daily-universe-scope-expansion §7 and two Quote sections
+# all carry a FLAGGED, UNRESOLVED note reading, in substance, "if both
+# STOP_EC2_INSTANCES budget actions are still in EXECUTION_FAILURE then the
+# kill switch does not fire AT ALL". That sentence names the AWS-NATIVE budget
+# action and then generalises to "the kill switch", which is wrong: this
+# account has TWO independent switches, and the second one is ours.
+#
+# `tv_hard_stop_guard` above reads month-to-date spend from Cost Explorer every
+# hour, and at `>= BUDGET_KILL_USD` it stops the instance, disables the morning
+# auto-start rule, and pages — see `hard_stop_guard.rs::classify` ("breach_stop"
+# / "cost_unknown" / "below_budget") and `execute_breach_stop`. Its IAM policy
+# carries `ec2:StopInstances` scoped by the `tv-<env>-app` Name tag,
+# `ce:GetCostAndUsage` and `events:DisableRule`. It does not consult the native
+# budget action and does not care whether that action works. So the honest
+# statement is "the AWS-NATIVE action is unverifiable", never "the kill switch
+# may not fire" — and whether the native one works is now a nice-to-know rather
+# than the most serious open item on the account.
+#
+# THE GAP THAT IS REAL, and that nobody was looking at while everyone worried
+# about the native action: NOTHING checks that OUR switch still runs. Its
+# Errors alarm (added 2026-08-25 with the other twelve) is structurally blind to
+# a dropped schedule — zero invocations produce zero errors, so a silently
+# disabled EventBridge rule reads as a permanently healthy Lambda. That is the
+# 2026-07-02 repo-wide scheduler-drop class, which this repo has already been
+# bitten by twice, and it applies with more force here than anywhere else: a
+# kill-switch that stopped being invoked is indistinguishable from a kill-switch
+# that has nothing to do.
+#
+# 6-hour window, not the 24h the token-minter uses. That alarm watches a DAILY
+# mint where 24h is the natural unit; this Lambda fires HOURLY, so a 6h window
+# expects six invocations and still cannot false-page on a single miss, while
+# cutting detection from ~a day to ~a quarter of one. For the component whose
+# whole job is to stop a runaway bill, a day of blindness is the wrong trade.
+#
+# ok_actions = [] deliberately: recovery here means "a datapoint appeared
+# again", which is worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "tv_hard_stop_guard_not_invoked" {
+  alarm_name          = "tv-${var.environment}-hard-stop-guard-not-invoked"
+  alarm_description   = "The hourly budget kill-switch did NOT RUN in the last 6h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This is the guard that stops the box on a budget breach; while it is not running there is no spend ceiling in force at all, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 21600
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_hard_stop_guard.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the digest RUN?" (found by the new guard)
+#
+# The tempting exemption - "the operator notices a missing daily Telegram" - is
+# refused deliberately. It is the same reasoning this repo has rejected twice
+# before: noticing an ABSENCE requires remembering to expect something, which
+# is precisely what people stop doing on the days it matters. The digest is
+# also the only routine surface on which a cost trend is visible at all; the
+# hourly kill-switch reads spend but only speaks at the threshold.
+#
+# 24h window: MON-FRI 17:30 IST cron, one invocation expected per weekday.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "tv_daily_budget_digest_not_invoked" {
+  alarm_name          = "tv-${var.environment}-daily-budget-digest-not-invoked"
+  alarm_description   = "The daily spend digest did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). The digest is the operator-facing view of AWS spend; while it is not running the bill is unobserved between the hourly kill-switch checks, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_daily_budget_digest.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
 }
