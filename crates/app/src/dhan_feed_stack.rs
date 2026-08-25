@@ -7103,6 +7103,14 @@ pub struct CrossverifyDeps {
     pub jwt_provider: Box<dyn Fn() -> Option<String> + Send + Sync>,
     /// Comparator knobs.
     pub config: crate::dhan_live_crossverify::DhanLiveCrossverifyConfig,
+    /// QuestDB connection used to PERSIST the run's findings.
+    ///
+    /// Separate from `questdb_exec_url` above because that one is the HTTP
+    /// `/exec` READ endpoint and this is the ILP WRITE config — the same
+    /// server, two protocols. Added 2026-08-25 with the persistence wiring:
+    /// before it, this comparator produced its verdict, logged it, and threw
+    /// it away.
+    pub questdb: tickvault_common::config::QuestDbConfig,
 }
 
 static CROSSVERIFY_DEPS: std::sync::OnceLock<CrossverifyDeps> = std::sync::OnceLock::new();
@@ -7363,9 +7371,19 @@ pub fn spawn_daily_crossverify(
                     //
                     // The single most important measurement in the system was
                     // the one number the log could not carry. Named fields are
-                    // bounded by construction and queryable; the findings are
-                    // already persisted to the audit table, which is where
-                    // per-cell detail belongs.
+                    // bounded by construction and queryable; the per-cell
+                    // detail belongs in the audit table, which is what the
+                    // `persist_xverify_report` call below writes.
+                    //
+                    // ⚠ CORRECTED 2026-08-25. This comment previously read
+                    // "the findings are already persisted to the audit table"
+                    // — and that was FALSE. `append_cell`, `append_daily` and
+                    // even `ensure_dhan_live_crossverify_tables` had ZERO
+                    // production callers: the two tables were never created,
+                    // nothing was ever written, and the only record of the
+                    // feed's one ground-truth check was this log line. A
+                    // comment asserting persistence is worse than no comment,
+                    // because the next reader stops looking.
                     info!(
                         targets = targets.len(),
                         outcome = ?c.outcome,
@@ -7388,6 +7406,12 @@ pub fn spawn_daily_crossverify(
                         "Dhan live-feed cross-verification finished — this is the honest \
                          measure of whether the revived feed agrees with Dhan's own record"
                     );
+                    // PERSIST, before any early-return branch below. A
+                    // vacuous or degraded verdict is exactly the one worth
+                    // keeping: "we could not measure today" is a fact about
+                    // the feed, and a table that only records the good days
+                    // cannot answer "how often were we blind last month".
+                    persist_xverify_report(&deps.questdb, &report, deps.config.tolerance_paise);
                     if c.is_vacuous() {
                         // A run that compared nothing proves nothing, and the
                         // outcome field alone does not say so loudly enough.
@@ -7460,6 +7484,132 @@ pub fn spawn_daily_crossverify(
 /// 15:40, so ten minutes that had not happened yet would be scored as missing on
 /// BOTH sides — turning a silent blind spot into a flood of false loss findings
 /// in the one check that exists to detect real loss.
+/// Writes one cross-verification run to its two audit tables.
+///
+/// # Why this exists, and why it is best-effort
+///
+/// The 15:41 comparison is the ONLY ground truth the revived Dhan feed has:
+/// the India feed carries no sequence number and offers no
+/// snapshot-on-subscribe, so packet loss is undetectable at the protocol
+/// level. Until 2026-08-25 the result of that comparison was written to a log
+/// line and discarded — `append_cell`, `append_daily` and
+/// `ensure_dhan_live_crossverify_tables` all had zero production callers, so
+/// there was no history, no trend, and no way to ask how often the feed
+/// disagreed with Dhan's own record last month.
+///
+/// Best-effort by construction: a persistence failure logs and returns. This
+/// runs once a day on a cold-path task, long after the market has closed, and
+/// failing the task would lose the log line too — which is strictly worse than
+/// losing the table row, since the log line is what the operator sees today.
+///
+/// Complexity is O(findings) with one ILP buffer; the row count is bounded by
+/// the comparison itself (one row per divergent/missing cell), and the
+/// findings vector already exists in memory — this adds no allocation beyond
+/// the ILP buffer.
+// TEST-EXEMPT: thin ILP-write shell over the fully-tested writer (append_cell / append_daily / flush are unit-tested in tickvault_storage) and a pure row mapping asserted by `the_daily_row_carries_every_comparison_total` below.
+fn persist_xverify_report(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    report: &crate::dhan_live_crossverify::RunReport,
+    tolerance_paise: i64,
+) {
+    use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyAuditWriter;
+
+    let c = &report.comparison;
+    let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+
+    let mut cell_errors = 0_usize;
+    for finding in &c.findings {
+        if writer.append_cell(finding).is_err() {
+            cell_errors += 1;
+        }
+    }
+
+    let daily = xverify_daily_row(c, tolerance_paise);
+    let daily_err = writer.append_daily(&daily).err();
+
+    match writer.flush() {
+        Ok(()) => {
+            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(c.findings.len() as u64 + 1);
+            if cell_errors > 0 || daily_err.is_some() {
+                // Partial writes are reported, never rounded up to success:
+                // an audit table that silently drops rows is worse than one
+                // that is honestly incomplete.
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_persist_partial",
+                    cell_errors,
+                    daily_failed = daily_err.is_some(),
+                    findings = c.findings.len(),
+                    "Dhan live-feed cross-verification persisted with gaps — some findings \
+                     could not be appended, so the audit tables are incomplete for today"
+                );
+            }
+        }
+        Err(err) => {
+            let discarded = writer.discard_pending();
+            metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                // Deliberately the SAME label the run-failure arm uses, not a
+                // new one. The operator consequence is identical — there is
+                // no verdict on record for today — and `xverify_failed` is
+                // one of only two xverify labels an alarm matches on. A
+                // distinct label would be better triage and would page
+                // nobody, which is the trade this repository has got wrong
+                // before. The message below is what separates the causes.
+                source = "xverify_failed",
+                ?err,
+                discarded,
+                "Dhan live-feed cross-verification could NOT be persisted — today's \
+                 comparison exists only in this log stream. The feed's one ground-truth \
+                 record has no row for today; check QuestDB before the next session."
+            );
+        }
+    }
+}
+
+/// Maps a finished comparison onto its daily audit row. Pure.
+///
+/// Separated from the write so the mapping is testable without QuestDB — the
+/// failure this guards against is a column silently carrying the wrong total,
+/// which no integration test would notice and no log line would show.
+#[must_use]
+fn xverify_daily_row(
+    c: &crate::dhan_live_crossverify::DayComparison,
+    tolerance_paise: i64,
+) -> tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyDailyRow {
+    use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyDailyRow;
+    // Every finding carries the run stamp and the trading day the comparison
+    // was FOR, so the daily row is stamped from the same source rather than
+    // from `now()` — a rerun must UPSERT onto the same row, not append a
+    // second one an hour later.
+    let (run_ts, day_ts) = c
+        .findings
+        .first()
+        .map_or((0, 0), |f| (f.run_ts_ist_nanos, f.trading_date_ist_nanos));
+    DhanLiveXverifyDailyRow {
+        run_ts_ist_nanos: run_ts,
+        trading_date_ist_nanos: day_ts,
+        instruments: c.instruments,
+        minutes_compared: c.minutes_compared,
+        cells_diverged: c.cells_diverged,
+        missing_live: c.missing_live,
+        missing_rest: c.missing_rest,
+        tail_unsealed: c.tail_unsealed,
+        out_of_session: c.out_of_session,
+        noise_p50_paise: c.noise_p50_paise,
+        noise_p95_paise: c.noise_p95_paise,
+        noise_max_paise: c.noise_max_paise,
+        tolerance_paise,
+        outcome: c.outcome,
+    }
+}
+
+/// Rows successfully written to the cross-verification audit tables.
+pub const XVERIFY_PERSIST_ROWS_COUNTER: &str = "tv_dhan_feed_xverify_rows_total";
+/// Runs whose findings could not be persisted at all.
+pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_errors_total";
+
 pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 =
     crate::dhan_live_crossverify::RUN_SECS_OF_DAY_IST as u64;
 
@@ -9447,6 +9597,117 @@ mod tests {
     /// new alarm, no operator quote. The remaining surfaces are recorded above
     /// rather than quietly fixed, because an alarm needs a dated operator
     /// quote per `dhan-rest-only-noise-lock-2026-07-14.md` §3.
+    /// The daily audit row must carry EVERY total the comparison produced.
+    ///
+    /// A mapping that drops or transposes a column is the one failure mode
+    /// this table cannot survive and no integration test would catch: the row
+    /// lands, the count looks right, and the trend it exists to show is
+    /// silently wrong. Distinct values per field so a transposition cannot
+    /// pass by coincidence.
+    #[test]
+    fn the_daily_row_carries_every_comparison_total() {
+        use tickvault_storage::dhan_live_crossverify_persistence::{
+            DhanLiveXverifyCellFinding, DhanLiveXverifyCellKind, DhanLiveXverifyOutcome,
+        };
+
+        let finding = DhanLiveXverifyCellFinding {
+            run_ts_ist_nanos: 1_724_000_000_000_000_000,
+            trading_date_ist_nanos: 1_723_900_000_000_000_000,
+            security_id: 13,
+            segment: "IDX_I".to_owned(),
+            minute_ts_ist_nanos: 1_723_950_000_000_000_000,
+            kind: DhanLiveXverifyCellKind::Diverged,
+            field: "close",
+            live_value: 100.5,
+            rest_value: 100.25,
+            live_volume: 7,
+            rest_volume: 9,
+            diff_paise: 25,
+        };
+        let c = crate::dhan_live_crossverify::DayComparison {
+            outcome: DhanLiveXverifyOutcome::Diverged,
+            findings: vec![finding.clone()],
+            instruments: 11,
+            minutes_compared: 22,
+            cells_diverged: 33,
+            missing_live: 44,
+            missing_rest: 55,
+            tail_unsealed: 66,
+            out_of_session: 77,
+            noise_p50_paise: 88,
+            noise_p95_paise: 99,
+            noise_max_paise: 111,
+        };
+
+        let row = xverify_daily_row(&c, 5);
+        assert_eq!(row.instruments, 11);
+        assert_eq!(row.minutes_compared, 22);
+        assert_eq!(row.cells_diverged, 33);
+        assert_eq!(row.missing_live, 44);
+        assert_eq!(row.missing_rest, 55);
+        assert_eq!(row.tail_unsealed, 66);
+        assert_eq!(row.out_of_session, 77);
+        assert_eq!(row.noise_p50_paise, 88);
+        assert_eq!(row.noise_p95_paise, 99);
+        assert_eq!(row.noise_max_paise, 111);
+        assert_eq!(row.tolerance_paise, 5);
+        assert_eq!(row.outcome, DhanLiveXverifyOutcome::Diverged);
+
+        // The stamps come from the findings, NOT from `now()`, so a rerun
+        // upserts onto the same row instead of appending a second verdict for
+        // the same day an hour later.
+        assert_eq!(row.run_ts_ist_nanos, finding.run_ts_ist_nanos);
+        assert_eq!(row.trading_date_ist_nanos, finding.trading_date_ist_nanos);
+
+        // A vacuous run has no findings and therefore no stamp to borrow.
+        // It must still produce a row — "we could not measure today" is a
+        // fact worth keeping — and it must not fabricate a timestamp.
+        let blind = crate::dhan_live_crossverify::DayComparison {
+            outcome: DhanLiveXverifyOutcome::Blind,
+            findings: Vec::new(),
+            minutes_compared: 0,
+            ..c
+        };
+        let blind_row = xverify_daily_row(&blind, 0);
+        assert_eq!(blind_row.outcome, DhanLiveXverifyOutcome::Blind);
+        assert_eq!(blind_row.minutes_compared, 0);
+    }
+
+    /// The comment that said the findings "are already persisted" was false
+    /// for the entire life of the feature. This pins that the wiring which
+    /// makes it true is actually present — in all three places it has to be,
+    /// because any one of them missing puts the system straight back to
+    /// logging a verdict into the void.
+    #[test]
+    fn the_cross_verification_findings_are_actually_persisted() {
+        let src = include_str!("dhan_feed_stack.rs");
+        assert!(
+            src.contains("persist_xverify_report(&deps.questdb, &report"),
+            "the cross-verification run must call the persister; without this call the \
+             feed's only ground-truth check is a log line again"
+        );
+        assert!(
+            !src.contains("findings are\n                    // already persisted"),
+            "the retracted false comment must not return"
+        );
+
+        // The DDL must run at boot, or ILP auto-creates both tables WITHOUT
+        // their DEDUP keys and a rerun appends duplicate verdicts instead of
+        // replacing them.
+        let boot = include_str!("main.rs");
+        assert!(
+            boot.contains("ensure_dhan_live_crossverify_tables"),
+            "boot must create the cross-verification audit tables; ILP would otherwise \
+             auto-create them without the DEDUP keys that make a rerun idempotent"
+        );
+
+        // And the write-side config must reach the task.
+        assert!(
+            src.contains("pub questdb: tickvault_common::config::QuestDbConfig"),
+            "CrossverifyDeps must carry the ILP write config"
+        );
+    }
+
     #[test]
     fn xverify_counter_separates_a_measured_run_from_a_vacuous_one() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -9567,13 +9828,42 @@ mod tests {
         // (say, a fixed indentation prefix) would stop biting the moment
         // rustfmt moved the line, which is the failure mode this file's own
         // O(1) table records five separate times about line numbers.
-        let emitted = src.matches("source = \"xverify_").count()
-            - src.matches("$.source = \"xverify_").count();
+        // 2026-08-25: the persistence wiring added two more emit sites, so
+        // the assertion moved from "exactly two emissions" to "exactly this
+        // SET of labels" — which is the property that actually matters and
+        // does not have to be re-counted every time an arm is added.
+        let mut labels: Vec<&str> = Vec::new();
+        for (idx, _) in src.match_indices("source = \"xverify_") {
+            let rest = &src[idx + "source = \"".len()..];
+            if let Some(end) = rest.find('"') {
+                labels.push(&rest[..end]);
+            }
+        }
+        labels.sort_unstable();
+        labels.dedup();
         assert_eq!(
-            emitted, 2,
-            "exactly two xverify source labels are expected — a third would mean a \
-             new emit site landed without its own dated review, and a merged one \
-             would mean two independent failures now share a series"
+            labels,
+            vec![
+                "xverify_failed",
+                "xverify_persist_partial",
+                "xverify_vacuous"
+            ],
+            "the xverify source labels changed. Two of these are matched by CloudWatch \
+             metric filters (`xverify_vacuous`, `xverify_failed`) and page; \
+             `xverify_persist_partial` deliberately does not, because a partial write \
+             still lands the daily verdict row and adding an alarm needs a dated \
+             operator quote per dhan-rest-only-noise-lock-2026-07-14.md §3. A new label \
+             here means a new failure mode that pages nobody — decide that deliberately."
+        );
+
+        // The TOTAL-loss persist arm must reuse the ALARMED label. A distinct
+        // label would give better triage and reach no alarm, which is exactly
+        // how the audit found a comment claiming persistence that never
+        // happened: the failure would be invisible again.
+        assert!(
+            !src.contains("source = \"xverify_persist_failed\""),
+            "a total persistence failure must page through the alarmed `xverify_failed` \
+             label, not a private one nothing matches"
         );
     }
 

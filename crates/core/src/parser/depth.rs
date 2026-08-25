@@ -228,6 +228,7 @@ pub struct DepthPacketHeader {
 /// # Performance
 /// O(1) — four fixed-offset `from_le_bytes` reads, no allocation.
 #[inline]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by the DEEP_DEPTH_HEADER_SIZE check above
 pub fn parse_depth_header(raw: &[u8]) -> Result<DepthPacketHeader, ParseError> {
     if raw.len() < DEEP_DEPTH_HEADER_SIZE {
@@ -389,6 +390,7 @@ pub struct DepthPacket<'b> {
 ///
 /// Caller MUST have validated that `base + 16 <= raw.len()`.
 #[inline(always)]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: base + constant offsets bounded by the caller's length check
 // Level layout, `16-fmd:131-135` / `:163-167` (1-based in the doc):
 //   `1-8` float64 Price | `9-12` uint32 Quantity | `13-16` uint32 No. of Orders
@@ -417,6 +419,7 @@ fn parse_depth_level(raw: &[u8], base: usize) -> DeepDepthLevel {
 /// O(levels), bounded at 200. Zero heap allocation — levels are written into
 /// the caller's buffer.
 #[inline]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: `i` is bounded by `count` <= 200 and the length check above
 pub fn parse_depth_packet<'b>(
     raw: &[u8],
@@ -652,6 +655,7 @@ pub fn split_depth_frame(raw: &[u8], kind: DepthFeedKind) -> DepthFrameIter<'_> 
 // proves the vector is actually sensitive to a one-byte shift.
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test builders use constant offsets for packet construction
 mod tests {
     use super::*;

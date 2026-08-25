@@ -38,7 +38,9 @@ use std::collections::HashMap;
 
 use tickvault_core::instrument::master_csv::{InstrumentClass, MasterRow, OptionLeg};
 use tickvault_storage::instrument_lifecycle_persistence::{
-    InstrumentLifecycleRow, LIFECYCLE_FEED_DHAN, LifecycleState, append_instrument_lifecycle_rows,
+    InstrumentLifecycleAuditRow, InstrumentLifecycleRow, LIFECYCLE_FEED_DHAN, LifecycleState,
+    TransitionKind, append_instrument_lifecycle_audit_rows, append_instrument_lifecycle_rows,
+    ensure_instrument_lifecycle_audit_table,
 };
 
 /// Seconds a QuestDB `/exec` read of the known-instrument set may take.
@@ -210,6 +212,13 @@ pub struct KnownInstrument {
     pub active: bool,
     /// Its class, for choosing which expired state absence implies.
     pub class: InstrumentClass,
+    /// The FULL prior `lifecycle_state`, not just whether it was active.
+    ///
+    /// Added 2026-08-25 with the audit-trail wiring. `active` answers the one
+    /// question the absence pass needs; the audit row needs the actual
+    /// `from_state`, and reconstructing it from a boolean would turn every
+    /// expiry kind into the same row.
+    pub state: LifecycleState,
 }
 
 /// Builds the day's lifecycle rows from the master plus what the table knows.
@@ -401,6 +410,7 @@ pub fn parse_known_instruments(body: &str) -> Result<Vec<KnownInstrument>, Strin
             security_id,
             segment,
             active: state.is_active(),
+            state,
             class: InstrumentClass::from_master_field(cols[3].as_str().unwrap_or("").trim()),
         });
     }
@@ -417,6 +427,122 @@ fn static_segment_label(s: &str) -> Option<&'static str> {
         "BSE_FNO" => Some("BSE_FNO"),
         _ => None,
     }
+}
+
+/// Classifies one instrument's state change into an audit transition. Pure.
+///
+/// Returns `None` when nothing changed — an unchanged row must not produce an
+/// audit entry, or the 5-year chain becomes a daily snapshot of the whole
+/// master (~150,000 rows a day) and the transitions it exists to record are
+/// buried in it.
+///
+/// # Why this does not call `lifecycle_reconciler::classify_transition`
+///
+/// That classifier answers "is this instrument present in today's CSV?", which
+/// is the right question for a master where expiry is signalled by a row
+/// DISAPPEARING. The Dhan master is not that shape: an expired contract stays
+/// in the file with a past `SM_EXPIRY_DATE`, so `lifecycle_state_for` flips it
+/// to `expired_contract` while it is still present — and the reconciler
+/// returns `None` for exactly that case (present + previously active + no
+/// field change). Routing this through it would have silently dropped the
+/// single most common transition in the product.
+///
+/// O(1), no allocation.
+#[must_use]
+pub const fn classify_lifecycle_transition(
+    prev: Option<LifecycleState>,
+    new: LifecycleState,
+) -> Option<TransitionKind> {
+    let Some(prev) = prev else {
+        // Never seen before under this (security_id, segment).
+        return Some(TransitionKind::Appeared);
+    };
+    if matches!(prev, LifecycleState::Delisted) {
+        // Operator-set terminal state. Never auto-flipped, so never audited
+        // as an automatic transition (§5 lock semantics).
+        return None;
+    }
+    if prev as u8 == new as u8 {
+        return None;
+    }
+    if new.is_active() {
+        Some(TransitionKind::Reactivated)
+    } else if prev.is_active() {
+        Some(TransitionKind::Expired)
+    } else {
+        // One expired kind reclassified into another (e.g. a stock that left
+        // the F&O list and later has its contracts expire). A real change,
+        // and not an expiry event.
+        Some(TransitionKind::Updated)
+    }
+}
+
+/// Builds the day's `instrument_lifecycle_audit` rows from the lifecycle rows
+/// that are about to be written plus what the table held before. Pure.
+///
+/// # The gap this closes
+///
+/// `instrument_lifecycle_audit` is the SEBI 5-year point-in-time chain — the
+/// table that answers "what did this instrument look like on this date?". The
+/// table DDL existed, the retention policy existed, `classify_transition`
+/// existed and was tested, and `append_instrument_lifecycle_audit_row` existed.
+/// **Nothing called any of it.** The question was unanswerable, and nothing
+/// said so, because a table that is never written looks exactly like a table
+/// with nothing to report.
+///
+/// Rows borrow from `rows`, which borrow from the master — no copies.
+/// O(rows) with one hash lookup per row.
+#[must_use]
+pub fn build_lifecycle_audit_rows<'a>(
+    rows: &'a [InstrumentLifecycleRow<'a>],
+    known: &[KnownInstrument],
+    today_ist_nanos: i64,
+    source_sha256: &'a str,
+) -> Vec<InstrumentLifecycleAuditRow<'a>> {
+    let prev: HashMap<(i64, &'static str), LifecycleState> = known
+        .iter()
+        .map(|k| ((k.security_id, k.segment), k.state))
+        .collect();
+
+    let mut out = Vec::new();
+    for row in rows {
+        // `exchange_segment` on the row is the same `&'static str` the map is
+        // keyed on — interned by `lifecycle_segment_for` / `static_segment_label`.
+        let key = (row.security_id, row.exchange_segment);
+        let before = prev.get(&key).copied();
+        let Some(kind) = classify_lifecycle_transition(before, row.lifecycle_state) else {
+            continue;
+        };
+        out.push(InstrumentLifecycleAuditRow {
+            // The run stamp, not `now()`. The DEDUP key carries `ts`, so a
+            // re-run of the same day upserts onto the same rows instead of
+            // appending a second, contradictory history.
+            ts_nanos_ist: today_ist_nanos,
+            trading_date_ist_nanos: today_ist_nanos,
+            security_id: row.security_id,
+            exchange_segment: row.exchange_segment,
+            from_state: before,
+            to_state: row.lifecycle_state,
+            transition_kind: kind,
+            // Deliberately empty. The Dhan lifecycle writer reads four columns
+            // back from the table (id, segment, state, type) and does not know
+            // yesterday's lot size, tick size or symbol — so it cannot honestly
+            // report a field delta, and inventing one would be worse than
+            // omitting it. `from_state` / `to_state` carry the change that IS
+            // known.
+            field_deltas: "",
+            source_csv_sha256: source_sha256,
+            operator_note: "",
+            lifecycle_state_after: row.lifecycle_state,
+            lot_size_after: row.lot_size,
+            tick_size_after: row.tick_size,
+            expiry_date_after_nanos: row.expiry_date_nanos,
+            symbol_name_after: row.symbol_name,
+            dry_run: row.dry_run,
+            feed: row.feed,
+        });
+    }
+    out
 }
 
 /// Writes the day's Dhan lifecycle rows.
@@ -447,6 +573,46 @@ pub async fn write_dhan_lifecycle(
     for chunk in rows.chunks(LIFECYCLE_WRITE_CHUNK) {
         append_instrument_lifecycle_rows(questdb, chunk).await?;
     }
+
+    // --- The SEBI 5-year audit chain ---
+    //
+    // Written AFTER the data rows and never allowed to fail the write: the
+    // lifecycle table is what the system reads, the audit table is what a
+    // regulator reads, and losing today's history is strictly better than
+    // losing today's state. Both are still reported.
+    //
+    // The DDL is ensured here rather than at boot because this is the only
+    // writer: ILP would otherwise auto-create the table without its DEDUP
+    // key, and a re-run would then append a second, contradictory history for
+    // the same day instead of upserting onto the first.
+    ensure_instrument_lifecycle_audit_table(questdb).await;
+    let audit_rows = build_lifecycle_audit_rows(&rows, &known, today_ist_nanos, source_sha256);
+    let mut audit_written = 0_usize;
+    let mut audit_failed = 0_usize;
+    for chunk in audit_rows.chunks(LIFECYCLE_WRITE_CHUNK) {
+        match append_instrument_lifecycle_audit_rows(questdb, chunk).await {
+            Ok(()) => audit_written += chunk.len(),
+            Err(err) => {
+                audit_failed += chunk.len();
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    source = "lifecycle_audit_persist_failed",
+                    ?err,
+                    rows = chunk.len(),
+                    "instrument lifecycle AUDIT rows could not be written — the 5-year \
+                     point-in-time chain is incomplete for today. The lifecycle table \
+                     itself is unaffected; what is missing is the record of what changed."
+                );
+            }
+        }
+    }
+    metrics::counter!("tv_instrument_lifecycle_audit_rows_total").increment(audit_written as u64);
+
+    tracing::info!(
+        audit_rows_written = audit_written,
+        audit_rows_failed = audit_failed,
+        "instrument lifecycle audit transitions recorded"
+    );
 
     tracing::info!(
         active = tally.active,
@@ -718,6 +884,147 @@ mod tests {
         );
     }
 
+    /// The 5-year regulatory chain had NO writer: the table, the retention
+    /// policy and the classifier all existed and nothing called any of them,
+    /// so "what did this instrument look like on this date?" was
+    /// unanswerable.
+    ///
+    /// The transition that matters most here is the one a naive reuse of
+    /// `lifecycle_reconciler::classify_transition` would have silently
+    /// dropped — a contract that is STILL IN the master but past its expiry
+    /// date. In the Dhan master that is how expiry actually looks.
+    #[test]
+    fn the_audit_chain_records_every_state_change_and_nothing_else() {
+        // id 1: brand new equity           -> appeared
+        // id 2: option expired YESTERDAY, still in the master -> expired
+        // id 3: option expiring later, unchanged and active  -> NO ROW
+        // id 4: previously expired, back in the master today -> reactivated
+        let master = vec![
+            row(1, InstrumentClass::Equity, "NSE", 0, OptionLeg::None),
+            row(
+                2,
+                InstrumentClass::IndexOption,
+                "NSE",
+                2026_08_18,
+                OptionLeg::Call,
+            ),
+            row(
+                3,
+                InstrumentClass::IndexOption,
+                "NSE",
+                2026_08_26,
+                OptionLeg::Put,
+            ),
+            row(4, InstrumentClass::Equity, "NSE", 0, OptionLeg::None),
+        ];
+        let known = vec![
+            KnownInstrument {
+                security_id: 2,
+                segment: "NSE_FNO",
+                active: true,
+                state: LifecycleState::Active,
+                class: InstrumentClass::IndexOption,
+            },
+            KnownInstrument {
+                security_id: 3,
+                segment: "NSE_FNO",
+                active: true,
+                state: LifecycleState::Active,
+                class: InstrumentClass::IndexOption,
+            },
+            KnownInstrument {
+                security_id: 4,
+                segment: "NSE_EQ",
+                active: false,
+                state: LifecycleState::ExpiredFromFno,
+                class: InstrumentClass::Equity,
+            },
+        ];
+
+        let (rows, _) = build_lifecycle_rows(&master, &known, TODAY, TODAY_NANOS, "sha");
+        let audit = build_lifecycle_audit_rows(&rows, &known, TODAY_NANOS, "sha");
+
+        let kind_of = |id: i64| {
+            audit
+                .iter()
+                .find(|a| a.security_id == id)
+                .map(|a| a.transition_kind)
+        };
+        assert_eq!(
+            kind_of(1),
+            Some(TransitionKind::Appeared),
+            "a never-seen instrument appears"
+        );
+        assert_eq!(
+            kind_of(2),
+            Some(TransitionKind::Expired),
+            "a contract still PRESENT in the master but past its expiry date is the most \
+             common transition in this product, and the CSV-absence classifier returns \
+             None for it"
+        );
+        assert_eq!(
+            kind_of(3),
+            None,
+            "an unchanged active instrument must produce NO audit row — otherwise the \
+             5-year chain becomes a daily snapshot of ~150,000 rows and the real \
+             transitions are buried in it"
+        );
+        assert_eq!(
+            kind_of(4),
+            Some(TransitionKind::Reactivated),
+            "an expired instrument back in the master reactivates"
+        );
+
+        // The snapshot columns (§25) must describe the state AFTER, and the
+        // stamps must be the run stamp so a re-run upserts rather than
+        // appending a contradictory second history for the same day.
+        let expired = audit.iter().find(|a| a.security_id == 2).expect("row 2");
+        assert_eq!(expired.from_state, Some(LifecycleState::Active));
+        assert_eq!(expired.to_state, expired.lifecycle_state_after);
+        assert!(!expired.to_state.is_active());
+        assert_eq!(expired.ts_nanos_ist, TODAY_NANOS);
+        assert_eq!(expired.trading_date_ist_nanos, TODAY_NANOS);
+        assert_eq!(expired.feed, LIFECYCLE_FEED_DHAN);
+    }
+
+    /// A locked/manual terminal state is never auto-flipped, so it must never
+    /// be auto-audited either — an automatic row would claim the system made
+    /// a change it is forbidden from making.
+    #[test]
+    fn a_delisted_instrument_is_never_audited_automatically() {
+        assert_eq!(
+            classify_lifecycle_transition(Some(LifecycleState::Delisted), LifecycleState::Active),
+            None
+        );
+        assert_eq!(
+            classify_lifecycle_transition(
+                Some(LifecycleState::Delisted),
+                LifecycleState::ExpiredContract
+            ),
+            None
+        );
+        // And the ordinary no-change case, in both directions.
+        assert_eq!(
+            classify_lifecycle_transition(Some(LifecycleState::Active), LifecycleState::Active),
+            None
+        );
+        assert_eq!(
+            classify_lifecycle_transition(
+                Some(LifecycleState::ExpiredContract),
+                LifecycleState::ExpiredContract
+            ),
+            None
+        );
+        // One expired kind reclassified into another is a real change.
+        assert_eq!(
+            classify_lifecycle_transition(
+                Some(LifecycleState::ExpiredFromFno),
+                LifecycleState::ExpiredContract
+            ),
+            Some(TransitionKind::Updated)
+        );
+    }
+
     #[test]
     fn build_lifecycle_rows_expires_an_instrument_that_vanished_from_the_master() {
         // The half no date can detect: a stock that dropped out of F&O has no
@@ -728,12 +1035,14 @@ mod tests {
                 security_id: 1,
                 segment: "NSE_EQ",
                 active: true,
+                state: LifecycleState::Active,
                 class: InstrumentClass::Equity,
             },
             KnownInstrument {
                 security_id: 99,
                 segment: "NSE_EQ",
                 active: true,
+                state: LifecycleState::Active,
                 class: InstrumentClass::Equity,
             },
         ];
@@ -760,6 +1069,7 @@ mod tests {
             security_id: 99,
             segment: "NSE_EQ",
             active: false,
+            state: LifecycleState::ExpiredFromFno,
             class: InstrumentClass::Equity,
         }];
         let (rows, tally) = build_lifecycle_rows(&[], &known, TODAY, TODAY_NANOS, "sha");
@@ -778,6 +1088,7 @@ mod tests {
             security_id: 7,
             segment: "BSE_EQ",
             active: true,
+            state: LifecycleState::Active,
             class: InstrumentClass::Equity,
         }];
         let (_, tally) = build_lifecycle_rows(&master, &known, TODAY, TODAY_NANOS, "sha");

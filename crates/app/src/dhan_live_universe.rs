@@ -283,6 +283,78 @@ pub fn select_live_universe(
 // the writer never produces, finds nothing, falls back, and the result is
 // indistinguishable from "the master resolved nothing usable".
 
+/// Fraction of the authorized envelope that must remain free before the
+/// headroom warning fires, expressed as a divisor: `capacity / 10` = 10%.
+///
+/// Chosen against the measured shape, not picked round. The 2026-08-22 live
+/// reading was 22,996 of 25,000 — **8% free** — and index option chains are
+/// deliberately UNCAPPED, having been observed at 2,037 contracts for three
+/// underlyings. One volatile expiry closes a gap that size.
+pub const UNIVERSE_HEADROOM_WARN_DIVISOR: usize = 10;
+
+/// Warns while there is still time to act on a universe approaching the
+/// subscription ceiling.
+///
+/// # Why this exists at all
+///
+/// Overflow is not graceful here and must not be made graceful: `plan_pool`
+/// refuses the WHOLE pool rather than truncating it, so crossing the ceiling
+/// costs the entire session's feed rather than its excess. That fail-closed
+/// shape is correct — silently subscribing a subset would be a false-OK about
+/// coverage — but it means the only safe place to notice the problem is
+/// BEFORE it happens, and until now nothing did. The size gauge shows today's
+/// number; nothing said how close today's number was to the edge.
+///
+/// # Why the constant is read here
+///
+/// `MAX_DAILY_UNIVERSE_SIZE` had ZERO production readers. Its own doc records
+/// that the function which once enforced it was deleted on 2026-07-13, and
+/// that the live lane subsequently ran at 4,565 SIDs against a stated cap of
+/// 1,200 with nothing halting — a documented limit that enforced nothing, so
+/// anyone reading it believed a check existed where none did. It is read here
+/// as a cross-check on the capacity the caller passed: if the two ever
+/// disagree, the constant is stale and says so, instead of sitting in the
+/// tree looking authoritative.
+///
+/// Pure apart from the log/metric side effects. O(1).
+fn report_universe_headroom(instruments: usize, capacity: usize) {
+    let headroom = capacity.saturating_sub(instruments);
+    let warn_below = capacity / UNIVERSE_HEADROOM_WARN_DIVISOR;
+
+    if capacity != tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE {
+        // Not an error — the caller's capacity is the REAL bound (it comes
+        // from the endpoint's subscription capacity) and is allowed to differ.
+        // What is not allowed is for the documented constant to drift out of
+        // step with it unnoticed, which is how it became decorative.
+        tracing::warn!(
+            capacity,
+            documented_max = tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE,
+            "the live subscription capacity and MAX_DAILY_UNIVERSE_SIZE disagree — the \
+             capacity in force is the one logged here; the constant is documentation and \
+             is now stale. Bring them back into lockstep or the constant misleads the \
+             next reader."
+        );
+    }
+
+    if headroom < warn_below {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "universe_headroom_low",
+            instruments,
+            capacity,
+            headroom,
+            warn_below,
+            "live universe is within {headroom} instruments of the {capacity} ceiling. \
+             Crossing it does NOT drop the excess — the whole subscription is refused \
+             and the session runs with no feed at all. Index option chains are uncapped \
+             by design, so one volatile expiry can close a gap this size. Act before the \
+             next session: raise the ceiling or narrow the spot universe."
+        );
+    } else {
+        tracing::info!(instruments, capacity, headroom, "live universe headroom");
+    }
+}
+
 /// Why a daily artifact could not be turned into a master list.
 ///
 /// Two variants rather than one because they mean different things and want
@@ -502,6 +574,7 @@ pub fn resolve_live_universe(
             #[allow(clippy::cast_precision_loss)]
             // APPROVED: bounded by the capacity envelope, far below 2^53.
             metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(selection.instruments.len() as f64);
+            report_universe_headroom(selection.instruments.len(), capacity);
             tracing::info!(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
@@ -762,6 +835,53 @@ mod tests {
     /// artifacts from disk. This asserts the exact property that matters and
     /// that the exemption otherwise leaves unchecked: with both flags on, the
     /// F&O read cannot run once NTM has produced a set.
+    /// `MAX_DAILY_UNIVERSE_SIZE` had zero production readers. This is now a
+    /// reader, and this test is what stops it becoming decorative again.
+    ///
+    /// The number itself is the one the scope lock derives: 5 main-feed
+    /// connections x 5,000 instruments each. If the capacity ever stops
+    /// matching that derivation the constant is lying about the bound, which
+    /// is exactly the state the audit found it in.
+    #[test]
+    fn the_documented_universe_ceiling_is_actually_read_and_matches_its_derivation() {
+        use tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE;
+
+        assert_eq!(
+            MAX_DAILY_UNIVERSE_SIZE, 25_000,
+            "the ceiling is 5 connections x 5,000 instruments — the main-feed subscription \
+             capacity, not a round number"
+        );
+
+        // The warn band must leave real room to act. A 1% band on 25,000 is
+        // 250 instruments — less than one index option chain, i.e. a warning
+        // that arrives after the decision is already made.
+        let warn_below = MAX_DAILY_UNIVERSE_SIZE / UNIVERSE_HEADROOM_WARN_DIVISOR;
+        assert!(
+            warn_below >= 2_000,
+            "the headroom warning must fire while at least one full index option chain \
+             still fits (2,037 contracts observed for three underlyings); {warn_below} \
+             would arrive too late to act on"
+        );
+
+        // The measured 2026-08-22 reading — 22,996 of 25,000 — must be inside
+        // the warn band. If it is not, this warning would have stayed silent
+        // through the exact state that prompted it.
+        assert!(
+            MAX_DAILY_UNIVERSE_SIZE - 22_996 < warn_below,
+            "the live 2026-08-22 universe (22,996 of 25,000) must trip the headroom \
+             warning; a band that misses it is decoration"
+        );
+
+        // And the function must actually be called on the success path —
+        // publishing headroom only when something already broke is the
+        // fallback-only-tripwire shape this file rejected for the size gauge.
+        let src = include_str!("dhan_live_universe.rs");
+        assert!(
+            src.contains("report_universe_headroom(selection.instruments.len(), capacity)"),
+            "the headroom report must run on the MASTER-SOURCED success path, not only \
+             on a failure branch"
+        );
+    }
     #[test]
     fn ntm_wins_when_both_narrowing_flags_are_on() {
         let src = include_str!("dhan_live_universe.rs");
