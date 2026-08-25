@@ -615,8 +615,40 @@ applying them. Every writer therefore reported success: the operator's manual
 super order incremented `tv_order_update_events_rows_total{feed="dhan"}` and
 `tv_order_audit_rows_total{event="placed"}` to 6 each, no persist-error counter
 existed at all, and both tables were EMPTY. The operator found it by asking why
-his order was not in any table — not by a page. `WAL-SUSPEND-01` exists for
-exactly this and did not fire; that gap is tracked separately from this quote.
+his order was not in any table — not by a page.
+
+> **⚠ CORRECTED 2026-08-25 — the sentence that stood here was FALSE, and it is
+> the exact class this file's own O(1) table warns about.** It read:
+> *"`WAL-SUSPEND-01` exists for exactly this and did not fire; that gap is
+> tracked separately from this quote."* Checked against the live log rather
+> than repeated, the code **DID** fire, promptly, and it **DID** page:
+>
+> | evidence | value |
+> |---|---|
+> | coded `ERROR` events, 2026-08-25 | **70**, naming each suspended table (`ticks`, `candles_3m`, `candles_15s`, …) with `error_message: "bulk update failed and will be rolled back"` |
+> | first fire | **11:23 IST** — the volume reached 100% at ~11:11, so ~12 minutes |
+> | CloudWatch alarm | `tv-prod-errcode-wal-suspend-01`, `ActionsEnabled: True` |
+> | alarm transitions that day | OK→ALARM **11:24 IST**, →OK 12:05, OK→ALARM **12:37**, →OK 13:02 |
+>
+> So detection worked and the operator was paged twice. What actually failed
+> was the DISK, and separately the operator's own read of the situation — he
+> found the empty tables by asking, which is true, but not because nothing had
+> told him.
+>
+> **This row cost real work.** A later session read the false sentence, carried
+> it into a live risk assessment as *"the alarm for it did not fire"*, and
+> ranked "make WAL-suspension page you" as the next thing to build — work that
+> was already done and shipped on 2026-07-10 (W2 PR#6). That is the same
+> failure the `day_ohlc_tracker` row records on 2026-08-12: a stale row does
+> not merely fail to warn, it **manufactures false findings**, and the cost is
+> paid by whoever trusts it next.
+>
+> The durable lesson is narrow and worth stating: this file records what an
+> incident FELT like from the operator's side, and that is legitimate — but a
+> claim about whether a MECHANISM fired is checkable in one query
+> (`aws logs filter-log-events --filter-pattern '"WAL-SUSPEND-01"'`) and must
+> be checked before it is written, not inferred from the fact that nobody
+> noticed the page.
 
 **By 11:51 IST the box became UNMANAGEABLE.** `ssm send-command` began failing
 in **0.001 s** with empty stdout and stderr — the agent cannot allocate the
