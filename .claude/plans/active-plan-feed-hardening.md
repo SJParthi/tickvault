@@ -1595,3 +1595,121 @@ REST-absent instruments would have MASKED the highest-value finding the comparat
 produce — a wrong or stale `security_id`. None of it shipped. The remaining cross-verify
 defects (target scaling, `missing_rest` conflation at the verdict line, live-read pagination,
 and the shared Data-API limiter bypass) are recorded in Item 18 and are NOT fixed here.
+
+---
+
+## Item 18 — four more live defects from the parallel permutation sweep (FIXED)
+
+- [x] **18a — a poison timestamp on an untraded tick stamped a year-2106 partition**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/storage/src/tick_persistence.rs`
+  - Tests: `an_untraded_sentinel_with_a_poison_timestamp_is_refused_outright`,
+    `an_all_ones_exchange_timestamp_never_stamps_a_year_2106_partition` (both bite-proven)
+- [x] **18b — a NaN `average_traded_price` reached ILP**
+  - Files: `crates/storage/src/tick_persistence.rs`
+  - Tests: `a_non_finite_average_traded_price_becomes_null_and_never_refuses_the_tick` (bite-proven)
+- [x] **18c — the cross-verify labelled every target `INDEX`: a partial-denominator vacuous pass**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed` (bite-proven)
+- [x] **18d — an out-of-range target id was coerced to security_id 0**
+  - Folded into 18c; same function, same test.
+
+### 18a — one malformed packet, a partition nothing can reach
+
+`exchange_timestamp` is a raw `u32` off the wire, so `0xFFFFFFFF` is ~2106-02-07. Two
+independent gates should have caught it and neither did:
+
+* The aggregator's band check sat **below** the `p == 0.0` untraded-sentinel return. A packet
+  with LTP 0 and a poison LTT returned early, so `refused_timestamp` stayed false. The drain
+  classifies `untraded_sentinel` as a **candle-only** refusal — the row is still written.
+* `row_timestamp_ist_nanos` had a **floor and no ceiling**, so the poison value became the
+  row's DESIGNATED timestamp.
+
+`ticks.ts` is the designated timestamp, so such a row lands in a far-future partition that
+retention and archival — both keyed on the trading day — can never reach, while every
+`max(ts)` and range scan over `ticks` silently includes it. The drain's own comment claims a
+timestamp "beyond a 30-year band" refuses the whole tick; that claim was false on this path.
+
+Fixed at both layers: the band check moved above every early return that can still produce a
+persisted row, and the stamp gained the ceiling. The second is defence in depth on purpose —
+the band belongs where the stamp is MADE, so a future writer cannot reintroduce the hole by
+calling the helper directly.
+
+### 18b — the gate that documented itself as closed
+
+The finiteness loop covers five fields. `average_traded_price` is a **sixth** caller of the
+same `opt_price` closure and was never in it. `NaN != 0.0` is true, and both
+`f32_to_f64_clean` and `round_to_2dp` pass non-finite straight through — so a NaN went to the
+wire. The parser proves Dhan sends it: `parser::quote` has its own
+`average_traded_price.is_nan()` assertion.
+
+The consequence is exactly the chain `TickRowError::PriceNotFinite` documents as **closed**:
+QuestDB rejects the whole batch, `discard_pending` clears up to 1,000 good rows, the rescued
+buffer spills, and the replay tier wedges behind a file it can never accept.
+
+A non-finite OPTIONAL price now becomes NULL and is counted, rather than refusing the row the
+way the five mandatory prices do. Refusing here would discard a tick whose LTP is perfectly
+good — losing a tick to protect an auxiliary column is the wrong trade.
+
+### 18c — the vacuous pass the zero-denominator guard cannot see
+
+`crossverify_targets` stamped the literal `"INDEX"` on every target, and that string goes
+verbatim into the Dhan REST intraday body. The live universe is ~119 indices plus ~750 NSE_EQ
+constituents, so roughly **86% of every run's fetches asked for a stock as though it were an
+index**. Those return no candles, land in `rest_failures`, and are never compared — while the
+run can still report **Clean** on the handful of correctly-labelled indices.
+
+The module's `minutes_compared > 0` guard cannot catch this: the denominator is **partial**,
+not zero. And the function's own doc comment says the lane "can never verify a different
+universe than it captured" — true of the id set, false of the instrument type, and the type
+is what decides whether a fetch returns anything at all.
+
+F&O is deliberately **not guessed**. `(security_id, segment)` is all the subscribe set
+carries, and `NSE_FNO` could be `FUTIDX`, `OPTIDX`, `FUTSTK` or `OPTSTK`. An unverifiable
+target is counted (`tv_dhan_xverify_targets_unverifiable_total`) and named in a `warn!`, not
+fetched with a wrong label — because a wrong label is worse than an absent one: it fetches
+nothing while looking like a fetch that failed.
+
+### Still NOT fixed, recorded rather than half-done
+
+* **`tv_dhan_feed_depth_total` has no alarm and no dashboard widget.** Item 17a made the d5
+  refusals countable; nothing in CloudWatch reads the counter, so the fix is half-delivered.
+  Seven more EMF-shipped metrics are in the same state.
+* **`dhan_live_crossverify.rs` emits ZERO metrics**, and `DHAN-LIVE-XVERIFY-01` is not among
+  the codes in `error-code-alarms.tf`. The lane's only ground truth reaches CloudWatch through
+  no metric and no alarm.
+* **The cross-verify target list still cannot be fetched in one run** (~870 sequential REST
+  fetches against a 240 s budget). Pagination of the live read and wiring the leg to the
+  shared Data-API limiter are both open.
+* **`missing_rest` is still counted as divergence** at the verdict line, contradicting the
+  module's own header.
+* **The aggregator's resident space is 2x every figure recorded in the repo** — `AggregatorCell`
+  holds TWO `[LiveCandleState; TF_COUNT]` arrays, so 24,600 instruments is ~152 MB, not the
+  42/77 MB the host-sizing arguments are built on. Not a defect; an understated claim.
+* **"Entire current day in RAM" is arithmetically impossible for the second-scale timeframes.**
+  See Item 19.
+
+---
+
+## Item 19 — the operator's RAM requirement, measured against the host
+
+**Not a defect. A contradiction between two stated requirements, with the arithmetic.**
+
+The requirement is the entire current day's **ticks + seconds + minutes** always resident.
+Measured against `spot_bar_store.rs::total_bars_per_day_all_tfs` and `LiveCandleState`'s real
+128-byte width, at the authorized 24,600 instruments:
+
+| Layer | Arithmetic | Resident |
+|---|---|---|
+| Minute-scale bars, whole day | 831 bars x 48 B x 24,600 | **~981 MB — fits** |
+| Second-scale bars, whole day | 77,422 bars x 48 B x 24,600 | **~87 GiB — impossible** |
+| Raw ticks, whole day | 25–80 M x ~90 B | 2.3–7.2 GB — not implemented at all |
+
+The host is 32 GiB with QuestDB taking 8–16 GiB. Second-scale residency is **~2.7x the entire
+machine** and ~5x the free budget. The store resolves this today with a single `continue` that
+skips `is_second_scale()` timeframes — load-bearing, not a placeholder, and currently silent.
+
+So O(1) SPACE and full-day second-scale residency cannot both hold. This is an operator
+decision, not an executor one, and the honest options are: keep seconds as a rolling window
+(what the code does today), retain seconds for a bounded instrument subset, or move to a host
+where the arithmetic closes. Recorded here so the next session decides deliberately rather
+than discovering it at the OOM.
