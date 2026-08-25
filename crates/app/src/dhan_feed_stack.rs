@@ -3659,11 +3659,20 @@ fn append_inline_depth(
     // REFUSED, never written under a placeholder. A row labelled "UNKNOWN"
     // would silently merge distinct instruments under one segment value.
     let Some(segment) = depth_segment_label(tick.exchange_segment_code) else {
+        // 2026-08-25: was a SILENT return. `DEPTH_COUNTER`'s own doc already
+        // promised `refused` covered "an unmappable segment code", and the
+        // dedicated depth drain honours that; this inline twin, written four
+        // days later, dropped ten rows per packet with no counter and no log.
+        // A reader auditing the counter would have concluded d5 losses were
+        // visible when they were not.
+        c.depth_refused.increment(1);
         return 0;
     };
     // A value above i64::MAX cannot be a real Dhan id. Refuse rather than
     // saturate: saturating writes every such packet under one bogus id.
     let Ok(security_id) = i64::try_from(tick.security_id) else {
+        // 2026-08-25: was a SILENT return, same class as the segment arm above.
+        c.depth_refused.increment(1);
         return 0;
     };
     let Some(capture_seq) =
@@ -3727,7 +3736,14 @@ fn append_inline_depth(
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
+            } else {
+                // 2026-08-25: the dedicated drain has this else arm; the
+                // inline twin did not, so an ILP append failure lost the row
+                // in silence.
+                c.depth_refused.increment(1);
             }
+        } else {
+            c.depth_refused.increment(1);
         }
         if plausible(level.ask_price) {
             let row = DepthRow {
@@ -3744,7 +3760,11 @@ fn append_inline_depth(
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
+            } else {
+                c.depth_refused.increment(1);
             }
+        } else {
+            c.depth_refused.increment(1);
         }
     }
     rows
@@ -6733,7 +6753,8 @@ pub fn crossverify_targets(
         .collect()
 }
 
-/// Spawns the daily 15:31 IST comparator for the subscribed universe.
+/// Spawns the daily comparator (see [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`]) for the
+/// subscribed universe.
 ///
 /// Returns `None` — loudly — when no [`CrossverifyDeps`] were installed. That
 /// is a refusal, not a skip: a live lane with no verifier has no way to detect
@@ -6764,7 +6785,7 @@ pub fn spawn_daily_crossverify(
         // main feed carries no sequence number and no snapshot-on-subscribe).
         info!(
             targets = targets.len(),
-            run_at_ist = "15:31",
+            run_at_ist = %run_at_ist_hhmm(),
             "Dhan live-feed cross-verification armed — it will compare captured candles \
              against Dhan's own REST record after the close"
         );
@@ -6956,10 +6977,25 @@ const _: () = assert!(
     "the comparator must fire AFTER the last minute of the window it compares"
 );
 
+/// The comparator's fire time as a `HH:MM` IST string, DERIVED.
+///
+/// Added 2026-08-25 because the arming log line carried a hardcoded `"15:31"`
+/// that survived the CAS correction above by three constants. A literal in an
+/// operator-facing field is the same class of defect as a literal in a
+/// comparison window — it just fails quietly, by telling the operator a time
+/// the code no longer uses.
+#[must_use]
+pub fn run_at_ist_hhmm() -> String {
+    let h = XVERIFY_RUN_AT_SECS_OF_DAY_IST / 3_600;
+    let m = (XVERIFY_RUN_AT_SECS_OF_DAY_IST % 3_600) / 60;
+    format!("{h:02}:{m:02}")
+}
+
 /// Seconds in a day.
 const SECS_PER_DAY: u64 = 24 * 3_600;
 
-/// Seconds to sleep from `now_secs_of_day` until the next 15:31 IST.
+/// Seconds to sleep from `now_secs_of_day` until the next run time (see
+/// [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`] — 15:41 IST today).
 ///
 /// Pure, so the schedule is testable without waiting a day. Returns a full day
 /// when called exactly at the run time, which is the right way round: firing
@@ -11914,6 +11950,79 @@ mod inline_depth_tests {
             append_inline_depth(&mut sink, &tick, &levels, 1, 0, 0, counters()),
             0,
             "an unknown segment must produce NO rows"
+        );
+    }
+
+    /// RATCHET for the 2026-08-25 silent-drop fix in `append_inline_depth`.
+    ///
+    /// `DEPTH_COUNTER`'s own doc says `refused` covers "parse error, unmappable
+    /// segment code, truncated frame tail, or an ILP append failure". The
+    /// DEDICATED depth drain honoured that. The INLINE d5 twin, written four
+    /// days later, did not: an unmappable segment dropped ten rows, an
+    /// out-of-range id dropped ten rows, an implausible price dropped one, and
+    /// a failed ILP append dropped one — every one of them with no counter and
+    /// no log.
+    ///
+    /// That is worse than an unmeasured loss. A reader auditing
+    /// `tv_dhan_feed_depth_total{outcome="refused"}` would have concluded d5
+    /// losses were visible, because the counter's documentation promised
+    /// coverage the code never delivered.
+    ///
+    /// This is a SOURCE SCAN rather than a counter assertion because the
+    /// metrics registry is process-global and a delta assertion would be flaky
+    /// under the parallel test harness. It fails the build if any of the four
+    /// arms loses its counter.
+    #[test]
+    fn every_inline_depth_drop_is_counted_never_silent() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let start = src
+            .find("fn append_inline_depth(")
+            .expect("append_inline_depth must exist"); // APPROVED: test
+        let body = &src[start..];
+        let end = body
+            .find("\nfn drain_depth_frame")
+            .expect("the function must be followed by drain_depth_frame"); // APPROVED: test
+        let body = &body[..end];
+
+        // 1 + 2: every early `return 0;` must be counted.
+        let returns = body.matches("return 0;").count();
+        assert!(
+            returns >= 3,
+            "expected the segment / id / capture_seq refusal arms; found {returns}"
+        );
+        for (i, chunk) in body.split("return 0;").enumerate() {
+            if i >= returns {
+                break; // the tail after the last `return 0;`
+            }
+            assert!(
+                chunk.contains("depth_refused.increment(1);"),
+                "the early return #{i} in append_inline_depth drops depth rows \
+                 with NO counter — that is the silent-drop class this ratchet exists \
+                 to forbid"
+            );
+        }
+
+        // 3 + 4: both `append_row` sites must carry an else arm, and both
+        // `plausible` guards must too. Two sides x two guards = four counters
+        // beyond the three refusal arms.
+        let counted = body.matches("depth_refused.increment(1);").count();
+        assert!(
+            counted >= 7,
+            "append_inline_depth must count every drop: 3 early refusals + 2 \
+             implausible-price arms + 2 failed-append arms = 7 minimum; found {counted}"
+        );
+        assert_eq!(
+            body.matches("if sink.writer.append_row(&row).is_ok() {")
+                .count(),
+            2,
+            "both the bid and ask sides append exactly one row"
+        );
+        assert!(
+            !body.contains(
+                "rows = rows.saturating_add(1);\n            }\n        }\n        if plausible"
+            ),
+            "the bid-side append has no else arm — a failed ILP append is being \
+             dropped in silence"
         );
     }
     #[test]
