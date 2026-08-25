@@ -1335,3 +1335,66 @@ The instance has NOT been started and the database has NOT been queried. Every n
 CloudWatch or source. The DB questions — rows per table, whether `ticks.ts` is out of order,
 whether the refused ticks are the indices — remain open and are answered in one command by
 `scripts/diagnose-write-amplification.sh` once the box is up (08:30 IST, or on operator request).
+
+---
+
+## Item 16 — the cross-verify was blind to the last 10 minutes of every session (FIXED)
+
+- [x] **16a — `SESSION_CLOSE_SECS_OF_DAY_IST` derived from the canonical constant, not restated**
+  - Files: `crates/app/src/dhan_live_crossverify.rs`
+  - Tests: `secs_of_day_and_is_in_session_boundaries_are_half_open`,
+    `deterministic_run_ts_nanos_is_one_minute_past_the_close_regardless_of_fire_time`
+- [x] **16b — the fire time moved in lockstep with the window end**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires`,
+    `test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes`
+
+### What was wrong
+
+`dhan_live_crossverify.rs` carried its OWN `SESSION_CLOSE_SECS_OF_DAY_IST = 15*3600 + 30*60`
+— a **private duplicate** of the session end. On 2026-08-07 NSE added the 15:30–15:40 closing
+session and six production sites moved `55_800 → 56_400` with a dated comment
+(`constants.rs`, `rest_candle_fold.rs`, `tf_consistency_boot.rs`, `feed_scoreboard_boot.rs`,
+`trading_pipeline.rs`, `day_ohlc_orchestrator.rs`). This file kept its own copy and drifted for
+**eighteen days**.
+
+### What it cost — and what it did NOT cost
+
+It did **not** produce false findings, and that is why nobody saw it. `is_in_session` gated
+BOTH sides of the join, so the window stayed symmetric and every verdict it printed was
+honest. What it produced was a **blind spot**: ten minutes of every session — specifically
+the closing-auction window the NSE migration exists for — were structurally unverifiable by
+the one check `websocket-connection-scope-lock.md` calls *"the ONLY ground truth the revived
+Dhan feed has"*.
+
+It also mis-aimed the tail amnesty. `is_tail_minute` derives from this constant, so it
+excused 15:28–15:29 while the genuinely-unsealed tail had moved to 15:38–15:39 — meaning the
+two minutes that legitimately are unsealed at run time were being counted as **real loss**,
+and two minutes that were fine were being excused.
+
+### Why the two halves had to move together
+
+The window end (`dhan_live_crossverify.rs`) and the fire time
+(`dhan_feed_stack::XVERIFY_RUN_AT_SECS_OF_DAY_IST`) are **coupled**. Widening the window to
+15:40 while still firing at 15:31 would have turned a silent blind spot into a flood of false
+`MissingLive` findings — comparing nine minutes that have not happened yet. Both moved in one
+change: close 15:30 → 15:40, fire 15:31 → 15:41.
+
+### The guarantee that this cannot drift a seventh time
+
+Three `const _: () = assert!(...)` lockstep guards — the close tracks
+`TICK_PERSIST_END_SECS_OF_DAY_IST`, the window is non-empty, and the run stamp is strictly
+after the close. **Bite-proven 2026-08-25:** restoring the `15 * 3600 + 30 * 60` literal fails
+the build with `error[E0080]: evaluation panicked: the cross-verify session close must track
+the canonical persistence end`. The four ratchets that pinned the old values were re-blessed
+to the corrected ones **and rewritten to DERIVE** — `375` is now
+`(close − open) / 60` and the tail minutes are `close − 60` / `close − 120`, so the next
+session-hours change moves them automatically instead of failing four tests.
+
+### Honest envelope
+
+This restores the ability to VERIFY the CAS window. It does **not** prove the feed captures it
+— that is what a non-zero `compared` covering 15:30–15:39 will show on the first session after
+this lands, and nothing before then. Defects #1 (the 200,000-row live-side truncation), #3
+(every target labelled `instrument: "INDEX"`), #4 (no `[dhan_live_crossverify]` config section)
+and #5 (silent inline-depth drops) are untouched by this item and remain open.
