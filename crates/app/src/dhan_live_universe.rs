@@ -418,10 +418,14 @@ pub fn resolve_live_universe(
     // than 2026-08-21), and it is pinned by
     // `ntm_wins_when_both_narrowing_flags_are_on` so it cannot be reversed by
     // someone tidying the two branches into a different order.
+    let mut ntm_used = false;
     if cfg.spot_universe_ntm_only {
         let ntm_path = crate::dhan_universe::ntm_spot_artifact_path(date_ist);
         match read_master_artifact(&ntm_path) {
-            Ok(m) => master = Some(m),
+            Ok(m) => {
+                master = Some(m);
+                ntm_used = true;
+            }
             Err(failure) => {
                 metrics::counter!(
                     MASTER_SOURCING_FALLBACK_COUNTER,
@@ -466,6 +470,29 @@ pub fn resolve_live_universe(
         }
     }
     let narrowed = master.is_some();
+    // WHICH narrowing actually produced the master, for the log label.
+    //
+    // The label used to be a two-arm ternary — `narrowed ? "fno_underlyings"
+    // : "full_master"` — with NO NTM arm, even though NTM is tried FIRST and
+    // wins when both flags are on. So an NTM universe was reported as
+    // `fno_underlyings`, naming a narrowing that had not run.
+    //
+    // MEASURED 2026-08-25: the box logged `spot_universe: "fno_underlyings",
+    // instruments: 865` while the artifact line the same session read
+    // `ntm_constituents: 746, nse_indices: 119` — 746 + 119 = exactly the 865
+    // subscribed. NTM was working perfectly and the label said otherwise.
+    //
+    // That cost a real false finding: an audit read the label, concluded the
+    // operator's NTM requirement was NOT being met, and was about to report a
+    // gap that did not exist. A label is not decoration — it is what the next
+    // reader trusts instead of re-deriving the answer.
+    let spot_universe_label = if !narrowed {
+        "full_master"
+    } else if ntm_used {
+        "ntm"
+    } else {
+        "fno_underlyings"
+    };
 
     let master = match master {
         Some(m) => m,
@@ -505,11 +532,7 @@ pub fn resolve_live_universe(
             tracing::info!(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
-                spot_universe = if narrowed {
-                    "fno_underlyings"
-                } else {
-                    "full_master"
-                },
+                spot_universe = spot_universe_label,
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
@@ -523,11 +546,7 @@ pub fn resolve_live_universe(
             tracing::error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 master_entries = master.len(),
-                spot_universe = if narrowed {
-                    "fno_underlyings"
-                } else {
-                    "full_master"
-                },
+                spot_universe = spot_universe_label,
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
@@ -751,6 +770,76 @@ pub async fn await_mapping_artifact(
 
 #[cfg(test)]
 mod tests {
+
+    /// The three spot-universe sources must produce THREE distinct labels.
+    ///
+    /// MEASURED 2026-08-25: the box logged `spot_universe: "fno_underlyings",
+    /// instruments: 865` while the same session's artifact line read
+    /// `ntm_constituents: 746, nse_indices: 119` — which is exactly 865. NTM
+    /// was working and the label named a narrowing that had not run, because
+    /// the label was a two-arm ternary with no NTM case.
+    ///
+    /// Source-scanned rather than called: the label is computed inside
+    /// `resolve_live_universe`, which needs an artifact on disk. What must not
+    /// regress is the SHAPE — a two-arm ternary cannot describe three sources,
+    /// and that is checkable without a filesystem.
+    #[test]
+    fn the_spot_universe_label_has_an_arm_for_every_source() {
+        let full = include_str!("dhan_live_universe.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        for label in ["\"ntm\"", "\"fno_underlyings\"", "\"full_master\""] {
+            assert!(
+                src.contains(label),
+                "the label {label} must exist — three sources need three names"
+            );
+        }
+        assert!(
+            src.contains("let spot_universe_label ="),
+            "the label must be computed once and reused, not re-derived per log site"
+        );
+        assert_eq!(
+            src.matches("spot_universe = spot_universe_label").count(),
+            2,
+            "both the success and the fallback log line must use the SAME computed label — \
+             two independently-written ternaries are how the NTM arm went missing"
+        );
+        // The exact shape that was wrong: a `narrowed` ternary choosing
+        // between only fno_underlyings and full_master.
+        assert!(
+            !src.contains("spot_universe = if narrowed {"),
+            "the two-arm ternary must not come back — it cannot name the NTM source"
+        );
+    }
+
+    /// NTM winning must SET the flag the label reads, or the label silently
+    /// falls back to naming the F&O narrowing again.
+    #[test]
+    fn the_ntm_success_path_records_that_ntm_was_used() {
+        let full = include_str!("dhan_live_universe.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        let ntm_branch = src
+            .find("if cfg.spot_universe_ntm_only {")
+            .expect("the NTM branch must exist");
+        let fno_branch = src
+            .find("if master.is_none() && cfg.spot_universe_fno_underlyings_only {")
+            .expect("the F&O branch must exist");
+        assert!(
+            ntm_branch < fno_branch,
+            "NTM is tried FIRST — that ordering IS the 2026-08-22-over-2026-08-21 precedence"
+        );
+        assert!(
+            src[ntm_branch..fno_branch].contains("ntm_used = true"),
+            "the NTM success arm must record that it won, or the label names the wrong source"
+        );
+        assert!(
+            !src[fno_branch..].contains("ntm_used = true"),
+            "only the NTM arm may set it"
+        );
+    }
     /// Precedence is expressed by ORDER — the NTM branch runs first and the
     /// F&O branch is guarded by `master.is_none()`. That is a real decision
     /// (operator 2026-08-22 supersedes 2026-08-21) sitting in a form that a
