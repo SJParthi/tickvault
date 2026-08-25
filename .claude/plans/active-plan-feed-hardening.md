@@ -1807,3 +1807,72 @@ So the live path today is tick -> fold -> ILP -> QuestDB. Nothing lands in
 RAM for a decision to read. The arithmetic above proves the budget is
 comfortable; it does **not** prove the capability exists. Wiring the live
 seal into `append_sealed` is a real change with its own design, not a flag.
+
+---
+
+## Item 21 — Write amplification: ROOT CAUSE MEASURED on the live box
+
+**Status:** measured 2026-08-25 ~08:55 IST, live box, read-only. Item 15 asked
+what causes ~31x write amplification. This answers it, and the answer is a
+schema decision, not a tuning knob.
+
+### Live readings (Verified)
+
+| Reading | Value |
+|---|---|
+| Root filesystem | **171 GB / 200 GB = 86%** (was 80.1% on 2026-08-24) |
+| QuestDB `db` dir | **139 GB** |
+| `ticks` partitions | **199** |
+| `market_depth` partitions | 28 |
+| WAL backlog — `market_depth` | **8,061 txns behind** (seq 209,312 / writer 201,251) |
+| WAL backlog — every other table | < 1,500, mostly < 900 |
+| Suspended WAL tables | **none** |
+| App RSS, 69 min uptime | **1.62 GB** of 31.5 GB host |
+| Deployed SHA | `6bfa4246` = `origin/main` exactly |
+
+### The mechanism (Verified in source + data)
+
+1. `ticks` is `TIMESTAMP(ts) PARTITION BY HOUR WAL`
+   (`tick_persistence.rs:486-506`).
+2. `ts` is the exchange **last-TRADE time**, not receive time.
+3. **6,433,267 ticks on 2026-08-24 — 10.0% of the day's 64.3M — have `ts`
+   more than one hour behind `received_at`.**
+4. Those are not late packets. For an illiquid option the last trade
+   genuinely WAS hours ago, so the packet is correct and its designated
+   timestamp is old.
+5. But the designated timestamp decides the PARTITION. So one commit in ten
+   reopens an already-closed hourly partition and rewrites it.
+
+That is the amplification: 4,744 GB written against ~151 GB retained. It is
+not a QuestDB misconfiguration and not the page-size setting — it is
+append-vs-rewrite, caused by choosing business time as the designated
+timestamp on a feed whose business time runs hours behind arrival.
+
+### What this rules OUT
+
+- **Not the indices.** `IDX_I` ticked 7,946,506 rows on 2026-08-24
+  (NSE_FNO 45.3M, NSE_EQ 11.7M). The hypothesis that the refusals were
+  indices is FALSE.
+- **Not a stuck writer.** Zero suspended WAL tables.
+- **Not memory.** 4.6 GB used of 31.5 GB; the app holds 1.62 GB.
+
+### The one live backlog worth watching
+
+`market_depth` is 8,061 WAL transactions behind while every other table is
+under 1,500. Depth is 1.53 billion rows/day (Item 20) against 64 million
+ticks — 24x — and its writer is the only one losing ground.
+
+### Independent confirmation of Item 20's no-live-writer finding
+
+App RSS is 1.62 GB after 69 minutes. If the RAM bar store were being filled
+by the live lane, RSS would already be climbing toward the multi-GB figures
+Item 20 computes. It is not, because nothing writes it.
+
+### NOT claimed
+
+The 31x figure itself is from Item 15's earlier reading, not re-measured
+here. Whether moving the designated timestamp to `received_at` is the right
+fix is a DESIGN decision with real consequences — it changes what range
+scans mean and interacts with the DEDUP key `(ts, security_id, segment,
+capture_seq, feed)`. Recorded as the measured cause, not as an authorized
+change.
