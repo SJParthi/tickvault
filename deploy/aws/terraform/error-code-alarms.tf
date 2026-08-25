@@ -737,11 +737,28 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
 # This one needs the NUMBER: `value = "$.ready_at_ist_secs"` extracts the field
 # itself, so the metric IS the readiness second.
 #
-# Why that matters beyond tidiness: it costs ZERO user-data bytes. The gauge
-# `tv_dhan_preopen_ready_secs` cannot ship — the EMF selector is an explicit
-# list and the user-data template renders at exactly its 15,872-byte budget
-# with nothing free (§2.3d-ii). Pulling the value out of the log line reaches
-# CloudWatch through a lane that is already in place.
+# Why that matters beyond tidiness: it costs ZERO user-data bytes, and the
+# log-filter lane is already in place and already carries the value.
+#
+# CORRECTED TWICE, 2026-08-25 — both the original claim and the first
+# correction were wrong, in opposite directions, and the measured numbers are
+# recorded here so there is no third time.
+#
+#   * This comment used to say the gauge "cannot ship — the user-data
+#     template renders at exactly its 15,872-byte budget with nothing free".
+#     STALE: the Groww removal and a metric rename freed space.
+#     `user_data_size_guard` measures the render at 15,841 bytes = 31 FREE.
+#   * The first correction then claimed the name was 31 bytes and so still
+#     did not fit. ALSO WRONG — that is the length of a DIFFERENT metric.
+#     `tv_dhan_preopen_ready_secs` is 26 bytes; with its separating pipe, 27.
+#     It WOULD fit in the 31 free bytes today.
+#
+# So the honest position is: the EMF route is no longer BLOCKED for this
+# gauge, and the log-filter route is kept anyway — because it already works,
+# costs nothing, and does not spend the last of a budget whose exhaustion is
+# what forced this design in the first place. That is a choice with a reason,
+# not a constraint. (For scale: `tv_dhan_feed_xverify_runs_total` is 31 bytes,
+# so with its pipe it needs 32 and genuinely does NOT fit — one byte over.)
 #
 # Filtered on the INFO completion line, NOT the ERROR line that fires on a
 # miss. The ERROR line would only ever produce a datapoint on a BAD morning —
