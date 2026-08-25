@@ -1531,4 +1531,419 @@ mod tests {
             }
         }
     }
+
+    // =======================================================================
+    // ORDER-BOOK ORDERING INVARIANTS
+    // =======================================================================
+    //
+    // WHY THIS SECTION EXISTS (2026-08-25). Every one of the 46 tests above
+    // asserts a FIELD VALUE from a golden vector (`levels[0].orders == 3`).
+    // Not one asserts a RELATION BETWEEN levels. That is the same blind spot
+    // that let the ~9.2x candle-volume inflation ship green this morning:
+    // every part was tested, and no test asked whether the parts AGREE.
+    //
+    // The concrete bug class this catches: a level-index or side-code drift
+    // in the fixed-offset walk (`DEEP_DEPTH_HEADER_SIZE + i * LEVEL_SIZE`)
+    // produces a book in which EVERY FIELD DECODES CORRECTLY and every
+    // golden-value test still passes — the levels are simply in the wrong
+    // order, or attributed to the wrong side. Depth is the largest payload
+    // in the system, so a scrambled book is also the most expensive one.
+    //
+    // WHAT AN "ABSENT" LEVEL IS (read from the parser, not assumed).
+    // `parse_depth_packet` has NO empty-level sentinel: it decodes whatever
+    // bytes are there, and `DeepDepthLevel::default()` is all-zero. Depth-20
+    // is a FIXED 20 levels on the wire regardless of how many the exchange
+    // actually populated, so the tail is zero-padding — exactly what
+    // `golden_twenty_bid_packet()` reproduces. An all-zero level is
+    // therefore ABSENT, not "a resting order at price 0", and is excluded
+    // from the price-ordering comparison EXPLICITLY below rather than
+    // slipping through because `100.25 >= 0.0` happens to hold.
+    //
+    // WHERE THE UNCROSSED RULE DOES *NOT* HOLD (honest limit, do not delete).
+    // NSE's pre-open call auction (09:00-09:08 IST) legitimately produces a
+    // CROSSED book — buy orders above sell orders crossing is how the
+    // auction discovers the equilibrium price. `trading_calendar.rs` sets
+    // `data_collection_start = "09:00:00"`, so captured depth genuinely
+    // CONTAINS that window. `check_book_uncrossed` therefore encodes the
+    // CONTINUOUS-SESSION rule and is applied here to constructed packets
+    // only. It must NEVER be promoted to a runtime reject/alarm without a
+    // continuous-session gate, or every trading morning pages falsely.
+    // No vendor doc states a crossed-book rule either way (searched
+    // `docs/dhan-ref/04-full-market-depth-websocket.md`, zero hits) — this
+    // is market structure, not vendor contract, and is labelled as such.
+
+    /// True when a level carries no resting order and is therefore padding
+    /// rather than a price point. See the section header: the parser has no
+    /// sentinel, so absence is "no size and no orders", plus a defensive
+    /// guard on a non-positive / non-finite price (never a real NSE price).
+    fn depth_level_is_absent(level: &DeepDepthLevel) -> bool {
+        (level.quantity == 0 && level.orders == 0) || !(level.price > 0.0)
+    }
+
+    /// Bid prices must be NON-INCREASING by level: level 0 is the best (i.e.
+    /// highest) buy price and each further level is worse or equal. Equal is
+    /// permitted — two price points can legitimately tie after a tick-size
+    /// rounding, and refusing ties would make this fire on real data.
+    fn check_bid_ordering(levels: &[DeepDepthLevel]) -> Result<(), String> {
+        let live: Vec<&DeepDepthLevel> = levels
+            .iter()
+            .filter(|l| !depth_level_is_absent(l))
+            .collect();
+        for (i, pair) in live.windows(2).enumerate() {
+            if pair[0].price < pair[1].price {
+                return Err(format!(
+                    "BID ORDERING VIOLATED: level {i} price {} < level {} price {} \
+                     (bids must be non-increasing, best/highest first)",
+                    pair[0].price,
+                    i + 1,
+                    pair[1].price
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask prices must be NON-DECREASING by level: level 0 is the best (i.e.
+    /// lowest) sell price and each further level is worse or equal.
+    fn check_ask_ordering(levels: &[DeepDepthLevel]) -> Result<(), String> {
+        let live: Vec<&DeepDepthLevel> = levels
+            .iter()
+            .filter(|l| !depth_level_is_absent(l))
+            .collect();
+        for (i, pair) in live.windows(2).enumerate() {
+            if pair[0].price > pair[1].price {
+                return Err(format!(
+                    "ASK ORDERING VIOLATED: level {i} price {} > level {} price {} \
+                     (asks must be non-decreasing, best/lowest first)",
+                    pair[0].price,
+                    i + 1,
+                    pair[1].price
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Populated levels must form a PREFIX — no hole between two live levels.
+    /// A book is ranked best-first, so "level 3 empty, level 4 populated" is
+    /// not a market state; it is precisely what a level-index drift looks
+    /// like, and no field-value assertion can see it.
+    fn check_populated_levels_are_a_prefix(levels: &[DeepDepthLevel]) -> Result<(), String> {
+        let mut seen_absent_at: Option<usize> = None;
+        for (i, level) in levels.iter().enumerate() {
+            if depth_level_is_absent(level) {
+                if seen_absent_at.is_none() {
+                    seen_absent_at = Some(i);
+                }
+            } else if let Some(hole) = seen_absent_at {
+                return Err(format!(
+                    "DEPTH HOLE: level {hole} is absent but level {i} is populated \
+                     (price {}, qty {}) — populated levels must be a contiguous prefix",
+                    level.price, level.quantity
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Best bid must be strictly BELOW best ask wherever both sides have at
+    /// least one populated level. Continuous-session rule only — see the
+    /// pre-open carve-out in the section header.
+    fn check_book_uncrossed(
+        bids: &[DeepDepthLevel],
+        asks: &[DeepDepthLevel],
+    ) -> Result<(), String> {
+        // O(1) EXEMPT: test-only checker inside `#[cfg(test)] mod tests` — it never
+        // runs in production and never touches the hot path. Reading index 0 WOULD be
+        // O(1) and is correct for a well-formed book (populated levels are a prefix),
+        // but this checker must stay honest on a MALFORMED one: with level 0 empty and
+        // level 1 populated, an index-0 read reports "side empty" and silently skips
+        // the crossed-book test — a false OK on exactly the drift this exists to catch.
+        // The scan is bounded by the level count (≤200) and runs once per test.
+        let best_bid = bids.iter().find(|l| !depth_level_is_absent(l)); // O(1) EXEMPT: see above
+        let best_ask = asks.iter().find(|l| !depth_level_is_absent(l)); // O(1) EXEMPT: see above
+        match (best_bid, best_ask) {
+            (Some(bid), Some(ask)) if bid.price >= ask.price => Err(format!(
+                "BOOK CROSSED: best bid {} >= best ask {} \
+                 (continuous session; pre-open auction is exempt)",
+                bid.price, ask.price
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Builds a REALISTIC depth-20 book side: bids descend from `best`, asks
+    /// ascend from `best`, both in 0.05 tick steps.
+    ///
+    /// The pre-existing `build_twenty` helper is NOT usable for ordering
+    /// tests — see `test_finding_existing_build_twenty_fixture_is_not_a_legal_bid_book`.
+    fn build_twenty_realistic(code: u8, sid: u32, best: f64, populated: usize) -> Vec<u8> {
+        let total = DEEP_DEPTH_HEADER_SIZE + TWENTY_DEPTH_LEVELS * DEEP_DEPTH_LEVEL_SIZE;
+        let mut buf = vec![0u8; total];
+        put_header(&mut buf, total as u16, code, 1, sid, 0);
+        let descending = code == DEEP_DEPTH_FEED_CODE_BID;
+        for i in 0..populated.min(TWENTY_DEPTH_LEVELS) {
+            let step = 0.05 * i as f64;
+            let price = if descending { best - step } else { best + step };
+            put_level(&mut buf, i, price, 10 * (i as u32 + 1), i as u32 + 1);
+        }
+        buf
+    }
+
+    fn parse_twenty_levels<'b>(raw: &[u8], buf: &'b mut DepthLevelBuffer) -> &'b [DeepDepthLevel] {
+        let packet = parse_depth_packet(raw, DepthFeedKind::Twenty, buf).unwrap();
+        match packet.payload {
+            DepthPayload::Levels { levels, .. } => levels,
+            DepthPayload::Disconnect { .. } => panic!("expected levels"),
+        }
+    }
+
+    // ---- the invariants hold on the GOLDEN data ---------------------------
+
+    #[test]
+    fn test_golden_twenty_bid_packet_prices_are_non_increasing() {
+        // The golden vector's two derived levels are 100.5 then 100.25 —
+        // a legal bid book. Levels 2..19 are vendor zero-padding and are
+        // excluded as ABSENT, not silently satisfied by `100.25 >= 0.0`.
+        let raw = golden_twenty_bid_packet();
+        let mut buf = DepthLevelBuffer::new();
+        let levels = parse_twenty_levels(&raw, &mut buf);
+        assert_eq!(levels.len(), TWENTY_DEPTH_LEVELS);
+        check_bid_ordering(levels).unwrap();
+        check_populated_levels_are_a_prefix(levels).unwrap();
+        // Prove the exclusion is real and not incidental: exactly 2 live.
+        assert_eq!(
+            levels.iter().filter(|l| !depth_level_is_absent(l)).count(),
+            2,
+            "golden vector derives 2 levels; the other 18 must read as ABSENT"
+        );
+    }
+
+    #[test]
+    fn test_realistic_twenty_book_is_ordered_and_uncrossed() {
+        let bid_raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_BID, 1333, 100.50, 20);
+        let ask_raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_ASK, 1333, 100.55, 20);
+        let mut b1 = DepthLevelBuffer::new();
+        let mut b2 = DepthLevelBuffer::new();
+        let bids: Vec<DeepDepthLevel> = parse_twenty_levels(&bid_raw, &mut b1).to_vec();
+        let asks: Vec<DeepDepthLevel> = parse_twenty_levels(&ask_raw, &mut b2).to_vec();
+        check_bid_ordering(&bids).unwrap();
+        check_ask_ordering(&asks).unwrap();
+        check_populated_levels_are_a_prefix(&bids).unwrap();
+        check_populated_levels_are_a_prefix(&asks).unwrap();
+        check_book_uncrossed(&bids, &asks).unwrap();
+    }
+
+    #[test]
+    fn test_partially_filled_twenty_book_is_ordered_and_uncrossed() {
+        // 3 populated levels + 17 pad levels — the shape the exchange
+        // actually sends for a thin instrument.
+        let bid_raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_BID, 9, 250.00, 3);
+        let ask_raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_ASK, 9, 250.05, 3);
+        let mut b1 = DepthLevelBuffer::new();
+        let mut b2 = DepthLevelBuffer::new();
+        let bids: Vec<DeepDepthLevel> = parse_twenty_levels(&bid_raw, &mut b1).to_vec();
+        let asks: Vec<DeepDepthLevel> = parse_twenty_levels(&ask_raw, &mut b2).to_vec();
+        assert_eq!(bids.iter().filter(|l| !depth_level_is_absent(l)).count(), 3);
+        check_bid_ordering(&bids).unwrap();
+        check_ask_ordering(&asks).unwrap();
+        check_populated_levels_are_a_prefix(&bids).unwrap();
+        check_book_uncrossed(&bids, &asks).unwrap();
+    }
+
+    // ---- the invariants FIRE on violations (bite-proof, permanent) --------
+    //
+    // A test that cannot fail is worse than no test. Each checker is proven
+    // here to REJECT the exact corruption it exists to catch, so the positive
+    // assertions above can never degrade into no-ops.
+
+    #[test]
+    fn test_bid_ordering_check_rejects_a_swapped_level_pair() {
+        let raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_BID, 1333, 100.50, 5);
+        let mut buf = DepthLevelBuffer::new();
+        let mut bids: Vec<DeepDepthLevel> = parse_twenty_levels(&raw, &mut buf).to_vec();
+        check_bid_ordering(&bids).unwrap();
+        bids.swap(1, 2); // exactly what a level-index drift produces
+        let err = check_bid_ordering(&bids).unwrap_err();
+        assert!(err.contains("BID ORDERING VIOLATED"), "{err}");
+    }
+
+    #[test]
+    fn test_ask_ordering_check_rejects_a_swapped_level_pair() {
+        let raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_ASK, 1333, 100.55, 5);
+        let mut buf = DepthLevelBuffer::new();
+        let mut asks: Vec<DeepDepthLevel> = parse_twenty_levels(&raw, &mut buf).to_vec();
+        check_ask_ordering(&asks).unwrap();
+        asks.swap(0, 3);
+        let err = check_ask_ordering(&asks).unwrap_err();
+        assert!(err.contains("ASK ORDERING VIOLATED"), "{err}");
+    }
+
+    #[test]
+    fn test_uncrossed_check_rejects_a_crossed_book() {
+        // Side-code inversion (the 41/51 hazard the module docs warn about)
+        // presents exactly as a crossed book: the "bid" side carries the
+        // ask prices and vice versa.
+        let bid_raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_BID, 1333, 100.50, 5);
+        let ask_raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_ASK, 1333, 100.55, 5);
+        let mut b1 = DepthLevelBuffer::new();
+        let mut b2 = DepthLevelBuffer::new();
+        let bids: Vec<DeepDepthLevel> = parse_twenty_levels(&bid_raw, &mut b1).to_vec();
+        let asks: Vec<DeepDepthLevel> = parse_twenty_levels(&ask_raw, &mut b2).to_vec();
+        check_book_uncrossed(&bids, &asks).unwrap();
+        // Swap the sides -> best "bid" 100.55 >= best "ask" 100.50.
+        let err = check_book_uncrossed(&asks, &bids).unwrap_err();
+        assert!(err.contains("BOOK CROSSED"), "{err}");
+    }
+
+    #[test]
+    fn test_prefix_check_rejects_a_hole_between_populated_levels() {
+        let raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_BID, 1333, 100.50, 5);
+        let mut buf = DepthLevelBuffer::new();
+        let mut bids: Vec<DeepDepthLevel> = parse_twenty_levels(&raw, &mut buf).to_vec();
+        check_populated_levels_are_a_prefix(&bids).unwrap();
+        bids[2] = DeepDepthLevel::default(); // blank a middle level
+        let err = check_populated_levels_are_a_prefix(&bids).unwrap_err();
+        assert!(err.contains("DEPTH HOLE"), "{err}");
+    }
+
+    #[test]
+    fn test_absent_level_definition_is_explicit_not_incidental() {
+        // If "absent" ever silently widened to include real levels, the
+        // ordering checks would pass vacuously by filtering everything out.
+        assert!(depth_level_is_absent(&DeepDepthLevel::default()));
+        assert!(depth_level_is_absent(&DeepDepthLevel {
+            price: 100.5,
+            quantity: 0,
+            orders: 0
+        }));
+        assert!(depth_level_is_absent(&DeepDepthLevel {
+            price: -1.0,
+            quantity: 5,
+            orders: 1
+        }));
+        assert!(depth_level_is_absent(&DeepDepthLevel {
+            price: f64::NAN,
+            quantity: 5,
+            orders: 1
+        }));
+        assert!(!depth_level_is_absent(&DeepDepthLevel {
+            price: 100.5,
+            quantity: 250,
+            orders: 3
+        }));
+        // A real level with 0 orders but real size is still PRESENT.
+        assert!(!depth_level_is_absent(&DeepDepthLevel {
+            price: 100.5,
+            quantity: 250,
+            orders: 0
+        }));
+    }
+
+    // ---- FINDING ---------------------------------------------------------
+
+    #[test]
+    fn test_finding_existing_build_twenty_fixture_is_not_a_legal_bid_book() {
+        // FINDING (2026-08-25, recorded loudly rather than worked around):
+        // the pre-existing `build_twenty` helper emits price = 100.0 + i, an
+        // ASCENDING ladder, and the suite feeds it through code 41 (BID) in
+        // several tests. A real bid book DESCENDS. The fixture is therefore
+        // not a legal order book, which is precisely why 46 field-value tests
+        // could never have caught an ordering defect: the fixture they assert
+        // against is already ordered wrongly for one of the two sides.
+        //
+        // NOT "fixed" here: `build_twenty` is load-bearing for the existing
+        // round-trip and offset tests, which legitimately only care that
+        // level i decodes to the value written at level i. Changing it would
+        // churn tests that are correct for their own purpose. It is pinned as
+        // a FINDING so the next reader knows the fixture is synthetic and
+        // must not be reused for book-shape reasoning.
+        let raw = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1, 1333, 0);
+        let mut buf = DepthLevelBuffer::new();
+        let levels = parse_twenty_levels(&raw, &mut buf);
+        let err = check_bid_ordering(levels)
+            .expect_err("build_twenty ascends; as a BID book that is a violation");
+        assert!(err.contains("BID ORDERING VIOLATED"), "{err}");
+        // As an ASK book the same bytes are legal — proving the checkers are
+        // side-aware and not merely "sorted somehow".
+        check_ask_ordering(levels).unwrap();
+    }
+
+    #[test]
+    fn test_finding_existing_build_two_hundred_fixture_is_not_a_legal_bid_book() {
+        // Same finding on the depth-200 fixture (500.0 + i*0.25, ascending).
+        let raw = build_two_hundred(DEEP_DEPTH_FEED_CODE_BID, 2, 7, 200);
+        let mut buf = DepthLevelBuffer::new();
+        let packet = parse_depth_packet(&raw, DepthFeedKind::TwoHundred, &mut buf).unwrap();
+        let (_, levels) = levels_of(&packet);
+        assert!(
+            check_bid_ordering(levels).is_err(),
+            "ascending bid must fail"
+        );
+        check_ask_ordering(levels).unwrap();
+        check_populated_levels_are_a_prefix(levels).unwrap();
+    }
+
+    #[test]
+    fn test_realistic_two_hundred_book_is_ordered_and_uncrossed() {
+        let rows: u32 = 200;
+        let build = |code: u8, best: f64| {
+            let count = rows as usize;
+            let total = DEEP_DEPTH_HEADER_SIZE + count * DEEP_DEPTH_LEVEL_SIZE;
+            let mut buf = vec![0u8; total];
+            put_header(&mut buf, total as u16, code, 2, 7, rows);
+            let descending = code == DEEP_DEPTH_FEED_CODE_BID;
+            for i in 0..count {
+                let step = 0.05 * i as f64;
+                let price = if descending { best - step } else { best + step };
+                put_level(&mut buf, i, price, 7 * (i as u32 + 1), i as u32 + 1);
+            }
+            buf
+        };
+        let bid_raw = build(DEEP_DEPTH_FEED_CODE_BID, 500.00);
+        let ask_raw = build(DEEP_DEPTH_FEED_CODE_ASK, 500.05);
+        let mut b1 = DepthLevelBuffer::new();
+        let mut b2 = DepthLevelBuffer::new();
+        let bids: Vec<DeepDepthLevel> = {
+            let p = parse_depth_packet(&bid_raw, DepthFeedKind::TwoHundred, &mut b1).unwrap();
+            levels_of(&p).1.to_vec()
+        };
+        let asks: Vec<DeepDepthLevel> = {
+            let p = parse_depth_packet(&ask_raw, DepthFeedKind::TwoHundred, &mut b2).unwrap();
+            levels_of(&p).1.to_vec()
+        };
+        assert_eq!(bids.len(), 200);
+        check_bid_ordering(&bids).unwrap();
+        check_ask_ordering(&asks).unwrap();
+        check_populated_levels_are_a_prefix(&bids).unwrap();
+        check_book_uncrossed(&bids, &asks).unwrap();
+    }
+
+    // ---- property coverage over ORDERING ---------------------------------
+
+    proptest! {
+        /// Any descending bid ladder, at any level count, must satisfy the
+        /// bid ordering invariant after a real parse round-trip; the same
+        /// bytes routed through the ask checker must be REJECTED whenever
+        /// there are at least two distinct populated levels. The second half
+        /// is what stops the checker degenerating into "always Ok".
+        #[test]
+        fn test_bid_ladder_roundtrip_satisfies_ordering_and_rejects_as_ask(
+            populated in 2_usize..=20,
+            best in 1.0_f64..5000.0,
+        ) {
+            let raw = build_twenty_realistic(DEEP_DEPTH_FEED_CODE_BID, 1333, best, populated);
+            let mut buf = DepthLevelBuffer::new();
+            let packet = parse_depth_packet(&raw, DepthFeedKind::Twenty, &mut buf)
+                .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+            let (side, levels) = levels_of(&packet);
+            prop_assert_eq!(side, DepthSide::Bid);
+            prop_assert!(check_bid_ordering(levels).is_ok(), "descending ladder must pass");
+            prop_assert!(check_populated_levels_are_a_prefix(levels).is_ok());
+            prop_assert!(
+                check_ask_ordering(levels).is_err(),
+                "a strictly descending ladder can never be a legal ask book"
+            );
+        }
+    }
 }
