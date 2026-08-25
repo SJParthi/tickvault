@@ -5,7 +5,10 @@
 //! cooperative cancellation via a [`tokio::sync::watch`] channel.
 //! The future boot wiring (item 1.4) spawns this task at app
 //! startup; the shutdown path flips the cancellation flag, the loop
-//! does ONE final drain, then exits gracefully.
+//! drains the ring to EMPTY (bounded by `FINAL_DRAIN_BUDGET_SECS`), then
+//! exits gracefully. Until 2026-08-25 it ran exactly ONE bounded cycle, so
+//! anything past `max_drain_per_cycle` died in RAM while the log said the
+//! drain had completed -- see `final_drain`.
 //!
 //! ## What this slice ships
 //!
@@ -14,8 +17,7 @@
 //!   `aggregator.consume_tick → ILP commit` to ~100 ms +
 //!   one `flush()` round-trip).
 //! - [`run_seal_writer_loop`] — the async fn; runs forever until
-//!   cancelled, returns on cancel after one final drain cycle so no
-//!   buffered seal is lost.
+//!   cancelled, then drains the ring to empty so no buffered seal is lost.
 //! - 5 `#[tokio::test]` cases covering: idle ticks; submit-then-tick
 //!   processes seals; cancellation exits the loop; cancellation does
 //!   ONE final drain (`final_drain_outcome` non-idle); `MissedTickBehavior::Skip`
@@ -55,7 +57,7 @@
 //! tasks in the codebase (`ip_monitor.rs`, `depth_rebalancer.rs`)
 //! already use this pattern.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::sync::watch;
@@ -280,6 +282,96 @@ fn utc_now_secs() -> i64 {
 /// `tokio::task::block_in_place` — the worker's other tasks migrate while the
 /// flush blocks. Current-thread runtimes (the `#[tokio::test]` harness) call
 /// directly, because `block_in_place` panics there.
+/// Wall-clock ceiling on the shutdown drain.
+///
+/// The app's shutdown path budgets ~75 s for the whole sequence, so this must
+/// leave room for everything after it. A drain that has not finished by then
+/// is reported as loss rather than waited on indefinitely — a shutdown that
+/// hangs is worse than one that says exactly what it could not persist.
+pub const FINAL_DRAIN_BUDGET_SECS: u64 = 45;
+
+/// Drains the ring to empty on cancellation, bounded by
+/// [`FINAL_DRAIN_BUDGET_SECS`], and reports any residue LOUDLY.
+///
+/// # Why this is a loop
+///
+/// Until 2026-08-25 the cancel arm ran exactly ONE cycle and returned.
+/// `run_one_cycle` is bounded by the runner's `max_drain_per_cycle`, so
+/// everything beyond that bound stayed in the ring and died with the process
+/// — and the shutdown log said `"final drain complete"` with
+/// `rescued_dropped = 0`, because that counter measures triple-tier failure,
+/// never ring residue. A silent loss reported as a success.
+///
+/// It fires on the most ordinary event there is: the 17:30 stop, every
+/// weekday, immediately after the close force-seal has just produced one seal
+/// per instrument per timeframe — the largest burst of the day. At today's
+/// universe the burst fits under the per-cycle bound with room to spare, so
+/// nothing is being lost right now; at the authorised universe it would not,
+/// and the first symptom would have been a success message.
+///
+/// # Termination
+///
+/// Three independent exits, so this can never spin: the ring empties, the
+/// budget expires, or a cycle makes no progress at all (which is what a
+/// permanently-stuck tier looks like — continuing would burn the budget to
+/// achieve nothing).
+///
+/// # Complexity
+/// O(seals in the ring), bounded by the budget. No allocation.
+fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress) -> CycleOutcome {
+    let deadline = Instant::now() + Duration::from_secs(FINAL_DRAIN_BUDGET_SECS);
+    let mut total = CycleOutcome::default();
+    let mut cycles: u64 = 0;
+
+    loop {
+        let outcome = run_cycle(runner, utc_now_secs());
+        let dropped = progress.absorb(&outcome);
+        record_cycle_observability(&outcome, dropped);
+        total.accumulate(&outcome);
+        cycles = cycles.saturating_add(1);
+
+        if runner.ring_len() == 0 {
+            break;
+        }
+        if outcome.is_idle() {
+            // The ring is non-empty and yet nothing moved — every tier is
+            // refusing. More cycles cannot change that.
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    emit_progress_report(&progress.take(), runner.ring_len());
+
+    let residue = runner.ring_len();
+    if residue > 0 {
+        // NOT an `info!` "complete" line. These seals are in RAM, the process
+        // is exiting, and no tier accepted them — they are gone.
+        error!(
+            code = ErrorCode::AggregatorDrop01.code_str(),
+            ring_len = residue,
+            cycles,
+            submitted_from_mpsc = total.submitted_from_mpsc,
+            "seal writer final drain ENDED WITH SEALS STILL IN MEMORY — \
+             {residue} sealed candles are lost at shutdown"
+        );
+        metrics::counter!("tv_seal_final_drain_residue_total").increment(residue as u64);
+    } else {
+        info!(
+            cycles,
+            submitted_from_mpsc = total.submitted_from_mpsc,
+            rescued_to_spill = total.drain.rescued_to_spill,
+            rescued_to_dlq = total.drain.rescued_to_dlq,
+            rescued_dropped = total.drain.rescued_dropped,
+            "seal writer loop final drain complete — ring empty"
+        );
+    }
+
+    total
+}
+
 fn run_cycle(runner: &mut SealWriterRunner, now_unix_secs: i64) -> CycleOutcome {
     if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
@@ -361,18 +453,7 @@ pub async fn run_seal_writer_loop(
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
                     info!("seal writer loop cancelled — performing final drain");
-                    let now = utc_now_secs();
-                    let final_outcome = run_cycle(&mut runner, now);
-                    let dropped = progress.absorb(&final_outcome);
-                    record_cycle_observability(&final_outcome, dropped);
-                    emit_progress_report(&progress.take(), runner.ring_len());
-                    info!(
-                        submitted_from_mpsc = final_outcome.submitted_from_mpsc,
-                        rescued_to_spill = final_outcome.drain.rescued_to_spill,
-                        rescued_to_dlq = final_outcome.drain.rescued_to_dlq,
-                        rescued_dropped = final_outcome.drain.rescued_dropped,
-                        "seal writer loop final drain complete"
-                    );
+                    let final_outcome = final_drain(&mut runner, &mut progress);
                     return final_outcome;
                 }
                 // The watch receiver's `.changed()` future also
@@ -853,5 +934,76 @@ mod tests {
             seals_left_pending: 50,
             records_undecodable: 2,
         });
+    }
+
+    #[tokio::test]
+    async fn test_final_drain_empties_a_ring_deeper_than_one_cycles_bound() {
+        // THE REGRESSION. Until 2026-08-25 the cancel arm ran exactly ONE
+        // cycle, and `run_one_cycle` is bounded by `max_drain_per_cycle` — so
+        // everything past that bound stayed in the ring and died with the
+        // process, while the shutdown log said "final drain complete" with
+        // `rescued_dropped = 0` (a counter that measures a different kind of
+        // loss entirely).
+        //
+        // Fixture: a ring holding 12 seals against a per-cycle bound of 3, so
+        // one cycle provably cannot finish and four are required.
+        let (spill, dlq) = temp_pair("final-drain-deep");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 64, 64, 3);
+        assert_eq!(runner.max_drain_per_cycle(), 3, "fixture bound");
+        let tx = runner.sender();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let task = tokio::spawn(run_seal_writer_loop(
+            runner,
+            Duration::from_secs(10),
+            cancel_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for i in 0..12u32 {
+            tx.try_send(mk_seal(
+                13,
+                0,
+                TfIndex::M1,
+                1_716_000_900 + i * 60,
+                100.0 + f64::from(i),
+            ))
+            .expect("queue seal");
+        }
+        cancel_tx.send(true).expect("send");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("final drain must not hang")
+            .expect("task panicked");
+
+        assert_eq!(
+            outcome.submitted_from_mpsc, 12,
+            "every queued seal must reach the pipeline, not just one cycle's worth"
+        );
+        assert_eq!(
+            outcome.drain.ring_seals_popped, 12,
+            "the ring must be drained to EMPTY, across as many cycles as that takes"
+        );
+        assert_eq!(
+            outcome.drain.rescued_to_spill, 12,
+            "with the writer disconnected all twelve land on disk — recoverable, not lost"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[tokio::test]
+    async fn test_final_drain_budget_is_under_the_shutdown_allowance() {
+        // The app budgets ~75 s for the whole shutdown sequence. A drain
+        // allowed to consume all of it would turn a bounded loss into a hung
+        // stop, which is worse.
+        assert!(
+            FINAL_DRAIN_BUDGET_SECS < 75,
+            "the drain budget must leave room for the rest of shutdown"
+        );
+        assert!(
+            FINAL_DRAIN_BUDGET_SECS >= 10,
+            "and must be long enough to drain a real close-seal burst"
+        );
     }
 }
