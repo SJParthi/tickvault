@@ -2113,3 +2113,76 @@ i.e. it proved nothing. The reproduction now includes the June candle partitions
 that pushed prod over the cap, and asserts `worklist.len() > 200` so it can
 never silently become vacuous again. Bite-proven both directions: reverted, it
 fails with `market_depth scheduled: 0`.
+
+---
+
+## Item 14 — the pre-open readiness alarm pages on every restart (2026-08-25)
+
+**Status: DONE.** Found by reading why `tv-prod-preopen-ready-late` was in ALARM
+and armed, hours after the eight #1809 alarms finally applied.
+
+### What the live log actually said
+
+```
+09:08:04  attempts: 57  ready_at 32884  deadline 33120  met_deadline: TRUE
+12:37:58  attempts:  1  ready_at 45478  deadline 33120  met_deadline: false
+16:17:30  attempts:  1  ready_at 58650  deadline 33120  met_deadline: false
+17:33:59  attempts:  1  ready_at 63239  deadline 33120  met_deadline: false
+18:17:30  attempts:  1  ready_at 65850  deadline 33120  met_deadline: false
+19:21:34  attempts:  1  ready_at 69694  deadline 33120  met_deadline: false
+```
+
+The morning MET the deadline with four minutes to spare. The five `false` rows
+are restarts on a busy deploy afternoon; `ready_at_ist_secs` is simply "now".
+
+### The defect
+
+`met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS` asked "did this
+attach finish before 09:12?" of EVERY attach, including ones that had not begun
+until the afternoon. A restart cannot pass a test whose pass condition is a time
+already in the past, so the verdict was decided by the wall clock rather than by
+anything about the lane. Each restart fired `WS-GAP-02` and drove the alarm —
+ungated by design — into ALARM.
+
+The alarm's own comment reasoned that "on a restart day the LATEST attach is the
+one that matters". True of a 10:30 re-attach; false of a 19:21 one. The missing
+distinction is not WHEN the attach finished but whether it was ever racing the
+open, and only the START second carries that.
+
+- [x] **Gate the deadline verdict on whether the attach was racing the open**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `contract_attach_tests::the_preopen_deadline_does_not_apply_to_a_mid_session_restart`,
+    `an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns`,
+    `the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on`
+
+### Why no terraform change
+
+The CloudWatch filter is anchored on `{ $.fields.ready_at_ist_secs = * }`. The
+mid-session arm reports its completion second as `attached_at_ist_secs`
+instead, so it produces no datapoint at all. The alarm's threshold, statistic
+and `notBreaching` semantics are untouched, and the gauge is skipped on that
+arm for the reason its own doc already gives for the give-up paths: there is no
+readiness second, and publishing the wall clock as one reads as a permanently
+missed deadline.
+
+### Guarantee matrix
+
+Carried by reference from this plan's shared matrix (15-row + 7-row). Rows that
+move for this item: **monitoring** (an armed alarm stops firing on normal
+operation), **logging** (the mid-session arm gets its own line and field),
+**alerting** (`WS-GAP-02` no longer fires on a restart), **scenarios**
+(restart-after-deadline is now a covered case), **extreme check** (three tests,
+all bite-proven). No hot-path, schema, DEDUP-key, or WebSocket-count change, so
+the 7-row resilience matrix is unmoved.
+
+### Honest envelope
+
+- This removes a FALSE page. It does not make any attach faster, and a genuinely
+  late pre-open still fires exactly as before — pinned by
+  `an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns`.
+- Keyed on the attach START, so an attach beginning at 09:11 and finishing at
+  09:20 is still judged. Excusing that would hollow the alarm out from the other
+  side while fixing the false pages.
+- UNVERIFIED-LIVE: the fix is proven in tests and by source scan against the
+  real filter pattern; that the alarm actually stays quiet across tomorrow's
+  restarts is measured tomorrow, not claimed here.
