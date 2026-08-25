@@ -46,6 +46,7 @@ use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
+use crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST;
 use crate::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
@@ -212,13 +213,18 @@ impl TickPrices {
     pub fn from_tick(tick: &ParsedTick) -> Self {
         Self {
             last_traded_price: f32_to_f64_clean(tick.last_traded_price),
-            // `> 0.0` is false for NaN — a poisoned field can never be adopted.
-            day_open: if tick.day_open > 0.0 {
+            // Both day fields go through the SAME gate the day extremes use.
+            // `> 0.0` alone was the old test: it rejects NaN, but accepts
+            // `+inf`, `f32::MAX` and subnormals — and `day_open` is stamped
+            // into a bar's `open` AND `session_open`, `day_close` into
+            // `prev_day_close`, so one mangled frame reached four persisted
+            // columns. See `usable_exchange_price`.
+            day_open: if usable_exchange_price(tick.day_open) {
                 f32_to_f64_clean(tick.day_open)
             } else {
                 0.0
             },
-            day_close: if tick.day_close > 0.0 {
+            day_close: if usable_exchange_price(tick.day_close) {
                 f32_to_f64_clean(tick.day_close)
             } else {
                 0.0
@@ -421,7 +427,19 @@ impl AggregatorCell {
             prev_observed_ts: self.last_observed_ts,
             ..SessionExtremeDelta::default()
         };
-        self.last_observed_ts = tick.exchange_timestamp;
+
+        // The interval's left endpoint may only be moved by a packet that
+        // actually REPORTED a session extreme. Advancing it unconditionally
+        // was a real defect (found by permutation sweep 2026-08-25): a Ticker
+        // packet, or a Quote whose day fields decoded 0.0 / NaN, carries no
+        // information about the session extremes at all — yet it narrowed the
+        // interval, so the NEXT rise was attributed on evidence that did not
+        // exist. A packet that says nothing must move nothing.
+        let carries_extremes =
+            usable_exchange_price(tick.day_high) || usable_exchange_price(tick.day_low);
+        if carries_extremes {
+            self.last_observed_ts = tick.exchange_timestamp;
+        }
 
         if usable_exchange_price(tick.day_high) {
             if tick.day_high > self.last_seen_day_high {
@@ -658,7 +676,9 @@ impl AggregatorCell {
             // than losing the official open for the whole day; pinning it to a
             // session-time window would put trading-calendar knowledge inside
             // this cell, which is the wrong place for it.
-            let use_day_open = self.armed_for_day_open[ord] && prices.day_open > 0.0;
+            let use_day_open = self.armed_for_day_open[ord]
+                && prices.day_open > 0.0
+                && is_days_first_session_bucket(tf, bucket_start);
             if use_day_open {
                 self.armed_for_day_open[ord] = false;
             }
@@ -668,7 +688,8 @@ impl AggregatorCell {
             // across days on its own. Chosen over a new `[bool; TF_COUNT]`
             // array because it costs 0 bytes and cannot drift out of sync with
             // the seal path it is read from.
-            let first_bucket_of_day = self.last_sealed[ord].is_uninitialised();
+            let first_bucket_of_day = self.last_sealed[ord].is_uninitialised()
+                && is_days_first_session_bucket(tf, bucket_start);
             self.slots[ord] = open_bucket(
                 tick,
                 prices,
@@ -693,7 +714,10 @@ impl AggregatorCell {
             // carried no session open would lose the official open for the
             // whole day — the bucket is already open, and `fold_in_bucket`
             // deliberately never touches `open`.
-            if self.armed_for_day_open[ord] && prices.day_open > 0.0 {
+            if self.armed_for_day_open[ord]
+                && prices.day_open > 0.0
+                && is_days_first_session_bucket(tf, open_start)
+            {
                 self.armed_for_day_open[ord] = false;
                 self.slots[ord].open = prices.day_open;
                 // The MORE dangerous of the two `day_open` stamp sites: this
@@ -722,7 +746,9 @@ impl AggregatorCell {
             // Session extremes keep arriving through the first bucket's life,
             // so re-adopt on every tick of it — `day_high` at the bucket's LAST
             // tick is the one that matters, and max/min converge to it.
-            if self.last_sealed[ord].is_uninitialised() {
+            if self.last_sealed[ord].is_uninitialised()
+                && is_days_first_session_bucket(tf, open_start)
+            {
                 adopt_exchange_day_extremes(&mut self.slots[ord], tick);
             } else if attributable {
                 adopt_session_extreme_delta(&mut self.slots[ord], extremes);
@@ -866,6 +892,37 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
     }
 }
 
+/// True when `bucket_start` is the bucket that CONTAINS the day's 09:15 open,
+/// for this timeframe.
+///
+/// The session-open stamp and the session-extreme LEVEL adoption are both
+/// correct for exactly one bucket per timeframe per day, and both used to be
+/// gated on `last_sealed[ord].is_uninitialised()` — "nothing has sealed yet".
+/// A permutation sweep on 2026-08-25 showed that is a different question with
+/// the same answer only on a clean 09:15 start. It is ALSO true for:
+///
+/// - an instrument first seen MID-SESSION (a contract attached at 11:00, a
+///   process restart), whose 11:00 bar then adopted the whole running session
+///   range — an observed single tick at 100 producing `high 180 / low 60`;
+/// - the bucket after an intraday `catch_up_seal`, which clears the slot but
+///   deliberately does not re-arm, so a later bucket could open at the 09:15
+///   official price and widen its own `low` down to it — a fabricated open
+///   and low on a mid-session candle, which then increments
+///   `tv_candle_open_clamped_total` and reads as a legitimate gap-open.
+///
+/// Deriving the answer from the CLOCK instead of from seal history closes all
+/// three. It is exact for every timeframe, including the ones 09:15 does not
+/// divide evenly (M30 and M60 resolve to the 09:00 bucket, which is the one
+/// that contains the open) and including D1, whose bucket is the whole day.
+///
+/// # Complexity
+/// O(1) — one remainder, one bucket alignment, one compare.
+#[inline]
+fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
+    let day_start = bucket_start - (bucket_start % 86_400);
+    bucket_start == tf.bucket_start(day_start + MARKET_OPEN_SECS_OF_DAY_IST)
+}
+
 /// True when `raw` is a usable exchange-published price.
 ///
 /// `> 0.0` alone is NOT sufficient and the difference is load-bearing:
@@ -874,9 +931,25 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
 ///
 /// `0.0` is the documented ABSENT sentinel — Ticker-mode packets carry no day
 /// fields at all, so a bare `0.0` must never be read as a real price of zero.
+///
+/// Two further rejections were added 2026-08-25 after a permutation sweep
+/// showed the LTP guard's protections were never extended to the day fields,
+/// even though both come off the wire the same way (`read_f32_le`):
+///
+/// - **`MAX_PLAUSIBLE_LTP` ceiling.** `tick_price_is_sane` has bounded the LTP
+///   since 2026-08-15, but a mangled frame decoding `f32::MAX` in `day_high`
+///   went straight into a bar's `high` — and, through `TickPrices`, into
+///   `open`, `session_open` and `prev_day_close` as well. One packet, four
+///   poisoned columns.
+/// - **`is_normal()`.** A positive SUBNORMAL passes every finiteness and sign
+///   test, but `f32_to_f64_clean` round-trips through a fixed 24-byte decimal
+///   buffer that a subnormal overruns, so it parses back as `0.0` — which then
+///   wins the `<` comparison and sets a bar's `low` to zero. `is_normal()`
+///   excludes exactly the subnormals (and `NaN`, `±∞`, `0.0`) and excludes no
+///   price any exchange can quote: the smallest normal `f32` is ~1.2e-38.
 #[inline]
-const fn usable_exchange_price(raw: f32) -> bool {
-    raw.is_finite() && raw > 0.0
+fn usable_exchange_price(raw: f32) -> bool {
+    raw.is_normal() && raw > 0.0 && raw <= MAX_PLAUSIBLE_LTP
 }
 
 /// Builds the state of a bucket being opened by `tick`.
@@ -928,19 +1001,17 @@ fn open_bucket(
         oi: i64::from(tick.open_interest),
         tick_count: 1,
         close_ts_ist_secs: tick.exchange_timestamp,
-        prev_day_close: if tick.day_close > 0.0 {
-            f32_to_f64_clean(tick.day_close)
-        } else {
-            0.0
-        },
+        // Same reasoning as `session_open` below: the gated widened value,
+        // never the raw wire field.
+        prev_day_close: prices.day_close,
         close_pct_from_prev_day: 0.0,
         oi_pct_from_prev_day: 0.0,
         volume_pct_from_prev_day: 0.0,
-        session_open: if tick.day_open > 0.0 {
-            f32_to_f64_clean(tick.day_open)
-        } else {
-            0.0
-        },
+        // Uses the ALREADY-GATED widened value, not the raw wire field. The
+        // raw read here was the last hole through which an absurd or
+        // subnormal `day_open` reached a persisted column after every other
+        // site had been closed (permutation sweep 2026-08-25).
+        session_open: prices.day_open,
         open_pct: 0.0,
         open_gap_pct: 0.0,
     };
@@ -2425,5 +2496,237 @@ mod session_extreme_delta_tests {
                 "{tf:?} must recover the session high from the single observation"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Permutation-sweep regressions (2026-08-25)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod permutation_regression_tests {
+    use super::tests::{DAY, OPEN, tick_at};
+    use super::*;
+
+    fn strategy() -> FeedStrategy {
+        FeedStrategy::DEFAULT
+    }
+
+    #[test]
+    fn a_mid_session_first_bucket_must_not_adopt_the_whole_running_session_range() {
+        // Row #2 of the sweep. "The day's first bucket" was derived as
+        // "nothing has sealed yet", which is ALSO true for an instrument first
+        // seen at 11:00 — a contract attached after the open, or a process
+        // restart. That bar adopted the entire session's high and low, so a
+        // single tick at 100 published `high 180 / low 60`: a bar whose range
+        // is 120 points wide from one observed price.
+        let mut cell = AggregatorCell::empty();
+        let mid_session = OPEN + 105 * 60; // 11:00 IST
+
+        let mut t = tick_at(mid_session, 100.0, 10);
+        t.day_high = 180.0;
+        t.day_low = 60.0;
+        t.day_open = 95.0;
+        cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(100.0),
+            "high must be the observed price, not the session high"
+        );
+        assert_eq!(
+            s.low,
+            f32_to_f64_clean(100.0),
+            "low must be the observed price, not the session low"
+        );
+        assert_eq!(
+            s.open,
+            f32_to_f64_clean(100.0),
+            "a mid-session bar must not open at the 09:15 price"
+        );
+    }
+
+    #[test]
+    fn the_days_real_first_bucket_still_adopts_everything_it_should() {
+        // The other half — the fix must NARROW the predicate, not disable it.
+        let mut cell = AggregatorCell::empty();
+        let mut t = tick_at(OPEN, 100.0, 10);
+        t.day_high = 104.0;
+        t.day_low = 96.0;
+        t.day_open = 98.0;
+        cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.open,
+            f32_to_f64_clean(98.0),
+            "the day's first bar opens at the official open"
+        );
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(104.0),
+            "and adopts the session high"
+        );
+        assert_eq!(s.low, f32_to_f64_clean(96.0), "and the session low");
+    }
+
+    #[test]
+    fn a_bucket_opened_after_an_intraday_catch_up_seal_must_not_use_the_session_open() {
+        // Row #1, the sweep's worst finding. `catch_up_seal` clears the slot
+        // but deliberately does not re-arm day-open — and only the ROLL path
+        // disarmed. So a thin instrument whose first tick lacked `day_open`
+        // could open an 11:00 bucket at the 09:15 official price and widen
+        // that bar's `low` down to it: a fabricated open AND low on a
+        // mid-session candle, which then reads as a legitimate gap-open.
+        let mut cell = AggregatorCell::empty();
+
+        // Day's first bucket, no session open published yet.
+        let first = tick_at(OPEN, 100.0, 10);
+        assert_eq!(first.day_open, 0.0, "fixture models the unpopulated case");
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy(), 10);
+        assert!(
+            cell.catch_up_seal(TfIndex::M1, OPEN + 600).is_some(),
+            "fixture must drain the slot"
+        );
+
+        // Much later, the official open finally arrives on a packet.
+        let mid_session = OPEN + 105 * 60;
+        let mut later = tick_at(mid_session, 120.0, 40);
+        later.day_open = 95.0;
+        cell.consume_tick(TfIndex::M1, &later, 0, strategy(), 40);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.open,
+            f32_to_f64_clean(120.0),
+            "an 11:00 bar must open at its own first traded price"
+        );
+        assert_eq!(
+            s.low,
+            f32_to_f64_clean(120.0),
+            "and must not be widened down to the 09:15 price"
+        );
+    }
+
+    #[test]
+    fn an_absurd_but_finite_session_extreme_is_refused_everywhere_the_ltp_would_be() {
+        // Rows #4-#6. `tick_price_is_sane` has bounded the LTP by
+        // MAX_PLAUSIBLE_LTP since 2026-08-15; the day fields come off the wire
+        // the same way and were never bounded. One mangled frame reached a
+        // bar's `high`, `open`, `session_open` and `prev_day_close`.
+        for absurd in [f32::MAX, 1e30, MAX_PLAUSIBLE_LTP * 1.5] {
+            let mut cell = AggregatorCell::empty();
+            let mut t = tick_at(OPEN, 100.0, 10);
+            t.day_high = absurd;
+            t.day_open = absurd;
+            t.day_close = absurd;
+            cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+            let s = cell.snapshot(TfIndex::M1);
+            assert_eq!(
+                s.high,
+                f32_to_f64_clean(100.0),
+                "{absurd} must never become a bar high"
+            );
+            assert_eq!(
+                s.open,
+                f32_to_f64_clean(100.0),
+                "{absurd} must never become a bar open"
+            );
+            assert_eq!(
+                s.session_open, 0.0,
+                "{absurd} must never become the session open"
+            );
+            assert_eq!(
+                s.prev_day_close, 0.0,
+                "{absurd} must never become the previous close"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subnormal_session_low_cannot_zero_a_bars_low() {
+        // Row #11. A positive subnormal passes every finiteness and sign test,
+        // but `f32_to_f64_clean` round-trips through a fixed decimal buffer
+        // that a subnormal overruns, so it parses back as 0.0 -- which then
+        // wins the `<` comparison and sets the bar's low to zero.
+        let mut cell = AggregatorCell::empty();
+        let mut t = tick_at(OPEN, 100.0, 10);
+        t.day_low = f32::MIN_POSITIVE / 2.0;
+        assert!(
+            t.day_low > 0.0 && t.day_low.is_finite(),
+            "fixture is positive and finite"
+        );
+        cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).low,
+            f32_to_f64_clean(100.0),
+            "a subnormal must never reach a bar's low"
+        );
+    }
+
+    #[test]
+    fn a_packet_carrying_no_session_extremes_must_not_narrow_the_delta_interval() {
+        // Rows #7-#8, and the one defect in the delta mechanism itself. A
+        // Ticker packet -- or a Quote whose day fields decoded 0.0/NaN --
+        // reports nothing about the session extremes, yet it was advancing the
+        // interval's left endpoint. The next rise was then attributed on
+        // evidence that did not exist.
+        let mut cell = AggregatorCell::empty();
+
+        // 09:15 bucket: a real Quote establishes the mark.
+        let mut a = tick_at(OPEN, 100.0, 10);
+        a.day_high = 100.0;
+        a.day_low = 100.0;
+        let d = cell.observe_session_extremes(&a);
+        cell.consume_tick_with_extremes(
+            TfIndex::M1,
+            &a,
+            TickPrices::from_tick(&a),
+            0,
+            strategy(),
+            10,
+            d,
+        );
+
+        // 09:16 bucket: a Ticker packet -- no day fields at all.
+        let silent = tick_at(OPEN + 70, 100.0, 20);
+        assert_eq!(silent.day_high, 0.0, "fixture models a Ticker packet");
+        let d = cell.observe_session_extremes(&silent);
+        cell.consume_tick_with_extremes(
+            TfIndex::M1,
+            &silent,
+            TickPrices::from_tick(&silent),
+            0,
+            strategy(),
+            20,
+            d,
+        );
+
+        // 09:16 again: a Quote with a risen high. The rise could have printed
+        // any time since the LAST PACKET THAT REPORTED AN EXTREME -- which was
+        // in the 09:15 bucket -- so it straddles and must be refused.
+        let mut c = tick_at(OPEN + 80, 100.0, 30);
+        c.day_high = 105.0;
+        c.day_low = 100.0;
+        let d = cell.observe_session_extremes(&c);
+        cell.consume_tick_with_extremes(
+            TfIndex::M1,
+            &c,
+            TickPrices::from_tick(&c),
+            0,
+            strategy(),
+            30,
+            d,
+        );
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).high,
+            f32_to_f64_clean(100.0),
+            "a silent packet must not license attribution it cannot support"
+        );
+        let _ = DAY;
     }
 }
