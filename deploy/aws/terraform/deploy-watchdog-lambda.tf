@@ -325,3 +325,39 @@ resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_errors" {
   # recovery signal is the NEXT scheduled run succeeding.
   ok_actions = []
 }
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the deploy watchdog RUN?" (found by the new guard)
+#
+# Worth stating plainly because the history is specific: on 2026-07-09 both
+# morning deploy crons were scheduler-dropped and the box booted on a stale
+# binary. THIS Lambda is the detector for that class - and it is itself
+# scheduler-drop-fragile, with nothing watching. A detector that can go missing
+# by the same mechanism as the fault it detects needs its own liveness check,
+# or the first time both drop together nobody learns anything.
+#
+# 24h window: MON-FRI post-boot cron.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_not_invoked" {
+  alarm_name          = "tv-${var.environment}-deploy-watchdog-not-invoked"
+  alarm_description   = "The deploy watchdog did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This is the check that catches a box booted on a STALE BINARY (the 2026-07-09 incident); while it is not running a stale deploy trades all day looking perfectly healthy. Its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.deploy_watchdog.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}

@@ -305,3 +305,43 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
   # recovery signal is the NEXT scheduled run succeeding.
   ok_actions = []
 }
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the gate RUN?" (found by the new scheduled-Lambda guard)
+#
+# This Lambda does not DO anything an operator would miss directly - it flips
+# another alarm's actions on and off around the boot window. That is exactly
+# what makes its silence dangerous: a stuck gate leaves the boot alarm armed
+# through the night (a page every morning at the stop, training the operator to
+# ignore it) or disarmed through the morning (blind at the one moment boot
+# failure matters). Neither state looks like a broken Lambda from outside.
+#
+# 24h window rather than the 6h used for the hourly guards: this one fires on
+# MON-FRI open/close crons, so a 6h window would breach every weekend on a
+# perfectly healthy schedule. A dropped schedule here costs one trading
+# morning's alarm fidelity, not the trading day itself, so a day of detection
+# latency is the right trade against a weekend of false pages.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_not_invoked" {
+  alarm_name          = "tv-${var.environment}-boot-heartbeat-gate-not-invoked"
+  alarm_description   = "The boot-window gate did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This gate ARMS and DISARMS the boot alarm around the morning window; while it is not running the boot alarm is stuck in whichever state it was last left, so a dead app either pages nobody all morning or pages every night, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}

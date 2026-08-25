@@ -314,3 +314,49 @@ resource "aws_cloudwatch_metric_alarm" "start_watchdog_errors" {
   # recovery signal is the NEXT scheduled run succeeding.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 — "did the box-starter RUN?" (the §2.3f follow-up, now taken)
+#
+# `dhan-rest-only-noise-lock-2026-07-14.md` §2.3f records this verbatim as a
+# real follow-up, and records that an earlier draft of that section CLAIMED
+# this alarm already existed. It did not: a tree-wide scan for
+# `metric_name = "Invocations"` returned exactly two alarms, on the token
+# minter and the market-hours gate. This closes it.
+#
+# Why it matters more here than for most Lambdas: this is the component that
+# STARTS the trading box at 08:30 IST, retries the start, and verifies the
+# 17:30 stop. Its Errors alarm is blind to the failure that actually happened
+# to this repo on 2026-07-02 — EventBridge dropped schedules repo-wide — and
+# a schedule that never fires produces no error to alarm on. The observable
+# symptom of a dropped start schedule is a trading day that silently does not
+# happen, discovered by the operator rather than by a page. CloudWatch CPU
+# already recorded exactly that shape three times in August (Aug 5, 7 and 8 at
+# 0 hours), for a different cause; nothing would have distinguished this one.
+#
+# 6-hour window because the hourly `cron(5 * * * ? *)` rule below makes six
+# invocations the expectation, so a single miss cannot page. The MON-FRI
+# start/retry/stop-verify rules are additive on top of that; the hourly one is
+# what makes a 6h window safe every day of the week, weekends included.
+#
+# ok_actions = [] — recovery is "a datapoint appeared", not a fix worth a page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "start_watchdog_not_invoked" {
+  alarm_name          = "tv-${var.environment}-start-watchdog-not-invoked"
+  alarm_description   = "The start-watchdog did NOT RUN in the last 6h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This is the component that starts the trading box each morning and verifies the evening stop; while it is not running a missed start looks exactly like a quiet day, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 21600
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.start_watchdog.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}
