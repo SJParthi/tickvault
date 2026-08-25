@@ -483,20 +483,45 @@ impl MultiTfAggregator {
         // `// O(1) EXEMPT:` hatch instead would be a small lie: this is not
         // exempt FROM O(1), it IS O(1).
         //
-        // The zero check runs FIRST (2026-08-25). It used to run second,
-        // behind the representability gate — and that ORDER is what let a
-        // widening-collapse value through: it is not `== 0.0`, so it escaped
-        // the sentinel arm, while `f32_to_f64_clean` turned it into `0.0`
-        // anyway a few lines later. One such packet set open/high/low/close to
-        // 0.0 and pinned `low` there for the rest of the bucket: exactly the
-        // poisons-a-bucket class the day fields were hardened against on
-        // 2026-08-24, still live in the PRIMARY price field because that sweep
-        // only touched `TickPrices`.
+        // `is_finite()` is redundant with the bounds (NaN fails `>= 0.0`,
+        // `+Inf` fails `<= MAX`, `-Inf` fails `>= 0.0`) and kept anyway,
+        // because "is this a real number" is the first question a reader asks.
+        // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
+        #[allow(clippy::manual_range_contains)]
+        let price_is_representable = p.is_finite() && p >= 0.0 && p <= MAX_PLAUSIBLE_LTP;
+        if !price_is_representable {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
+            return ConsumeStats {
+                refused_price: true,
+                ..ConsumeStats::default()
+            };
+        }
+        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
+        // 2026-08-25, and that reordering is the whole fix.
         //
-        // Swapping the two arms is behaviour-preserving for every other
-        // value: `-0.0 == 0.0` is true in IEEE-754, so negative zero still
-        // classifies as the untraded sentinel exactly as before, and NaN,
-        // ±Inf, negatives and over-range values all still fail the gate below.
+        // It used to sit below, which left a hole the drain's own comment
+        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
+        // and returns early, so a packet carrying LTP = 0 AND
+        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
+        // stayed false, the drain classified it `untraded_sentinel` — a
+        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
+        // DESIGNATED timestamp, so that row lands in a year-2106 partition
+        // that retention and archival, which key on the trading day, can never
+        // reach, while every `max(ts)` and range query over `ticks` silently
+        // includes it.
+        //
+        // One malformed or hostile packet was enough. The band check belongs
+        // above every early return that can still produce a persisted row, not
+        // merely above the fold.
+        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
+        {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
+            return ConsumeStats {
+                refused_timestamp: true,
+                ..ConsumeStats::default()
+            };
+        }
         if p == 0.0 {
             counter!("tv_aggregator_tick_refused_total", "reason" => "untraded_sentinel")
                 .increment(1);
@@ -671,17 +696,29 @@ impl MultiTfAggregator {
         // bucket's baseline matches what was just written — never the
         // truncated `u32` when a `u64` override was supplied.
         //
-        // MONOTONIC, not last-write-wins (2026-08-25). Cumulative traded
-        // volume only ever rises within a session, so a lower arrival is an
-        // out-of-order packet — and this feed reorders, which is why
-        // `LatePolicy::Refold` exists at all. Last-write-wins let such a
-        // packet LOWER the baseline; the next bucket then opened with a
-        // `bucket_start_cumulative` below the true figure and DOUBLE-COUNTED
-        // the slice already attributed to the bucket before it. The in-bucket
-        // fold was made monotonic on 2026-08-24 (`state.volume.max(..)`), but
-        // that guard sits on the fold path and structurally cannot reach the
-        // open path — this is the other end of the same argument.
-        slot.last_cumulative = slot.last_cumulative.max(cumulative_volume);
+        // ADVANCE ONLY. This was an UNCONDITIONAL assignment and that was a
+        // live data-corruption defect, measured 2026-08-24: the same trading
+        // day tiled five ways did not sum to one volume total (1s
+        // 40,397,638,853 vs 1d 4,372,993,982 — the intraday frames were ~9.2x
+        // the day bar, and 6,088 instruments disagreed with their own 1m sum).
+        //
+        // Mechanism: `tick.volume` is DAY-CUMULATIVE. `FeedStrategy::DEFAULT`
+        // is `Refold`, so late ticks are routine (10.0% of live ticks arrive
+        // >1h behind receive time) and every timeframe can return
+        // `DiscardLate` — yet the store below still ran, writing that late
+        // tick's SMALLER cumulative. The next bucket then opened on a baseline
+        // BELOW the volume already traded, and `cumulative - baseline`
+        // double-counted the difference. The regression is silently
+        // self-amplifying because nothing downstream can see a baseline.
+        //
+        // Refusing the regression is the only correct answer: a cumulative
+        // counter cannot legitimately go down within a day, so a smaller value
+        // is stale, never news. It is counted so the correction is visible.
+        if cumulative_volume > slot.last_cumulative {
+            slot.last_cumulative = cumulative_volume;
+        } else if cumulative_volume < slot.last_cumulative {
+            counter!("tv_aggregator_cumulative_regression_total").increment(1);
+        }
         stats
     }
 
