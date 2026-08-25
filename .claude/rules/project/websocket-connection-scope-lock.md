@@ -963,6 +963,73 @@ Three things bound it, none of which is a promise that it works:
   a non-zero `compared`.** Until a session reports one, "the Dhan live feed is
   working" is not a claim this repository can make.
 
+### 2026-08-25 — THE DAY OPEN IS THE PRE-OPEN EQUILIBRIUM PRICE, NOT OUR FIRST OBSERVED TICK
+
+**The verbatim operator demand (2026-08-25, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "firts tell me whtehr all thsi sorted ourt meanwhiel whatve rthe 9.12 am ckose rpcie shdou lbe eth 9.15 am open price rigth ddue see we need to make the rpe market price as 9.15 am open price always right dude am i irgth ddue see emanhwiel alogn with this to fidn each and evry one minute of high low tarckign cpaturing also we beed to tarck pature and do it irtght dude am i irght dude tell me dude okay?"
+
+**Authorization to implement (same session, immediately after the plan was
+listed back with this item marked as needing his decision):**
+
+> "yes dude fix evrythgin dud ehwtevr i have stared and discusse ddude oaky?"
+
+This section is the dated record the rule-file-first law requires, written
+BEFORE the code change. It REVERSES a behaviour that is currently deliberate
+and test-defended, so it cannot land on a verbal reading alone.
+
+#### What the code does TODAY, and why it was written that way
+
+`crates/app/src/day_ohlc_orchestrator.rs` states it in its own header:
+
+> *"`day_open` is the first live SESSION tick (not a pre-market value) … the
+> 09:15:00 tick IS the day open"*
+
+`day_ohlc_session_accepts` REFUSES every pre-open timestamp, and
+`test_preopen_tick_never_arms_day_open_then_0915_tick_is_the_open` exists
+specifically to keep it that way. That was a defensible choice when the
+pre-market buffer had just been deleted and the only alternative was a
+half-removed code path.
+
+#### Why the operator is right, and why the fix is not what it first looks like
+
+On NSE the 09:15 opening price **is** the pre-open equilibrium price,
+discovered in the 09:08–09:12 matching window. So "the 09:12 close is the
+09:15 open" is not a preference — it is how the exchange defines the open.
+
+Taking "the first tick we happen to observe at or after 09:15:00" is a
+DIFFERENT number for any instrument that does not trade in the first moments
+of the session. For a thin stock option that first prints at 09:31, our
+recorded `open` was a 09:31 price wearing the day's opening label. Across
+20,268 stock options that is a systematic error, not an edge case.
+
+**The fix is therefore NOT to synthesise an open from pre-open ticks.** The
+exchange already sends its own value: `ParsedTick.day_open`, present in every
+Quote and Full packet (`crates/common/src/tick_types.rs:38` — *"Day open price
+(from Quote/Full; 0.0 for Ticker)"*). The authoritative open is already on the
+wire and is being discarded in favour of a derived one.
+
+#### The contract
+
+| Aspect | Locked value |
+|---|---|
+| Source of `day_open` | the EXCHANGE field `ParsedTick.day_open` when finite and > 0 |
+| Fallback | first in-session tick LTP, exactly as today — Ticker-mode packets carry `day_open = 0.0` and must not be broken |
+| Pre-open gate | UNCHANGED for high/low/close. This section changes where OPEN comes from; it does not admit pre-open ticks into the day's range |
+| Per-minute high/low | UNCHANGED — already folded per tick into the 1m bucket and 23 other frames |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Synthesises a day open from a pre-open tick LTP instead of reading the
+  exchange's own `day_open` field.
+- Lets a `day_open` of `0.0` (the documented Ticker-mode absent sentinel)
+  overwrite a real open with zero.
+- Admits pre-open ticks into day HIGH/LOW/CLOSE under cover of this quote —
+  it authorizes the OPEN only.
+- Removes the first-tick fallback, which is the only source for a Ticker-mode
+  instrument.
+
 ### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
 
 Operator Parthiban, 2026-07-24 (verbatim quotes preserved in

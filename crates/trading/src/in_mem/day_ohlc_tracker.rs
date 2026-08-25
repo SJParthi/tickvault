@@ -162,6 +162,67 @@ impl DayOhlc {
         self.day_close = last_price;
     }
 
+    /// Records a tick AND adopts the EXCHANGE's own day-open price.
+    ///
+    /// # Why the exchange's value and not our first observed tick
+    ///
+    /// Operator directive 2026-08-25 (recorded with his verbatim words in
+    /// `websocket-connection-scope-lock.md`): *"whatever the 9.12 am close
+    /// price should be the 9.15 am open price … we need to make the pre market
+    /// price as 9.15 am open price always"*.
+    ///
+    /// He is describing how NSE defines the open. The 09:15 opening price IS
+    /// the equilibrium discovered in the 09:08–09:12 pre-open matching window,
+    /// so "the 09:12 price is the open" is the exchange's own rule, not a
+    /// preference.
+    ///
+    /// [`Self::update_tick`] instead arms `day_open` from the first in-session
+    /// tick it happens to SEE. For any instrument that does not trade in the
+    /// first moments of the session those are different numbers: a thin stock
+    /// option whose first print is 09:31 had a 09:31 price stored wearing the
+    /// day's opening label. Across ~20,000 subscribed stock options that is a
+    /// systematic error rather than an edge case.
+    ///
+    /// The authoritative value is already on the wire — `ParsedTick.day_open`
+    /// rides in every Quote and Full packet — and was simply being discarded
+    /// in favour of a derived one.
+    ///
+    /// # The OHLC invariant, which is why this also touches high/low
+    ///
+    /// Adopting an open the tracker never observed can put it OUTSIDE the
+    /// range built from observed ticks, producing `open < low` — an
+    /// internally inconsistent row that reads as corruption to every
+    /// downstream consumer. So the adopted open WIDENS the range to contain
+    /// itself. That is not scope creep beyond the directive; it is what keeps
+    /// the directive's result a valid OHLC record.
+    ///
+    /// # Fallback
+    ///
+    /// `exchange_day_open` of `0.0` is the DOCUMENTED absent sentinel for
+    /// Ticker-mode packets (`tick_types.rs`: *"Day open price (from
+    /// Quote/Full; 0.0 for Ticker)"*), and non-finite is the NaN class the
+    /// ingest gate above exists for. Either one leaves the first-tick open
+    /// exactly as it was — never overwritten with zero.
+    pub fn update_tick_with_exchange_open(&mut self, last_price: f64, exchange_day_open: f64) {
+        self.update_tick(last_price);
+        // Only after the tick gate has run: an instrument whose LTP was
+        // refused has no armed state to attach an open to.
+        if !self.armed {
+            return;
+        }
+        if !exchange_day_open.is_finite() || exchange_day_open <= 0.0 {
+            return;
+        }
+        self.day_open = exchange_day_open;
+        // Keep `low <= open <= high` true by construction.
+        if exchange_day_open > self.day_high {
+            self.day_high = exchange_day_open;
+        }
+        if exchange_day_open < self.day_low {
+            self.day_low = exchange_day_open;
+        }
+    }
+
     /// Daily reset at IST midnight. Drops `armed` to false; sentinel values restored.
     pub fn reset_daily(&mut self) {
         *self = Self::disarmed();
@@ -260,11 +321,18 @@ impl DayOhlcTracker {
     /// a stale or absent day high/low into every downstream consumer while
     /// every counter read normal.
     #[inline]
-    pub fn update_tick(&self, security_id: u64, segment: ExchangeSegment, last_price: f64) -> bool {
+    pub fn update_tick_with_exchange_open(
+        &self,
+        security_id: u64,
+        segment: ExchangeSegment,
+        last_price: f64,
+        exchange_day_open: f64,
+    ) -> bool {
         let pinned = self.inner.pin();
         let key = (security_id, segment);
         if let Some(slot) = pinned.get(&key) {
-            slot.lock().update_tick(last_price);
+            slot.lock()
+                .update_tick_with_exchange_open(last_price, exchange_day_open);
             return true;
         }
         // First tick for this instrument. `papaya::len` is NOT a single
@@ -297,9 +365,19 @@ impl DayOhlcTracker {
             return false;
         }
         let mut fresh = DayOhlc::disarmed();
-        fresh.update_tick(last_price);
+        fresh.update_tick_with_exchange_open(last_price, exchange_day_open);
         pinned.insert(key, Mutex::new(fresh));
         true
+    }
+
+    /// Records a tick WITHOUT an exchange-supplied open.
+    ///
+    /// Retained so callers that genuinely have no `day_open` — a Ticker-mode
+    /// packet, a test, a replayed row — keep their existing behaviour by
+    /// construction. `0.0` is the documented absent sentinel, so this is the
+    /// same call with the sentinel spelled out rather than a second code path.
+    pub fn update_tick(&self, security_id: u64, segment: ExchangeSegment, last_price: f64) -> bool {
+        self.update_tick_with_exchange_open(security_id, segment, last_price, 0.0)
     }
 
     /// Snapshot the current OHLC for one instrument. Returns `None` if no
@@ -377,6 +455,96 @@ pub fn ist_seconds_of_day() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The exchange's own open replaces the first-tick open.
+    ///
+    /// Operator 2026-08-25: the 09:15 open IS the 09:08-09:12 pre-open
+    /// equilibrium, so a thin instrument whose first print is 09:31 must not
+    /// store that 09:31 price as the day's open.
+    #[test]
+    fn the_exchange_open_replaces_the_first_tick_we_happened_to_see() {
+        let mut d = DayOhlc::disarmed();
+        // First observed print is 09:31 at 105; the exchange says the day
+        // opened at 100.
+        d.update_tick_with_exchange_open(105.0, 100.0);
+        assert!(
+            (d.day_open - 100.0).abs() < f64::EPSILON,
+            "open must be the exchange's"
+        );
+        assert!(
+            (d.day_close - 105.0).abs() < f64::EPSILON,
+            "close is still the tick"
+        );
+    }
+
+    /// `low <= open <= high` must hold even when the adopted open sits
+    /// outside the range built from observed ticks — otherwise the row reads
+    /// as corruption downstream.
+    #[test]
+    fn an_adopted_open_below_the_observed_low_widens_the_range() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(105.0, 100.0);
+        assert!(
+            d.day_low <= d.day_open,
+            "low {} must not exceed open {}",
+            d.day_low,
+            d.day_open
+        );
+        assert!(
+            d.day_open <= d.day_high,
+            "open {} must not exceed high {}",
+            d.day_open,
+            d.day_high
+        );
+
+        let mut up = DayOhlc::disarmed();
+        up.update_tick_with_exchange_open(100.0, 120.0);
+        assert!(
+            up.day_high >= 120.0,
+            "an open ABOVE the observed high must lift the high"
+        );
+        assert!(up.day_low <= up.day_open);
+    }
+
+    /// 0.0 is the DOCUMENTED absent sentinel for Ticker-mode packets. It must
+    /// never overwrite a real open with zero — that would read as a free
+    /// instrument.
+    #[test]
+    fn the_ticker_mode_zero_sentinel_never_overwrites_a_real_open() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(100.0, 0.0);
+        assert!(
+            (d.day_open - 100.0).abs() < f64::EPSILON,
+            "0.0 must leave the first-tick open"
+        );
+        assert!(d.day_low > 0.0, "and must never drag the low to zero");
+    }
+
+    /// Non-finite is the NaN class the ingest gate exists for; it must be
+    /// refused on this path too rather than poisoning the open forever.
+    #[test]
+    fn a_non_finite_exchange_open_is_refused_not_adopted() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(100.0, bad);
+            assert!(
+                (d.day_open - 100.0).abs() < f64::EPSILON,
+                "{bad} must not become the open"
+            );
+            assert!(d.day_open.is_finite() && d.day_low.is_finite() && d.day_high.is_finite());
+        }
+    }
+
+    /// A refused LTP has no armed state, so there is nothing to attach an
+    /// open to — the exchange open must not arm the slot by itself.
+    #[test]
+    fn an_exchange_open_cannot_arm_a_slot_whose_tick_was_refused() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(f64::NAN, 100.0);
+        assert!(!d.is_armed(), "a refused tick must leave the slot disarmed");
+        d.update_tick_with_exchange_open(-5.0, 100.0);
+        assert!(!d.is_armed());
+    }
     use super::*;
 
     fn nifty() -> (u64, ExchangeSegment) {
