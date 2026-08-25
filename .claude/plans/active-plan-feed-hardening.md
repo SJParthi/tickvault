@@ -1398,3 +1398,81 @@ This restores the ability to VERIFY the CAS window. It does **not** prove the fe
 this lands, and nothing before then. Defects #1 (the 200,000-row live-side truncation), #3
 (every target labelled `instrument: "INDEX"`), #4 (no `[dhan_live_crossverify]` config section)
 and #5 (silent inline-depth drops) are untouched by this item and remain open.
+
+---
+
+## Item 17 — three live defects found by parallel adversarial review (FIXED)
+
+- [x] **17a — `append_inline_depth` dropped depth rows in silence, four ways**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `every_inline_depth_drop_is_counted_never_silent` (bite-proven)
+- [x] **17b — the paper book's sid ceiling manufactured a permanent false divergence**
+  - Files: `crates/app/src/order_runtime.rs`
+  - Tests: `a_full_tripwire_never_manufactures_a_mirror_divergence` (bite-proven)
+- [x] **17c — the comparator's arming log told the operator a fire time it no longer uses**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+
+### 17a — depth loss with no counter and no log
+
+The dedicated depth drain counts every refusal. The INLINE d5 twin, written four days
+later, did not. Four arms dropped data silently: an unmappable segment (**10 rows**), an
+id above `i64::MAX` (**10 rows**), an implausible price (1 row), and a failed ILP append
+(1 row, because the `is_ok()` check had no `else` — the arm the dedicated drain does have).
+
+The sharp part is not the loss, it is the **false assurance**. `DEPTH_COUNTER`'s own doc
+states `refused` covers *"parse error, unmappable segment code, truncated frame tail, or an
+ILP append failure"* — so an operator auditing `tv_dhan_feed_depth_total{outcome="refused"}`
+would conclude d5 losses were visible when they were not. The counter documented coverage
+the code never delivered.
+
+**Reachable today, not latent:** the depth writer exists, the boot site wires
+`with_inline_depth` unconditionally, and with the main feed in Full mode every code-8
+packet reaches these arms on every tick.
+
+Fixed with the EXISTING counter — no new metric name, which matters because
+`user-data.sh.tftpl` has **zero free bytes** against its budget. No new pager either: the
+Dhan noise lock makes a new Telegram page a REJECT without a dated operator quote.
+
+### 17b — a cap that manufactured the signal it was meant to bound
+
+The 2026-08-22 per-sid ceiling gated the MIRROR insert while `risk.record_fill` stayed
+unconditional — deliberately unconditional, because refusing a fill would hide a leg we
+actually hold. So past the ceiling risk held a position and the mirror had no key, and
+`local_reconcile` reads a missing mirror key as `0`. The result: a **permanent
+self-inflicted divergence**, firing OMS-GAP-02 on every reconcile cycle for the rest of the
+day, and raising a floor that would mask a genuinely lost fill.
+
+It also broke the invariant the file states in its own type doc — *"mirror + risk are
+mutated together in `apply_fill`"* — which is the property leg 1 depends on for meaning.
+
+**The mirror needs no bound of its own.** It gains a key only where risk gains one, so it is
+bounded transitively at `MAX_TRACKED_POSITIONS + in-flight`, and risk halts with
+`PositionCapacityExhausted` at the ceiling, which stops the inflow. `can_admit_sid` now
+counts the TRIPWIRE alone; it used to take `max(tripwire, mirror)`, which — with the mirror
+free to grow — would have let the mirror's size refuse tripwire slots the tripwire had room
+for. Two maps, two growth axes, two bounds: conflating them is the mistake `oms/engine.rs`
+already had to revert once this week.
+
+Honest residual, unchanged: past the tripwire ceiling a new sid's fill still flows, with no
+I-P1-11 cross-segment check for that id today. Counted, logged, and narrower coverage —
+never a dropped fill.
+
+### 17c — a stale time in an operator-facing field
+
+The arming line carried a hardcoded `run_at_ist = "15:31"` that survived the Item 16 CAS
+correction by three constants. It now derives. A literal in an operator-facing field is the
+same class as a literal in a comparison window; it just fails more quietly, by telling the
+operator a time the code no longer uses.
+
+### What the parallel review REFUTED, recorded because it was my proposal
+
+A hostile pass was run against my own proposed cross-verify scaling fix and killed four of
+its five parts: a bounded `max_targets` breaks the "verify exactly what you captured"
+doctrine and the test that enforces it; a `security_id IN (...)` filter re-admits the
+I-P1-11 cross-product and is not expressible for a 24,600-id list in a GET query; refusing
+on truncation is a REGRESSION because `Degraded` is excluded from `is_measured()`, so the
+keep-better guard would leave a stale prior day's verdict standing; and excluding
+REST-absent instruments would have MASKED the highest-value finding the comparator can
+produce — a wrong or stale `security_id`. None of it shipped. The remaining cross-verify
+defects (target scaling, `missing_rest` conflation at the verdict line, live-read pagination,
+and the shared Data-API limiter bypass) are recorded in Item 18 and are NOT fixed here.
