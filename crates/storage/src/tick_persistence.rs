@@ -88,7 +88,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -426,7 +426,10 @@ impl TickRow {
         // protect an auxiliary column, which is the wrong trade.
         let opt_price = |v: f32| {
             if !v.is_finite() {
-                metrics::counter!("tv_tick_optional_price_dropped_total").increment(1);
+                note_non_finite_optional_price(
+                    tick.security_id,
+                    segment_code_to_str(tick.exchange_segment_code),
+                );
                 return None;
             }
             (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)))
@@ -760,6 +763,44 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
 /// time available, so the sentinel is kept unchanged. That row stays out of the
 /// live range exactly as it does today — a guess would be worse than a value
 /// that is visibly wrong.
+/// Counts and reports a non-finite OPTIONAL price, throttled to powers of two.
+///
+/// The counter and the log line live together deliberately. `crates/common`'s
+/// `loss_counter_visibility_guard` refuses a loss counter that reaches no
+/// operator surface — "a counter that measures data loss and reaches nobody is
+/// worse than no counter: the loss is measured, the measurement is discarded,
+/// and the dashboard stays green" — and it is right. The counter alone was the
+/// first version of this fix and the guard caught it.
+///
+/// A `warn!` rather than an EMF metric because the deployed selector list lives
+/// in a user-data template that currently renders at EXACTLY its 15,872-byte
+/// budget, with zero free bytes. Adding a name there is a real decision with a
+/// real monthly cost, not a formality — so this takes the log route the guard
+/// explicitly offers instead.
+///
+/// Powers of two: 1, 2, 4, 8, … The first occurrence always logs, the rate
+/// decays logarithmically so a corruption storm cannot flood the sink, and the
+/// running total rides in the line so a throttled message still states the true
+/// magnitude rather than implying a single event.
+fn note_non_finite_optional_price(security_id: u64, segment: &'static str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    metrics::counter!("tv_tick_optional_price_dropped_total").increment(1);
+    let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total.is_power_of_two() {
+        warn!(
+            code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+            security_id,
+            segment,
+            dropped_total = total,
+            "an OPTIONAL tick price was non-finite and is stored as NULL rather \
+             than sent to the database, where a NaN would make QuestDB reject the \
+             whole batch. The tick itself is kept — its mandatory prices are \
+             valid. This log is throttled to powers of two; dropped_total is the \
+             true running count."
+        );
+    }
+}
+
 #[must_use]
 pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: Option<i64>) -> i64 {
     let ltt_nanos = i64::from(exchange_timestamp).saturating_mul(1_000_000_000);
@@ -779,10 +820,11 @@ pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: O
     // helper directly: the band belongs where the stamp is MADE.
     //
     // Out of band falls back to the receipt time, exactly as below-floor does.
-    if exchange_timestamp
-        >= tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-        && exchange_timestamp
-            <= tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS
+    use tickvault_trading::candles::multi_tf_aggregator::{
+        MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+    };
+    if (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+        .contains(&exchange_timestamp)
     {
         return ltt_nanos;
     }
