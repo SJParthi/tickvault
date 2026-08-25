@@ -6,14 +6,58 @@
 //! At **15:40 IST** every trading day (after the Dhan 15:30:05 close-time
 //! force-seal + writer drain and the 15:31 cross-verify burst, before the
 //! 15:45 scoreboard), recompute every stored higher-timeframe candle — the
-//! 3 TFs `3m..15m` (`TfIndex::ALL` minus `M1` the baseline minus `D1`,
-//! which is excluded by design: Dhan drops D1 at the write boundary per
-//! `live-feed-purity.md` rule 10) — from its constituent `candles_1m` rows and
-//! compare EXACTLY (integer-paise OHLC, exact i64 volume).
+//! **6** minute-scale TFs `2m`, `3m`, `5m`, `15m`, `30m`, `60m`
+//! (`tf_verify_targets` = `TfIndex::ALL` minus the 16 second-scale frames,
+//! minus `M1` the recompute baseline, minus `D1`, which is excluded by
+//! design: Dhan drops D1 at the write boundary per `live-feed-purity.md`
+//! rule 10) — from its constituent `candles_1m` rows and compare EXACTLY
+//! (integer-paise OHLC, exact i64 volume).
+//!
+//! *(**CORRECTED 2026-08-25:** this said "the 3 TFs `3m..15m`". True when
+//! written; `M2`, `M30` and `M60` joined `TfIndex::ALL` afterwards and
+//! `tf_verify_targets` picked them up silently, so the verifier has been
+//! checking SIX frames while its own header advertised three. Cite the
+//! function, not a count: `tf_verify_targets` is derived from `TfIndex::ALL`
+//! and moves with it, which a hand-written number cannot.)*
 //!
 //! One pass per run: `feed='dhan'` verifies **TODAY** (amend-frozen after
 //! the close seal; Dhan finals are covered by the 15:30:05 close-time
 //! force-seal).
+//!
+//! **⚠ "amend-frozen after the close seal" is MEASURED FALSE, and reading
+//! `missing_tf_rows` as data loss is the trap it sets (2026-08-25).** The
+//! stored set keeps moving for hours after 15:40, so an early pass reports a
+//! shortfall that later passes do not:
+//!
+//! | pass (IST) | target day | `missing_tf_rows` | `mismatches` | `buckets_compared` |
+//! |---|---|---:|---:|---:|
+//! | 08-24 15:41 | 08-24 | 27,374 | 277,017 | 1,942,138 |
+//! | 08-24 20:20 | 08-24 | **0** | 316,756 | 1,971,275 |
+//! | 08-25 15:40 | 08-25 | 44,981 | 186,443 | 1,481,086 |
+//! | 08-25 16:19 | 08-25 | 22,667 | 188,912 | 1,507,115 |
+//! | 08-25 17:29..19:23 | 08-25 | 22,685 (flat) | 202,029 → 230,341 | 1,508,168 → 1,508,264 |
+//!
+//! Two things follow, and they point in opposite directions:
+//!
+//! 1. **`missing_tf_rows` at 15:40 is race-dominated, not loss.** On 08-24 it
+//!    converged to ZERO — every one of those 27,374 "missing" candles existed,
+//!    just not yet at 15:40. So the count is a lower bound on lateness, not an
+//!    upper bound on loss, and paging on it at 15:40 pages on the write tail.
+//!    A count that does NOT converge (08-25 stalls at 22,685) is the real
+//!    signal — but only a later pass can tell the two apart, and today only
+//!    repeated restarts produced later passes at all.
+//! 2. **`mismatches` grew ~28,000 while `buckets_compared` moved +96.** A
+//!    bucket already counted stays counted as more 1m rows land inside it, so
+//!    that shape can only mean late `candles_1m` rows arriving for buckets
+//!    whose higher-TF row was sealed once and never re-folded. The higher-TF
+//!    row is not amended to match; the divergence is created AFTER the close.
+//!
+//! Deliberately NOT "fixed" here by moving the trigger: 2026-08-25 is the
+//! disk-full / WAL-suspension day, so its write tail is contaminated by a
+//! replay backlog and is the wrong day to calibrate a trigger against. What
+//! is recorded is the READING — the number is not a loss figure — so the next
+//! session does not open an incident over a value that converged to zero the
+//! day before.
 //!
 //! The bucket grid is REIMPLEMENTED here independently (windows
 //! `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
@@ -52,12 +96,12 @@ use tickvault_trading::candles::TfIndex;
 
 /// IST seconds-of-day of the daily trigger (15:40:00) — after the Dhan
 /// 15:30:05 close-time force-seal (+ ~100ms drain cadence) and the 15:31
-/// cross-verify burst, before the 15:45 scoreboard and the 16:30 auto-stop.
+/// cross-verify burst, before the 15:45 scoreboard and the 17:30 auto-stop.
 pub const TF_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60; // 56_400
 
 /// Hard wall-clock budget for the whole run (both passes). Checked between
 /// SIDs; on exceed the remaining SIDs count as read-degraded and the run
-/// classifies Degraded — worst case ends well before the 16:30 auto-stop.
+/// classifies Degraded — worst case ends well before the 17:30 auto-stop.
 pub const TF_VERIFY_RUN_BUDGET_SECS: u64 = 900;
 
 /// Per-request HTTP timeout against the local QuestDB `/exec` endpoint.
@@ -2158,7 +2202,7 @@ pub fn spawn_tf_consistency_tasks(
                 });
             }
             Err(_) => {
-                // Cancellation during graceful shutdown (16:30 IST auto-stop,
+                // Cancellation during graceful shutdown (17:30 IST auto-stop,
                 // `make stop`) — normal teardown, NOT an abort. No page.
                 info!("tf_consistency: task cancelled during shutdown");
             }
@@ -3245,7 +3289,7 @@ mod tests {
 
     #[test]
     fn test_run_budget_and_caps_are_sane() {
-        // The budget ends the worst case at ~15:55 IST, before the 16:30
+        // The budget ends the worst case at ~15:55 IST, before the 17:30
         // auto-stop; the caps sit strictly above the arithmetic maxima.
         assert_eq!(TF_VERIFY_RUN_BUDGET_SECS, 900);
         assert!(TF_VERIFY_1M_ROW_LIMIT > 375);
