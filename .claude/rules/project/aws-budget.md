@@ -1007,7 +1007,7 @@ them), so "the disk is healthy again" is a true statement worth sending.
 reached the end of what it is permitted to do. The remedy — grow the volume, or cut
 ingest scope — is the operator's, deliberately.
 
-## COST NOTE 2026-08-25 — cross-verify blind page + 6 unwatched Lambdas (+~$0.70/mo)
+## COST NOTE 2026-08-25 — cross-verify blind pages + 6 unwatched Lambdas (+~$0.80/mo)
 
 Authority: operator 2026-08-25, *"Fix wbrytjonf dude oaku"*, recorded verbatim in
 `dhan-rest-only-noise-lock-2026-07-14.md` §2.3f BEFORE this terraform, per the
@@ -1022,7 +1022,7 @@ namespace we do not publish.
 **Measured against the live account the same day**, rather than against the planning
 envelope: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130**
 with the 90% `STOP_EC2_INSTANCES` action line at **$117**. The Quote 19 hard maximum
-is $150. Seventy cents is inside every one of those with room to spare, and it is
+is $150. Eighty cents is inside every one of those with room to spare, and it is
 named here rather than absorbed because this file's own history shows round "it's
 only a dime" additions accumulating into the ~$3.27/mo CloudWatch line that the
 2026-07-31 ruling then had to account for.
