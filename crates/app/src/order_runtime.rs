@@ -775,26 +775,41 @@ impl BookState {
     /// second check would suggest a second source of growth that does not
     /// exist.
     ///
-    /// Refusal is the safe direction on this path. The tripwire's job is to
-    /// make a cross-segment collision LOUD; a refused new sid simply is not
-    /// watched, and it is counted and logged rather than dropped in silence.
-    /// The mirror is a reconciliation aid, not the book of record -- the OMS
-    /// and the risk engine each hold their own, and both are now capped in
-    /// their own right.
+    /// Refusal is the safe direction on THIS path, and only this path. The
+    /// tripwire's job is to make a cross-segment collision LOUD; a refused new
+    /// sid simply is not watched, and it is counted and logged rather than
+    /// dropped in silence. The fill itself still flows — `tripwire_ok` returns
+    /// `true` on refusal, because dropping a fill would hide a leg we hold.
+    ///
+    /// **AMENDED 2026-08-25 — this ceiling no longer touches the mirror.** It
+    /// did from 2026-08-22, and that was wrong: `risk.record_fill` is
+    /// unconditional, so a refused mirror key left risk holding a position the
+    /// mirror read as `0`, which `local_reconcile` reports as a permanent
+    /// divergence — manufacturing the exact signal the reconcile exists to
+    /// detect. The mirror gains a key only where risk gains one, so it is
+    /// bounded transitively by `RiskEngine::MAX_TRACKED_POSITIONS` and the
+    /// `PositionCapacityExhausted` halt that stops the inflow.
     ///
     /// Set to 25,000, matching every other per-entity ceiling in the
     /// workspace.
     const MAX_TRACKED_SIDS: usize = 25_000;
 
-    /// `true` when a NEW sid can still be admitted to the per-sid maps.
+    /// `true` when a NEW sid can still be admitted to the TRIPWIRE.
     ///
     /// Already-tracked sids are never refused: the check runs only where a
     /// fresh key would be created.
+    ///
+    /// Counts the tripwire ALONE (2026-08-25). It used to take
+    /// `tripwire.len().max(mirror.len())`, which — now that the mirror grows
+    /// freely with risk — would let the mirror's size refuse tripwire slots
+    /// the tripwire has room for. Two maps with different growth axes need
+    /// their own bounds; conflating them is the mistake `oms/engine.rs`
+    /// already had to revert once.
     fn can_admit_sid(&self, sid: u64) -> bool {
-        if self.tripwire.contains_key(&sid) || self.mirror.contains_key(&sid) {
+        if self.tripwire.contains_key(&sid) {
             return true;
         }
-        let tracked = self.tripwire.len().max(self.mirror.len());
+        let tracked = self.tripwire.len();
         if tracked >= Self::MAX_TRACKED_SIDS {
             metrics::counter!("tv_order_runtime_sid_refused_total").increment(1);
             error!(
@@ -802,8 +817,9 @@ impl BookState {
                 security_id = sid,
                 tracked,
                 max = Self::MAX_TRACKED_SIDS,
-                "paper book is FULL - refusing a new security id. Its fills are \
-                 not mirrored and its segment is not tripwired today. Already \
+                "paper book is FULL - refusing a new security id for the segment \
+                 tripwire. Its fills are still recorded and mirrored; what is lost \
+                 is the I-P1-11 cross-segment check for this id today. Already \
                  tracked ids are unaffected; cleared by the daily reset."
             );
             return false;
@@ -1048,12 +1064,29 @@ fn apply_fill(
         fill.avg_price,
         fill.lot_size,
     );
-    // 2026-08-22: the mirror is bounded by the same per-sid ceiling. A
-    // refused id is counted and logged; the OMS and risk engine keep their
-    // own books of record, each capped in its own right.
-    if book.can_admit_sid(fill.security_id) {
-        *book.mirror.entry(fill.security_id).or_insert(0) += i64::from(fill.fill_lots);
-    }
+    // 2026-08-25 — the `can_admit_sid` gate that sat here from 2026-08-22 is
+    // REMOVED, because it manufactured the exact divergence the reconcile
+    // exists to detect.
+    //
+    // `risk.record_fill` above is UNCONDITIONAL — deliberately, per
+    // `RiskEngine::MAX_TRACKED_POSITIONS`: refusing a fill would hide a leg we
+    // actually hold. So past the ceiling risk held the position while the
+    // mirror was refused a key, and `local_reconcile` reads a missing mirror
+    // key as `0` against a non-zero `net_lots_for` — a PERMANENT self-inflicted
+    // divergence for the rest of the day, firing OMS-GAP-02 on every reconcile
+    // cycle and raising a floor that would mask a genuinely lost fill.
+    //
+    // It also broke the invariant this file states at `LocalReconcileReport`:
+    // "mirror + risk are mutated together in `apply_fill`" — the property leg 1
+    // depends on for its meaning.
+    //
+    // The mirror needs no independent bound. It gains a key ONLY where risk
+    // gains one, so it is bounded transitively at `MAX_TRACKED_POSITIONS +
+    // in-flight`, and risk halts with `PositionCapacityExhausted` at the
+    // ceiling, which stops the inflow. `can_admit_sid` still bounds the
+    // tripwire, whose growth axis is different (every cadence-fetched contract
+    // id, fill or no fill).
+    *book.mirror.entry(fill.security_id).or_insert(0) += i64::from(fill.fill_lots);
     let kind = if fill.order_id.starts_with("PAPER-") {
         "paper"
     } else {
@@ -3216,5 +3249,61 @@ mod tests {
     #[test]
     fn the_paper_book_ceiling_agrees_with_the_others() {
         assert_eq!(BookState::MAX_TRACKED_SIDS, 25_000);
+    }
+    /// BITE TEST for the 2026-08-25 mirror fix.
+    ///
+    /// The 2026-08-22 ceiling gated the MIRROR insert while
+    /// `risk.record_fill` stayed unconditional. Past the ceiling risk held the
+    /// position and the mirror had no key, so `local_reconcile` — which reads a
+    /// missing mirror key as `0` — reported a divergence forever, on every
+    /// reconcile cycle, for a book that was perfectly consistent.
+    ///
+    /// Re-adding `if book.can_admit_sid(fill.security_id)` around the mirror
+    /// insert makes this test fail on the LAST assertion.
+    #[test]
+    fn a_full_tripwire_never_manufactures_a_mirror_divergence() {
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+
+        // Fill the TRIPWIRE to its ceiling with ids that never take a fill —
+        // the real growth axis (every cadence-fetched contract id).
+        for i in 0..BookState::MAX_TRACKED_SIDS as u64 {
+            book.tripwire.insert(1_000_000 + i, 0);
+        }
+        assert!(
+            !book.can_admit_sid(42),
+            "a NEW tripwire slot must be refused at the ceiling"
+        );
+
+        // A fill for a brand-new sid now arrives.
+        let fill = FillEvent {
+            security_id: 42,
+            segment_code: 0,
+            fill_lots: 3,
+            avg_price: 100.0,
+            lot_size: 25,
+            order_id: "PAPER-full".to_string(),
+        };
+        assert!(
+            apply_fill(&mut risk, &mut book, &fill, None),
+            "a full tripwire must never drop a fill — that would hide a leg we hold"
+        );
+
+        // Risk recorded it, so the mirror MUST have recorded it too.
+        assert_eq!(risk.net_lots_for(42), 3, "risk always records the fill");
+        assert_eq!(
+            book.mirror.get(&42),
+            Some(&3),
+            "the mirror must move with risk — a refused mirror key is read as 0 \
+             and reported as a permanent divergence"
+        );
+
+        let report = local_reconcile(&make_oms(), &risk, &book.mirror);
+        assert_eq!(
+            report.divergences, 0,
+            "a consistent book past the tripwire ceiling must report ZERO \
+             divergences; a non-zero count here is self-inflicted and would mask \
+             a genuinely lost fill"
+        );
     }
 }

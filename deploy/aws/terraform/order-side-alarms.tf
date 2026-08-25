@@ -219,6 +219,49 @@ resource "aws_cloudwatch_metric_alarm" "daily_loss_breach" {
 }
 
 # ---------------------------------------------------------------------------
+# ⚠ 2026-08-25 — DELETION ATTEMPTED, BLOCKED, AND DELIBERATELY NOT FORCED.
+#
+# This alarm was slated for deletion in the 2026-08-25 observability sweep, and
+# the reasoning behind that was right as far as it went: `tv_order_fill_lag_seconds`
+# has ZERO emit sites anywhere in `crates/*/src` (verified again on that date),
+# and this file's own header at line 26 says so. A permanently-green alarm is
+# worse than no alarm — it occupies a row in every "are we green?" sweep and
+# answers a question nobody asked it.
+#
+# It was NOT deleted, because deleting it turns TWO Rust guards red, and both
+# live in crates the terraform sweep does not own:
+#
+#   crates/app/tests/order_side_paging_wiring_guard.rs
+#     ::test_fill_lag_alarm_ships_disarmed_with_arming_description
+#     — `.expect("order-side-alarms.tf must define the order_fill_lag_high alarm")`
+#       panics outright the moment the resource is gone.
+#   crates/storage/tests/cloudwatch_dormant_alarms_guard.rs
+#     — carries ("order_fill_lag_high", "tv_order_fill_lag_seconds") in its
+#       dormancy table and asserts the DORMANT markers stay in the description.
+#
+# Shipping a terraform-only deletion would therefore have traded a green alarm
+# for a red build, which is the worse of the two. It is worth being precise
+# about what this alarm actually costs today, because the two are not the same
+# thing: it carries `actions_enabled = false`, so it can page nobody in any
+# state. What it does is read GREEN in the console while measuring nothing.
+#
+# TO ACTUALLY DELETE IT, one PR must do all three together:
+#   1. remove this resource;
+#   2. delete `test_fill_lag_alarm_ships_disarmed_with_arming_description` and
+#      the fill-lag row from the dormancy table in cloudwatch_dormant_alarms_guard;
+#   3. remove `tv_order_fill_lag_seconds` from `DORMANT_BY_DESIGN` in
+#      crates/common/tests/alarm_metric_has_a_route_guard.rs (it passes today
+#      only because the metric is absent from the EMF selector, so it goes
+#      stale rather than red — a quieter kind of drift, but drift).
+#
+# TO RESTORE IT INSTEAD, the Phase-1 arming PR needs: a production emit site for
+# `tv_order_fill_lag_seconds`, the name restored to BOTH EMF selector copies
+# (`cloudwatch-agent.json` and `user-data.sh.tftpl`, pinned byte-identical, and
+# the user-data template renders at exactly its byte budget with nothing free —
+# see §2.3d-ii), and `actions_enabled = true`. Whoever gets there first wins;
+# what must not happen is a third year of it sitting green.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 4. Order fill lag — SHIPS DISARMED (arming contract in the description)
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {

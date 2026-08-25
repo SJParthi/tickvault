@@ -1742,3 +1742,61 @@ mode, intraday resubscribe, new WS). Selection remains ONE shared pure function 
 once per build per feed; cross-feed parity compares the expiry SET per underlying —
 nearest-month or in-set divergence pages FUTIDX-02 (High); a far-suffix depth difference
 (one vendor publishes far serials earlier) is an info-level note + counter, never a page.
+
+**Quote 19 (2026-08-25, budget ceiling raised to $150 to buy an O(1) guarantee — preserve EXACTLY, typos included):**
+> "see evn if budget ened to be icnreased little bit extra also do it dude but i just need the O(1) workign solution always dude okay? yes fix evrythign. dude see i just need always O(1) dude i dotn need any slowness ddue irrespective of any situaitons dude okay?"
+
+> "even if we need to reach the max 150 usd also let su gfo ahead dude but ensure to achieve alwyas O(1) dude okay?"
+
+Given in DIRECT response to a report that the prod box's root volume was pinned at its
+provisioned 500 MiB/s ceiling for an entire session (4,744 GB written for ~190 GB of
+logical rows), that write latency degraded 0.86 -> 2.30 ms/op while the CPU idled at
+13-27%, and that raising throughput 500 -> 1000 MiB/s would cost ~+$20/mo. This is the
+fresh dated quote that Quote 18's own REJECT list requires before `limit_amount` moves
+above 125, and it supersedes Quote 18's $125 hard cap.
+
+**What this authorizes: a HARD MAXIMUM of $150/month.** Nothing else. The instance stays
+r8g.xlarge (Quote 15, FINALISED), the AZ stays un-pinned, the schedule stays 08:30-17:30
+IST, and no universe or scope change is authorized by it.
+
+**Where the bill actually stands — MEASURED 2026-08-25, not projected.** Read live rather
+than trusting the planning envelope, because this file's own history records an unverified
+assumption becoming a recorded fact:
+
+| Reading | Value | Source |
+|---|---|---|
+| August month-to-date actual | **$48.87** | `budgets describe-budget` ActualSpend |
+| AWS forecast, August | **$61.51** | same |
+| Live `limit_amount` | **$130** | same |
+
+So the live bill is running well UNDER both the old $125 cap and the new $150 one, and the
+$112.72 high-side figure Quote 17 planned against has not materialised. There is real room.
+
+**The three lockstep sites** Quote 18 names (`budget.tf` + `budget-guards.tf` +
+`budget_digest.rs`) must move together when `limit_amount` is changed. At $150 the 90%
+`STOP_EC2_INSTANCES` action line sits at **$135**, which is $73 above the current forecast
+— the widest margin this account has had since the ceiling ladder began.
+
+**⚠ WHAT THIS QUOTE DOES NOT DO, and it is the important half.** The operator's stated
+GOAL is O(1) with no slowness, and the budget is the means he offered, not the end. **Money
+does not buy O(1) here.** Three findings from the same 2026-08-25 audit say so directly:
+
+1. **The ILP flush runs ON the drain task** (`dhan_feed_stack.rs:2524`, `block_in_place`).
+   A saturated disk therefore does not merely store data more slowly — it STALLS THE FOLD,
+   which fills socket buffers, which is how a vendor that skips a slow consumer forward
+   produces tick loss. Buying a bigger pipe shortens the stall; it does not remove the
+   coupling. Decoupling the flush from the drain is the actual O(1) fix and it costs $0.
+2. **The amplification is ~25x.** Raising throughput 2x against a 25x inefficiency buys one
+   doubling of headroom and leaves the defect intact — and at the authorized 24,600-instrument
+   target the same wall returns.
+3. **A newly-identified suspect is a CONFIG value, not a capacity one:**
+   `QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE = 16777216` (16 MiB) in
+   `deploy/docker/docker-compose.yml`, multiplied across 24 candle tables x ~17 columns.
+   If page-granular allocation is the amplifier, the fix is an env var and costs nothing.
+
+**Therefore the EBS raise is AUTHORIZED but deliberately NOT TAKEN YET.** It will be taken
+if and only if the measurement in plan Item 12 shows traffic still at the ceiling after the
+amplification fix — at which point it lands with a measured number behind it rather than as
+a guess. Spending first would hide the defect and the operator would still not have O(1).
+Recorded this way so that a future session reads the authorization AND the reason it was
+held, rather than treating an unspent authorization as an oversight.

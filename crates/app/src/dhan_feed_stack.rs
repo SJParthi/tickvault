@@ -80,7 +80,7 @@
 //! minute — `websocket-connection-scope-lock.md` §E) are Dhan-side and are
 //! NOT fixed by any of this.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -854,6 +854,17 @@ pub struct LiveIngest {
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
+    /// Edge latch for the dead-class detector: one bit per segment, set while
+    /// that class is reported dead.
+    ///
+    /// An `AtomicU8` rather than a plain `[bool; 8]` because the sweep runs
+    /// behind `&self` — and a bitmask because eight classes fit in one byte,
+    /// so the whole latch is a single relaxed load. Edge-latched, not
+    /// level-triggered: the sweep runs every 30 seconds and a dead class stays
+    /// dead all session, so a level trigger would emit ~1,100 identical lines
+    /// per class per session. One line per episode is the signal; the rest is
+    /// noise that buries it.
+    dead_class_latch: AtomicU8,
     aggregator: MultiTfAggregator,
     writer: TickWriter,
     seq_refused: u64,
@@ -916,6 +927,7 @@ impl LiveIngest {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            dead_class_latch: AtomicU8::new(0),
             aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
             writer,
             seq_refused: 0,
@@ -1183,7 +1195,32 @@ impl LiveIngest {
             return IngestOutcome::SeqUnrepresentable;
         };
 
-        // Gap detector observes unconditionally — see the type docs on order.
+        // The gap detector observes BEFORE the fold, and deliberately so.
+        //
+        // (Until 2026-08-25 this comment said "see the type docs on order".
+        // Those docs say nothing about ordering — they cover segment mapping.
+        // The pointer was to a justification that did not exist, so here is
+        // the real one.)
+        //
+        // `observe` answers "is the feed still delivering PACKETS for this
+        // instrument", not "is this instrument producing usable data". A tick
+        // that arrives and is then refused by the aggregator — a poisoned
+        // timestamp, a non-finite price — is still proof the socket is alive
+        // for that security. Moving the call below the refusal would silently
+        // change the question, and would re-open the crying-wolf class this
+        // module documents at `SilenceVerdict::Warming`: a legitimately sparse
+        // contract would then page every session open.
+        //
+        // KNOWN RESIDUAL, recorded rather than papered over: an instrument
+        // whose ticks ALL arrive and are ALL refused therefore reads healthy
+        // to the silence detector while producing nothing. That is a real
+        // unmonitored state. It is NOT fixed by reordering — it needs its own
+        // signal, and one that stays O(1) in space: a per-instrument refusal
+        // map is exactly the unbounded-growth shape this codebase keeps
+        // finding and removing. The refusal counters (`refused_price`,
+        // `refused_timestamp`, `refused_slot_exhausted`) already carry the
+        // aggregate, and AGGREGATOR-DROP-01's 30-second delta report is where
+        // a systemic refusal rate surfaces today.
         if let Some(obs) = TickObservation::from_parsed_tick(tick, recv_monotonic_millis) {
             let _assessment = self.detector.observe(obs);
         }
@@ -1560,7 +1597,25 @@ impl LiveIngest {
         let mut silent = 0u64;
         let mut never = 0u64;
         let mut named = 0usize;
+        let mut classes = ClassLiveness::default();
         self.detector.scan_silence(now_millis, |report| {
+            // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
+            // deliberately not behind `counts_toward_alarm()`.
+            //
+            // That filter is `!sparse && (Exceeded | NeverTicked)`, so it
+            // drops HEALTHY instruments. Reusing it as the class denominator
+            // would leave a denominator of "only the troubled ones", making
+            // `never == eligible` true the moment any instrument in a segment
+            // had never ticked — the detector would fire on a healthy lane
+            // every sweep. The rollup therefore does its own classification
+            // from the raw report, and rides this sweep rather than adding a
+            // second O(n) pass over the universe.
+            classes.observe(
+                report.key.1,
+                report.sparse,
+                report.verdict == SilenceVerdict::NeverTicked,
+                report.silent_millis > report.expected_millis,
+            );
             if !report.counts_toward_alarm() {
                 return;
             }
@@ -1597,7 +1652,58 @@ impl LiveIngest {
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
+        self.report_dead_classes(&classes);
         (silent, never, named)
+    }
+
+    /// Reports any instrument class that produced NOTHING, once per episode.
+    ///
+    /// Edge-latched per segment: the rising edge emits, the falling edge
+    /// clears the latch so a later recurrence emits again. The gauge is set
+    /// unconditionally every sweep, so a dashboard shows the live state while
+    /// the log carries one line per episode.
+    ///
+    /// Log-sink-only by construction. This adds NO Telegram page: the Dhan
+    /// alert family is fixed at four items by
+    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2, and adding a fifth needs
+    /// a dated operator quote in that file FIRST. The counter and gauge are
+    /// what an alarm would later read.
+    fn report_dead_classes(&self, classes: &ClassLiveness) {
+        let previous = self.dead_class_latch.load(Ordering::Relaxed);
+        let mut current = 0u8;
+        let mut dead_now = 0u64;
+
+        for index in 0..SEGMENT_CLASS_COUNT {
+            if !classes.is_dead(index) {
+                continue;
+            }
+            let Some(segment) = segment_class_at(index) else {
+                continue;
+            };
+            dead_now = dead_now.saturating_add(1);
+            let bit = 1u8 << index;
+            current |= bit;
+
+            if previous & bit != 0 {
+                // Already reported this episode — count nothing, log nothing.
+                continue;
+            }
+            metrics::counter!(DEAD_CLASS_METRIC, "segment" => segment.as_str()).increment(1);
+            error!(
+                code = ErrorCode::RiskGapTickGap.code_str(),
+                segment = segment.as_str(),
+                instruments = classes.eligible[index],
+                "instrument class produced NOTHING since subscribe — every \
+                 non-sparse instrument in this segment is still never-ticked \
+                 past its warmup window, which is what a subscribe that did \
+                 not take looks like; there is no payload to parse and no \
+                 error to log, so absence against a seeded key is the only \
+                 evidence"
+            );
+        }
+
+        metrics::gauge!(DEAD_CLASSES_GAUGE).set(dead_now as f64);
+        self.dead_class_latch.store(current, Ordering::Relaxed);
     }
 
     /// Seals every bucket the watermark has moved past, mid-session.
@@ -2285,6 +2391,154 @@ pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
 /// lane produces — there is no payload to count, no parse to fail, and no
 /// error to log. Absence against a seeded key is the only evidence.
 pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
+
+/// Counter: an entire instrument CLASS produced nothing, once per episode.
+///
+/// # Why a class detector exists beside a per-instrument one
+///
+/// [`INSTRUMENTS_NEVER_TICKED_GAUGE`] counts instruments. It cannot answer
+/// the question that actually matters when a subscribe silently fails for one
+/// SEGMENT: on 2026-08-21 the lane subscribed 119 NSE indices and received
+/// **zero** ticks from any of them for the whole session, while 8,868
+/// tradeable instruments flowed normally at 17.5M ticks. The per-instrument
+/// gauge read 119 out of ~9,000 — under 1.5%, indistinguishable at a glance
+/// from ordinary thin-instrument quiet, and nothing paged. It was found by a
+/// human reading logs.
+///
+/// A whole class producing nothing is a different fact with a different
+/// cause: the subscribe did not take for that segment. `IDX_I` in Full mode
+/// is the known instance — an index has no order book, so asking for depth-5
+/// requests something that does not exist and Dhan answers with silence
+/// rather than an error. That failure is invisible to every other signal the
+/// lane produces, because absence has no payload to parse and no error to
+/// log.
+pub const DEAD_CLASS_METRIC: &str = "tv_dhan_feed_dead_instrument_class_total";
+
+/// Gauge: instrument classes currently judged dead. `0` is the healthy value.
+pub const DEAD_CLASSES_GAUGE: &str = "tv_dhan_feed_dead_instrument_classes";
+
+/// Number of [`ExchangeSegment`] variants — the width of the class tallies.
+///
+/// A fixed array rather than a map: the count is a compile-time property of
+/// the enum, so the rollup stays O(1) per report and allocation-free, which
+/// matters because it rides inside the O(n) silence sweep rather than adding
+/// a second pass over the universe.
+const SEGMENT_CLASS_COUNT: usize = 8;
+
+/// Dense index for a segment. Explicit match, never a discriminant cast, so
+/// re-ordering the enum cannot silently re-label a class's tallies.
+const fn segment_class_index(segment: ExchangeSegment) -> usize {
+    match segment {
+        ExchangeSegment::IdxI => 0,
+        ExchangeSegment::NseEquity => 1,
+        ExchangeSegment::NseFno => 2,
+        ExchangeSegment::NseCurrency => 3,
+        ExchangeSegment::BseEquity => 4,
+        ExchangeSegment::McxComm => 5,
+        ExchangeSegment::BseCurrency => 6,
+        ExchangeSegment::BseFno => 7,
+    }
+}
+
+/// Inverse of [`segment_class_index`], for labelling an episode.
+const fn segment_class_at(index: usize) -> Option<ExchangeSegment> {
+    match index {
+        0 => Some(ExchangeSegment::IdxI),
+        1 => Some(ExchangeSegment::NseEquity),
+        2 => Some(ExchangeSegment::NseFno),
+        3 => Some(ExchangeSegment::NseCurrency),
+        4 => Some(ExchangeSegment::BseEquity),
+        5 => Some(ExchangeSegment::McxComm),
+        6 => Some(ExchangeSegment::BseCurrency),
+        7 => Some(ExchangeSegment::BseFno),
+        _ => None,
+    }
+}
+
+/// Per-segment liveness tally, folded from the silence sweep.
+///
+/// # The three buckets, and why a naive two-bucket version is wrong
+///
+/// `eligible` is the denominator: every seeded instrument in the segment that
+/// we are willing to judge. `never` is the numerator: those that have
+/// produced nothing AND have had a fair chance to. `pending` is the ones
+/// still inside their fair-chance window.
+///
+/// `pending` is what stops a false page on every boot. Between subscribing
+/// and the first tick every instrument is legitimately never-ticked, so a
+/// detector without this bucket would declare every class dead a few seconds
+/// after connect, every single morning.
+///
+/// **Sparse instruments are excluded from ALL THREE.** Far-month futures and
+/// INDIA VIX are legitimately quiet for minutes at a time and the scope lock
+/// already excludes them from the silent count; judging them here would
+/// manufacture the alarm this detector exists to make trustworthy. Excluding
+/// them from the denominator too — not just the numerator — is the part that
+/// is easy to get wrong: leaving them in the denominator would make
+/// `never == eligible` unreachable for any segment containing one, and the
+/// detector would silently never fire. That is the false-OK class this
+/// repository has retired twice.
+#[derive(Debug, Default, Clone, Copy)]
+struct ClassLiveness {
+    eligible: [u32; SEGMENT_CLASS_COUNT],
+    never: [u32; SEGMENT_CLASS_COUNT],
+    pending: [u32; SEGMENT_CLASS_COUNT],
+}
+
+impl ClassLiveness {
+    /// Folds one silence report. O(1), no allocation.
+    fn observe(
+        &mut self,
+        segment: ExchangeSegment,
+        sparse: bool,
+        never_ticked: bool,
+        past_window: bool,
+    ) {
+        if sparse {
+            return;
+        }
+        let i = segment_class_index(segment);
+        self.eligible[i] = self.eligible[i].saturating_add(1);
+        if never_ticked {
+            if past_window {
+                self.never[i] = self.never[i].saturating_add(1);
+            } else {
+                self.pending[i] = self.pending[i].saturating_add(1);
+            }
+        }
+    }
+
+    /// True when this segment produced NOTHING and every member has had its
+    /// fair chance.
+    ///
+    /// An instrument that ticked and then went quiet carries the `Exceeded`
+    /// verdict, not `NeverTicked`, so it counts in `eligible` and keeps the
+    /// class alive: this fires for "never produced anything", never for "has
+    /// gone quiet".
+    ///
+    /// # The `pending` term is REDUNDANT, and that is recorded rather than hidden
+    ///
+    /// `pending == 0` reads like the warmup guard, and it was written as one.
+    /// It is not load-bearing: `observe` increments `eligible` for every
+    /// non-sparse instrument but `never` only for past-window ones, so
+    /// `pending > 0` already forces `never < eligible` and the equality below
+    /// fails on its own. Mutating this term away does not change a single
+    /// verdict — proven by bite-testing it, which is how the redundancy was
+    /// found at all.
+    ///
+    /// It is KEPT because it states the intent that the arithmetic only
+    /// implies, and it costs one comparison on a path that runs eight times
+    /// per 30-second sweep. What makes that safe rather than decorative is
+    /// `the_tally_invariant_that_makes_the_pending_term_redundant_holds`,
+    /// which pins the relationship the redundancy depends on — so a future
+    /// change to the fold that broke it would fail a test instead of silently
+    /// turning this into the warmup guard everyone already believes it is.
+    fn is_dead(&self, index: usize) -> bool {
+        self.eligible[index] > 0
+            && self.pending[index] == 0
+            && self.never[index] == self.eligible[index]
+    }
+}
 
 /// How many silent instruments a single episode may NAME in the log.
 ///
@@ -3659,11 +3913,20 @@ fn append_inline_depth(
     // REFUSED, never written under a placeholder. A row labelled "UNKNOWN"
     // would silently merge distinct instruments under one segment value.
     let Some(segment) = depth_segment_label(tick.exchange_segment_code) else {
+        // 2026-08-25: was a SILENT return. `DEPTH_COUNTER`'s own doc already
+        // promised `refused` covered "an unmappable segment code", and the
+        // dedicated depth drain honours that; this inline twin, written four
+        // days later, dropped ten rows per packet with no counter and no log.
+        // A reader auditing the counter would have concluded d5 losses were
+        // visible when they were not.
+        c.depth_refused.increment(1);
         return 0;
     };
     // A value above i64::MAX cannot be a real Dhan id. Refuse rather than
     // saturate: saturating writes every such packet under one bogus id.
     let Ok(security_id) = i64::try_from(tick.security_id) else {
+        // 2026-08-25: was a SILENT return, same class as the segment arm above.
+        c.depth_refused.increment(1);
         return 0;
     };
     let Some(capture_seq) =
@@ -3727,7 +3990,14 @@ fn append_inline_depth(
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
+            } else {
+                // 2026-08-25: the dedicated drain has this else arm; the
+                // inline twin did not, so an ILP append failure lost the row
+                // in silence.
+                c.depth_refused.increment(1);
             }
+        } else {
+            c.depth_refused.increment(1);
         }
         if plausible(level.ask_price) {
             let row = DepthRow {
@@ -3744,7 +4014,11 @@ fn append_inline_depth(
             };
             if sink.writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
+            } else {
+                c.depth_refused.increment(1);
             }
+        } else {
+            c.depth_refused.increment(1);
         }
     }
     rows
@@ -6717,100 +6991,86 @@ pub fn crossverify_deps_installed() -> bool {
     CROSSVERIFY_DEPS.get().is_some()
 }
 
-/// Counts targets dropped because their segment does not determine a Dhan
-/// `instrument` string. Labelled by segment so the log and the metric name
-/// the same thing.
-pub const XVERIFY_TARGET_UNMAPPABLE_COUNTER: &str = "tv_dhan_feed_xverify_target_unmappable_total";
-
-/// The Dhan `instrument` string a segment determines, or `None` when the
-/// segment alone is ambiguous.
+/// Dhan's `instrument` string for a segment, or `None` when the segment alone
+/// cannot determine it.
 ///
-/// `POST /v2/charts/intraday` takes `exchangeSegment` AND `instrument`
-/// (`docs/dhan-ref/08-annexure-enums.md`), and it answers a mismatched pair
-/// with no candles rather than an error — so a wrong `instrument` is
-/// indistinguishable from "the exchange published nothing", which is exactly
-/// the false-OK this repository forbids.
+/// Added 2026-08-25. `crossverify_targets` used to stamp `"INDEX"` on EVERY
+/// target, and that string goes verbatim into the Dhan REST intraday body. The
+/// live universe is ~119 indices plus ~750 NSE_EQ constituents, so roughly 86%
+/// of every run's fetches asked for a STOCK as though it were an INDEX. Those
+/// return no candles, land in the `rest_failures` bucket, and are never
+/// compared — while the run can still report `Clean` on the handful of real
+/// indices that happened to be labelled correctly.
 ///
-/// The cash segments are unambiguous: an `IDX_I` id is always an INDEX and an
-/// `NSE_EQ`/`BSE_EQ` id is always an EQUITY. The F&O segments are NOT — one
-/// `NSE_FNO` id may be `FUTIDX`, `OPTIDX`, `FUTSTK` or `OPTSTK`, and
-/// [`SubscribeInstrument`] carries only `(security_id, segment)`, so nothing
-/// here can tell them apart. Returning `None` is therefore the honest answer,
-/// and [`crossverify_targets`] drops-and-counts rather than guessing: a
-/// contract verified under the wrong label reports a clean `missing_rest`
-/// while proving nothing.
+/// That is a PARTIAL-denominator vacuous pass, and it is invisible to the
+/// module's `minutes_compared > 0` guard, which only catches a ZERO
+/// denominator. The comparator's own doc comment says it "can never verify a
+/// different universe than it captured" — true of the id set, false of the
+/// instrument type, and the type is what decides whether a fetch returns
+/// anything at all.
 ///
-/// Currency and commodity are outside the subscription scope entirely
-/// (`daily-universe-scope-expansion-2026-05-27.md` §2), so they are `None`
-/// too — a target in one of those segments is a scope bug worth surfacing,
-/// not a label to invent.
+/// F&O returns `None` deliberately. `(security_id, segment)` is all the
+/// subscribe set carries, and `NSE_FNO` could be `FUTIDX`, `OPTIDX`, `FUTSTK`
+/// or `OPTSTK` — a guess would land back in the silent-failure bucket this
+/// exists to empty. An unverifiable target is counted and named, not fetched
+/// with a wrong label.
 #[must_use]
-pub const fn dhan_instrument_for_segment(segment: ExchangeSegment) -> Option<&'static str> {
+pub fn dhan_intraday_instrument_for(segment: ExchangeSegment) -> Option<&'static str> {
     match segment {
         ExchangeSegment::IdxI => Some("INDEX"),
         ExchangeSegment::NseEquity | ExchangeSegment::BseEquity => Some("EQUITY"),
-        // Ambiguous from the segment alone — see the doc comment.
-        ExchangeSegment::NseFno
-        | ExchangeSegment::BseFno
-        | ExchangeSegment::NseCurrency
-        | ExchangeSegment::BseCurrency
-        | ExchangeSegment::McxComm => None,
+        // Ambiguous from the segment alone; see the doc above.
+        ExchangeSegment::NseFno | ExchangeSegment::BseFno => None,
+        // Out of the authorized scope entirely.
+        ExchangeSegment::NseCurrency | ExchangeSegment::BseCurrency | ExchangeSegment::McxComm => {
+            None
+        }
     }
 }
 
 /// Builds the comparator's target list from the subscribed main-feed set, so
 /// the lane can never verify a different universe than it captured.
 ///
-/// Every target's `instrument` is DERIVED from its segment
-/// ([`dhan_instrument_for_segment`]). An instrument whose segment does not
-/// determine one is DROPPED and counted — never stamped with a guess.
-///
-/// **2026-08-25 — this function stamped the literal `"INDEX"` on every
-/// target.** Today's universe is ~119 NSE indices plus ~750 NTM equities, so
-/// roughly six of every seven targets asked Dhan for an INDEX bar on an
-/// equity id. Dhan answers such a pair with an empty candle set, which the
-/// comparator counts as `missing_rest` — so the verification reported an
-/// absent vendor tape for most of the universe when what was actually absent
-/// was a correct request. Since this comparator is the ONLY ground truth a
-/// feed with no sequence number and no snapshot-on-subscribe has, a mislabel
-/// here does not merely lose coverage: it makes the one instrument that could
-/// detect packet loss report a plausible number about the wrong question.
+/// Returns the targets plus the count of subscribed instruments that CANNOT be
+/// targeted, because a wrong `instrument` label is worse than an absent one: it
+/// fetches nothing while looking like a fetch that failed.
 #[must_use]
-pub fn crossverify_targets(
+pub fn crossverify_targets_with_skipped(
     main_feed: &[SubscribeInstrument],
-) -> Vec<crate::dhan_live_crossverify::XverifyTarget> {
+) -> (Vec<crate::dhan_live_crossverify::XverifyTarget>, usize) {
     let mut targets = Vec::with_capacity(main_feed.len());
-    let mut unmappable: std::collections::BTreeMap<&'static str, usize> =
-        std::collections::BTreeMap::new();
+    let mut skipped = 0_usize;
     for i in main_feed {
-        let Some(instrument) = dhan_instrument_for_segment(i.segment) else {
-            *unmappable.entry(i.segment.as_str()).or_insert(0) += 1;
+        let (Some(instrument), Ok(security_id)) = (
+            dhan_intraday_instrument_for(i.segment),
+            i64::try_from(i.security_id),
+        ) else {
+            // 2026-08-25: the id arm used to be `unwrap_or(0)`, which turned an
+            // out-of-range id into a target for instrument 0 — the comparator
+            // would then verify, and report on, an instrument that does not
+            // exist.
+            skipped = skipped.saturating_add(1);
             continue;
         };
         targets.push(crate::dhan_live_crossverify::XverifyTarget {
-            security_id: i64::try_from(i.security_id).unwrap_or(0),
+            security_id,
             segment: i.segment.as_str().to_string(),
             instrument: instrument.to_string(),
         });
     }
-    for (segment, count) in &unmappable {
-        metrics::counter!(XVERIFY_TARGET_UNMAPPABLE_COUNTER, "segment" => *segment)
-            .increment(*count as u64);
-        error!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            segment = *segment,
-            dropped = *count,
-            "cross-verification cannot label these instruments: the segment does not \
-             determine a Dhan `instrument` string, and guessing one would make the \
-             comparator report an absent vendor tape instead of an unverified \
-             instrument. They are EXCLUDED from today's verification and counted here. \
-             Widen SubscribeInstrument with the contract kind to verify them."
-        );
-    }
-    targets
+    (targets, skipped)
 }
 
-/// Spawns the daily 15:31 IST comparator for the subscribed universe.
+/// Convenience wrapper for callers that only need the targets.
+#[must_use]
+pub fn crossverify_targets(
+    main_feed: &[SubscribeInstrument],
+) -> Vec<crate::dhan_live_crossverify::XverifyTarget> {
+    crossverify_targets_with_skipped(main_feed).0
+}
+
+/// Spawns the daily comparator (see [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`]) for the
+/// subscribed universe.
 ///
 /// Returns `None` — loudly — when no [`CrossverifyDeps`] were installed. That
 /// is a refusal, not a skip: a live lane with no verifier has no way to detect
@@ -6819,7 +7079,24 @@ pub fn crossverify_targets(
 pub fn spawn_daily_crossverify(
     main_feed: &[SubscribeInstrument],
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let targets = crossverify_targets(main_feed);
+    let (targets, skipped) = crossverify_targets_with_skipped(main_feed);
+    if skipped > 0 {
+        // Named, never silent. These instruments are captured by the lane and
+        // CANNOT be verified against the vendor tape, which is a coverage hole
+        // in the lane's only ground truth — the operator must be able to see
+        // its size rather than infer it from a `rest_failures` count that also
+        // carries genuine failures.
+        metrics::counter!("tv_dhan_xverify_targets_unverifiable_total").increment(skipped as u64);
+        warn!(
+            skipped,
+            targeted = targets.len(),
+            "cross-verification cannot target every subscribed instrument: an F&O \
+             contract's Dhan `instrument` string (FUTIDX / OPTIDX / FUTSTK / OPTSTK) \
+             is not derivable from its segment alone, and a wrong label fetches \
+             nothing while looking like a failed fetch. These instruments are \
+             CAPTURED but UNVERIFIED."
+        );
+    }
     if !crossverify_deps_installed() {
         metrics::counter!(XVERIFY_UNPROVISIONED_COUNTER).increment(1);
         error!(
@@ -6841,7 +7118,7 @@ pub fn spawn_daily_crossverify(
         // main feed carries no sequence number and no snapshot-on-subscribe).
         info!(
             targets = targets.len(),
-            run_at_ist = "15:31",
+            run_at_ist = %run_at_ist_hhmm(),
             "Dhan live-feed cross-verification armed — it will compare captured candles \
              against Dhan's own REST record after the close"
         );
@@ -7011,14 +7288,47 @@ pub fn spawn_daily_crossverify(
     }))
 }
 
-/// IST seconds-of-day at which the comparator runs: 15:31, one minute after
-/// the 15:30 close, so the final minute's candle has sealed.
-pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 = 15 * 3_600 + 31 * 60;
+/// IST seconds-of-day at which the comparator runs: 15:41, one minute after
+/// the 15:40 close, so the final minute's candle has sealed.
+///
+/// **CORRECTED 2026-08-25** from 15:31, in lockstep with
+/// `dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST`. Both had missed the
+/// 2026-08-07 NSE CAS migration that moved the session end 15:30 -> 15:40.
+///
+/// The two MUST move together, and the const assert below is what enforces it.
+/// Moving the window without the fire time would be strictly worse than the
+/// drift it fixes: the comparator would run at 15:31 against a window ending at
+/// 15:40, so ten minutes that had not happened yet would be scored as missing on
+/// BOTH sides — turning a silent blind spot into a flood of false loss findings
+/// in the one check that exists to detect real loss.
+pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 =
+    crate::dhan_live_crossverify::RUN_SECS_OF_DAY_IST as u64;
+
+const _: () = assert!(
+    XVERIFY_RUN_AT_SECS_OF_DAY_IST as i64
+        > crate::dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST,
+    "the comparator must fire AFTER the last minute of the window it compares"
+);
+
+/// The comparator's fire time as a `HH:MM` IST string, DERIVED.
+///
+/// Added 2026-08-25 because the arming log line carried a hardcoded `"15:31"`
+/// that survived the CAS correction above by three constants. A literal in an
+/// operator-facing field is the same class of defect as a literal in a
+/// comparison window — it just fails quietly, by telling the operator a time
+/// the code no longer uses.
+#[must_use]
+pub fn run_at_ist_hhmm() -> String {
+    let h = XVERIFY_RUN_AT_SECS_OF_DAY_IST / 3_600;
+    let m = (XVERIFY_RUN_AT_SECS_OF_DAY_IST % 3_600) / 60;
+    format!("{h:02}:{m:02}")
+}
 
 /// Seconds in a day.
 const SECS_PER_DAY: u64 = 24 * 3_600;
 
-/// Seconds to sleep from `now_secs_of_day` until the next 15:31 IST.
+/// Seconds to sleep from `now_secs_of_day` until the next run time (see
+/// [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`] — 15:41 IST today).
 ///
 /// Pure, so the schedule is testable without waiting a day. Returns a full day
 /// when called exactly at the run time, which is the right way round: firing
@@ -9173,6 +9483,329 @@ mod tests {
     /// A seeded-but-never-ticked instrument must be reported.
     ///
     /// This is the partial-subscribe detector's whole reason to exist: a
+    // -----------------------------------------------------------------
+    // Dead-instrument-class detector (Item 3)
+    //
+    // The unit tests below drive `ClassLiveness` directly because the
+    // interesting cases are about the SHAPE of the tally, and a pure test can
+    // state each one exactly. The end-to-end test that follows them proves
+    // the fold is actually wired into the live sweep — without it, all of
+    // these could pass against a struct nothing calls.
+    // -----------------------------------------------------------------
+
+    /// The 2026-08-21 incident, reduced to its essentials.
+    ///
+    /// Every index never ticked; every option did. The detector must name the
+    /// index class and stay silent about the option class.
+    #[test]
+    fn a_class_where_nothing_ever_ticked_is_dead_and_a_live_class_beside_it_is_not() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..119 {
+            c.observe(ExchangeSegment::IdxI, false, true, true);
+        }
+        for _ in 0..8_868 {
+            c.observe(ExchangeSegment::NseFno, false, false, true);
+        }
+
+        assert!(
+            c.is_dead(segment_class_index(ExchangeSegment::IdxI)),
+            "119 indices subscribed and not one tick past warmup is the \
+             subscribe-did-not-take signature — this is the live incident the \
+             per-instrument gauge showed as 119-of-9000 and nobody paged on"
+        );
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::NseFno)),
+            "the option class was flowing normally and must never be swept up \
+             with the dead one"
+        );
+    }
+
+    /// A fully healthy lane must report NOTHING.
+    ///
+    /// # What this actually catches, measured
+    ///
+    /// Bite-tested rather than assumed, and the first version of this comment
+    /// was WRONG about it. This test catches an INVERTED verdict (`never !=
+    /// eligible`), which makes it fail immediately.
+    ///
+    /// It does NOT catch the `counts_toward_alarm()` denominator trap
+    /// described on [`ClassLiveness`]. Under that mutation a healthy class has
+    /// `eligible == 0`, so `eligible > 0` is false and this test still passes.
+    /// The test that actually bites on that trap is
+    /// `a_single_ticking_instrument_keeps_its_class_alive` — verified by
+    /// mutating the denominator and watching exactly that one fail.
+    ///
+    /// Recorded because a comment claiming a test protects something it does
+    /// not is the same false-OK this detector was written to end.
+    #[test]
+    fn a_healthy_class_is_never_reported_dead() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..500 {
+            c.observe(ExchangeSegment::NseEquity, false, false, true);
+        }
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::NseEquity)),
+            "a class where every instrument has ticked is alive — reporting it \
+             dead would train the operator to ignore this signal, which is \
+             worse than not having it"
+        );
+    }
+
+    /// No false page during warmup — the every-morning failure mode.
+    #[test]
+    fn a_class_still_inside_its_warmup_window_is_not_yet_judged() {
+        let mut c = ClassLiveness::default();
+        // Every instrument never-ticked, but none past its fair-chance window.
+        for _ in 0..50 {
+            c.observe(ExchangeSegment::IdxI, false, true, false);
+        }
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::IdxI)),
+            "between subscribing and the first tick EVERY instrument is \
+             legitimately never-ticked; judging here would declare every class \
+             dead seconds after connect, every single morning"
+        );
+
+        // One straggler still warming is enough to withhold the verdict.
+        let mut mixed = ClassLiveness::default();
+        for _ in 0..49 {
+            mixed.observe(ExchangeSegment::IdxI, false, true, true);
+        }
+        mixed.observe(ExchangeSegment::IdxI, false, true, false);
+        assert!(
+            !mixed.is_dead(segment_class_index(ExchangeSegment::IdxI)),
+            "a single instrument still inside its window means the class has \
+             not finished starting up — the verdict waits rather than guesses"
+        );
+    }
+
+    /// Pins the invariant that makes `is_dead`'s `pending` term redundant.
+    ///
+    /// Found by bite-testing: mutating `pending == 0` away changed no verdict,
+    /// because `eligible` counts every non-sparse instrument while `never`
+    /// counts only past-window ones, so `pending > 0` already forces
+    /// `never < eligible`. That reasoning is only sound while every counted
+    /// instrument passes through `eligible` — this asserts exactly that, so a
+    /// future fold that broke it fails here instead of silently demoting the
+    /// warmup guard to decoration.
+    #[test]
+    fn the_tally_invariant_that_makes_the_pending_term_redundant_holds() {
+        let mut c = ClassLiveness::default();
+        c.observe(ExchangeSegment::IdxI, false, true, true); // never
+        c.observe(ExchangeSegment::IdxI, false, true, false); // pending
+        c.observe(ExchangeSegment::IdxI, false, false, true); // ticked
+        c.observe(ExchangeSegment::IdxI, true, true, true); // sparse: counted nowhere
+
+        let i = segment_class_index(ExchangeSegment::IdxI);
+        assert_eq!(c.eligible[i], 3, "sparse must not reach any bucket");
+        assert_eq!(c.never[i], 1);
+        assert_eq!(c.pending[i], 1);
+        assert!(
+            c.never[i].saturating_add(c.pending[i]) <= c.eligible[i],
+            "never + pending must never exceed eligible — the moment it can, \
+             `pending == 0` stops being implied by the equality and the \
+             documented redundancy argument becomes false"
+        );
+
+        // The implication itself, stated directly: a pending instrument makes
+        // the dead-verdict equality unreachable on its own.
+        assert!(
+            c.never[i] < c.eligible[i],
+            "with one instrument still warming, the equality cannot hold, \
+             which is precisely why the explicit pending check never changes \
+             a verdict"
+        );
+    }
+
+    /// One live instrument keeps the whole class alive.
+    ///
+    /// # This is the test that guards the denominator trap
+    ///
+    /// `counts_toward_alarm()` is `!sparse && (Exceeded | NeverTicked)`, so it
+    /// DROPS healthy instruments. Had the rollup reused it as the denominator,
+    /// the one ticking instrument below would be filtered out, leaving
+    /// `eligible == 99 == never` — and the class would read dead while it was
+    /// demonstrably alive.
+    ///
+    /// Verified by mutation: making `eligible` count only never-ticked
+    /// instruments fails THIS test and no other. That makes this the
+    /// load-bearing guard on the single most dangerous mistake available in
+    /// this fold, which is worth knowing before someone "simplifies" it.
+    #[test]
+    fn a_single_ticking_instrument_keeps_its_class_alive() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..99 {
+            c.observe(ExchangeSegment::BseFno, false, true, true);
+        }
+        c.observe(ExchangeSegment::BseFno, false, false, true);
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::BseFno)),
+            "this detector answers 'did the subscribe take for this segment', \
+             and one tick proves it did — 99 quiet instruments are the \
+             per-instrument gauge's business, not this one's"
+        );
+    }
+
+    /// An instrument that ticked and then went quiet is NOT never-ticked.
+    #[test]
+    fn a_class_that_has_gone_quiet_is_not_a_class_that_never_started() {
+        let mut c = ClassLiveness::default();
+        // `Exceeded` instruments reach the fold as never_ticked = false.
+        for _ in 0..30 {
+            c.observe(ExchangeSegment::NseFno, false, false, true);
+        }
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::NseFno)),
+            "gone-quiet and never-started have different causes and different \
+             fixes; conflating them would make this signal unactionable"
+        );
+    }
+
+    /// Sparse instruments leave BOTH sides of the ratio.
+    ///
+    /// This is the subtle half. Far-month futures and INDIA VIX are
+    /// legitimately quiet and the scope lock excludes them from the silent
+    /// count. Excluding them from the NUMERATOR only — while leaving them in
+    /// the denominator — would make `never == eligible` unreachable for any
+    /// segment containing one, and the detector would silently never fire.
+    /// That is a false-OK, and it is invisible without this test.
+    #[test]
+    fn sparse_instruments_leave_both_sides_of_the_ratio() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..10 {
+            c.observe(ExchangeSegment::NseFno, false, true, true);
+        }
+        // Two legitimately-sparse contracts in the same segment.
+        c.observe(ExchangeSegment::NseFno, true, true, true);
+        c.observe(ExchangeSegment::NseFno, true, false, true);
+
+        let i = segment_class_index(ExchangeSegment::NseFno);
+        assert_eq!(
+            c.eligible[i], 10,
+            "sparse instruments must not inflate the denominator"
+        );
+        assert!(
+            c.is_dead(i),
+            "the ten judgeable instruments all produced nothing, so the class \
+             is dead — if sparse entries had been left in the denominator this \
+             would read alive and the detector would never fire at all"
+        );
+
+        // A segment made up ENTIRELY of sparse instruments is unjudgeable,
+        // and must report nothing rather than guess either way.
+        let mut all_sparse = ClassLiveness::default();
+        all_sparse.observe(ExchangeSegment::BseFno, true, true, true);
+        assert!(
+            !all_sparse.is_dead(segment_class_index(ExchangeSegment::BseFno)),
+            "with nothing judgeable there is no evidence, and absence of \
+             evidence must not render as a verdict"
+        );
+    }
+
+    /// An unseeded class is not a dead class.
+    #[test]
+    fn a_class_we_never_subscribed_is_not_reported_dead() {
+        let c = ClassLiveness::default();
+        for index in 0..SEGMENT_CLASS_COUNT {
+            assert!(
+                !c.is_dead(index),
+                "an empty tally means we subscribed nothing in that segment; \
+                 reporting it dead would page about instruments that do not \
+                 exist"
+            );
+        }
+    }
+
+    /// The index mapping must be a bijection.
+    ///
+    /// If two segments ever collided on one slot their tallies would merge and
+    /// a dead class could be masked by a live one sharing its index — a silent
+    /// wrong answer with no other symptom.
+    #[test]
+    fn every_segment_maps_to_its_own_slot_and_back() {
+        let all = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        assert_eq!(all.len(), SEGMENT_CLASS_COUNT, "the array width must match");
+
+        let mut seen = [false; SEGMENT_CLASS_COUNT];
+        for segment in all {
+            let i = segment_class_index(segment);
+            assert!(!seen[i], "two segments collided on slot {i}");
+            seen[i] = true;
+            assert_eq!(
+                segment_class_at(i),
+                Some(segment),
+                "index and inverse must agree, or an episode names the wrong \
+                 class"
+            );
+        }
+        assert!(seen.iter().all(|s| *s), "every slot must be claimed");
+        assert_eq!(
+            segment_class_at(SEGMENT_CLASS_COUNT),
+            None,
+            "out of range must be None, never a wrapped segment"
+        );
+    }
+
+    /// END TO END: the fold is actually wired into the live sweep.
+    ///
+    /// Every unit test above would still pass if `ClassLiveness` were dead
+    /// code nothing called. This one drives the real `LiveIngest` sweep, so it
+    /// fails if the rollup is ever unhooked from `scan_silence_named`.
+    #[test]
+    fn the_dead_class_rollup_is_wired_into_the_live_silence_sweep() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let seeded_at = 1_000u64;
+        for sid in [13u64, 25, 51] {
+            assert!(
+                ingest.seed(sid, ExchangeSegment::IdxI, seeded_at),
+                "precondition: the index is tracked"
+            );
+        }
+
+        let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+
+        // Inside the window: the class must not be judged yet, and the latch
+        // must stay clear so a later real episode can still raise an edge.
+        let _ = ingest.scan_silence(seeded_at);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            0,
+            "no class may be latched while every instrument is still inside \
+             its warmup window"
+        );
+
+        // Past the window with nothing received: the class is dead and the
+        // latch records it exactly once.
+        let _ = ingest.scan_silence(seeded_at + floor + 1);
+        let bit = 1u8 << segment_class_index(ExchangeSegment::IdxI);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            bit,
+            "three seeded indices past warmup with zero ticks is a dead class, \
+             and the live sweep must be the thing that notices"
+        );
+
+        // Edge-latched: a second sweep in the same episode must not re-raise.
+        let before = ingest.dead_class_latch.load(Ordering::Relaxed);
+        let _ = ingest.scan_silence(seeded_at + floor + 2);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            before,
+            "the sweep runs every 30s and a dead class stays dead all session; \
+             re-reporting would emit ~1,100 identical lines per session and \
+             bury the signal it exists to raise"
+        );
+    }
+
     /// subscribe that silently did not take produces no payload to count, no
     /// parse to fail and no error to log, so the ONLY evidence is absence
     /// measured against a key we know we asked for.
@@ -9639,13 +10272,14 @@ mod tests {
         // different set would produce a clean verdict about instruments the
         // lane never subscribed.
         let universe = hardcoded_index_universe();
-        let targets = crossverify_targets(&universe);
+        let (targets, skipped) = crossverify_targets_with_skipped(&universe);
 
         assert_eq!(
             targets.len(),
             universe.len(),
             "one target per subscribed instrument, no more and no fewer"
         );
+        assert_eq!(skipped, 0, "every index is targetable");
         for (t, i) in targets.iter().zip(universe.iter()) {
             assert_eq!(t.security_id, i64::try_from(i.security_id).expect("fits"));
             assert_eq!(t.segment, i.segment.as_str());
@@ -9653,6 +10287,61 @@ mod tests {
         assert!(
             crossverify_targets(&[]).is_empty(),
             "an empty universe yields no targets rather than a default one"
+        );
+    }
+
+    /// BITE TEST (2026-08-25) — the partial-denominator vacuous pass.
+    ///
+    /// `instrument` used to be the literal `"INDEX"` for every target, and it
+    /// goes verbatim into the Dhan REST intraday body. The live universe is
+    /// ~119 indices plus ~750 NSE_EQ constituents, so ~86% of every run's
+    /// fetches asked for a STOCK as though it were an INDEX — returning no
+    /// candles, landing in `rest_failures`, and never being compared, while the
+    /// run could still report `Clean` on the correctly-labelled indices.
+    ///
+    /// The module's `minutes_compared > 0` guard cannot catch this: the
+    /// denominator is partial, not zero.
+    #[test]
+    fn an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed() {
+        let universe = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 2885,
+                segment: ExchangeSegment::NseEquity,
+            },
+            SubscribeInstrument {
+                security_id: 500_325,
+                segment: ExchangeSegment::BseEquity,
+            },
+            SubscribeInstrument {
+                security_id: 45_800,
+                segment: ExchangeSegment::NseFno,
+            },
+        ];
+        let (targets, skipped) = crossverify_targets_with_skipped(&universe);
+
+        assert_eq!(
+            targets.len(),
+            3,
+            "the three cash instruments are targetable"
+        );
+        assert_eq!(
+            skipped, 1,
+            "the F&O contract is COUNTED as unverifiable, never guessed"
+        );
+        assert_eq!(targets[0].instrument, "INDEX");
+        assert_eq!(
+            targets[1].instrument, "EQUITY",
+            "an NSE_EQ constituent fetched as INDEX returns nothing and is \
+             silently never compared"
+        );
+        assert_eq!(targets[2].instrument, "EQUITY");
+        assert!(
+            targets.iter().all(|t| t.security_id != 0),
+            "an out-of-range id must be skipped, never coerced to instrument 0"
         );
     }
 
@@ -9729,19 +10418,19 @@ mod tests {
     }
 
     #[test]
-    fn test_dhan_instrument_for_segment_covers_every_variant_deliberately() {
+    fn test_dhan_intraday_instrument_for_covers_every_variant_deliberately() {
         // Pins the mapping so a new segment cannot default into a label. Each
         // arm below is a decision, not an accident.
         assert_eq!(
-            dhan_instrument_for_segment(ExchangeSegment::IdxI),
+            dhan_intraday_instrument_for(ExchangeSegment::IdxI),
             Some("INDEX")
         );
         assert_eq!(
-            dhan_instrument_for_segment(ExchangeSegment::NseEquity),
+            dhan_intraday_instrument_for(ExchangeSegment::NseEquity),
             Some("EQUITY")
         );
         assert_eq!(
-            dhan_instrument_for_segment(ExchangeSegment::BseEquity),
+            dhan_intraday_instrument_for(ExchangeSegment::BseEquity),
             Some("EQUITY")
         );
         for ambiguous in [
@@ -9752,7 +10441,7 @@ mod tests {
             ExchangeSegment::McxComm,
         ] {
             assert_eq!(
-                dhan_instrument_for_segment(ambiguous),
+                dhan_intraday_instrument_for(ambiguous),
                 None,
                 "{} must refuse a label rather than invent one",
                 ambiguous.as_str()
@@ -9780,13 +10469,27 @@ mod tests {
 
     #[test]
     fn test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires() {
-        // 15:31 = one minute after the close, so the final minute has sealed.
-        assert_eq!(XVERIFY_RUN_AT_SECS_OF_DAY_IST, 55_860);
+        // One minute after the close, so the final minute has sealed.
+        //
+        // RE-BLESSED 2026-08-25 from a hardcoded 55_860 (15:31). That literal
+        // was correct for the pre-CAS 15:30 close and became wrong on
+        // 2026-08-07 when the NSE CAS migration moved the session end to 15:40
+        // everywhere except here and the comparator's own window constant. The
+        // schedule is now DERIVED from the close, and the relationship — not a
+        // literal — is what this test pins, so the next session-hours change
+        // cannot leave it behind a seventh time.
+        const RUN: u64 = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        assert_eq!(
+            RUN as i64,
+            crate::dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST + 60,
+            "the comparator must fire exactly one minute after the session close"
+        );
+        assert_eq!(RUN, 56_460, "09:15-15:40 session ⇒ a 15:41 IST run");
 
         // Before the run time: wait until today's.
-        assert_eq!(secs_until_next_run_ist(0), 55_860, "midnight → today 15:31");
+        assert_eq!(secs_until_next_run_ist(0), RUN, "midnight → today's run");
         assert_eq!(
-            secs_until_next_run_ist(55_859),
+            secs_until_next_run_ist(RUN - 1),
             1,
             "one second before → one second to wait"
         );
@@ -9794,17 +10497,17 @@ mod tests {
         // AT the run time: a full day, never zero. Zero would busy-loop the
         // task and fire the comparator repeatedly within one session.
         assert_eq!(
-            secs_until_next_run_ist(55_860),
+            secs_until_next_run_ist(RUN),
             SECS_PER_DAY,
             "exactly at the run time must wait a full day, not fire again"
         );
 
         // After: tomorrow's.
-        assert_eq!(secs_until_next_run_ist(55_861), SECS_PER_DAY - 1);
+        assert_eq!(secs_until_next_run_ist(RUN + 1), SECS_PER_DAY - 1);
         assert_eq!(
             secs_until_next_run_ist(SECS_PER_DAY - 1),
-            55_861,
-            "one second before midnight → tomorrow 15:31"
+            RUN + 1,
+            "one second before midnight → tomorrow's run"
         );
 
         // Total over every second of the day: always a positive, bounded wait.
@@ -10534,7 +11237,10 @@ mod tests {
     /// too, as long as the constant were derived the same broken way.
     #[test]
     fn test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes() {
-        use crate::dhan_live_crossverify::{is_in_session, is_tail_minute};
+        use crate::dhan_live_crossverify::{
+            SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_OPEN_SECS_OF_DAY_IST, is_in_session,
+            is_tail_minute,
+        };
 
         let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"); // APPROVED: test
         // Built EXACTLY as the runner builds it.
@@ -10570,17 +11276,27 @@ mod tests {
                 in_session += 1;
             }
         }
+        // 09:15..15:40 = 385 minutes. DERIVED, never a hand-typed literal:
+        // this count moved once already (375 -> 385) when NSE added the
+        // 15:30-15:40 closing session on 2026-08-07, and a literal is exactly
+        // what let the private duplicate close-constant miss that migration
+        // for eighteen days.
+        let expected_minutes = (SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / 60;
         assert_eq!(
-            in_session, 375,
-            "the session gate must accept all 375 minutes of 09:15..15:30. \
+            in_session, expected_minutes,
+            "the session gate must accept all {expected_minutes} session minutes. \
              Got {in_session} — a count near 45 is the +19,800s IST-origin skew returning."
         );
 
-        // And the tail amnesty must land on the REAL tail (15:28, 15:29), not
-        // on 09:58/09:59 as it did under the skew.
+        // And the tail amnesty must land on the REAL tail — the last two
+        // session minutes, whatever the close currently is — never on
+        // 09:58/09:59 as it did under the skew.
         let tail_at = |h: i64, mi: i64| is_tail_minute(stamp(h, mi), origin);
-        assert!(tail_at(15, 28), "15:28 must be tail-amnestied");
-        assert!(tail_at(15, 29), "15:29 must be tail-amnestied");
+        let hm = |secs: i64| (secs / 3600, (secs % 3600) / 60);
+        let (h1, m1) = hm(SESSION_CLOSE_SECS_OF_DAY_IST - 60);
+        let (h2, m2) = hm(SESSION_CLOSE_SECS_OF_DAY_IST - 120);
+        assert!(tail_at(h1, m1), "{h1}:{m1} must be tail-amnestied");
+        assert!(tail_at(h2, m2), "{h2}:{m2} must be tail-amnestied");
         assert!(
             !tail_at(9, 58),
             "09:58 is NOT the tail — that is the skew signature"
@@ -12050,6 +12766,79 @@ mod inline_depth_tests {
             append_inline_depth(&mut sink, &tick, &levels, 1, 0, 0, counters()),
             0,
             "an unknown segment must produce NO rows"
+        );
+    }
+
+    /// RATCHET for the 2026-08-25 silent-drop fix in `append_inline_depth`.
+    ///
+    /// `DEPTH_COUNTER`'s own doc says `refused` covers "parse error, unmappable
+    /// segment code, truncated frame tail, or an ILP append failure". The
+    /// DEDICATED depth drain honoured that. The INLINE d5 twin, written four
+    /// days later, did not: an unmappable segment dropped ten rows, an
+    /// out-of-range id dropped ten rows, an implausible price dropped one, and
+    /// a failed ILP append dropped one — every one of them with no counter and
+    /// no log.
+    ///
+    /// That is worse than an unmeasured loss. A reader auditing
+    /// `tv_dhan_feed_depth_total{outcome="refused"}` would have concluded d5
+    /// losses were visible, because the counter's documentation promised
+    /// coverage the code never delivered.
+    ///
+    /// This is a SOURCE SCAN rather than a counter assertion because the
+    /// metrics registry is process-global and a delta assertion would be flaky
+    /// under the parallel test harness. It fails the build if any of the four
+    /// arms loses its counter.
+    #[test]
+    fn every_inline_depth_drop_is_counted_never_silent() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let start = src
+            .find("fn append_inline_depth(")
+            .expect("append_inline_depth must exist"); // APPROVED: test
+        let body = &src[start..];
+        let end = body
+            .find("\nfn drain_depth_frame")
+            .expect("the function must be followed by drain_depth_frame"); // APPROVED: test
+        let body = &body[..end];
+
+        // 1 + 2: every early `return 0;` must be counted.
+        let returns = body.matches("return 0;").count();
+        assert!(
+            returns >= 3,
+            "expected the segment / id / capture_seq refusal arms; found {returns}"
+        );
+        for (i, chunk) in body.split("return 0;").enumerate() {
+            if i >= returns {
+                break; // the tail after the last `return 0;`
+            }
+            assert!(
+                chunk.contains("depth_refused.increment(1);"),
+                "the early return #{i} in append_inline_depth drops depth rows \
+                 with NO counter — that is the silent-drop class this ratchet exists \
+                 to forbid"
+            );
+        }
+
+        // 3 + 4: both `append_row` sites must carry an else arm, and both
+        // `plausible` guards must too. Two sides x two guards = four counters
+        // beyond the three refusal arms.
+        let counted = body.matches("depth_refused.increment(1);").count();
+        assert!(
+            counted >= 7,
+            "append_inline_depth must count every drop: 3 early refusals + 2 \
+             implausible-price arms + 2 failed-append arms = 7 minimum; found {counted}"
+        );
+        assert_eq!(
+            body.matches("if sink.writer.append_row(&row).is_ok() {")
+                .count(),
+            2,
+            "both the bid and ask sides append exactly one row"
+        );
+        assert!(
+            !body.contains(
+                "rows = rows.saturating_add(1);\n            }\n        }\n        if plausible"
+            ),
+            "the bid-side append has no else arm — a failed ILP append is being \
+             dropped in silence"
         );
     }
     #[test]
