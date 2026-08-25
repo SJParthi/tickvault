@@ -2186,3 +2186,67 @@ the 7-row resilience matrix is unmoved.
 - UNVERIFIED-LIVE: the fix is proven in tests and by source scan against the
   real filter pattern; that the alarm actually stays quiet across tomorrow's
   restarts is measured tomorrow, not claimed here.
+
+---
+
+## Item 15 — the silence detector was blind to 96% of the universe (2026-08-25)
+
+**Status: DONE.** Found while verifying that the 2026-08-21 IDX_I Quote-mode fix
+had worked. It had (`never_ticked: 0`, vs 119 the day before) — but the same log
+lines carried the real finding.
+
+### Measured
+
+```
+08:31:09  refused: 1,276,658  tracked: 865
+12:37:47  refused: 1,211,764  tracked: 865
+```
+
+865 is exactly the spot universe. Today's subscribed set was **23,044**
+(868 spot + 22,176 contracts).
+
+### The defect
+
+`LiveIngest::new(writer, capacity)` uses one number for two things with
+opposite semantics: a SOFT pre-size for the fold, and a HARD cap for the
+detector (`TickGapDetector::with_capacity` — "Never grows; never reallocates").
+The boot site computes `capacity` from the main-feed set BEFORE any socket
+opens, which is the spot universe; the ~22,000 contracts attach minutes later
+via `run_contract_attach`. Every contract tick was then refused a slot.
+
+Consequence, in the detector's own words: `scan_silence`'s `silent` and
+`never_ticked` counts "describe only the instruments it still tracks, while
+reading exactly as though they describe all of them". A contract that was
+silently never subscribed could not be reported by anything.
+
+- [x] **Size the detector at the authorized ceiling, not the boot-time count**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `tests::the_detector_outlives_the_boot_time_universe_when_given_the_ceiling`,
+    `a_detector_at_its_ceiling_still_refuses_and_still_counts`,
+    `the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling`
+
+### Why the ceiling and not a bigger boot-time count
+
+The ceiling does not depend on WHEN the universe is counted, so this cannot
+silently re-break the next time instruments are added after boot — which is
+exactly how it broke the first time. Cost: ~2 MB of slots plus its index,
+against a 32 GiB host.
+
+### Guarantee matrix
+
+Carried by reference from this plan's shared matrix. Rows that move:
+**monitoring** (silence detection now covers the whole subscribed set),
+**scenarios** (grow-after-boot is a covered case), **extreme check** (three
+tests, bite-proven). Fail-closed behaviour at the ceiling is explicitly
+preserved and pinned — a tracked instrument is still never evicted.
+
+### Honest envelope
+
+- This makes the detector ABLE to see contracts. It does not prove any
+  contract is actually ticking, and it adds no alarm: the refusal gauge is not
+  EMF-selected (user-data byte budget), so the coded log line remains the only
+  operator surface.
+- It does not address loss UPSTREAM at the vendor: Dhan publishes no sequence
+  number and skips a slow consumer forward, so ticks discarded on their side
+  are invisible to every counter we own. The 15:31 cross-verification remains
+  the only ground truth for that class.
