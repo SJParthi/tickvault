@@ -463,7 +463,7 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// | both sides, field differs > tolerance | `diverged` | **yes** |
 /// | REST has it, live doesn't (mid-session) | `missing_live` | **yes** — the closest proxy we have for packet loss |
 /// | REST has it, live doesn't (last 2 min) | `tail_unsealed` | no — expected at 15:31 |
-/// | live has it, REST doesn't | `missing_rest` | **yes** |
+/// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
 /// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
 #[must_use]
 pub fn compare_day(
@@ -606,11 +606,39 @@ pub fn compare_day(
     // which `is_pass() == false`. This is the structural answer to the
     // predecessor's blind-since-birth failure.
     let outcome = if minutes_compared > 0 {
-        let real = cells_diverged > 0 || missing_live > 0 || missing_rest > 0;
+        // The asymmetry here is deliberate and was WRONG until 2026-08-25.
+        //
+        // `missing_live` (REST has the minute, we don't) is the closest proxy
+        // this system has for packet loss on our own feed. It stays a real
+        // divergence.
+        //
+        // `missing_rest` (we have the minute, the vendor's REST tape doesn't)
+        // is NOT evidence against the live feed. The REST tape is sparse by
+        // construction — it publishes a candle where trading happened — so an
+        // illiquid strike that we correctly recorded shows up here through no
+        // fault of ours. Counting it as divergence made a vendor-side hole
+        // read as a live-feed failure, and inflated the one signal this lane
+        // exists to produce.
+        //
+        // This module's own header has always said `missing_rest` is
+        // "reported but never conflated with real divergence". The
+        // classification table below it said the opposite, and the code
+        // followed the table. The header was right.
+        //
+        // It is NOT silenced, and it must never be: a bar we hold for a
+        // minute the exchange never traded could also mean we FABRICATED one
+        // — which is not hypothetical, since the aggregator was proven on
+        // 2026-08-24 to inflate candle volumes 9.2x. So a run whose only
+        // anomaly is `missing_rest` lands on `Partial`, which `is_pass()`
+        // refuses and `is_measured()` accepts: visible, never a pass, and
+        // never crying feed-loss either.
+        let real = cells_diverged > 0 || missing_live > 0;
         if degraded {
             DhanLiveXverifyOutcome::Partial
         } else if real {
             DhanLiveXverifyOutcome::Diverged
+        } else if missing_rest > 0 {
+            DhanLiveXverifyOutcome::Partial
         } else {
             DhanLiveXverifyOutcome::Clean
         }
@@ -1353,6 +1381,75 @@ mod tests {
         assert_eq!(cmp.missing_live, 0);
     }
 
+    /// A REST-side hole is not a live-feed failure — but it is not a pass either.
+    ///
+    /// Until 2026-08-25 `missing_rest` was folded into the same `real` term as
+    /// `cells_diverged` and `missing_live`, so a minute the vendor's sparse REST
+    /// tape simply never published rendered as `Diverged` — the lane crying
+    /// feed-loss about a hole on the other side. This module's header had always
+    /// promised the opposite ("reported but never conflated with real
+    /// divergence"); the classification table said "yes" and the code followed
+    /// the table.
+    ///
+    /// The verdict must now be `Partial`: `is_pass()` refuses it, so a bar we
+    /// hold for a minute the exchange never traded can never be waved through as
+    /// clean (it could mean we FABRICATED one — not hypothetical, the aggregator
+    /// was proven to inflate volumes 9.2x on 2026-08-24), while `is_measured()`
+    /// accepts it, so the keep-better rerun guard still treats the run as real.
+    #[test]
+    fn a_rest_side_hole_is_partial_never_diverged_and_never_clean() {
+        let live = vec![
+            side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5)),
+            side(1, OPEN + 60, bar(100.5, 102.0, 100.0, 101.0)),
+        ];
+        // REST published only the first minute.
+        let rest = vec![side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.missing_rest, 1, "the REST hole must still be counted");
+        assert_eq!(cmp.missing_live, 0);
+        assert_eq!(cmp.cells_diverged, 0, "no OHLC field actually disagreed");
+        assert!(cmp.minutes_compared > 0, "the run must be non-vacuous");
+
+        assert_eq!(
+            cmp.outcome,
+            DhanLiveXverifyOutcome::Partial,
+            "a REST-side hole alone must be Partial — not Diverged (that blames \
+             our feed for the vendor's sparsity) and not Clean (that would wave \
+             through a bar we may have fabricated)"
+        );
+        assert!(
+            !cmp.outcome.is_pass(),
+            "Partial must never read as a pass — audit Rule 11, no false-OK"
+        );
+        assert!(
+            cmp.outcome.is_measured(),
+            "the run compared real minutes, so the rerun guard must treat it as measured"
+        );
+    }
+
+    /// The other half of the asymmetry: a minute WE missed is still a real
+    /// divergence, because it is the closest proxy this system has for packet
+    /// loss on our own feed. Narrowing `missing_rest` must not narrow this.
+    #[test]
+    fn a_minute_missing_from_our_own_feed_is_still_diverged() {
+        let live = vec![side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+        let rest = vec![
+            side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5)),
+            side(1, OPEN + 60, bar(100.5, 102.0, 100.0, 101.0)),
+        ];
+
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.missing_live, 1);
+        assert_eq!(
+            cmp.outcome,
+            DhanLiveXverifyOutcome::Diverged,
+            "a minute absent from OUR side stays a real divergence"
+        );
+        assert!(!cmp.outcome.is_pass());
+    }
     /// The last two session minutes may legitimately be unsealed at 15:31 —
     /// recorded, but never counted as loss.
     #[test]

@@ -123,10 +123,14 @@
 //! rather than quietly rewritten because an auditor checking the intra-frame
 //! collision would have read that paragraph and concluded it was handled.)*
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
+use crate::tick_spill_replay::SPILL_FILE_EXTENSION;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
 use tickvault_common::error_code::ErrorCode;
@@ -383,6 +387,124 @@ fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Depth ILP spill — the durable floor depth did not have
+// ---------------------------------------------------------------------------
+
+/// Directory failed-flush depth ILP payloads are appended to.
+///
+/// A SIBLING of `tick_persistence::TICK_SPILL_DIR` (`data/spill/ticks`), not a
+/// parallel invention: same `data/spill` root, same `.ilp` payload, same
+/// per-feed-per-hour file naming, so ONE retention sweep and ONE replay task
+/// can see both. Kept in its own subdirectory so the byte cap below bounds
+/// depth independently — depth is ~24× the tick row volume, so sharing a
+/// budget would let depth starve the tick rescue.
+pub const DEPTH_SPILL_DIR: &str = "data/spill/depth";
+
+/// Hard ceiling on the depth spill directory, in bytes (512 MiB).
+///
+/// **The bound is explicit because the disk is the thing that fails first.**
+/// The spill lives on the SAME filesystem as QuestDB, which was 86% full on
+/// 2026-08-24. An unbounded rescue would trade a bounded depth loss for an
+/// unbounded outage of everything sharing that volume — a strictly worse
+/// trade. Past the cap the rows ARE dropped and counted, which is the honest
+/// failure this module already had, not a new one.
+///
+/// **Honest horizon:** at the measured 1,530,651,649 rows/session over the
+/// 24,000-second window (~63,800 rows/s) and ~140 B of line protocol per row,
+/// 512 MiB holds roughly **60 seconds** of full-rate depth. That is the right
+/// order of magnitude for the failure this rescues — a QuestDB write stall or
+/// a client-side flush timeout — and deliberately NOT sized for an outage of
+/// minutes, because 24 GB of depth spill on a volume with ~28 GB free is how a
+/// rescue becomes the incident.
+pub const DEPTH_SPILL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Total bytes currently held in the depth spill directory.
+///
+/// Non-recursive and best-effort: an unreadable entry contributes 0 rather
+/// than aborting, because failing to MEASURE the cap must not also fail the
+/// rescue the cap protects. Duplicated from the tick writer's private helper
+/// rather than shared, because that one is module-private there.
+fn depth_spill_dir_bytes(dir: &Path) -> u64 {
+    // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.len())
+        .sum()
+    // O(1) EXEMPT: end
+}
+
+/// Appends a failed flush's ILP payload to the depth spill directory.
+///
+/// # Why the payload is stored verbatim
+///
+/// `Buffer::as_bytes()` is InfluxDB line protocol — byte-for-byte the body
+/// QuestDB's own `/write` endpoint accepts. So the file needs no bespoke
+/// format and no parser: replay is POSTing the bytes back, which is exactly
+/// what `tick_spill_replay` already does for every `.ilp` file in a directory.
+/// The extension is taken from that module's own constant so the two cannot
+/// silently diverge.
+///
+/// # Why replaying it twice is safe
+///
+/// [`DEDUP_KEY_MARKET_DEPTH`] carries `depth_kind` AND `capture_seq`, and both
+/// are emitted on every line. A replayed row therefore reproduces an
+/// IDENTICAL key and UPSERTs onto itself instead of duplicating — including
+/// across the two pools, whose level-5 rows would otherwise collide.
+///
+/// # Why the cap is a parameter
+///
+/// `cap_bytes` is injected rather than read from the const so the enforcement
+/// can be proven end to end without writing half a gigabyte on an already-full
+/// volume — a test that must fill the disk to prove the disk guard is a test
+/// nobody runs. Production always passes [`DEPTH_SPILL_MAX_BYTES`].
+///
+/// # Errors
+///
+/// `Err` when the directory cannot be created, the cap is reached, or the
+/// append fails. The caller treats that as "rescue unavailable" and falls back
+/// to the counted drop: **a spill that cannot be written must never mask the
+/// loss.** The spill filesystem is the one currently closest to full, so this
+/// arm is a live path, not a theoretical one.
+fn spill_failed_depth_ilp(
+    dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    now_unix_secs: i64,
+    cap_bytes: u64,
+) -> std::io::Result<PathBuf> {
+    // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
+    std::fs::create_dir_all(dir)?;
+
+    if depth_spill_dir_bytes(dir) >= cap_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            format!("depth spill dir at or past its {cap_bytes}-byte cap"),
+        ));
+    }
+
+    // One file per feed per hour: bounded file count, and an operator replaying
+    // a known-bad window does not have to read one ever-growing file.
+    let hour = now_unix_secs / 3_600;
+    let path = dir.join(format!(
+        "depth-{}-{hour}.{SPILL_FILE_EXTENSION}",
+        feed.as_str()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(payload)?;
+    file.flush()?;
+    Ok(path)
+    // O(1) EXEMPT: end
+}
+
 /// Publish a zero on the drop series before any row can be written.
 ///
 /// The CloudWatch agent computes a counter's alarm value as the DELTA between
@@ -399,17 +521,46 @@ fn register_depth_drop_baseline(feed: Feed) {
 /// Batched `market_depth` ILP writer.
 ///
 /// Lazy: an unreachable QuestDB at construction still builds (rows buffer
-/// locally). `flush` returns `Err` and the pending buffer is discarded LOUDLY,
-/// so one poisoned row cannot wedge the rest of the session.
+/// locally). On a failed `flush` the pending buffer leaves memory — but it is
+/// RESCUED to the depth spill tier first, and only genuinely dropped when that
+/// rescue itself fails. Either way it is loud.
 pub struct DepthWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
     feed: Feed,
-    /// Rows discarded across this writer's lifetime — the honest counterpart
-    /// to "nothing is dropped". If this is non-zero, something WAS dropped and
-    /// the operator is told rather than reassured.
+    /// Rows that left the buffer without reaching QuestDB, across this
+    /// writer's lifetime.
+    ///
+    /// Deliberately counts the RESCUED rows too, mirroring `TickWriter`: the
+    /// EMF-shipped `tv_depth_rows_dropped_total` is the only depth series an
+    /// alarm can watch, so diverting the common flush failure off it would
+    /// have told the operator LESS than before the rescue existed — a false-OK
+    /// (audit Rule 11). `rescued` is the strictly narrower "and it is
+    /// recoverable"; `dropped - rescued` is the unrecoverable loss.
     dropped: u64,
+    /// Rows durably captured to the spill tier — the recoverable subset of
+    /// `dropped`.
+    rescued: u64,
+    /// Spill directory. Production uses [`DEPTH_SPILL_DIR`]; tests get an
+    /// isolated temp dir so they never write into the repo.
+    spill_dir: PathBuf,
+}
+
+/// A unique temp spill directory, so a test writer never touches
+/// `data/spill/depth` in the working tree.
+///
+/// `for_test` is called from the APP crate too, where `cfg(test)` does not
+/// reach — so the isolation has to live in the constructor, not behind a test
+/// gate.
+fn temp_depth_spill_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!(
+        "tv-depth-spill-test-{nanos}-{:?}",
+        std::thread::current().id()
+    ))
 }
 
 impl DepthWriter {
@@ -428,6 +579,8 @@ impl DepthWriter {
                     pending: 0,
                     feed,
                     dropped: 0,
+                    rescued: 0,
+                    spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
                 }
             }
             Err(err) => {
@@ -442,6 +595,8 @@ impl DepthWriter {
                     pending: 0,
                     feed,
                     dropped: 0,
+                    rescued: 0,
+                    spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
                 }
             }
         }
@@ -463,7 +618,17 @@ impl DepthWriter {
             pending: 0,
             feed,
             dropped: 0,
+            rescued: 0,
+            spill_dir: temp_depth_spill_dir(),
         }
+    }
+
+    /// Test-only: points the rescue tier at an isolated directory.
+    #[cfg(test)]
+    #[must_use]
+    fn with_spill_dir_for_test(mut self, dir: PathBuf) -> Self {
+        self.spill_dir = dir;
+        self
     }
 
     /// Rows appended but not yet flushed.
@@ -478,6 +643,15 @@ impl DepthWriter {
     // TEST-EXEMPT: observability accessor, asserted by the discard tests below.
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Rows durably captured to the depth spill tier — the RECOVERABLE subset
+    /// of [`DepthWriter::dropped`]. `dropped - rescued` is the loss nothing
+    /// re-inserts.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the rescue tests below.
+    pub fn rescued(&self) -> u64 {
+        self.rescued
     }
 
     /// Raw ILP buffer text — the ONLY way a caller can assert what was actually
@@ -545,19 +719,100 @@ impl DepthWriter {
         Ok(())
     }
 
-    /// Discards the pending buffer, counting and logging the loss.
+    /// Rescues every buffered-but-unflushed row to the depth spill tier, then
+    /// clears. Returns how many rows left the buffer.
     ///
-    /// Returns how many rows were discarded.
+    /// # What this replaces, and why
+    ///
+    /// This was a bare discard whose own log line said *"These levels are gone
+    /// from the table"*. Ticks have had a three-tier durable floor since
+    /// 2026-08-21 — ring, NDJSON/ILP spill, DLQ — so a tick flush failure is
+    /// recoverable. Depth, at a MEASURED 1,530,651,649 rows/session against
+    /// 64,349,753 ticks (2026-08-24) — **24× the tick volume and the largest
+    /// payload in the process** — had none of it, on a box whose QuestDB write
+    /// path is demonstrably stalling (`market_depth`'s WAL 8,061 transactions
+    /// behind, the volume pinned at its provisioned throughput ceiling). So
+    /// this path is not hypothetical; it is the one most likely to fire.
+    ///
+    /// It also violated the operator's standing 2026-08-15 directive that
+    /// nothing may be missed, hidden or wiped off — the discard did all three
+    /// while reporting a healthy table.
+    ///
+    /// # Why the rescue can still fail, and what happens then
+    ///
+    /// The spill shares the filesystem with QuestDB, which was 86% full. A
+    /// write failure or the [`DEPTH_SPILL_MAX_BYTES`] cap is therefore a live
+    /// outcome, and it falls back to the counted drop with its own coded
+    /// error. Silent loss is the defect; a NAMED unrecoverable loss is not.
     fn discard_pending(&mut self) -> usize {
-        let dropped = self.pending;
-        if dropped > 0 {
+        let rows = self.pending;
+        if rows == 0 {
             self.buffer.clear();
-            self.pending = 0;
-            self.dropped = self.dropped.saturating_add(dropped as u64);
-            metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
-                .increment(dropped as u64);
+            return 0;
         }
-        dropped
+        let payload_len = self.buffer.as_bytes().len();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        match spill_failed_depth_ilp(
+            &self.spill_dir,
+            self.buffer.as_bytes(),
+            self.feed,
+            now,
+            DEPTH_SPILL_MAX_BYTES,
+        ) {
+            Ok(path) => {
+                self.rescued = self.rescued.saturating_add(rows as u64);
+                // BOTH counters, and the EMF-shipped one is not optional: it
+                // is the only depth series an alarm watches, so incrementing
+                // only the new name would divert the common flush failure off
+                // the pager that exists for it.
+                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
+                    .increment(rows as u64);
+                metrics::counter!("tv_depth_rows_spilled_total", "feed" => self.feed.as_str())
+                    .increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    rescued = rows,
+                    bytes = payload_len,
+                    path = %path.display(),
+                    "market_depth flush failed — the buffered levels were RESCUED to the \
+                     depth spill file named here, not lost. They are NOT in QuestDB yet. \
+                     Re-ingest is one command and is safe to repeat, because the depth \
+                     dedup key carries depth_kind and capture_seq: \
+                     curl --data-binary @<path> http://<questdb>:9000/write"
+                );
+            }
+            Err(err) => {
+                // The rescue itself failed — cap reached, disk full, or no
+                // permission. Count it as the genuine unrecoverable loss it is.
+                if err.kind() == std::io::ErrorKind::StorageFull {
+                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
+                        .increment(1);
+                } else {
+                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write")
+                        .increment(1);
+                }
+                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
+                    .increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped = rows,
+                    cap_bytes = DEPTH_SPILL_MAX_BYTES,
+                    spill_dir = %self.spill_dir.display(),
+                    spill_error = %err,
+                    "market_depth flush failed AND the depth spill rescue also failed — \
+                     these levels are permanently lost and nothing re-inserts them. The \
+                     raw frames remain in the write-ahead log for manual recovery."
+                );
+            }
+        }
+        self.buffer.clear();
+        self.pending = 0;
+        self.dropped = self.dropped.saturating_add(rows as u64);
+        rows
     }
 
     /// Flushes buffered rows over ILP-HTTP with a per-flush server ACK.
@@ -580,9 +835,9 @@ impl DepthWriter {
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = self.feed.as_str(),
                 dropped,
-                "market_depth flush with no QuestDB connection — {dropped} depth row(s) \
-                 DISCARDED. These levels are gone from the table; the raw frames remain \
-                 in the write-ahead log"
+                "market_depth flush with no QuestDB connection — {dropped} depth row(s) left \
+                 the buffer; see the preceding line for whether they were rescued to the \
+                 depth spill tier or permanently lost"
             );
             anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
         };
@@ -784,6 +1039,281 @@ mod tests {
             w.append_row(&r).expect("append");
         }
         assert_eq!(w.pending(), 200, "a depth-200 side is 200 rows, not one");
+    }
+
+    // -- the durable floor (2026-08-25) -------------------------------------
+    //
+    // Before this, `discard_pending` threw the pending buffer away and its own
+    // comment said the levels were "gone from the table". Depth is 24× the
+    // tick volume and QuestDB write stalls are measured on the live box, so
+    // this is the largest data-loss surface in the process. Each test below
+    // was written against the OLD behaviour first and failed there.
+
+    fn spill_tmp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("tv-depth-spill-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn spill_files(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Extracts the eight [`DEDUP_KEY_MARKET_DEPTH`] columns from one ILP line.
+    ///
+    /// Returns `None` when any key column is missing — which is the point: a
+    /// line that omits `capture_seq` or `depth_kind` cannot be replayed
+    /// idempotently, and the test that uses this would rather fail than
+    /// silently compare short keys.
+    fn dedup_key_of_ilp_line(line: &str) -> Option<String> {
+        let (head, ts) = line.rsplit_once(' ')?;
+        let (symbols, fields) = head.split_once(' ')?;
+        let mut parts: Vec<String> = vec![format!("ts={}", ts.trim())];
+        for col in DEDUP_KEY_MARKET_DEPTH.split(',').map(str::trim) {
+            if col == "ts" {
+                continue;
+            }
+            let needle = format!("{col}=");
+            let hay = symbols
+                .split(',')
+                .chain(fields.split(','))
+                .find(|kv| kv.starts_with(&needle))?;
+            parts.push(hay.to_string());
+        }
+        Some(parts.join("|"))
+    }
+
+    #[test]
+    fn a_failed_flush_leaves_the_rows_recoverable_on_disk_not_merely_counted() {
+        // The defect: a dropped-counter increment is NOT a durable floor. This
+        // asserts the ROWS survive, which the old discard could never satisfy.
+        let dir = spill_tmp("recoverable");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        for level in 1..=20 {
+            let mut r = row();
+            r.level = level;
+            w.append_row(&r).expect("append");
+        }
+        let _ = w.flush();
+
+        let files = spill_files(&dir);
+        assert_eq!(files.len(), 1, "exactly one depth spill file: {files:?}");
+        let body = std::fs::read_to_string(&files[0]).expect("spill readable");
+        assert_eq!(
+            body.lines().filter(|l| !l.trim().is_empty()).count(),
+            20,
+            "every buffered level must be on disk, not merely counted: {body}"
+        );
+        assert!(body.contains("depth_kind=d20") && body.contains(MARKET_DEPTH_TABLE));
+        assert_eq!(w.rescued(), 20, "the rescue is counted as recoverable");
+        assert_eq!(
+            w.dropped(),
+            20,
+            "the EMF-shipped series still sees rows leaving the buffer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_spill_file_is_replayable_by_the_existing_tick_replay_contract() {
+        // Reuse, not reinvention: `tick_spill_replay` drains every file with
+        // this extension by POSTing it verbatim to /write. If that module
+        // renames the extension, this fails rather than silently orphaning the
+        // depth spill.
+        let dir = spill_tmp("extension");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_row(&row()).expect("append");
+        let _ = w.flush();
+        let files = spill_files(&dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].extension().and_then(|e| e.to_str()),
+            Some(SPILL_FILE_EXTENSION),
+            "the depth spill must be drainable by tick_spill_replay: {files:?}"
+        );
+        assert_eq!(
+            crate::tick_spill_replay::list_spill_files(&dir).len(),
+            1,
+            "the shared replay lister must SEE the depth spill file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaying_a_spilled_batch_twice_cannot_duplicate_rows() {
+        // Idempotency is a property of the KEY, so this asserts the key: every
+        // one of the eight DEDUP columns is present on every emitted line, and
+        // the same batch spilled twice yields the same key SET. Drop
+        // `capture_seq` or `depth_kind` from the line and this fails — which
+        // is exactly the collapse the single shared table risks.
+        let dir = spill_tmp("idempotent");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        for level in 1..=5 {
+            for (kind, side) in [
+                (DEPTH_KIND_20, DEPTH_SIDE_BID),
+                (DEPTH_KIND_200, DEPTH_SIDE_BID),
+                (DEPTH_KIND_20, DEPTH_SIDE_ASK),
+            ] {
+                let mut r = row();
+                r.level = level;
+                r.depth_kind = kind;
+                r.side = side;
+                w.append_row(&r).expect("append");
+            }
+        }
+        let _ = w.flush();
+        // Second failed flush of the SAME rows — a real replay: the drain
+        // re-folds the same WAL frame, so capture_seq is identical.
+        for level in 1..=5 {
+            for (kind, side) in [
+                (DEPTH_KIND_20, DEPTH_SIDE_BID),
+                (DEPTH_KIND_200, DEPTH_SIDE_BID),
+                (DEPTH_KIND_20, DEPTH_SIDE_ASK),
+            ] {
+                let mut r = row();
+                r.level = level;
+                r.depth_kind = kind;
+                r.side = side;
+                w.append_row(&r).expect("append");
+            }
+        }
+        let _ = w.flush();
+
+        let files = spill_files(&dir);
+        let body: String = files
+            .iter()
+            .map(|p| std::fs::read_to_string(p).expect("readable"))
+            .collect();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 30, "both batches are on disk");
+        let mut keys = std::collections::BTreeSet::new();
+        for line in &lines {
+            let key = dedup_key_of_ilp_line(line)
+                .unwrap_or_else(|| panic!("every DEDUP key column must be on the line: {line}"));
+            keys.insert(key);
+        }
+        assert_eq!(
+            keys.len(),
+            15,
+            "re-applying the same batch must UPSERT onto itself, not duplicate: {keys:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spill_write_failure_is_counted_and_coded_never_silent() {
+        // The spill shares the filesystem with QuestDB, which was 86% full on
+        // 2026-08-24 — so this arm is a live path. A regular FILE where the
+        // directory should be makes `create_dir_all` fail deterministically on
+        // every OS (the chaos suite's own "spill disk dead" injection).
+        let dir = spill_tmp("write-fail");
+        std::fs::create_dir_all(dir.parent().expect("temp dir has a parent")).ok();
+        std::fs::write(&dir, b"not a directory").expect("plant a file at the dir path");
+
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_row(&row()).expect("append");
+        let err = w.flush().expect_err("disconnected writer cannot flush");
+        assert!(format!("{err}").contains("1 row(s) discarded"));
+        assert_eq!(w.dropped(), 1, "the loss is COUNTED");
+        assert_eq!(
+            w.rescued(),
+            0,
+            "a failed rescue must NEVER be reported as recoverable — that is \
+             the false-OK this tier exists to avoid"
+        );
+        assert!(
+            spill_failed_depth_ilp(&dir, b"x\n", Feed::Dhan, 0, DEPTH_SPILL_MAX_BYTES).is_err(),
+            "the spill helper reports the failure rather than claiming success"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+    #[test]
+    fn the_bound_refuses_a_spill_once_the_directory_is_at_the_cap() {
+        // The enforcement itself, end to end. The cap is a PARAMETER precisely
+        // so this can bite without writing half a gigabyte onto a volume that
+        // is 86% full — a disk guard whose test must fill the disk is a guard
+        // nobody exercises.
+        let dir = spill_tmp("at-cap");
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        let seeded = b"already-here\n";
+        std::fs::write(
+            dir.join(format!("depth-dhan-0.{SPILL_FILE_EXTENSION}")),
+            seeded,
+        )
+        .expect("seed");
+        let held = depth_spill_dir_bytes(&dir);
+        assert_eq!(
+            held,
+            seeded.len() as u64,
+            "the cap is measured from real bytes on disk"
+        );
+
+        // Under the cap: accepted.
+        spill_failed_depth_ilp(&dir, b"under\n", Feed::Dhan, 1_700_000_000, held + 1)
+            .expect("below the cap the rescue must succeed — otherwise the test is vacuous");
+
+        // At the cap: REFUSED, and classifiable so the "cap" counter stage is
+        // the right one.
+        let err = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held)
+            .expect_err("at the cap the rescue must refuse rather than fill the disk");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            format!("{err}").contains(&held.to_string()),
+            "the refusal names the ceiling it hit: {err}"
+        );
+
+        // The refusal is a REFUSAL, not a partial write.
+        let after = depth_spill_dir_bytes(&dir);
+        let body =
+            std::fs::read_to_string(dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")))
+                .unwrap_or_default();
+        assert!(
+            !body.contains("over"),
+            "a capped rescue must write NOTHING, not a truncated row: {body}"
+        );
+        assert_eq!(after, depth_spill_dir_bytes(&dir));
+
+        // And production really does pass the const, so the bound above is the
+        // one that fires on the box.
+        assert!(
+            DEPTH_SPILL_MAX_BYTES > 0 && DEPTH_SPILL_MAX_BYTES <= 1024 * 1024 * 1024,
+            "the depth spill bound must be explicit and sane: {DEPTH_SPILL_MAX_BYTES}"
+        );
+        assert_eq!(DEPTH_SPILL_DIR, "data/spill/depth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_flush_writes_no_spill_file_at_all() {
+        let dir = spill_tmp("empty");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.flush().expect("nothing pending is not a failure");
+        assert!(
+            spill_files(&dir).is_empty(),
+            "an empty buffer must not create a rescue file"
+        );
+        assert_eq!(w.rescued(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_test_never_writes_into_the_production_spill_directory() {
+        // `for_test` is called from the app crate too, where cfg(test) does not
+        // reach — so the isolation has to be in the constructor.
+        let w = DepthWriter::for_test(Feed::Dhan);
+        assert_ne!(w.spill_dir, PathBuf::from(DEPTH_SPILL_DIR));
     }
 
     #[test]
