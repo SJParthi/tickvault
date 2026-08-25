@@ -147,16 +147,26 @@ pub const TAIL_UNSEALED_MINUTES: i64 = 2;
 /// bounds so the row cap below can never disagree with the window the
 /// comparator actually classifies against.
 ///
-/// **⚠ Deliberately derived from THIS module's 15:30 close, not the fold's.**
-/// `tf_index::MARKET_CLOSE_SECS_OF_DAY_IST` is 15:40 (the 2026-08-03 NSE CAS
-/// change), so live bars in `[15:30, 15:40)` are folded and persisted but
-/// classified `out_of_session` here and never compared. Which bound is right
-/// is a real question about whether Dhan's REST tape publishes 1-minute
-/// candles for the closing-auction window, and it is NOT settled by picking
-/// the larger number: widening this to 15:40 while the REST side has no bars
-/// there would turn ~81 quietly-uncompared rows a day into thousands of
-/// `missing_rest` entries and make the verdict look worse for a reason that is
-/// not loss. Left at 15:30 and recorded, pending evidence from a live tape.
+/// **MERGE RESOLUTION 2026-08-25 — this bound MOVED, and the reasoning that
+/// argued against moving it is preserved rather than deleted.**
+///
+/// This branch deliberately held the compared close at **15:30** while
+/// `main` changed it to track `TICK_PERSIST_END_SECS_OF_DAY_IST` (**15:40**,
+/// the 2026-08-03 NSE CAS change), with a `const_assert` binding the two.
+/// The merge takes main's, for the reason main gives: a row that was
+/// PERSISTED and never COMPARED is a silently unverified row, and the
+/// comparator exists precisely so no such row exists. At ~868 instruments
+/// that is ~81 rows a day moving from quietly-unverified to verified.
+///
+/// **The risk the 15:30 position identified is real and is NOT retired by
+/// this choice.** If Dhan's REST tape does not publish 1-minute candles for
+/// the closing-auction window, those same ~81 rows become thousands of
+/// `missing_rest` entries a day and the verdict looks worse for a reason that
+/// is not loss. That is a REPORTING failure, not a data one — which is why it
+/// is the acceptable side to be wrong on, and why it is stated here instead
+/// of discovered from a puzzling verdict. **The next 15:31 run measures it:**
+/// a `missing_rest` that jumps by roughly the instrument count times ten
+/// minutes is this, not packet loss.
 pub const SESSION_MINUTES: usize =
     ((SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / SECS_PER_MINUTE) as usize;
 
@@ -1904,7 +1914,11 @@ mod tests {
         // so the comparator verified every morning and no afternoon. Nothing
         // connected the number to the universe it had to cover, so nobody
         // could see it had stopped being enough.
-        assert_eq!(SESSION_MINUTES, 375, "09:15 to 15:30 is 375 minutes");
+        assert_eq!(
+            SESSION_MINUTES, 385,
+            "09:15 to 15:40 is 385 minutes — the close tracks the canonical \
+             persistence end, not a literal (merge resolution 2026-08-25)"
+        );
         assert_eq!(
             LIVE_ROW_LIMIT,
             LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES,

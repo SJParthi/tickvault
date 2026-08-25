@@ -484,38 +484,32 @@ impl MultiTfAggregator {
         // `// O(1) EXEMPT:` hatch instead would be a small lie: this is not
         // exempt FROM O(1), it IS O(1).
         //
-        // `is_finite()` is redundant with the bounds (NaN fails `>= 0.0`,
-        // `+Inf` fails `<= MAX`, `-Inf` fails `>= 0.0`) and kept anyway,
-        // because "is this a real number" is the first question a reader asks.
-        // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
-        #[allow(clippy::manual_range_contains)]
-        let price_is_representable = p.is_finite() && p >= 0.0 && p <= MAX_PLAUSIBLE_LTP;
-        if !price_is_representable {
-            crate::candles::fold_counters::fold_counters()
-                .tick_refused_price
-                .increment(1);
-            return ConsumeStats {
-                refused_price: true,
-                ..ConsumeStats::default()
-            };
-        }
-        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
-        // 2026-08-25, and that reordering is the whole fix.
+        // MERGE RESOLUTION 2026-08-25 — two independent hardening fixes
+        // landed on the SAME three gates from opposite directions, and both
+        // wanted to be first. Neither is dropped; the order below satisfies
+        // both, and the reasoning is recorded because a future reader will
+        // otherwise "tidy" one of them back.
         //
-        // It used to sit below, which left a hole the drain's own comment
-        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
-        // and returns early, so a packet carrying LTP = 0 AND
-        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
-        // stayed false, the drain classified it `untraded_sentinel` — a
-        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
-        // DESIGNATED timestamp, so that row lands in a year-2106 partition
-        // that retention and archival, which key on the trading day, can never
-        // reach, while every `max(ts)` and range query over `ticks` silently
-        // includes it.
+        // 1. TIMESTAMP BAND runs first (from main). It must precede every
+        //    early return that can still produce a PERSISTED row — including
+        //    the untraded-sentinel return, which is candle-only and writes
+        //    the tick anyway. A packet carrying LTP = 0 AND
+        //    LTT = 0xFFFFFFFF used to classify as `untraded_sentinel` and
+        //    land in a year-2106 partition that retention and archival, which
+        //    key on the trading day, can never reach — while every `max(ts)`
+        //    and range query over `ticks` silently included it.
         //
-        // One malformed or hostile packet was enough. The band check belongs
-        // above every early return that can still produce a persisted row, not
-        // merely above the fold.
+        // 2. UNTRADED SENTINEL runs second (from this branch). It must
+        //    precede the strict `p > 0.0` price gate, or a legitimately
+        //    untraded instrument is miscounted as a malformed price.
+        //
+        // 3. REPRESENTABILITY runs last, and tests the WIDENED value.
+        //
+        // Hoisting the timestamp band above the price gate is a superset of
+        // main's position, not a weakening: a tick that is bad in BOTH ways
+        // is now attributed to `timestamp` rather than `price`, which is the
+        // more actionable of the two — a bad price costs one candle, a bad
+        // timestamp poisons a partition.
         if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
             || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
         {
@@ -561,7 +555,9 @@ impl MultiTfAggregator {
         // might refuse a legitimate five-paise option premium.
         let price_is_representable = raw_is_representable && prices.last_traded_price > 0.0;
         if !price_is_representable {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .tick_refused_price
+                .increment(1);
             return ConsumeStats {
                 refused_price: true,
                 ..ConsumeStats::default()
@@ -704,6 +700,14 @@ impl MultiTfAggregator {
         // bucket's baseline matches what was just written — never the
         // truncated `u32` when a `u64` override was supplied.
         //
+        // MERGE RESOLUTION 2026-08-25 — both branches found this same defect
+        // independently and fixed it the same way. main's version is kept
+        // because it is a strict superset: identical monotonic advance, plus
+        // a counter that makes the correction VISIBLE. This branch's version
+        // (`slot.last_cumulative.max(cumulative_volume)`) is behaviourally
+        // equal and silent, and a silent correction is the weaker of two
+        // otherwise-identical fixes.
+        //
         // ADVANCE ONLY. This was an UNCONDITIONAL assignment and that was a
         // live data-corruption defect, measured 2026-08-24: the same trading
         // day tiled five ways did not sum to one volume total (1s
@@ -801,22 +805,29 @@ impl MultiTfAggregator {
                     on_seal(feed, sid, seg, tf, state);
                 }
             }
-            // Reset the SLOT's day-scoped state too (2026-08-25).
-            // `force_seal` resets the CELL's day state — `last_seen_day_high`,
-            // `last_seen_day_low`, `last_observed_ts`, `armed_for_day_open` —
-            // but `last_cumulative` lives out here on the slot, and nothing
-            // touched it. Cumulative volume restarts at ~0 each session, so a
-            // process spanning midnight opened day 2's first bucket with
-            // YESTERDAY's final cumulative as the baseline: `saturating_sub`
-            // floored every bucket to 0, and with the monotonic `max` above it
-            // would have STAYED pinned there. D1 is the worst case — its
-            // bucket opens once per day, so the whole daily bar would read
-            // zero volume.
+            // MERGE RESOLUTION 2026-08-25 — both branches found this same
+            // day-boundary defect and reset the baseline; main's version is
+            // kept and this branch's duplicate assignment is removed.
             //
+            // The difference was not cosmetic. This branch reset to a
+            // baseline of `0`, so day two's first bar owned everything traded
+            // since the open. main resets to UNSEEDED, so day two's first
+            // PACKET re-seeds and the first bar owns only what traded after
+            // it. main's is kept because it is the conservative direction: it
+            // can under-attribute the sub-second window before our first
+            // packet of the day, but it can never over-attribute volume that
+            // was not ours — and the same seeding rule already governs a slot
+            // allocated mid-session, so one rule now covers both arrivals.
+            //
+            // The original reasoning, still true: `force_seal` resets the
+            // CELL's day state, but `last_cumulative` lives on the SLOT and
+            // nothing touched it, so a process spanning midnight opened day
+            // two with YESTERDAY's final cumulative as baseline and
+            // `saturating_sub` floored every bucket to 0. D1 is the worst
+            // case — one bucket per day, so the whole daily bar read zero.
             // Masked today only because the box stops at 17:30 and restarts
-            // with `last_cumulative: 0`. A schedule change would have made it
+            // with `last_cumulative: 0`; a schedule change would have made it
             // live, silently, with no counter moving.
-            slot.last_cumulative = 0;
         }
         emitted
     }
@@ -1215,16 +1226,29 @@ mod tests {
                 day2 = Some(st.volume);
             }
         });
-        // 400, not 300: a fresh session's baseline is 0, so the first bar
-        // legitimately owns everything traded since the open — including the
-        // 100 the first packet reported. Without the reset the baseline is
-        // yesterday's 9,000, `saturating_sub` floors both packets, and the bar
-        // reads 0.
+        // 300, and the number itself is the merge decision (2026-08-25).
+        //
+        // The day-close drops the baseline to UNSEEDED, so day two's FIRST
+        // packet (cumulative 100) re-seeds it, and the first bar owns only
+        // what traded after that observation: 400 - 100 = 300.
+        //
+        // This branch originally asserted 400, arguing that a continuously
+        // running process owns everything since the open. That is more precise
+        // and less safe: it cannot distinguish "we were running and had not yet
+        // received a packet" from "we arrived late", so it can OVER-attribute.
+        // Seeding can only ever under-attribute the sub-second window before
+        // the day's first packet, and it reuses the rule that already governs
+        // a slot allocated mid-session — one rule for both kinds of arrival.
+        //
+        // What this test still proves is the defect it was written for: delete
+        // the reset in `force_seal_all` and this reads 0, not 300, because
+        // yesterday's 9,000 baseline floors both packets through
+        // `saturating_sub`.
         assert_eq!(
             day2,
-            Some(400),
-            "day two's first bar must charge the whole session-to-date volume, \
-             not be floored to zero by yesterday's 9,000 cumulative"
+            Some(300),
+            "day two's first bar must be measured from its own re-seeded \
+             baseline, not floored to zero by yesterday's 9,000 cumulative"
         );
     }
 
