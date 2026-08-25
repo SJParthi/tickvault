@@ -163,6 +163,34 @@ pub enum ErrorCode {
     HotPath01SyncFsFailed,
     /// HOT-PATH-02: hot-path writer queue full / closed / uninitialized.
     HotPath02WriterQueueDrop,
+    /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
+    /// QuestDB and has been quarantined so the rest of the backlog can drain.
+    ///
+    /// The spill tier exists so a failed ILP flush costs disk instead of data.
+    /// That guarantee has a second half nobody had exercised: the file has to
+    /// be replayable. A malformed file is refused with an HTTP 4xx, which no
+    /// amount of retrying can change — and before this code existed the drain
+    /// stopped the whole round on ANY failure, so one bad file stranded every
+    /// file behind it, indefinitely.
+    ///
+    /// Found live 2026-08-25: a single torn line in a 401 KB file blocked a
+    /// 512 MB file holding 1,662,318 rescued ticks. The big file was
+    /// perfectly intact; it had simply never been attempted. `replayed_bytes`
+    /// read 0 while `replay_failed` climbed every five minutes, and both
+    /// files sat on disk for hours.
+    ///
+    /// The tear itself came from a PARTIAL APPEND while the volume was full:
+    /// one buffer's last line was cut mid-field and the next buffer's first
+    /// line ran straight into it, producing `lasticks`. So the rescue path
+    /// corrupted its own output under exactly the condition it exists for.
+    ///
+    /// Quarantine, never delete: the surviving lines are recoverable by hand
+    /// (1,292 of 1,293 were), and a rescue tier that deletes what it cannot
+    /// parse is worse than the loss it was built to prevent. Cold path only;
+    /// log-sink-only delivery. Severity::High, auto-triage-safe — the file is
+    /// already set aside and the queue is already moving; the operator
+    /// decides what to salvage.
+    TickSpill01FileQuarantined,
     // PR #5 (2026-05-19): PHASE2-01 + PHASE2-02 variants RETIRED.
     // Phase 2 dispatcher chain (phase2_scheduler + phase2_delta +
     // phase2_emit_guard + phase2_readiness_check + phase2_recovery) is
@@ -1021,6 +1049,7 @@ impl ErrorCode {
             // Wave 1 (PR #393)
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
+            Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
@@ -1309,6 +1338,9 @@ impl ErrorCode {
             // check ran degraded or blind. Loud (High), never a halt; the
             // feed and tick capture are unaffected.
             Self::DhanLiveXverify01RunDegraded => Severity::High,
+            // TICK-SPILL-01: rescued ticks are on disk and unreplayable until
+            // someone looks. High because the spill tier IS the loss guarantee.
+            Self::TickSpill01FileQuarantined => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1463,6 +1495,9 @@ impl ErrorCode {
             | Self::AuthGapDisconnectTokenMap
             | Self::StorageGapTickDedupSegment
             | Self::StorageGapF32F64Precision => ".claude/rules/project/gap-enforcement.md",
+            Self::TickSpill01FileQuarantined => {
+                "docs/error-runbooks/tick-spill-replay-error-codes.md"
+            }
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
             | Self::PrevClose01IlpFailed
@@ -1758,6 +1793,7 @@ impl ErrorCode {
             Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
+            Self::TickSpill01FileQuarantined,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
             Self::PrevClose02FirstSeenInconsistency,
@@ -2277,7 +2313,11 @@ mod tests {
                 // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
                 || s.starts_with("CADENCE-")
                 // The revived Dhan feed's live-vs-REST ground-truth check
-                || s.starts_with("DHAN-LIVE-XVERIFY-");
+                || s.starts_with("DHAN-LIVE-XVERIFY-")
+                // 2026-08-25: the tick spill tier's replay path — a rescued
+                // file QuestDB will never accept, set aside so the rest of
+                // the backlog can drain.
+                || s.starts_with("TICK-SPILL-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
