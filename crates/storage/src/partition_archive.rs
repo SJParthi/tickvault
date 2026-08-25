@@ -785,6 +785,45 @@ impl ArchiveOutcome {
     }
 }
 
+/// The canonical S3 key a partition's archive lives at.
+///
+/// One key per `(table, partition)`. Stable across runs, and the object at
+/// this key is **never overwritten and never deleted** by the archiver —
+/// it may be the only surviving copy of data that has since been dropped
+/// from the database.
+#[must_use]
+pub fn canonical_archive_key(table: &str, partition: &str) -> String {
+    format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.csv.gz")
+}
+
+/// The content-addressed key used when a partition no longer matches the
+/// archive already sitting at its canonical key.
+///
+/// # Why this exists
+///
+/// A partition is not immutable. `ticks` is `PARTITION BY HOUR` on the
+/// exchange last-trade time, and 10.0% of live ticks arrive with a timestamp
+/// more than an hour behind their receive time (measured 2026-08-24:
+/// 6,433,267 of 64,349,753). Those rows land in an hourly partition that has
+/// already been archived, so a later export can never reproduce the archived
+/// bytes — and under a pure never-overwrite policy the partition is pinned to
+/// disk forever. That is not hypothetical: on 2026-08-25 the live box held
+/// 1,000 `s3_conflict` audit rows, zero successful archives, and tick data
+/// going back to 2026-06-02 against a ONE-DAY hot window.
+///
+/// Embedding the FULL SHA-256 hex of the gzip makes the key:
+/// - **collision-free** — different content is a different key, so writing
+///   here can never destroy another export;
+/// - **idempotent** — re-exporting unchanged content yields the same key, so
+///   a retry reuses the object instead of uploading a duplicate;
+/// - **self-describing** — the key states exactly which bytes it holds.
+///
+/// The canonical object is left untouched, so BOTH copies survive.
+#[must_use]
+pub fn sidecar_archive_key(table: &str, partition: &str, gzip_sha256_hex: &str) -> String {
+    format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.sha-{gzip_sha256_hex}.csv.gz")
+}
+
 /// The idempotent `CREATE TABLE` DDL for the archive-audit chain. Pure
 /// (unit-testable without QuestDB).
 #[must_use]
@@ -1235,7 +1274,7 @@ impl PartitionArchiver {
             );
             return;
         };
-        let s3_key = format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.csv.gz");
+        let mut s3_key = canonical_archive_key(table, partition);
         // Did THIS run put the object there, or did it reuse an existing one?
         // The 4b mismatch arm below needs to tell those apart: deleting an
         // object we did not write could destroy the only copy of already-
@@ -1292,6 +1331,41 @@ impl PartitionArchiver {
                 );
             }
             Some(meta) => {
+                // The object at the canonical key does NOT match what this
+                // partition holds now. Before 2026-08-25 that ended the
+                // attempt: keep the partition, page nobody, retry forever.
+                //
+                // That policy deadlocked retention completely. Measured on
+                // the live box 2026-08-25: `partition_archive_audit` held
+                // 1,000 rows, EVERY one `s3_conflict`, ZERO successes ever
+                // recorded; the oldest surviving tick partition was
+                // 2026-06-02 against a ONE-DAY hot window, and the volume
+                // was 86% full and projected to fill within three sessions.
+                //
+                // The cause is not a bug in the never-overwrite rule — that
+                // rule is right. It is that a partition can legitimately
+                // CHANGE after it was archived: `ticks` is PARTITION BY HOUR
+                // on the exchange last-trade time, and 10.0% of live ticks
+                // arrive with a timestamp more than an hour behind their
+                // receive time (6,433,267 of 64,349,753 on 2026-08-24). Those
+                // land in an already-archived hourly partition, so the next
+                // export can never reproduce the archived bytes again, and
+                // the partition is pinned to disk for the life of the box.
+                //
+                // Resolution: keep the never-overwrite guarantee EXACTLY as
+                // it is — the existing object is never touched, never
+                // deleted, never PUT over — and write the current content to
+                // a CONTENT-ADDRESSED sidecar key instead. The key embeds the
+                // full SHA-256 of the gzip, so it is:
+                //   * collision-free  — a different digest is a different key;
+                //   * idempotent      — a re-run of an unchanged partition
+                //                       computes the same key and reuses it
+                //                       rather than uploading twice;
+                //   * complete        — it holds the partition as it stands
+                //                       NOW, which is what the drop removes.
+                // Both copies survive. The drop below then verifies against
+                // whichever key this run actually used.
+                let sidecar_key = sidecar_archive_key(table, partition, &exported.gzip_sha256_hex);
                 let reason = if meta.len != exported.gzip_bytes {
                     format!(
                         "existing S3 object length {} != local gzip {}",
@@ -1308,18 +1382,87 @@ impl PartitionArchiver {
                         exported.gzip_sha256_b64
                     )
                 };
-                self.record_failure(
-                    table,
-                    partition,
-                    ArchiveOutcome::S3Conflict,
-                    &format!(
-                        "{reason} — NEVER overwritten (may be the only copy of \
-                         already-dropped data); operator must inspect the key"
-                    ),
-                    summary,
-                );
-                remove_temp_file(&exported.path);
-                return;
+                match self.head_object_meta(&sidecar_key).await {
+                    Some(side)
+                        if side.len == exported.gzip_bytes
+                            && side.checksum_sha256_b64.as_deref()
+                                == Some(exported.gzip_sha256_b64.as_str()) =>
+                    {
+                        // A previous run already archived exactly this
+                        // content under the sidecar key. Reuse it — this is
+                        // the idempotent path, not a second upload.
+                        metrics::counter!("tv_partition_archive_sidecar_reused_total").increment(1);
+                        info!(
+                            table,
+                            partition,
+                            s3_key = %sidecar_key,
+                            reason = %reason,
+                            "canonical archive key differs from the current partition \
+                             (late-arriving rows changed it); identical sidecar archive \
+                             already present — reusing it, canonical key untouched"
+                        );
+                        s3_key = sidecar_key;
+                    }
+                    Some(_) => {
+                        // The sidecar key exists with DIFFERENT content. Two
+                        // distinct gzips cannot share a full SHA-256, so this
+                        // is a foreign object squatting the key rather than
+                        // one of ours. Refuse exactly as before.
+                        self.record_failure(
+                            table,
+                            partition,
+                            ArchiveOutcome::S3Conflict,
+                            &format!(
+                                "{reason}; and the content-addressed sidecar key is \
+                                 occupied by an object with a DIFFERENT digest — \
+                                 neither key overwritten; operator must inspect both"
+                            ),
+                            summary,
+                        );
+                        remove_temp_file(&exported.path);
+                        return;
+                    }
+                    None => {
+                        uploaded_this_run = true;
+                        if let Err(err) = self
+                            .upload_to_s3(&exported.path, &sidecar_key, &exported.gzip_sha256_b64)
+                            .await
+                        {
+                            self.record_failure(
+                                table,
+                                partition,
+                                ArchiveOutcome::UploadFailed,
+                                &format!("{err:#}"),
+                                summary,
+                            );
+                            remove_temp_file(&exported.path);
+                            return;
+                        }
+                        summary.gzip_bytes_uploaded = summary
+                            .gzip_bytes_uploaded
+                            .saturating_add(exported.gzip_bytes);
+                        metrics::counter!("tv_partition_archived_total").increment(1);
+                        // Counted separately from a clean first archive: a
+                        // rising sidecar rate means partitions are being
+                        // re-dirtied after archival, which is the signal that
+                        // the hot window is shorter than the feed's real
+                        // out-of-order lateness.
+                        metrics::counter!("tv_partition_archive_sidecar_written_total")
+                            .increment(1);
+                        warn!(
+                            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                            table,
+                            partition,
+                            s3_key = %sidecar_key,
+                            reason = %reason,
+                            "canonical archive key differs from the current partition \
+                             (late-arriving rows changed it) — archived to a \
+                             content-addressed sidecar key; canonical object NEVER \
+                             overwritten, both copies retained"
+                        );
+                        s3_key = sidecar_key;
+                    }
+                }
             }
             None => {
                 uploaded_this_run = true;
@@ -2008,6 +2151,106 @@ fn now_ist_nanos() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- Content-addressed sidecar archive keys (2026-08-25) -------------
+    //
+    // These pin the property that unblocked retention on the live box without
+    // weakening the never-overwrite guarantee: a changed partition is written
+    // to a key DERIVED FROM ITS CONTENT, so it can never land on top of an
+    // existing archive.
+
+    const SHA_A: &str = "3b1f2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809";
+    const SHA_B: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn canonical_archive_key_is_one_stable_key_per_partition() {
+        let a = canonical_archive_key("ticks", "2026-07-24T13");
+        assert_eq!(a, canonical_archive_key("ticks", "2026-07-24T13"));
+        assert!(
+            a.ends_with("/ticks/2026-07-24T13.csv.gz"),
+            "shape changed: {a}"
+        );
+        assert_ne!(a, canonical_archive_key("ticks", "2026-07-24T14"));
+        assert_ne!(a, canonical_archive_key("market_depth", "2026-07-24T13"));
+    }
+
+    #[test]
+    fn a_sidecar_key_can_never_collide_with_the_canonical_key() {
+        // The whole safety argument rests on this: if these could ever be
+        // equal, the sidecar upload would overwrite the object the
+        // never-overwrite policy exists to protect.
+        let canonical = canonical_archive_key("ticks", "2026-07-24T13");
+        for sha in [SHA_A, SHA_B] {
+            assert_ne!(
+                canonical,
+                sidecar_archive_key("ticks", "2026-07-24T13", sha),
+                "sidecar key collided with the canonical key"
+            );
+        }
+    }
+
+    #[test]
+    fn different_content_yields_different_sidecar_keys() {
+        // Two distinct exports of the same partition must never share a key,
+        // or the second would destroy the first.
+        assert_ne!(
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_A),
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_B)
+        );
+    }
+
+    #[test]
+    fn identical_content_yields_the_same_sidecar_key_so_retries_reuse() {
+        // Idempotence is what stops a retry loop uploading a duplicate object
+        // on every run for a partition that is no longer changing.
+        assert_eq!(
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_A),
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_A)
+        );
+    }
+
+    #[test]
+    fn the_sidecar_key_carries_the_full_digest_not_a_prefix() {
+        // A truncated digest reintroduces collision risk on the one path
+        // whose entire safety argument is "a different digest is a different
+        // key". Pin the full 64 hex characters.
+        let key = sidecar_archive_key("ticks", "2026-07-24T13", SHA_A);
+        assert!(key.contains(SHA_A), "full digest missing from key: {key}");
+        assert!(
+            key.ends_with(&format!(".sha-{SHA_A}.csv.gz")),
+            "unexpected sidecar shape: {key}"
+        );
+    }
+
+    #[test]
+    fn the_conflict_arm_never_uploads_to_the_canonical_key() {
+        // Source-scan ratchet. The mismatch arm must resolve to the sidecar
+        // key and nothing else — if a future edit points its upload back at
+        // `s3_key` while the canonical object is still present, the
+        // never-overwrite guarantee is silently gone and no unit test that
+        // does not read the source would notice.
+        let src = include_str!("partition_archive.rs");
+        let arm = src
+            .split("Some(meta) => {")
+            .nth(1)
+            .expect("the S3 mismatch arm must exist");
+        let arm = arm
+            .split("\n            None => {")
+            .next()
+            .expect("the mismatch arm must be followed by the absent arm");
+        assert!(
+            arm.contains("sidecar_archive_key("),
+            "the mismatch arm must derive a content-addressed key"
+        );
+        assert!(
+            arm.contains("&sidecar_key,"),
+            "the mismatch arm must upload to the sidecar key"
+        );
+        assert!(
+            !arm.contains("&s3_key,"),
+            "the mismatch arm must NEVER upload to the canonical key"
+        );
+    }
 
     // -----------------------------------------------------------------
     // INTRADAY class (2026-08-19) — ticks + second-level candles are
@@ -3459,27 +3702,57 @@ mod stub_integration_tests {
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
         let summary = archiver.archive_and_drop_old_partitions().await;
 
-        assert_eq!(summary.dropped, 0);
-        assert_eq!(summary.failed, 1, "S3Conflict must count as a failure");
+        // CONTRACT CHANGED 2026-08-25. This previously asserted
+        // "conflict => keep the partition forever". That policy deadlocked
+        // retention on the live box: 1,000 `s3_conflict` audit rows, ZERO
+        // successful archives ever recorded, tick data surviving back to
+        // 2026-06-02 against a ONE-DAY hot window, and the volume 86% full
+        // and projected to fill within three sessions.
+        //
+        // The cause is legitimate rather than a bug: `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10.0% of
+        // live ticks arrive with a timestamp over an hour behind their
+        // receive time, so an already-archived hourly partition keeps
+        // gaining rows and can never reproduce the archived bytes again.
+        //
+        // The guarantee that actually mattered is UNCHANGED and is still
+        // asserted below: the pre-existing object is never overwritten.
+        // What changed is that the partition's CURRENT content now goes to
+        // a content-addressed sidecar key, so both copies survive and the
+        // partition can finally be released.
+        assert_eq!(
+            summary.dropped, 1,
+            "a resolvable conflict must release the partition"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "the sidecar path is a success, not a failure"
+        );
+        let puts: Vec<String> = s3_log
+            .lock()
+            .expect("s3 log")
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(puts.len(), 1, "exactly one upload, to the sidecar key");
         assert!(
-            !s3_log
-                .lock()
-                .expect("s3 log")
-                .iter()
-                .any(|r| r.method == "PUT"),
-            "a different-length existing object must NEVER be overwritten"
+            puts[0].contains(".sha-"),
+            "upload must use a content-addressed key, got {}",
+            puts[0]
         );
         assert!(
-            !qdb_log
+            !puts[0].ends_with("/2026-04-01T09.csv.gz"),
+            "upload must NEVER target the canonical key, got {}",
+            puts[0]
+        );
+        assert!(
+            qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
-                .any(|r| r.target.contains("DROP PARTITION"))
-        );
-        assert_eq!(
-            objects.lock().expect("objects").get(TICKS_KEY),
-            Some(&(999_999, None)),
-            "the pre-existing object must be untouched"
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the partition must now be dropped"
         );
     }
 
@@ -3552,22 +3825,57 @@ mod stub_integration_tests {
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
         let summary = archiver.archive_and_drop_old_partitions().await;
 
-        assert_eq!(summary.dropped, 0, "checksum mismatch must never drop");
-        assert_eq!(summary.failed, 1, "S3Conflict counts as a failure");
+        // CONTRACT CHANGED 2026-08-25. This previously asserted
+        // "conflict => keep the partition forever". That policy deadlocked
+        // retention on the live box: 1,000 `s3_conflict` audit rows, ZERO
+        // successful archives ever recorded, tick data surviving back to
+        // 2026-06-02 against a ONE-DAY hot window, and the volume 86% full
+        // and projected to fill within three sessions.
+        //
+        // The cause is legitimate rather than a bug: `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10.0% of
+        // live ticks arrive with a timestamp over an hour behind their
+        // receive time, so an already-archived hourly partition keeps
+        // gaining rows and can never reproduce the archived bytes again.
+        //
+        // The guarantee that actually mattered is UNCHANGED and is still
+        // asserted below: the pre-existing object is never overwritten.
+        // What changed is that the partition's CURRENT content now goes to
+        // a content-addressed sidecar key, so both copies survive and the
+        // partition can finally be released.
+        assert_eq!(
+            summary.dropped, 1,
+            "a resolvable conflict must release the partition"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "the sidecar path is a success, not a failure"
+        );
+        let puts: Vec<String> = s3_log
+            .lock()
+            .expect("s3 log")
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(puts.len(), 1, "exactly one upload, to the sidecar key");
         assert!(
-            !s3_log
-                .lock()
-                .expect("s3 log")
-                .iter()
-                .any(|r| r.method == "PUT"),
-            "a same-length different-content object must NEVER be overwritten"
+            puts[0].contains(".sha-"),
+            "upload must use a content-addressed key, got {}",
+            puts[0]
         );
         assert!(
-            !qdb_log
+            !puts[0].ends_with("/2026-04-01T09.csv.gz"),
+            "upload must NEVER target the canonical key, got {}",
+            puts[0]
+        );
+        assert!(
+            qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
-                .any(|r| r.target.contains("DROP PARTITION"))
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the partition must now be dropped"
         );
     }
 
@@ -3591,21 +3899,57 @@ mod stub_integration_tests {
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
         let summary = archiver.archive_and_drop_old_partitions().await;
 
-        assert_eq!(summary.dropped, 0, "unprovable content must never drop");
-        assert_eq!(summary.failed, 1, "S3Conflict counts as a failure");
+        // CONTRACT CHANGED 2026-08-25. This previously asserted
+        // "conflict => keep the partition forever". That policy deadlocked
+        // retention on the live box: 1,000 `s3_conflict` audit rows, ZERO
+        // successful archives ever recorded, tick data surviving back to
+        // 2026-06-02 against a ONE-DAY hot window, and the volume 86% full
+        // and projected to fill within three sessions.
+        //
+        // The cause is legitimate rather than a bug: `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10.0% of
+        // live ticks arrive with a timestamp over an hour behind their
+        // receive time, so an already-archived hourly partition keeps
+        // gaining rows and can never reproduce the archived bytes again.
+        //
+        // The guarantee that actually mattered is UNCHANGED and is still
+        // asserted below: the pre-existing object is never overwritten.
+        // What changed is that the partition's CURRENT content now goes to
+        // a content-addressed sidecar key, so both copies survive and the
+        // partition can finally be released.
+        assert_eq!(
+            summary.dropped, 1,
+            "a resolvable conflict must release the partition"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "the sidecar path is a success, not a failure"
+        );
+        let puts: Vec<String> = s3_log
+            .lock()
+            .expect("s3 log")
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(puts.len(), 1, "exactly one upload, to the sidecar key");
         assert!(
-            !s3_log
-                .lock()
-                .expect("s3 log")
-                .iter()
-                .any(|r| r.method == "PUT")
+            puts[0].contains(".sha-"),
+            "upload must use a content-addressed key, got {}",
+            puts[0]
         );
         assert!(
-            !qdb_log
+            !puts[0].ends_with("/2026-04-01T09.csv.gz"),
+            "upload must NEVER target the canonical key, got {}",
+            puts[0]
+        );
+        assert!(
+            qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
-                .any(|r| r.target.contains("DROP PARTITION"))
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the partition must now be dropped"
         );
     }
 
