@@ -130,7 +130,7 @@ fn test_eventbridge_dlq_retention_is_bounded_drain_after_inspect() {
     let value: u64 = retention_line
         .split('=')
         .nth(1)
-        .and_then(|v| v.trim().split_whitespace().next())
+        .and_then(|v| v.split_whitespace().next())
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| panic!("could not parse retention from: {retention_line}")); // APPROVED: test
 

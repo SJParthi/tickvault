@@ -46,6 +46,7 @@ use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
+use crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST;
 use crate::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
@@ -212,13 +213,18 @@ impl TickPrices {
     pub fn from_tick(tick: &ParsedTick) -> Self {
         Self {
             last_traded_price: f32_to_f64_clean(tick.last_traded_price),
-            // `> 0.0` is false for NaN — a poisoned field can never be adopted.
-            day_open: if tick.day_open > 0.0 {
+            // Both day fields go through the SAME gate the day extremes use.
+            // `> 0.0` alone was the old test: it rejects NaN, but accepts
+            // `+inf`, `f32::MAX` and subnormals — and `day_open` is stamped
+            // into a bar's `open` AND `session_open`, `day_close` into
+            // `prev_day_close`, so one mangled frame reached four persisted
+            // columns. See `usable_exchange_price`.
+            day_open: if usable_exchange_price(tick.day_open) {
                 f32_to_f64_clean(tick.day_open)
             } else {
                 0.0
             },
-            day_close: if tick.day_close > 0.0 {
+            day_close: if usable_exchange_price(tick.day_close) {
                 f32_to_f64_clean(tick.day_close)
             } else {
                 0.0
@@ -295,6 +301,57 @@ pub struct AggregatorCell {
     /// first tick's LTP. Set at construction and re-set by
     /// [`Self::force_seal`] (the day boundary); consumed on the open.
     armed_for_day_open: [bool; TF_COUNT],
+    /// The highest exchange-published session HIGH this cell has observed
+    /// TODAY, in raw wire `f32`. `0.0` = no baseline (boot, or just after a
+    /// day-boundary [`Self::force_seal`]). Written ONLY by
+    /// [`Self::observe_session_extremes`], once per TICK — never once per
+    /// timeframe, because the comparison that gives it meaning is
+    /// "did the session high move between two consecutive PACKETS".
+    ///
+    /// It is a HIGH-WATER MARK, not a last-seen value, and that distinction is
+    /// load-bearing — see [`Self::observe_session_extremes`].
+    last_seen_day_high: f32,
+    /// Session LOW counterpart of [`Self::last_seen_day_high`] — a LOW-water
+    /// mark, moving only downward within a day.
+    last_seen_day_low: f32,
+    /// LTT of the PREVIOUS packet this cell observed. `0` = none yet. This is
+    /// the left endpoint of the interval a session-extreme delta describes,
+    /// and it is what makes attribution exact rather than assumed.
+    last_observed_ts: u32,
+}
+
+/// The session extremes that moved between the previous observed packet and
+/// this one, pre-widened to `f64`.
+///
+/// A `Some(v)` means: the exchange's running session high (or low) reached `v`
+/// at some instant strictly after the previous packet we saw and at or before
+/// this one. It says WHERE the print landed only in combination with the
+/// caller's bucket check — see [`AggregatorCell::observe_session_extremes`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SessionExtremeDelta {
+    /// New session high, if it rose since the previous observed packet.
+    pub new_high: Option<f64>,
+    /// New session low, if it fell since the previous observed packet.
+    pub new_low: Option<f64>,
+    /// LTT of the packet this delta is measured FROM — the OPEN left endpoint
+    /// of the interval `(prev_observed_ts, this packet's LTT]` inside which
+    /// the exchange set the new extreme. `0` when there was no previous
+    /// packet, which no bucket can match, so a first observation attributes to
+    /// nothing.
+    ///
+    /// Carried on the delta rather than read from the cell at fold time
+    /// because the fold must ask about the packet the delta CAME FROM, not
+    /// whatever the cell has seen since.
+    prev_observed_ts: u32,
+}
+
+impl SessionExtremeDelta {
+    /// `true` when neither extreme moved — the overwhelmingly common case.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.new_high.is_none() && self.new_low.is_none()
+    }
 }
 
 impl Default for AggregatorCell {
@@ -312,7 +369,126 @@ impl AggregatorCell {
             slots: [LiveCandleState::empty(); TF_COUNT],
             last_sealed: [LiveCandleState::empty(); TF_COUNT],
             armed_for_day_open: [true; TF_COUNT],
+            last_seen_day_high: 0.0,
+            last_seen_day_low: 0.0,
+            last_observed_ts: 0,
         }
+    }
+
+    /// Observes this packet's exchange-published session extremes and records
+    /// what MOVED since the previous packet. Call ONCE per tick, BEFORE the
+    /// per-timeframe fold.
+    ///
+    /// # Why a delta and not the level
+    ///
+    /// `day_high` / `day_low` are RUNNING SESSION extremes computed by the
+    /// exchange over the FULL tape — so they are immune both to our sampling
+    /// gaps and to Dhan's documented consumer-conflation (a slow consumer is
+    /// skipped forward to "the latest available state", silently discarding
+    /// the intermediate prints). Adopting the LEVEL into a mid-session bar
+    /// would smear the whole day's range across it, which is why
+    /// [`adopt_exchange_day_extremes`] is confined to the day's first bucket.
+    /// The DELTA carries a strictly narrower, and therefore usable, claim:
+    /// *the session high reached `v` somewhere in the interval between the
+    /// previous packet and this one.*
+    ///
+    /// That interval is attributable to exactly one bucket only when BOTH
+    /// endpoints sit inside it — which is why the fold applies the delta only
+    /// on the in-bucket path of a bucket that has already folded a tick. When
+    /// the interval straddles a bucket boundary the print's bucket is
+    /// genuinely unknown, and the delta is DROPPED rather than guessed.
+    ///
+    /// # Why the baseline is a HIGH-WATER MARK and never moves back down
+    ///
+    /// A session high cannot fall while the session runs, so a packet carrying
+    /// a LOWER `day_high` is never news — it is a stale packet, a vendor
+    /// reset, or corruption. This method is called before the fold knows
+    /// whether the packet is late, and the feed genuinely delivers out of
+    /// order (`LatePolicy::Refold` exists for exactly that). So if a fall were
+    /// allowed to move the baseline down, a stale packet would lower it and
+    /// the very next fresh packet would restore the earlier level as an
+    /// apparent RISE — attributing a print from minutes ago to the bucket that
+    /// happens to be open now. That is the session-range smearing this whole
+    /// design exists to avoid, arriving through the back door.
+    ///
+    /// Holding the mark instead makes a stale packet cost at worst a MISSED
+    /// widening, never a wrong one. Regressions are counted rather than
+    /// swallowed, because a persistent stream of them means the feed is
+    /// resetting mid-session and that is worth seeing.
+    ///
+    /// # Complexity
+    /// O(1) — two `f32` compares on the common path; the `f32`→`f64` widening
+    /// runs only on the rare packet where an extreme actually moved, so a
+    /// quiet tick pays two register comparisons and nothing else. No
+    /// allocation.
+    #[inline]
+    pub fn observe_session_extremes(&mut self, tick: &ParsedTick) -> SessionExtremeDelta {
+        let mut delta = SessionExtremeDelta {
+            prev_observed_ts: self.last_observed_ts,
+            ..SessionExtremeDelta::default()
+        };
+
+        // The interval's left endpoint may only be moved by a packet that
+        // actually REPORTED a session extreme. Advancing it unconditionally
+        // was a real defect (found by permutation sweep 2026-08-25): a Ticker
+        // packet, or a Quote whose day fields decoded 0.0 / NaN, carries no
+        // information about the session extremes at all — yet it narrowed the
+        // interval, so the NEXT rise was attributed on evidence that did not
+        // exist. A packet that says nothing must move nothing.
+        let carries_extremes =
+            usable_exchange_price(tick.day_high) || usable_exchange_price(tick.day_low);
+        if carries_extremes {
+            self.last_observed_ts = tick.exchange_timestamp;
+        }
+
+        // A packet claiming a session high BELOW its own session low is
+        // internally impossible, so it is evidence the frame is corrupt. The
+        // monotone marks below already make it harmless — neither value can
+        // win its comparison against a mark on the correct side — but harmless
+        // is not the same as seen. Without this the only self-contradictory
+        // signal the feed can produce leaves no trace anywhere, and a rising
+        // rate of it (a decode drift, a vendor change) would be invisible
+        // until something downstream broke for a reason nobody could name.
+        if usable_exchange_price(tick.day_high)
+            && usable_exchange_price(tick.day_low)
+            && tick.day_high < tick.day_low
+        {
+            metrics::counter!("tv_candle_session_extremes_inverted_total").increment(1);
+        }
+
+        if usable_exchange_price(tick.day_high) {
+            if tick.day_high > self.last_seen_day_high {
+                // A first observation has `last_seen_day_high == 0.0`, so it
+                // establishes the mark and reports NO delta — with no previous
+                // packet there is no interval for a delta to describe.
+                if self.last_seen_day_high > 0.0 {
+                    delta.new_high = Some(f32_to_f64_clean(tick.day_high));
+                }
+                self.last_seen_day_high = tick.day_high;
+            } else if tick.day_high < self.last_seen_day_high {
+                metrics::counter!(
+                    "tv_candle_session_extreme_regressed_total",
+                    "extreme" => "high"
+                )
+                .increment(1);
+            }
+        }
+        if usable_exchange_price(tick.day_low) {
+            if self.last_seen_day_low == 0.0 || tick.day_low < self.last_seen_day_low {
+                if self.last_seen_day_low > 0.0 {
+                    delta.new_low = Some(f32_to_f64_clean(tick.day_low));
+                }
+                self.last_seen_day_low = tick.day_low;
+            } else if tick.day_low > self.last_seen_day_low {
+                metrics::counter!(
+                    "tv_candle_session_extreme_regressed_total",
+                    "extreme" => "low"
+                )
+                .increment(1);
+            }
+        }
+
+        delta
     }
 
     /// Snapshot of the open bucket of one timeframe. Cheap `Copy`.
@@ -380,6 +556,40 @@ impl AggregatorCell {
         )
     }
 
+    /// [`Self::consume_tick_with_prices`] plus the session extremes that moved
+    /// on THIS packet, as returned by [`Self::observe_session_extremes`].
+    ///
+    /// The delta is an ARGUMENT rather than cell state on purpose. Carrying it
+    /// on `self` would make correctness depend on an unenforceable 1:1 pairing
+    /// between observe and fold: any caller that folded two packets through
+    /// one observation would re-apply the same delta to two different buckets.
+    /// Passing it makes the pairing structural, and makes every existing
+    /// caller of [`Self::consume_tick_with_prices`] fail CLOSED (empty delta,
+    /// today's exact LTP-only behaviour) rather than fail stale.
+    ///
+    /// # Complexity
+    /// O(1) — [`Self::consume_tick_with_prices`] plus at most two compares.
+    pub fn consume_tick_with_extremes(
+        &mut self,
+        tf: TfIndex,
+        tick: &ParsedTick,
+        prices: TickPrices,
+        bucket_start_cumulative: u64,
+        strategy: FeedStrategy,
+        cumulative_volume: u64,
+        extremes: SessionExtremeDelta,
+    ) -> ConsumeOutcome {
+        self.fold(
+            tf,
+            tick,
+            prices,
+            bucket_start_cumulative,
+            strategy,
+            cumulative_volume,
+            extremes,
+        )
+    }
+
     /// Folds one tick into ONE timeframe slot using PRE-WIDENED prices.
     ///
     /// Identical to [`AggregatorCell::consume_tick`] except the caller supplies
@@ -400,6 +610,36 @@ impl AggregatorCell {
         bucket_start_cumulative: u64,
         strategy: FeedStrategy,
         cumulative_volume: u64,
+    ) -> ConsumeOutcome {
+        self.fold(
+            tf,
+            tick,
+            prices,
+            bucket_start_cumulative,
+            strategy,
+            cumulative_volume,
+            SessionExtremeDelta::default(),
+        )
+    }
+
+    /// The single fold implementation behind all three public entry points.
+    // The fold is the single implementation behind three public entry points
+    // whose argument lists are fixed by the hot-path contract: prices and
+    // cumulative volume are widened once per TICK and passed down, never
+    // recomputed per timeframe. Bundling them into a struct would either
+    // reintroduce that per-timeframe cost or add an indirection on the
+    // per-tick path, for no behavioural gain.
+    // APPROVED: argument count is the hot-path contract, see above.
+    #[allow(clippy::too_many_arguments)]
+    fn fold(
+        &mut self,
+        tf: TfIndex,
+        tick: &ParsedTick,
+        prices: TickPrices,
+        bucket_start_cumulative: u64,
+        strategy: FeedStrategy,
+        cumulative_volume: u64,
+        extremes: SessionExtremeDelta,
     ) -> ConsumeOutcome {
         let ord = tf.as_ordinal();
         let bucket_start = tf.bucket_start(tick.exchange_timestamp);
@@ -451,7 +691,9 @@ impl AggregatorCell {
             // than losing the official open for the whole day; pinning it to a
             // session-time window would put trading-calendar knowledge inside
             // this cell, which is the wrong place for it.
-            let use_day_open = self.armed_for_day_open[ord] && prices.day_open > 0.0;
+            let use_day_open = self.armed_for_day_open[ord]
+                && prices.day_open > 0.0
+                && is_days_first_session_bucket(tf, bucket_start);
             if use_day_open {
                 self.armed_for_day_open[ord] = false;
             }
@@ -461,7 +703,8 @@ impl AggregatorCell {
             // across days on its own. Chosen over a new `[bool; TF_COUNT]`
             // array because it costs 0 bytes and cannot drift out of sync with
             // the seal path it is read from.
-            let first_bucket_of_day = self.last_sealed[ord].is_uninitialised();
+            let first_bucket_of_day = self.last_sealed[ord].is_uninitialised()
+                && is_days_first_session_bucket(tf, bucket_start);
             self.slots[ord] = open_bucket(
                 tick,
                 prices,
@@ -486,7 +729,10 @@ impl AggregatorCell {
             // carried no session open would lose the official open for the
             // whole day — the bucket is already open, and `fold_in_bucket`
             // deliberately never touches `open`.
-            if self.armed_for_day_open[ord] && prices.day_open > 0.0 {
+            if self.armed_for_day_open[ord]
+                && prices.day_open > 0.0
+                && is_days_first_session_bucket(tf, open_start)
+            {
                 self.armed_for_day_open[ord] = false;
                 self.slots[ord].open = prices.day_open;
                 // The MORE dangerous of the two `day_open` stamp sites: this
@@ -495,12 +741,32 @@ impl AggregatorCell {
                 // bar publishes an `open` outside its own `[low, high]`.
                 widen_range_to_include(&mut self.slots[ord], prices.day_open);
             }
+            // THE ATTRIBUTION TEST, and the only thing that makes a session-
+            // extreme delta usable: did the PREVIOUS observed packet also fall
+            // in THIS bucket? If it did, the interval the delta describes lies
+            // wholly inside this bucket, so the extreme was set here. If it
+            // did not — the packet before was late-routed, or opened an
+            // earlier bucket — the interval straddles a boundary and the
+            // extreme's bucket is genuinely unknown. Refuse rather than guess.
+            //
+            // Deliberately NOT `tick_count > 0`: `open_bucket` stamps
+            // `tick_count: 1`, so that test is always true on this path and
+            // proves nothing. This one asks the real question.
+            //
+            // Guarded by `is_empty()` so a quiet packet — the overwhelming
+            // majority — never pays the bucket arithmetic.
+            let attributable =
+                !extremes.is_empty() && tf.bucket_start(extremes.prev_observed_ts) == bucket_start;
             fold_in_bucket(&mut self.slots[ord], tick, prices, cumulative_volume);
             // Session extremes keep arriving through the first bucket's life,
             // so re-adopt on every tick of it — `day_high` at the bucket's LAST
             // tick is the one that matters, and max/min converge to it.
-            if self.last_sealed[ord].is_uninitialised() {
+            if self.last_sealed[ord].is_uninitialised()
+                && is_days_first_session_bucket(tf, open_start)
+            {
                 adopt_exchange_day_extremes(&mut self.slots[ord], tick);
+            } else if attributable {
+                adopt_session_extreme_delta(&mut self.slots[ord], extremes);
             }
             return ConsumeOutcome::Updated;
         }
@@ -563,6 +829,16 @@ impl AggregatorCell {
         let ord = tf.as_ordinal();
         self.armed_for_day_open[ord] = true;
         self.last_sealed[ord] = LiveCandleState::empty();
+        // The session-extreme baseline is a DAY-scoped quantity, so the day
+        // boundary must drop it: carrying yesterday's high across midnight
+        // would make today's genuinely-lower session high look like a fall and
+        // suppress every rise until it exceeded yesterday's. Clearing it here
+        // is idempotent across the 24 per-timeframe calls the boundary makes,
+        // and a partial (single-timeframe) force-seal only ever costs a missed
+        // widening — never a wrong one.
+        self.last_seen_day_high = 0.0;
+        self.last_seen_day_low = 0.0;
+        self.last_observed_ts = 0;
         if self.slots[ord].is_uninitialised() {
             return None;
         }
@@ -631,6 +907,37 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
     }
 }
 
+/// True when `bucket_start` is the bucket that CONTAINS the day's 09:15 open,
+/// for this timeframe.
+///
+/// The session-open stamp and the session-extreme LEVEL adoption are both
+/// correct for exactly one bucket per timeframe per day, and both used to be
+/// gated on `last_sealed[ord].is_uninitialised()` — "nothing has sealed yet".
+/// A permutation sweep on 2026-08-25 showed that is a different question with
+/// the same answer only on a clean 09:15 start. It is ALSO true for:
+///
+/// - an instrument first seen MID-SESSION (a contract attached at 11:00, a
+///   process restart), whose 11:00 bar then adopted the whole running session
+///   range — an observed single tick at 100 producing `high 180 / low 60`;
+/// - the bucket after an intraday `catch_up_seal`, which clears the slot but
+///   deliberately does not re-arm, so a later bucket could open at the 09:15
+///   official price and widen its own `low` down to it — a fabricated open
+///   and low on a mid-session candle, which then increments
+///   `tv_candle_open_clamped_total` and reads as a legitimate gap-open.
+///
+/// Deriving the answer from the CLOCK instead of from seal history closes all
+/// three. It is exact for every timeframe, including the ones 09:15 does not
+/// divide evenly (M30 and M60 resolve to the 09:00 bucket, which is the one
+/// that contains the open) and including D1, whose bucket is the whole day.
+///
+/// # Complexity
+/// O(1) — one remainder, one bucket alignment, one compare.
+#[inline]
+fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
+    let day_start = bucket_start - (bucket_start % 86_400);
+    bucket_start == tf.bucket_start(day_start + MARKET_OPEN_SECS_OF_DAY_IST)
+}
+
 /// True when `raw` is a usable exchange-published price.
 ///
 /// `> 0.0` alone is NOT sufficient and the difference is load-bearing:
@@ -639,9 +946,25 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
 ///
 /// `0.0` is the documented ABSENT sentinel — Ticker-mode packets carry no day
 /// fields at all, so a bare `0.0` must never be read as a real price of zero.
+///
+/// Two further rejections were added 2026-08-25 after a permutation sweep
+/// showed the LTP guard's protections were never extended to the day fields,
+/// even though both come off the wire the same way (`read_f32_le`):
+///
+/// - **`MAX_PLAUSIBLE_LTP` ceiling.** `tick_price_is_sane` has bounded the LTP
+///   since 2026-08-15, but a mangled frame decoding `f32::MAX` in `day_high`
+///   went straight into a bar's `high` — and, through `TickPrices`, into
+///   `open`, `session_open` and `prev_day_close` as well. One packet, four
+///   poisoned columns.
+/// - **`is_normal()`.** A positive SUBNORMAL passes every finiteness and sign
+///   test, but `f32_to_f64_clean` round-trips through a fixed 24-byte decimal
+///   buffer that a subnormal overruns, so it parses back as `0.0` — which then
+///   wins the `<` comparison and sets a bar's `low` to zero. `is_normal()`
+///   excludes exactly the subnormals (and `NaN`, `±∞`, `0.0`) and excludes no
+///   price any exchange can quote: the smallest normal `f32` is ~1.2e-38.
 #[inline]
-const fn usable_exchange_price(raw: f32) -> bool {
-    raw.is_finite() && raw > 0.0
+fn usable_exchange_price(raw: f32) -> bool {
+    raw.is_normal() && raw > 0.0 && raw <= MAX_PLAUSIBLE_LTP
 }
 
 /// Builds the state of a bucket being opened by `tick`.
@@ -693,19 +1016,17 @@ fn open_bucket(
         oi: i64::from(tick.open_interest),
         tick_count: 1,
         close_ts_ist_secs: tick.exchange_timestamp,
-        prev_day_close: if tick.day_close > 0.0 {
-            f32_to_f64_clean(tick.day_close)
-        } else {
-            0.0
-        },
+        // Same reasoning as `session_open` below: the gated widened value,
+        // never the raw wire field.
+        prev_day_close: prices.day_close,
         close_pct_from_prev_day: 0.0,
         oi_pct_from_prev_day: 0.0,
         volume_pct_from_prev_day: 0.0,
-        session_open: if tick.day_open > 0.0 {
-            f32_to_f64_clean(tick.day_open)
-        } else {
-            0.0
-        },
+        // Uses the ALREADY-GATED widened value, not the raw wire field. The
+        // raw read here was the last hole through which an absurd or
+        // subnormal `day_open` reached a persisted column after every other
+        // site had been closed (permutation sweep 2026-08-25).
+        session_open: prices.day_open,
         open_pct: 0.0,
         open_gap_pct: 0.0,
     };
@@ -763,6 +1084,37 @@ fn adopt_exchange_day_extremes(state: &mut LiveCandleState, tick: &ParsedTick) {
     }
 }
 
+/// Widens a bar to include a session extreme that the exchange set INSIDE it.
+///
+/// The caller must have established attribution first — both the previous and
+/// the current packet inside this bucket (see
+/// [`AggregatorCell::observe_session_extremes`]). Given that, this is not an
+/// estimate: `day_high` is the exchange's own figure over the full tape, so
+/// the widening replaces a value we sampled with the value that actually
+/// printed.
+///
+/// Widening only ever expands `[low, high]`, so it cannot invalidate
+/// `low <= open,close <= high`; and a delta that the LTP already covered is a
+/// no-op rather than a double count.
+///
+/// # Complexity
+/// O(1) — at most two compares and two stores. No allocation.
+#[inline]
+fn adopt_session_extreme_delta(state: &mut LiveCandleState, delta: SessionExtremeDelta) {
+    if let Some(new_high) = delta.new_high
+        && new_high > state.high
+    {
+        state.high = new_high;
+        metrics::counter!("tv_candle_session_high_recovered_total").increment(1);
+    }
+    if let Some(new_low) = delta.new_low
+        && new_low < state.low
+    {
+        state.low = new_low;
+        metrics::counter!("tv_candle_session_low_recovered_total").increment(1);
+    }
+}
+
 /// Folds an in-bucket tick. The caller has already established that the tick
 /// belongs to THIS bucket.
 #[inline]
@@ -779,12 +1131,32 @@ fn fold_in_bucket(
     if price < state.low {
         state.low = price;
     }
-    state.close = price;
-    state.close_ts_ist_secs = tick.exchange_timestamp;
-    // saturating_sub guards the rare out-of-order tick whose cumulative is
-    // below the bucket-start snapshot.
-    state.volume = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
-    state.oi = i64::from(tick.open_interest);
+    // ORDER GUARD (2026-08-25, permutation sweep). `fold_late_hlc` — the
+    // SEALED-bucket path — has always had this test; the OPEN-bucket path did
+    // not, so an out-of-order packet arriving inside a still-open bucket
+    // overwrote `close` with an EARLIER price and moved `close_ts` backwards.
+    // Two paths, two policies, and only one of them was right.
+    //
+    // The damage scaled with the bucket: on a 1-minute bar the window is 60
+    // seconds, but on the daily bar it is the whole session, so ANY reordered
+    // packet could rewrite the day's close — making it whichever packet
+    // arrived last rather than the one that traded last. `>=` is deliberate:
+    // many packets share one LTT second, and within a second last-write-wins
+    // is the pre-existing, correct behaviour.
+    if tick.exchange_timestamp >= state.close_ts_ist_secs {
+        state.close = price;
+        state.close_ts_ist_secs = tick.exchange_timestamp;
+        // Open interest is a point-in-time reading, so it belongs to the same
+        // "latest packet" question as the close. A stale packet's OI is simply
+        // an older reading, never news.
+        state.oi = i64::from(tick.open_interest);
+    }
+    // Exchange cumulative volume only ever rises, so a bucket's traded volume
+    // is monotone too. `saturating_sub` alone bounded the arithmetic but still
+    // let a stale packet SHRINK the bar's volume below a figure we had already
+    // observed. Taking the maximum keeps the highest cumulative actually seen.
+    let bucket_volume = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
+    state.volume = state.volume.max(bucket_volume);
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
     // baseline captured earlier in the session. The widened fields are `0.0`
@@ -924,12 +1296,12 @@ mod tests {
 
         // Roll into the next minute; day_open is on the wire now, but this
         // bucket is NOT the day's first and must open at its own price.
-        let mut second = tick_at(OPEN + 60, 24_055.50, 20);
+        let mut second = tick_at(OPEN + 60, 24_055.5, 20);
         second.day_open = 24_000.25;
         cell.consume_tick(TfIndex::M1, &second, 0, strategy, 20);
         assert_eq!(
             cell.snapshot(TfIndex::M1).open,
-            f32_to_f64_clean(24_055.50),
+            f32_to_f64_clean(24_055.5),
             "every bucket after the first opens at its OWN first traded price"
         );
     }
@@ -1758,5 +2130,788 @@ mod first_bucket_ohlc_tests {
         assert_eq!(s.low, 195.0, "day 2 first bucket must adopt day_low again");
         assert_ohlc_valid(&s, "day 2 first bucket");
         let _ = DAY;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session-extreme DELTA adoption (2026-08-25)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod session_extreme_delta_tests {
+    use super::tests::{OPEN, tick_at};
+    use super::*;
+
+    /// Drives the cell exactly as the real fan-out does: observe the packet's
+    /// session extremes ONCE, then fold it into one timeframe.
+    fn feed(cell: &mut AggregatorCell, tf: TfIndex, tick: &ParsedTick, cum: u32) {
+        let delta = cell.observe_session_extremes(tick);
+        cell.consume_tick_with_extremes(
+            tf,
+            tick,
+            TickPrices::from_tick(tick),
+            0,
+            FeedStrategy::DEFAULT,
+            u64::from(cum),
+            delta,
+        );
+    }
+
+    /// Puts the cell past the day's FIRST bucket, so the level-based
+    /// `adopt_exchange_day_extremes` path is no longer live and the delta path
+    /// is the one under test. Returns the timestamp of the first tick of the
+    /// second bucket.
+    fn advance_past_first_bucket(cell: &mut AggregatorCell, day_high: f32, day_low: f32) -> u32 {
+        let mut t = tick_at(OPEN, 100.0, 10);
+        t.day_high = day_high;
+        t.day_low = day_low;
+        feed(cell, TfIndex::M1, &t, 10);
+
+        let mut roll = tick_at(OPEN + 60, 100.0, 20);
+        roll.day_high = day_high;
+        roll.day_low = day_low;
+        feed(cell, TfIndex::M1, &roll, 20);
+        assert!(
+            cell.last_sealed_snapshot(TfIndex::M1).is_some(),
+            "fixture must be past the day's first bucket"
+        );
+        OPEN + 60
+    }
+
+    #[test]
+    fn a_session_high_set_between_two_ticks_of_one_bucket_is_recovered() {
+        // The whole point. Both observations sit inside the 09:16 bucket, so
+        // the print that lifted the session high to 104.5 necessarily landed
+        // inside it — even though our sampled LTPs never saw a price above
+        // 101.0. This is the trade Dhan's conflation dropped on the floor.
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+
+        let mut t = tick_at(second + 20, 101.0, 30);
+        t.day_high = 104.5;
+        t.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &t, 30);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(104.5),
+            "the exchange's own session high must widen the bucket it printed in"
+        );
+        assert_eq!(s.close, f32_to_f64_clean(101.0), "close stays the real LTP");
+        assert!(s.low <= s.high && s.close <= s.high, "range stays valid");
+    }
+
+    #[test]
+    fn a_session_low_set_between_two_ticks_of_one_bucket_is_recovered() {
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+
+        let mut t = tick_at(second + 20, 99.5, 30);
+        t.day_high = 100.0;
+        t.day_low = 95.25;
+        feed(&mut cell, TfIndex::M1, &t, 30);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.low, f32_to_f64_clean(95.25), "session low must widen it");
+        assert!(s.low <= s.high, "range stays valid");
+    }
+
+    #[test]
+    fn a_delta_whose_interval_straddles_a_bucket_boundary_is_dropped_not_guessed() {
+        // THE SAFETY PROPERTY. The previous packet was in the 09:15 bucket and
+        // this one opens 09:16, so the exchange could have printed the new high
+        // on either side of the boundary. We do not know which bucket owns it,
+        // so neither bucket gets it. Attributing it would be a fabricated bar.
+        let mut cell = AggregatorCell::empty();
+
+        let mut first = tick_at(OPEN, 100.0, 10);
+        first.day_high = 100.0;
+        first.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &first, 10);
+
+        // Roll into the second bucket, carrying a RISEN session high.
+        let mut roll = tick_at(OPEN + 60, 100.5, 20);
+        roll.day_high = 108.0;
+        roll.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &roll, 20);
+
+        let opened = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            opened.high,
+            f32_to_f64_clean(100.5),
+            "the straddling delta must NOT widen the freshly opened bucket"
+        );
+        let sealed = cell
+            .last_sealed_snapshot(TfIndex::M1)
+            .expect("first bucket sealed");
+        assert_eq!(
+            sealed.high,
+            f32_to_f64_clean(100.0),
+            "nor may it retro-widen the bucket that just sealed"
+        );
+    }
+
+    #[test]
+    fn a_late_packet_between_two_in_bucket_packets_breaks_attribution_and_is_refused() {
+        // THE TEST THAT PINS THE ATTRIBUTION CHECK. Everything else here is
+        // satisfied structurally by the roll path never adopting; this is the
+        // one shape that reaches the IN-BUCKET path with a predecessor that
+        // was somewhere else, and it is reachable because the feed genuinely
+        // delivers out of order.
+        //
+        // A: 09:16:10 opens the 09:16 bucket.
+        // B: 09:15:55 arrives late and is discarded — but it is still the
+        //    previous packet OBSERVED, and it sits in the 09:15 bucket.
+        // C: 09:16:20 folds in-bucket carrying a risen session high.
+        //
+        // The interval B→C spans 09:15:55 → 09:16:20, so the print could have
+        // landed in either minute. Attributing it to 09:16 would invent a high
+        // for a minute that may never have traded there.
+        let mut cell = AggregatorCell::empty();
+        let first_bucket = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+        let second_bucket = first_bucket + 60;
+
+        let mut a = tick_at(second_bucket + 10, 100.0, 30);
+        a.day_high = 100.0;
+        a.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &a, 30);
+
+        let mut b = tick_at(second_bucket - 5, 100.0, 28);
+        b.day_high = 100.0;
+        b.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &b, 28);
+
+        let mut c = tick_at(second_bucket + 20, 100.0, 35);
+        c.day_high = 140.0;
+        c.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &c, 35);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).high,
+            f32_to_f64_clean(100.0),
+            "a delta measured from a late packet in an earlier bucket must be refused"
+        );
+    }
+
+    #[test]
+    fn the_first_tick_of_a_bucket_never_carries_a_delta_even_mid_session() {
+        // Same rule stated from the other side: `tick_count == 0` means the
+        // previous packet was somewhere else, so nothing is attributable yet.
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+
+        // Force a third bucket whose FIRST tick carries a risen high.
+        let mut third = tick_at(second + 60, 100.0, 30);
+        third.day_high = 130.0;
+        third.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &third, 30);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).high,
+            f32_to_f64_clean(100.0),
+            "a bucket's first tick has no in-bucket predecessor to bound the interval"
+        );
+    }
+
+    #[test]
+    fn the_very_first_observation_of_the_day_establishes_a_baseline_and_widens_nothing() {
+        // With no previous packet there is no interval, so there is no delta —
+        // only a baseline. The day's first bucket still gets the LEVEL through
+        // the pre-existing `adopt_exchange_day_extremes` path, which is correct
+        // there and is deliberately left untouched.
+        let mut cell = AggregatorCell::empty();
+        let mut t = tick_at(OPEN, 100.0, 10);
+        t.day_high = 250.0;
+        t.day_low = 90.0;
+        let d = cell.observe_session_extremes(&t);
+        assert!(d.is_empty(), "no previous packet means no delta");
+    }
+
+    #[test]
+    fn a_stale_packet_cannot_lower_the_baseline_and_manufacture_a_false_rise() {
+        // THE OUT-OF-ORDER ATTACK, and the reason the baseline is a high-water
+        // mark. The feed delivers packets out of order — `LatePolicy::Refold`
+        // exists for exactly that — and `observe_session_extremes` runs before
+        // the fold knows a packet is late.
+        //
+        // If a fall re-baselined, this sequence would smear: a stale packet
+        // carrying an OLD, lower session high drops the mark, and the next
+        // fresh packet restores the level we already knew about as an apparent
+        // RISE — attributing a print from minutes ago to whichever bucket
+        // happens to be open now. Holding the mark makes that impossible.
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+
+        // Fresh packet: the session high genuinely rises to 130.
+        let mut fresh = tick_at(second + 10, 100.0, 25);
+        fresh.day_high = 130.0;
+        fresh.day_low = 100.0;
+        let d = cell.observe_session_extremes(&fresh);
+        assert_eq!(d.new_high, Some(f32_to_f64_clean(130.0)), "a real rise");
+
+        // A LATE packet from before that print, carrying the older high.
+        let mut stale = tick_at(second + 3, 100.0, 22);
+        stale.day_high = 100.0;
+        stale.day_low = 100.0;
+        let d = cell.observe_session_extremes(&stale);
+        assert!(d.new_high.is_none(), "a fall is never a delta");
+
+        // The next fresh packet re-states 130. It must NOT read as a rise.
+        let mut echo = tick_at(second + 20, 100.0, 30);
+        echo.day_high = 130.0;
+        echo.day_low = 100.0;
+        let d = cell.observe_session_extremes(&echo);
+        assert!(
+            d.new_high.is_none(),
+            "restoring a level we already recorded is not a new print"
+        );
+
+        // A genuine rise ABOVE the mark still fires, so holding the mark costs
+        // nothing real.
+        let mut higher = tick_at(second + 30, 100.0, 35);
+        higher.day_high = 131.0;
+        higher.day_low = 100.0;
+        let d = cell.observe_session_extremes(&higher);
+        assert_eq!(
+            d.new_high,
+            Some(f32_to_f64_clean(131.0)),
+            "a true new session high must still be recovered"
+        );
+    }
+
+    #[test]
+    fn absent_and_malformed_session_extremes_are_ignored_entirely() {
+        // Ticker-mode packets carry no session extremes at all (the field
+        // defaults to 0.0), and a malformed packet can decode to NaN. Neither
+        // may move the baseline, or the next real value would read as a delta
+        // against garbage.
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+
+        for bad in [0.0_f32, f32::NAN, -1.0_f32] {
+            let mut t = tick_at(second + 5, 100.0, 25);
+            t.day_high = bad;
+            t.day_low = bad;
+            let d = cell.observe_session_extremes(&t);
+            assert!(
+                d.is_empty(),
+                "an unusable session extreme must produce no delta"
+            );
+        }
+
+        // ...and the baseline survived, so a real rise still fires.
+        let mut good = tick_at(second + 10, 100.0, 30);
+        good.day_high = 101.0;
+        good.day_low = 100.0;
+        let d = cell.observe_session_extremes(&good);
+        assert_eq!(
+            d.new_high,
+            Some(f32_to_f64_clean(101.0)),
+            "the pre-existing baseline must be intact"
+        );
+    }
+
+    #[test]
+    fn a_delta_already_covered_by_the_traded_price_is_a_no_op() {
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 100.0, 100.0);
+
+        let mut high_trade = tick_at(second + 5, 120.0, 25);
+        high_trade.day_high = 120.0;
+        high_trade.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &high_trade, 25);
+
+        let mut echo = tick_at(second + 10, 110.0, 30);
+        echo.day_high = 120.0;
+        echo.day_low = 100.0;
+        feed(&mut cell, TfIndex::M1, &echo, 30);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).high,
+            f32_to_f64_clean(120.0),
+            "no double counting; the LTP already reached the session high"
+        );
+    }
+
+    #[test]
+    fn the_day_boundary_drops_the_baseline_so_yesterday_cannot_suppress_today() {
+        // Without this, an instrument that closed at 500 yesterday and trades
+        // at 90 today would need to exceed 500 before ANY rise registered.
+        let mut cell = AggregatorCell::empty();
+        let mut yesterday = tick_at(OPEN, 500.0, 10);
+        yesterday.day_high = 500.0;
+        yesterday.day_low = 400.0;
+        feed(&mut cell, TfIndex::M1, &yesterday, 10);
+
+        for tf in TfIndex::ALL {
+            let _ = cell.force_seal(tf);
+        }
+
+        let mut today = tick_at(OPEN + 86_400, 90.0, 5);
+        today.day_high = 90.0;
+        today.day_low = 90.0;
+        let d = cell.observe_session_extremes(&today);
+        assert!(
+            d.is_empty(),
+            "the first packet of a new day is a baseline, not a fall"
+        );
+
+        let mut later = tick_at(OPEN + 86_400 + 10, 91.0, 8);
+        later.day_high = 91.0;
+        later.day_low = 90.0;
+        let d = cell.observe_session_extremes(&later);
+        assert_eq!(
+            d.new_high,
+            Some(f32_to_f64_clean(91.0)),
+            "today's rises must register against today's baseline"
+        );
+    }
+
+    #[test]
+    fn a_caller_that_never_observes_extremes_gets_exactly_the_old_behaviour() {
+        // The contract is fail-CLOSED: `consume_tick` on its own must never
+        // widen from a stale delta. Every pre-existing caller and test depends
+        // on this.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        let mut first = tick_at(OPEN, 100.0, 10);
+        first.day_high = 100.0;
+        first.day_low = 100.0;
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 10);
+        let mut roll = tick_at(OPEN + 60, 100.0, 20);
+        roll.day_high = 100.0;
+        roll.day_low = 100.0;
+        cell.consume_tick(TfIndex::M1, &roll, 0, strategy, 20);
+
+        let mut spike = tick_at(OPEN + 80, 101.0, 30);
+        spike.day_high = 900.0;
+        spike.day_low = 1.0;
+        cell.consume_tick(TfIndex::M1, &spike, 0, strategy, 30);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.high, f32_to_f64_clean(101.0), "no observe, no widening");
+        assert_eq!(s.low, f32_to_f64_clean(100.0), "no observe, no widening");
+    }
+
+    #[test]
+    fn every_timeframe_sees_the_same_delta_from_one_observation() {
+        // `observe_session_extremes` runs ONCE per packet and all 24 folds read
+        // it. If it were ever moved inside the fan-out loop it would compare a
+        // packet against itself for 23 of them and the delta would vanish.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        for (ts, cum) in [(OPEN, 10_u32), (OPEN + 60, 20)] {
+            let mut t = tick_at(ts, 100.0, cum);
+            t.day_high = 100.0;
+            t.day_low = 100.0;
+            let delta = cell.observe_session_extremes(&t);
+            let prices = TickPrices::from_tick(&t);
+            for tf in TfIndex::ALL {
+                cell.consume_tick_with_extremes(tf, &t, prices, 0, strategy, u64::from(cum), delta);
+            }
+        }
+
+        let mut spike = tick_at(OPEN + 80, 100.0, 30);
+        spike.day_high = 107.0;
+        spike.day_low = 100.0;
+        let delta = cell.observe_session_extremes(&spike);
+        let prices = TickPrices::from_tick(&spike);
+        for tf in TfIndex::ALL {
+            cell.consume_tick_with_extremes(tf, &spike, prices, 0, strategy, 30, delta);
+        }
+
+        // M1 and M3 both have a prior in-bucket tick, so both recover it.
+        for tf in [TfIndex::M1, TfIndex::M3] {
+            assert_eq!(
+                cell.snapshot(tf).high,
+                f32_to_f64_clean(107.0),
+                "{tf:?} must recover the session high from the single observation"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Permutation-sweep regressions (2026-08-25)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod permutation_regression_tests {
+    use super::tests::{DAY, OPEN, tick_at};
+    use super::*;
+
+    fn strategy() -> FeedStrategy {
+        FeedStrategy::DEFAULT
+    }
+
+    #[test]
+    fn a_mid_session_first_bucket_must_not_adopt_the_whole_running_session_range() {
+        // Row #2 of the sweep. "The day's first bucket" was derived as
+        // "nothing has sealed yet", which is ALSO true for an instrument first
+        // seen at 11:00 — a contract attached after the open, or a process
+        // restart. That bar adopted the entire session's high and low, so a
+        // single tick at 100 published `high 180 / low 60`: a bar whose range
+        // is 120 points wide from one observed price.
+        let mut cell = AggregatorCell::empty();
+        let mid_session = OPEN + 105 * 60; // 11:00 IST
+
+        let mut t = tick_at(mid_session, 100.0, 10);
+        t.day_high = 180.0;
+        t.day_low = 60.0;
+        t.day_open = 95.0;
+        cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(100.0),
+            "high must be the observed price, not the session high"
+        );
+        assert_eq!(
+            s.low,
+            f32_to_f64_clean(100.0),
+            "low must be the observed price, not the session low"
+        );
+        assert_eq!(
+            s.open,
+            f32_to_f64_clean(100.0),
+            "a mid-session bar must not open at the 09:15 price"
+        );
+    }
+
+    #[test]
+    fn the_days_real_first_bucket_still_adopts_everything_it_should() {
+        // The other half — the fix must NARROW the predicate, not disable it.
+        let mut cell = AggregatorCell::empty();
+        let mut t = tick_at(OPEN, 100.0, 10);
+        t.day_high = 104.0;
+        t.day_low = 96.0;
+        t.day_open = 98.0;
+        cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.open,
+            f32_to_f64_clean(98.0),
+            "the day's first bar opens at the official open"
+        );
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(104.0),
+            "and adopts the session high"
+        );
+        assert_eq!(s.low, f32_to_f64_clean(96.0), "and the session low");
+    }
+
+    #[test]
+    fn a_bucket_opened_after_an_intraday_catch_up_seal_must_not_use_the_session_open() {
+        // Row #1, the sweep's worst finding. `catch_up_seal` clears the slot
+        // but deliberately does not re-arm day-open — and only the ROLL path
+        // disarmed. So a thin instrument whose first tick lacked `day_open`
+        // could open an 11:00 bucket at the 09:15 official price and widen
+        // that bar's `low` down to it: a fabricated open AND low on a
+        // mid-session candle, which then reads as a legitimate gap-open.
+        let mut cell = AggregatorCell::empty();
+
+        // Day's first bucket, no session open published yet.
+        let first = tick_at(OPEN, 100.0, 10);
+        assert_eq!(first.day_open, 0.0, "fixture models the unpopulated case");
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy(), 10);
+        assert!(
+            cell.catch_up_seal(TfIndex::M1, OPEN + 600).is_some(),
+            "fixture must drain the slot"
+        );
+
+        // Much later, the official open finally arrives on a packet.
+        let mid_session = OPEN + 105 * 60;
+        let mut later = tick_at(mid_session, 120.0, 40);
+        later.day_open = 95.0;
+        cell.consume_tick(TfIndex::M1, &later, 0, strategy(), 40);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.open,
+            f32_to_f64_clean(120.0),
+            "an 11:00 bar must open at its own first traded price"
+        );
+        assert_eq!(
+            s.low,
+            f32_to_f64_clean(120.0),
+            "and must not be widened down to the 09:15 price"
+        );
+    }
+
+    #[test]
+    fn an_absurd_but_finite_session_extreme_is_refused_everywhere_the_ltp_would_be() {
+        // Rows #4-#6. `tick_price_is_sane` has bounded the LTP by
+        // MAX_PLAUSIBLE_LTP since 2026-08-15; the day fields come off the wire
+        // the same way and were never bounded. One mangled frame reached a
+        // bar's `high`, `open`, `session_open` and `prev_day_close`.
+        for absurd in [f32::MAX, 1e30, MAX_PLAUSIBLE_LTP * 1.5] {
+            let mut cell = AggregatorCell::empty();
+            let mut t = tick_at(OPEN, 100.0, 10);
+            t.day_high = absurd;
+            t.day_open = absurd;
+            t.day_close = absurd;
+            cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+            let s = cell.snapshot(TfIndex::M1);
+            assert_eq!(
+                s.high,
+                f32_to_f64_clean(100.0),
+                "{absurd} must never become a bar high"
+            );
+            assert_eq!(
+                s.open,
+                f32_to_f64_clean(100.0),
+                "{absurd} must never become a bar open"
+            );
+            assert_eq!(
+                s.session_open, 0.0,
+                "{absurd} must never become the session open"
+            );
+            assert_eq!(
+                s.prev_day_close, 0.0,
+                "{absurd} must never become the previous close"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subnormal_session_low_cannot_zero_a_bars_low() {
+        // Row #11. A positive subnormal passes every finiteness and sign test,
+        // but `f32_to_f64_clean` round-trips through a fixed decimal buffer
+        // that a subnormal overruns, so it parses back as 0.0 -- which then
+        // wins the `<` comparison and sets the bar's low to zero.
+        let mut cell = AggregatorCell::empty();
+        let mut t = tick_at(OPEN, 100.0, 10);
+        t.day_low = f32::MIN_POSITIVE / 2.0;
+        assert!(
+            t.day_low > 0.0 && t.day_low.is_finite(),
+            "fixture is positive and finite"
+        );
+        cell.consume_tick(TfIndex::M1, &t, 0, strategy(), 10);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).low,
+            f32_to_f64_clean(100.0),
+            "a subnormal must never reach a bar's low"
+        );
+    }
+
+    #[test]
+    fn a_packet_carrying_no_session_extremes_must_not_narrow_the_delta_interval() {
+        // Rows #7-#8, and the one defect in the delta mechanism itself. A
+        // Ticker packet -- or a Quote whose day fields decoded 0.0/NaN --
+        // reports nothing about the session extremes, yet it was advancing the
+        // interval's left endpoint. The next rise was then attributed on
+        // evidence that did not exist.
+        let mut cell = AggregatorCell::empty();
+
+        // 09:15 bucket: a real Quote establishes the mark.
+        let mut a = tick_at(OPEN, 100.0, 10);
+        a.day_high = 100.0;
+        a.day_low = 100.0;
+        let d = cell.observe_session_extremes(&a);
+        cell.consume_tick_with_extremes(
+            TfIndex::M1,
+            &a,
+            TickPrices::from_tick(&a),
+            0,
+            strategy(),
+            10,
+            d,
+        );
+
+        // 09:16 bucket: a Ticker packet -- no day fields at all.
+        let silent = tick_at(OPEN + 70, 100.0, 20);
+        assert_eq!(silent.day_high, 0.0, "fixture models a Ticker packet");
+        let d = cell.observe_session_extremes(&silent);
+        cell.consume_tick_with_extremes(
+            TfIndex::M1,
+            &silent,
+            TickPrices::from_tick(&silent),
+            0,
+            strategy(),
+            20,
+            d,
+        );
+
+        // 09:16 again: a Quote with a risen high. The rise could have printed
+        // any time since the LAST PACKET THAT REPORTED AN EXTREME -- which was
+        // in the 09:15 bucket -- so it straddles and must be refused.
+        let mut c = tick_at(OPEN + 80, 100.0, 30);
+        c.day_high = 105.0;
+        c.day_low = 100.0;
+        let d = cell.observe_session_extremes(&c);
+        cell.consume_tick_with_extremes(
+            TfIndex::M1,
+            &c,
+            TickPrices::from_tick(&c),
+            0,
+            strategy(),
+            30,
+            d,
+        );
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).high,
+            f32_to_f64_clean(100.0),
+            "a silent packet must not license attribution it cannot support"
+        );
+        let _ = DAY;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open-bucket ordering (2026-08-25)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod open_bucket_ordering_tests {
+    use super::tests::{OPEN, tick_at};
+    use super::*;
+
+    /// Feeds a tick straight into one timeframe, as a caller with no session
+    /// extremes to report would.
+    fn fold(cell: &mut AggregatorCell, tf: TfIndex, tick: &ParsedTick, cum: u64) {
+        cell.consume_tick(tf, tick, 0, FeedStrategy::DEFAULT, cum);
+    }
+
+    #[test]
+    fn an_out_of_order_packet_inside_an_open_bucket_cannot_rewrite_the_close() {
+        // `fold_late_hlc` — the SEALED-bucket path — has always refused to let
+        // an earlier packet clobber a later close. The OPEN-bucket path did
+        // not, so a reordered packet arriving before its bucket sealed
+        // overwrote `close` with a stale price and moved `close_ts` backwards.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 40, 110.0, 30), 30);
+        // Reordered: an EARLIER tick arrives after the later one.
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 20, 101.0, 15), 15);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            s.close,
+            f32_to_f64_clean(110.0),
+            "the close must be the LATEST traded price, not the last packet to arrive"
+        );
+        assert_eq!(
+            s.close_ts_ist_secs,
+            OPEN + 40,
+            "and its timestamp must never move backwards"
+        );
+        assert_eq!(
+            s.high,
+            f32_to_f64_clean(110.0),
+            "the stale packet's price still counts toward the range"
+        );
+    }
+
+    #[test]
+    fn the_daily_bars_close_survives_reordering_across_the_whole_session() {
+        // The same defect, at the scale where it hurt most. A 1-minute bucket
+        // gives a reordered packet a 60-second window to do damage; the daily
+        // bucket gives it the entire session, so ANY reordered packet could
+        // rewrite the day's close.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::D1, &tick_at(OPEN, 100.0, 10), 10);
+        fold(
+            &mut cell,
+            TfIndex::D1,
+            &tick_at(OPEN + 5 * 3600, 250.0, 900),
+            900,
+        );
+        // Fifty minutes stale, arriving last.
+        fold(
+            &mut cell,
+            TfIndex::D1,
+            &tick_at(OPEN + 4 * 3600, 180.0, 700),
+            700,
+        );
+
+        let s = cell.snapshot(TfIndex::D1);
+        assert_eq!(
+            s.close,
+            f32_to_f64_clean(250.0),
+            "the day's close must be the last TRADE, not the last delivery"
+        );
+    }
+
+    #[test]
+    fn a_stale_packet_cannot_shrink_a_bars_volume() {
+        // Exchange cumulative volume only rises, so a bar's traded volume is
+        // monotone. `saturating_sub` bounded the arithmetic but still let a
+        // stale packet overwrite the bar with a SMALLER figure than one we had
+        // already observed.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 40, 110.0, 90), 90);
+        assert_eq!(cell.snapshot(TfIndex::M1).volume, 90, "fixture baseline");
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 20, 101.0, 40), 40);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            90,
+            "a stale cumulative must never reduce volume already observed"
+        );
+    }
+
+    #[test]
+    fn an_in_order_packet_still_advances_everything_it_should() {
+        // The positive control: the guard must NARROW behaviour, not freeze it.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        let mut later = tick_at(OPEN + 40, 110.0, 90);
+        later.open_interest = 4_242;
+        fold(&mut cell, TfIndex::M1, &later, 90);
+
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.close, f32_to_f64_clean(110.0), "close advances");
+        assert_eq!(s.close_ts_ist_secs, OPEN + 40, "close timestamp advances");
+        assert_eq!(s.volume, 90, "volume advances");
+        assert_eq!(s.oi, 4_242, "open interest advances");
+        assert_eq!(s.tick_count, 2, "both ticks counted");
+    }
+
+    #[test]
+    fn two_packets_sharing_one_second_keep_last_write_wins() {
+        // LTT is whole seconds and many packets share one. `>=` preserves the
+        // pre-existing behaviour inside a second; `>` would have silently
+        // frozen the close at the first packet of every second.
+        let mut cell = AggregatorCell::empty();
+
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M1, &tick_at(OPEN + 10, 103.0, 20), 20);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).close,
+            f32_to_f64_clean(103.0),
+            "within one second the later-arriving packet is the close"
+        );
+    }
+
+    #[test]
+    fn a_self_contradictory_session_range_is_counted_rather_than_ignored() {
+        // A packet whose session high sits BELOW its own session low is
+        // internally impossible. The monotone marks make it harmless, but
+        // harmless is not the same as seen.
+        let mut cell = AggregatorCell::empty();
+
+        let mut inverted = tick_at(OPEN + 10, 100.0, 10);
+        inverted.day_high = 50.0;
+        inverted.day_low = 150.0;
+        let delta = cell.observe_session_extremes(&inverted);
+        assert!(
+            delta.is_empty(),
+            "an inverted pair must never produce a widening"
+        );
     }
 }

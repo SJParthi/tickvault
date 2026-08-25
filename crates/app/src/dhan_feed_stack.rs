@@ -7694,7 +7694,7 @@ mod tests {
             inst(2, ExchangeSegment::NseFno),
         ];
         let (unique, _) = dedup_subscribe_set(&set);
-        let ids: Vec<u64> = unique.iter().map(|i| u64::from(i.security_id)).collect();
+        let ids: Vec<u64> = unique.iter().map(|i| i.security_id).collect();
         assert_eq!(ids, vec![3, 1, 2], "first occurrence wins, order preserved");
     }
 

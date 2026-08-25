@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn test_classify_frame_unknown_code_reported() {
         assert_eq!(
-            classify_frame(&[b'Z']),
+            classify_frame(b"Z"),
             Err(TruedataDecodeError::UnknownMsgCode(b'Z'))
         );
     }

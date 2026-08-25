@@ -163,7 +163,8 @@ fn guard_daily_cards_carry_the_compact_date() {
 
 #[test]
 fn guard_tf_pass_body_is_exactly_one_line() {
-    for ev in [tf_pass()] {
+    {
+        let ev = tf_pass();
         let body = ev.to_message();
         assert_eq!(body.lines().count(), 1, "TF pass must be ONE line: {body}");
     }

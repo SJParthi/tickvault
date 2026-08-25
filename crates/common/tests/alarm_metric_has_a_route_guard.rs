@@ -145,12 +145,12 @@ fn assigned_tv_values(block: &str, key: &str) -> Vec<String> {
         let trimmed = rest.trim_start();
         if prev_ok && trimmed.starts_with('=') {
             let after_eq = trimmed[1..].trim_start();
-            if let Some(stripped) = after_eq.strip_prefix('"') {
-                if let Some(close) = stripped.find('"') {
-                    let val = &stripped[..close];
-                    if val.starts_with("tv_") {
-                        out.push(val.to_string());
-                    }
+            if let Some(stripped) = after_eq.strip_prefix('"')
+                && let Some(close) = stripped.find('"')
+            {
+                let val = &stripped[..close];
+                if val.starts_with("tv_") {
+                    out.push(val.to_string());
                 }
             }
         }
@@ -224,10 +224,10 @@ fn every_alarm_metric_can_actually_arrive() {
         let dir = root.join("crates/aws-lambdas/src");
         let mut set = BTreeSet::new();
         for entry in std::fs::read_dir(&dir).expect("aws-lambdas src").flatten() {
-            if entry.path().extension().is_some_and(|x| x == "rs") {
-                if let Ok(body) = std::fs::read_to_string(entry.path()) {
-                    set.extend(tv_names(&body));
-                }
+            if entry.path().extension().is_some_and(|x| x == "rs")
+                && let Ok(body) = std::fs::read_to_string(entry.path())
+            {
+                set.extend(tv_names(&body));
             }
         }
         set

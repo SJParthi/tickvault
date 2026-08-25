@@ -676,7 +676,7 @@ fn literals_in_group(after: &str) -> Vec<String> {
     let mut in_string = false;
     let mut lit_start = 0_usize;
     let mut escaped = false;
-    while let Some((idx, ch)) = chars.next() {
+    for (idx, ch) in chars {
         if in_string {
             if escaped {
                 escaped = false;
@@ -2036,6 +2036,131 @@ fn native_build_toolchain_only_shrinks() {
         "SHRINK THE RATCHET: {gone:?} no longer appear in Cargo.lock. Remove \
          them from NATIVE_BUILD_TOOLCHAIN_BUDGET in the same PR — a budget that \
          outlives what it bounds is a permission nobody is using."
+    );
+}
+
+/// (i) SCOPE FIX #9 — the EMBEDDED-INTERPRETER class in the locked graph.
+///
+/// Every prior scope fix in this file closed a hole in what the guard LOOKED
+/// AT, never in its token list, and this is the ninth of exactly that shape.
+/// `native_build_toolchain_only_shrinks` above taught the guard to read
+/// `Cargo.lock` — but only for native BUILD systems. Nothing anywhere asked
+/// whether the graph contains a scripting RUNTIME.
+///
+/// That gap is reachable without tripping a single existing guard. A crate
+/// declaring `rhai = "1"` carries no banned file extension (the manifest is
+/// `.toml`), no shebang, no spawn literal, and no invocation token — and
+/// `.lock` is explicitly excluded from the token scan. The script itself
+/// travels as an `include_str!` string, which is `.rs` and therefore outside
+/// the invocation scan by design. Green everywhere, with a full interpreter
+/// compiled into the binary.
+///
+/// VERIFIED ABSENT when this landed (2026-08-24): none of the names below
+/// appears in the graph.
+///
+/// `wasm-bindgen`/`js-sys`/`web-sys` are deliberately NOT on this list. They
+/// ARE in the lockfile today, pulled transitively by chrono, getrandom, uuid,
+/// reqwest and opentelemetry — but every one of those declares them under
+/// `[target.'cfg(target_arch = "wasm32")'.dependencies]`, so they are never
+/// compiled for this system's targets. Banning them would fail the build over
+/// packages that do not exist in any artifact we ship. The lockfile is
+/// target-agnostic; that is a property of the FILE, not a breach.
+#[test]
+fn embedded_interpreters_are_absent_from_the_locked_graph() {
+    let root = repo_root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
+        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
+    let names = locked_package_names(&lock);
+
+    // Anti-vacuity, same reason as the sibling test: a parser returning
+    // nothing would make the assertion below trivially true. That is the
+    // false-OK class this file exists to prevent, and it must never be the
+    // way THIS guard reports green.
+    assert!(
+        names.len() > 100,
+        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
+         The lockfile format changed or the read failed, and this guard is \
+         enforcing nothing.",
+        names.len()
+    );
+
+    // Scripting/bytecode runtimes that would execute non-Rust code from
+    // inside a Rust binary. Absence from this list is not safety — it is why
+    // the list is a LIST, and adding to it is how the next one gets caught.
+    const EMBEDDED_INTERPRETERS: &[&str] = &[
+        "boa_engine",
+        "deno_core",
+        "duktape",
+        "hematita",
+        "mlua",
+        "neon",
+        "pyo3",
+        "quick-js",
+        "quickjs-rs",
+        "rhai",
+        "rlua",
+        "rquickjs",
+        "rustpython-vm",
+        "v8",
+        "wasmer",
+        "wasmi",
+        "wasmtime",
+    ];
+    assert_sorted_unique(EMBEDDED_INTERPRETERS, "EMBEDDED_INTERPRETERS");
+
+    let found: Vec<&str> = EMBEDDED_INTERPRETERS
+        .iter()
+        .copied()
+        .filter(|i| names.iter().any(|n| n == i))
+        .collect();
+
+    assert!(
+        found.is_empty(),
+        "RUST-ONLY BREACH — an embedded scripting runtime entered the dependency \
+         graph: {found:?}. The operator's standing rule is Rust only, except the \
+         enumerated frontend surfaces (rust-only-forever-lock-2026-07-19.md). A \
+         crate that embeds an interpreter ships one INSIDE the binary, where no \
+         file-extension ban, shebang check, or spawn scan can see it. If this is \
+         deliberate, it needs a fresh dated operator quote in that lock file \
+         FIRST — then remove the name here in the same PR, so the exemption is a \
+         visible diff and not an accident."
+    );
+}
+
+/// BITE-PROOF for SCOPE FIX #9.
+///
+/// The real-tree test above cannot be bite-proven by planting a package in
+/// `Cargo.lock` — `cargo test` validates and rewrites the lockfile before the
+/// test binary reads it, so the plant is gone by the time it matters (the
+/// sibling test's own doc records discovering this the hard way). The
+/// detection logic is therefore proven against fixtures, which is stronger
+/// anyway: it pins the parser as well as the rule.
+#[test]
+fn embedded_interpreter_detection_self_test() {
+    let clean = "[[package]]\nname = \"serde\"\n[[package]]\nname = \"tokio\"\n";
+    let dirty = "[[package]]\nname = \"serde\"\n[[package]]\nname = \"rhai\"\n";
+
+    let clean_names = locked_package_names(clean);
+    let dirty_names = locked_package_names(dirty);
+    assert_eq!(
+        clean_names,
+        vec!["serde", "tokio"],
+        "parser must read names"
+    );
+    assert_eq!(dirty_names, vec!["serde", "rhai"], "parser must read names");
+
+    let hits = |names: &[String]| -> usize {
+        ["pyo3", "rhai", "mlua"]
+            .iter()
+            .filter(|i| names.iter().any(|n| n == *i))
+            .count()
+    };
+    assert_eq!(hits(&clean_names), 0, "a clean graph must not match");
+    assert_eq!(
+        hits(&dirty_names),
+        1,
+        "an interpreter in the graph MUST be detected — if this fails, the \
+         real-tree test above is reporting green while enforcing nothing"
     );
 }
 
