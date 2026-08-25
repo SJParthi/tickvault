@@ -158,10 +158,22 @@ pub fn spawn_day_ohlc_tick_consumer(
                     // scope widened in the same change (and it immediately
                     // caught an earlier draft of THIS comment for quoting the
                     // pattern literally — the widened scope works).
-                    let _ = tracker.update_tick(
+                    //
+                    // The EXCHANGE's own `day_open` rides alongside the LTP
+                    // (operator 2026-08-25, recorded verbatim in
+                    // `websocket-connection-scope-lock.md`: the 09:15 open IS
+                    // the 09:08-09:12 pre-open equilibrium, so taking the
+                    // first tick we happen to SEE stored a 09:31 price under
+                    // the day's opening label for anything thin). Same
+                    // `f32_to_f64_clean` as the LTP: it is a price on the same
+                    // wire, so the same precision rule binds it. A Ticker-mode
+                    // packet carries 0.0 here, which the tracker treats as the
+                    // documented absent sentinel and ignores.
+                    let _ = tracker.update_tick_with_exchange_open(
                         tick.security_id,
                         ExchangeSegment::IdxI,
                         tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price),
+                        tickvault_common::price_precision::f32_to_f64_clean(tick.day_open),
                     );
                 }
                 Err(RecvError::Lagged(n)) => {

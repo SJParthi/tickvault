@@ -88,9 +88,7 @@ use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-    DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, MAX_PLAUSIBLE_LTP,
-    OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICKER_PACKET_SIZE,
+    MAX_PLAUSIBLE_LTP, SPOT_1M_REST_INDICES, TICK_PERSIST_END_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -3813,8 +3811,8 @@ pub fn drain_main_feed_frame(
 ) -> FrameOutcome {
     let mut out = FrameOutcome::default();
     // A single WebSocket message may carry SEVERAL stacked packets — the
-    // frame cap is sized for ~1,600 of them. Walking the frame packet by
-    // packet is what stops packets 2..N being silently discarded.
+    // frame cap is `MAX_PACKETS_PER_FRAME` (70,000) of them. Walking the frame
+    // packet by packet is what stops packets 2..N being silently discarded.
     let mut offset = 0usize;
     let mut packets = 0u32;
     while offset < frame.bytes.len() {
@@ -4454,31 +4452,10 @@ pub struct DrainOutcome {
     pub unparseable: u64,
 }
 
-/// Packets we will walk within one main-feed message before declaring the
-/// message malformed.
-///
-/// **The arithmetic here was wrong until 2026-08-14** and is worth stating
-/// rather than quietly fixing. The comment claimed "the 1 MiB frame cap over
-/// the smallest (16-byte) packet bounds a legitimate message well under this".
-/// Two errors: the cap is `MAIN_FEED_MAX_FRAME_BYTES` = 162 × 5,000 × 2 =
-/// 1,620,000 bytes (~1.55 MiB, not 1 MiB), and 1,620,000 / 16 = **101,250**,
-/// which is ABOVE this ceiling, not well under it. A maximum-size frame made
-/// entirely of 16-byte ticker packets would be truncated here, its remainder
-/// counted as unparseable.
-///
-/// The ceiling is nonetheless kept, because it is a defence against a hostile
-/// or malfunctioning peer rather than a capacity limit, and the shape it
-/// bounds cannot occur legitimately: a socket carries at most
-/// `MAIN_FEED_INSTRUMENTS_PER_CONNECTION` (5,000) subscriptions, so a
-/// legitimate frame carries on the order of 5,000 packets — 14× below this —
-/// and reaching 101,250 would require the peer to send ~20 packets per
-/// subscribed instrument in a single message. Raising the ceiling to clear the
-/// theoretical maximum would weaken the defence to buy nothing.
-///
-/// What changed is only the honesty of the justification: the bound is a
-/// deliberate policy ceiling, not the arithmetic consequence the old comment
-/// asserted.
-pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;
+/// Re-exported so the drain and the WS classifier walk the SAME bound. The
+/// declaration moved to `common` on 2026-08-25 (see there for the arithmetic
+/// correction and why the ceiling is a policy bound, not a capacity one).
+pub use tickvault_common::constants::MAX_PACKETS_PER_FRAME;
 
 /// Prometheus histogram of exchange→receipt delivery lag on the LIVE socket.
 ///
@@ -4760,29 +4737,11 @@ pub enum WsLag {
     ClampedNegative,
 }
 
-/// Byte length of the main-feed packet starting at `bytes`, from its response
-/// code. `None` for an unknown code or a header too short to classify.
-///
-/// The header carries its own message length at bytes 1..3, but that field is
-/// vendor-supplied: trusting it would let a malformed length walk the parser
-/// off the end of one packet and into the middle of the next. The code→size
-/// table is ours and is fixed by the protocol.
-fn main_feed_packet_len(bytes: &[u8]) -> Option<usize> {
-    let code = *bytes.first()?;
-    let size = match code {
-        // Ticker (2), previous close (6), OI (5), disconnect (50), market
-        // status (7) — sizes from `crates/common/src/constants.rs`.
-        2 => TICKER_PACKET_SIZE,
-        4 => QUOTE_PACKET_SIZE,
-        5 => OI_PACKET_SIZE,
-        6 => PREVIOUS_CLOSE_PACKET_SIZE,
-        7 => MARKET_STATUS_PACKET_SIZE,
-        8 => FULL_QUOTE_PACKET_SIZE,
-        50 => DISCONNECT_PACKET_SIZE,
-        _ => return None,
-    };
-    Some(size)
-}
+/// Re-exported so the drain and the WS classifier walk the SAME packet
+/// boundaries. Moved to `core` on 2026-08-25: two walks that disagree let the
+/// drain decode a disconnect the classifier never saw, which is exactly how a
+/// stacked 804 escaped Fatal classification for a full session.
+pub use tickvault_core::parser::dispatcher::main_feed_packet_len;
 
 /// Republishes the fold's depth gauges. Reads only — never mutates the fold.
 ///
@@ -7892,6 +7851,10 @@ pub fn now_ist_secs_of_day() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickvault_common::constants::{
+        DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE,
+        QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
+    };
     // Test-only: production stopped importing this when the silence gate moved
     // from the persistence window (09:00) to the continuous session (09:15).
     // The tests still need it — proving 09:00 is OUTSIDE the gate is exactly

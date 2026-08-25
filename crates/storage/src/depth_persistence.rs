@@ -563,6 +563,34 @@ fn temp_depth_spill_dir() -> PathBuf {
     ))
 }
 
+/// Whether a flush failure is worth ONE retry before the buffer is discarded.
+///
+/// The discard exists for a real reason, stated at [`DepthPersistence::flush`]:
+/// a row the SERVER rejected would be re-sent forever and block every later
+/// row. That reasoning covers a rejection and nothing else — and until
+/// 2026-08-25 the code applied it to every error alike.
+///
+/// It cost rows. On 2026-08-25 at 13:12:07 a flush failed with
+/// `io: Interrupted system call (os error 4)` and 8,810 depth rows left the
+/// buffer. EINTR is a signal arriving mid-syscall. The server never saw a
+/// complete request, nothing was rejected, and the buffer was untouched —
+/// there was nothing to wedge the session and every row was recoverable by
+/// simply trying again.
+///
+/// `SocketError` is the transport class (`from_ureq_error` maps IO and
+/// timeout failures onto it), so it is the one worth retrying.
+/// `ServerFlushError` is the rejection the discard was designed for and is
+/// deliberately NOT retried. Everything else — a bad name, a bad timestamp,
+/// an API misuse — is our own bug and would fail identically forever.
+///
+/// Retrying is safe here for the SAME reason the rescue path already tells
+/// the operator a manual re-ingest is safe: the depth DEDUP key carries
+/// `depth_kind` and `capture_seq`, so a partially-applied write plus a
+/// re-send collapses instead of duplicating.
+#[must_use]
+fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
+    matches!(err.code(), questdb::ErrorCode::SocketError)
+}
 impl DepthWriter {
     /// Production constructor — ILP-over-HTTP, lazy on connect failure.
     #[must_use]
@@ -841,22 +869,72 @@ impl DepthWriter {
             );
             anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
         };
-        match sender.flush(&mut self.buffer) {
+        let first = sender.flush(&mut self.buffer);
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err) if flush_failure_is_retryable(&err) => {
+                // ONE retry, only for the transport class. EINTR and a
+                // connection reset leave the buffer intact and the server
+                // holding nothing to reject, so discarding here throws away
+                // rows that a second attempt would have written -- which is
+                // exactly what happened on 2026-08-25 at 13:12:07, when
+                // `io: Interrupted system call (os error 4)` cost 8,810 rows.
+                //
+                // Bounded at one deliberately. This runs on the flush path, so
+                // an unbounded ladder would trade row loss for a stall, and a
+                // stall on this path fills the socket buffer and loses ticks
+                // upstream instead -- the same loss wearing a different name.
+                // A second failure falls through to the rescue-then-discard
+                // below, unchanged.
+                metrics::counter!(
+                    "tv_depth_flush_retries_total",
+                    "feed" => self.feed.as_str(),
+                )
+                .increment(1);
+                sender.flush(&mut self.buffer)
+            }
+            Err(err) => Err(err),
+        };
+        match outcome {
             Ok(()) => {
                 self.pending = 0;
                 Ok(())
             }
             Err(err) => {
+                let rescued_before = self.rescued;
                 let dropped = self.discard_pending();
-                error!(
-                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                    feed = self.feed.as_str(),
-                    dropped,
-                    ?err,
-                    "market_depth flush FAILED — {dropped} depth row(s) DISCARDED so one \
-                     rejected row cannot wedge the session. These levels are gone from the \
-                     table; the raw frames remain in the write-ahead log"
-                );
+                let rescued = self.rescued > rescued_before;
+                // The message used to say "These levels are gone from the
+                // table" on EVERY failure -- including the common case where
+                // `discard_pending` had just RESCUED the whole buffer to the
+                // depth spill file one line earlier. That is not a wording
+                // nit: reading the 2026-08-25 log it made a rescued 5,770-row
+                // flush look like 5,770 lost rows, and a loss figure that is
+                // wrong in the alarming direction gets acted on.
+                if rescued {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        dropped,
+                        rescued = true,
+                        ?err,
+                        "market_depth flush FAILED — {dropped} depth row(s) left the buffer \
+                         and were RESCUED to the depth spill file named on the preceding \
+                         line. They are NOT lost and NOT in QuestDB; re-ingest is safe to \
+                         repeat"
+                    );
+                } else {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        dropped,
+                        rescued = false,
+                        ?err,
+                        "market_depth flush FAILED and the spill rescue failed too — \
+                         {dropped} depth row(s) are permanently gone from the table. The \
+                         raw frames remain in the write-ahead log"
+                    );
+                }
                 Err(anyhow::anyhow!(err)).context(format!(
                     "market_depth flush failed; {dropped} row(s) discarded"
                 ))
@@ -890,6 +968,63 @@ pub fn depth_segment_label(code: u8) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- flush-failure classification (2026-08-25) ----------------------
+    //
+    // On 2026-08-25 at 13:12:07 a depth flush failed with
+    // `io: Interrupted system call (os error 4)` and 8,810 rows left the
+    // buffer. Nothing had been rejected; a signal had interrupted a syscall.
+    // These pin which failures earn a retry and, more importantly, which
+    // must NOT -- retrying a server rejection is the wedge the discard was
+    // built to prevent, so widening this predicate re-opens that.
+
+    #[test]
+    fn a_transport_failure_is_retried() {
+        // The observed 2026-08-25 error, verbatim. `from_ureq_error` maps IO
+        // and timeout failures onto SocketError.
+        let eintr = questdb::Error::new(
+            questdb::ErrorCode::SocketError,
+            "Could not flush buffer: io: Interrupted system call (os error 4)",
+        );
+        assert!(
+            flush_failure_is_retryable(&eintr),
+            "EINTR left the buffer intact and the server holding nothing — retry it"
+        );
+    }
+
+    #[test]
+    fn a_server_rejection_is_never_retried() {
+        // THE reason the discard exists. A row the server refused would be
+        // re-sent forever and block every later row, so this must stay false
+        // however the retry predicate is edited.
+        let rejected = questdb::Error::new(
+            questdb::ErrorCode::ServerFlushError,
+            "failed to parse line protocol: invalid field format",
+        );
+        assert!(
+            !flush_failure_is_retryable(&rejected),
+            "a rejected row must be discarded, not re-sent — this is the wedge case"
+        );
+    }
+
+    #[test]
+    fn our_own_bugs_are_never_retried() {
+        // A bad name or timestamp fails identically forever; retrying buys a
+        // second stall and no rows.
+        for code in [
+            questdb::ErrorCode::InvalidName,
+            questdb::ErrorCode::InvalidTimestamp,
+            questdb::ErrorCode::InvalidApiCall,
+            questdb::ErrorCode::ConfigError,
+            questdb::ErrorCode::AuthError,
+        ] {
+            let err = questdb::Error::new(code, "deterministic failure");
+            assert!(
+                !flush_failure_is_retryable(&err),
+                "{code:?} is deterministic — retrying stalls the flush path for nothing"
+            );
+        }
+    }
 
     fn row() -> DepthRow {
         DepthRow {

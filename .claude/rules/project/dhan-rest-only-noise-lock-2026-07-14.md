@@ -900,3 +900,108 @@ day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** wit
   restructure §2.3d-ii describes — it is over by one byte, and shaving an unrelated
   comment to make room is what that guard's own message forbids.
 - Automates an instance TERMINATE for AZ failover under cover of this quote.
+
+### §2.3g — 2026-08-25: the disk went to 20 KB free and 15 tables suspended, and neither gauge had an alarm
+
+**The verbatim operator demand (2026-08-25, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see menawhoel alogn with these ensure to achieve O(1) irrepsetcive of any woerts case sistauitons or errros or scenarios it can ve any stuaitons dudew which is db memory ram app forntend backend ir tut ca be antthing dude see which is forntend bakcend db app memory ram db aws isnatcnes ebs iops imbs disk rpessure ram wal disk spill ring ufefr dlq or etc etc"
+
+> "See this process shod lbe entitled fully comprehsoisnvely automated no manual intervention or human inputs or human monitoring shod lobe expected"
+
+The quote names **disk pressure, WAL and disk spill** by hand and rules out
+human monitoring. This dated row is the rule-file edit §3 requires before any
+new page, recorded BEFORE the terraform.
+
+#### The evidence, read from the live account rather than inferred
+
+`get-metric-statistics`, namespace `Tickvault/Prod`, 2026-08-25:
+
+| IST | `tv_spill_dir_free_bytes` (Min) | `tv_questdb_wal_suspended_tables` (Max) |
+|---|---:|---:|
+| 08:30 | **38.8 GB** | 0 |
+| 09:30 | **14.5 GB** | 0 |
+| 10:30 | **20,480 bytes** | 3 |
+| 11:30 | 20,480 bytes | **15** |
+| 12:30 | 20,480 bytes | 11 |
+| 13:30 | 58.6 GB | 0 |
+
+24 GB vanished in the first hour, the volume sat at **twenty kilobytes free**
+for three hours, and fifteen tables suspended themselves. A WAL-suspended
+QuestDB table keeps ACKing ILP writes while silently not applying them, so
+every writer reported success throughout.
+
+**Neither metric has an alarm.** Verified live:
+`describe-alarms --query 'MetricAlarms[?MetricName==...]'` returns EMPTY for
+both. Both are EMF-selected and both reached CloudWatch on schedule — the data
+was there, in the operator's own account, the whole time, and nothing was
+watching it. The hour of warning between 38.8 GB and 14.5 GB went to nobody.
+
+#### ⚠ A claim from the same audit that live data REFUTED
+
+The audit reported that `tv-prod-disk-fill-rate-high` "cannot fire inside a
+session" because its 6-hour period × 2 evaluations needs 12 hours of data on a
+box that runs ~9. **That is FALSE**, and it is recorded here because acting on
+it would have damaged a working alarm. `describe-alarms` returns:
+
+> `Threshold Crossed: 1 out of the last 2 datapoints [1.4588218265938622 (25/08/26 12:22:00)] was not greater than the threshold (4.0)`
+
+It evaluates, it produces datapoints, it can fire. Its periods are wall-clock
+aligned, not "12 hours of samples" — a 9-hour session spans two aligned 6-hour
+buckets and both carry samples.
+
+**What the same reading DOES show is worse than the claim it refutes.** On the
+day the volume hit 100% for three hours, this alarm measured **1.46 points per
+day against a threshold of 4** — arithmetically correct and completely useless.
+The 24-hour drift stays low *because* overnight archival drops partitions; the
+failure is INTRADAY, and a daily-trend alarm cannot see an intraday fill by
+construction. Its 6-hour window is the right window for the trend it measures
+and must not be "fixed"; what was missing is an intraday signal, which is
+exactly what the free-bytes gauge is.
+
+#### What this authorizes — family (5) gains an ELEVENTH and TWELFTH signal
+
+| Alarm | Metric | Fires when | Why this shape |
+|---|---|---|---|
+| `tv-<env>-spill-dir-free-low` | `tv_spill_dir_free_bytes` | `Minimum <= 20 GiB` | 20 GiB is ~1 hour of headroom at the MEASURED 24 GB/h open burn, and the archiver's own high-water trigger sits at 75% used — this fires while remediation is still possible, not after |
+| `tv-<env>-questdb-wal-suspended` | `tv_questdb_wal_suspended_tables` | `Maximum >= 1` | The ONE detector for the one failure where every tick counter reports success and the rows are not there. Threshold 1, not 3: a single suspended table is already silent loss for that table |
+
+Both `treat_missing_data = notBreaching` and ungated: the box is stopped
+overnight, so no-data is the normal off-hours state, and each reports a DEFECT
+rather than silence. The dark-lane case is already owned by
+`dhan-no-ticks-flowing` (§2.3b-i). Neither takes `ok_actions` — a gauge falling
+back is an aged-out datapoint or a recovery the operator performed, never proof
+the space came back (the round-14 precedent).
+
+**Cost:** 2 alarms ≈ **$0.20/mo**, no new EMF name and no user-data byte —
+which matters, because the user-data template renders at exactly its
+15,872-byte budget with **zero** free (§2.3d-ii), so an EMF-route alarm is
+currently impossible.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on free bytes does not create free bytes. The volume filled because a
+session's ingest exceeds what 300 GB holds with a 2-day archival floor, and
+that arithmetic is untouched here. This converts a three-hour full disk that
+reached the operator only when he asked why a table was empty into a page an
+hour before it happens — that is the entire claim.
+
+It also does not fix the probe that FEEDS the WAL gauge. Until 2026-08-25 a
+QuestDB schema drift that changed the `suspended` cell's TYPE made
+`parse_wal_tables_response` skip every row and return `Ok(vec![])`, which set
+the gauge to a confident **0**. Alarming a gauge whose producer can fail open
+would be alarming a lie; the probe now returns `AllRowsSkipped` instead, so the
+alarm has something honest to read. `tv_wal_suspension_probe_failed_total` is
+still NOT EMF-selected and so is still CloudWatch-invisible — blocked by the
+same zero-byte budget, recorded rather than papered over.
+
+#### What a PR that violates §2.3g looks like (REJECT)
+
+- Changes `disk_fill_rate_high`'s 6-hour period on the strength of the refuted
+  "cannot fire" claim.
+- Gives either alarm `ok_actions` (a green "recovered" for an aged-out
+  datapoint is the Rule-11 false recovery).
+- Makes either `breaching` on missing data (pages every night and weekend).
+- Alarms the WAL gauge while leaving the probe able to fail open.
+- Adds a per-INSTRUMENT dimension to either (the §2.3 cardinality rule stands).
