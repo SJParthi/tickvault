@@ -368,7 +368,7 @@ impl TfIndex {
     /// The plan item that flagged this proposed gating **all sixteen**
     /// second-scale frames off, citing the disk cost. That would have been
     /// wrong in the opposite direction: it deletes `S1 S5 S10 S15 S30`, which
-    /// are five of the thirteen the operator explicitly requested and the
+    /// are five of the frames the operator explicitly requested and the
     /// reason the 32 GiB instance was bought. Gating exactly the eleven
     /// unrequested frames removes most of the cost while removing none of the
     /// capability — the requirement and the disk concern were never actually
@@ -382,7 +382,17 @@ impl TfIndex {
     /// deleting variants would cascade through all of that for no benefit.
     ///
     /// Changing this set needs a fresh dated operator quote, exactly like the
-    /// constants it derives from; `tf_index_operator_set_is_thirteen` pins it.
+    /// constants it derives from; `tf_index_operator_set_is_twelve` pins it.
+    ///
+    /// # 2026-08-25 — D1 removed (13 -> 12)
+    ///
+    /// Operator directive 2026-08-25: *"never evr do th edeirvation of 1day
+    /// usign these intenrla tiemframes clauclation"*. `D1` therefore leaves
+    /// this set, so the live lane stops emitting `candles_1d`. Recorded in
+    /// `.claude/rules/project/live-feed-purity.md` rule 10 BEFORE this edit,
+    /// per the rule-file-first law. The variant, its ordinal and its slot are
+    /// untouched — only EMISSION is gated, exactly as the eleven unrequested
+    /// second-scale frames already are.
     #[inline]
     #[must_use]
     pub const fn is_operator_requested(self) -> bool {
@@ -400,7 +410,6 @@ impl TfIndex {
                 | Self::M15
                 | Self::M30
                 | Self::M60
-                | Self::D1
         )
     }
 
@@ -897,7 +906,7 @@ mod tests {
     /// (`S4`/`S5`/`S6`, `S14`/`S15`), so an off-by-one in either direction is
     /// a plausible edit that a length check would wave through.
     #[test]
-    fn tf_index_operator_set_is_thirteen() {
+    fn tf_index_operator_set_is_twelve() {
         let requested: Vec<TfIndex> = TfIndex::ALL
             .iter()
             .copied()
@@ -906,13 +915,13 @@ mod tests {
 
         assert_eq!(
             requested.len(),
-            13,
-            "operator Quote 13 (2026-08-08) names exactly 13 timeframes; found \
-             {}. Changing this set needs a fresh dated quote.",
+            12,
+            "operator Quote 13 (2026-08-08) named 13; the 2026-08-25 directive removed \
+             D1, leaving 12. Found {}. Changing this set needs a fresh dated quote.",
             requested.len()
         );
 
-        // The thirteen that must emit rows.
+        // The twelve that must emit rows.
         for tf in [
             TfIndex::S1,
             TfIndex::S5,
@@ -926,13 +935,22 @@ mod tests {
             TfIndex::M15,
             TfIndex::M30,
             TfIndex::M60,
-            TfIndex::D1,
         ] {
             assert!(
                 tf.is_operator_requested(),
-                "{tf:?} is one of the operator's thirteen and must emit rows"
+                "{tf:?} is one of the operator's twelve and must emit rows"
             );
         }
+
+        // D1 — removed 2026-08-25. Kept as its OWN assertion rather than
+        // folded into the list below, because it is not "never asked for":
+        // it was requested, then explicitly withdrawn, and a reader needs to
+        // see that difference.
+        assert!(
+            !TfIndex::D1.is_operator_requested(),
+            "operator 2026-08-25: 1d must NEVER be derived from the internal \
+             timeframe fold — the live lane must not emit candles_1d"
+        );
 
         // The eleven that exist but were never asked for.
         for tf in [

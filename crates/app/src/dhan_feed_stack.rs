@@ -1223,7 +1223,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -1420,7 +1420,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -1675,7 +1675,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
