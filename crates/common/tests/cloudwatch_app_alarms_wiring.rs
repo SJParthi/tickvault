@@ -1843,7 +1843,38 @@ fn the_dead_monitor_check_resolves_consts_not_just_literals() {
 /// weaken the guard. An entry costs a written reason and is checked from both
 /// ends below: it must name a Lambda that still exists AND that is still
 /// unalarmed, so an exemption can never outlive what it excuses.
-const LAMBDA_ERRORS_ALARM_EXEMPT: &[(&str, &str)] = &[];
+const LAMBDA_ERRORS_ALARM_EXEMPT: &[(&str, &str)] = &[
+    // These three DO have an `Errors` alarm; what they lack is an SNS route,
+    // so they change state in the console and page nobody. Until 2026-08-25
+    // the guard counted them as watched, which certified three dead pagers.
+    //
+    // They are listed rather than routed because all three are operator
+    // CONVENIENCE surfaces, not the trading path: a 3am page because a console
+    // proxy threw while nobody was looking at the console is noise, and this
+    // file has spent the day removing noise, not adding it. What was wrong was
+    // never the choice — it was that the choice was invisible.
+    //
+    // NOTE the asymmetry deliberately preserved: `questdb_console_front` and
+    // `operator_control` predate this work and were always action-less;
+    // `questdb_console_proxy` was added on 2026-08-25 mirroring its front
+    // sibling exactly. Giving one half of a two-Lambda surface a pager while
+    // the other stays silent is a worse inconsistency than either state.
+    (
+        "questdb_console_front",
+        "dashboard-only by design: operator console surface, alarm exists without \
+         alarm_actions. Pre-dates 2026-08-25.",
+    ),
+    (
+        "questdb_console_proxy",
+        "dashboard-only by design: mirrors questdb_console_front, including its \
+         lack of alarm_actions. Added 2026-08-25.",
+    ),
+    (
+        "operator_control",
+        "dashboard-only by design: operator control surface, alarm exists without \
+         alarm_actions. Pre-dates 2026-08-25.",
+    ),
+];
 
 /// Every `resource "aws_lambda_function" "<name>"` in the terraform directory.
 fn declared_lambda_resources(bodies: &[(String, String)]) -> Vec<String> {
@@ -1906,7 +1937,22 @@ fn lambdas_with_errors_alarm(bodies: &[(String, String)]) -> Vec<String> {
                     inside = false;
                     let is_lambda_errors =
                         block.contains("\"Errors\"") && block.contains("\"AWS/Lambda\"");
-                    if is_lambda_errors {
+                    // COVERAGE REQUIRES A ROUTE, not just an alarm (2026-08-25).
+                    //
+                    // An adversarial re-read found this guard counted
+                    // `questdb_console_proxy_errors` as "watched" while it has
+                    // no `alarm_actions` at all — it changes state in the
+                    // console and pages nobody. The guard therefore certified
+                    // a dead pager, which is the exact false-OK its own rule
+                    // section forbids elsewhere. A dashboard-only alarm is a
+                    // legitimate CHOICE; it just has to be a declared one, so
+                    // it goes in DASHBOARD_ONLY_ALARM_LAMBDAS below rather
+                    // than passing silently as a pager.
+                    let has_route = block.lines().any(|l| {
+                        let t = l.trim();
+                        t.starts_with("alarm_actions") && !t.contains("= []") && !t.ends_with('[')
+                    });
+                    if is_lambda_errors && has_route {
                         if let Some(name) = function_name_ref(&block) {
                             out.push(name);
                         }
@@ -1977,7 +2023,9 @@ fn every_lambda_has_an_errors_alarm_or_a_declared_exemption() {
 
     assert!(
         unwatched.is_empty(),
-        "these Lambdas have NO `Errors` alarm and no declared exemption: {unwatched:?}\n\
+        "these Lambdas have no ROUTED `Errors` alarm and no declared exemption: {unwatched:?}\n\
+         (An alarm with no `alarm_actions` does not count — it pages nobody. Either give \
+         it an SNS route, or add it to LAMBDA_ERRORS_ALARM_EXEMPT with a written reason.)\n\
          A Lambda that throws writes to its own log group and stops there — nothing pages, \
          and for a scheduled one the only other signal is the absence of whatever it was \
          supposed to do.\n\
@@ -2022,10 +2070,20 @@ resource "aws_lambda_function" "beta" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "alpha_errors" {
-  metric_name = "Errors"
-  namespace   = "AWS/Lambda"
+  metric_name   = "Errors"
+  namespace     = "AWS/Lambda"
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
   dimensions = {
     FunctionName = aws_lambda_function.alpha.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "delta_errors" {
+  metric_name   = "Errors"
+  namespace     = "AWS/Lambda"
+  alarm_actions = []
+  dimensions = {
+    FunctionName = aws_lambda_function.delta.function_name
   }
 }
 
@@ -2042,6 +2100,14 @@ resource "aws_cloudwatch_metric_alarm" "unrelated" {
     // AWS/Lambda, so it is not a Lambda-Errors alarm at all. This is the case
     // a namespace-blind matcher would get wrong.
     assert_eq!(lambdas_with_errors_alarm(&bodies), vec!["alpha"]);
+
+    // `delta` has a textbook Lambda-Errors alarm and `alarm_actions = []`, so
+    // it pages NOBODY and must NOT count as covered. Before 2026-08-25 it
+    // would have — that is how three dead pagers were certified as watched.
+    assert!(
+        !lambdas_with_errors_alarm(&bodies).contains(&"delta".to_string()),
+        "an alarm with `alarm_actions = []` routes nowhere and must not count as coverage"
+    );
 
     // The `[0]` count-index form must resolve to the bare resource name.
     let indexed = "FunctionName = aws_lambda_function.gamma[0].function_name }";
@@ -2168,8 +2234,20 @@ fn alarm_eval_windows(bodies: &[(String, String)]) -> Vec<(String, u64, u64, boo
             }
             inside = false;
 
-            // A Metrics Insights alarm is one whose expression is a query.
-            let is_insights = block.contains("SELECT ") && block.contains(" FROM ");
+            // A Metrics Insights alarm is one whose EXPRESSION is a query.
+            //
+            // Deliberately scoped to the `expression =` line, not the whole
+            // block. An adversarial re-read found that `block.contains("SELECT ")`
+            // also matches PROSE: `partition_archive_failed` is a plain alarm
+            // whose alarm_description quotes "SELECT outcome, count() FROM
+            // partition_archive_audit". That misclassified it as Insights (a
+            // false failure waiting on any legal window widening) AND let it
+            // satisfy the non-vacuity assertion below, so deleting every real
+            // Insights alarm would have left this guard "passing" on a comment.
+            let is_insights = block.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with("expression") && t.contains("SELECT ") && t.contains(" FROM ")
+            });
             if !is_insights {
                 continue;
             }
@@ -2183,21 +2261,50 @@ fn alarm_eval_windows(bodies: &[(String, String)]) -> Vec<(String, u64, u64, boo
                 })
                 .unwrap_or_else(|| "<unnamed>".to_string());
 
-            let num = |key: &str| -> Option<u64> {
-                block.lines().find_map(|l| {
+            // Returns (parsed value, saw_the_key_but_could_not_parse).
+            //
+            // MAX, not first-match. An alarm may carry several `period` lines
+            // (a metric_query with a plain `metric {}` block alongside one with
+            // a SELECT). Taking the FIRST let a 60-second decorative period
+            // mask a 21600-second query period — a 12-hour window reported as
+            // 120 seconds, i.e. the exact defect this guard exists to catch,
+            // sailing through it.
+            let num = |key: &str| -> (Option<u64>, bool) {
+                let mut best: Option<u64> = None;
+                let mut unparsed = false;
+                for l in block.lines() {
                     let t = l.trim();
-                    let rest = t.strip_prefix(key)?;
-                    let rest = rest.trim_start();
-                    let rest = rest.strip_prefix('=')?;
-                    rest.trim().split_whitespace().next()?.parse::<u64>().ok()
-                })
+                    let Some(rest) = t.strip_prefix(key) else {
+                        continue;
+                    };
+                    let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                        continue;
+                    };
+                    match rest.trim().split_whitespace().next().map(str::parse::<u64>) {
+                        Some(Ok(v)) => best = Some(best.map_or(v, |b: u64| b.max(v))),
+                        // A `period = local.six_hours` or `= var.x` parsed to
+                        // None and then `unwrap_or(0)` reported a ZERO-second
+                        // window, which always passes. Absent is safe; present
+                        // but unreadable is NOT, and must fail loudly.
+                        _ => unparsed = true,
+                    }
+                }
+                (best, unparsed)
             };
 
-            // `period` lives inside the metric_query block; evaluation_periods
-            // at the alarm level. A missing period means the query inherits a
-            // default, which cannot exceed the cap on its own.
-            let period = num("period").unwrap_or(0);
-            let evals = num("evaluation_periods").unwrap_or(1);
+            let (period_opt, period_unparsed) = num("period");
+            let (evals_opt, evals_unparsed) = num("evaluation_periods");
+            assert!(
+                !period_unparsed && !evals_unparsed,
+                "Metrics Insights alarm `{name}` has a non-literal `period` or \
+                 `evaluation_periods` (an interpolation or variable), so this guard \
+                 CANNOT verify it stays inside AWS's 3-hour cap.\n\
+                 Use a literal, or extend this guard to resolve the value — do not \
+                 leave it unverifiable, because an over-wide window is rejected only \
+                 at APPLY time and freezes the entire apply lane."
+            );
+            let period = period_opt.unwrap_or(0);
+            let evals = evals_opt.unwrap_or(1);
             out.push((name, period, evals, true));
         }
     }
@@ -2269,4 +2376,70 @@ resource "aws_cloudwatch_metric_alarm" "plain" {
         alarm_eval_windows(&bodies).is_empty(),
         "a non-Insights alarm must not be subject to the Insights cap"
     );
+
+    // --- The three bypasses an adversarial re-read found on 2026-08-25 ---
+    // Each defeated the guard at exactly the job it exists for. Pinned here so
+    // they cannot come back quietly.
+
+    // BYPASS 1: two metric_query blocks, the SHORT decorative period first.
+    // `find_map` took 60 and reported a 120s window for a real 43200s one.
+    let two_queries = r#"
+resource "aws_cloudwatch_metric_alarm" "masked" {
+  evaluation_periods = 2
+  metric_query {
+    id = "a"
+    metric {
+      period = 60
+    }
+  }
+  metric_query {
+    id          = "b"
+    period      = 21600
+    expression  = "SELECT MAX(x) FROM \"CWAgent\" WHERE y = 'z'"
+  }
+}
+"#;
+    let w = alarm_eval_windows(&[("f.tf".to_string(), two_queries.to_string())]);
+    assert_eq!(w.len(), 1, "the Insights alarm must still be found");
+    assert_eq!(
+        w[0].1 * w[0].2,
+        43200,
+        "MAX period must win: a decorative 60s period must not mask the 21600s \
+         query period (this reported 120s before the fix)"
+    );
+
+    // BYPASS 3: `SELECT ... FROM` quoted in PROSE must not classify a plain
+    // alarm as Insights. This is live in the tree (partition_archive_failed).
+    let prose = r#"
+resource "aws_cloudwatch_metric_alarm" "prose_only" {
+  evaluation_periods = 1
+  period             = 21600
+  metric_name        = "Errors"
+  alarm_description  = "check retention: SELECT outcome, count() FROM partition_archive_audit"
+}
+"#;
+    assert!(
+        alarm_eval_windows(&[("f.tf".to_string(), prose.to_string())]).is_empty(),
+        "a SELECT quoted in an alarm_description must NOT be treated as a Metrics \
+         Insights query — it caused both a false failure and a vacuity hole"
+    );
+}
+
+#[test]
+#[should_panic(expected = "CANNOT verify")]
+fn metrics_insights_guard_refuses_an_unreadable_window() {
+    // BYPASS 2: a non-literal period parsed to None, then `unwrap_or(0)`
+    // reported a ZERO-second window, which passes every cap. Absent is safe;
+    // present-but-unreadable must fail loudly rather than silently pass.
+    let interpolated = r#"
+resource "aws_cloudwatch_metric_alarm" "unreadable" {
+  evaluation_periods = 2
+  metric_query {
+    id          = "q"
+    period      = local.six_hours
+    expression  = "SELECT MAX(x) FROM \"CWAgent\" WHERE y = 'z'"
+  }
+}
+"#;
+    let _ = alarm_eval_windows(&[("f.tf".to_string(), interpolated.to_string())]);
 }
