@@ -997,3 +997,129 @@ path. A PR that routes it write-through is a REJECT.
   fold and flush, and flush failure is DEDUP-idempotent via spill + WAL replay. Larger
   batches widen only the VISIBILITY-latency window, never the loss window. No secret flows
   through an ILP buffer.
+
+## ITEM 13 — THE O(1) DEFECT, AND WHAT MONEY CANNOT BUY (2026-08-25, operator: "i just need always O(1) dude i dotn need any slowness ddue irrespective of any situaitons" + "even if we need to reach the max 150 usd also let su gfo ahead dude but ensure to achieve alwyas O(1)")
+
+Five parallel adversarial agents were run on the operator's instruction to attack
+everything. Budget authorization to $150/mo is recorded as Quote 19 in
+`daily-universe-scope-expansion-2026-05-27.md`. **It is deliberately unspent — see 13d.**
+
+### 13a — THE defect: the ILP flush runs ON the drain task (Verified, CRITICAL)
+
+`flush_and_record` (`dhan_feed_stack.rs:2564-2578`) is a **synchronous blocking
+ILP-over-HTTP round trip** executed inside `block_in_place` (`:2524`) **on the frame-drain
+task** — the same `tokio::select!` loop (`:2705`) that carries frame ingest, the 5 s
+catch-up seal and the 30 s silence scan.
+
+So while a flush is in flight, **no frames are drained**. That is the causal chain from a
+saturated disk to LOST TICKS, and it is the reason the operator sees "slowness" that no
+amount of hot-path O(1) work can remove:
+
+    disk saturated -> flush RTT grows -> drain stalls -> ring/socket buffer fills
+      -> Dhan skips a slow consumer forward to "latest available state"
+      -> intermediate ticks are dropped VENDOR-SIDE, with no sequence number to detect it
+
+**This is the single highest-value fix in this plan and it costs nothing.** Decoupling the
+flush from the drain (own task + bounded channel) removes the coupling entirely. Until it
+is decoupled, no O(1) guarantee can honestly be given for the END-TO-END path, however
+O(1) the decode is.
+
+### 13b — Flush RATE is the axis, and the tick threshold was never re-sized (Verified, HIGH)
+
+`FLUSH_ROW_THRESHOLD = 1_000` (`:3282`) is evaluated per frame. Measured emission is
+~1.44 rows/sec per continuously-ticking instrument (derived in 13c), so:
+
+| Instruments | rows/sec | flushes/sec @1,000 | drain blocked @5 ms RTT |
+|---|---|---|---|
+| 8,315 (today) | ~11,900 | ~12 | ~6% |
+| 24,600 (authorized) | ~35,300 | ~35 | ~18% |
+
+`DEPTH_FLUSH_ROW_THRESHOLD` was raised 10x to 10,000 for exactly this reason, and its own
+comment says so verbatim: *"Payload is the wrong axis here; FLUSH RATE is"* (`:3285-3306`).
+The TICK threshold sat at 1,000 through that reasoning and through the 21 -> 24 TF append.
+Raising it is the cheap mitigation; 13a is the real fix.
+
+### 13c — A hostile finding, CORRECTED before it was acted on (Verified)
+
+An agent reported the row rate as **3.39/sec/instrument** (28,200 today, 83,400 at target,
+42% drain blocked), computed as the harmonic sum over all sixteen second-scale frames
+S1..S15 + S30. **That is wrong by 2.4x**, and acting on it would have justified far more
+drastic surgery than the system needs.
+
+`TfIndex::is_operator_requested()` (`tf_index.rs:388`) gates ROW EMISSION to the operator's
+**thirteen** frames (S1 S5 S10 S15 S30 + M1 M2 M3 M5 M15 M30 M60 + D1), with three live
+production call sites (`dhan_feed_stack.rs:1227`, `:1424`, `:1679`). The eleven unrequested
+frames (S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14) fold but never emit. True rate is
+1 + 0.2 + 0.1 + 0.0667 + 0.0333 + minute frames = **~1.44 rows/sec**.
+
+**And this closes off a comfortable answer.** That gate has been live since 2026-08-18
+(#1768), so it was ALREADY ACTIVE during the 2026-08-24 session that wrote 4,744 GB. The
+row rate therefore does NOT explain the amplification, and no further timeframe trimming
+will. Recorded because the agent's number was plausible, alarming, and would have sent the
+next session cutting capability the operator explicitly paid for.
+
+### 13d — Why the $150 authorization is NOT being spent yet
+
+Quote 19 authorizes up to $150/mo (live: $48.87 actual, $61.51 forecast, $130 limit — the
+widest margin this account has had). The EBS raise 500 -> 1000 MiB/s is +$20/mo and fits.
+It is held anyway, on three grounds:
+
+1. **It does not deliver the thing asked for.** The requirement is O(1) with no slowness.
+   13a is a *coupling* defect: a faster disk shortens the stall, it does not remove the
+   drain from the flush's critical path. The $0 fix is the one that gives the guarantee.
+2. **~25x amplification is still unexplained** (13c removed the row-count explanation).
+   Doubling throughput against a 25x inefficiency buys one doubling and leaves the defect;
+   at 24,600 instruments the same wall returns.
+3. **The newest prime suspect is a config value, not a capacity one:**
+   `QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE = 16777216` (16 MiB) in
+   `deploy/docker/docker-compose.yml`, across 24 tables x ~17 columns. If page granularity
+   is the amplifier the fix is an env var at $0. Also newly noted from the same file:
+   `QDB_CAIRO_O3_MAX_LAG = 60000000` (60 s) — a tick whose last-trade time is 90 minutes
+   stale falls FAR outside that window and forces a hard partition merge, which strengthens
+   the out-of-order candidate rather than the commit-rate one.
+
+The raise is taken the moment a measurement shows traffic still at the ceiling after the
+amplification fix — with a number behind it, not a guess.
+
+### 13e — Scale cliffs found by the same pass (recorded, not yet fixed)
+
+- **HIGH — ring-full drops are unrecoverable within the session.** `pool_supervisor.rs:127-160`:
+  a full ring counts and DROPS the frame. It is in the WAL, but `dhan_feed_stack.rs:1007-1021`
+  states the re-fold path needs a LIVE ring, so recovery is *"the next boot re-folds them"*.
+  A mid-session backpressure episode is therefore silent tick loss until tomorrow.
+- **HIGH — the measured `catch_up_seal_all` cost is the EMPTY case.** `multi_tf_aggregator.rs:1676-1679`
+  measures "none seals"; the 9.67 ms figure is pure traversal. At a minute boundary with
+  24,600 slots the sweep must EMIT, and each emission runs the absorption chain. The
+  recorded number does not bound the real one. Unknown.
+- **MEDIUM — subscribe dispatch is unpaced.** 24,600/100 = 246 messages sent back-to-back
+  (`connection.rs:794-850`, no delay). Dhan's subscribe rate limit is Unknown; a throttled
+  subscribe produces no error, only absence — and the 09:12 readiness deadline would miss
+  silently.
+- **LOW — memory is fine.** `AggregatorCell` 6.2 KB x 24,600 = 153 MB; seal ring 86 MB;
+  all per-instrument maps cap fail-closed at 25,000. 32 GiB holds it comfortably.
+- **No locks on the drain hot path** — single-owner `&mut`, verified.
+
+### 13f — The honest O(1) verdict (audited stage by stage)
+
+**Per PACKET the path IS O(1) and effectively zero-allocation, and it is PROVEN, not
+claimed:** fixed-offset `from_le_bytes` decode, one O(1)-average composite-key lookup, 24
+scalar folds, one bounded `try_send`, one ILP append — with `dhat_allocation.rs`,
+`dhat_multi_tf_fold.rs` (exactly 0 allocations over 10,000 folds), `dhat_ws_lag.rs` and
+`dhat_ws_reader_zero_alloc.rs` gating every PR. No banned pattern appears on the per-tick
+path.
+
+**Three stages break strict O(1) and must never be described otherwise:**
+1. **The ILP flush** — O(rows) AND blocking AND on the drain task (13a). The real defect.
+2. **Slot allocation** on an instrument's first tick — a `Vec` growth step is O(n) and
+   unbounded; mitigated by boot pre-sizing, not eliminated.
+3. **Seal-refusal escalation** (`:4192`) — writes to disk INLINE on the tick thread when
+   the seal channel is full.
+
+**Per FRAME it is not O(1)** either: `drain_main_feed_frame` walks every stacked packet,
+bounded only by `MAX_PACKETS_PER_FRAME = 70,000`.
+
+**Correction to CLAUDE.md, found by this audit:** the codebase map credits this path with a
+`papaya` concurrent-map lookup. There is **zero `papaya` on the live tick path** —
+`multi_tf_aggregator.rs:348` is a plain `HashMap<CompositeKey, u32>` into a dense `Vec`
+index. Still O(1) average; the claim was wrong about the type, exactly as the
+`instrument_registry` row in that same table was wrong in 2026-08-07.
