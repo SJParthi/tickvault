@@ -606,11 +606,25 @@ pub const TICK_SPILL_DIR: &str = "data/spill/ticks";
 /// Floor for the spill-directory ceiling, in bytes (512 MiB).
 ///
 /// This WAS the whole ceiling, a fixed 512 MiB, and it cost 1,695,983 ticks in
-/// one event on the live box on 2026-08-25: at 08:33:44 the boot WAL replay's
-/// flush failed, the rescue was refused with "tick spill dir at or past its
-/// 536870912-byte cap", and `tv_ticks_spilled_total` stayed at 0 — no rescue,
-/// permanent loss. The volume it was protecting is **200 GB**, so the ceiling
-/// that destroyed the data was **0.26% of the disk**.
+/// one event on the live box on 2026-08-25. The log timeline, in full, because
+/// the shape of it is the argument:
+///
+/// | 08:31:09 | boot #1's WAL-replay flush fails. **1,774,802 rows are
+///              RESCUED, writing 544,034,728 bytes** — a single rescue that on
+///              its own exceeds the 512 MiB ceiling |
+/// | 08:31:56 | the deploy swaps the binary; the process restarts |
+/// | 08:33:44 | boot #2's flush fails. **1,695,983 rows REFUSED** — "tick spill
+///              dir at or past its 536870912-byte cap". `tv_ticks_spilled_total`
+///              stays 0: no rescue, permanent loss |
+///
+/// **The ceiling was smaller than ONE unit of the work it existed to rescue.**
+/// A WAL-replay flush is the largest single buffer this process ever holds, and
+/// at ~544 MB it could not fit even once — so the first rescue consumed the
+/// entire budget and the second was guaranteed to be refused. That is not a
+/// tuning miss; it is a bound that could never do its job.
+///
+/// The volume it was protecting is **200 GB**, so the ceiling that destroyed
+/// the data was **0.26% of the disk**.
 ///
 /// The rationale for HAVING a ceiling was and remains right — QuestDB and the
 /// frame WAL share this disk, and a rescue that can fill the root volume trades
