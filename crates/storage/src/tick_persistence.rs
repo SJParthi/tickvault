@@ -1003,6 +1003,12 @@ pub struct TickWriter {
     /// was never split behaves byte-for-byte as before — this is an opt-in
     /// added to one call site, not a behaviour change to the type.
     offload: Option<std::sync::mpsc::SyncSender<FlushBatch>>,
+    /// Consecutive flushes whose rows the producer RETAINED because the queue
+    /// was full. Reset to zero on every successful hand-off.
+    ///
+    /// This is the batch-WIDTH bound, and it is the one the live measurement
+    /// made load-bearing — see [`MAX_RETAINED_FLUSH_SPANS`].
+    retained_spans: u32,
 }
 
 /// Publish a zero on this feed's drop series before any row can be written.
@@ -1052,6 +1058,7 @@ impl TickWriter {
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
+                    retained_spans: 0,
                 }
             }
             Err(err) => {
@@ -1068,6 +1075,7 @@ impl TickWriter {
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
+                    retained_spans: 0,
                 }
             }
         }
@@ -1102,6 +1110,7 @@ impl TickWriter {
             last_capture_seq: 0,
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
             offload: None,
+            retained_spans: 0,
         }
     }
 
@@ -1267,6 +1276,14 @@ impl TickWriter {
                 // the next flush tries again. Returning `Err` would make the
                 // drain report a loss that did not happen.
                 OffloadOutcome::QueueFull(_) => Ok(()),
+                OffloadOutcome::WidthCapped(rows) => {
+                    anyhow::bail!(
+                        "ticks: the writer stayed behind for more than \
+                         {MAX_RETAINED_FLUSH_SPANS} flush span(s) — {rows} row(s) were \
+                         RESCUED to the spill tier rather than widening the commit, \
+                         because commit width is the measured write amplifier"
+                    )
+                }
                 OffloadOutcome::SinkGone(rows) => {
                     anyhow::bail!(
                         "ticks: the offload writer thread is gone — {rows} row(s) rescued"
@@ -1403,6 +1420,7 @@ impl TickWriter {
         match tx.try_send(batch) {
             Ok(()) => {
                 self.pending = 0;
+                self.retained_spans = 0;
                 metrics::counter!(
                     "tv_tick_flush_offloaded_total",
                     "feed" => self.feed.as_str()
@@ -1423,13 +1441,33 @@ impl TickWriter {
                 .increment(1);
                 let held = returned.buffer.as_bytes().len();
                 self.buffer = returned.buffer;
-                if held >= MAX_PRODUCER_BUFFER_BYTES {
-                    // Past the producer ceiling. Stop accumulating and rescue,
-                    // so an hour-long stall cannot become an OOM. Reuses the
-                    // synchronous rescue path verbatim, which is why the
-                    // buffer is restored first.
+                self.retained_spans = self.retained_spans.saturating_add(1);
+                // TWO independent cuts, and the SPAN one is the reason this
+                // change is safe to ship at all.
+                //
+                // Span: commit WIDTH is the measured amplifier — 10% of a
+                // day's ticks carry an exchange timestamp over an hour behind
+                // arrival, so a wide commit reopens closed hourly partitions
+                // and rewrites them. Accumulating without this bound would have
+                // made the disk pressure this change exists to relieve WORSE.
+                //
+                // Bytes: a belt-and-braces bound on a pathological append rate,
+                // kept well under the questdb-rs wedge (const-asserted above).
+                // `>` and not `>=`: the constant names how many spans may be
+                // RETAINED, so the cut belongs on the span after them.
+                if self.retained_spans > MAX_RETAINED_FLUSH_SPANS
+                    || held >= MAX_PRODUCER_BUFFER_BYTES
+                {
+                    metrics::counter!(
+                        "tv_tick_flush_width_capped_total",
+                        "feed" => self.feed.as_str()
+                    )
+                    .increment(1);
+                    self.retained_spans = 0;
+                    // Rescue rather than keep widening. Durable, counted, and
+                    // re-ingestable — the same tier a failed flush uses.
                     let dropped = self.discard_pending();
-                    return OffloadOutcome::SinkGone(dropped);
+                    return OffloadOutcome::WidthCapped(dropped);
                 }
                 OffloadOutcome::QueueFull(rows)
             }
@@ -1545,9 +1583,61 @@ pub const FLUSH_QUEUE_DEPTH: usize = 4;
 /// the spill tier, which is durable, counted, and re-ingestable — the same
 /// tier a failed flush uses.
 ///
-/// 64 MiB against a 32 GiB host: large enough that only a genuine multi-minute
-/// stall reaches it, small enough that reaching it is survivable.
-pub const MAX_PRODUCER_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+/// This is the SECONDARY bound. [`MAX_RETAINED_FLUSH_SPANS`] is the primary
+/// one and cuts far earlier; this exists so a pathological append rate cannot
+/// reach the wedge below even inside two spans.
+///
+/// 32 MiB and not 64: the first draft used 64, and the const assertion below
+/// REFUSED TO COMPILE, which is the assertion doing its job. With a batch
+/// already in flight toward a client whose buffer wedges permanently at
+/// 100 MiB, a 64 MiB producer ceiling leaves no real headroom.
+pub const MAX_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+/// The questdb-rs client buffer ceiling. Past it EVERY flush fails, permanently
+/// — a wedge, not a degrade, which is why the producer must cut well below it.
+///
+/// Named here rather than left implicit because the two sibling writers
+/// (`seal_writer_task.rs`, `shadow_candle_writer.rs`) both document this cliff
+/// in prose and neither asserts against it. A number that only exists in a
+/// comment is a number nothing checks.
+pub const QUESTDB_MAX_BUF_SIZE_BYTES: usize = 100 * 1024 * 1024;
+
+// The producer ceiling must leave real headroom under the wedge, or the
+// "rescue instead of accumulate" arm fires only after every flush is already
+// permanently failing — which would make the rescue path unreachable exactly
+// when it is needed.
+const _: () = assert!(
+    MAX_PRODUCER_BUFFER_BYTES * 2 <= QUESTDB_MAX_BUF_SIZE_BYTES,
+    "the producer ceiling must sit at or below half the questdb-rs max_buf_size wedge"
+);
+
+/// How many consecutive 500 ms flush spans the producer may RETAIN before it
+/// stops accumulating and spills.
+///
+/// # This is the condition the measurement made load-bearing
+///
+/// A design pass on 2026-08-25 flagged an own-goal that the obvious version of
+/// this change walks straight into: a decoupled writer batches more
+/// aggressively under pressure, so each commit spans a WIDER range of rows —
+/// and wider commits are exactly what the write amplification is made of. The
+/// same change is therefore beneficial or harmful depending on which amplifier
+/// is real, and the design bound the implementing PR to cap batch width "at
+/// today's 500 ms span" until that was measured.
+///
+/// It was then measured on the live box: `ticks` is `PARTITION BY HOUR` on the
+/// exchange last-TRADE time, and **10.0% of one day's 64.3M ticks carried a
+/// `ts` more than an hour behind arrival** — legitimately, because for an
+/// illiquid strike the last trade genuinely was hours ago. So one commit in ten
+/// reopens an already-closed hourly partition and REWRITES it. Commit width is
+/// the amplifier. Unbounded accumulation would have made the disk problem this
+/// change exists to relieve measurably worse.
+///
+/// TWO, not one: the queue already absorbs `FLUSH_QUEUE_DEPTH` batches before
+/// the producer ever sees a full queue, so the honest absorption is that depth
+/// plus this, and a cap of one would spill on the first hiccup. Two keeps the
+/// widest possible commit to roughly three flush spans rather than the ~128
+/// that the byte ceiling alone would have permitted at a typical row size.
+pub const MAX_RETAINED_FLUSH_SPANS: u32 = 2;
 
 /// One handed-off ILP payload, in flight between the drain and the writer.
 ///
@@ -1581,6 +1671,14 @@ pub enum OffloadOutcome {
     Sent(usize),
     /// The writer is behind. Rows RETAINED by the producer, nothing lost.
     QueueFull(usize),
+    /// The writer stayed behind long enough that retaining further would
+    /// WIDEN the commit past [`MAX_RETAINED_FLUSH_SPANS`]. Rows rescued to the
+    /// spill tier rather than accumulated.
+    ///
+    /// Its own arm and not `SinkGone`, because the writer is alive and well —
+    /// reporting "the writer thread is gone" here would send an operator to
+    /// diagnose a thread that is running fine.
+    WidthCapped(usize),
     /// The writer thread is gone. Rows rescued to the spill tier.
     SinkGone(usize),
 }
@@ -2602,6 +2700,83 @@ mod tests {
             producer.pending(),
             1,
             "the row is RETAINED — it is still ours to flush next time"
+        );
+    }
+
+    #[test]
+    fn the_producer_stops_widening_the_batch_and_spills_instead() {
+        // THE condition the live measurement made load-bearing. `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10% of a
+        // day's ticks carry a ts over an hour behind arrival — so a wide
+        // commit reopens closed hourly partitions and rewrites them. A
+        // decoupled writer that accumulated without bound would have made the
+        // write amplification WORSE, which is the own-goal a design pass
+        // flagged before this was implemented.
+        //
+        // So: retaining is allowed, widening without limit is not.
+        let dir = scratch_dir("offload-width-cap");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, mut sink, _rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+
+        // Fill the queue so every later flush is refused.
+        for i in 0..FLUSH_QUEUE_DEPTH {
+            producer.flush().expect("flush while the queue has room");
+            let seq = 2 + i64::try_from(i).expect("loop bound fits i64");
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+        }
+
+        // Retained spans, up to the cap — rows KEPT and accumulating, nothing
+        // spilled. Accumulation is the point: these rows are still ours and
+        // still pending, which is what makes backpressure lossless.
+        for span in 0..MAX_RETAINED_FLUSH_SPANS {
+            let before = producer.pending();
+            producer.flush().expect("a full queue is backpressure");
+            assert_eq!(
+                producer.pending(),
+                before,
+                "span {span} must RETAIN its rows — a retained flush neither \
+                 sends nor discards"
+            );
+            let seq = 100 + i64::from(span);
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+        }
+        assert!(
+            producer.pending() > 1,
+            "retained spans accumulate — that is what makes backpressure lossless"
+        );
+
+        // One span past the cap: stop widening, spill instead.
+        let capped = producer.flush();
+
+        let msg = format!("{:#}", capped.expect_err("the width cap must report"));
+        assert!(
+            msg.contains("RESCUED to the spill tier"),
+            "the message must say the rows are SAFE and where they went; got: {msg}"
+        );
+        assert!(
+            !msg.contains("writer thread is gone"),
+            "the writer is alive — reporting it gone would send an operator to \
+             diagnose a healthy thread. Got: {msg}"
+        );
+        assert_eq!(
+            producer.pending(),
+            0,
+            "the buffer was handed to the spill tier, so it is no longer pending"
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("spill dir")
+                .filter_map(std::result::Result::ok)
+                .count()
+                >= 1,
+            "the rows must be DURABLE on disk — capping width may never mean \
+             dropping rows"
         );
     }
 

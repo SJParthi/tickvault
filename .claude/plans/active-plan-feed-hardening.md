@@ -2499,3 +2499,47 @@ instance has run it; the ~25× write amplification that makes the disk saturate
 in the first place is untouched and is the next item. **NOT claimed:** clippy
 clean locally — the component is not installed in this container; CI's Build &
 Verify is the check.
+
+### Item 24 — compliance with Item 14d's five binding conditions
+
+Item 14 recorded this design on 2026-08-25 and bound the implementing PR to
+five conditions. Audited one by one rather than asserted:
+
+| | Condition | Status |
+|---|---|---|
+| **C1** | Overflow SPILLS, never a silent drop, never a blocking append on the fold path | **PASS** — `try_send`, never `send`; every cut routes through the existing rescue tier |
+| **C2** | The drain ships pre-stamped rows; the writer never mints `capture_seq` | **PASS** — `FlushBatch` carries a finished `Buffer`; the sink only calls `sender.flush()` |
+| **C3** | `record_ticks` and `LAST_TICK_AGE_GAUGE` move to the writer | **PASS, by construction** — `record_ticks` is on the thread, and the gauge is *derived* from `feed_health.last_tick_age_secs`, so it follows the registry the writer stamps. `no_ticks_alarm_gauge_guard.rs` passes unchanged, so no re-bless and no dated §2.3b edit are needed — the alarm still means "rows persisted" |
+| **C4** | Bounded shutdown grace; batch width capped; `max_buf_size` headroom const-asserted | **PASS — and this was the one the first draft FAILED** |
+| **C5** | A size cut must fire well before the 100 MiB questdb-rs wedge | **PASS** — `MAX_PRODUCER_BUFFER_BYTES` is const-asserted at ≤ half of `QUESTDB_MAX_BUF_SIZE_BYTES` |
+
+**C4 is worth writing out, because the first draft of Item 24 shipped without
+it and would have made the disk problem worse.** Item 14's hostile pass had
+flagged the own-goal: a decoupled writer accumulates under pressure, so each
+commit spans a wider row range — and wider commits are what the amplification
+is made of. It bound the implementation to cap width *until 14b(3) was
+measured*. Item 15/f638bb66 then measured it: `ticks` is `PARTITION BY HOUR` on
+the exchange last-TRADE time, and **10.0% of one day's 64.3M ticks carried a
+`ts` more than an hour behind arrival**, so one commit in ten reopens a closed
+hourly partition and rewrites it. **Commit width is the amplifier**, which is
+the branch of 14b(3) that makes the cap mandatory rather than optional.
+
+Three fixes followed:
+
+1. `MAX_RETAINED_FLUSH_SPANS = 2` — the producer may retain across two flush
+   spans, then stops widening and spills. Enforced on the retain path, not
+   merely declared, and pinned by the structural guard.
+2. `OFFLOAD_SHUTDOWN_GRACE = 30 s` — `JoinHandle::join` has no timeout, so a
+   writer wedged on a hung socket would have hung the box's shutdown. Worse,
+   on a host whose auto-stop is a cost control, than losing the tail batch.
+3. `MAX_PRODUCER_BUFFER_BYTES` 64 MiB → **32 MiB**. The const assertion
+   *refused to compile* at 64 — the assertion doing its job, on the first
+   number I picked.
+
+`OffloadOutcome::WidthCapped` is a distinct arm from `SinkGone` because the
+writer is alive and well during a width cut; reporting "the writer thread is
+gone" would send an operator to diagnose a healthy thread.
+
+**14e** (no new EMF metric name may ship — `user-data.sh.tftpl` at zero free
+bytes) is honoured: all three new counters are local-exporter only. The loss
+path they sit on already pages through `tv_ticks_dropped_total`.

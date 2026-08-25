@@ -917,6 +917,14 @@ pub struct LiveIngest {
     /// without a join would have re-created that loss one queue further out,
     /// with the batch dying in a detached thread as the process exits.
     writer_thread: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the writer thread as its LAST act, so shutdown can wait
+    /// with a bounded grace instead of a `join` that has no timeout.
+    ///
+    /// `JoinHandle::join` blocks forever by contract. A writer wedged on a
+    /// hung socket would therefore hang the whole shutdown — trading a lost
+    /// tail batch for a box that never stops, which is the worse failure on a
+    /// host whose auto-stop is a cost control.
+    writer_done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl LiveIngest {
@@ -995,6 +1003,7 @@ impl LiveIngest {
             pending_rows: 0,
             writer_offloaded: false,
             writer_thread: None,
+            writer_done: None,
         }
     }
 
@@ -1066,6 +1075,7 @@ impl LiveIngest {
         let (producer, mut sink, rx) = live.split_for_offload();
         self.writer = producer;
         self.writer_offloaded = true;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("tv-tick-writer".to_owned())
             .spawn(move || {
@@ -1086,8 +1096,12 @@ impl LiveIngest {
                     );
                 }
                 info!("tick writer thread exiting — the drain closed its queue");
+                // Last act, and deliberately ignored: if the receiver is gone
+                // the shutdown already timed out and said so.
+                drop(done_tx.send(()));
             })?;
         self.writer_thread = Some(handle);
+        self.writer_done = Some(done_rx);
         Ok(())
     }
 
@@ -1103,9 +1117,32 @@ impl LiveIngest {
     pub fn shutdown_offload_writer(&mut self) {
         self.writer.close_offload();
         self.writer_offloaded = false;
-        if let Some(handle) = self.writer_thread.take()
-            && handle.join().is_err()
-        {
+        let Some(handle) = self.writer_thread.take() else {
+            return;
+        };
+        // BOUNDED, not `join()`. The grace is generous against the ILP client's
+        // own 5 s request timeout — one in-flight flush plus the queue behind
+        // it — but it is finite, because a writer wedged on a hung socket must
+        // not be able to hang the box's shutdown.
+        let finished = self
+            .writer_done
+            .take()
+            .is_some_and(|rx| rx.recv_timeout(OFFLOAD_SHUTDOWN_GRACE).is_ok());
+        if !finished {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                grace_secs = OFFLOAD_SHUTDOWN_GRACE.as_secs(),
+                "the tick writer did not finish within the shutdown grace — the \
+                 final batch of the session may not have reached QuestDB. Check \
+                 the tick spill directory; the rows are re-ingestable if they \
+                 were rescued."
+            );
+            // Deliberately NOT joined after a timeout: joining here is exactly
+            // the unbounded wait the grace exists to avoid. The thread is
+            // detached and the process is going away.
+            return;
+        }
+        if handle.join().is_err() {
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 "the tick writer thread PANICKED — the final batch of the session \
@@ -2811,6 +2848,18 @@ pub const SILENCE_DETECTOR_REFUSED_GAUGE: &str = "tv_dhan_feed_silence_detector_
 /// during one, the feed genuinely is not delivering.
 ///
 /// [`FeedHealthRegistry`]: tickvault_common::feed_health::FeedHealthRegistry
+/// How long shutdown waits for the tick writer to finish its last batch.
+///
+/// Sized against the ILP client's own 5 s request timeout: one flush already
+/// on the wire, plus the queue behind it, plus slack. Finite by requirement —
+/// `JoinHandle::join` has no timeout, and a writer wedged on a hung socket
+/// would otherwise hang a shutdown that the host's cost control depends on.
+pub const OFFLOAD_SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// [`OFFLOAD_SHUTDOWN_GRACE_SECS`] as a `Duration`.
+pub const OFFLOAD_SHUTDOWN_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(OFFLOAD_SHUTDOWN_GRACE_SECS);
+
 pub const LAST_TICK_AGE_GAUGE: &str = "tv_dhan_feed_last_tick_age_secs";
 
 /// The value [`LAST_TICK_AGE_GAUGE`] publishes.
@@ -11707,6 +11756,33 @@ mod tests {
             "the boot site must actually spawn the writer thread — a split that \
              is never performed leaves the blocking flush on the drain while \
              every symbol needed to move it sits right there unused"
+        );
+        // C4 of the recorded design, and the condition the LIVE MEASUREMENT
+        // made load-bearing. A decoupled writer that accumulates without bound
+        // widens each commit, and commit width is the measured amplifier — 10%
+        // of a day's ticks carry an exchange timestamp over an hour behind
+        // arrival, so a wide commit reopens closed hourly partitions and
+        // rewrites them. Without the cap this change makes the disk pressure
+        // it exists to relieve WORSE, which is why it is pinned here and not
+        // left to a comment.
+        let storage_src = include_str!("../../storage/src/tick_persistence.rs");
+        assert!(
+            storage_src.contains("MAX_RETAINED_FLUSH_SPANS"),
+            "the batch-WIDTH cap must exist — unbounded accumulation under \
+             backpressure is the own-goal this design was flagged for"
+        );
+        assert!(
+            storage_src.contains("self.retained_spans > MAX_RETAINED_FLUSH_SPANS"),
+            "the width cap must be ENFORCED on the retain path, not merely \
+             declared — a constant nothing reads is the defect this repo has \
+             now recorded seven times"
+        );
+        assert!(
+            production_half.contains("OFFLOAD_SHUTDOWN_GRACE"),
+            "the shutdown wait must be BOUNDED: `JoinHandle::join` has no \
+             timeout, so a writer wedged on a hung socket would hang the box's \
+             shutdown — worse, on a host whose auto-stop is a cost control, \
+             than losing the tail batch"
         );
         assert!(
             production_half.contains("ingest.shutdown_offload_writer()"),
