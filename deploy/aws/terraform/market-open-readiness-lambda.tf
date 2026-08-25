@@ -190,3 +190,39 @@ resource "aws_cloudwatch_metric_alarm" "market_open_readiness_lambda_errors" {
   # NEXT scheduled run succeeding (verdict visible in the Lambda log group).
   ok_actions = []
 }
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the readiness check RUN?" (found by the new guard)
+#
+# The failure mode this closes is specifically a false-OK: this check pages
+# when the system is NOT ready, so its silence is the SAME observable as a
+# clean pass. An operator who sees nothing before the open cannot tell "checked,
+# all good" from "never checked". That ambiguity is the whole reason a
+# did-it-run alarm belongs on a check whose success is silent.
+#
+# 24h window: MON-FRI pre-open cron, so a shorter window breaches every
+# weekend.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "market_open_readiness_not_invoked" {
+  alarm_name          = "tv-${var.environment}-market-open-readiness-not-invoked"
+  alarm_description   = "The pre-open readiness check did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). While it is not running nothing verifies the system is ready before the market opens, and the absence of a readiness page is indistinguishable from a clean readiness result. Its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.market_open_readiness.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}

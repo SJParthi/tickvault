@@ -146,7 +146,45 @@ resource "aws_budgets_budget" "tv_monthly" {
   #     2. budget-guards.tf   BUDGET_KILL_USD               (injected into the guard Lambda)
   #     3. budget_digest.rs   BUDGET_USD                    (the "% of stop-budget" the operator reads)
   #     4. hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD       (env-missing FALLBACK; must be >= this)
-  limit_amount      = "130"
+  # 2026-08-25 OPERATOR RULING (Quote 19) — LIMIT RAISED $130 -> $150.
+  # Operator verbatim (typed directly in-session, typos preserved):
+  #   "see evn if budget ened to be icnreased little bit extra also do it dude but i
+  #    just need the O(1) workign solution always dude okay?"
+  #   "even if we need to reach the max 150 usd also let su gfo ahead dude but ensure
+  #    to achieve alwyas O(1) dude okay?"
+  # Recorded in daily-universe-scope-expansion-2026-05-27.md as an authorization that
+  #   was deliberately NOT SPENT at the time — the EBS throughput raise it was offered
+  #   for was held pending a measurement. This change spends a different, much smaller
+  #   part of it, and says so rather than quietly inheriting the headroom.
+  #
+  # WHY NOW: at $130 the AUTOMATIC STOP_EC2_INSTANCES action fires at 90% = $117.00,
+  #   and a maximal month on the current configuration projects $118.28 (22 weekdays
+  #   x $4.06 + 8 weekend days x $2.48, from the MEASURED daily series — Aug 21 was
+  #   the first full weekday after the 300 GB grow). So the guard was already
+  #   $1.28 BELOW a normal high-side month: on a busy month it would switch the
+  #   trading box off mid-session, which is the 2026-07-31 failure mode caused by the
+  #   guard rather than by the spend. The six `*-not-invoked` alarms added in this
+  #   same change add ~$0.60/mo, taking the projection to ~$118.88 and making the
+  #   overlap worse, not better.
+  # At $150 the 90% line sits at $135.00 — $16.12 clear of the projection, and the
+  #   widest real margin this account has had since the ceiling ladder began.
+  # STILL A REAL GUARD, not a rubber stamp: $150 is the operator's stated HARD
+  #   MAXIMUM, so the ceiling and the cap now coincide instead of the ceiling sitting
+  #   ABOVE the cap (which is the gap Quote 18 recorded — a budget that would permit
+  #   a month the operator had forbidden before it acted at all). That gap closes here.
+  # The sub-₹1,000/mo TARGET is breached ~11x and the downward ratchet ladder stays
+  #   PAUSED — recorded honestly, not silently dropped.
+  #
+  # WHAT THIS DOES NOT FIX, restated because four dated sections now carry it: the
+  #   two AWS-NATIVE budget actions were last seen in EXECUTION_FAILURE (2026-07-31)
+  #   and `budgets:DescribeBudgetActionsForBudget` is AccessDenied for the agent
+  #   identity, so whether THEY fire is still Unknown. What IS now established, and
+  #   what those sections overstated, is that this account has a SECOND, independent
+  #   kill-switch that does not depend on them at all — `tv_hard_stop_guard`, hourly,
+  #   in our own code, with ec2:StopInstances scoped to the prod box. See the dated
+  #   correction block in budget-guards.tf. Raising a ceiling still does
+  #   not repair a native action; it no longer follows that no switch fires.
+  limit_amount      = "150"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

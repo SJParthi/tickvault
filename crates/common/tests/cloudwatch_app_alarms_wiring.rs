@@ -2065,6 +2065,299 @@ fn every_lambda_has_an_errors_alarm_or_a_declared_exemption() {
     }
 }
 
+/// Lambdas covered by an `Invocations` alarm on the `AWS/Lambda` namespace.
+///
+/// Same block-scoped shape as `lambdas_with_errors_alarm`, and deliberately a
+/// separate function rather than a `metric` parameter on that one: the two ask
+/// different questions and their *route* requirements could reasonably diverge
+/// later (a dashboard-only Errors alarm is a defensible choice; a
+/// dashboard-only "did it run" alarm is not, because nobody opens a console to
+/// discover that a schedule stopped firing). Keeping them apart means that
+/// divergence is an edit rather than a re-parameterisation.
+fn lambdas_with_invocations_alarm(bodies: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("resource \"aws_cloudwatch_metric_alarm\"") {
+                inside = true;
+                block.clear();
+            }
+            if inside {
+                block.push_str(line);
+                block.push('\n');
+                if line == "}" {
+                    inside = false;
+                    let is_lambda_invocations =
+                        block.contains("\"Invocations\"") && block.contains("\"AWS/Lambda\"");
+                    let has_route = block.lines().any(|l| {
+                        let t = l.trim();
+                        t.starts_with("alarm_actions") && !t.contains("= []") && !t.ends_with('[')
+                    });
+                    // `treat_missing_data = "breaching"` is not optional here
+                    // and is checked as part of COVERAGE, not as a separate
+                    // style rule. The condition being detected is the ABSENCE
+                    // of a datapoint: a Lambda whose schedule was dropped
+                    // publishes no Invocations datapoint at all, so under the
+                    // default `missing` the alarm sits in INSUFFICIENT_DATA
+                    // forever and pages nobody. An alarm that cannot fire on
+                    // the one case it exists for is not coverage, and counting
+                    // it as coverage is the false-OK this file polices
+                    // everywhere else.
+                    let breaches_on_missing = block.contains("\"breaching\"");
+                    if is_lambda_invocations && has_route && breaches_on_missing {
+                        if let Some(name) = function_name_ref(&block) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Lambdas that an EventBridge **schedule** invokes.
+///
+/// Two hops, because terraform states it in two places: an
+/// `aws_cloudwatch_event_rule` carrying a `schedule_expression` (as opposed to
+/// an `event_pattern`, which is reactive and has no "should have run by now"),
+/// and an `aws_cloudwatch_event_target` pointing that rule at a Lambda ARN.
+/// Pairing them is what distinguishes "runs on a clock" from "runs when
+/// something happens" — and only the first kind can be *missing*.
+fn schedule_driven_lambdas(bodies: &[(String, String)]) -> Vec<String> {
+    let mut scheduled_rules: Vec<String> = Vec::new();
+    let mut targets: Vec<(String, String)> = Vec::new(); // (rule, lambda)
+
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut kind: Option<&str> = None;
+        let mut name = String::new();
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("resource \"aws_cloudwatch_event_rule\" \"") {
+                kind = Some("rule");
+                name = rest.split('"').next().unwrap_or_default().to_string();
+                block.clear();
+            } else if line.starts_with("resource \"aws_cloudwatch_event_target\"") {
+                kind = Some("target");
+                block.clear();
+            }
+            if kind.is_some() {
+                block.push_str(line);
+                block.push('\n');
+                if line == "}" {
+                    match kind {
+                        Some("rule") if block.contains("schedule_expression") => {
+                            scheduled_rules.push(name.clone());
+                        }
+                        Some("target") => {
+                            let rule = block
+                                .split("aws_cloudwatch_event_rule.")
+                                .nth(1)
+                                .map(|r| {
+                                    r.chars()
+                                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default();
+                            let lambda = block
+                                .split("aws_lambda_function.")
+                                .nth(1)
+                                .map(|r| {
+                                    r.chars()
+                                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default();
+                            if !rule.is_empty() && !lambda.is_empty() {
+                                targets.push((rule, lambda));
+                            }
+                        }
+                        _ => {}
+                    }
+                    kind = None;
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<String> = targets
+        .into_iter()
+        .filter(|(rule, _)| scheduled_rules.iter().any(|r| r == rule))
+        .map(|(_, lambda)| lambda)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Scheduled Lambdas deliberately left without a "did it run" alarm.
+///
+/// Empty, and that is the intended steady state. An entry here is a decision
+/// that a given clock-driven Lambda may silently stop running — which is a
+/// real choice for something purely cosmetic, and never one for anything on a
+/// safety or money path.
+const LAMBDA_INVOCATIONS_ALARM_EXEMPT: &[(&str, &str)] = &[];
+
+#[test]
+fn every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption() {
+    // WHY THIS EXISTS, and why an `Errors` alarm is not a substitute.
+    //
+    // On 2026-07-02 EventBridge dropped scheduled rules repo-wide. A Lambda
+    // whose schedule stops firing throws no error, writes no log line, and
+    // publishes no datapoint — so its `Errors` alarm, which this file already
+    // requires of all thirteen Lambdas, reads PERFECTLY HEALTHY for exactly as
+    // long as the component is completely dead. The two alarms are therefore
+    // not redundant: `Errors` catches a Lambda that runs and fails,
+    // `Invocations` catches one that never runs at all, and only the second
+    // covers the failure this repo has actually experienced.
+    //
+    // Found by the same 2026-08-25 sweep that added the thirteen Errors
+    // alarms: a tree-wide scan for `metric_name = "Invocations"` returned
+    // exactly TWO, on the token minter and the market-hours gate. The budget
+    // kill-switch and the Lambda that starts the trading box each morning were
+    // both blind, which is the worst possible pair to be blind about.
+    let bodies = terraform_bodies();
+    let scheduled = schedule_driven_lambdas(&bodies);
+    let covered = lambdas_with_invocations_alarm(&bodies);
+
+    assert!(
+        scheduled.len() >= 6,
+        "expected at least the 6 schedule-driven Lambdas known on 2026-08-25, found {} — \
+         did the two-hop rule->target enumerator stop matching? A guard that finds no \
+         scheduled Lambdas passes vacuously, which is the failure it exists to prevent",
+        scheduled.len()
+    );
+
+    let mut blind: Vec<&str> = Vec::new();
+    for l in &scheduled {
+        if covered.iter().any(|c| c == l) {
+            continue;
+        }
+        if LAMBDA_INVOCATIONS_ALARM_EXEMPT.iter().any(|(n, _)| n == l) {
+            continue;
+        }
+        blind.push(l);
+    }
+
+    assert!(
+        blind.is_empty(),
+        "these Lambdas run on a SCHEDULE but have no routed `Invocations` alarm and no \
+         declared exemption: {blind:?}\n\
+         A dropped EventBridge schedule is silent by construction — no invocation means no \
+         error, so the `Errors` alarm this file already requires cannot see it, and the \
+         component reads healthy for as long as it is entirely dead (the 2026-07-02 \
+         repo-wide scheduler-drop class).\n\
+         Fix: add an `aws_cloudwatch_metric_alarm` with metric_name=\"Invocations\", \
+         namespace=\"AWS/Lambda\", a FunctionName dimension, a routed `alarm_actions`, and \
+         `treat_missing_data = \"breaching\"` (copy the `start_watchdog_not_invoked` \
+         block) — or add an entry with a written reason to \
+         LAMBDA_INVOCATIONS_ALARM_EXEMPT."
+    );
+
+    // Both ends of every exemption, same as the Errors list: an exemption that
+    // outlives its reason is a lie that reads like a decision.
+    for (name, reason) in LAMBDA_INVOCATIONS_ALARM_EXEMPT {
+        assert!(
+            !reason.trim().is_empty(),
+            "exemption for {name} carries no reason"
+        );
+        assert!(
+            scheduled.iter().any(|l| l == name),
+            "LAMBDA_INVOCATIONS_ALARM_EXEMPT names {name}, which is no longer a \
+             schedule-driven Lambda — delete the stale entry"
+        );
+        assert!(
+            !covered.iter().any(|c| c == name),
+            "LAMBDA_INVOCATIONS_ALARM_EXEMPT still excuses {name}, but it now HAS a routed \
+             Invocations alarm — delete the entry so the list keeps meaning something"
+        );
+    }
+}
+
+#[test]
+fn the_two_switches_that_matter_most_are_covered_by_name() {
+    // The list-based test above is generic, and a generic test can be
+    // satisfied by an enumerator that quietly stops matching. These two are
+    // named outright because they are the ones whose silence costs the most:
+    // one stops a runaway bill, the other starts the trading day.
+    let bodies = terraform_bodies();
+    let covered = lambdas_with_invocations_alarm(&bodies);
+    for critical in ["tv_hard_stop_guard", "start_watchdog"] {
+        assert!(
+            covered.iter().any(|c| c == critical),
+            "{critical} has no routed, breaching-on-missing `Invocations` alarm.\n\
+             This is the budget kill-switch / the box-starter: while its schedule is \
+             dropped there is no spend ceiling in force, or no trading day, and NOTHING \
+             else reports it."
+        );
+    }
+}
+
+#[test]
+fn invocations_extraction_self_test() {
+    // Proves each half of the coverage rule bites independently, so a real
+    // regression is reported rather than silently absorbed. Written after
+    // finding that the sibling Errors extractor had been counting a
+    // route-less alarm as coverage for weeks.
+    let full = vec![(
+        "x.tf".to_string(),
+        "resource \"aws_cloudwatch_metric_alarm\" \"a\" {\n  metric_name = \"Invocations\"\n  \
+         namespace = \"AWS/Lambda\"\n  treat_missing_data = \"breaching\"\n  dimensions = {\n    \
+         FunctionName = aws_lambda_function.good.function_name\n  }\n  alarm_actions = \
+         [aws_sns_topic.tv_alerts.arn]\n}\n"
+            .to_string(),
+    )];
+    assert_eq!(lambdas_with_invocations_alarm(&full), vec!["good"]);
+
+    // No route -> not coverage (it pages nobody).
+    let routeless = vec![(
+        "x.tf".to_string(),
+        full[0].1.replace("[aws_sns_topic.tv_alerts.arn]", "[]"),
+    )];
+    assert!(
+        lambdas_with_invocations_alarm(&routeless).is_empty(),
+        "an Invocations alarm with no SNS route was counted as coverage"
+    );
+
+    // Missing-data default -> not coverage (it can never fire on absence).
+    let not_breaching = vec![(
+        "x.tf".to_string(),
+        full[0].1.replace("\"breaching\"", "\"notBreaching\""),
+    )];
+    assert!(
+        lambdas_with_invocations_alarm(&not_breaching).is_empty(),
+        "an Invocations alarm that does not treat missing data as breaching was counted \
+         as coverage — it cannot fire on the absence it exists to detect"
+    );
+
+    // A rule with an event_pattern is reactive, not scheduled: nothing is
+    // "missing" when nothing happened, so it must not be demanded of.
+    let reactive = vec![(
+        "y.tf".to_string(),
+        "resource \"aws_cloudwatch_event_rule\" \"r\" {\n  event_pattern = \"{}\"\n}\n\
+         resource \"aws_cloudwatch_event_target\" \"t\" {\n  rule = \
+         aws_cloudwatch_event_rule.r.name\n  arn = aws_lambda_function.reactive.arn\n}\n"
+            .to_string(),
+    )];
+    assert!(
+        schedule_driven_lambdas(&reactive).is_empty(),
+        "a Lambda driven by an event_pattern rule was reported as schedule-driven"
+    );
+
+    let timed = vec![(
+        "y.tf".to_string(),
+        reactive[0].1.replace(
+            "event_pattern = \"{}\"",
+            "schedule_expression = \"rate(1 hour)\"",
+        ),
+    )];
+    assert_eq!(schedule_driven_lambdas(&timed), vec!["reactive"]);
+}
+
 #[test]
 fn lambda_errors_alarm_extraction_self_test() {
     // Proves the two extractors bite, so a real regression is reported as

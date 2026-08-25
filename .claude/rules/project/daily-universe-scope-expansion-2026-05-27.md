@@ -717,6 +717,59 @@ arithmetic about a switch that does not throw, and if they are fixed the box
 gets stopped mid-month. A broken safety net is never a reason to cross a
 threshold.
 
+> ### ⚠ CORRECTED 2026-08-25 — "the kill switch may not fire AT ALL" was OVERSTATED, in four places
+>
+> Quotes 13, 17, 18 and 19 each carry a FLAGGED, UNRESOLVED note whose substance
+> is: *both `STOP_EC2_INSTANCES` budget actions were last seen in
+> `EXECUTION_FAILURE`, the read is `AccessDenied`, so **"whether the kill switch
+> works AT ALL is Unknown"** and every ceiling number above is "arithmetic about a
+> switch that does not throw."*
+>
+> The premise is true. **The conclusion is not, and the gap between them is a
+> whole second kill-switch that nobody was counting.**
+>
+> | | AWS-native budget action | `tv_hard_stop_guard` (ours) |
+> |---|---|---|
+> | Owner | AWS Budgets | this repository, `hard_stop_guard.rs` |
+> | Cadence | on budget threshold | **hourly**, `cron(0 * * * ? *)` |
+> | Reads spend from | AWS Budgets internals | Cost Explorer, `ce:GetCostAndUsage` |
+> | On breach | `STOP_EC2_INSTANCES` | stops the box, **disables the morning auto-start**, and pages |
+> | Permission | the `budget_action` role | `ec2:StopInstances` scoped by the `tv-<env>-app` Name tag |
+> | Verifiable from here | **no** — `AccessDenied` | **yes** — 34 ported tests, `classify` → `breach_stop` |
+>
+> So the honest statement is **"the AWS-NATIVE action is unverifiable"**, never
+> "the kill switch may not fire". A ceiling is not arithmetic about nothing:
+> `hard_stop_guard` enforces it hourly, in code that ships with this repo, and it
+> never consults the native action.
+>
+> **This row cost real work, which is why it is corrected rather than quietly
+> narrowed.** On 2026-08-25 an executor reported it to the operator as *"arguably
+> the most serious open item in the whole repo"* — reasoning from these four
+> sections rather than from `hard_stop_guard.rs`, which is thirty lines of
+> reading away. That is precisely the failure the O(1) table's own
+> `day_ohlc_tracker` note records on 2026-08-12: **a stale row does not merely
+> fail to warn, it manufactures false findings**, and the cost is paid by
+> whoever trusts it next.
+>
+> **THE GAP THAT WAS REAL, and that all four sections missed while watching the
+> native action:** nothing checked that OUR switch still *runs*. Its `Errors`
+> alarm is structurally blind to a dropped EventBridge schedule — no invocation
+> means no error — so a silently disabled rule reads as a permanently healthy
+> Lambda. That is the 2026-07-02 repo-wide scheduler-drop class, and it applied
+> to the budget kill-switch and to the Lambda that starts the trading box each
+> morning, simultaneously. **FIXED the same day:** six `*-not-invoked` alarms
+> (6-hour window for the two hourly guards, 24-hour for the four weekday ones),
+> plus `cloudwatch_app_alarms_wiring.rs::
+> every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption`, which
+> fails the build if a future scheduled Lambda arrives without one. That guard
+> found four of the six itself, on its first run.
+>
+> **Still Unknown, and still worth an operator's IAM edit:** whether the two
+> native actions have recovered. It is now a nice-to-know rather than a hole in
+> the safety net, and the read needs one action added to a policy — not new
+> credentials (`sts get-caller-identity`, `budgets describe-budget` and
+> `ce get-cost-and-usage` all succeed for the same identity).
+
 **One-way door.** gp3 grows online in one command and can **NEVER** shrink;
 `modify-volume` refuses a smaller size and a 300 GB snapshot cannot restore into
 anything smaller. Reversing this needs a terminate-and-recreate. `variables.tf`
