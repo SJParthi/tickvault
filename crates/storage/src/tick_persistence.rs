@@ -1250,7 +1250,7 @@ mod tests {
             last_trade_quantity: 50,
             exchange_timestamp: 1_780_000_000,
             received_at_nanos: 1_780_000_000_111_000_000,
-            average_traded_price: 23_145.10,
+            average_traded_price: 23_145.1,
             volume: 1_234_567,
             total_sell_quantity: 9_000,
             total_buy_quantity: 10_000,
@@ -1628,7 +1628,7 @@ mod tests {
     /// (STORAGE-GAP-02, operator-spotted 2026-05-25).
     #[test]
     fn test_prices_widen_via_f32_to_f64_clean_not_raw_widening() {
-        for raw in [23_925.65_f32, 23_937.30, 10.20, 25_461.30] {
+        for raw in [23_925.65_f32, 23_937.3, 10.20, 25_461.3] {
             let mut tick = sample_tick();
             tick.last_traded_price = raw;
             tick.day_open = raw;

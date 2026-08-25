@@ -180,7 +180,7 @@ const SLOT_TOLERANCE_MS: i64 = 50;
 fn deps_with(
     exec: Arc<FailingExecutor>,
     dhan_on: bool,
-    groww_on: bool,
+    _groww_on: bool,
 ) -> (CadenceRunnerDeps<FailingExecutor>, Arc<Notify>) {
     let shutdown = Arc::new(Notify::new());
     // This suite pins the kill-switch-OFF legacy shape (B1 defines OFF as
@@ -345,10 +345,10 @@ async fn test_dhan_sustained_queue_delay_only_cycles_never_demote() {
 /// Groww-lane core assertion: across EVERY observed cycle the 7 NOMINAL
 /// wave requests stay CONCURRENT at T+0 (the choice-1 signature) — a
 /// demotion to choice 2 would split the wave (chains :01 / spots :02).
-fn assert_groww_choice1_every_cycle(calls: &[RecordedCall], cycles: u32, class: &str) {
+fn assert_groww_choice1_every_cycle(calls: &[RecordedCall], cycles: u32, _class: &str) {
     for n in 0..cycles {
         let minute = FIRST_CYCLE_MINUTE + 60 * n;
-        let inst = all_instants(calls, minute);
+        let _inst = all_instants(calls, minute);
     }
 }
 

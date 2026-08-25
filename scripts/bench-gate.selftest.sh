@@ -190,5 +190,23 @@ for spec in \
 done
 expect "31/31 drift + one +111.6% outlier -> PASS (IQR ignores tails; was false RED)" 0 "$G"
 
+# --- Case H: benches present but NONE matches a budget key -> FAIL-CLOSED ----
+# The 2026-08-24 audit finding. Criterion produced output, but every bench id
+# drifted away from its budget key, so ZERO absolute budgets were enforced.
+# Pre-fix this printed an INFO line and fell through to exit 0 — a green
+# verdict from an empty comparison. Mirrors coverage-gate self-test case 4.
+H="$TMP/h"
+for name in zzz_unbudgeted_alpha zzz_unbudgeted_beta ; do
+  mk_bench "$H" "$name" 10 "0.001" "-0.020"
+done
+expect "benches present, zero budget matches -> FAIL-CLOSED" 3 "$H"
+
+# --- Case I: empty Criterion tree -> FAIL-CLOSED ----------------------------
+# The benches-did-not-run / artifact-not-restored shape. Pre-fix this printed
+# "No benchmark estimates found — skipping." and exited 0.
+I_DIR="$TMP/i"
+mkdir -p "$I_DIR"
+expect "empty criterion dir -> FAIL-CLOSED" 3 "$I_DIR"
+
 printf '  bench-gate self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

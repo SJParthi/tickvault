@@ -89,6 +89,26 @@ impl DrainOutcome {
         self.ring_seals_popped == 0
     }
 
+    /// Folds another cycle's outcome into this one, for callers that run
+    /// several cycles and must report the TOTAL rather than the last.
+    ///
+    /// `flushed_ok` is `AND`ed, not `OR`ed: across a multi-cycle drain the
+    /// honest reading of "did the data reach QuestDB" is *every* flush
+    /// succeeded. `OR` would let one good cycle mask a failing one, which is
+    /// the false-OK this codebase keeps having to remove.
+    ///
+    /// # Complexity
+    /// O(1) — five saturating adds and a boolean.
+    pub const fn accumulate(&mut self, other: &Self) {
+        self.ring_seals_popped = self
+            .ring_seals_popped
+            .saturating_add(other.ring_seals_popped);
+        self.flushed_ok = self.flushed_ok && other.flushed_ok;
+        self.rescued_to_spill = self.rescued_to_spill.saturating_add(other.rescued_to_spill);
+        self.rescued_to_dlq = self.rescued_to_dlq.saturating_add(other.rescued_to_dlq);
+        self.rescued_dropped = self.rescued_dropped.saturating_add(other.rescued_dropped);
+    }
+
     /// `true` if any seals were rescued to spill / DLQ / dropped
     /// because flush failed.
     #[must_use]

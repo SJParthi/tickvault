@@ -326,7 +326,8 @@ mod tests {
 
     #[test]
     fn test_feed_as_str_and_parse_round_trip() {
-        for feed in [Feed::Dhan] {
+        {
+            let feed = Feed::Dhan;
             assert_eq!(Feed::parse(feed.as_str()), Some(feed));
         }
         assert_eq!(Feed::parse("DHAN"), None, "parse is case-sensitive");

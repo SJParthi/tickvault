@@ -151,7 +151,7 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
     // would make this gate fail for the wrong reason and teach the next reader
     // to raise the budget instead of finding the leak.
     for i in 0..4u64 {
-        let _ = ingest.ingest_tick_at(&tick(13 + i, 100.0, SESSION_EPOCH_SECS), i as u64, 0, 1_000);
+        let _ = ingest.ingest_tick_at(&tick(13 + i, 100.0, SESSION_EPOCH_SECS), i, 0, 1_000);
     }
 
     let profiler = dhat::Profiler::builder().testing().build();
