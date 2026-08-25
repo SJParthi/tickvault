@@ -2432,9 +2432,12 @@ where
                                     pool_index = supervisor.slot().pool_index,
                                     dropped_on_this_socket = ring_full_seen,
                                     "the frame ring is FULL — the fold cannot keep up, so this \
-                                     frame is not being turned into ticks or candles. It is in \
-                                     the write-ahead log, but nothing re-folds WAL frames, so \
-                                     treat this as data loss until that changes. Logged at \
+                                     frame is not being turned into ticks or candles NOW. It IS \
+                                     in the write-ahead log and the next boot re-folds it, so \
+                                     the tick ROWS come back; what does not come back is their \
+                                     CANDLE contribution, because by then the tick is outside \
+                                     the aggregating session and only the row is written. Treat \
+                                     this as lost candles, not lost ticks. Logged at \
                                      1, 2, 4, 8 ... occurrences per socket to bound the noise."
                                 );
                             }

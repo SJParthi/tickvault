@@ -901,6 +901,22 @@ pub struct LiveIngest {
     /// staging area, NOT storage: without a flush the rows never leave the
     /// process, so this counter is what makes the flush happen at all.
     pending_rows: u64,
+    /// True once [`Self::spawn_offload_writer`] has moved the blocking ILP
+    /// round trip onto a thread of its own.
+    ///
+    /// Read by `flush_and_record`, which must NOT record feed health from an
+    /// offloaded flush: the number that comes back is rows HANDED OFF, and
+    /// health is defined as rows LANDED. The writer thread reports it instead.
+    writer_offloaded: bool,
+    /// The writer thread's join handle, held HERE rather than at the boot site
+    /// so the drain — which owns the tail flush — can wait for the last batch
+    /// to land.
+    ///
+    /// This is not tidiness. The shutdown tail exists because "the tail of the
+    /// session is exactly the data a naive shutdown loses"; offloading it
+    /// without a join would have re-created that loss one queue further out,
+    /// with the batch dying in a detached thread as the process exits.
+    writer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LiveIngest {
@@ -977,6 +993,8 @@ impl LiveIngest {
             seals_rescued: 0,
             seals_dropped: 0,
             pending_rows: 0,
+            writer_offloaded: false,
+            writer_thread: None,
         }
     }
 
@@ -1005,6 +1023,104 @@ impl LiveIngest {
     /// Returns the number of rows the flush covered. A failed flush DISCARDS
     /// the buffer by `TickWriter` contract — loudly, so the loss is counted
     /// rather than silently re-sent forever.
+    /// Moves the blocking ILP round trip onto a dedicated OS thread.
+    ///
+    /// # The coupling this removes
+    ///
+    /// `TickWriter::flush` is a synchronous HTTP call with a 5 s timeout, and
+    /// it ran ON the frame-drain task. `blocking_flush` wrapped it in
+    /// `block_in_place`, which is a real mitigation for the RUNTIME — the
+    /// other tasks keep their workers — but it does nothing for the drain
+    /// itself, and the drain is the only thing emptying the socket. So a slow
+    /// QuestDB stopped the fold; the receive buffer filled; and Dhan, whose
+    /// published behaviour is to skip a slow consumer forward to "the latest
+    /// available state" with no sequence number, discarded the intermediate
+    /// ticks at their side. The loss was therefore invisible to every counter
+    /// we own, and no amount of provisioned disk throughput removes it,
+    /// because the coupling is structural.
+    ///
+    /// After this call the drain's flush is a bounded-queue hand-off: it
+    /// never waits on the network, and when the queue is full it keeps the
+    /// rows and retries rather than blocking or dropping.
+    ///
+    /// # An OS thread, not `spawn_blocking`
+    ///
+    /// The writer runs for the life of the process doing a blocking wait.
+    /// Parking a tokio blocking-pool thread on it forever is exactly what
+    /// that pool is not for, and a named OS thread shows up in `top` as
+    /// `tv-tick-writer`, which is worth something at 3 a.m.
+    ///
+    /// # Health is reported HERE
+    ///
+    /// The thread — not the drain — calls `record_ticks`, with rows that
+    /// actually LANDED. Reporting on hand-off instead would forge liveness
+    /// during a database outage: the queue would accept batches happily while
+    /// nothing reached the database, and `feed_health` would read green for
+    /// precisely as long as the data was going nowhere.
+    pub fn spawn_offload_writer(
+        &mut self,
+        feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    ) -> std::io::Result<()> {
+        let placeholder = TickWriter::for_test(Feed::Dhan);
+        let live = std::mem::replace(&mut self.writer, placeholder);
+        let (producer, mut sink, rx) = live.split_for_offload();
+        self.writer = producer;
+        self.writer_offloaded = true;
+        let handle = std::thread::Builder::new()
+            .name("tv-tick-writer".to_owned())
+            .spawn(move || {
+                // `recv` ends only when every sender is dropped, i.e. when the
+                // drain itself is gone. There is no other exit, deliberately:
+                // a writer that could stop on its own would leave the producer
+                // handing rows to a closed queue.
+                while let Ok(mut batch) = rx.recv() {
+                    let landed = sink.write(&mut batch);
+                    report_tick_persistence(landed > 0);
+                    feed_health.record_ticks(
+                        Feed::Dhan,
+                        landed as u64,
+                        chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+                    );
+                }
+                info!("tick writer thread exiting — the drain closed its queue");
+            })?;
+        self.writer_thread = Some(handle);
+        Ok(())
+    }
+
+    /// Closes the hand-off queue and WAITS for the writer thread to finish.
+    ///
+    /// Call once, after the shutdown tail flush. The order is load-bearing:
+    /// the tail flush hands the last batch to the queue, closing the queue
+    /// tells the writer there is no more, and the join is what guarantees that
+    /// batch reaches QuestDB (or the spill tier) before the process goes away.
+    /// Skipping the join loses exactly the rows the tail flush exists to save.
+    ///
+    /// Idempotent and safe on a lane that was never offloaded.
+    pub fn shutdown_offload_writer(&mut self) {
+        self.writer.close_offload();
+        self.writer_offloaded = false;
+        if let Some(handle) = self.writer_thread.take()
+            && handle.join().is_err()
+        {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the tick writer thread PANICKED — the final batch of the session \
+                 may not have reached QuestDB. Check the tick spill directory."
+            );
+        }
+    }
+
+    /// Has the blocking flush been moved off the drain task?
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the offload wiring tests below.
+    pub const fn writer_is_offloaded(&self) -> bool {
+        self.writer_offloaded
+    }
+
     pub fn flush(&mut self) -> u64 {
         // Flush the inline-depth sink FIRST, and unconditionally.
         //
@@ -2856,6 +2972,17 @@ fn flush_and_record(
     ingest: &mut LiveIngest,
     feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
 ) -> u64 {
+    // OFFLOADED: the flush is a bounded-queue hand-off with no network in it,
+    // so there is nothing to move off-worker and — more importantly — nothing
+    // to report health from. `rows` here means rows HANDED OFF, and health is
+    // defined three paragraphs up as rows FLUSHED. Recording on hand-off would
+    // forge liveness for exactly as long as the database was unreachable: the
+    // queue accepts batches, the sink fails every write, and the one signal an
+    // operator checks reads green. The writer thread records instead, from the
+    // rows that actually landed — see `LiveIngest::spawn_offload_writer`.
+    if ingest.writer_is_offloaded() {
+        return ingest.flush();
+    }
     let rows = blocking_flush(|| ingest.flush());
     feed_health.record_ticks(
         Feed::Dhan,
@@ -3518,6 +3645,11 @@ async fn run_frame_drain(
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
     let tail = flush_and_record(&mut ingest, &feed_health);
+    // Close the hand-off queue and WAIT. The tail flush above only handed the
+    // batch to the writer thread; without this join the process can exit while
+    // that batch is still in flight, which would lose precisely the rows the
+    // tail flush exists to save. No-op on a lane that was never offloaded.
+    ingest.shutdown_offload_writer();
     flush_depth(depth_ingest.as_mut());
     publish_fold_depth(&ingest);
     let depth_dropped = depth_ingest.as_ref().map_or(0, DepthIngest::dropped_rows);
@@ -6691,6 +6823,32 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // `with_detector_capacity` for the 1.2M refusals this fixes.
     .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb));
+
+    // Move the blocking ILP round trip off the drain task, BEFORE any socket
+    // opens. See `LiveIngest::spawn_offload_writer` for why a flush on the
+    // drain is not merely slow but a tick-loss mechanism.
+    //
+    // A spawn failure is NOT fatal and NOT silent: the lane falls back to the
+    // synchronous path it has always used, which is degraded rather than
+    // broken, and says so with a coded error. Refusing to boot over it would
+    // trade a real feed for a better-shaped one.
+    match ingest.spawn_offload_writer(Arc::clone(&params.feed_health)) {
+        Ok(()) => {
+            info!(
+                "tick writer: the ILP flush now runs on its own thread — a slow \
+                 database can no longer stall the frame drain"
+            );
+        }
+        Err(err) => {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                error = %err,
+                "tick writer thread could not be spawned — the ILP flush stays ON \
+                 the frame drain, where a slow database stalls the fold and ticks \
+                 are lost upstream at the vendor. The lane still runs."
+            );
+        }
+    }
 
     // Seed BEFORE any socket opens, so an instrument that never delivers a
     // single tick is reported as silent rather than being invisible to the gap
@@ -11375,6 +11533,74 @@ mod tests {
     // -- structural proofs --------------------------------------------------
 
     #[test]
+    fn an_offloaded_flush_never_touches_the_network_from_the_drain() {
+        // `for_test` has NO ILP sender. Un-offloaded, a flush with pending
+        // rows therefore takes the "QuestDB unreachable" arm, rescues the
+        // buffer to disk and reports the rows as gone. Offloaded, the same
+        // flush must be a queue hand-off that completes immediately — which
+        // is the whole behavioural difference this change buys.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(Arc::clone(&health))
+            .expect("the writer thread must spawn");
+
+        assert!(
+            ingest.writer_is_offloaded(),
+            "the split must be observable — `flush_and_record` reads this flag \
+             to decide whether the returned row count means LANDED or HANDED OFF"
+        );
+
+        let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let parsed = dispatch_frame(&packet, 1_779_355_000_000_000_000)
+            .expect("a well-formed ticker packet must parse");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+        assert_eq!(ingest.pending_rows(), 1, "the tick must be buffered");
+
+        let covered = ingest.flush();
+
+        assert_eq!(covered, 1, "the flush covered the buffered row");
+        assert_eq!(
+            ingest.pending_rows(),
+            0,
+            "the rows left the drain's buffer on hand-off"
+        );
+
+        // Shutdown order under test: close the queue, then wait. This is the
+        // step that makes the tail of a session durable rather than in-flight.
+        ingest.shutdown_offload_writer();
+        assert!(
+            !ingest.writer_is_offloaded(),
+            "after shutdown the lane falls back to the synchronous arm, so a \
+             late flush rescues to disk instead of handing to a closed queue"
+        );
+    }
+
+    #[test]
+    fn the_writer_thread_is_joined_at_shutdown_so_the_tail_batch_lands() {
+        // A thread that outlives its producer is a leak, and a thread that
+        // exits EARLY is worse: the producer would keep handing rows to a
+        // closed queue, which rescues every batch to disk while the lane looks
+        // healthy. The only correct exit is "every sender is gone", so pin it.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(health)
+            .expect("the writer thread must spawn");
+
+        // `shutdown_offload_writer` joins. It would hang forever if closing
+        // the queue did not actually wake the writer's blocking `recv`, so
+        // reaching the next line at all is the assertion.
+        ingest.shutdown_offload_writer();
+
+        // Idempotent: a second call must not panic on an already-taken handle.
+        ingest.shutdown_offload_writer();
+    }
+
+    #[test]
     fn test_drain_never_flushes_bare_on_the_async_worker() {
         // The drain task owns the ONLY consumer of the frame ring. Its
         // `flush()` is a SYNCHRONOUS blocking ILP-over-HTTP call bounded by
@@ -11427,18 +11653,73 @@ mod tests {
              module's drain tests are bare #[tokio::test]"
         );
 
-        // The load-bearing assertion: no production call site may invoke
-        // flush() bare. Written as a search for the bare form so that adding a
-        // FOURTH flush site without the helper fails here rather than in prod.
+        // The load-bearing assertion: no production call site may invoke a
+        // BLOCKING flush() bare. Written as a search for the bare form so that
+        // adding a further flush site without the helper fails here rather
+        // than in prod.
+        //
+        // 2026-08-25 — one exception now exists, and it is the opposite of the
+        // defect this test was written for. When the writer has been SPLIT
+        // (`LiveIngest::spawn_offload_writer`), `ingest.flush()` performs no
+        // network I/O at all: it hands the ILP buffer to a bounded queue that
+        // a dedicated OS thread drains. Wrapping THAT in `block_in_place`
+        // would ask the runtime to spin up a replacement worker for a
+        // `try_send`, which is pure cost for no benefit.
+        //
+        // So the exception is counted EXPLICITLY rather than by loosening the
+        // equality. `bare == wrapped` would have been the tempting edit and it
+        // is the wrong one: it stops noticing a genuinely bare blocking flush,
+        // which is the entire point of the test. Instead the offloaded form is
+        // recognised by its own literal, and anything that is neither wrapped
+        // nor that literal still fails.
         let bare = production_half.matches("ingest.flush()").count();
         let wrapped = production_half
             .matches("blocking_flush(|| ingest.flush())")
             .count();
+        let offloaded = production_half.matches("return ingest.flush();").count();
         assert_eq!(
-            bare, wrapped,
-            "every production ingest.flush() must be wrapped in blocking_flush; \
-             found {bare} call(s) and {wrapped} wrapped — the difference is a \
-             blocking HTTP call sitting on the async drain task"
+            offloaded, 1,
+            "expected exactly ONE non-blocking flush — the early return inside \
+             `flush_and_record` taken when the writer has been offloaded. Found \
+             {offloaded}: either the offload branch was deleted (the flush is \
+             back on the drain) or a second site started bypassing the helper"
+        );
+        assert_eq!(
+            bare,
+            wrapped + offloaded,
+            "every production ingest.flush() must be either wrapped in \
+             blocking_flush (the synchronous fallback) or the offloaded early \
+             return; found {bare} call(s), {wrapped} wrapped and {offloaded} \
+             offloaded — the difference is a blocking HTTP call sitting on the \
+             async drain task"
+        );
+
+        // The offload must be WIRED, not merely available. Seven of the nine
+        // findings fixed on 2026-08-25 were the same shape — a mechanism that
+        // existed and was never plugged in — so a declaration on its own
+        // proves nothing here either.
+        assert!(
+            production_half.contains("fn spawn_offload_writer"),
+            "the writer-thread split must exist"
+        );
+        assert!(
+            production_half.contains("ingest.spawn_offload_writer("),
+            "the boot site must actually spawn the writer thread — a split that \
+             is never performed leaves the blocking flush on the drain while \
+             every symbol needed to move it sits right there unused"
+        );
+        assert!(
+            production_half.contains("ingest.shutdown_offload_writer()"),
+            "the drain must JOIN the writer thread after its tail flush — that \
+             flush only HANDS OFF the last batch of the session, so without the \
+             join the process can exit with it still in flight, losing exactly \
+             the rows the tail flush exists to save"
+        );
+        assert!(
+            production_half.contains("if ingest.writer_is_offloaded()"),
+            "`flush_and_record` must gate on the offload flag: an offloaded \
+             flush returns rows HANDED OFF, and recording those as feed health \
+             forges liveness for exactly as long as the database is unreachable"
         );
 
         // 2026-08-18: the drain's three flush sites now route through
