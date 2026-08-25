@@ -2655,6 +2655,35 @@ pub const WS_WAL_ARCHIVE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 /// Cadence of the WAL archive prune task (6 hours in seconds).
 pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;
 
+/// Age bound on the ACTIVE `<wal_dir>/*.wal` set — 2 days (2026-08-25).
+///
+/// Until this existed, ONLY `archive/` was bounded. The active directory had
+/// no age bound and no byte bound, because the design assumed it drains
+/// itself: replay at boot → `replaying/` → confirm → `archive/` → pruned
+/// there.
+///
+/// It does not drain. `WAL_REPLAY_MAX_BYTES` caps a boot replay at 512 MiB —
+/// five segments — while the live lane writes continuously all session.
+/// Everything past the newest 512 MiB is never replayed, never confirmed,
+/// never archived, and so was eligible for no bound at all. Measured on the
+/// prod box: **244 active segments, 31 GB, oldest dated 08-24**, against a
+/// 1.9 GB archive its own bounds were holding correctly. The volume was 94%
+/// full and free space was cycling down to 1.94 GB.
+///
+/// **Why 2 days rather than the archive's 3.** These segments are
+/// PRE-confirmation, so the set is larger and turns over faster, and their
+/// recovery value decays faster too: a crash is recovered from the current
+/// session's tail. Two days keeps the previous session for triage while
+/// guaranteeing the bound cannot race the replay budget — at any retention of
+/// a full day or more, nothing a prune pass can delete is reachable by the
+/// next boot's 512 MiB replay window.
+///
+/// The BYTE half of the bound is deliberately NOT a constant here: see
+/// `ws_frame_spill::ws_wal_active_max_bytes`, which derives it from the
+/// volume. A ceiling pinned to no machine is what this session was spent
+/// repairing.
+pub const WS_WAL_ACTIVE_RETENTION_SECS: u64 = 172_800;
+
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
 // ---------------------------------------------------------------------------

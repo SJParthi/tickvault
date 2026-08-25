@@ -1404,6 +1404,24 @@ async fn async_main() -> Result<()> {
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
                 tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
             );
+            // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
+            // Only `archive/` was ever pruned, on the assumption that active
+            // segments drain themselves via boot replay. They do not — the
+            // replay budget is 512 MiB per boot against continuous writing,
+            // so everything past the newest five segments was never replayed,
+            // never confirmed, never archived, and eligible for no bound.
+            // Measured on the prod box the day this landed: 244 active
+            // segments, 31 GB, oldest from the previous day, on a volume that
+            // was 94% full with free space cycling down to 1.94 GB — which is
+            // the condition that makes an ILP flush fail in the first place.
+            //
+            // Rides this same loop for the same reason the spill sweep does:
+            // same cadence, same cold path, one fewer task to supervise.
+            let _active = tickvault_storage::ws_frame_spill::prune_active_segments(
+                &wal_dir,
+                tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
+                tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
+            );
             // 2026-08-19: the SPILL retention sweep, wired for the first
             // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
             // unit-tested since 2026-07-13 with ZERO production consumers,
