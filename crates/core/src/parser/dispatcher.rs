@@ -341,8 +341,13 @@ pub fn stacked_disconnect_reason(frame: &[u8], max_packets: u32) -> Option<u16> 
             return None;
         }
         if found.is_none() && rest.first().copied() == Some(RESPONSE_CODE_DISCONNECT) {
-            let raw = rest.get(len.checked_sub(2)?..len)?;
-            found = Some(u16::from_le_bytes([raw[0], raw[1]]));
+            // `try_into` rather than `raw[0]`/`raw[1]`: this module carries
+            // `deny(clippy::indexing_slicing)` under `not(test)`, and it is
+            // right to. A panic in a parser reading vendor bytes is the one
+            // failure a feed cannot absorb, so the reason code is read through
+            // a fallible conversion that yields `None` instead.
+            let raw: [u8; 2] = rest.get(len.checked_sub(2)?..len)?.try_into().ok()?;
+            found = Some(u16::from_le_bytes(raw));
         }
         offset = end;
         packets = packets.saturating_add(1);
