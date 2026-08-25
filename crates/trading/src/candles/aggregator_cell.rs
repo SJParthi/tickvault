@@ -1146,17 +1146,42 @@ fn fold_in_bucket(
     if tick.exchange_timestamp >= state.close_ts_ist_secs {
         state.close = price;
         state.close_ts_ist_secs = tick.exchange_timestamp;
-        // Open interest is a point-in-time reading, so it belongs to the same
-        // "latest packet" question as the close. A stale packet's OI is simply
-        // an older reading, never news.
-        state.oi = i64::from(tick.open_interest);
+        // MERGE 2026-08-25: the order guard above and the non-zero guard here
+        // fix DIFFERENT halves of the same field, and OI needs BOTH.
+        //
+        // The order guard answers "is this packet newer?". It cannot answer
+        // "does this packet carry an OI reading at all". `0` is the ABSENT
+        // sentinel — a Ticker-mode packet has no OI field and an equity never
+        // has one — so a NEWER blank packet passes the order guard and would
+        // still erase a real OI that an earlier tick in the SAME bucket had
+        // established. Order alone does not make a blank field into news.
+        //
+        // Last NON-ZERO wins, exactly like `prev_day_close` / `session_open`
+        // below, which carry the same reasoning for the same reason.
+        if tick.open_interest != 0 {
+            state.oi = i64::from(tick.open_interest);
+        } else if state.oi != 0 {
+            metrics::counter!("tv_candle_oi_zero_ignored_total").increment(1);
+        }
     }
     // Exchange cumulative volume only ever rises, so a bucket's traded volume
-    // is monotone too. `saturating_sub` alone bounded the arithmetic but still
-    // let a stale packet SHRINK the bar's volume below a figure we had already
-    // observed. Taking the maximum keeps the highest cumulative actually seen.
+    // is monotone too. `saturating_sub` bounded the ARITHMETIC against
+    // underflow, which is not the same thing as bounding the BAR: a stale
+    // packet carries a smaller day-cumulative, so the difference is smaller
+    // too, and the assignment dragged an already-correct volume back down.
+    // The bar then sealed under-reporting while the NEXT bar reported the gap
+    // — the volume moved between buckets instead of staying put.
+    //
+    // Widening only, kept as an explicit compare rather than `.max()` so the
+    // suppressed case is COUNTED. A silent `.max()` is correct and tells you
+    // nothing: the regression RATE is what says whether this guard is
+    // load-bearing today or dormant, and that is worth a counter.
     let bucket_volume = cumulative_volume.saturating_sub(state.bucket_start_cumulative);
-    state.volume = state.volume.max(bucket_volume);
+    if bucket_volume > state.volume {
+        state.volume = bucket_volume;
+    } else if bucket_volume < state.volume {
+        metrics::counter!("tv_candle_volume_regression_suppressed_total").increment(1);
+    }
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
     // baseline captured earlier in the session. The widened fields are `0.0`
@@ -1227,6 +1252,88 @@ mod tests {
     pub(super) const DAY: u32 = 1_779_321_600;
     /// 09:15:00 IST of [`DAY`].
     pub(super) const OPEN: u32 = DAY + 33_300;
+
+    // -- volume / oi regression guards (live defect, measured 2026-08-24) ----
+
+    #[test]
+    fn an_out_of_order_tick_inside_an_open_bucket_must_not_lower_the_bars_volume() {
+        // BITE PROOF: on the pre-fix `state.volume = cumulative - baseline`
+        // (last-write-wins) this asserts 500 == 900 and FAILS.
+        //
+        // `tick.volume` is DAY-CUMULATIVE. Two ticks land in the same minute
+        // and the second is the EARLIER one (out of order on the wire), so it
+        // carries a smaller cumulative. Its arrival must not un-count volume
+        // the bucket has already legitimately observed.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN, 100.0, 1_000),
+            100,
+            strategy,
+            1_000,
+        );
+        assert_eq!(cell.snapshot(TfIndex::M1).volume, 900);
+
+        // Same bucket, out of order: earlier cumulative, later arrival.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 5, 101.0, 600),
+            100,
+            strategy,
+            600,
+        );
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            900,
+            "in-bucket volume widens only; a stale cumulative is not news"
+        );
+
+        // A genuinely larger cumulative still advances it.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 9, 102.0, 1_500),
+            100,
+            strategy,
+            1_500,
+        );
+        assert_eq!(cell.snapshot(TfIndex::M1).volume, 1_400);
+    }
+
+    #[test]
+    fn an_open_interest_of_zero_must_not_clobber_a_previously_non_zero_oi() {
+        // BITE PROOF: on the pre-fix unconditional `state.oi = ...` this
+        // asserts 4_200 == 0 and FAILS.
+        //
+        // `0` is the ABSENT sentinel for open interest — Ticker-mode packets
+        // carry no OI field at all — exactly as it is for `day_close` /
+        // `day_open` three lines below in the same function, which already
+        // use last-NON-ZERO-wins.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        let mut with_oi = tick_at(OPEN, 100.0, 10);
+        with_oi.open_interest = 4_200;
+        cell.consume_tick(TfIndex::M1, &with_oi, 0, strategy, 10);
+        assert_eq!(cell.snapshot(TfIndex::M1).oi, 4_200);
+
+        // Same bucket, a packet with no OI field populated.
+        let blank = tick_at(OPEN + 5, 101.0, 20);
+        assert_eq!(blank.open_interest, 0, "fixture models the absent case");
+        cell.consume_tick(TfIndex::M1, &blank, 0, strategy, 20);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).oi,
+            4_200,
+            "an absent OI must not erase a real one captured earlier in the bar"
+        );
+
+        // A real later value still wins.
+        let mut newer = tick_at(OPEN + 9, 102.0, 30);
+        newer.open_interest = 4_500;
+        cell.consume_tick(TfIndex::M1, &newer, 0, strategy, 30);
+        assert_eq!(cell.snapshot(TfIndex::M1).oi, 4_500);
+    }
 
     pub(super) fn tick_at(ts: u32, price: f32, cum_volume: u32) -> ParsedTick {
         ParsedTick {

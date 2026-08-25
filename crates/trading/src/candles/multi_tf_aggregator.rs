@@ -118,7 +118,26 @@ struct InstrumentSlot {
     cell: AggregatorCell,
     /// Cumulative day volume as of the END of the last tick folded. On a
     /// boundary crossing this becomes the new bucket's volume baseline.
+    ///
+    /// MONOTONIC by construction (see `consume_tick`): it may advance, never
+    /// regress. `tick.volume` is DAY-CUMULATIVE, so a late tick carries a
+    /// SMALLER value than the one already stored; letting that value land
+    /// here dragged the NEXT bucket's baseline backwards and inflated its
+    /// volume by the whole regression. Measured live 2026-08-24: intraday
+    /// frames summed to ~9.2x the day bar.
     last_cumulative: u64,
+    /// `false` until the first tick this slot ever folds.
+    ///
+    /// A slot created MID-SESSION starts with no knowledge of the volume the
+    /// instrument already traded, and `0` is not that knowledge — it is the
+    /// absence of it. Treating `0` as a baseline made the first bucket report
+    /// `cumulative - 0`, i.e. THE ENTIRE DAY SO FAR, in one bar. The first
+    /// tick seeds the baseline instead, so the first bar reports `0` and the
+    /// unattributable volume is COUNTED
+    /// (`tv_aggregator_slot_volume_baseline_seeded_total`) rather than
+    /// invented. Under-reporting one bucket is far less wrong than
+    /// over-reporting by a whole day, and it must not be silent.
+    volume_baseline_seeded: bool,
 }
 
 /// Per-tick outcome, coalesced across all [`TF_COUNT`](crate::candles::TF_COUNT)
@@ -402,6 +421,9 @@ impl MultiTfAggregator {
             key,
             cell: AggregatorCell::empty(),
             last_cumulative: 0,
+            // Deliberately NOT a baseline — see the field doc. The first tick
+            // this slot folds replaces it with a real observation.
+            volume_baseline_seeded: false,
         });
         self.index
             .insert(key, u32::try_from(idx).unwrap_or(u32::MAX));
@@ -474,6 +496,32 @@ impl MultiTfAggregator {
                 ..ConsumeStats::default()
             };
         }
+        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
+        // 2026-08-25, and that reordering is the whole fix.
+        //
+        // It used to sit below, which left a hole the drain's own comment
+        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
+        // and returns early, so a packet carrying LTP = 0 AND
+        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
+        // stayed false, the drain classified it `untraded_sentinel` — a
+        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
+        // DESIGNATED timestamp, so that row lands in a year-2106 partition
+        // that retention and archival, which key on the trading day, can never
+        // reach, while every `max(ts)` and range query over `ticks` silently
+        // includes it.
+        //
+        // One malformed or hostile packet was enough. The band check belongs
+        // above every early return that can still produce a persisted row, not
+        // merely above the fold.
+        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
+        {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
+            return ConsumeStats {
+                refused_timestamp: true,
+                ..ConsumeStats::default()
+            };
+        }
         if p == 0.0 {
             counter!("tv_aggregator_tick_refused_total", "reason" => "untraded_sentinel")
                 .increment(1);
@@ -511,15 +559,12 @@ impl MultiTfAggregator {
         // watermark begins at 0, so the first honest tick is itself a
         // ~1.78-billion-second jump and a relative cap clamps it to garbage.
         // That mistake was written, caught by these tests, and replaced.
-        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
-        {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
-            return ConsumeStats {
-                refused_timestamp: true,
-                ..ConsumeStats::default()
-            };
-        }
+        //
+        // 2026-08-25: defence 2 (the band check) now sits ABOVE the
+        // untraded-sentinel return rather than here, because a sentinel tick
+        // still produces a PERSISTED row. See the block above the `p == 0.0`
+        // arm. The watermark is still advanced only after both gates, so this
+        // paragraph's reasoning is unchanged.
 
         if tick.exchange_timestamp > self.watermark_secs {
             self.watermark_secs = tick.exchange_timestamp;
@@ -563,6 +608,17 @@ impl MultiTfAggregator {
 
         let cumulative_volume =
             cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
+
+        // SEED, do not assume zero. A slot allocated mid-session has never
+        // seen this instrument, so the volume it traded before we arrived is
+        // unattributable to any bucket we own. Anchoring the baseline on this
+        // first observation makes the first bar report 0; anchoring it on `0`
+        // made the first bar report the whole day.
+        if !slot.volume_baseline_seeded {
+            slot.volume_baseline_seeded = true;
+            slot.last_cumulative = cumulative_volume;
+            counter!("tv_aggregator_slot_volume_baseline_seeded_total").increment(1);
+        }
         let baseline = slot.last_cumulative;
         let mut stats = ConsumeStats::default();
 
@@ -608,7 +664,30 @@ impl MultiTfAggregator {
         // Store the SAME resolved cumulative the cells folded, so the next
         // bucket's baseline matches what was just written — never the
         // truncated `u32` when a `u64` override was supplied.
-        slot.last_cumulative = cumulative_volume;
+        //
+        // ADVANCE ONLY. This was an UNCONDITIONAL assignment and that was a
+        // live data-corruption defect, measured 2026-08-24: the same trading
+        // day tiled five ways did not sum to one volume total (1s
+        // 40,397,638,853 vs 1d 4,372,993,982 — the intraday frames were ~9.2x
+        // the day bar, and 6,088 instruments disagreed with their own 1m sum).
+        //
+        // Mechanism: `tick.volume` is DAY-CUMULATIVE. `FeedStrategy::DEFAULT`
+        // is `Refold`, so late ticks are routine (10.0% of live ticks arrive
+        // >1h behind receive time) and every timeframe can return
+        // `DiscardLate` — yet the store below still ran, writing that late
+        // tick's SMALLER cumulative. The next bucket then opened on a baseline
+        // BELOW the volume already traded, and `cumulative - baseline`
+        // double-counted the difference. The regression is silently
+        // self-amplifying because nothing downstream can see a baseline.
+        //
+        // Refusing the regression is the only correct answer: a cumulative
+        // counter cannot legitimately go down within a day, so a smaller value
+        // is stale, never news. It is counted so the correction is visible.
+        if cumulative_volume > slot.last_cumulative {
+            slot.last_cumulative = cumulative_volume;
+        } else if cumulative_volume < slot.last_cumulative {
+            counter!("tv_aggregator_cumulative_regression_total").increment(1);
+        }
         stats
     }
 
@@ -665,6 +744,16 @@ impl MultiTfAggregator {
         let mut emitted = 0_usize;
         for slot in &mut self.slots {
             let (feed, sid, seg) = slot.key;
+            // DAY-BOUNDARY RESET — required by the monotonic baseline in
+            // `consume_tick`, and wrong to omit. The vendor's cumulative
+            // volume restarts at ~0 each session; without this the
+            // advance-only rule would read tomorrow's honest small cumulative
+            // as a regression, refuse it all day, and publish every bar at
+            // volume 0. This is the ONE place a regression is legitimate, so
+            // it is the one place the baseline drops — and it drops to
+            // UNSEEDED, not to a fabricated `0` baseline.
+            slot.last_cumulative = 0;
+            slot.volume_baseline_seeded = false;
             for tf in TfIndex::ALL {
                 if let Some(state) = slot.cell.force_seal(tf) {
                     emitted = emitted.saturating_add(1);
@@ -747,6 +836,196 @@ mod tests {
             volume: cum,
             ..ParsedTick::default()
         }
+    }
+
+    // -- volume-conservation guards (live defect, measured 2026-08-24) ------
+    //
+    // The live box tiled ONE trading day five ways and got five different
+    // volume totals: 1s 40,397,638,853 / 30s 40,150,925,671 / 1m
+    // 40,529,097,793 / 5m 41,219,723,749 / 1d 4,372,993,982. The intraday
+    // frames were ~9.2x the day bar and 6,088 instruments disagreed with
+    // their own 1m sum. These four tests are the shapes that produced it.
+
+    #[test]
+    fn a_late_tick_with_a_smaller_cumulative_must_not_lower_the_next_buckets_baseline() {
+        // BITE PROOF: with the pre-fix unconditional
+        // `slot.last_cumulative = cumulative_volume` this asserts
+        // 1_000 == 4_000 and FAILS.
+        //
+        // `tick.volume` is DAY-CUMULATIVE, so a late tick carries a SMALLER
+        // value. Storing it dragged the NEXT bucket's baseline backwards, and
+        // that bucket then re-counted volume the previous bucket had already
+        // reported. Silently self-amplifying: nothing downstream sees a
+        // baseline.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut m1: Vec<(u32, u64)> = Vec::new();
+        let collect = |tf: TfIndex, st: LiveCandleState, out: &mut Vec<(u32, u64)>| {
+            if tf == TfIndex::M1 {
+                out.push((st.bucket_start_ist_secs, st.volume));
+            }
+        };
+
+        // Seed, then advance well inside the first minute.
+        for (off, cum) in [(0_u32, 1_000_u32), (10, 5_000)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                collect(tf, st, &mut m1);
+            });
+        }
+
+        // A LATE tick: earlier timestamp, therefore smaller cumulative.
+        let late = tick(13, SEG_IDX, OPEN + 1, 99.0, 2_000);
+        let _ = agg.consume_tick(Feed::Dhan, &late, None, |_, _, _, tf, st| {
+            collect(tf, st, &mut m1);
+        });
+
+        // Roll into the next minute. Its baseline must be 5_000, not 2_000.
+        let next = tick(13, SEG_IDX, OPEN + 70, 101.0, 6_000);
+        let _ = agg.consume_tick(Feed::Dhan, &next, None, |_, _, _, tf, st| {
+            collect(tf, st, &mut m1);
+        });
+        agg.force_seal_all(|_, _, _, tf, st| collect(tf, st, &mut m1));
+
+        // Last emission per bucket wins (a Refold amend re-emits its bucket).
+        let vol_of = |start: u32| -> u64 {
+            m1.iter()
+                .rfind(|(b, _)| *b == start)
+                .map_or(u64::MAX, |(_, v)| *v)
+        };
+        assert_eq!(vol_of(OPEN), 4_000, "first minute: 5_000 - seeded 1_000");
+        assert_eq!(
+            vol_of(OPEN + 60),
+            1_000,
+            "second minute must baseline on 5_000 (the high-water cumulative), \
+             never on the late tick's stale 2_000"
+        );
+    }
+
+    #[test]
+    fn a_mid_session_slot_creation_must_not_put_a_whole_days_volume_in_one_bar() {
+        // BITE PROOF: with the pre-fix `last_cumulative: 0` this asserts
+        // 0 == 1_000_000 and FAILS.
+        //
+        // A slot allocated an hour into the session has never seen this
+        // instrument. `0` is not a baseline, it is the ABSENCE of one, and
+        // `cumulative - 0` published the whole day so far as a single bar.
+        // The first tick seeds the baseline instead: the first bar
+        // under-reports by the unattributable amount and
+        // `tv_aggregator_slot_volume_baseline_seeded_total` counts it.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut m1: Vec<(u32, u64)> = Vec::new();
+
+        let first = tick(13, SEG_IDX, OPEN + 3_600, 100.0, 1_000_000);
+        let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, _, _| {});
+        let second = tick(13, SEG_IDX, OPEN + 3_610, 101.0, 1_000_500);
+        let _ = agg.consume_tick(Feed::Dhan, &second, None, |_, _, _, _, _| {});
+        agg.force_seal_all(|_, _, _, tf, st| {
+            if tf == TfIndex::M1 {
+                m1.push((st.bucket_start_ist_secs, st.volume));
+            }
+        });
+
+        assert_eq!(m1.len(), 1);
+        assert_eq!(
+            m1[0].1, 500,
+            "the bar reports only what we observed (1_000_500 - 1_000_000); \
+             pre-arrival volume is unattributable, never the bar's"
+        );
+    }
+
+    #[test]
+    fn a_new_day_resets_the_baseline_so_the_monotonic_rule_cannot_freeze_volume() {
+        // The other half of the monotonic rule, and wrong to omit: the
+        // vendor's cumulative restarts at ~0 each session. Without the
+        // day-boundary reset in `force_seal_all` the advance-only rule would
+        // read tomorrow's honest small cumulative as a regression and publish
+        // every bar of the new day at volume 0.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let day1 = tick(13, SEG_IDX, OPEN + 10, 100.0, 900_000);
+        let _ = agg.consume_tick(Feed::Dhan, &day1, None, |_, _, _, _, _| {});
+        agg.force_seal_all(|_, _, _, _, _| {});
+
+        // Next session: cumulative restarts small.
+        let mut m1: Vec<u64> = Vec::new();
+        for (off, cum) in [(0_u32, 100_u32), (10, 700)] {
+            let t = tick(13, SEG_IDX, OPEN + 86_400 + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            if tf == TfIndex::M1 {
+                m1.push(st.volume);
+            }
+        });
+        assert_eq!(m1, vec![600], "600 = 700 - the new day's seeded 100");
+    }
+
+    #[test]
+    fn every_timeframe_of_one_day_must_sum_to_the_same_volume_total() {
+        // THE INVARIANT. This is the test that would have caught the live
+        // defect: the same day tiled three ways must sum to one total.
+        // It FAILS on the pre-fix code (1s and 1m over-report against 1d,
+        // exactly as the box did).
+        //
+        // The sequence is a realistic session slice: several ticks per
+        // second, two OUT-OF-ORDER ticks inside an open bucket, and two
+        // genuinely LATE ticks arriving after their bucket sealed — the
+        // three shapes `FeedStrategy::DEFAULT`'s Refold policy makes routine
+        // (10.0% of live ticks arrive >1h behind receive time).
+        const SEQ: &[(u32, u32)] = &[
+            (0, 1_000), // seeds the baseline
+            (1, 1_200),
+            (2, 1_500),
+            (2, 1_400), // out of order, same second
+            (5, 2_000),
+            (59, 3_000),
+            (60, 3_500), // rolls 1s and 1m
+            (30, 2_500), // LATE: its 1m bucket already sealed
+            (61, 4_000),
+            (120, 5_000),
+            (119, 4_800), // LATE again
+            (180, 6_000),
+        ];
+
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        // (tf, bucket_start) -> volume; a Refold amend re-emits its bucket,
+        // so the LAST emission per key is the published bar.
+        let mut bars: std::collections::HashMap<(TfIndex, u32), u64> =
+            std::collections::HashMap::new();
+
+        for (off, cum) in SEQ {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, *cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+
+        let total = |want: TfIndex| -> u64 {
+            bars.iter()
+                .filter(|((tf, _), _)| *tf == want)
+                .map(|(_, v)| *v)
+                .sum()
+        };
+
+        // Ground truth: the highest cumulative observed minus the first one.
+        // Volume traded before our first tick is unattributable to any bucket
+        // we own, so it is excluded from BOTH sides — never invented.
+        let expected = 6_000_u64 - 1_000;
+        assert_eq!(
+            total(TfIndex::S1),
+            expected,
+            "1s frames must tile the day exactly"
+        );
+        assert_eq!(
+            total(TfIndex::M1),
+            expected,
+            "1m frames must tile the day exactly"
+        );
+        assert_eq!(total(TfIndex::D1), expected, "the day bar is the same day");
+        assert_eq!(total(TfIndex::S1), total(TfIndex::M1));
+        assert_eq!(total(TfIndex::M1), total(TfIndex::D1));
     }
 
     /// Collects `(feed, sid, seg, tf, bucket_start, o, h, l, c)` for
@@ -1382,6 +1661,49 @@ mod tests {
     /// folding — still set the watermark to ~4.29 billion, and the next
     /// catch-up cycle force-sealed every open bucket in the entire book with
     /// incomplete OHLCV. Silent, whole-book, and unrecoverable (the watermark
+
+    /// BITE TEST (2026-08-25) — the sentinel bypass of the timestamp band.
+    ///
+    /// The band check used to sit BELOW the `p == 0.0` untraded-sentinel
+    /// return, so a packet carrying LTP = 0 AND a poison timestamp never
+    /// reached it. `refused_timestamp` stayed false, and the drain classifies
+    /// `untraded_sentinel` as a CANDLE-ONLY refusal — meaning the row was still
+    /// written to `ticks`, with the poison value as its DESIGNATED timestamp.
+    ///
+    /// The sibling test above covers a SANE price with a poison timestamp; this
+    /// covers the combination that slipped through. Moving the band check back
+    /// below the sentinel return makes this fail.
+    #[test]
+    fn an_untraded_sentinel_with_a_poison_timestamp_is_refused_outright() {
+        let mut agg = MultiTfAggregator::default();
+        for poison in [u32::MAX, MAX_PLAUSIBLE_EXCHANGE_TS_SECS + 1, 0, 1] {
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                // price 0.0 — the documented "untraded" sentinel.
+                &tick(13, SEG_IDX, poison, 0.0, 1),
+                None,
+                |_, _, _, _, _| panic!("an implausible timestamp must never seal"),
+            );
+            assert!(
+                stats.refused_timestamp,
+                "ts {poison} with an untraded price must be refused as \
+                 IMPLAUSIBLE, not merely as an untraded sentinel — the drain \
+                 treats the sentinel as a candle-only refusal and still writes \
+                 the row"
+            );
+            assert!(
+                !stats.untraded_sentinel,
+                "the timestamp is the more serious defect and must be the \
+                 reported reason; classifying it as a sentinel is what let the \
+                 row through"
+            );
+            assert_eq!(
+                agg.watermark_secs(),
+                0,
+                "and it must never move the watermark"
+            );
+        }
+    }
     /// never regresses).
     #[test]
     fn test_watermark_cannot_be_poisoned_by_an_all_ones_timestamp() {
@@ -1603,7 +1925,27 @@ mod tests {
         let s = agg
             .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
             .expect("slot");
-        assert_eq!(s.volume, big, "the u64 cumulative must survive intact");
+        // AMENDED 2026-08-25. This asserted `s.volume == big` — i.e. that the
+        // slot's very first bar publishes the ENTIRE day's cumulative as its
+        // own volume. That is the mid-session-slot defect measured live on
+        // 2026-08-24 (intraday frames ~9.2x the day bar), and the test was
+        // pinning it as correct. The first tick now SEEDS the baseline, so the
+        // first bar reports 0 and the unattributable volume is counted by
+        // `tv_aggregator_slot_volume_baseline_seeded_total` rather than
+        // invented.
+        //
+        // The test's REAL intent — a u64 cumulative must not be truncated
+        // through the `u32` `tick.volume` field — is unchanged and is now
+        // carried by the `+ 250` assertion below, which can only hold if the
+        // baseline retained all 64 bits of `big`.
+        assert_eq!(
+            s.volume, 0,
+            "the slot's first bar cannot own pre-arrival volume"
+        );
+        assert!(
+            big > u64::from(u32::MAX),
+            "fixture must exceed the u32 range"
+        );
         // The next bucket baselines off the SAME u64 value.
         let mut sealed: Vec<SealRow> = Vec::new();
         let _ = agg.consume_tick(

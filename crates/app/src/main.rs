@@ -1671,6 +1671,37 @@ async fn async_main() -> Result<()> {
             config.questdb.http_port,
         );
 
+    // The SAME drain, pointed at the depth rescue tier (2026-08-25).
+    //
+    // `depth_persistence::discard_pending` used to throw its whole buffer
+    // away — its own comment said "These levels are gone from the table" —
+    // while ticks had ring, spill and dead-letter behind them. Depth is the
+    // larger surface by far: 1,530,651,649 rows in the 2026-08-24 session
+    // against 64,349,753 ticks, 24x. It now spills instead of discarding.
+    //
+    // But a spill nobody drains is the exact failure the comment above this
+    // block describes: a file on disk that looks like success. The rescue
+    // shipped with recovery documented as a `curl` a human runs, which is the
+    // no-manual-intervention rule broken in the same change that fixed the
+    // loss. So the drain is spawned here, against the depth directory.
+    //
+    // One supervisor per directory rather than one that walks both: the two
+    // tiers fail independently (depth fills ~24x faster and has its own
+    // 512 MiB cap), and a shared loop would let a wedged depth file starve
+    // tick recovery. The replay body is directory-scoped and format-agnostic
+    // — the spill file IS line protocol — so nothing needed to change in it.
+    //
+    // Idempotent for the same reason ticks are: the `market_depth` DEDUP key
+    // carries `depth_kind` alongside the composite instrument key, so a
+    // replayed row UPSERTs onto itself and a crash between POST and truncate
+    // costs nothing.
+    let _depth_spill_drain_supervisor =
+        tickvault_storage::tick_spill_replay::spawn_supervised_tick_spill_replay(
+            std::path::PathBuf::from(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+            &config.questdb.host,
+            config.questdb.http_port,
+        );
+
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
     //

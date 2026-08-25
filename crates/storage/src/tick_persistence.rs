@@ -88,7 +88,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -405,7 +405,35 @@ impl TickRow {
         // rest. Zero means "not carried" for those, so it becomes NULL. Every
         // value reaching here is finite (refused above), so the `!= 0.0` gate
         // now means exactly what it reads as.
-        let opt_price = |v: f32| (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)));
+        // 2026-08-25 — `is_finite()` added, and it is NOT redundant with the
+        // loop above.
+        //
+        // That loop covers five fields; `average_traded_price` is a SIXTH
+        // caller of this closure and was never in it. `NaN != 0.0` is TRUE, and
+        // both `f32_to_f64_clean` and `round_to_2dp` pass non-finite straight
+        // through — so a NaN ATP went to ILP. The parser proves it can: Dhan
+        // Quote packets carry NaN there, asserted by
+        // `parser::quote`'s own `average_traded_price.is_nan()` test.
+        //
+        // The consequence is exactly the chain `TickRowError::PriceNotFinite`
+        // documents as CLOSED: QuestDB rejects the whole batch, `discard_pending`
+        // clears up to 1,000 good rows, the rescued buffer spills, and the replay
+        // tier wedges behind a file it can never accept.
+        //
+        // A non-finite OPTIONAL price becomes NULL and is counted, rather than
+        // refusing the row the way the five mandatory prices do. Refusing here
+        // would discard a tick whose LTP is perfectly good — losing a tick to
+        // protect an auxiliary column, which is the wrong trade.
+        let opt_price = |v: f32| {
+            if !v.is_finite() {
+                note_non_finite_optional_price(
+                    tick.security_id,
+                    segment_code_to_str(tick.exchange_segment_code),
+                );
+                return None;
+            }
+            (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)))
+        };
         let opt_qty = |v: u32| (v != 0).then(|| i64::from(v));
 
         // Hoisted: the receipt time is now needed TWICE — once as its own
@@ -735,11 +763,68 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
 /// time available, so the sentinel is kept unchanged. That row stays out of the
 /// live range exactly as it does today — a guess would be worse than a value
 /// that is visibly wrong.
+/// Counts and reports a non-finite OPTIONAL price, throttled to powers of two.
+///
+/// The counter and the log line live together deliberately. `crates/common`'s
+/// `loss_counter_visibility_guard` refuses a loss counter that reaches no
+/// operator surface — "a counter that measures data loss and reaches nobody is
+/// worse than no counter: the loss is measured, the measurement is discarded,
+/// and the dashboard stays green" — and it is right. The counter alone was the
+/// first version of this fix and the guard caught it.
+///
+/// A `warn!` rather than an EMF metric because the deployed selector list lives
+/// in a user-data template that currently renders at EXACTLY its 15,872-byte
+/// budget, with zero free bytes. Adding a name there is a real decision with a
+/// real monthly cost, not a formality — so this takes the log route the guard
+/// explicitly offers instead.
+///
+/// Powers of two: 1, 2, 4, 8, … The first occurrence always logs, the rate
+/// decays logarithmically so a corruption storm cannot flood the sink, and the
+/// running total rides in the line so a throttled message still states the true
+/// magnitude rather than implying a single event.
+fn note_non_finite_optional_price(security_id: u64, segment: &'static str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    metrics::counter!("tv_tick_optional_price_dropped_total").increment(1);
+    let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total.is_power_of_two() {
+        warn!(
+            code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+            security_id,
+            segment,
+            dropped_total = total,
+            "an OPTIONAL tick price was non-finite and is stored as NULL rather \
+             than sent to the database, where a NaN would make QuestDB reject the \
+             whole batch. The tick itself is kept — its mandatory prices are \
+             valid. This log is throttled to powers of two; dropped_total is the \
+             true running count."
+        );
+    }
+}
+
 #[must_use]
 pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: Option<i64>) -> i64 {
     let ltt_nanos = i64::from(exchange_timestamp).saturating_mul(1_000_000_000);
-    if exchange_timestamp
-        >= tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+    // A CEILING as well as a floor, added 2026-08-25.
+    //
+    // This had only the floor, and `exchange_timestamp` is a `u32` read raw
+    // off the wire: `0xFFFFFFFF` is ~year 2106 and sailed past a
+    // `>= MIN_PLAUSIBLE` test. `ts` is the DESIGNATED timestamp, so such a row
+    // creates a far-future QuestDB partition that retention and archival — both
+    // keyed on the trading day — can never reach, while every `max(ts)` and
+    // range scan over `ticks` silently includes it.
+    //
+    // The aggregator now refuses that tick outright (the band check moved above
+    // its untraded-sentinel return in the same change), so this ceiling is
+    // defence in depth rather than the only guard. It is here anyway because a
+    // second writer must not be able to reintroduce the hole by calling this
+    // helper directly: the band belongs where the stamp is MADE.
+    //
+    // Out of band falls back to the receipt time, exactly as below-floor does.
+    use tickvault_trading::candles::multi_tf_aggregator::{
+        MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+    };
+    if (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+        .contains(&exchange_timestamp)
     {
         return ltt_nanos;
     }
@@ -2130,6 +2215,69 @@ mod tests {
 
     /// Dhan's measured never-traded LTT sentinel: 1980-01-01, IST-epoch secs.
     const SENTINEL_LTT: u32 = 315_532_800;
+
+    /// BITE TEST (2026-08-25) — the year-2106 partition.
+    ///
+    /// `exchange_timestamp` is a raw `u32` off the wire, so `0xFFFFFFFF` is
+    /// ~2106-02-07. The stamp had a FLOOR only, so that value passed straight
+    /// through and became the row's DESIGNATED timestamp — a far-future
+    /// QuestDB partition that retention and archival, which key on the trading
+    /// day, can never reach, while every `max(ts)` and range scan over `ticks`
+    /// silently includes it.
+    ///
+    /// Deleting the `<= MAX_PLAUSIBLE_EXCHANGE_TS_SECS` half of the guard makes
+    /// this fail.
+    #[test]
+    fn an_all_ones_exchange_timestamp_never_stamps_a_year_2106_partition() {
+        let received = 1_787_000_000_i64 * 1_000_000_000;
+        let stamped = row_timestamp_ist_nanos(u32::MAX, Some(received));
+        assert_eq!(
+            stamped, received,
+            "an out-of-band LTT must fall back to the receipt time, exactly as \
+             a below-floor one does"
+        );
+        // And the ceiling is a real edge, not a rounded-off approximation.
+        let max = tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS;
+        assert_eq!(
+            row_timestamp_ist_nanos(max, Some(received)),
+            i64::from(max) * 1_000_000_000,
+            "the last in-band second must still keep the exchange's own time"
+        );
+        assert_eq!(
+            row_timestamp_ist_nanos(max + 1, Some(received)),
+            received,
+            "one second past the ceiling must fall back"
+        );
+    }
+
+    /// BITE TEST (2026-08-25) — a NaN `average_traded_price` reaching ILP.
+    ///
+    /// The finiteness loop guards five fields; `average_traded_price` is a
+    /// sixth caller of the same closure and was never in it. `NaN != 0.0` is
+    /// true, so it passed the "not carried" gate and went to the wire — the
+    /// exact batch-reject → spill → wedged-replay chain that
+    /// `TickRowError::PriceNotFinite` documents as closed.
+    #[test]
+    fn a_non_finite_average_traded_price_becomes_null_and_never_refuses_the_tick() {
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 100.0,
+            exchange_timestamp: 1_787_000_000,
+            average_traded_price: f32::NAN,
+            ..Default::default()
+        };
+        let row = TickRow::from_parsed_tick(&tick, 1).expect("a good LTP must still produce a row"); // APPROVED: test
+        assert_eq!(
+            row.avg_price, None,
+            "a non-finite optional price must be NULL, never NaN on the wire"
+        );
+        assert!(
+            (row.ltp - 100.0).abs() < f64::EPSILON,
+            "and the tick itself must survive — refusing it would lose a good \
+             LTP to protect an auxiliary column"
+        );
+    }
 
     #[test]
     fn row_timestamp_ist_nanos_keeps_a_real_exchange_time_untouched() {

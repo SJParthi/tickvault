@@ -82,14 +82,59 @@ const SECS_PER_MINUTE: i64 = 60;
 
 /// NSE session open — 09:15:00 IST, as seconds-of-day.
 pub const SESSION_OPEN_SECS_OF_DAY_IST: i64 = 9 * 3600 + 15 * 60;
-/// NSE session close — 15:30:00 IST, as seconds-of-day. The window is
-/// half-open `[open, close)`, so the last comparable bucket opens at 15:29.
-pub const SESSION_CLOSE_SECS_OF_DAY_IST: i64 = 15 * 3600 + 30 * 60;
+/// NSE session close — 15:40:00 IST, as seconds-of-day. The window is
+/// half-open `[open, close)`, so the last comparable bucket opens at 15:39.
+///
+/// **CORRECTED 2026-08-25.** This was `15 * 3600 + 30 * 60` (15:30) — a PRIVATE
+/// DUPLICATE of the session end that the 2026-08-07 NSE CAS migration missed.
+/// Every other production site moved 55,800 -> 56,400 that day with a dated
+/// comment (`constants.rs`, `rest_candle_fold.rs`, `tf_consistency_boot.rs`,
+/// `feed_scoreboard_boot.rs`, `trading_pipeline.rs`, `day_ohlc_orchestrator.rs`);
+/// this file kept its own copy and drifted.
+///
+/// The consequence was NOT false findings — `is_in_session` dropped 15:30-15:39
+/// from BOTH sides before the join, so the window was symmetric and the verdict
+/// honest. It was a BLIND SPOT: ten minutes of every session, and specifically
+/// the CAS window the migration was made for, were structurally unverifiable by
+/// the one check the scope-lock calls the revived feed's only ground truth.
+///
+/// It also mis-aimed the tail amnesty: `is_tail_minute` derives from this
+/// constant, so it excused 15:28-15:29 while the genuinely-unsealed tail had
+/// moved to 15:38-15:39. Deriving the value below fixes both at once.
+///
+/// Now DERIVED from the canonical constant rather than restated, so a future
+/// session-hours change cannot leave this file behind again. The const assert
+/// below is the actual guarantee.
+pub const SESSION_CLOSE_SECS_OF_DAY_IST: i64 =
+    tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST as i64;
 
-/// The run's deterministic stamp — 15:31:00 IST, as seconds-of-day. Used as
+// A private duplicate of a session boundary drifted silently for 18 days. This
+// makes that a COMPILE error rather than a blind spot nobody can see.
+const _: () = assert!(
+    SESSION_CLOSE_SECS_OF_DAY_IST
+        == tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST as i64,
+    "the cross-verify session close must track the canonical persistence end"
+);
+const _: () = assert!(
+    SESSION_OPEN_SECS_OF_DAY_IST < SESSION_CLOSE_SECS_OF_DAY_IST,
+    "the comparison window must be non-empty"
+);
+
+/// The run's deterministic stamp — 15:41:00 IST, as seconds-of-day. Used as
 /// the designated audit timestamp regardless of when the run actually fired,
 /// so a catch-up / forced rerun UPSERTs the same rows.
-pub const RUN_SECS_OF_DAY_IST: i64 = 15 * 3600 + 31 * 60;
+///
+/// **CORRECTED 2026-08-25** from 15:31 in lockstep with the close above. It
+/// MUST stay one minute past the close: the stamp and the fire time
+/// (`dhan_feed_stack::XVERIFY_RUN_AT_SECS_OF_DAY_IST`) move together, and a
+/// stamp earlier than the window's end would date the audit row before the
+/// last minute it claims to have compared.
+pub const RUN_SECS_OF_DAY_IST: i64 = SESSION_CLOSE_SECS_OF_DAY_IST + 60;
+
+const _: () = assert!(
+    RUN_SECS_OF_DAY_IST > SESSION_CLOSE_SECS_OF_DAY_IST,
+    "the run must be stamped after the last minute it compares"
+);
 
 /// How many trailing session minutes are excused when absent on the LIVE side.
 ///
@@ -418,7 +463,7 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// | both sides, field differs > tolerance | `diverged` | **yes** |
 /// | REST has it, live doesn't (mid-session) | `missing_live` | **yes** — the closest proxy we have for packet loss |
 /// | REST has it, live doesn't (last 2 min) | `tail_unsealed` | no — expected at 15:31 |
-/// | live has it, REST doesn't | `missing_rest` | **yes** |
+/// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
 /// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
 #[must_use]
 pub fn compare_day(
@@ -561,11 +606,39 @@ pub fn compare_day(
     // which `is_pass() == false`. This is the structural answer to the
     // predecessor's blind-since-birth failure.
     let outcome = if minutes_compared > 0 {
-        let real = cells_diverged > 0 || missing_live > 0 || missing_rest > 0;
+        // The asymmetry here is deliberate and was WRONG until 2026-08-25.
+        //
+        // `missing_live` (REST has the minute, we don't) is the closest proxy
+        // this system has for packet loss on our own feed. It stays a real
+        // divergence.
+        //
+        // `missing_rest` (we have the minute, the vendor's REST tape doesn't)
+        // is NOT evidence against the live feed. The REST tape is sparse by
+        // construction — it publishes a candle where trading happened — so an
+        // illiquid strike that we correctly recorded shows up here through no
+        // fault of ours. Counting it as divergence made a vendor-side hole
+        // read as a live-feed failure, and inflated the one signal this lane
+        // exists to produce.
+        //
+        // This module's own header has always said `missing_rest` is
+        // "reported but never conflated with real divergence". The
+        // classification table below it said the opposite, and the code
+        // followed the table. The header was right.
+        //
+        // It is NOT silenced, and it must never be: a bar we hold for a
+        // minute the exchange never traded could also mean we FABRICATED one
+        // — which is not hypothetical, since the aggregator was proven on
+        // 2026-08-24 to inflate candle volumes 9.2x. So a run whose only
+        // anomaly is `missing_rest` lands on `Partial`, which `is_pass()`
+        // refuses and `is_measured()` accepts: visible, never a pass, and
+        // never crying feed-loss either.
+        let real = cells_diverged > 0 || missing_live > 0;
         if degraded {
             DhanLiveXverifyOutcome::Partial
         } else if real {
             DhanLiveXverifyOutcome::Diverged
+        } else if missing_rest > 0 {
+            DhanLiveXverifyOutcome::Partial
         } else {
             DhanLiveXverifyOutcome::Clean
         }
@@ -1308,6 +1381,75 @@ mod tests {
         assert_eq!(cmp.missing_live, 0);
     }
 
+    /// A REST-side hole is not a live-feed failure — but it is not a pass either.
+    ///
+    /// Until 2026-08-25 `missing_rest` was folded into the same `real` term as
+    /// `cells_diverged` and `missing_live`, so a minute the vendor's sparse REST
+    /// tape simply never published rendered as `Diverged` — the lane crying
+    /// feed-loss about a hole on the other side. This module's header had always
+    /// promised the opposite ("reported but never conflated with real
+    /// divergence"); the classification table said "yes" and the code followed
+    /// the table.
+    ///
+    /// The verdict must now be `Partial`: `is_pass()` refuses it, so a bar we
+    /// hold for a minute the exchange never traded can never be waved through as
+    /// clean (it could mean we FABRICATED one — not hypothetical, the aggregator
+    /// was proven to inflate volumes 9.2x on 2026-08-24), while `is_measured()`
+    /// accepts it, so the keep-better rerun guard still treats the run as real.
+    #[test]
+    fn a_rest_side_hole_is_partial_never_diverged_and_never_clean() {
+        let live = vec![
+            side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5)),
+            side(1, OPEN + 60, bar(100.5, 102.0, 100.0, 101.0)),
+        ];
+        // REST published only the first minute.
+        let rest = vec![side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.missing_rest, 1, "the REST hole must still be counted");
+        assert_eq!(cmp.missing_live, 0);
+        assert_eq!(cmp.cells_diverged, 0, "no OHLC field actually disagreed");
+        assert!(cmp.minutes_compared > 0, "the run must be non-vacuous");
+
+        assert_eq!(
+            cmp.outcome,
+            DhanLiveXverifyOutcome::Partial,
+            "a REST-side hole alone must be Partial — not Diverged (that blames \
+             our feed for the vendor's sparsity) and not Clean (that would wave \
+             through a bar we may have fabricated)"
+        );
+        assert!(
+            !cmp.outcome.is_pass(),
+            "Partial must never read as a pass — audit Rule 11, no false-OK"
+        );
+        assert!(
+            cmp.outcome.is_measured(),
+            "the run compared real minutes, so the rerun guard must treat it as measured"
+        );
+    }
+
+    /// The other half of the asymmetry: a minute WE missed is still a real
+    /// divergence, because it is the closest proxy this system has for packet
+    /// loss on our own feed. Narrowing `missing_rest` must not narrow this.
+    #[test]
+    fn a_minute_missing_from_our_own_feed_is_still_diverged() {
+        let live = vec![side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+        let rest = vec![
+            side(1, OPEN, bar(100.0, 101.0, 99.0, 100.5)),
+            side(1, OPEN + 60, bar(100.5, 102.0, 100.0, 101.0)),
+        ];
+
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.missing_live, 1);
+        assert_eq!(
+            cmp.outcome,
+            DhanLiveXverifyOutcome::Diverged,
+            "a minute absent from OUR side stays a real divergence"
+        );
+        assert!(!cmp.outcome.is_pass());
+    }
     /// The last two session minutes may legitimately be unsealed at 15:31 —
     /// recorded, but never counted as loss.
     #[test]
@@ -1365,15 +1507,22 @@ mod tests {
         );
         assert!(
             is_in_session(minute(SESSION_CLOSE_SECS_OF_DAY_IST - 60), DAY_START_NANOS),
-            "15:29 is the last in-session bucket"
+            "15:39 is the last in-session bucket"
         );
         assert!(
             !is_in_session(minute(SESSION_CLOSE_SECS_OF_DAY_IST), DAY_START_NANOS),
-            "15:30 is out (half-open window)"
+            "15:40 is out (half-open window)"
         );
-        // 375 comparable minutes in a full session.
+        // 385 comparable minutes in a full session: 09:15-15:40.
+        //
+        // RE-BLESSED 2026-08-25 from 375. That figure was correct for the
+        // pre-CAS 09:15-15:30 session and became wrong on 2026-08-07, when the
+        // NSE CAS migration moved the close to 15:40 everywhere EXCEPT this
+        // file's private duplicate. The ten extra minutes are real session
+        // minutes that were previously dropped from both sides before the join
+        // and therefore never verified at all.
         let total = (SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / 60;
-        assert_eq!(total, 375);
+        assert_eq!(total, 385, "09:15-15:40 is 385 one-minute buckets");
     }
 
     /// I-P1-11: Dhan reuses numeric security_ids across segments, so the join
@@ -1688,12 +1837,15 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_run_ts_nanos_is_1531_ist_regardless_of_fire_time() {
+    fn deterministic_run_ts_nanos_is_one_minute_past_the_close_regardless_of_fire_time() {
         let stamp = deterministic_run_ts_nanos(DAY_START_NANOS);
         assert_eq!(
             secs_of_day(stamp, DAY_START_NANOS),
-            15 * 3600 + 31 * 60,
-            "the audit stamp must be 15:31 IST regardless of actual fire time"
+            SESSION_CLOSE_SECS_OF_DAY_IST + 60,
+            "the audit stamp must be one minute past the session close, whatever \
+             the actual fire time -- DERIVED, not a restated literal, so a \
+             future session-hours change cannot leave it behind the way the \
+             hardcoded 15:31 did through the 2026-08-07 CAS migration"
         );
         // Idempotent: a catch-up rerun produces the identical stamp.
         assert_eq!(stamp, deterministic_run_ts_nanos(DAY_START_NANOS));
