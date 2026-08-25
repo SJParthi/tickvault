@@ -537,8 +537,116 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # Output — operator-facing reminder + alarm list
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 20. Spill-directory free bytes — the INTRADAY disk early warning.
+#
+# Authorized by dhan-rest-only-noise-lock-2026-07-14.md §2.3g (operator
+# 2026-08-25, naming "disk rpessure ... disk spill" and ruling out human
+# monitoring). Recorded there BEFORE this resource, per the rule-file-first
+# law.
+#
+# WHY THIS EXISTS WHEN `disk_fill_rate_high` ALREADY WATCHES THE DISK. They
+# measure different things, and on the day it mattered only one of them could
+# have helped. MEASURED from the live account, 2026-08-25:
+#
+#   08:30 IST  38.8 GB free   0 tables suspended
+#   09:30 IST  14.5 GB free   0
+#   10:30 IST  20,480 BYTES   3      <- full
+#   11:30 IST  20,480 bytes  15
+#   13:30 IST  58.6 GB free   0      <- archival recovered it
+#
+# Through all of that `disk_fill_rate_high` read 1.46 points per day against a
+# threshold of 4, and it was arithmetically RIGHT: the 24-hour drift stays low
+# precisely because overnight archival drops partitions. A daily-trend alarm
+# cannot see an intraday fill by construction. Its 6-hour window is correct for
+# the trend it measures and must not be shortened (§2.3g records the audit
+# claim that it "cannot fire", and the live describe-alarms output that refutes
+# it).
+#
+# WHY 20 GiB. At the MEASURED open burn of ~24 GB/hour that is roughly one hour
+# of headroom — enough to act, and past the archiver's own 75%-used high-water
+# so the pressure episode has already started and not helped. Free BYTES rather
+# than percent-used deliberately: the volume has grown 30 -> 50 -> 100 -> 200 GB
+# and a percentage threshold silently means a different amount of time at every
+# size, while an hour of runway is an hour at any size.
+#
+# Minimum, not Average: a 5-minute window that touched zero has no headroom
+# left, and averaging that with four healthy samples hides it.
+#
+# notBreaching + ungated: the box is stopped overnight, so no-data is the
+# normal off-hours state. This reports a DEFECT, never silence — the dark-lane
+# case belongs to dhan-no-ticks-flowing.
+#
+# NO ok_actions. Free space coming back means archival dropped partitions or
+# the operator grew the volume; neither is news, and a green "recovered" for a
+# volume that is still fuller than it was is the Rule-11 false recovery.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "spill_dir_free_low" {
+  alarm_name          = "tv-${var.environment}-spill-dir-free-low"
+  alarm_description   = "Root volume free space is at or below 20 GiB - roughly ONE HOUR of headroom at the measured 24 GB/hour open burn. On 2026-08-25 this gauge went 38.8 GB -> 14.5 GB -> 20 KB across two hours and nothing was watching it; the volume then sat full for three hours and 15 QuestDB tables suspended themselves, which silently discards rows while ILP keeps ACKing. ACT NOW, in this order: (1) SELECT outcome, count() FROM partition_archive_audit - if archival is failing, that is the cause and it is fixable without spending money; (2) check pressure_hot_days is at its 2-day floor already; (3) grow gp3 online: scripts/aws-upgrade-instance.sh --ebs-size N, then on the box sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / . gp3 can NEVER shrink, so go up in steps. Companion alarms: tv-<env>-disk-used-high (the 90% ceiling) and tv-<env>-disk-fill-rate-high (the multi-day trend, which cannot see an intraday fill)."
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_spill_dir_free_bytes"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Minimum"
+  threshold           = 21474836480 # 20 GiB
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = []
+}
+
+# ---------------------------------------------------------------------------
+# 21. QuestDB WAL-suspended tables — the silent-loss detector.
+#
+# Authorized by dhan-rest-only-noise-lock-2026-07-14.md §2.3g.
+#
+# A WAL-suspended QuestDB table KEEPS ACCEPTING AND ACKING ILP writes while
+# never applying them. That is the one failure in the whole durability chain
+# where every writer reports success and the rows are simply not there: the
+# flush returns Ok, tv_ticks_dropped_total stays 0, tv_ticks_spilled_total
+# stays 0, and tv_dhan_feed_last_tick_age_secs stays fresh, so no other alarm
+# in family (5) can see it. On 2026-08-25 this gauge reached 15 and the
+# operator found out by asking why a table was empty.
+#
+# THRESHOLD 1, not 3. A single suspended table is already silent loss for that
+# table, and there is no such thing as an acceptable number of them.
+#
+# Maximum: suspension is transient-but-serious, and averaging a 5-minute window
+# would let a table suspend and resume between samples unnoticed.
+#
+# WHY THIS ALARM IS ONLY HONEST BECAUSE THE PROBE WAS FIXED FIRST. Until
+# 2026-08-25 a QuestDB schema drift that changed the `suspended` cell's TYPE
+# made parse_wal_tables_response skip every row and return Ok(vec![]), and
+# emit_wal_delta then set this gauge to a confident ZERO. Alarming a gauge
+# whose producer can fail open would have been alarming a lie; the probe now
+# returns AllRowsSkipped instead. Residual, stated rather than hidden:
+# tv_wal_suspension_probe_failed_total is still not EMF-selected (the
+# user-data template is at exactly its byte budget with zero free - see
+# §2.3d-ii), so a probe failure is counted on the box and invisible here.
+#
+# NO ok_actions. RESUME WAL succeeding does not replay what was discarded
+# while suspended; a green "recovered" would say otherwise.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "questdb_wal_suspended" {
+  alarm_name          = "tv-${var.environment}-questdb-wal-suspended"
+  alarm_description   = "One or more QuestDB tables are WAL-SUSPENDED. A suspended table keeps ACKing ILP writes and silently does not apply them, so every tick counter reads healthy while rows are lost - this is the ONLY alarm that can see it. Triage: SELECT name, suspended, writerTxn, sequencerTxn, errorTag, errorMessage FROM wal_tables() WHERE suspended = true. The usual cause is a full volume (see tv-<env>-spill-dir-free-low, which should have paged an hour earlier); free space FIRST, because RESUME WAL on a full disk re-suspends immediately. Then ALTER TABLE <name> RESUME WAL. Rows written while suspended are NOT replayed by resuming - check the sequencerTxn/writerTxn gap for how many transactions were behind."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_questdb_wal_suspended_tables"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = []
+}
+
 output "app_cloudwatch_alarms" {
-  description = "12 application-level alarms in THIS file (10 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm RETIRED 2026-07-15 — their gauge/counter producers, the Groww bridge + sidecar stall watchdog, were deleted with the Groww live feed); 2 more silent-feed alarms live in silent-feed-alarms.tf (the Groww lag mirror also retired 2026-07-15). Cost note: the 2026-07-15 Groww live retirement removes 3 alarms + the feed-stall-restarts counter pager + 4 EMF series and adds 1 (tv_rest_1m_fire_heartbeat) — dated note in aws-budget.md; still well inside the $55 budget cap."
+  description = "14 application-level alarms in THIS file (12 + the 2026-08-25 spill-dir-free-low and questdb-wal-suspended pair, §2.3g) (10 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm RETIRED 2026-07-15 — their gauge/counter producers, the Groww bridge + sidecar stall watchdog, were deleted with the Groww live feed); 2 more silent-feed alarms live in silent-feed-alarms.tf (the Groww lag mirror also retired 2026-07-15). Cost note: the 2026-07-15 Groww live retirement removes 3 alarms + the feed-stall-restarts counter pager + 4 EMF series and adds 1 (tv_rest_1m_fire_heartbeat) — dated note in aws-budget.md; still well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
@@ -554,6 +662,11 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.orders_rejected.alarm_name,
     aws_cloudwatch_metric_alarm.clock_skew_high.alarm_name,
     aws_cloudwatch_metric_alarm.disk_watcher_respawn.alarm_name,
+    # Added 2026-08-25 per dhan-rest-only-noise-lock-2026-07-14.md §2.3g: on
+    # 2026-08-25 the volume went 38.8 GB -> 20 KB free in two hours and 15
+    # QuestDB tables suspended themselves, and NEITHER gauge had an alarm.
+    aws_cloudwatch_metric_alarm.spill_dir_free_low.alarm_name,
+    aws_cloudwatch_metric_alarm.questdb_wal_suspended.alarm_name,
     # late_tick_after_boundary retired 2026-07-18 (stage-4 unit A).
   ]
 }

@@ -4811,3 +4811,35 @@ mod tests {
 
 #[cfg(test)]
 mod cadence_native_retry_hedge_tests {}
+
+/// Packets we will walk within one main-feed message before declaring the
+/// message malformed.
+///
+/// **The arithmetic here was wrong until 2026-08-14** and is worth stating
+/// rather than quietly fixing. The comment claimed "the 1 MiB frame cap over
+/// the smallest (16-byte) packet bounds a legitimate message well under this".
+/// Two errors: the cap is `MAIN_FEED_MAX_FRAME_BYTES` = 162 × 5,000 × 2 =
+/// 1,620,000 bytes (~1.55 MiB, not 1 MiB), and 1,620,000 / 16 = **101,250**,
+/// which is ABOVE this ceiling, not well under it. A maximum-size frame made
+/// entirely of 16-byte ticker packets would be truncated here, its remainder
+/// counted as unparseable.
+///
+/// The ceiling is nonetheless kept, because it is a defence against a hostile
+/// or malfunctioning peer rather than a capacity limit, and the shape it
+/// bounds cannot occur legitimately: a socket carries at most
+/// `MAIN_FEED_INSTRUMENTS_PER_CONNECTION` (5,000) subscriptions, so a
+/// legitimate frame carries on the order of 5,000 packets — 14× below this —
+/// and reaching 101,250 would require the peer to send ~20 packets per
+/// subscribed instrument in a single message. Raising the ceiling to clear the
+/// theoretical maximum would weaken the defence to buy nothing.
+///
+/// What changed is only the honesty of the justification: the bound is a
+/// deliberate policy ceiling, not the arithmetic consequence the old comment
+/// asserted.
+///
+/// **Moved from `crates/app` to `common` on 2026-08-25.** It now bounds TWO
+/// walks over the same bytes: the frame drain that decodes packets, and the
+/// classifier that walks looking for a stacked disconnect. A second copy
+/// could drift, and a classifier that stops walking earlier than the drain
+/// would miss exactly the disconnect the drain goes on to decode.
+pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;

@@ -79,7 +79,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tickvault_common::constants::{
     DEEP_DEPTH_HEADER_OFFSET_FEED_CODE, DEEP_DEPTH_HEADER_SIZE, DISCONNECT_PACKET_SIZE,
-    RESPONSE_CODE_DISCONNECT,
+    MAX_PACKETS_PER_FRAME, RESPONSE_CODE_DISCONNECT,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::redact_url_params;
@@ -687,6 +687,26 @@ pub fn classify_frame(endpoint: DhanEndpointType, frame: &[u8]) -> FrameClass {
         }
     };
     if frame.len() != expected_len {
+        // A Dhan frame STACKS packets, so a disconnect can arrive with data
+        // ahead of it. Until 2026-08-25 this arm returned `Data` for every such
+        // frame, so `[quote][disconnect 804]` never became
+        // `SocketEvent::Closed{code}` -- the drain decoded the disconnect and
+        // counted it as untyped "non-tick" traffic, and the reason reached no
+        // log, no metric and no classifier. The socket then closed on TCP with
+        // `code: None`, which `classify_disconnect` reads as Transient, so the
+        // ladder retried the IDENTICAL over-limit subscribe set forever: the
+        // exact self-amplifying loop the Fatal class was added to stop.
+        //
+        // Only the main feed walks here. The depth feeds carry a length-
+        // prefixed header whose packet sizes this function does not own, and
+        // their drain already counts a stacked disconnect -- guessing at their
+        // boundaries to shave a milder gap would be inventing a classification.
+        if matches!(endpoint, DhanEndpointType::MainFeed)
+            && let Some(reason) =
+                crate::parser::dispatcher::stacked_disconnect_reason(frame, MAX_PACKETS_PER_FRAME)
+        {
+            return FrameClass::Disconnect(DisconnectCode::from_u16(reason));
+        }
         return FrameClass::Data;
     }
     let Some(&code) = frame.get(code_offset) else {
@@ -1236,7 +1256,8 @@ mod tests {
     use super::*;
     use tickvault_common::constants::{
         DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL,
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, TWENTY_DEPTH_PACKET_SIZE,
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, RESPONSE_CODE_FULL, RESPONSE_CODE_OI,
+        RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TWENTY_DEPTH_PACKET_SIZE,
         TWO_HUNDRED_DEPTH_PACKET_SIZE,
     };
     use tickvault_common::types::{ExchangeSegment, SecurityId};
@@ -2029,6 +2050,76 @@ mod tests {
         }
     }
 
+    /// One zero-filled main-feed packet of `code`.
+    fn main_feed_packet(code: u8) -> Vec<u8> {
+        let len = crate::parser::dispatcher::main_feed_packet_len(&[code]).expect("known code");
+        let mut p = vec![0u8; len];
+        p[0] = code;
+        p
+    }
+
+    #[test]
+    fn a_disconnect_stacked_behind_data_reaches_the_supervisor() {
+        // THE 2026-08-25 regression, at the layer that actually gates
+        // `SocketEvent::Closed{code}`. A Dhan frame stacks packets, so
+        // `[quote][disconnect 804]` is a legal shape -- and the old
+        // `frame.len() != 10 => Data` test called it data. The drain then
+        // decoded the disconnect and counted it as untyped "non-tick"
+        // traffic, so the reason reached no log, no metric and no
+        // classifier; the socket closed on TCP with `code: None`, which
+        // `classify_disconnect` reads as Transient, and the ladder retried
+        // the IDENTICAL over-limit subscribe set forever.
+        let mut frame = main_feed_packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&main_feed_disconnect(804));
+        assert_eq!(
+            classify_frame(DhanEndpointType::MainFeed, &frame),
+            FrameClass::Disconnect(DisconnectCode::InstrumentsExceedLimit),
+            "a stacked 804 must be classified so the supervisor can PARK, not retry"
+        );
+    }
+
+    #[test]
+    fn a_stacked_805_is_classified_too() {
+        let mut frame = main_feed_packet(RESPONSE_CODE_FULL);
+        frame.extend_from_slice(&main_feed_packet(RESPONSE_CODE_OI));
+        frame.extend_from_slice(&main_feed_disconnect(805));
+        assert_eq!(
+            classify_frame(DhanEndpointType::MainFeed, &frame),
+            FrameClass::Disconnect(DisconnectCode::ExceededActiveConnections)
+        );
+    }
+
+    #[test]
+    fn a_multi_packet_data_frame_stays_data() {
+        // Non-vacuity in the other direction: the walk must not turn ordinary
+        // stacked market data into a fabricated disconnect, which would park
+        // a healthy socket on a code we invented.
+        let mut frame = main_feed_packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&main_feed_packet(RESPONSE_CODE_FULL));
+        frame.extend_from_slice(&main_feed_packet(RESPONSE_CODE_TICKER));
+        assert_eq!(
+            classify_frame(DhanEndpointType::MainFeed, &frame),
+            FrameClass::Data
+        );
+    }
+
+    #[test]
+    fn the_stacked_walk_does_not_apply_to_the_depth_feeds() {
+        // Depth carries a length-prefixed header whose packet sizes the
+        // main-feed table does not own. Walking it with those sizes would be
+        // inventing a classification, so a depth frame that is not exactly a
+        // depth disconnect stays data -- unchanged by this fix.
+        let mut frame = main_feed_packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&main_feed_disconnect(804));
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert_eq!(
+                classify_frame(endpoint, &frame),
+                FrameClass::Data,
+                "{endpoint}"
+            );
+        }
+    }
+
     #[test]
     fn test_a_depth_layout_disconnect_on_the_main_feed_is_not_misread() {
         // Cross-layout confusion in both directions must be impossible.
@@ -2085,11 +2176,28 @@ mod tests {
     fn test_classification_is_total_over_short_and_empty_frames() {
         // Fail-safe direction: anything unrecognised is DATA. A false
         // "disconnect" would park a healthy connection on an invented code.
+        //
+        // AMENDED 2026-08-25 with the stacked-disconnect walk. This loop fills
+        // every length with the disconnect response code itself, so any length
+        // that is an exact MULTIPLE of the 10-byte disconnect packet is not
+        // "unrecognised" at all -- it is N well-formed disconnect packets
+        // stacked, which is precisely the shape the walk exists to catch. The
+        // blanket assertion held before only because no walk existed; keeping
+        // it would now pin the bug rather than the invariant.
+        //
+        // The invariant this test protects is UNCHANGED and still non-vacuous:
+        // every length that does NOT resolve into whole packets must be DATA,
+        // and 15 of the 21 lengths here exercise exactly that.
         for len in 0usize..=20 {
             let frame = vec![RESPONSE_CODE_DISCONNECT; len];
             for endpoint in DhanEndpointType::ALL {
                 let class = classify_frame(endpoint, &frame);
-                if len == DISCONNECT_PACKET_SIZE || len == DEEP_DEPTH_HEADER_SIZE + 2 {
+                let walks_into_whole_disconnect_packets =
+                    len > 0 && len % DISCONNECT_PACKET_SIZE == 0;
+                if len == DISCONNECT_PACKET_SIZE
+                    || len == DEEP_DEPTH_HEADER_SIZE + 2
+                    || walks_into_whole_disconnect_packets
+                {
                     // May be either, depending on layout — the point is only
                     // that it does not panic.
                     let _ = class;

@@ -7,10 +7,11 @@ use std::sync::OnceLock;
 
 use metrics::Counter;
 use tickvault_common::constants::{
-    DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, RESPONSE_CODE_DISCONNECT,
-    RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER, RESPONSE_CODE_MARKET_DEPTH,
-    RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI, RESPONSE_CODE_PREVIOUS_CLOSE,
-    RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
+    DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DISCONNECT_PACKET_SIZE,
+    FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE,
+    QUOTE_PACKET_SIZE, RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER,
+    RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
+    RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE,
 };
 
 // PR #4 (2026-05-19): DEEP_DEPTH_HEADER_SIZE retired alongside the
@@ -274,6 +275,93 @@ pub fn dispatch_depth_packet<'b>(
     };
     depth_dispatcher_counter(code).increment(1);
     Ok(packet)
+}
+
+/// Byte length of the main-feed packet starting at `bytes`, from its response
+/// code. `None` for an unknown code or a header too short to classify.
+///
+/// The header carries its own message length at bytes 1..3, but that field is
+/// vendor-supplied: trusting it would let a malformed length walk the parser
+/// off the end of one packet and into the middle of the next. The code -> size
+/// table is ours and is fixed by the protocol.
+///
+/// This lives in `core` rather than beside its caller because TWO walks depend
+/// on agreeing byte-for-byte: the frame drain that decodes packets, and
+/// [`crate::websocket::connection::classify_frame`], which walks the same bytes
+/// looking for a stacked disconnect. When those two disagree, the drain decodes
+/// a disconnect the classifier never saw -- which is exactly the defect the
+/// 2026-08-25 audit found. One function makes them agree by construction.
+#[must_use]
+pub fn main_feed_packet_len(bytes: &[u8]) -> Option<usize> {
+    let code = *bytes.first()?;
+    let size = match code {
+        RESPONSE_CODE_TICKER => TICKER_PACKET_SIZE,
+        RESPONSE_CODE_QUOTE => QUOTE_PACKET_SIZE,
+        RESPONSE_CODE_OI => OI_PACKET_SIZE,
+        RESPONSE_CODE_PREVIOUS_CLOSE => PREVIOUS_CLOSE_PACKET_SIZE,
+        RESPONSE_CODE_MARKET_STATUS => MARKET_STATUS_PACKET_SIZE,
+        RESPONSE_CODE_FULL => FULL_QUOTE_PACKET_SIZE,
+        RESPONSE_CODE_DISCONNECT => DISCONNECT_PACKET_SIZE,
+        _ => return None,
+    };
+    Some(size)
+}
+
+/// The reason code of a disconnect packet STACKED anywhere inside a main-feed
+/// frame, found by walking the packet boundaries rather than scanning bytes.
+///
+/// A Dhan frame stacks packets, so a disconnect can arrive with data ahead of
+/// it -- and until 2026-08-25 that shape was invisible: the classifier compared
+/// the WHOLE frame length against 10 and called anything else data, so a
+/// `[quote][disconnect 804]` frame was handed to the drain, which decoded the
+/// disconnect and folded it into an untyped "non-tick" count. The reason code
+/// reached no log, no metric and no classifier. 804 means the subscribe set
+/// exceeds the per-connection cap, and the repo already rules it Fatal
+/// precisely because retrying re-sends the identical over-limit set forever and
+/// can earn a 805 block -- so the one code that must never be retried was the
+/// one being retried blind.
+///
+/// Structural, not a byte scan: a value of 50 inside a quote packet's payload
+/// is never at a packet boundary and so is never read as a code. An unwalkable
+/// frame yields `None` and stays data, keeping the fail-safe direction the
+/// classifier already documents.
+///
+/// O(packets per frame), no allocation.
+#[must_use]
+pub fn stacked_disconnect_reason(frame: &[u8], max_packets: u32) -> Option<u16> {
+    let mut offset = 0usize;
+    let mut packets = 0u32;
+    let mut found: Option<u16> = None;
+    while offset < frame.len() {
+        let rest = frame.get(offset..)?;
+        let len = main_feed_packet_len(rest)?;
+        let end = offset.checked_add(len)?;
+        if end > frame.len() {
+            // A trailing partial packet: refuse to guess at its contents.
+            return None;
+        }
+        if found.is_none() && rest.first().copied() == Some(RESPONSE_CODE_DISCONNECT) {
+            let raw = rest.get(len.checked_sub(2)?..len)?;
+            found = Some(u16::from_le_bytes([raw[0], raw[1]]));
+        }
+        offset = end;
+        packets = packets.saturating_add(1);
+        if packets >= max_packets {
+            return None;
+        }
+    }
+    // The WHOLE frame must walk cleanly before a disconnect inside it counts.
+    //
+    // An earlier draft returned as soon as it saw a code-50 packet at offset
+    // 0, and two existing tests caught it: a 16-byte frame whose first byte
+    // happens to be 50 is a valid 10-byte disconnect plus six bytes that
+    // resolve to nothing, and honouring that would park a healthy socket on a
+    // reason read out of random data. Requiring the frame to walk end to end
+    // means a fabricated disconnect needs the peer to send an entirely
+    // well-formed frame that genuinely contains one -- which is the fail-safe
+    // direction `classify_frame` already documents, preserved rather than
+    // traded away for the stacked case.
+    found
 }
 
 #[cfg(test)]
@@ -839,5 +927,133 @@ mod depth_dispatch_tests {
             depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_BID),
             depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_ASK)
         ));
+    }
+}
+
+/// The stacked-disconnect walk (2026-08-25). Its own module because it is a
+/// MAIN-FEED concern and the module above is the depth dispatcher's.
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: fixed protocol offsets
+mod stacked_disconnect_tests {
+    use super::*;
+    // ---- stacked disconnect (2026-08-25) --------------------------------
+    //
+    // The classifier compared the WHOLE frame length against 10 and called
+    // anything else data, so a disconnect stacked behind a data packet was
+    // handed to the drain as ordinary traffic and its reason code reached no
+    // log, no metric and no classifier. These pin the walk that fixed it.
+
+    /// A 10-byte main-feed disconnect packet for `reason`.
+    fn disc(reason: u16) -> Vec<u8> {
+        let mut p = vec![0u8; DISCONNECT_PACKET_SIZE];
+        p[0] = RESPONSE_CODE_DISCONNECT;
+        let r = reason.to_le_bytes();
+        p[DISCONNECT_PACKET_SIZE - 2] = r[0];
+        p[DISCONNECT_PACKET_SIZE - 1] = r[1];
+        p
+    }
+
+    /// One well-formed packet of `code`, zero-filled after the code byte.
+    fn packet(code: u8) -> Vec<u8> {
+        let len = main_feed_packet_len(&[code]).expect("known code");
+        let mut p = vec![0u8; len];
+        p[0] = code;
+        p
+    }
+
+    #[test]
+    fn a_disconnect_alone_is_still_found() {
+        assert_eq!(stacked_disconnect_reason(&disc(804), 70_000), Some(804));
+    }
+
+    #[test]
+    fn a_disconnect_stacked_behind_data_is_found() {
+        // THE regression. Before the fix this frame was classified `Data`,
+        // the drain folded the disconnect into an untyped "non-tick" count,
+        // and 804 -- the one code the repo rules Fatal because retrying
+        // re-sends the identical over-limit subscribe set forever -- was
+        // retried blind.
+        let mut frame = packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&disc(804));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(804));
+    }
+
+    #[test]
+    fn a_disconnect_behind_several_packets_is_found() {
+        let mut frame = packet(RESPONSE_CODE_TICKER);
+        frame.extend_from_slice(&packet(RESPONSE_CODE_FULL));
+        frame.extend_from_slice(&packet(RESPONSE_CODE_OI));
+        frame.extend_from_slice(&disc(805));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(805));
+    }
+
+    #[test]
+    fn a_pure_data_frame_yields_no_disconnect() {
+        let mut frame = packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&packet(RESPONSE_CODE_FULL));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), None);
+    }
+
+    #[test]
+    fn a_byte_50_inside_a_payload_is_not_read_as_a_code() {
+        // The whole reason this walks packet boundaries instead of scanning
+        // for the byte: a quote packet's payload is free to contain 50, and a
+        // scan would park a healthy socket on a reason invented from a price.
+        let mut p = packet(RESPONSE_CODE_QUOTE);
+        for b in p.iter_mut().skip(1) {
+            *b = RESPONSE_CODE_DISCONNECT;
+        }
+        assert_eq!(stacked_disconnect_reason(&p, 70_000), None);
+    }
+
+    #[test]
+    fn an_unknown_code_stops_the_walk_rather_than_guessing() {
+        let mut frame = vec![99u8, 0, 0, 0];
+        frame.extend_from_slice(&disc(804));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), None);
+    }
+
+    #[test]
+    fn a_trailing_partial_packet_is_refused_not_guessed() {
+        let mut frame = packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&disc(804)[..6]); // truncated disconnect
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), None);
+    }
+
+    #[test]
+    fn the_packet_cap_bounds_the_walk() {
+        let mut frame = Vec::new();
+        for _ in 0..5 {
+            frame.extend_from_slice(&packet(RESPONSE_CODE_TICKER));
+        }
+        frame.extend_from_slice(&disc(804));
+        // Within the cap it is found; below it the walk stops first.
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(804));
+        assert_eq!(stacked_disconnect_reason(&frame, 3), None);
+    }
+
+    #[test]
+    fn an_empty_frame_yields_nothing() {
+        assert_eq!(stacked_disconnect_reason(&[], 70_000), None);
+    }
+
+    #[test]
+    fn every_documented_main_feed_code_has_a_length() {
+        for code in [
+            RESPONSE_CODE_TICKER,
+            RESPONSE_CODE_QUOTE,
+            RESPONSE_CODE_OI,
+            RESPONSE_CODE_PREVIOUS_CLOSE,
+            RESPONSE_CODE_MARKET_STATUS,
+            RESPONSE_CODE_FULL,
+            RESPONSE_CODE_DISCONNECT,
+        ] {
+            assert!(
+                main_feed_packet_len(&[code]).is_some(),
+                "code {code} has no length; the walk would stop on it"
+            );
+        }
+        assert_eq!(main_feed_packet_len(&[99]), None);
+        assert_eq!(main_feed_packet_len(&[]), None);
     }
 }
