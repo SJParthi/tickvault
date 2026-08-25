@@ -143,6 +143,15 @@ pub enum WalProbeFailure {
     Parse,
     /// The `columns` header lacks `name` and/or `suspended` (schema drift).
     MissingColumn,
+    /// The header resolved, rows arrived, and EVERY one was skipped -- the
+    /// mandatory cells are present by name but not by TYPE. A QuestDB upgrade
+    /// that renders `suspended` as the string `"true"` instead of a boolean
+    /// produces exactly this, and until 2026-08-25 it returned `Ok(vec![])`:
+    /// no error, no counter, and `emit_wal_delta` then set the gauge to a
+    /// confident ZERO. The one detector for the one failure mode where every
+    /// tick counter reports success and the rows are not there would have read
+    /// green for as long as the drift lasted.
+    AllRowsSkipped,
 }
 
 impl WalProbeFailure {
@@ -154,6 +163,7 @@ impl WalProbeFailure {
             Self::Status => "status",
             Self::Parse => "parse",
             Self::MissingColumn => "missing_column",
+            Self::AllRowsSkipped => "all_rows_skipped",
         }
     }
 }
@@ -169,11 +179,14 @@ impl WalProbeFailure {
 /// - [`WalProbeFailure::Parse`] — body is not an object with a `columns`
 ///   array (not the `/exec` shape at all);
 /// - [`WalProbeFailure::MissingColumn`] — header lacks `name` or
-///   `suspended` (server schema drift; fail-soft, loud counter upstream).
+///   `suspended` (server schema drift; fail-soft, loud counter upstream);
+/// - [`WalProbeFailure::AllRowsSkipped`] — rows arrived and EVERY one was
+///   skipped (mandatory cells present by NAME but not by TYPE).
 ///
 /// Individual malformed ROWS (non-array, missing cells, wrong cell types
 /// for the mandatory columns) are skipped defensively so one bad row
-/// cannot blind the probe to the remaining tables.
+/// cannot blind the probe to the remaining tables — but ALL of them being
+/// skipped is drift, not an empty answer, and is reported as such.
 pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalProbeFailure> {
     let columns = body
         .get("columns")
@@ -225,6 +238,20 @@ pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalPr
             error_tag: opt_str(error_tag_idx),
             error_message: opt_str(error_message_idx),
         });
+    }
+    // A dataset that arrived with rows and produced NOTHING is schema drift,
+    // not an empty answer. Returning `Ok(vec![])` here let `emit_wal_delta`
+    // set `tv_questdb_wal_suspended_tables` to a confident 0 while every row
+    // was being silently skipped -- and WAL suspension is the one failure
+    // where ILP keeps ACKing, `flush()` returns Ok, every loss counter reads
+    // zero, and the rows are simply not there. A blind probe reporting health
+    // is strictly worse than no probe at all.
+    //
+    // An EMPTY dataset stays a legitimate `Ok(vec![])`: no WAL tables is a
+    // real answer, and the boot DDL means it is only true before any table
+    // exists.
+    if out.is_empty() && !rows.is_empty() {
+        return Err(WalProbeFailure::AllRowsSkipped);
     }
     Ok(out)
 }
@@ -776,6 +803,86 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "good_table");
         assert!(rows[0].suspended);
+    }
+
+    #[test]
+    fn a_dataset_whose_every_row_is_skipped_is_drift_not_an_empty_answer() {
+        // THE 2026-08-25 fail-open. A QuestDB upgrade that renders `suspended`
+        // as the STRING "true" leaves the header intact -- `MissingColumn`
+        // never fires -- while `Value::as_bool` returns None for every row. The
+        // old code returned `Ok(vec![])`, `emit_wal_delta` then set
+        // `tv_questdb_wal_suspended_tables` to a confident 0, and the ONE
+        // detector for the one failure where ILP keeps ACKing rows that are
+        // never applied read green for as long as the drift lasted.
+        let string_booleans = json!({
+            "columns": header(&["name", "suspended"]),
+            "dataset": [
+                ["ticks", "false"],
+                ["market_depth", "true"],
+                ["candles_1m", "true"],
+            ],
+        });
+        assert_eq!(
+            parse_wal_tables_response(&string_booleans),
+            Err(WalProbeFailure::AllRowsSkipped),
+            "schema drift must fail LOUD, never report zero suspended tables"
+        );
+    }
+
+    #[test]
+    fn an_empty_dataset_is_still_a_legitimate_zero() {
+        // Non-vacuity in the other direction: "no WAL tables" is a real
+        // answer and must not be turned into a probe failure, or the counter
+        // would fire on every pre-DDL boot.
+        let empty = json!({
+            "columns": header(&["name", "suspended"]),
+            "dataset": [],
+        });
+        assert_eq!(parse_wal_tables_response(&empty), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn one_bad_row_among_good_ones_is_still_skipped_not_failed() {
+        // The defensive per-row skip is UNCHANGED. Only ALL rows failing is
+        // drift; a single malformed row must never blind the probe to the
+        // tables that did parse -- which is what this fix could easily have
+        // broken by over-reaching.
+        let mixed = json!({
+            "columns": header(&["name", "suspended"]),
+            "dataset": [
+                ["ticks", "not-a-bool"],
+                ["market_depth", true],
+            ],
+        });
+        let rows = parse_wal_tables_response(&mixed).expect("one good row survives");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "market_depth");
+        assert!(rows[0].suspended);
+    }
+
+    #[test]
+    fn the_all_rows_skipped_label_is_distinct_and_stable() {
+        // The label is the metric dimension the operator greps for; two
+        // failures sharing one label would be indistinguishable in CloudWatch.
+        let labels: Vec<&str> = [
+            WalProbeFailure::Http,
+            WalProbeFailure::Status,
+            WalProbeFailure::Parse,
+            WalProbeFailure::MissingColumn,
+            WalProbeFailure::AllRowsSkipped,
+        ]
+        .iter()
+        .map(|f| f.as_str())
+        .collect();
+        assert_eq!(WalProbeFailure::AllRowsSkipped.as_str(), "all_rows_skipped");
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            labels.len(),
+            "every failure label is distinct"
+        );
     }
 
     #[test]

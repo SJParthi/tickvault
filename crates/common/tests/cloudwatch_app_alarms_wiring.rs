@@ -1300,7 +1300,7 @@ fn test_hcl_stripper_and_join_locator_reject_commented_out_members() {
 // lives in test_boundary_catchup_emf_declaration_stays_retired.
 
 #[test]
-fn test_app_alarms_count_is_twenty_two() {
+fn test_app_alarms_count_is_seven() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -1410,10 +1410,21 @@ fn test_app_alarms_count_is_twenty_two() {
     // all four alarms were permanently-dead monitors. Cost: -4 alarms
     // (~-$0.40/mo) — dated notes in app-alarms.tf + aws-budget.md
     // (COST NOTE 2026-07-18).
+    // 7 (was 5) since 2026-08-25: ADDED tv_spill_dir_free_bytes (alarm
+    // tv-<env>-spill-dir-free-low) and tv_questdb_wal_suspended_tables
+    // (tv-<env>-questdb-wal-suspended). Authorized by
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.3g. Both gauges were ALREADY
+    // EMF-selected and reaching CloudWatch; neither had an alarm. MEASURED on
+    // the live account that day: free bytes went 38.8 GB -> 14.5 GB -> 20,480
+    // BYTES across two hours, the volume sat full for three, and 15 QuestDB
+    // tables suspended themselves -- which keeps ACKing ILP writes while
+    // silently discarding rows, so no other alarm in the tree could see it.
+    // Cost: +2 alarms (~+$0.20/mo), NO new EMF name and no user-data byte --
+    // dated note in aws-budget.md (COST NOTE 2026-08-25).
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 5,
-        "Z+ L2 VERIFY ratchet: expected exactly 5 app-level CloudWatch alarm \
+        count, 7,
+        "Z+ L2 VERIFY ratchet: expected exactly 7 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \
