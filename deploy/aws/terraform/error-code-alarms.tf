@@ -686,14 +686,38 @@ locals {
     #
     # ok_recovery = false: the comparison runs ONCE per session, so an auto-OK
     # an hour later means the datapoint aged out, never that anything compared.
-    "ws-gap-03-xverify-blind" = {
-      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && ($.source = \"xverify_vacuous\" || $.source = \"xverify_failed\") }"
+    # SPLIT INTO TWO ENTRIES, deliberately (2026-08-25, same change).
+    #
+    # The first draft was ONE entry matching both verdicts with
+    # `($.source = "a" || $.source = "b")`. `terraform plan` accepted it — and
+    # that acceptance means nothing here: the provider treats `pattern` as an
+    # opaque string, so filter-pattern SYNTAX is parsed only by the real
+    # PutMetricFilter call at APPLY time. A malformed pattern would therefore
+    # sail through every PR check and break the post-merge apply lane.
+    #
+    # Two single-condition entries use only the shape already proven live by
+    # ws-gap-03-universe-collapse above. It costs one extra alarm (~$0.10/mo)
+    # and buys better triage anyway: the two verdicts have DIFFERENT causes and
+    # different next steps, so naming them separately tells the operator which
+    # one fired without opening the log.
+    "ws-gap-03-xverify-vacuous" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_vacuous\" }"
       period      = 3600
       threshold   = 1
       eval        = 1
       dta         = 1
       ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run compared
-      desc        = "WS-GAP-03 cross-verify blind: the 15:41 live-vs-official comparison produced NO verdict - either it compared ZERO minutes (source=xverify_vacuous) or it could not run at all (source=xverify_failed). This is the only ground truth the DHAN live feed has: it is the check that would tell you the lane is capturing real ticks rather than merely dialling, and while it is blind nothing else can answer that question. A vacuous run reporting 'no mismatches' is the false-OK class this repo has already retired twice. Triage from the same log line: source=xverify_vacuous with a live session means the live rows or the REST rows are missing for the compared window (check tv_dhan_feed_ingest_ticks_total and the spot-1m leg); source=xverify_failed carries the underlying error. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+      desc        = "WS-GAP-03 cross-verify VACUOUS: the 15:41 live-vs-official comparison RAN and compared ZERO minutes. This is not a pass with no findings - it is no measurement at all, and a vacuous run rendering as 'no mismatches' is the false-OK class this repo has already retired twice. The comparison is the only ground truth the DHAN live feed has: the one check separating a lane that captures real ticks from one that merely dials. Triage from the same log line: missing_live high means the live lane produced no candles for the window (check tv_dhan_feed_last_tick_age_secs and the no-ticks alarm); missing_rest high means the official REST leg did not serve it (check the spot-1m leg). Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
+
+    "ws-gap-03-xverify-failed" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_failed\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
+      desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 live-vs-official comparison errored out, so the day's captured candles are UNVERIFIED - never assume they are clean. Distinct from the vacuous alarm: that one ran and found nothing to compare; this one did not complete. The comparison is the only ground truth the DHAN live feed has. Triage: the same log line carries the underlying error verbatim in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
   }
 }
