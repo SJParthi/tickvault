@@ -474,6 +474,32 @@ impl MultiTfAggregator {
                 ..ConsumeStats::default()
             };
         }
+        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
+        // 2026-08-25, and that reordering is the whole fix.
+        //
+        // It used to sit below, which left a hole the drain's own comment
+        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
+        // and returns early, so a packet carrying LTP = 0 AND
+        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
+        // stayed false, the drain classified it `untraded_sentinel` — a
+        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
+        // DESIGNATED timestamp, so that row lands in a year-2106 partition
+        // that retention and archival, which key on the trading day, can never
+        // reach, while every `max(ts)` and range query over `ticks` silently
+        // includes it.
+        //
+        // One malformed or hostile packet was enough. The band check belongs
+        // above every early return that can still produce a persisted row, not
+        // merely above the fold.
+        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
+        {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
+            return ConsumeStats {
+                refused_timestamp: true,
+                ..ConsumeStats::default()
+            };
+        }
         if p == 0.0 {
             counter!("tv_aggregator_tick_refused_total", "reason" => "untraded_sentinel")
                 .increment(1);
@@ -511,15 +537,12 @@ impl MultiTfAggregator {
         // watermark begins at 0, so the first honest tick is itself a
         // ~1.78-billion-second jump and a relative cap clamps it to garbage.
         // That mistake was written, caught by these tests, and replaced.
-        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
-        {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
-            return ConsumeStats {
-                refused_timestamp: true,
-                ..ConsumeStats::default()
-            };
-        }
+        //
+        // 2026-08-25: defence 2 (the band check) now sits ABOVE the
+        // untraded-sentinel return rather than here, because a sentinel tick
+        // still produces a PERSISTED row. See the block above the `p == 0.0`
+        // arm. The watermark is still advanced only after both gates, so this
+        // paragraph's reasoning is unchanged.
 
         if tick.exchange_timestamp > self.watermark_secs {
             self.watermark_secs = tick.exchange_timestamp;
@@ -1364,6 +1387,49 @@ mod tests {
     /// folding — still set the watermark to ~4.29 billion, and the next
     /// catch-up cycle force-sealed every open bucket in the entire book with
     /// incomplete OHLCV. Silent, whole-book, and unrecoverable (the watermark
+
+    /// BITE TEST (2026-08-25) — the sentinel bypass of the timestamp band.
+    ///
+    /// The band check used to sit BELOW the `p == 0.0` untraded-sentinel
+    /// return, so a packet carrying LTP = 0 AND a poison timestamp never
+    /// reached it. `refused_timestamp` stayed false, and the drain classifies
+    /// `untraded_sentinel` as a CANDLE-ONLY refusal — meaning the row was still
+    /// written to `ticks`, with the poison value as its DESIGNATED timestamp.
+    ///
+    /// The sibling test above covers a SANE price with a poison timestamp; this
+    /// covers the combination that slipped through. Moving the band check back
+    /// below the sentinel return makes this fail.
+    #[test]
+    fn an_untraded_sentinel_with_a_poison_timestamp_is_refused_outright() {
+        let mut agg = MultiTfAggregator::default();
+        for poison in [u32::MAX, MAX_PLAUSIBLE_EXCHANGE_TS_SECS + 1, 0, 1] {
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                // price 0.0 — the documented "untraded" sentinel.
+                &tick(13, SEG_IDX, poison, 0.0, 1),
+                None,
+                |_, _, _, _, _| panic!("an implausible timestamp must never seal"),
+            );
+            assert!(
+                stats.refused_timestamp,
+                "ts {poison} with an untraded price must be refused as \
+                 IMPLAUSIBLE, not merely as an untraded sentinel — the drain \
+                 treats the sentinel as a candle-only refusal and still writes \
+                 the row"
+            );
+            assert!(
+                !stats.untraded_sentinel,
+                "the timestamp is the more serious defect and must be the \
+                 reported reason; classifying it as a sentinel is what let the \
+                 row through"
+            );
+            assert_eq!(
+                agg.watermark_secs(),
+                0,
+                "and it must never move the watermark"
+            );
+        }
+    }
     /// never regresses).
     #[test]
     fn test_watermark_cannot_be_poisoned_by_an_all_ones_timestamp() {
