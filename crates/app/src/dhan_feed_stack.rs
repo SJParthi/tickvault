@@ -6737,20 +6737,82 @@ pub fn crossverify_deps_installed() -> bool {
     CROSSVERIFY_DEPS.get().is_some()
 }
 
+/// Dhan's `instrument` string for a segment, or `None` when the segment alone
+/// cannot determine it.
+///
+/// Added 2026-08-25. `crossverify_targets` used to stamp `"INDEX"` on EVERY
+/// target, and that string goes verbatim into the Dhan REST intraday body. The
+/// live universe is ~119 indices plus ~750 NSE_EQ constituents, so roughly 86%
+/// of every run's fetches asked for a STOCK as though it were an INDEX. Those
+/// return no candles, land in the `rest_failures` bucket, and are never
+/// compared — while the run can still report `Clean` on the handful of real
+/// indices that happened to be labelled correctly.
+///
+/// That is a PARTIAL-denominator vacuous pass, and it is invisible to the
+/// module's `minutes_compared > 0` guard, which only catches a ZERO
+/// denominator. The comparator's own doc comment says it "can never verify a
+/// different universe than it captured" — true of the id set, false of the
+/// instrument type, and the type is what decides whether a fetch returns
+/// anything at all.
+///
+/// F&O returns `None` deliberately. `(security_id, segment)` is all the
+/// subscribe set carries, and `NSE_FNO` could be `FUTIDX`, `OPTIDX`, `FUTSTK`
+/// or `OPTSTK` — a guess would land back in the silent-failure bucket this
+/// exists to empty. An unverifiable target is counted and named, not fetched
+/// with a wrong label.
+#[must_use]
+pub fn dhan_intraday_instrument_for(segment: ExchangeSegment) -> Option<&'static str> {
+    match segment {
+        ExchangeSegment::IdxI => Some("INDEX"),
+        ExchangeSegment::NseEquity | ExchangeSegment::BseEquity => Some("EQUITY"),
+        // Ambiguous from the segment alone; see the doc above.
+        ExchangeSegment::NseFno | ExchangeSegment::BseFno => None,
+        // Out of the authorized scope entirely.
+        ExchangeSegment::NseCurrency | ExchangeSegment::BseCurrency | ExchangeSegment::McxComm => {
+            None
+        }
+    }
+}
+
 /// Builds the comparator's target list from the subscribed main-feed set, so
 /// the lane can never verify a different universe than it captured.
+///
+/// Returns the targets plus the count of subscribed instruments that CANNOT be
+/// targeted, because a wrong `instrument` label is worse than an absent one: it
+/// fetches nothing while looking like a fetch that failed.
+#[must_use]
+pub fn crossverify_targets_with_skipped(
+    main_feed: &[SubscribeInstrument],
+) -> (Vec<crate::dhan_live_crossverify::XverifyTarget>, usize) {
+    let mut targets = Vec::with_capacity(main_feed.len());
+    let mut skipped = 0_usize;
+    for i in main_feed {
+        let (Some(instrument), Ok(security_id)) = (
+            dhan_intraday_instrument_for(i.segment),
+            i64::try_from(i.security_id),
+        ) else {
+            // 2026-08-25: the id arm used to be `unwrap_or(0)`, which turned an
+            // out-of-range id into a target for instrument 0 — the comparator
+            // would then verify, and report on, an instrument that does not
+            // exist.
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        targets.push(crate::dhan_live_crossverify::XverifyTarget {
+            security_id,
+            segment: i.segment.as_str().to_string(),
+            instrument: instrument.to_string(),
+        });
+    }
+    (targets, skipped)
+}
+
+/// Convenience wrapper for callers that only need the targets.
 #[must_use]
 pub fn crossverify_targets(
     main_feed: &[SubscribeInstrument],
 ) -> Vec<crate::dhan_live_crossverify::XverifyTarget> {
-    main_feed
-        .iter()
-        .map(|i| crate::dhan_live_crossverify::XverifyTarget {
-            security_id: i64::try_from(i.security_id).unwrap_or(0),
-            segment: i.segment.as_str().to_string(),
-            instrument: "INDEX".to_string(),
-        })
-        .collect()
+    crossverify_targets_with_skipped(main_feed).0
 }
 
 /// Spawns the daily comparator (see [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`]) for the
@@ -6763,7 +6825,24 @@ pub fn crossverify_targets(
 pub fn spawn_daily_crossverify(
     main_feed: &[SubscribeInstrument],
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let targets = crossverify_targets(main_feed);
+    let (targets, skipped) = crossverify_targets_with_skipped(main_feed);
+    if skipped > 0 {
+        // Named, never silent. These instruments are captured by the lane and
+        // CANNOT be verified against the vendor tape, which is a coverage hole
+        // in the lane's only ground truth — the operator must be able to see
+        // its size rather than infer it from a `rest_failures` count that also
+        // carries genuine failures.
+        metrics::counter!("tv_dhan_xverify_targets_unverifiable_total").increment(skipped as u64);
+        warn!(
+            skipped,
+            targeted = targets.len(),
+            "cross-verification cannot target every subscribed instrument: an F&O \
+             contract's Dhan `instrument` string (FUTIDX / OPTIDX / FUTSTK / OPTSTK) \
+             is not derivable from its segment alone, and a wrong label fetches \
+             nothing while looking like a failed fetch. These instruments are \
+             CAPTURED but UNVERIFIED."
+        );
+    }
     if !crossverify_deps_installed() {
         metrics::counter!(XVERIFY_UNPROVISIONED_COUNTER).increment(1);
         error!(
@@ -9616,13 +9695,14 @@ mod tests {
         // different set would produce a clean verdict about instruments the
         // lane never subscribed.
         let universe = hardcoded_index_universe();
-        let targets = crossverify_targets(&universe);
+        let (targets, skipped) = crossverify_targets_with_skipped(&universe);
 
         assert_eq!(
             targets.len(),
             universe.len(),
             "one target per subscribed instrument, no more and no fewer"
         );
+        assert_eq!(skipped, 0, "every index is targetable");
         for (t, i) in targets.iter().zip(universe.iter()) {
             assert_eq!(t.security_id, i64::try_from(i.security_id).expect("fits"));
             assert_eq!(t.segment, i.segment.as_str());
@@ -9630,6 +9710,61 @@ mod tests {
         assert!(
             crossverify_targets(&[]).is_empty(),
             "an empty universe yields no targets rather than a default one"
+        );
+    }
+
+    /// BITE TEST (2026-08-25) — the partial-denominator vacuous pass.
+    ///
+    /// `instrument` used to be the literal `"INDEX"` for every target, and it
+    /// goes verbatim into the Dhan REST intraday body. The live universe is
+    /// ~119 indices plus ~750 NSE_EQ constituents, so ~86% of every run's
+    /// fetches asked for a STOCK as though it were an INDEX — returning no
+    /// candles, landing in `rest_failures`, and never being compared, while the
+    /// run could still report `Clean` on the correctly-labelled indices.
+    ///
+    /// The module's `minutes_compared > 0` guard cannot catch this: the
+    /// denominator is partial, not zero.
+    #[test]
+    fn an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed() {
+        let universe = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 2885,
+                segment: ExchangeSegment::NseEquity,
+            },
+            SubscribeInstrument {
+                security_id: 500_325,
+                segment: ExchangeSegment::BseEquity,
+            },
+            SubscribeInstrument {
+                security_id: 45_800,
+                segment: ExchangeSegment::NseFno,
+            },
+        ];
+        let (targets, skipped) = crossverify_targets_with_skipped(&universe);
+
+        assert_eq!(
+            targets.len(),
+            3,
+            "the three cash instruments are targetable"
+        );
+        assert_eq!(
+            skipped, 1,
+            "the F&O contract is COUNTED as unverifiable, never guessed"
+        );
+        assert_eq!(targets[0].instrument, "INDEX");
+        assert_eq!(
+            targets[1].instrument, "EQUITY",
+            "an NSE_EQ constituent fetched as INDEX returns nothing and is \
+             silently never compared"
+        );
+        assert_eq!(targets[2].instrument, "EQUITY");
+        assert!(
+            targets.iter().all(|t| t.security_id != 0),
+            "an out-of-range id must be skipped, never coerced to instrument 0"
         );
     }
 
