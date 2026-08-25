@@ -1098,7 +1098,12 @@ impl LiveIngest {
                 info!("tick writer thread exiting — the drain closed its queue");
                 // Last act, and deliberately ignored: if the receiver is gone
                 // the shutdown already timed out and said so.
-                drop(done_tx.send(()));
+                //
+                // `let _ =` and not `drop(...)`: `SendError<()>` is `Copy`, so
+                // `drop` on it is a no-op the compiler rejects under
+                // `-D warnings` (`dropping_copy_types`). Caught by CI, because
+                // clippy is not installable on this repo's pinned toolchain.
+                let _ = done_tx.send(());
             })?;
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
