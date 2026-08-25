@@ -1510,7 +1510,7 @@ mod tests {
         // return 0 (the ATM strike only) and never a negative or a panic.
         let each_side = depth_20_strikes_each_side(200);
         assert_eq!(each_side, 0);
-        assert!((0 * 2 + 1) * 200 * 2 > DEPTH_20_MAX_INSTRUMENTS);
+        assert!(200 * 2 > DEPTH_20_MAX_INSTRUMENTS);
         // ...which is exactly why the last-resort truncate guard exists.
     }
 

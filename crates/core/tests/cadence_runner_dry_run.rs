@@ -434,7 +434,7 @@ fn test_decision_fires_instant_predicate_completes() {
     // LAST required cell — and the latch admits the decision at that
     // exact event, not at any timer.
     let mut a = LaneAssembly::new(Feed::Truedata, FIRST_CYCLE_MINUTE, 33_360_000);
-    let mut latch = DecisionLatch::new();
+    let _latch = DecisionLatch::new();
     for u in ChainUnderlying::ALL {
         assert!(!a.is_data_complete(), "incomplete before every chain");
         a.record_chain(
@@ -584,7 +584,7 @@ async fn test_cadence_runner_reenable_after_both_disabled_park_still_cycles() {
 
     // APPROVED (test-only): poisoned mutex propagates the panic.
     #[allow(clippy::unwrap_used)]
-    let calls = log.lock().unwrap().clone();
+    let _calls = log.lock().unwrap().clone();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

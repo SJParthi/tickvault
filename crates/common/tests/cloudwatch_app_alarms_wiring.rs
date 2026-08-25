@@ -908,7 +908,8 @@ fn test_log_metric_filter_fallback_covers_both_liveness_alarm_metrics() {
     // PR-C2 (2026-07-13): tv_realtime_guarantee_score left this list — its
     // fallback filter retired with the PARKed SLO publisher.
     let tf = read("deploy/aws/terraform/metrics-log-metric-filters.tf");
-    for metric in ["tv_boot_completed"] {
+    {
+        let metric = "tv_boot_completed";
         assert!(
             tf.contains(&format!("{{ $.{metric} = * }}")),
             "fallback filter pattern for {metric} missing from \

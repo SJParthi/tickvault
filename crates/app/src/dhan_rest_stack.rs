@@ -1738,7 +1738,8 @@ mod tests {
         }
         // Keep the original loop shape below vacuous-proof: assert the
         // supervisor helper itself exists in the production region.
-        for needle in ["fn spawn_supervised_stack_task"] {
+        {
+            let needle = "fn spawn_supervised_stack_task";
             assert!(
                 prod.contains(needle),
                 "dhan_rest_stack.rs production region lost `{needle}` — the \

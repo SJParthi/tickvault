@@ -314,16 +314,17 @@ fn const_aliases(lines: &[&str], cutoff: usize) -> Vec<(String, String)> {
         // binding. `resource_monitor` logs at ALL THREE of its probe-failure
         // arms and still looked unreachable, because the name is 40+ lines
         // above them at the `let`.
-        if !t.starts_with("//") && t.starts_with("let ") && t.contains("counter!(") {
-            if let Some(ident) = t
+        if !t.starts_with("//")
+            && t.starts_with("let ")
+            && t.contains("counter!(")
+            && let Some(ident) = t
                 .strip_prefix("let ")
                 .and_then(|r| r.split('=').next())
                 .map(|s| s.trim().trim_start_matches("mut ").trim())
-            {
-                for name in tv_names_in(line) {
-                    if is_loss_shaped(&name) && !ident.is_empty() {
-                        out.push((ident.to_string(), name));
-                    }
+        {
+            for name in tv_names_in(line) {
+                if is_loss_shaped(&name) && !ident.is_empty() {
+                    out.push((ident.to_string(), name));
                 }
             }
         }
