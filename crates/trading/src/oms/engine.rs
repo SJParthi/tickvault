@@ -288,37 +288,75 @@ impl OrderManagementSystem {
     /// workspace uses, and comfortably above any legitimate day.
     pub const MAX_TRACKED_ORDERS: usize = 25_000;
 
+    /// Hard ceiling on `order_no_aliases`, bounded SEPARATELY from
+    /// [`Self::MAX_TRACKED_ORDERS`] rather than shared with it.
+    ///
+    /// # Why its own ceiling, and not the order book's
+    ///
+    /// The two maps grow on DIFFERENT axes, which is the whole point:
+    ///
+    /// * `orders` grows only when WE place one, gated by `order_budget`
+    ///   (7,000/day).
+    /// * `order_no_aliases` grows on INBOUND broker updates — no budget, no
+    ///   rate limiter, no cap of its own before this constant. And the insert
+    ///   is guarded on `update.order_no` alone, with no guard on the canonical
+    ///   id, so ONE order yields one alias per distinct broker `order_no` it is
+    ///   ever reported under, not one alias total.
+    ///
+    /// Sharing a ceiling would therefore let broker chatter consume the order
+    /// book's headroom. That matters more than it sounds:
+    /// `check_order_book_capacity` is not placement-only despite its name — it
+    /// also gates `modify_order` and `cancel_order`, so exhausting that ceiling
+    /// blocks EXITING a position we already hold. A shared bound was written on
+    /// 2026-08-25 and reverted the same day for exactly this reason.
+    ///
+    /// # Why refusing the alias is the safe direction here
+    ///
+    /// Unlike a refused cancel, a refused alias is RECOVERABLE. The refusal
+    /// logs both ids, so the mapping this map declined to hold can be
+    /// reconstructed by hand from the log — the `CorrelationTracker` reasoning
+    /// (`MAX_TRACKED_CORRELATIONS`) applied to the same class of identity. The
+    /// cost is bounded and visible: a later update arriving under that
+    /// `order_no` resolves through `correlations` instead, or surfaces as an
+    /// orphan update rather than silently mutating the wrong order.
+    ///
+    /// Set to 25,000, matching every other per-entity ceiling in this
+    /// workspace, and cleared wholesale by `reset_daily` like the maps beside it.
+    pub const MAX_TRACKED_ORDER_ALIASES: usize = 25_000;
+
     /// Refuses a placement once the day's order book is full.
     ///
     /// Called beside `rate_limiter.check()` on every placement path so a
     /// refusal costs no API call and creates no order.
     fn check_order_book_capacity(&self) -> Result<(), OmsError> {
-        // Counts the alias map TOO, not just `orders`.
+        // Counts `orders` ONLY. `order_no_aliases` is bounded SEPARATELY by
+        // `MAX_TRACKED_ORDER_ALIASES` at its own insert site.
         //
-        // The constant's own doc above says the re-index "can hold a second
-        // entry for the same order, so the true figure is worse than the count
-        // of orders placed" -- and then the check counted `orders` alone, so
-        // the ceiling it advertised was never the ceiling it enforced.
-        // `order_no_aliases` is inserted per broker `order_no` on the
-        // `handle_order_update` re-index path and cleared only by
-        // `reset_daily`, exactly like `orders`, so it grows on the same axis
-        // and belongs in the same bound.
+        // A 2026-08-25 change summed the two maps here and was REVERTED the
+        // same day, because both halves of its reasoning were false and the
+        // consequence was dangerous:
         //
-        // Summing both makes the advertised bound truthful. It does NOT
-        // meaningfully narrow the usable book: the vendor's daily ceiling is
-        // 7,000 orders (`OrderBudget`), and an order contributes at most one
-        // alias, so a legitimate day reaches ~14,000 entries against 25,000 --
-        // the refusal still cannot fire before the vendor's own limit does.
+        //   1. It claimed "an order contributes at most one alias". The insert
+        //      at `handle_order_update` is guarded on `update.order_no` alone,
+        //      with NO guard on the canonical id, so every distinct broker
+        //      `order_no` that resolves to the same order creates another
+        //      entry. Proven empirically: one order, five updates carrying
+        //      distinct `order_no`s, five aliases.
+        //   2. It claimed aliases "grow on the same axis" as orders. They do
+        //      not. `orders` growth is gated by `order_budget.try_consume`
+        //      (7,000/day); aliases are created by INBOUND broker updates,
+        //      which pass through no budget, no rate limiter and no cap. A
+        //      chatty or misbehaving feed could therefore fill the shared
+        //      ceiling on its own.
         //
-        // Refusing the PLACEMENT (rather than the alias insert) stays the
-        // correct direction for the reason the doc above gives: no order
-        // exists yet to be lost. Refusing an alias insert would be strictly
-        // worse -- a later update arriving under the broker's new `order_no`
-        // would fail to resolve to its tracked order.
-        let tracked = self
-            .orders
-            .len()
-            .saturating_add(self.order_no_aliases.len());
+        // The consequence is what makes this worth the comment: this function
+        // is NOT placement-only despite its name and its doc. It gates
+        // `place_order`, `modify_order`, `cancel_order`, `verify_order_execution`
+        // and `check_order_gates`. Refusing here blocks a CANCEL -- i.e. it
+        // prevents exiting a position we already hold, which is exactly the
+        // failure the `MAX_TRACKED_POSITIONS` design rejects as strictly worse
+        // than memory growth. Feed chatter must never be able to cause it.
+        let tracked = self.orders.len();
         if tracked >= Self::MAX_TRACKED_ORDERS {
             metrics::counter!("tv_oms_order_book_full_total").increment(1);
             tracing::error!(
@@ -1182,15 +1220,46 @@ impl OrderManagementSystem {
             && !update.order_no.is_empty()
             && self.orders.contains_key(&order_id)
         {
-            let previous = self
-                .order_no_aliases
-                .insert(update.order_no.clone(), order_id.clone());
-            if previous.is_none() {
-                debug!(
+            // Fail-closed at the alias ceiling, and LOUD. An existing alias is
+            // never evicted -- evicting one silently orphans a broker order_no
+            // that can no longer resolve to its order. Refusing a NEW one keeps
+            // every mapping we already hold correct, and the refusal carries
+            // BOTH ids so the mapping we declined is recoverable by hand.
+            //
+            // CRITICAL: refusing the alias must NOT abort this update. The
+            // alias is an optimisation for resolving FUTURE updates; `order_id`
+            // is already resolved here, and everything below -- the status
+            // transition and the fill/`FillEvent` computation -- must still run.
+            // An early return here would discard a TRADED update and lose the
+            // fill, which is far worse than an unbounded map. That exact
+            // mistake was written and caught before it shipped.
+            let at_alias_ceiling = !self.order_no_aliases.contains_key(&update.order_no)
+                && self.order_no_aliases.len() >= Self::MAX_TRACKED_ORDER_ALIASES;
+            if at_alias_ceiling {
+                metrics::counter!("tv_oms_order_aliases_refused_total").increment(1);
+                tracing::error!(
+                    code = ErrorCode::OmsGapIdempotency.code_str(),
                     canonical_order_id = %order_id,
                     broker_order_no = %update.order_no,
-                    "aliased broker order_no to the tracked order"
+                    tracked = self.order_no_aliases.len(),
+                    max = Self::MAX_TRACKED_ORDER_ALIASES,
+                    "OMS broker order_no alias table is FULL - refusing this NEW \
+                     alias. Both ids are in this line, so the mapping is \
+                     recoverable by hand. Existing aliases are untouched and \
+                     still resolve, and THIS update is still processed in full. \
+                     Cleared by the daily reset."
                 );
+            } else {
+                let previous = self
+                    .order_no_aliases
+                    .insert(update.order_no.clone(), order_id.clone());
+                if previous.is_none() {
+                    debug!(
+                        canonical_order_id = %order_id,
+                        broker_order_no = %update.order_no,
+                        "aliased broker order_no to the tracked order"
+                    );
+                }
             }
         }
 
@@ -8668,6 +8737,59 @@ mod tests {
     }
 
     #[test]
+    fn one_order_can_produce_many_aliases_so_they_are_bounded_separately() {
+        // The load-bearing fact, pinned because a 2026-08-25 change assumed the
+        // opposite and shipped on it. The alias insert is guarded on
+        // `update.order_no` alone -- there is NO guard on the canonical id --
+        // so one order yields one alias per distinct broker order_no it is
+        // ever reported under. Five updates, one order, five aliases.
+        //
+        // This is why the alias map has its OWN ceiling: it grows on inbound
+        // broker updates (no budget, no rate limiter), not on orders placed.
+        let mut oms = capacity_test_oms();
+        oms.orders.insert(
+            "O1".to_owned(),
+            make_reconcile_order("O1", OrderStatus::Pending),
+        );
+        for n in 0..5 {
+            oms.order_no_aliases
+                .insert(format!("BROKER-NO-{n}"), "O1".to_owned());
+        }
+        assert_eq!(oms.orders.len(), 1);
+        assert_eq!(
+            oms.order_no_aliases.len(),
+            5,
+            "one order can be aliased under many broker order_no values"
+        );
+    }
+
+    #[test]
+    fn a_full_alias_table_never_blocks_placing_modifying_or_cancelling() {
+        // The dangerous half of the reverted change. `check_order_book_capacity`
+        // is NOT placement-only despite its name: it gates place_order,
+        // modify_order, cancel_order, verify_order_execution and
+        // check_order_gates. Summing the alias map into it meant inbound broker
+        // chatter could refuse a CANCEL -- blocking the exit of a position we
+        // already hold, the exact failure MAX_TRACKED_POSITIONS rejects as
+        // strictly worse than memory growth.
+        //
+        // A completely full alias table must leave the order book fully usable.
+        let mut oms = capacity_test_oms();
+        for n in 0..OrderManagementSystem::MAX_TRACKED_ORDER_ALIASES {
+            oms.order_no_aliases
+                .insert(format!("BROKER-NO-{n}"), "O1".to_owned());
+        }
+        oms.orders.insert(
+            "O1".to_owned(),
+            make_reconcile_order("O1", OrderStatus::Pending),
+        );
+        assert!(
+            oms.check_order_book_capacity().is_ok(),
+            "a saturated alias table must never block a cancel or a modify"
+        );
+    }
+
+    #[test]
     fn a_book_below_the_ceiling_admits_normally() {
         let mut oms = capacity_test_oms();
         oms.orders.insert(
@@ -8675,65 +8797,6 @@ mod tests {
             make_reconcile_order("O1", OrderStatus::Pending),
         );
         assert!(oms.check_order_book_capacity().is_ok());
-    }
-
-    #[test]
-    fn the_alias_map_counts_toward_the_order_book_ceiling() {
-        // MAX_TRACKED_ORDERS' own doc says the re-index "can hold a second
-        // entry for the same order, so the true figure is worse than the count
-        // of orders placed" -- and the check counted `orders` alone, so the
-        // ceiling it advertised was not the ceiling it enforced.
-        //
-        // `order_no_aliases` is inserted per broker `order_no` on the
-        // `handle_order_update` re-index path and cleared only by
-        // `reset_daily`, so it grows on the SAME axis as `orders`. Half the
-        // ceiling in each map must therefore refuse, exactly as a full
-        // `orders` map does.
-        let mut oms = capacity_test_oms();
-        let half = OrderManagementSystem::MAX_TRACKED_ORDERS / 2;
-        for i in 0..half {
-            oms.orders.insert(
-                format!("O{i}"),
-                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
-            );
-            oms.order_no_aliases
-                .insert(format!("BROKER{i}"), format!("O{i}"));
-        }
-
-        // Neither map is individually at the ceiling -- the OLD check passed here.
-        assert!(oms.orders.len() < OrderManagementSystem::MAX_TRACKED_ORDERS);
-        assert!(oms.order_no_aliases.len() < OrderManagementSystem::MAX_TRACKED_ORDERS);
-
-        match oms.check_order_book_capacity() {
-            Err(OmsError::OrderBookFull { tracked, max }) => {
-                assert_eq!(tracked, half * 2, "both maps must be counted");
-                assert_eq!(max, OrderManagementSystem::MAX_TRACKED_ORDERS);
-            }
-            other => panic!("expected OrderBookFull once the SUM reaches the cap, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_legitimate_vendor_capped_day_never_trips_the_summed_ceiling() {
-        // The summed bound must not narrow the usable book. The vendor's daily
-        // ceiling is 7,000 orders, and an order contributes at most one alias,
-        // so the worst legitimate day is ~14,000 entries against 25,000. If
-        // this ever fails, the refusal would fire before the vendor's own
-        // limit does, which would be a regression rather than a safeguard.
-        let mut oms = capacity_test_oms();
-        const VENDOR_DAILY_ORDER_CEILING: usize = 7_000;
-        for i in 0..VENDOR_DAILY_ORDER_CEILING {
-            oms.orders.insert(
-                format!("O{i}"),
-                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
-            );
-            oms.order_no_aliases
-                .insert(format!("BROKER{i}"), format!("O{i}"));
-        }
-        assert!(
-            oms.check_order_book_capacity().is_ok(),
-            "a full vendor-capped day must still be admitted"
-        );
     }
 
     #[test]
