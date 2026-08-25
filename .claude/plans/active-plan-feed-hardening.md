@@ -2400,3 +2400,146 @@ magnitude; the first session with real lag data is what validates it. NOT
 claimed: that the user-data restructure is live-verified — no instance has
 booted with it, and the fallback exists precisely because that is unproven.
 
+
+---
+
+## Item 24 — the ILP flush leaves the frame-drain task (2026-08-25)
+
+- [x] `TickWriter::split_for_offload` — producer keeps the buffer and the row
+      accounting; a new `TickWriterSink` takes the ILP `Sender`
+  - Files: `crates/storage/src/tick_persistence.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `offloaded_flush_hands_the_rows_off_and_does_not_touch_the_network`,
+    `a_full_queue_keeps_the_rows_and_never_reports_them_as_dropped`,
+    `the_sink_reports_zero_rows_when_the_flush_fails`,
+    `a_writer_that_was_never_split_behaves_exactly_as_before`,
+    `an_offloaded_flush_never_touches_the_network_from_the_drain`,
+    `the_writer_thread_is_joined_at_shutdown_so_the_tail_batch_lands`,
+    `test_drain_never_flushes_bare_on_the_async_worker` (re-blessed, 3 bites)
+
+### Design
+
+`TickWriter::flush` is a synchronous ILP-over-HTTP round trip with a 5 s
+timeout, and it ran ON the frame-drain task. `blocking_flush`/`block_in_place`
+bounded the damage to the RUNTIME — the other tasks keep their workers — but
+did nothing for the drain itself, and the drain is the only consumer of the
+frame ring. So a slow database stopped the fold, the socket receive buffer
+filled, and Dhan — whose published behaviour is to skip a slow consumer forward
+to "the latest available state", with no sequence number — discarded the
+intermediate ticks at THEIR side. That loss is invisible to every counter we
+own, and no amount of provisioned disk throughput removes it, because the
+coupling is structural rather than a matter of speed.
+
+The writer is now split across a bounded `sync_channel` (`FLUSH_QUEUE_DEPTH`
+= 4) with a named OS thread `tv-tick-writer` on the far side. The drain's flush
+becomes a `try_send`.
+
+### Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Queue full | `OffloadOutcome::QueueFull` — rows RETAINED and still pending, `Ok(())` returned, next flush retries. Counted by `tv_tick_flush_queue_full_total`. Never reported as loss, because none happened. |
+| Queue full past `MAX_PRODUCER_BUFFER_BYTES` (64 MiB) | Stops accumulating and rescues through the existing `discard_pending` path — durable, counted, re-ingestable. Bounds the memory an hour-long stall can consume. |
+| Writer thread gone | Rescue + `Err`, never a silent success. |
+| Writer never split | Byte-for-byte the previous synchronous behaviour, pinned by its own test. |
+| Shutdown | `shutdown_offload_writer` closes the queue and JOINS, after the tail flush. |
+
+### Failure Modes
+
+The tail flush was the sharp one: it hands the last batch to the queue, so
+without a join the process could exit with that batch in flight — re-creating,
+one queue further out, exactly the loss the tail flush exists to prevent. The
+join handle therefore lives inside `LiveIngest`, where the drain that owns the
+tail flush can reach it, and a source-scan assertion pins the call.
+
+Spawn failure is non-fatal and non-silent: the lane falls back to the
+synchronous path with a coded error. Degraded beats refusing to boot.
+
+### Test Plan
+
+132 test binaries green across `tickvault-storage` + `tickvault-app` with
+`--no-fail-fast`, zero failures. The structural guard was bite-proven three
+ways — a bare blocking flush, a never-wired boot site, and a removed shutdown
+join each turn it red, and each restores green.
+
+### Rollback
+
+Delete the `spawn_offload_writer` call at the boot site. Everything else is
+inert: `flush` branches on `offload.is_some()`, which is `None` on every
+constructor.
+
+### Observability
+
+New: `tv_tick_flush_offloaded_total`, `tv_tick_flush_queue_full_total` — local
+exporter only, deliberately NOT EMF-selected and NOT alarmed. **The loss path
+they sit on is already alarmed**: a stall long enough to matter crosses the
+producer ceiling and increments `tv_ticks_dropped_total`, which carries
+`tv-<env>-ticks-dropped`, plus `tv_ticks_spilled_total` and the coded
+`HOT-PATH-02` error. A transient full queue is backpressure, not loss, and
+paging on it would train the operator to ignore the counter that means loss.
+No new rule row is needed because no new page is added.
+
+### Per-Item Guarantee Matrix (Item 24)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +
+7-row). Coverage: 6 new tests + 1 re-blessed guard, bite-proven 3 ways. Zero
+tick-drop path added — the queue-full arm is the proof, and it retains rows.
+O(1): the hand-off is one `try_send` and one `mem::replace`; no allocation is
+added to the per-tick path (the replacement `Buffer` is minted once per FLUSH,
+at 500 ms cadence, not per row).
+
+**Honest envelope:** 100% inside the tested envelope, with ratcheted regression
+coverage: the drain's flush no longer performs network I/O, a full queue
+retains rows rather than blocking or dropping, and the session tail is joined
+before exit. **NOT claimed:** that this removes tick loss — it removes ONE
+mechanism (drain stall → socket backpressure → vendor-side skip-forward), and
+the vendor's skip-forward remains undetectable to us because the India feed
+carries no sequence number. **NOT claimed:** that it is measured live — no
+instance has run it; the ~25× write amplification that makes the disk saturate
+in the first place is untouched and is the next item. **NOT claimed:** clippy
+clean locally — the component is not installed in this container; CI's Build &
+Verify is the check.
+
+### Item 24 — compliance with Item 14d's five binding conditions
+
+Item 14 recorded this design on 2026-08-25 and bound the implementing PR to
+five conditions. Audited one by one rather than asserted:
+
+| | Condition | Status |
+|---|---|---|
+| **C1** | Overflow SPILLS, never a silent drop, never a blocking append on the fold path | **PASS** — `try_send`, never `send`; every cut routes through the existing rescue tier |
+| **C2** | The drain ships pre-stamped rows; the writer never mints `capture_seq` | **PASS** — `FlushBatch` carries a finished `Buffer`; the sink only calls `sender.flush()` |
+| **C3** | `record_ticks` and `LAST_TICK_AGE_GAUGE` move to the writer | **PASS, by construction** — `record_ticks` is on the thread, and the gauge is *derived* from `feed_health.last_tick_age_secs`, so it follows the registry the writer stamps. `no_ticks_alarm_gauge_guard.rs` passes unchanged, so no re-bless and no dated §2.3b edit are needed — the alarm still means "rows persisted" |
+| **C4** | Bounded shutdown grace; batch width capped; `max_buf_size` headroom const-asserted | **PASS — and this was the one the first draft FAILED** |
+| **C5** | A size cut must fire well before the 100 MiB questdb-rs wedge | **PASS** — `MAX_PRODUCER_BUFFER_BYTES` is const-asserted at ≤ half of `QUESTDB_MAX_BUF_SIZE_BYTES` |
+
+**C4 is worth writing out, because the first draft of Item 24 shipped without
+it and would have made the disk problem worse.** Item 14's hostile pass had
+flagged the own-goal: a decoupled writer accumulates under pressure, so each
+commit spans a wider row range — and wider commits are what the amplification
+is made of. It bound the implementation to cap width *until 14b(3) was
+measured*. Item 15/f638bb66 then measured it: `ticks` is `PARTITION BY HOUR` on
+the exchange last-TRADE time, and **10.0% of one day's 64.3M ticks carried a
+`ts` more than an hour behind arrival**, so one commit in ten reopens a closed
+hourly partition and rewrites it. **Commit width is the amplifier**, which is
+the branch of 14b(3) that makes the cap mandatory rather than optional.
+
+Three fixes followed:
+
+1. `MAX_RETAINED_FLUSH_SPANS = 2` — the producer may retain across two flush
+   spans, then stops widening and spills. Enforced on the retain path, not
+   merely declared, and pinned by the structural guard.
+2. `OFFLOAD_SHUTDOWN_GRACE = 30 s` — `JoinHandle::join` has no timeout, so a
+   writer wedged on a hung socket would have hung the box's shutdown. Worse,
+   on a host whose auto-stop is a cost control, than losing the tail batch.
+3. `MAX_PRODUCER_BUFFER_BYTES` 64 MiB → **32 MiB**. The const assertion
+   *refused to compile* at 64 — the assertion doing its job, on the first
+   number I picked.
+
+`OffloadOutcome::WidthCapped` is a distinct arm from `SinkGone` because the
+writer is alive and well during a width cut; reporting "the writer thread is
+gone" would send an operator to diagnose a healthy thread.
+
+**14e** (no new EMF metric name may ship — `user-data.sh.tftpl` at zero free
+bytes) is honoured: all three new counters are local-exporter only. The loss
+path they sit on already pages through `tv_ticks_dropped_total`.
