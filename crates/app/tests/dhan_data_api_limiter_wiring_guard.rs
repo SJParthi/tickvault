@@ -129,7 +129,8 @@ fn ratchet_both_spawn_seams_configure_the_limiter_from_config() {
     // The test name is kept (test-count ratchet stability); the loop now
     // pins exactly the surviving seam. A re-added main.rs seam MUST be
     // added back here in the same PR.
-    for rel in ["src/dhan_rest_stack.rs"] {
+    {
+        let rel = "src/dhan_rest_stack.rs";
         let src = read_app_src(rel);
         let configure_pos = src
             .find(CONFIGURE)

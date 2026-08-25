@@ -629,14 +629,22 @@ impl MultiTfAggregator {
         // cost by `TF_COUNT × 3` for no added information.
         let prices = TickPrices::from_tick(tick);
 
+        // Same reasoning, and a stronger reason besides: this one is a
+        // comparison against the PREVIOUS PACKET, so it is only meaningful
+        // once per tick. Running it inside the loop would compare a packet
+        // against itself for 23 of the 24 timeframes and silently destroy the
+        // delta. It must stay above the loop.
+        let extremes = slot.cell.observe_session_extremes(tick);
+
         for tf in TfIndex::ALL {
-            match slot.cell.consume_tick_with_prices(
+            match slot.cell.consume_tick_with_extremes(
                 tf,
                 tick,
                 prices,
                 baseline,
                 strategy,
                 cumulative_volume,
+                extremes,
             ) {
                 ConsumeOutcome::Updated => {}
                 ConsumeOutcome::Sealed { sealed_state } => {
@@ -789,6 +797,16 @@ impl MultiTfAggregator {
             }
         }
         emitted
+    }
+}
+
+#[cfg(test)]
+impl MultiTfAggregator {
+    /// Test-only: shrink the effective slot ceiling so the fail-closed
+    /// exhaustion path can be exercised without allocating
+    /// [`AGGREGATOR_MAX_SLOTS`] cells (~135 MB).
+    fn force_capacity_for_test(&mut self, cap: usize) {
+        self.test_capacity_override = Some(cap);
     }
 }
 
@@ -2101,15 +2119,5 @@ mod tests {
              decode + ILP append are NOT included)",
             ticks_per_sec / envelope
         );
-    }
-}
-
-#[cfg(test)]
-impl MultiTfAggregator {
-    /// Test-only: shrink the effective slot ceiling so the fail-closed
-    /// exhaustion path can be exercised without allocating
-    /// [`AGGREGATOR_MAX_SLOTS`] cells (~135 MB).
-    fn force_capacity_for_test(&mut self, cap: usize) {
-        self.test_capacity_override = Some(cap);
     }
 }

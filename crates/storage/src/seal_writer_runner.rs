@@ -282,6 +282,32 @@ impl CycleOutcome {
     pub const fn is_idle(&self) -> bool {
         self.submitted_from_mpsc == 0 && self.drain.is_idle()
     }
+
+    /// Folds another cycle's outcome into this one.
+    ///
+    /// Used by the shutdown drain, which runs cycles until the ring empties
+    /// and must return the TOTAL — a caller shown only the last cycle would
+    /// see an idle outcome and read a successful multi-cycle drain as nothing
+    /// having happened.
+    ///
+    /// # Complexity
+    /// O(1) — five saturating adds plus the drain's own.
+    pub const fn accumulate(&mut self, other: &Self) {
+        self.submitted_from_mpsc = self
+            .submitted_from_mpsc
+            .saturating_add(other.submitted_from_mpsc);
+        self.mpsc_submit_buffered = self
+            .mpsc_submit_buffered
+            .saturating_add(other.mpsc_submit_buffered);
+        self.mpsc_submit_spilled = self
+            .mpsc_submit_spilled
+            .saturating_add(other.mpsc_submit_spilled);
+        self.mpsc_submit_dlq = self.mpsc_submit_dlq.saturating_add(other.mpsc_submit_dlq);
+        self.mpsc_submit_dropped = self
+            .mpsc_submit_dropped
+            .saturating_add(other.mpsc_submit_dropped);
+        self.drain.accumulate(&other.drain);
+    }
 }
 
 /// Owns the consumer-side machinery: the mpsc receiver, the

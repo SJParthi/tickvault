@@ -9,8 +9,8 @@
 //! `>2s wall-clock skew → HALT boot` gate NEVER fired, `tv_clock_skew_seconds`
 //! never published, and the CloudWatch alarm on it was false-green forever. A
 //! >2s skew can silently split/merge trading days across QuestDB DEDUP keys.
-//! The fix wires the gate into `build_shared_infra` before the seal-writer
-//! spawn; this guard fails the build if that wiring silently dies again.
+//! > The fix wires the gate into `build_shared_infra` before the seal-writer
+//! > spawn; this guard fails the build if that wiring silently dies again.
 //!
 //! Mirrors the codebase's `*_is_wired` guard pattern
 //! (`orphan_position_watchdog_wiring_guard.rs`).

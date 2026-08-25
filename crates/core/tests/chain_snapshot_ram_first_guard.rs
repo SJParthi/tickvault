@@ -239,7 +239,8 @@ fn boot_legs_keep_moneyness_wiring() {
     let dhan_chain = std::fs::read_to_string(app_src.join("option_chain_1m_boot.rs"))
         .expect("option_chain_1m_boot.rs must exist");
 
-    for (name, content) in [("option_chain_1m_boot.rs", &dhan_chain)] {
+    {
+        let (name, content) = ("option_chain_1m_boot.rs", &dhan_chain);
         // TRH-NEW-1: the scan sees CALL SITES only — fn definition lines
         // are stripped so a leg that DEFINES the needle in its own
         // production region (the Dhan leg) cannot pass vacuously.

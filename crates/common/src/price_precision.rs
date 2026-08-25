@@ -98,6 +98,77 @@ pub fn round_to_2dp(value: f64) -> f64 {
     if rounded == 0.0 { 0.0 } else { rounded }
 }
 
+// ============================================================================
+// Display-layer 2-decimal formatters (Sub-PR #4.5)
+// ============================================================================
+
+/// Sentinel for non-finite display values. NaN / +inf / -inf render as
+/// an em-dash (operator-locked 2026-05-27) rather than "NaN" / "inf"
+/// which are confusing in a trading context. Callers MUST use these
+/// helpers — direct `format!("{:.2}", value)` is banned in
+/// operator-facing string paths per Sub-PR #4.6 (future hook addition).
+const NON_FINITE_SENTINEL: &str = "—";
+
+/// Format a price value for operator display — exactly 2 decimal places,
+/// non-finite values rendered as em-dash sentinel.
+///
+/// Operator-locked 2026-05-27: every price emitted via Telegram, UI, or
+/// REST response MUST go through this helper. Storage + RAM keep full
+/// f64 precision; only the operator-facing boundary rounds to 2 decimals.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::price_precision::format_price_2_decimals;
+/// assert_eq!(format_price_2_decimals(2500.55), "2500.55");
+/// assert_eq!(format_price_2_decimals(2520.5500488), "2520.55");
+/// assert_eq!(format_price_2_decimals(f64::NAN), "—");
+/// ```
+#[must_use]
+pub fn format_price_2_decimals(value: f64) -> String {
+    if !value.is_finite() {
+        return NON_FINITE_SENTINEL.to_string();
+    }
+    format!("{value:.2}")
+}
+
+/// Format a percentage value for operator display — exactly 2 decimal
+/// places, leading sign ('+' or '-'), trailing '%'. Zero renders without
+/// a sign. Non-finite values render as em-dash sentinel.
+///
+/// Operator-locked 2026-05-27: every percentage emitted via Telegram,
+/// UI, or REST response MUST go through this helper. Standard NSE
+/// display convention.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::price_precision::format_pct_2_decimals;
+/// assert_eq!(format_pct_2_decimals(5.0), "+5.00%");
+/// assert_eq!(format_pct_2_decimals(-0.81), "-0.81%");
+/// assert_eq!(format_pct_2_decimals(0.0), "0.00%");
+/// assert_eq!(format_pct_2_decimals(f64::NAN), "—");
+/// ```
+#[must_use]
+pub fn format_pct_2_decimals(value: f64) -> String {
+    if !value.is_finite() {
+        return NON_FINITE_SENTINEL.to_string();
+    }
+    // Zero (including -0.0) renders without a sign per operator
+    // convention. Use `format!("{:.2}", value)` to apply rounding first,
+    // then check the rounded value — avoids "+0.00%" when the raw value
+    // is a tiny negative that rounds to zero.
+    let rounded = format!("{value:.2}");
+    if rounded == "0.00" || rounded == "-0.00" {
+        return "0.00%".to_string();
+    }
+    if value > 0.0 {
+        format!("+{rounded}%")
+    } else {
+        format!("{rounded}%")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,8 +204,8 @@ mod tests {
         // Operator-observed corruption: 23925.65_f32 was landing as
         // 23925.650390625_f64 in candles_1m via f64::from().
         assert_eq!(f32_to_f64_clean(23925.65_f32), 23925.65_f64);
-        assert_eq!(f32_to_f64_clean(23937.30_f32), 23937.30_f64);
-        assert_eq!(f32_to_f64_clean(23924.40_f32), 23924.40_f64);
+        assert_eq!(f32_to_f64_clean(23_937.3_f32), 23937.30_f64);
+        assert_eq!(f32_to_f64_clean(23_924.4_f32), 23924.40_f64);
         assert_eq!(f32_to_f64_clean(10.20_f32), 10.20_f64);
         assert_eq!(f32_to_f64_clean(21004.95_f32), 21004.95_f64);
     }
@@ -289,76 +360,5 @@ mod tests {
         // the output is a valid % string with 2 decimals.
         let s = format_pct_2_decimals(0.005);
         assert!(s == "+0.01%" || s == "0.00%", "got {s}");
-    }
-}
-
-// ============================================================================
-// Display-layer 2-decimal formatters (Sub-PR #4.5)
-// ============================================================================
-
-/// Sentinel for non-finite display values. NaN / +inf / -inf render as
-/// an em-dash (operator-locked 2026-05-27) rather than "NaN" / "inf"
-/// which are confusing in a trading context. Callers MUST use these
-/// helpers — direct `format!("{:.2}", value)` is banned in
-/// operator-facing string paths per Sub-PR #4.6 (future hook addition).
-const NON_FINITE_SENTINEL: &str = "—";
-
-/// Format a price value for operator display — exactly 2 decimal places,
-/// non-finite values rendered as em-dash sentinel.
-///
-/// Operator-locked 2026-05-27: every price emitted via Telegram, UI, or
-/// REST response MUST go through this helper. Storage + RAM keep full
-/// f64 precision; only the operator-facing boundary rounds to 2 decimals.
-///
-/// # Examples
-///
-/// ```
-/// use tickvault_common::price_precision::format_price_2_decimals;
-/// assert_eq!(format_price_2_decimals(2500.55), "2500.55");
-/// assert_eq!(format_price_2_decimals(2520.5500488), "2520.55");
-/// assert_eq!(format_price_2_decimals(f64::NAN), "—");
-/// ```
-#[must_use]
-pub fn format_price_2_decimals(value: f64) -> String {
-    if !value.is_finite() {
-        return NON_FINITE_SENTINEL.to_string();
-    }
-    format!("{value:.2}")
-}
-
-/// Format a percentage value for operator display — exactly 2 decimal
-/// places, leading sign ('+' or '-'), trailing '%'. Zero renders without
-/// a sign. Non-finite values render as em-dash sentinel.
-///
-/// Operator-locked 2026-05-27: every percentage emitted via Telegram,
-/// UI, or REST response MUST go through this helper. Standard NSE
-/// display convention.
-///
-/// # Examples
-///
-/// ```
-/// use tickvault_common::price_precision::format_pct_2_decimals;
-/// assert_eq!(format_pct_2_decimals(5.0), "+5.00%");
-/// assert_eq!(format_pct_2_decimals(-0.81), "-0.81%");
-/// assert_eq!(format_pct_2_decimals(0.0), "0.00%");
-/// assert_eq!(format_pct_2_decimals(f64::NAN), "—");
-/// ```
-#[must_use]
-pub fn format_pct_2_decimals(value: f64) -> String {
-    if !value.is_finite() {
-        return NON_FINITE_SENTINEL.to_string();
-    }
-    // Zero (including -0.0) renders without a sign per operator
-    // convention. Use `format!("{:.2}", value)` to apply rounding first,
-    // then check the rounded value — avoids "+0.00%" when the raw value
-    // is a tiny negative that rounds to zero.
-    let rounded = format!("{value:.2}");
-    if rounded == "0.00" || rounded == "-0.00" {
-        return "0.00%".to_string();
-    }
-    if value > 0.0 {
-        format!("+{rounded}%")
-    } else {
-        format!("{rounded}%")
     }
 }

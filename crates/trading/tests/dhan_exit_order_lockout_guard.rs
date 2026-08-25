@@ -138,10 +138,10 @@ fn toml_exit_orders_enabled_value(body: &str) -> Option<String> {
         if !in_section {
             continue;
         }
-        if let Some((key, val)) = line.split_once('=') {
-            if key.trim() == "enabled" {
-                value = Some(val.trim().to_string());
-            }
+        if let Some((key, val)) = line.split_once('=')
+            && key.trim() == "enabled"
+        {
+            value = Some(val.trim().to_string());
         }
     }
     value
