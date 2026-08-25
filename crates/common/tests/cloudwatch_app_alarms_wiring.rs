@@ -1811,3 +1811,305 @@ fn the_dead_monitor_check_resolves_consts_not_just_literals() {
         "const resolution invented an alias for a metric that is not declared"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Every Lambda is watched — or its exemption is written down
+// (2026-08-25, operator "Fix wbrytjonf dude oaku"; the dated authorization is
+//  §2.3f of dhan-rest-only-noise-lock-2026-07-14.md).
+//
+// A Lambda with no `Errors` alarm fails SILENTLY. Nothing else reports it: a
+// throwing invocation writes to its own log group and stops there, and for the
+// scheduled ones the next signal is simply the absence of whatever they were
+// supposed to do — a box that did not start, a digest that did not arrive, a
+// gate that never disarmed.
+//
+// This was measured, not assumed: 13 `aws_lambda_function` resources, 7 with
+// an Errors alarm, SIX without — start_watchdog, hard_stop_guard,
+// boot_heartbeat_gate, deploy_watchdog, daily_budget_digest and
+// questdb_console_proxy. All six are alarmed in the same change as this guard.
+//
+// The guard is the part that lasts. Six alarms fix today's list; they do not
+// stop the SEVENTH Lambda from arriving unwatched next month, which is exactly
+// how these six accumulated — each added by a PR that did not think to, and
+// nothing ever decided otherwise. The house failure mode is a set nobody
+// enumerated; this enumerates it on every build.
+// ---------------------------------------------------------------------------
+
+/// Lambdas deliberately shipped without an `Errors` alarm, each with the
+/// reason. EMPTY TODAY — every Lambda in the tree is alarmed.
+///
+/// Kept as a declared escape hatch rather than a hard rule so a future
+/// genuinely-exempt Lambda has an honest home instead of forcing someone to
+/// weaken the guard. An entry costs a written reason and is checked from both
+/// ends below: it must name a Lambda that still exists AND that is still
+/// unalarmed, so an exemption can never outlive what it excuses.
+const LAMBDA_ERRORS_ALARM_EXEMPT: &[(&str, &str)] = &[];
+
+/// Every `resource "aws_lambda_function" "<name>"` in the terraform directory.
+fn declared_lambda_resources(bodies: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_file, body) in bodies {
+        for line in body.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("resource \"aws_lambda_function\" \"") else {
+                continue;
+            };
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Extract the `aws_lambda_function.<name>` referenced immediately after a
+/// `FunctionName` dimension. Tolerates the `[0]` count-index form and the
+/// single-line `dimensions = { FunctionName = ... }` form, both of which are
+/// live in this tree.
+fn function_name_ref(block: &str) -> Option<String> {
+    let at = block.find("FunctionName")?;
+    let rest = &block[at..];
+    let at = rest.find("aws_lambda_function.")?;
+    let rest = &rest[at + "aws_lambda_function.".len()..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(rest[..end].to_string())
+}
+
+/// Lambdas covered by an `Errors` alarm on the `AWS/Lambda` namespace.
+///
+/// Block-scoped rather than line-scoped: `metric_name = "Errors"`,
+/// `namespace = "AWS/Lambda"` and the `FunctionName` dimension are three
+/// separate lines, and pairing them by proximity would mis-associate two
+/// adjacent alarms. Top-level resources in this tree close on a bare `}` at
+/// column 0, which is what delimits a block here.
+fn lambdas_with_errors_alarm(bodies: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("resource \"aws_cloudwatch_metric_alarm\"") {
+                inside = true;
+                block.clear();
+            }
+            if inside {
+                block.push_str(line);
+                block.push('\n');
+                if line == "}" {
+                    inside = false;
+                    let is_lambda_errors =
+                        block.contains("\"Errors\"") && block.contains("\"AWS/Lambda\"");
+                    if is_lambda_errors {
+                        if let Some(name) = function_name_ref(&block) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn terraform_bodies() -> Vec<(String, String)> {
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        panic!("terraform directory unreadable: {}", dir.display()); // APPROVED: test
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        // Strip `#` comments: this guard's OWN comment blocks name Lambdas,
+        // and a commented mention must never satisfy or trip it.
+        out.push((name, strip_hcl_comments(&body)));
+    }
+    assert!(
+        !out.is_empty(),
+        "terraform corpus is EMPTY — the guard would pass vacuously"
+    );
+    out
+}
+
+#[test]
+fn every_lambda_has_an_errors_alarm_or_a_declared_exemption() {
+    let bodies = terraform_bodies();
+    let lambdas = declared_lambda_resources(&bodies);
+    let covered = lambdas_with_errors_alarm(&bodies);
+
+    assert!(
+        lambdas.len() >= 13,
+        "expected at least the 13 Lambdas known on 2026-08-25, found {} — \
+         did the enumerator stop matching? A guard that finds no Lambdas \
+         passes vacuously, which is the failure this test exists to prevent",
+        lambdas.len()
+    );
+
+    let mut unwatched: Vec<&str> = Vec::new();
+    for l in &lambdas {
+        if covered.iter().any(|c| c == l) {
+            continue;
+        }
+        if LAMBDA_ERRORS_ALARM_EXEMPT.iter().any(|(n, _)| n == l) {
+            continue;
+        }
+        unwatched.push(l);
+    }
+
+    assert!(
+        unwatched.is_empty(),
+        "these Lambdas have NO `Errors` alarm and no declared exemption: {unwatched:?}\n\
+         A Lambda that throws writes to its own log group and stops there — nothing pages, \
+         and for a scheduled one the only other signal is the absence of whatever it was \
+         supposed to do.\n\
+         Fix: add an `aws_cloudwatch_metric_alarm` with metric_name=\"Errors\", \
+         namespace=\"AWS/Lambda\" and a FunctionName dimension (copy the \
+         `market_open_readiness_lambda_errors` block), or add an entry with a reason to \
+         LAMBDA_ERRORS_ALARM_EXEMPT."
+    );
+
+    // Both ends of every exemption — an exemption that outlives its reason is
+    // a lie that reads like a decision.
+    for (name, reason) in LAMBDA_ERRORS_ALARM_EXEMPT {
+        assert!(
+            !reason.trim().is_empty(),
+            "exemption for {name} carries no reason"
+        );
+        assert!(
+            lambdas.iter().any(|l| l == name),
+            "LAMBDA_ERRORS_ALARM_EXEMPT names {name}, which is no longer a Lambda in the \
+             terraform — delete the stale entry"
+        );
+        assert!(
+            !covered.iter().any(|c| c == name),
+            "LAMBDA_ERRORS_ALARM_EXEMPT still excuses {name}, but it now HAS an Errors \
+             alarm — delete the entry so the exemption list keeps meaning something"
+        );
+    }
+}
+
+#[test]
+fn lambda_errors_alarm_extraction_self_test() {
+    // Proves the two extractors bite, so a real regression is reported as
+    // itself rather than as an empty corpus.
+    let fixture = r#"
+resource "aws_lambda_function" "alpha" {
+  function_name = "tv-prod-alpha"
+}
+
+resource "aws_lambda_function" "beta" {
+  count         = var.enabled ? 1 : 0
+  function_name = "tv-prod-beta"
+}
+
+resource "aws_cloudwatch_metric_alarm" "alpha_errors" {
+  metric_name = "Errors"
+  namespace   = "AWS/Lambda"
+  dimensions = {
+    FunctionName = aws_lambda_function.alpha.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "unrelated" {
+  metric_name = "Errors"
+  namespace   = "Tickvault/Prod"
+  dimensions  = { FunctionName = aws_lambda_function.beta[0].function_name }
+}
+"#;
+    let bodies = vec![("fixture.tf".to_string(), fixture.to_string())];
+    assert_eq!(declared_lambda_resources(&bodies), vec!["alpha", "beta"]);
+
+    // `beta` is NOT covered: its alarm is on the Tickvault namespace, not
+    // AWS/Lambda, so it is not a Lambda-Errors alarm at all. This is the case
+    // a namespace-blind matcher would get wrong.
+    assert_eq!(lambdas_with_errors_alarm(&bodies), vec!["alpha"]);
+
+    // The `[0]` count-index form must resolve to the bare resource name.
+    let indexed = "FunctionName = aws_lambda_function.gamma[0].function_name }";
+    assert_eq!(function_name_ref(indexed).as_deref(), Some("gamma"));
+
+    // A block with no FunctionName yields nothing rather than panicking.
+    assert_eq!(function_name_ref("metric_name = \"Errors\""), None);
+}
+
+// ---------------------------------------------------------------------------
+// A WS-GAP-03 filter must name WHICH WS-GAP-03
+// (2026-08-25, §2.3f REJECT row: "Filters the cross-verify alarm on
+//  `WS-GAP-03` alone, or drops the `source` conditions".)
+//
+// WS-GAP-03 is the WebSocket connection-state code, and it has ~50 emit sites
+// in dhan_feed_stack.rs alone — every dial failure, every reconnect, every
+// pool-supervisor event. A `{ $.code = "WS-GAP-03" }` filter therefore pages on
+// ordinary connection churn, which is the RISK-GAP-03 noise trap (25 pages in
+// one session) with fifty times the surface.
+//
+// §2.3d-i records that exact filter being approved by the operator on a
+// recommendation, and caught only because someone counted the emit sites before
+// writing the terraform. Nothing pinned the outcome, so the next person to add a
+// WS-GAP-03 alarm would have had to rediscover it. This pins it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_ws_gap_03_filter_carries_a_source_discriminator() {
+    let body = read("deploy/aws/terraform/error-code-alarms.tf");
+    let stripped = strip_hcl_comments(&body);
+
+    let patterns: Vec<&str> = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("pattern") && l.contains("WS-GAP-03"))
+        .collect();
+
+    assert!(
+        patterns.len() >= 2,
+        "expected at least the 2 WS-GAP-03 filters known on 2026-08-25 \
+         (universe-collapse, xverify-blind), found {} — if they were renamed or \
+         removed, update this guard deliberately rather than letting it pass \
+         vacuously",
+        patterns.len()
+    );
+
+    for p in patterns {
+        assert!(
+            p.contains("$.source"),
+            "this WS-GAP-03 filter has no `$.source` discriminator, so it matches all \
+             ~50 connection-state emit sites and will page on every reconnect:\n  {p}\n\
+             Add the `$.source = \"...\"` condition that identifies the specific emit \
+             (see ws-gap-03-universe-collapse / ws-gap-03-xverify-blind)."
+        );
+    }
+}
+
+#[test]
+fn ws_gap_03_discriminator_guard_self_test() {
+    // The stripper must not let a COMMENTED-OUT bare filter satisfy or trip the
+    // check — this guard's own §2.3f comment quotes the bad pattern verbatim.
+    let commented = strip_hcl_comments("  # pattern = \"{ $.code = \\\"WS-GAP-03\\\" }\"\n");
+    assert!(
+        !commented.contains("pattern"),
+        "a commented pattern line must be stripped, else the guard reads its own prose"
+    );
+
+    // And a real bare filter must be detectable as missing the discriminator.
+    let bare = "      pattern     = \"{ $.code = \\\"WS-GAP-03\\\" && $.level = \\\"ERROR\\\" }\"";
+    assert!(bare.contains("WS-GAP-03") && !bare.contains("$.source"));
+}

@@ -1006,3 +1006,45 @@ them), so "the disk is healthy again" is a true statement worth sending.
 **NOT claimed:** that this prevents a full disk. It reports that the automation has
 reached the end of what it is permitted to do. The remedy — grow the volume, or cut
 ingest scope — is the operator's, deliberately.
+
+## COST NOTE 2026-08-25 — cross-verify blind page + 6 unwatched Lambdas (+~$0.70/mo)
+
+Authority: operator 2026-08-25, *"Fix wbrytjonf dude oaku"*, recorded verbatim in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3f BEFORE this terraform, per the
+rule-file-first law.
+
+**+7 alarms ≈ $0.70/mo.** One errcode log-filter alarm
+(`ws-gap-03-xverify-blind`, `error-code-alarms.tf`) plus six `AWS/Lambda` `Errors`
+alarms. **Zero new EMF names and zero user-data bytes** — the errcode lane derives
+its metric from a log stream that already exists, and the Lambda alarms read an AWS
+namespace we do not publish.
+
+**Measured against the live account the same day**, rather than against the planning
+envelope: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130**
+with the 90% `STOP_EC2_INSTANCES` action line at **$117**. The Quote 19 hard maximum
+is $150. Seventy cents is inside every one of those with room to spare, and it is
+named here rather than absorbed because this file's own history shows round "it's
+only a dime" additions accumulating into the ~$3.27/mo CloudWatch line that the
+2026-07-31 ruling then had to account for.
+
+**Why the cross-verify dime earns itself.** The 15:41 comparison is the only ground
+truth the revived Dhan feed has — the one check that distinguishes a lane that is
+capturing real ticks from one that is merely dialling. Both of its failure verdicts
+reached nothing: the counter is in neither EMF selector copy, and the log line
+carries `WS-GAP-03`, a code with ~50 emit sites. A vacuous run reporting "no
+mismatches" is the false-OK class this repo has retired twice.
+
+**Why the six Lambda dimes earn themselves.** They were not a decision. 13
+`aws_lambda_function` resources, 7 alarmed, 6 not — each of the six created by a PR
+that did not think to add one. Among them: the Lambda that STARTS the trading box
+every morning, and the one that force-stops it when it runs out of window or over
+budget. A throwing invocation writes to its own log group and stops there.
+
+**The ratchet is the part that lasts.** Six alarms fix today's list;
+`every_lambda_has_an_errors_alarm_or_a_declared_exemption` stops the seventh Lambda
+arriving unwatched, which is how these six accumulated in the first place.
+
+**NOT claimed:** an `Errors` alarm catches a Lambda that THROWS. A Lambda that
+returns success having done nothing useful is invisible to it — `start_watchdog`'s
+separate not-invoked alarm exists precisely because a dropped schedule produces no
+error at all, and that class is unchanged.

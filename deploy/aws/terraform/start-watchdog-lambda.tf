@@ -279,3 +279,38 @@ output "start_watchdog_function_name" {
   description = "Instance start-watchdog Lambda name"
   value       = aws_lambda_function.start_watchdog.function_name
 }
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# None of the six was ever decided about: the seven that ARE alarmed were each
+# added by the PR that created them, and these six by PRs that did not think
+# to. The ratchet added alongside makes that omission fail the build.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "start_watchdog_errors" {
+  alarm_name          = "tv-${var.environment}-start-watchdog-errors"
+  alarm_description   = "The START WATCHDOG itself FAILED. This is the Lambda that starts the trading box at 08:30 IST, retries a failed start, and verifies the 17:30 stop - so when it dies silently the box simply does not come up and NOTHING says so: its own not-invoked alarm covers a dropped SCHEDULE, not a throwing run. A failure here means the next trading morning is at risk. Triage: read the Lambda log group; a capacity refusal is a classify_start_failure verdict and pages separately."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.start_watchdog.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (the round-14 precedent): these run on a schedule, so the
+  # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
+  # lookback — never that anything was fixed. The telegram-webhook Lambda
+  # forwards every OK as a green "recovered" page, so a symmetric ok_actions
+  # here would produce a Rule-11 false recovery per failure episode. The real
+  # recovery signal is the NEXT scheduled run succeeding.
+  ok_actions = []
+}

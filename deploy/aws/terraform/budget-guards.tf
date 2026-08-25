@@ -304,3 +304,59 @@ resource "aws_lambda_permission" "tv_hard_stop_guard_eventbridge" {
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.tv_hard_stop_guard.arn
 }
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "hard_stop_guard_errors" {
+  alarm_name          = "tv-${var.environment}-hard-stop-guard-errors"
+  alarm_description   = "The HARD STOP GUARD itself FAILED. This is the hourly Lambda that force-stops the box when it is running outside its authorized window or over budget. Its silence cuts BOTH ways: a box left running bills unnoticed, and a guard that is spuriously stopping a healthy box is equally invisible. Note the standing caveat - the budget's own STOP_EC2_INSTANCES actions have been recorded in EXECUTION_FAILURE since 2026-07-31 and cannot be re-checked with the current IAM identity, so this guard may be the only stop path that actually works. Triage: read the Lambda log group."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_hard_stop_guard.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (round-14): a post-ALARM auto-OK only means the Errors
+  # datapoint aged out of the lookback, never that anything was fixed.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "daily_budget_digest_errors" {
+  alarm_name          = "tv-${var.environment}-daily-budget-digest-errors"
+  alarm_description   = "The DAILY BUDGET DIGEST itself FAILED. Its failure mode is a digest that simply stops arriving - which reads exactly like a quiet day, so nothing else reports it. Spend visibility is the first thing lost. Triage: read the Lambda log group."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_daily_budget_digest.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (round-14): a post-ALARM auto-OK only means the Errors
+  # datapoint aged out of the lookback, never that anything was fixed.
+  ok_actions = []
+}

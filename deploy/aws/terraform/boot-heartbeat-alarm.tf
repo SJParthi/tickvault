@@ -270,3 +270,38 @@ output "boot_heartbeat_alarm_name" {
   description = "Boot-heartbeat alarm (pages on a hung/never-booted/DIED-BEFORE-09:20 app in the 08:50-09:20 IST window — widened from 09:10 on 2026-07-09 to close the market-open seam). Signal: the dedicated tv_boot_completed gauge MISSING (treat_missing_data=breaching) — emitted by crates/app/src/main.rs on a completed boot, in the CW-agent filter (daily-universe-scope-expansion-2026-05-27.md §19). Repointed off the tv_realtime_guarantee_score proxy (PR #1278 follow-up)."
   value       = aws_cloudwatch_metric_alarm.boot_heartbeat_missing.alarm_name
 }
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# None of the six was ever decided about: the seven that ARE alarmed were each
+# added by the PR that created them, and these six by PRs that did not think
+# to. The ratchet added alongside makes that omission fail the build.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
+  alarm_name          = "tv-${var.environment}-boot-heartbeat-gate-errors"
+  alarm_description   = "The BOOT-HEARTBEAT GATE itself FAILED. It arms the boot alarm in the morning and disarms it at 09:20 IST when the market-hours window takes over. A failure leaves the gate STUCK in whichever state it was in: armed all night (false pages) or disarmed all morning (the boot alarm silently covers nothing). Triage: read the Lambda log group, then check the boot alarm's actions_enabled state directly."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (the round-14 precedent): these run on a schedule, so the
+  # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
+  # lookback — never that anything was fixed. The telegram-webhook Lambda
+  # forwards every OK as a green "recovered" page, so a symmetric ok_actions
+  # here would produce a Rule-11 false recovery per failure episode. The real
+  # recovery signal is the NEXT scheduled run succeeding.
+  ok_actions = []
+}

@@ -772,3 +772,113 @@ instead of the log field (the gauge does not reach CloudWatch); makes the
 filter `breaching` on missing data (pages every night and weekend); adds the
 EMF name without the byte-budget restructure §2.3d-ii describes; or reports the
 deadline as met on the strength of a dial rather than a completed attach.
+
+### §2.3f — 2026-08-25: the cross-verify verdict gets its page, and the watchmen get watched
+
+**The verbatim operator authorization (2026-08-25, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Fix wbrytjonf dude oaku"
+
+Given in DIRECT response to a message whose "Still open, not done" list named exactly
+these items and stated that the first needed his go: *"**No new alarm exists.** Fix 3
+made one *writable*; creating it needs your dated quote per §3 of the noise lock"* and
+*"**The start-watchdog Lambda has no `Errors` alarm** — the only Lambda in the tree
+without one, and it's the component that starts the box and pages about it. Small and
+self-contained if you want it."* This section is the dated record the rule-file-first
+law requires, written BEFORE the terraform.
+
+#### ⚠ First, a correction to the message that earned this quote
+
+The claim that the start-watchdog is **the only** Lambda without an `Errors` alarm is
+**FALSE**, and it understated the gap by six times. Counted in source the same day:
+13 `aws_lambda_function` resources, **7** with an `Errors` alarm, **6 without**:
+
+| Unalarmed Lambda | What it does when it works | What its silence costs |
+|---|---|---|
+| `start_watchdog` | starts the box at 08:30 IST, retries, verifies the 17:30 stop | a failed start pages nobody; the trading day is simply missing |
+| `hard_stop_guard` | force-stops the box outside its window / over budget | a failed stop bills silently; a spuriously-failing one is invisible |
+| `boot_heartbeat_gate` | arms and disarms the boot alarm around the window | a stuck gate leaves the boot alarm armed all night or disarmed all morning |
+| `deploy_watchdog` | detects a box booted on a stale binary | the 2026-07-09 stale-binary class returns unannounced |
+| `tv_daily_budget_digest` | the daily spend digest | the digest just stops arriving |
+| `questdb_console_proxy` | serves the console (its FRONT half **is** alarmed) | half a surface watched, half not |
+
+The pattern is this file's own recurring one: **a set nobody enumerated.** The seven
+that are alarmed were each added by the PR that created them; the six that are not were
+each created by a PR that did not think to. Nothing was ever decided about them.
+
+#### What this section authorizes
+
+**(a) The cross-verification verdict becomes a page.** Family (5) gains a ninth signal:
+`tv-<env>-errcode-ws-gap-03-xverify-blind`. The 15:41 live-vs-official comparison is the
+only ground truth the revived Dhan feed has, and both of its failure verdicts — compared
+ZERO minutes, or could not run at all — reach nothing today.
+
+It is a **log-filter** alarm, not a metric alarm, and that is deliberate:
+`tv_dhan_feed_xverify_runs_total` is 31 bytes and needs 32 with its separating pipe
+against 31 free in the user-data budget (§2.3d-ii) — so the EMF route misses **by one
+byte**, while the log-filter lane costs no user-data byte at all.
+
+The pattern carries **four** conditions, not the usual two:
+
+```
+{ $.code = "WS-GAP-03" && $.level = "ERROR"
+  && ($.source = "xverify_vacuous" || $.source = "xverify_failed") }
+```
+
+`WS-GAP-03` has ~50 emit sites in `dhan_feed_stack.rs` — every dial failure, reconnect
+and pool event — so a bare code filter would page on ordinary connection churn. That is
+the RISK-GAP-03 noise trap with fifty times the surface, and it is the same mistake
+§2.3d-i records being approved and then caught. The `source` field, added by PR #1808
+specifically so this alarm could exist, appears on exactly these two emits.
+
+`ok_recovery = false`: the comparison runs **once per session**, so an auto-OK an hour
+later means the datapoint aged out, never that the next run compared anything.
+
+**(b) All six unalarmed Lambdas get an `Errors` alarm**, on the house shape — `Sum >= 1`
+over 300s, `notBreaching`, and `ok_actions = []` (their auto-OK is an aged-out datapoint,
+never a fix — the round-14 precedent).
+
+**(c) A ratchet, which is the durable half.** Six alarms fix today's list; they do not
+stop the seventh Lambda from arriving unwatched next month, which is exactly how these
+six accumulated. `every_lambda_has_an_errors_alarm_or_a_declared_exemption` reads every
+`aws_lambda_function` in the terraform directory and requires each to have an `Errors`
+alarm targeting it, or to be declared exempt with a reason. A new Lambda now fails the
+build until someone decides.
+
+#### Honest cost
+
+7 new alarms at ~$0.10/mo = **~$0.70/mo**. Measured against the live account the same
+day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** with the
+90% `STOP_EC2_INSTANCES` action line at **$117**. No new EMF name, no user-data byte.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make the feed work.** The cross-verify alarm reports that the comparison
+  produced no verdict. A non-zero `compared` remains the only evidence this repository
+  can offer that ticks arrive, and no alarm produces one.
+- **It does not fix the AZ pin.** The message that earned this quote also listed
+  automatic AZ failover, and that one is NOT taken here: remediation means flipping
+  termination protection, snapshotting a 200 GB root, TERMINATING the production
+  instance, re-applying, and restoring. That is a destructive, hard-to-reverse operation
+  on the live trading box, and "fix everything" is not the explicit go-ahead a terminate
+  needs. Detection is already correct and already pages (`classify_start_failure` names
+  the remedy). Automating the remediation needs its own dated quote that says so in as
+  many words.
+- **An `Errors` alarm catches a Lambda that THROWS.** A Lambda that returns success
+  having done nothing useful is invisible to it — `start_watchdog`'s own not-invoked
+  alarm exists because a dropped schedule produces no error at all, and that class is
+  unchanged here.
+
+#### What a PR that violates §2.3f looks like (REJECT)
+
+- Filters the cross-verify alarm on `WS-GAP-03` alone, or drops the `source` conditions
+  (pages on every reconnect — the trap this section exists to avoid).
+- Sets `ok_recovery = true` on it (a once-per-session emitter cannot recover by aging).
+- Adds an `aws_lambda_function` without an `Errors` alarm or a declared exemption.
+- Gives any of the seven `ok_actions` (a green "recovered" page for an aged-out
+  datapoint is the Rule-11 false-OK the round-14 note records).
+- Ships the EMF name for `tv_dhan_feed_xverify_runs_total` without the byte-budget
+  restructure §2.3d-ii describes — it is over by one byte, and shaving an unrelated
+  comment to make room is what that guard's own message forbids.
+- Automates an instance TERMINATE for AZ failover under cover of this quote.
