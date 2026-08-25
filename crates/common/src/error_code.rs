@@ -874,6 +874,26 @@ pub enum ErrorCode {
     /// auto-triage-safe (the degrade already happened; DEDUP-idempotent
     /// re-appends and the next event self-heal — the operator inspects).
     OrderEvt01PersistFailed,
+    /// ORDER-EVT-02 — an order-update frame PARSED but decoded HOLLOW: the
+    /// core identity fields (`order_no`, `status`, `security_id`) all came
+    /// out empty while the frame itself was well-formed JSON with a `Data`
+    /// object. `OrderUpdate` carries `#[serde(default)]` on EVERY field, so
+    /// a key-name mismatch — a Dhan schema change, an undocumented message
+    /// shape, a super-order leg frame — produces a full struct of defaults
+    /// and NO error. Found live 2026-08-25: ten captured rows whose only
+    /// populated fields were `ref_ltp`, `tick_size`, `mkt_type`,
+    /// `multiplier`, `good_till_days_date` and `algo_ord_no`, with the
+    /// operator's manual super order nowhere in them.
+    ///
+    /// This code exists because the raw frame was DISCARDED at parse time,
+    /// so the failure was undiagnosable after the fact. The emit carries a
+    /// BOUNDED, client-id-redacted excerpt of the raw JSON precisely so the
+    /// next occurrence can be read rather than guessed at. Cold path only;
+    /// log-sink-only delivery (no CloudWatch filter, no Telegram — the
+    /// 2026-07-14 Dhan noise-lock posture, whose 4-item family is
+    /// unchanged). Severity::High, auto-triage-safe: nothing is retried,
+    /// the row is still captured, and the operator reads the excerpt.
+    OrderEvt02DecodedHollow,
     /// ORDER-PNL-01 — per-leg option P&L persistence degraded (the
     /// `stage` field names the failing leg).
     OrderPnl01PersistFailed,
@@ -1128,6 +1148,7 @@ impl ErrorCode {
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded => "RAMSTORE-01",
             Self::OrderEvt01PersistFailed => "ORDER-EVT-01",
+            Self::OrderEvt02DecodedHollow => "ORDER-EVT-02",
             Self::OrderPnl01PersistFailed => "ORDER-PNL-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
@@ -1310,7 +1331,7 @@ impl ErrorCode {
             // a halt (cold path; QuestDB stays the durable truth and the
             // next boot re-fills). LOG-SINK-ONLY.
             Self::RamStore01Degraded => Severity::High,
-            Self::OrderEvt01PersistFailed => Severity::High,
+            Self::OrderEvt01PersistFailed | Self::OrderEvt02DecodedHollow => Severity::High,
             Self::OrderPnl01PersistFailed => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
@@ -1600,7 +1621,7 @@ impl ErrorCode {
             Self::OrderPnl01PersistFailed => {
                 "docs/error-runbooks/order-leg-pnl-error-codes.md"
             }
-            Self::OrderEvt01PersistFailed => {
+            Self::OrderEvt01PersistFailed | Self::OrderEvt02DecodedHollow => {
                 "docs/error-runbooks/order-update-events-error-codes.md"
             }
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
@@ -1832,6 +1853,7 @@ impl ErrorCode {
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded,
             Self::OrderEvt01PersistFailed,
+            Self::OrderEvt02DecodedHollow,
             Self::OrderPnl01PersistFailed,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,

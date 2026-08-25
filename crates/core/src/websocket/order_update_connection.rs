@@ -867,6 +867,49 @@ async fn connect_and_listen(
                             symbol = %update.symbol,
                             "order update received"
                         );
+                        // ORDER-EVT-02 (2026-08-25) — HOLLOW DECODE.
+                        //
+                        // `OrderUpdate` carries `#[serde(default)]` on every
+                        // field, so a frame whose key names do not match
+                        // deserializes into a full struct of defaults and
+                        // returns `Ok`. There is no error to catch: the parse
+                        // genuinely succeeded, it just produced nothing.
+                        //
+                        // Found live on 2026-08-25, when ten captured rows
+                        // held only `ref_ltp`, `tick_size`, `mkt_type`,
+                        // `multiplier`, `good_till_days_date` and
+                        // `algo_ord_no` — every core field empty, and the
+                        // operator's manual super order nowhere in them.
+                        // Diagnosing it was impossible after the fact
+                        // because `text` is dropped here and never logged.
+                        //
+                        // So the excerpt is the point of this block, not the
+                        // counter: it is the only place the raw frame still
+                        // exists. Bounded to keep a malformed-frame storm
+                        // from flooding the sink, and the client id is
+                        // redacted because an order payload carries it.
+                        //
+                        // Cheap by construction: three `is_empty()` calls on
+                        // an already-decoded struct. The excerpt is built
+                        // ONLY on the hollow branch, so a healthy frame pays
+                        // nothing beyond the three compares.
+                        if update.order_no.is_empty()
+                            && update.status.is_empty()
+                            && update.security_id.is_empty()
+                        {
+                            metrics::counter!(ORDER_UPDATE_HOLLOW_DECODE_COUNTER).increment(1);
+                            error!(
+                                code = tickvault_common::error_code::ErrorCode::OrderEvt02DecodedHollow
+                                    .code_str(),
+                                excerpt = %redacted_frame_excerpt(&text),
+                                "order update PARSED but decoded HOLLOW — order_no, status and \
+                                 security_id are all empty, so this frame's key names do not \
+                                 match what OrderUpdate expects. The row is still captured; the \
+                                 excerpt above is the raw frame (client id redacted, length \
+                                 bounded) and is what a schema fix must be written against — do \
+                                 not guess at Dhan's field names from this message alone."
+                            );
+                        }
                         // Broadcast to subscribers (OMS, notification, etc.).
                         // 2026-04-24 audit finding #4: previously discarded the
                         // SendError with "no receivers — that's fine". BUT if
@@ -1060,6 +1103,91 @@ enum AuthResponseKind {
     Success,
     /// Auth handshake failed with the given reason.
     Failed(String),
+}
+
+/// Prometheus counter for ORDER-EVT-02 hollow decodes.
+pub const ORDER_UPDATE_HOLLOW_DECODE_COUNTER: &str = "tv_order_update_hollow_decode_total";
+
+/// Longest raw-frame excerpt ORDER-EVT-02 will log.
+///
+/// An order-update frame is small; 1 KiB carries the whole key set, which is
+/// the only thing the excerpt exists to show. The bound is here so a storm of
+/// malformed frames cannot flood the log sink — the same reasoning as
+/// `ORDER_UPDATE_MAX_FRAME_BYTES`, applied to the logging side.
+const ORDER_UPDATE_EXCERPT_MAX_BYTES: usize = 1024;
+
+/// Builds a bounded, client-id-redacted excerpt of a raw order-update frame.
+///
+/// Redacts the `"DhanClientId"` / `"ClientId"` VALUE — an order payload
+/// carries the account identifier, and this string goes to a log sink. The
+/// KEY is deliberately preserved: a schema fix needs to see which keys the
+/// frame contained, and a wholly-removed key would misrepresent that.
+///
+/// Truncation is on a CHARACTER boundary, never a byte index, so a multi-byte
+/// symbol name cannot panic the logging path.
+fn redacted_frame_excerpt(raw: &str) -> String {
+    const KEY: &str = "ClientId";
+    let mut out = String::with_capacity(raw.len().min(ORDER_UPDATE_EXCERPT_MAX_BYTES) + 16);
+    let mut rest = raw;
+    // Walk the frame replacing each client-id VALUE. A frame carries at most
+    // one, but the loop costs nothing and a repeated key cannot slip through.
+    while let Some(found) = rest.find(KEY) {
+        let after_key = &rest[found + KEY.len()..];
+        // Expect exactly `"` `:` `"` <value> `"`. Anything else is left
+        // verbatim rather than guessed at — a redactor that reshapes a frame
+        // it did not understand would corrupt the evidence it exists to
+        // preserve.
+        let Some(parts) = split_quoted_value(after_key) else {
+            break;
+        };
+        let (prefix_end, value_end) = parts;
+        out.push_str(&rest[..found + KEY.len()]);
+        out.push_str(&after_key[..prefix_end]);
+        out.push_str("<redacted>");
+        rest = &after_key[value_end..];
+    }
+    out.push_str(rest);
+    if out.len() > ORDER_UPDATE_EXCERPT_MAX_BYTES {
+        let cut = out
+            .char_indices()
+            .take_while(|(i, _)| *i <= ORDER_UPDATE_EXCERPT_MAX_BYTES)
+            .last()
+            .map_or(0, |(i, _)| i);
+        out.truncate(cut);
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
+/// Given the text immediately AFTER a JSON key name, locates that key's
+/// string value.
+///
+/// Returns `(prefix_end, value_end)` where `[..prefix_end]` is everything up
+/// to and including the value's opening quote, and `value_end` indexes the
+/// value's closing quote. `None` when the text does not have the exact
+/// `"` `:` `"` … `"` shape — the caller then leaves the frame untouched.
+fn split_quoted_value(after_key: &str) -> Option<(usize, usize)> {
+    // 1. The key's own closing quote.
+    let kq = after_key.find('"')?;
+    let after_kq = &after_key[kq + 1..];
+    // 2. The colon — and it must come BEFORE the next quote, otherwise this
+    //    is not `key: value` and we are looking at something else entirely.
+    let colon = after_kq.find(':')?;
+    if after_kq[..colon].contains('"') {
+        return None;
+    }
+    let after_colon = &after_kq[colon + 1..];
+    // 3. The value's opening quote (a non-string value is not redacted here;
+    //    the client id is documented as a string).
+    let vq = after_colon.find('"')?;
+    if after_colon[..vq].chars().any(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let after_vq = &after_colon[vq + 1..];
+    // 4. The value's closing quote.
+    let vend = after_vq.find('"')?;
+    let prefix_end = kq + 1 + colon + 1 + vq + 1;
+    Some((prefix_end, prefix_end + vend))
 }
 
 /// O2 (2026-04-17): Fires the authenticated-signal notify exactly once per
@@ -2434,6 +2562,110 @@ mod tests {
         assert!(
             arm_region[too_large..classify].contains("tv_order_update_frames_dropped_total"),
             "the FrameTooLarge arm must count the dropped frame"
+        );
+    }
+
+    /// ORDER-EVT-02: the excerpt must redact the client id VALUE while
+    /// KEEPING the key. A schema fix needs to see which keys the frame
+    /// carried; a removed key would misrepresent the frame it is meant to
+    /// document.
+    #[test]
+    fn test_hollow_excerpt_redacts_client_id_value_but_keeps_the_key() {
+        let raw = r#"{"Data":{"DhanClientId":"1106656882","MktType":"XX"}}"#;
+        let out = redacted_frame_excerpt(raw);
+        assert!(
+            !out.contains("1106656882"),
+            "the account id must never reach a log sink: {out}"
+        );
+        assert!(
+            out.contains("DhanClientId"),
+            "the KEY must survive — the excerpt exists to show the key set: {out}"
+        );
+        assert!(
+            out.contains("<redacted>"),
+            "redaction must be visible: {out}"
+        );
+        assert!(
+            out.contains("\"MktType\":\"XX\""),
+            "every other field must pass through verbatim: {out}"
+        );
+    }
+
+    /// A frame with no client id at all passes through unchanged — the
+    /// redactor must not mangle the common case.
+    #[test]
+    fn test_hollow_excerpt_passes_through_a_frame_with_no_client_id() {
+        let raw = r#"{"Data":{"RefLtp":11.15,"TickSize":0.05}}"#;
+        assert_eq!(redacted_frame_excerpt(raw), raw);
+    }
+
+    /// The bound exists so a malformed-frame storm cannot flood the sink.
+    #[test]
+    fn test_hollow_excerpt_is_length_bounded() {
+        let raw = format!(r#"{{"Data":{{"Remarks":"{}"}}}}"#, "x".repeat(4096));
+        let out = redacted_frame_excerpt(&raw);
+        assert!(
+            out.len() <= ORDER_UPDATE_EXCERPT_MAX_BYTES + 16,
+            "excerpt must stay bounded, got {} bytes",
+            out.len()
+        );
+        assert!(out.ends_with("…[truncated]"), "truncation must be visible");
+    }
+
+    /// Truncation must land on a CHARACTER boundary. A multi-byte symbol
+    /// name near the cut would panic a byte-index `truncate`, and this
+    /// logging path runs inside the order-update read loop.
+    #[test]
+    fn test_hollow_excerpt_truncates_on_a_char_boundary_not_a_byte_index() {
+        // '₹' is 3 bytes, so a naive byte cut lands mid-character.
+        let raw = format!(r#"{{"Data":{{"Remarks":"{}"}}}}"#, "₹".repeat(2048));
+        let out = redacted_frame_excerpt(&raw);
+        assert!(out.ends_with("…[truncated]"));
+        // Reaching here without a panic IS the assertion; this re-states it.
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    /// The detector's own condition, stated as a test so the three-field
+    /// AND cannot silently become an OR: a frame missing ONLY the status
+    /// is a partial update, not a hollow decode, and must NOT fire.
+    #[test]
+    fn test_hollow_detector_requires_all_three_core_fields_empty() {
+        // Built through the REAL parser, not a struct literal: the whole
+        // defect is that `parse_order_update` returns Ok on a frame whose
+        // keys it does not recognise, so the test must go through it.
+        let hollow = parse_order_update(r#"{"Data":{"MktType":"XX","RefLtp":11.15}}"#)
+            .expect("an unrecognised-key frame still parses Ok — that IS the defect");
+        assert!(
+            hollow.order_no.is_empty() && hollow.status.is_empty() && hollow.security_id.is_empty(),
+            "a frame of unknown keys decodes hollow: {hollow:?}"
+        );
+        // And the shape that must NOT fire: a real update missing only the
+        // status is a partial frame, not a hollow decode.
+        let partial = parse_order_update(r#"{"Data":{"OrderNo":"12345"}}"#)
+            .expect("a partial but recognisable frame parses");
+        assert!(
+            !(partial.order_no.is_empty()
+                && partial.status.is_empty()
+                && partial.security_id.is_empty()),
+            "an update carrying an order number is NOT hollow — firing here would \
+             page on every legitimately partial frame"
+        );
+    }
+    #[test]
+    fn test_hollow_decode_detector_is_wired_at_the_parse_site() {
+        let src = include_str!("order_update_connection.rs");
+        assert!(
+            src.contains("OrderEvt02DecodedHollow"),
+            "the ORDER-EVT-02 emit must stay at the parse site"
+        );
+        assert!(
+            src.contains(ORDER_UPDATE_HOLLOW_DECODE_COUNTER),
+            "the hollow-decode counter must stay wired"
+        );
+        assert!(
+            src.contains("excerpt = %redacted_frame_excerpt(&text)"),
+            "the RAW excerpt is the whole point — a counter alone leaves the \
+             next occurrence as undiagnosable as this one was"
         );
     }
 }
