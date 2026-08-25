@@ -1017,6 +1017,17 @@ pub struct ArchiveRunSummary {
     pub dropped: u32,
     /// Failed attempts (kept partitions — retried next run).
     pub failed: u32,
+    /// Tables whose eligible-partition LIST query failed this run.
+    ///
+    /// A list failure means the table contributed NOTHING to the worklist —
+    /// it is skipped whole, exactly as if it had no eligible partitions. That
+    /// is indistinguishable from healthy in every other field here, and the
+    /// per-table log line for it is `debug!`, which production never emits.
+    /// Surfacing the count on the existing cycle-summary line makes a silently
+    /// unswept table visible without adding a metric (the EMF selector has no
+    /// byte budget left) or a per-run warning for tables that legitimately do
+    /// not exist yet.
+    pub tables_list_failed: u32,
     /// Rows durably archived to S3 across dropped partitions.
     pub rows_archived: u64,
     /// Compressed bytes uploaded to S3.
@@ -1208,6 +1219,10 @@ impl PartitionArchiver {
                     }
                 }
                 Err(err) => {
+                    // Counted so the cycle summary can report it: a list
+                    // failure silently removes the table from this run, and
+                    // this log line is invisible at production level.
+                    summary.tables_list_failed = summary.tables_list_failed.saturating_add(1);
                     debug!(
                         ?err,
                         table, "partition list failed (table may not exist yet)"
@@ -1216,13 +1231,12 @@ impl PartitionArchiver {
             }
         }
 
-        // Oldest first (partition names sort chronologically) so an
-        // interrupted run makes monotonic progress; bounded per run so the
-        // first catch-up sweep converges over a few evenings.
-        worklist.sort_by(|a, b| a.1.cmp(&b.1));
-        if self.cfg.max_partitions_per_run > 0 {
-            worklist.truncate(self.cfg.max_partitions_per_run as usize);
-        }
+        // Oldest first WITHIN each table (so an interrupted run makes
+        // monotonic progress per table), then FAIR-SHARED across tables so a
+        // table with an older backlog cannot starve a newer one out of the
+        // per-run budget entirely. See `fair_share_worklist` for the measured
+        // incident this replaces.
+        let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
         summary.partitions_considered = worklist.len() as u32;
 
         for (table, partition) in worklist {
@@ -1241,6 +1255,7 @@ impl PartitionArchiver {
 
         info!(
             tables_scanned = summary.tables_scanned,
+            tables_list_failed = summary.tables_list_failed,
             partitions_considered = summary.partitions_considered,
             verified = summary.verified,
             dropped = summary.dropped,
@@ -2086,6 +2101,99 @@ fn swept_tables() -> Vec<&'static str> {
     tables
 }
 
+/// Fair-shares the per-run partition budget across tables, oldest-first
+/// within each table.
+///
+/// # The incident this replaces (MEASURED on the prod box, 2026-08-25)
+///
+/// The previous form sorted the whole worklist by partition name — i.e.
+/// globally oldest-first across every table — and then truncated to
+/// `max_partitions_per_run`. Partition names sort chronologically, so that is
+/// a global date order, and a table whose backlog is OLDER takes every slot
+/// before a table whose backlog is NEWER gets one.
+///
+/// That is not a theoretical ordering nit. On the box that day:
+///
+/// | table | eligible partitions | oldest |
+/// |---|---|---|
+/// | `ticks` | 185 | `2026-07-30T09` |
+/// | `market_depth` | 4 | `2026-08-24T08` |
+///
+/// plus a handful of `2026-06-02` candle partitions that fail with
+/// `s3_conflict` every run and are re-listed the next run, permanently
+/// occupying the very front of the queue. With `max_partitions_per_run = 200`,
+/// the June conflicts and the 185 `ticks` entries filled the budget before a
+/// single `market_depth` partition was reached — so `market_depth` received
+/// **zero** archive attempts, deterministically, every run, forever.
+///
+/// `market_depth` was 174 GB of the 196 GB QuestDB volume at the time (~17 GB
+/// per HOUR-partition), so the one table that could actually relieve disk
+/// pressure was the one table structurally guaranteed never to be archived.
+/// The disk filled, QuestDB WAL-suspended 14 tables, and a suspended table
+/// keeps ACKing ILP writes while discarding them.
+///
+/// # Why round-robin rather than "biggest first"
+///
+/// Selecting by bytes-reclaimed would target disk pressure more directly, but
+/// it needs a size probe per partition (another QuestDB round trip per
+/// candidate) and it can starve small tables indefinitely — the same failure
+/// in the other direction. Round-robin needs no extra I/O, cannot starve
+/// anything, and is deterministic, which is what makes it testable.
+///
+/// Within a table the order stays oldest-first, so the monotonic-progress
+/// property the previous comment claimed is genuinely preserved: an
+/// interrupted run still advances every table from its oldest end.
+///
+/// `cap == 0` means "no cap" (the config's documented disable value) and
+/// returns every item, still grouped and fairly interleaved.
+fn fair_share_worklist(
+    worklist: Vec<(&'static str, String)>,
+    cap: usize,
+) -> Vec<(&'static str, String)> {
+    // Oldest-first overall first, so each table's queue is oldest-first when
+    // the entries are distributed below.
+    let mut sorted = worklist;
+    sorted.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // Group by table, preserving FIRST-SEEN table order so the output is
+    // deterministic (a HashMap iteration order would not be).
+    let mut queues: Vec<(&'static str, std::collections::VecDeque<String>)> = Vec::new();
+    for (table, partition) in sorted {
+        match queues.iter_mut().find(|(t, _)| *t == table) {
+            Some((_, q)) => q.push_back(partition),
+            None => {
+                let mut q = std::collections::VecDeque::new();
+                q.push_back(partition);
+                queues.push((table, q));
+            }
+        }
+    }
+
+    let total: usize = queues.iter().map(|(_, q)| q.len()).sum();
+    let limit = if cap == 0 { total } else { cap.min(total) };
+
+    let mut out: Vec<(&'static str, String)> = Vec::with_capacity(limit);
+    // One pass per round, one partition per table per round.
+    while out.len() < limit {
+        let mut progressed = false;
+        for (table, queue) in &mut queues {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(partition) = queue.pop_front() {
+                out.push((*table, partition));
+                progressed = true;
+            }
+        }
+        if !progressed {
+            // Every queue is empty — cannot happen while out.len() < limit,
+            // but a bounded loop beats a provably-unreachable infinite one.
+            break;
+        }
+    }
+    out
+}
+
 /// Builds a proof-backed audit row (verified/dropped/drop_failed classes).
 /// The `detail` is sanitized (SEC-LOW1) before it reaches logs/QuestDB.
 fn audit_row_from_proof(
@@ -2148,6 +2256,134 @@ fn now_ist_nanos() -> i64 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod fair_share_tests {
+    use super::fair_share_worklist;
+
+    /// Reproduces the prod worklist of 2026-08-25 exactly.
+    ///
+    /// `ticks` had 185 eligible partitions starting `2026-07-30`;
+    /// `market_depth` had 4 starting `2026-08-24`; the cap was 200. Under the
+    /// previous global oldest-first sort + truncate, every `ticks` entry sorts
+    /// ahead of every `market_depth` entry, so the 200-slot budget was spent
+    /// before `market_depth` was reached — zero attempts, every run, forever.
+    ///
+    /// BITE: replace the call below with
+    /// `w.sort_by(|a, b| a.1.cmp(&b.1)); w.truncate(200);` and this fails with
+    /// `market_depth scheduled: 0`.
+    #[test]
+    fn the_heaviest_table_is_not_starved_by_an_older_backlog() {
+        let mut worklist: Vec<(&'static str, String)> = Vec::new();
+        // The stuck 2026-06-02-class candle partitions: OLDEST of all, they
+        // fail with s3_conflict every run and are re-listed the next one, so
+        // they permanently occupy the head of a globally date-sorted queue.
+        for tf in ["candles_1m", "candles_3m", "candles_5m", "candles_15m"] {
+            for day in 1..=5 {
+                worklist.push((tf, format!("2026-06-{day:02}")));
+            }
+        }
+        // 185 ticks partitions, all OLDER than any market_depth one.
+        for day in 1..=37 {
+            for hour in 9..14 {
+                worklist.push(("ticks", format!("2026-07-{day:02}T{hour:02}")));
+            }
+        }
+        // 4 market_depth partitions, all NEWER — and the only ones that free
+        // meaningful disk (~17 GB per hour-partition vs ticks' far smaller).
+        for hour in 8..12 {
+            worklist.push(("market_depth", format!("2026-08-24T{hour:02}")));
+        }
+        assert!(
+            worklist.len() > 200,
+            "the reproduction must EXCEED the cap, or the truncate is a no-op \
+             and this test proves nothing — it did exactly that when first \
+             written, and the bite-proof is what caught it"
+        );
+
+        let scheduled = fair_share_worklist(worklist, 200);
+
+        let depth = scheduled
+            .iter()
+            .filter(|(t, _)| *t == "market_depth")
+            .count();
+        assert_eq!(
+            depth, 4,
+            "market_depth scheduled: {depth} — an older backlog on another \
+             table must never consume the whole per-run budget"
+        );
+        assert!(scheduled.len() <= 200, "cap must still bound the run");
+    }
+
+    #[test]
+    fn each_table_is_still_processed_oldest_first() {
+        let worklist = vec![
+            ("ticks", "2026-08-03T09".to_string()),
+            ("ticks", "2026-08-01T09".to_string()),
+            ("ticks", "2026-08-02T09".to_string()),
+            ("market_depth", "2026-08-24T09".to_string()),
+        ];
+        let scheduled = fair_share_worklist(worklist, 0);
+        let ticks: Vec<&str> = scheduled
+            .iter()
+            .filter(|(t, _)| *t == "ticks")
+            .map(|(_, p)| p.as_str())
+            .collect();
+        assert_eq!(
+            ticks,
+            vec!["2026-08-01T09", "2026-08-02T09", "2026-08-03T09"],
+            "monotonic per-table progress must survive the fair share"
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_means_no_cap_and_keeps_every_item() {
+        let worklist = vec![
+            ("ticks", "2026-08-01T09".to_string()),
+            ("market_depth", "2026-08-24T09".to_string()),
+        ];
+        assert_eq!(fair_share_worklist(worklist, 0).len(), 2);
+    }
+
+    #[test]
+    fn a_cap_smaller_than_the_table_count_still_reaches_more_than_one_table() {
+        let worklist = vec![
+            ("ticks", "2026-07-01T09".to_string()),
+            ("ticks", "2026-07-02T09".to_string()),
+            ("market_depth", "2026-08-24T09".to_string()),
+        ];
+        let scheduled = fair_share_worklist(worklist, 2);
+        assert_eq!(scheduled.len(), 2);
+        assert!(
+            scheduled.iter().any(|(t, _)| *t == "market_depth"),
+            "round-robin must hand the second slot to the second table, not \
+             to the older table's next partition"
+        );
+    }
+
+    #[test]
+    fn the_output_is_deterministic_across_runs() {
+        let build = || {
+            vec![
+                ("ticks", "2026-07-30T09".to_string()),
+                ("market_depth", "2026-08-24T08".to_string()),
+                ("candles_1m", "2026-06-02".to_string()),
+                ("ticks", "2026-07-30T10".to_string()),
+            ]
+        };
+        assert_eq!(
+            fair_share_worklist(build(), 3),
+            fair_share_worklist(build(), 3),
+            "selection must not depend on hash iteration order"
+        );
+    }
+
+    #[test]
+    fn an_empty_worklist_is_empty_and_does_not_hang() {
+        assert!(fair_share_worklist(Vec::new(), 200).is_empty());
+        assert!(fair_share_worklist(Vec::new(), 0).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {
