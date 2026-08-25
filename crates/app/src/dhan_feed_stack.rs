@@ -6934,9 +6934,27 @@ pub fn spawn_daily_crossverify(
     }))
 }
 
-/// IST seconds-of-day at which the comparator runs: 15:31, one minute after
-/// the 15:30 close, so the final minute's candle has sealed.
-pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 = 15 * 3_600 + 31 * 60;
+/// IST seconds-of-day at which the comparator runs: 15:41, one minute after
+/// the 15:40 close, so the final minute's candle has sealed.
+///
+/// **CORRECTED 2026-08-25** from 15:31, in lockstep with
+/// `dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST`. Both had missed the
+/// 2026-08-07 NSE CAS migration that moved the session end 15:30 -> 15:40.
+///
+/// The two MUST move together, and the const assert below is what enforces it.
+/// Moving the window without the fire time would be strictly worse than the
+/// drift it fixes: the comparator would run at 15:31 against a window ending at
+/// 15:40, so ten minutes that had not happened yet would be scored as missing on
+/// BOTH sides — turning a silent blind spot into a flood of false loss findings
+/// in the one check that exists to detect real loss.
+pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 =
+    crate::dhan_live_crossverify::RUN_SECS_OF_DAY_IST as u64;
+
+const _: () = assert!(
+    XVERIFY_RUN_AT_SECS_OF_DAY_IST as i64
+        > crate::dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST,
+    "the comparator must fire AFTER the last minute of the window it compares"
+);
 
 /// Seconds in a day.
 const SECS_PER_DAY: u64 = 24 * 3_600;
@@ -9599,13 +9617,27 @@ mod tests {
 
     #[test]
     fn test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires() {
-        // 15:31 = one minute after the close, so the final minute has sealed.
-        assert_eq!(XVERIFY_RUN_AT_SECS_OF_DAY_IST, 55_860);
+        // One minute after the close, so the final minute has sealed.
+        //
+        // RE-BLESSED 2026-08-25 from a hardcoded 55_860 (15:31). That literal
+        // was correct for the pre-CAS 15:30 close and became wrong on
+        // 2026-08-07 when the NSE CAS migration moved the session end to 15:40
+        // everywhere except here and the comparator's own window constant. The
+        // schedule is now DERIVED from the close, and the relationship — not a
+        // literal — is what this test pins, so the next session-hours change
+        // cannot leave it behind a seventh time.
+        const RUN: u64 = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        assert_eq!(
+            RUN as i64,
+            crate::dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST + 60,
+            "the comparator must fire exactly one minute after the session close"
+        );
+        assert_eq!(RUN, 56_460, "09:15-15:40 session ⇒ a 15:41 IST run");
 
         // Before the run time: wait until today's.
-        assert_eq!(secs_until_next_run_ist(0), 55_860, "midnight → today 15:31");
+        assert_eq!(secs_until_next_run_ist(0), RUN, "midnight → today's run");
         assert_eq!(
-            secs_until_next_run_ist(55_859),
+            secs_until_next_run_ist(RUN - 1),
             1,
             "one second before → one second to wait"
         );
@@ -9613,17 +9645,17 @@ mod tests {
         // AT the run time: a full day, never zero. Zero would busy-loop the
         // task and fire the comparator repeatedly within one session.
         assert_eq!(
-            secs_until_next_run_ist(55_860),
+            secs_until_next_run_ist(RUN),
             SECS_PER_DAY,
             "exactly at the run time must wait a full day, not fire again"
         );
 
         // After: tomorrow's.
-        assert_eq!(secs_until_next_run_ist(55_861), SECS_PER_DAY - 1);
+        assert_eq!(secs_until_next_run_ist(RUN + 1), SECS_PER_DAY - 1);
         assert_eq!(
             secs_until_next_run_ist(SECS_PER_DAY - 1),
-            55_861,
-            "one second before midnight → tomorrow 15:31"
+            RUN + 1,
+            "one second before midnight → tomorrow's run"
         );
 
         // Total over every second of the day: always a positive, bounded wait.
@@ -10353,7 +10385,10 @@ mod tests {
     /// too, as long as the constant were derived the same broken way.
     #[test]
     fn test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes() {
-        use crate::dhan_live_crossverify::{is_in_session, is_tail_minute};
+        use crate::dhan_live_crossverify::{
+            SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_OPEN_SECS_OF_DAY_IST, is_in_session,
+            is_tail_minute,
+        };
 
         let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"); // APPROVED: test
         // Built EXACTLY as the runner builds it.
@@ -10389,17 +10424,27 @@ mod tests {
                 in_session += 1;
             }
         }
+        // 09:15..15:40 = 385 minutes. DERIVED, never a hand-typed literal:
+        // this count moved once already (375 -> 385) when NSE added the
+        // 15:30-15:40 closing session on 2026-08-07, and a literal is exactly
+        // what let the private duplicate close-constant miss that migration
+        // for eighteen days.
+        let expected_minutes = (SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / 60;
         assert_eq!(
-            in_session, 375,
-            "the session gate must accept all 375 minutes of 09:15..15:30. \
+            in_session, expected_minutes,
+            "the session gate must accept all {expected_minutes} session minutes. \
              Got {in_session} — a count near 45 is the +19,800s IST-origin skew returning."
         );
 
-        // And the tail amnesty must land on the REAL tail (15:28, 15:29), not
-        // on 09:58/09:59 as it did under the skew.
+        // And the tail amnesty must land on the REAL tail — the last two
+        // session minutes, whatever the close currently is — never on
+        // 09:58/09:59 as it did under the skew.
         let tail_at = |h: i64, mi: i64| is_tail_minute(stamp(h, mi), origin);
-        assert!(tail_at(15, 28), "15:28 must be tail-amnestied");
-        assert!(tail_at(15, 29), "15:29 must be tail-amnestied");
+        let hm = |secs: i64| (secs / 3600, (secs % 3600) / 60);
+        let (h1, m1) = hm(SESSION_CLOSE_SECS_OF_DAY_IST - 60);
+        let (h2, m2) = hm(SESSION_CLOSE_SECS_OF_DAY_IST - 120);
+        assert!(tail_at(h1, m1), "{h1}:{m1} must be tail-amnestied");
+        assert!(tail_at(h2, m2), "{h2}:{m2} must be tail-amnestied");
         assert!(
             !tail_at(9, 58),
             "09:58 is NOT the tail — that is the skew signature"
