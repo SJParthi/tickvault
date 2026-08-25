@@ -4860,6 +4860,49 @@ pub const DEPTH_ATTACH_PREOPEN_RETRY_SECS: u64 = 15;
 /// practice, and the rest is margin.
 pub const PREOPEN_READY_DEADLINE_IST_SECS: u32 = 9 * 3_600 + 12 * 60;
 
+/// Whether the pre-open readiness deadline APPLIES to an attach that began at
+/// `attach_started_ist_secs`.
+///
+/// # The false page this closes (MEASURED live, 2026-08-25)
+///
+/// The deadline verdict was `ready_at <= PREOPEN_READY_DEADLINE_IST_SECS` and
+/// nothing else, so it asked "did this attach finish before 09:12?" of EVERY
+/// attach — including one that had not started until the afternoon. A restart
+/// cannot pass a test whose pass condition is a time already in the past, so
+/// the verdict was decided by the clock rather than by anything about the
+/// lane. Live that day, on a busy deploy afternoon:
+///
+/// ```text
+/// 09:08:04  attempts: 57  ready_at 32884  deadline 33120  met_deadline: TRUE
+/// 12:37:58  attempts:  1  ready_at 45478  deadline 33120  met_deadline: false
+/// 16:17:30  attempts:  1  ready_at 58650  deadline 33120  met_deadline: false
+/// 17:33:59  attempts:  1  ready_at 63239  deadline 33120  met_deadline: false
+/// 18:17:30  attempts:  1  ready_at 65850  deadline 33120  met_deadline: false
+/// 19:21:34  attempts:  1  ready_at 69694  deadline 33120  met_deadline: false
+/// ```
+///
+/// The morning MET the deadline with four minutes to spare. Five restarts
+/// then each fired `WS-GAP-02` and drove `tv-<env>-preopen-ready-late` into
+/// ALARM — armed, since that alarm is ungated by design — so the one alarm
+/// built to report a late pre-open reported instead that the box had been
+/// redeployed. An alarm that fires on normal operation is the mirror image of
+/// the false-OK this repo spends its guards on: it teaches the operator to
+/// ignore the one line that would have mattered on a genuinely late morning.
+///
+/// The alarm's own comment reasoned that "on a restart day the LATEST attach
+/// is the one that matters", which is true of a 10:30 re-attach and false of a
+/// 19:21 one. The distinction it needed is not WHEN the attach finished but
+/// whether it was ever RACING the open, and only the start second carries
+/// that.
+///
+/// Deliberately keyed on the START, not on "is it before the market open":
+/// an attach that begins at 09:11 and finishes at 09:20 genuinely missed, and
+/// keying on the finish would excuse exactly the case the deadline exists for.
+#[must_use]
+pub fn preopen_deadline_applies(attach_started_ist_secs: u32) -> bool {
+    attach_started_ist_secs < PREOPEN_READY_DEADLINE_IST_SECS
+}
+
 /// Gauge: IST second-of-day at which BOTH halves reached the wire.
 ///
 /// # Why this has to exist for the deadline to mean anything
@@ -5337,6 +5380,12 @@ async fn attach_depth_when_available(
     crate::dhan_contract_universe::pre_register_contract_failure_counters();
     crate::dhan_depth_universe::pre_register_depth_failure_counters();
 
+    // The IST second at which this attach sequence BEGAN.
+    //
+    // This exists to answer one question the deadline verdict below cannot
+    // answer for itself: is this attach the PRE-OPEN one at all? See
+    // `preopen_deadline_applies`.
+    let attach_started_ist = ist_second_of_day_now();
     let mut attempts: u32 = 0;
     // Whether the PREVIOUS attempt resolved something dialable.
     //
@@ -5885,31 +5934,66 @@ async fn attach_depth_when_available(
                 // real time, and reporting the second we STARTED looking would
                 // flatter every measurement by however long the work took.
                 let ready_at = ist_second_of_day_now();
-                metrics::gauge!(PREOPEN_READY_GAUGE).set(f64::from(ready_at));
-                let met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS;
-                info!(
-                    attempts,
-                    ready_at_ist_secs = ready_at,
-                    deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
-                    met_deadline,
-                    "late-attach complete: contracts and depth are both on the wire"
-                );
-                if !met_deadline {
-                    // An ERROR, not a warning, and deliberately so: everything
-                    // subscribed before the open is the stated requirement, and
-                    // a session that misses it trades the first minutes without
-                    // its contracts. Coded so a metric filter can page on it —
-                    // the gauge alone cannot say WHY, and a log line nothing
-                    // reads is how the previous deadline went unnoticed.
-                    error!(
-                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                // Whether the pre-open deadline is a question worth asking of
+                // THIS attach — see `preopen_deadline_applies` for the five
+                // false pages that made this gate necessary.
+                if !preopen_deadline_applies(attach_started_ist) {
+                    // A mid-session (re)start. It has a completion second but
+                    // no readiness VERDICT: it was never racing the open.
+                    //
+                    // The field is `attached_at_ist_secs`, NOT
+                    // `ready_at_ist_secs`, and that rename is the whole fix on
+                    // the alarm side: the CloudWatch metric filter is anchored
+                    // on `{ $.fields.ready_at_ist_secs = * }`, so a line that
+                    // does not carry that field produces no datapoint and the
+                    // alarm stays sparse to genuine pre-open attaches. No
+                    // terraform change, and the alarm's threshold semantics
+                    // are untouched.
+                    //
+                    // The gauge is skipped for the same reason its own doc
+                    // gives for skipping the give-up paths: there is no
+                    // readiness second here, and publishing the wall clock as
+                    // one would read as a missed deadline forever after.
+                    //
+                    // NOT an early `continue`: the late top-up work below runs
+                    // on this iteration too, and a mid-session restart is
+                    // exactly the shape that most needs it.
+                    info!(
+                        attempts,
+                        attached_at_ist_secs = ready_at,
+                        attach_started_ist_secs = attach_started_ist,
+                        deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
+                        "late-attach complete on a mid-session start: contracts and depth are \
+                         both on the wire. The pre-open readiness deadline does not apply — \
+                         this attach began after it had already passed."
+                    );
+                } else {
+                    metrics::gauge!(PREOPEN_READY_GAUGE).set(f64::from(ready_at));
+                    let met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS;
+                    info!(
+                        attempts,
                         ready_at_ist_secs = ready_at,
                         deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
-                        attempts,
-                        "late-attach finished AFTER the pre-open readiness deadline — the \
+                        met_deadline,
+                        "late-attach complete: contracts and depth are both on the wire"
+                    );
+                    if !met_deadline {
+                        // An ERROR, not a warning, and deliberately so: everything
+                        // subscribed before the open is the stated requirement, and
+                        // a session that misses it trades the first minutes without
+                        // its contracts. Coded so a metric filter can page on it —
+                        // the gauge alone cannot say WHY, and a log line nothing
+                        // reads is how the previous deadline went unnoticed.
+                        error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            ready_at_ist_secs = ready_at,
+                            deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
+                            attempts,
+                            "late-attach finished AFTER the pre-open readiness deadline — the \
                          session opened without its full contract and depth set on the wire. \
                          Everything dialed, just late."
-                    );
+                        );
+                    }
                 }
                 readiness_published = true;
             }
@@ -12300,6 +12384,104 @@ mod contract_attach_tests {
         assert!(
             src.contains("&& !past_preopen_ready_deadline;"),
             "the quorum wait must actually consult the deadline"
+        );
+    }
+
+    /// A mid-session restart is not a late pre-open, and must not be reported
+    /// as one.
+    ///
+    /// MEASURED 2026-08-25: the morning attach completed at 09:08:04 and MET
+    /// the 09:12 deadline, and five afternoon restarts each fired `WS-GAP-02`
+    /// and drove `tv-<env>-preopen-ready-late` into ALARM. The alarm is
+    /// ungated by design, so it stayed armed. Every one of those pages was
+    /// reporting a redeploy.
+    #[test]
+    fn the_preopen_deadline_does_not_apply_to_a_mid_session_restart() {
+        // The real morning: the loop began well before the deadline.
+        assert!(
+            super::preopen_deadline_applies(8 * 3_600 + 35 * 60),
+            "an attach that begins at 08:35 is racing the open and IS judged"
+        );
+        // The five real restarts from that afternoon, by their start second.
+        for (label, started) in [
+            ("12:37", 12 * 3_600 + 37 * 60),
+            ("16:17", 16 * 3_600 + 17 * 60),
+            ("17:33", 17 * 3_600 + 33 * 60),
+            ("18:17", 18 * 3_600 + 17 * 60),
+            ("19:21", 19 * 3_600 + 21 * 60),
+        ] {
+            assert!(
+                !super::preopen_deadline_applies(started),
+                "the {label} restart began after 09:12 and cannot be judged against it"
+            );
+        }
+    }
+
+    /// Keyed on the START, never the finish.
+    ///
+    /// An attach that begins at 09:11 and drags past 09:12 is the exact case
+    /// the deadline exists for; excusing it would hollow the alarm out from
+    /// the other side while fixing the false pages.
+    #[test]
+    fn an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns() {
+        let d = super::PREOPEN_READY_DEADLINE_IST_SECS;
+        assert!(
+            super::preopen_deadline_applies(d - 1),
+            "one second before the deadline still counts as racing it"
+        );
+        assert!(
+            !super::preopen_deadline_applies(d),
+            "an attach that begins AT the deadline has already lost the race it would be \
+             judged on — it is a restart, not a late pre-open"
+        );
+        assert!(!super::preopen_deadline_applies(d + 1));
+    }
+
+    /// The alarm-side half of the fix, pinned in source.
+    ///
+    /// The CloudWatch metric filter is `{ $.fields.ready_at_ist_secs = * }`.
+    /// The mid-session arm must therefore NOT carry that field name, or the
+    /// datapoint still lands and the gate changes nothing that the operator
+    /// can see. Bite-proven: renaming `attached_at_ist_secs` back to
+    /// `ready_at_ist_secs` fails this test.
+    #[test]
+    fn the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on() {
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        let gate = src
+            .find("if !preopen_deadline_applies(attach_started_ist) {")
+            .expect("the mid-session gate must exist");
+        let els = src[gate..]
+            .find("} else {")
+            .expect("the judged arm must be the else of that gate")
+            + gate;
+        // Comment lines are stripped before asserting: this arm's own comment
+        // QUOTES the CloudWatch filter pattern verbatim, so a raw substring
+        // scan matches the documentation rather than the code. Caught by this
+        // test failing on its first run, which is the right way round.
+        let mid_arm: String = src[gate..els]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mid_arm = mid_arm.as_str();
+
+        assert!(
+            mid_arm.contains("attached_at_ist_secs = ready_at"),
+            "the mid-session arm must report its completion second under a DIFFERENT field"
+        );
+        assert!(
+            !mid_arm.contains("ready_at_ist_secs ="),
+            "the mid-session arm must not emit `ready_at_ist_secs` — that field is what the \
+             CloudWatch filter matches, so emitting it re-creates the false page"
+        );
+        assert!(!mid_arm.contains("error!"), "a restart is not an error");
+        assert!(
+            !mid_arm.contains("metrics::gauge!(PREOPEN_READY_GAUGE)"),
+            "there is no readiness second on a restart; publishing the wall clock as one \
+             would read as a permanently missed deadline"
         );
     }
 
