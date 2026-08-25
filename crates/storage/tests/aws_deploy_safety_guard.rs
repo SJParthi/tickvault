@@ -17,8 +17,8 @@
 //!   3. Revert the weekday-only schedule (MON-FRI) back to daily (Mon-Sun).
 //!   4. Flip `enable_eip` default to true (no orders for 3 months → no Dhan
 //!      static-IP need → EIP off saves ~₹430/mo).
-//!   5. Change the EBS default away from 200 GB (operator Quote 16, 2026-08-19;
-//!      was 100 per Quote 13, and 50/30 before that).
+//!   5. Change the EBS default away from 300 GB (operator Quote 19, 2026-08-25;
+//!      was 200 per Quote 16, 100 per Quote 13, and 50/30 before that).
 //!
 //! Each assertion fails the build with an operator-readable message so the next
 //! session (or Cowork task) cannot regress the locked config by accident.
@@ -184,61 +184,81 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS FRESH-PROVISION default is 200 GB (operator Quote 16, 2026-08-19 —
-/// "Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?"). Raised
-/// from the Quote 13 default of 100 after r8gd.xlarge was proposed and
-/// REJECTED: r8gd.xlarge has the SAME 32 GiB of RAM, and its local NVMe is
-/// wiped on every instance stop while this box stops nightly — it would have
-/// cost ~25% more per hour to delete each day. EBS survives the stop.
+/// EBS FRESH-PROVISION default is 300 GB (operator Quote 19, 2026-08-25 —
+/// "go ahead with your eocmmendation ... i never evr want ot face rpessure
+/// flushign espielclay entilrey rleated to db questdb"). Raised from the
+/// Quote 16 default of 200 after the 200 GB volume filled MID-SESSION:
+/// QuestDB's O3 merge hit `CairoException: [28] No space left` at 11:29 IST
+/// and WAL-SUSPENDED 14 tables — `ticks`, `market_depth` and every candle
+/// frame. A suspended table keeps ACKing ILP writes while silently not
+/// applying them, so every writer reported success and every counter read
+/// healthy while the rows were discarded. By 11:51 IST `ssm send-command`
+/// failed in 0.001 s with empty output, because the agent could not allocate
+/// the scratch space to launch a shell: the box was unmanageable.
 ///
-/// Quote 13 rationale, still current for the sizing itself (2026-08-08 —
-/// sized for the 13-timeframe current-day workload WITH raw-tick retention:
-/// ticks ~44-141 GB/mo (Assumed 25-80 M rows/day) + 13 sparse timeframes
-/// ~61 GB/mo, held ~30 days with S3 archival beyond). Supersedes the
-/// 2026-07-15 20 GB downsize pre-stage.
+/// Only SIZE was exhausted. Measured against CloudWatch peaks (22-24 Aug):
+/// IOPS 1,168 of 6,000 provisioned (19%), throughput 107 MB/s of 500 MiB/s
+/// (21%), size 200 of 200 GB (100%). That is why the Quote 17 I/O
+/// provisioning is NOT reverted to fund this despite the tempting headroom —
+/// `VolumeQueueLength` peaked at 8.5 during the open burst, which is the
+/// opposite signal, and a 5-minute bucket cannot show a ten-second burst.
 ///
-/// 100 and NOT 250 deliberately: gp3 grows online in one command and can NEVER
-/// shrink, so the small side is the only reversible direction. If real tick
-/// volume lands at the top of the Assumed range, grow it live.
+/// The retention design is not at fault and did not fail silently: the
+/// pressure archiver started at 75% used, shrank the hot window to its hard
+/// `pressure_hot_days = 2` floor (today and yesterday are still being
+/// written, so its verify cannot close the count->drop race on them),
+/// archived everything it was permitted to, found the volume still full, and
+/// raised STORAGE-GAP-05 rather than dropping anything unverified. It means
+/// two days of data no longer fit in 200 GB, which no retention setting can
+/// change — only a larger volume can.
 ///
 /// This is a FRESH-PROVISION default only — `root_block_device[0].volume_size`
 /// sits in the instance's `lifecycle.ignore_changes`, so `terraform apply`
-/// never touches the live volume. History: 10 -> 30 -> [50 approved 2026-07-13,
-/// never physically applied, live verified 30 GiB on 2026-07-19] -> 20 target
-/// (2026-07-15) -> 100 (2026-08-08).
+/// never touches the live volume; the live grow runs through
+/// `.github/workflows/grow-ebs-volume.yml`, which exists because
+/// `user/claude-code-agent` cannot perform `ec2:ModifyVolume`. History:
+/// 10 -> 30 -> [50 approved 2026-07-13, never applied; live verified 30 GiB
+/// 2026-07-19] -> 20 target (2026-07-15) -> 100 (2026-08-08) -> 200
+/// (2026-08-19) -> 300 (2026-08-25).
 #[test]
-fn deploy_ebs_default_is_200gb() {
+fn deploy_ebs_default_is_300gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 200"),
-        "ebs_gp3_size_gb must default to 200 GB (operator Quote 16, 2026-08-19 — \
-         'Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?', given \
-         after r8gd.xlarge was proposed and rejected: its local NVMe is WIPED on \
-         every stop and this box stops nightly, so it would delete the day; EBS \
-         survives the stop. Raised from the Quote 13 default of 100)."
+        vars.contains("type = number default = 300"),
+        "ebs_gp3_size_gb must default to 300 GB (operator Quote 19, 2026-08-25 \
+         — given after the 200 GB volume filled mid-session and WAL-suspended \
+         14 QuestDB tables, which then ACKed and discarded every write. Raised \
+         from the Quote 16 default of 200)."
     );
-    // 200 is now BOTH the default and the validation ceiling, so the next grow
-    // cannot be a drive-by: it needs a validation edit, its own dated quote,
-    // AND a budget-ceiling raise (+100 GB = +$9.12/mo leaves only $7.28 under
-    // the $100 kill line, whose AUTOMATIC action stops the prod box).
+    // 300 is BOTH the default and the validation ceiling, so the next grow
+    // cannot be a drive-by: it needs a validation edit AND its own dated
+    // quote. It also needs the budget looked at again — the 2026-08-25 grow
+    // takes a maximal month to $118.28, which is under the Quote 18 hard cap
+    // of $125 but $1.28 ABOVE the budget's 90% STOP_EC2_INSTANCES line of
+    // $117.00 at the live $130 limit_amount. Recorded in Quote 19; NOT
+    // resolved by a ceiling edit, because Quote 18 forbids limit_amount above
+    // 125 and 90% of 125 is $112.50, below the bill.
     assert!(
-        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200"),
-        "the 10-200 GB validation range must stay — with the default AT the \
+        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 300"),
+        "the 10-300 GB validation range must stay — with the default AT the \
          ceiling it is what makes a further grow a deliberate, quoted decision \
          rather than a one-character edit."
     );
-    // Inverted pin: 250+ is NOT the safe direction. gp3 grows online and can
-    // never shrink, so over-provisioning is the irreversible mistake and pays
-    // for unused disk every month until an instance recreate.
+    // Inverted pin, unchanged in spirit: gp3 grows online and can never
+    // shrink, so over-provisioning is the irreversible mistake and pays for
+    // unused disk every month until an instance recreate. 300 was chosen
+    // because it puts the ~157 GB live QuestDB working set at ~52%, below the
+    // 75% pressure trigger, and NOT higher.
     assert!(
-        !vars.contains("type = number default = 250"),
+        !vars.contains("type = number default = 400"),
         "do not over-provision the fresh volume — gp3 grows online in one \
-         command but can NEVER shrink, so 100 GB is chosen as the reversible \
-         side. Grow it live if measured tick volume demands it."
+         command but can NEVER shrink. 300 GB clears the 75% pressure trigger \
+         for the measured working set; 400 GB would also breach the Quote 18 \
+         $125 cap. Grow it live if measured volume demands it."
     );
 }
 

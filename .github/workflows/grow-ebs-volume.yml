@@ -54,9 +54,9 @@ on:
         description: 'Type the EXACT root volume id to confirm (aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app --query "Reservations[].Instances[].BlockDeviceMappings[0].Ebs.VolumeId").'
         required: true
       target_size_gb:
-        description: 'New size in GB. Must be >= the current size (gp3 cannot shrink) and <= 200 (the variables.tf ebs_gp3_size_gb ceiling).'
+        description: 'New size in GB. Must be >= the current size (gp3 cannot shrink) and <= 300 (the variables.tf ebs_gp3_size_gb ceiling, raised 200 -> 300 by operator Quote 19, 2026-08-25).'
         required: true
-        default: '200'
+        default: '300'
       target_iops:
         description: 'Provisioned IOPS, 3000-16000 (the variables.tf ebs_gp3_iops range). Default 6000 = operator Quote 17, 2026-08-19. Unlike size this CAN go down.'
         required: true
@@ -182,8 +182,8 @@ jobs:
             echo "::error::gp3 can NEVER shrink. ${TARGET} < ${CUR} — refusing."
             exit 1
           fi
-          if [ "$TARGET" -gt 200 ]; then
-            echo "::error::${TARGET} exceeds the variables.tf ebs_gp3_size_gb ceiling of 200."
+          if [ "$TARGET" -gt 300 ]; then
+            echo "::error::${TARGET} exceeds the variables.tf ebs_gp3_size_gb ceiling of 300."
             echo "Raising it needs a validation edit AND its own dated operator quote."
             exit 1
           fi
