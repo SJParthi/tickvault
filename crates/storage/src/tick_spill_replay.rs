@@ -40,6 +40,7 @@
 use std::path::{Path, PathBuf};
 
 use reqwest::Client;
+use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
 
 /// Maximum bytes per `/write` POST.
@@ -66,6 +67,8 @@ pub struct SpillReplayOutcome {
     /// Files already empty — left alone for the age-based pruner.
     pub files_skipped_empty: usize,
     /// Bytes QuestDB accepted this round.
+    /// Files permanently refused and moved aside so the queue keeps moving.
+    pub files_quarantined: usize,
     pub bytes_replayed: u64,
 }
 
@@ -155,6 +158,55 @@ pub fn write_url(host: &str, http_port: u16) -> String {
     format!("http://{host}:{http_port}/write")
 }
 
+/// Directory (under the spill dir) where permanently-refused files are set
+/// aside so the rest of the backlog can drain.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
+/// Counter for files moved aside because QuestDB will never accept them.
+pub const REPLAY_QUARANTINED_COUNTER: &str = "tv_tick_spill_replay_quarantined_total";
+
+/// Is this HTTP status a PERMANENT refusal — one that retrying cannot fix?
+///
+/// The distinction is the whole point. A 5xx or a timeout means QuestDB is
+/// struggling, and the existing "stop the round" behaviour is right: pushing
+/// a backlog at a struggling server is how a bounded tick loss becomes an
+/// unbounded outage. A 4xx means the PAYLOAD is wrong, and no number of
+/// rounds will change a malformed byte — so the same behaviour that protects
+/// the server in the first case strands every file behind the bad one in the
+/// second. That is what happened on 2026-08-25: one torn line in a 401 KB
+/// file kept a 512 MB file holding 1,662,318 intact ticks from ever being
+/// attempted, for hours.
+///
+/// 408 and 429 are 4xx by number and TRANSIENT by meaning — request timeout
+/// and rate limit both succeed on a later try — so they are deliberately
+/// excluded and take the retry path.
+#[must_use]
+pub fn is_permanent_refusal(status: u16) -> bool {
+    (400..500).contains(&status) && status != 408 && status != 429
+}
+
+/// Moves a permanently-refused spill file into the quarantine directory.
+///
+/// Returns the new path on success. QUARANTINE, NEVER DELETE: the file's
+/// surviving lines are usually recoverable by hand — on 2026-08-25, 1,292 of
+/// 1,293 were — and a rescue tier that destroys what it cannot parse is worse
+/// than the loss it exists to prevent.
+///
+/// A failure to MOVE the file is itself reported and leaves the file where it
+/// is; the caller then treats it as a transient failure, because a file that
+/// could not be set aside would otherwise be silently skipped and the queue
+/// would appear to drain while it did not.
+fn quarantine_spill_file(dir: &Path, path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let quarantine = dir.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&quarantine)?;
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("unnamed.ilp")); // APPROVED: infallible fallback, no panic on a pathological path
+    let target = quarantine.join(name);
+    std::fs::rename(path, &target)?;
+    Ok(target)
+}
+
 /// Replays every spill file in `dir` into QuestDB.
 ///
 /// # Why a failing round stops the round
@@ -188,6 +240,7 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
 
         let mut accepted: u64 = 0;
         let mut failed = false;
+        let mut quarantined = false;
         for range in ilp_chunk_ranges(&payload, REPLAY_MAX_CHUNK_BYTES) {
             let chunk = payload[range].to_vec();
             let len = chunk.len() as u64;
@@ -196,9 +249,59 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                     accepted = accepted.saturating_add(len);
                 }
                 Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if is_permanent_refusal(status) {
+                        // The payload is wrong, not the server. Retrying can
+                        // never change a malformed byte, and the round-stops-
+                        // on-failure rule below would strand every file behind
+                        // this one — which is exactly what stranded 1,662,318
+                        // intact ticks on 2026-08-25. Set it aside and keep
+                        // going.
+                        match quarantine_spill_file(dir, &path) {
+                            Ok(moved) => {
+                                metrics::counter!(REPLAY_QUARANTINED_COUNTER).increment(1);
+                                outcome.files_quarantined =
+                                    outcome.files_quarantined.saturating_add(1);
+                                error!(
+                                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                                    path = %moved.display(),
+                                    status,
+                                    bytes = payload.len(),
+                                    "tick spill file PERMANENTLY refused by QuestDB and moved to \
+                                     quarantine so the rest of the backlog can drain. The rows \
+                                     are still on disk and are NOT in the database. Most of the \
+                                     file is usually salvageable — filter to well-formed lines \
+                                     and re-POST, which is safe to repeat because the ticks \
+                                     dedup key carries capture_seq."
+                                );
+                                // Deliberately NOT `failed = true`: this file
+                                // is dealt with, and the whole point is that
+                                // the queue keeps moving.
+                                quarantined = true;
+                                break;
+                            }
+                            Err(err) => {
+                                // Could not set it aside. Treat as transient
+                                // rather than skipping it — a file that stays
+                                // in place while being reported as handled
+                                // would make the queue look drained when it
+                                // is not.
+                                warn!(
+                                    path = %path.display(),
+                                    status,
+                                    %err,
+                                    "tick spill file was permanently refused but could NOT be \
+                                     moved to quarantine — left in place and retried, so the \
+                                     backlog behind it is still blocked"
+                                );
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
                     warn!(
                         path = %path.display(),
-                        status = resp.status().as_u16(),
+                        status,
                         "tick spill replay was refused by QuestDB — the file is kept intact and \
                          retried next round"
                     );
@@ -216,6 +319,13 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                     break;
                 }
             }
+        }
+
+        if quarantined {
+            // Moved aside, not drained. Continue to the NEXT file — the whole
+            // reason this branch exists is that the backlog behind a poison
+            // file is usually intact and just needs to be attempted.
+            continue;
         }
 
         if failed {
@@ -757,10 +867,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_spill_dir_keeps_the_file_when_the_database_refuses_it() {
-        // A 4xx is not a transport failure: the bytes arrived and were rejected.
-        // The file must survive that just as it survives an unreachable server,
-        // because the operator's manual replay is still available either way.
+    async fn a_permanently_refused_file_is_quarantined_not_left_in_the_queue() {
+        // A 4xx is not a transport failure: the bytes arrived and were
+        // rejected, so no number of retries can change the outcome. The file
+        // must SURVIVE byte-for-byte — the operator's manual replay of the
+        // salvageable lines is still the recovery — but it must leave the
+        // drain queue, because leaving it there strands every file behind it.
+        //
+        // Before 2026-08-25 this test asserted the file stayed put. That was
+        // the bug: on that day one torn line kept a 512 MB file holding
+        // 1,662,318 intact ticks from ever being attempted.
         let dir = temp_dir("refused");
         let path = dir.join("ticks-dhan-1.ilp");
         std::fs::write(&path, b"ticks value=1i 1\n").expect("write");
@@ -770,11 +886,18 @@ mod tests {
         let outcome = replay_spill_dir(&dir, &url, &client).await;
         let _ = server.join();
 
-        assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.files_quarantined, 1);
         assert_eq!(outcome.files_replayed, 0);
         assert_eq!(outcome.bytes_replayed, 0);
         assert_eq!(
-            std::fs::read(&path).expect("read"),
+            outcome.files_failed, 0,
+            "a quarantined file is handled, not failed — counting it as a \
+             failure would keep reporting a backlog that is no longer blocked"
+        );
+        assert!(!path.exists(), "it must leave the drain queue");
+        let moved = dir.join(QUARANTINE_DIR).join("ticks-dhan-1.ilp");
+        assert_eq!(
+            std::fs::read(&moved).expect("read"),
             b"ticks value=1i 1\n",
             "a refused replay must leave the payload byte-for-byte intact"
         );
@@ -877,6 +1000,129 @@ mod tests {
              how rescued ticks accumulate to the cap unnoticed"
         );
         handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The permanent-vs-transient split IS the fix. A 5xx must still stop the
+    /// round (pushing a backlog at a struggling server is how a bounded loss
+    /// becomes an outage); a 4xx must not, because retrying a malformed byte
+    /// can never succeed.
+    #[test]
+    fn permanent_refusal_is_4xx_except_the_two_that_mean_try_again() {
+        for s in [400, 401, 403, 404, 413, 422] {
+            assert!(
+                is_permanent_refusal(s),
+                "{s} is a payload-level refusal — retrying it forever blocks the queue"
+            );
+        }
+        // Transient by meaning despite being 4xx by number.
+        assert!(!is_permanent_refusal(408), "408 is a timeout — it retries");
+        assert!(
+            !is_permanent_refusal(429),
+            "429 is a rate limit — it retries"
+        );
+        // Server-side: the original stop-the-round reasoning still applies.
+        for s in [500, 502, 503, 504] {
+            assert!(
+                !is_permanent_refusal(s),
+                "{s} means QuestDB is struggling — the round must still stop"
+            );
+        }
+        assert!(!is_permanent_refusal(200), "success is not a refusal");
+    }
+
+    /// Quarantine MOVES, never deletes. On 2026-08-25 the refused file still
+    /// held 1,292 recoverable lines out of 1,293; a rescue tier that destroys
+    /// what it cannot parse is worse than the loss it exists to prevent.
+    #[test]
+    fn quarantine_moves_the_file_and_preserves_every_byte() {
+        let dir = temp_dir("quarantine");
+        let spill = dir.join("ticks-dhan-1.ilp");
+        let body = b"ticks,segment=NSE_EQ,feed=dhan security_id=1i 1\ntorn";
+        std::fs::write(&spill, body).expect("write"); // APPROVED: test
+
+        let moved = quarantine_spill_file(&dir, &spill).expect("quarantine"); // APPROVED: test
+
+        assert!(!spill.exists(), "the file must leave the drain queue");
+        assert!(moved.exists(), "and must still exist in quarantine");
+        assert_eq!(
+            std::fs::read(&moved).expect("read back"), // APPROVED: test
+            body,
+            "quarantine must preserve every byte — the surviving lines are \
+             what the operator salvages"
+        );
+        assert_eq!(
+            moved.parent().and_then(std::path::Path::file_name),
+            Some(std::ffi::OsStr::new(QUARANTINE_DIR)),
+            "it must land in the quarantine directory, not somewhere ad hoc"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot HTTP responder: 400 for a payload containing `poison`,
+    /// 204 otherwise. Hand-rolled on tokio rather than pulling a mock-server
+    /// dependency in, because adding a crate needs operator approval and this
+    /// is thirty lines.
+    async fn spawn_selective_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind"); // APPROVED: test
+        let addr = listener.local_addr().expect("addr"); // APPROVED: test
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0_u8; 65536];
+                let n = sock.read(&mut buf).await.unwrap_or(0); // APPROVED: test
+                let body = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = if body.contains("poison") {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/write"), handle)
+    }
+
+    /// The behaviour that actually stranded the data: a permanently-refused
+    /// file must not prevent the NEXT file from being attempted.
+    ///
+    /// Bite-proof: make `is_permanent_refusal` return `false` and this fails
+    /// at `files_replayed`, because the round stops at the poison file and the
+    /// intact one behind it is never posted — precisely the live shape on
+    /// 2026-08-25.
+    #[tokio::test]
+    async fn a_poison_file_does_not_strand_the_files_behind_it() {
+        let dir = temp_dir("poison");
+        // Oldest first by name, so `-1` is attempted before `-2`.
+        std::fs::write(dir.join("ticks-dhan-1.ilp"), b"poison\n").expect("w1"); // APPROVED: test
+        std::fs::write(
+            dir.join("ticks-dhan-2.ilp"),
+            b"ticks,segment=NSE_EQ,feed=dhan security_id=1i 1\n",
+        )
+        .expect("w2"); // APPROVED: test
+
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client).await;
+        server.abort();
+
+        assert_eq!(
+            out.files_quarantined, 1,
+            "the poison file must be set aside"
+        );
+        assert_eq!(
+            out.files_replayed, 1,
+            "and the file BEHIND it must still be replayed — this is the whole \
+             defect: on 2026-08-25 a 512 MB file holding 1,662,318 intact ticks \
+             was never once attempted, because a 401 KB file ahead of it kept \
+             being refused and the round stopped there every time"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

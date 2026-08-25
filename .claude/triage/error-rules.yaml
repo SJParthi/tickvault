@@ -2233,3 +2233,25 @@ rules:
       set against OrderUpdate and the Dhan reference — the repair is a
       schema change, never an auto-action, and several excerpts should be
       collected before the struct is touched.
+
+  # TICK-SPILL-01 = a rescued tick-spill file was permanently refused by
+  # QuestDB (a 4xx that is not 408/429) and moved to quarantine so the rest of
+  # the backlog can drain. Escalate, and no auto-action is appropriate: the
+  # file is ALREADY set aside and the queue is ALREADY moving, so there is
+  # nothing to restart; what remains is a salvage judgement — which lines
+  # survived the tear and are worth re-posting — and that is the operator's.
+  # Found live 2026-08-25, when one torn line kept a 512 MB file holding
+  # 1,662,318 intact ticks from ever being attempted.
+  - name: tick-spill-01-file-quarantined-escalate
+    match:
+      code: TICK-SPILL-01
+    action: escalate
+    runbook_path: docs/error-runbooks/tick-spill-replay-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      TICK-SPILL-01 = rescued ticks are on disk, permanently unreplayable as
+      written, and set aside so the backlog drains. Escalate so the operator
+      salvages the well-formed lines per the runbook (safe to repeat — the
+      ticks dedup key carries capture_seq). No auto-action: the blocking
+      condition is already resolved by the quarantine itself.

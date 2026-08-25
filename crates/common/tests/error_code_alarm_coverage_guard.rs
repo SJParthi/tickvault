@@ -267,6 +267,16 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "RISK-GAP-02",
     "SELFTEST-02",
     "SPOT1M-02",
+    // TICK-SPILL-01 is log-sink-only, and unlike most entries here that is
+    // a comfortable call rather than a constrained one. By the time it fires
+    // the file is already quarantined and the backlog is already draining —
+    // the condition it reports is one the system has just handled, not one
+    // waiting on a human. What needs a human is the salvage, which is not
+    // urgent: the rows are on disk and the dedup key makes the re-post
+    // repeatable whenever the operator gets to it. The urgent half of this
+    // story — the flush that failed in the first place — already pages via
+    // HOT-PATH-02 and the dhan_ticks_dropped alarm.
+    "TICK-SPILL-01",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",
