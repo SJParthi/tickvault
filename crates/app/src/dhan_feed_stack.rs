@@ -6737,82 +6737,97 @@ pub fn crossverify_deps_installed() -> bool {
     CROSSVERIFY_DEPS.get().is_some()
 }
 
-/// Dhan's `instrument` string for a segment, or `None` when the segment alone
-/// cannot determine it.
+/// Counts targets dropped because their segment does not determine a Dhan
+/// `instrument` string. Labelled by segment so the log and the metric name
+/// the same thing.
+pub const XVERIFY_TARGET_UNMAPPABLE_COUNTER: &str = "tv_dhan_feed_xverify_target_unmappable_total";
+
+/// The Dhan `instrument` string a segment determines, or `None` when the
+/// segment alone is ambiguous.
 ///
-/// Added 2026-08-25. `crossverify_targets` used to stamp `"INDEX"` on EVERY
-/// target, and that string goes verbatim into the Dhan REST intraday body. The
-/// live universe is ~119 indices plus ~750 NSE_EQ constituents, so roughly 86%
-/// of every run's fetches asked for a STOCK as though it were an INDEX. Those
-/// return no candles, land in the `rest_failures` bucket, and are never
-/// compared — while the run can still report `Clean` on the handful of real
-/// indices that happened to be labelled correctly.
+/// `POST /v2/charts/intraday` takes `exchangeSegment` AND `instrument`
+/// (`docs/dhan-ref/08-annexure-enums.md`), and it answers a mismatched pair
+/// with no candles rather than an error — so a wrong `instrument` is
+/// indistinguishable from "the exchange published nothing", which is exactly
+/// the false-OK this repository forbids.
 ///
-/// That is a PARTIAL-denominator vacuous pass, and it is invisible to the
-/// module's `minutes_compared > 0` guard, which only catches a ZERO
-/// denominator. The comparator's own doc comment says it "can never verify a
-/// different universe than it captured" — true of the id set, false of the
-/// instrument type, and the type is what decides whether a fetch returns
-/// anything at all.
+/// The cash segments are unambiguous: an `IDX_I` id is always an INDEX and an
+/// `NSE_EQ`/`BSE_EQ` id is always an EQUITY. The F&O segments are NOT — one
+/// `NSE_FNO` id may be `FUTIDX`, `OPTIDX`, `FUTSTK` or `OPTSTK`, and
+/// [`SubscribeInstrument`] carries only `(security_id, segment)`, so nothing
+/// here can tell them apart. Returning `None` is therefore the honest answer,
+/// and [`crossverify_targets`] drops-and-counts rather than guessing: a
+/// contract verified under the wrong label reports a clean `missing_rest`
+/// while proving nothing.
 ///
-/// F&O returns `None` deliberately. `(security_id, segment)` is all the
-/// subscribe set carries, and `NSE_FNO` could be `FUTIDX`, `OPTIDX`, `FUTSTK`
-/// or `OPTSTK` — a guess would land back in the silent-failure bucket this
-/// exists to empty. An unverifiable target is counted and named, not fetched
-/// with a wrong label.
+/// Currency and commodity are outside the subscription scope entirely
+/// (`daily-universe-scope-expansion-2026-05-27.md` §2), so they are `None`
+/// too — a target in one of those segments is a scope bug worth surfacing,
+/// not a label to invent.
 #[must_use]
-pub fn dhan_intraday_instrument_for(segment: ExchangeSegment) -> Option<&'static str> {
+pub const fn dhan_instrument_for_segment(segment: ExchangeSegment) -> Option<&'static str> {
     match segment {
         ExchangeSegment::IdxI => Some("INDEX"),
         ExchangeSegment::NseEquity | ExchangeSegment::BseEquity => Some("EQUITY"),
-        // Ambiguous from the segment alone; see the doc above.
-        ExchangeSegment::NseFno | ExchangeSegment::BseFno => None,
-        // Out of the authorized scope entirely.
-        ExchangeSegment::NseCurrency | ExchangeSegment::BseCurrency | ExchangeSegment::McxComm => {
-            None
-        }
+        // Ambiguous from the segment alone — see the doc comment.
+        ExchangeSegment::NseFno
+        | ExchangeSegment::BseFno
+        | ExchangeSegment::NseCurrency
+        | ExchangeSegment::BseCurrency
+        | ExchangeSegment::McxComm => None,
     }
 }
 
 /// Builds the comparator's target list from the subscribed main-feed set, so
 /// the lane can never verify a different universe than it captured.
 ///
-/// Returns the targets plus the count of subscribed instruments that CANNOT be
-/// targeted, because a wrong `instrument` label is worse than an absent one: it
-/// fetches nothing while looking like a fetch that failed.
-#[must_use]
-pub fn crossverify_targets_with_skipped(
-    main_feed: &[SubscribeInstrument],
-) -> (Vec<crate::dhan_live_crossverify::XverifyTarget>, usize) {
-    let mut targets = Vec::with_capacity(main_feed.len());
-    let mut skipped = 0_usize;
-    for i in main_feed {
-        let (Some(instrument), Ok(security_id)) = (
-            dhan_intraday_instrument_for(i.segment),
-            i64::try_from(i.security_id),
-        ) else {
-            // 2026-08-25: the id arm used to be `unwrap_or(0)`, which turned an
-            // out-of-range id into a target for instrument 0 — the comparator
-            // would then verify, and report on, an instrument that does not
-            // exist.
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
-        targets.push(crate::dhan_live_crossverify::XverifyTarget {
-            security_id,
-            segment: i.segment.as_str().to_string(),
-            instrument: instrument.to_string(),
-        });
-    }
-    (targets, skipped)
-}
-
-/// Convenience wrapper for callers that only need the targets.
+/// Every target's `instrument` is DERIVED from its segment
+/// ([`dhan_instrument_for_segment`]). An instrument whose segment does not
+/// determine one is DROPPED and counted — never stamped with a guess.
+///
+/// **2026-08-25 — this function stamped the literal `"INDEX"` on every
+/// target.** Today's universe is ~119 NSE indices plus ~750 NTM equities, so
+/// roughly six of every seven targets asked Dhan for an INDEX bar on an
+/// equity id. Dhan answers such a pair with an empty candle set, which the
+/// comparator counts as `missing_rest` — so the verification reported an
+/// absent vendor tape for most of the universe when what was actually absent
+/// was a correct request. Since this comparator is the ONLY ground truth a
+/// feed with no sequence number and no snapshot-on-subscribe has, a mislabel
+/// here does not merely lose coverage: it makes the one instrument that could
+/// detect packet loss report a plausible number about the wrong question.
 #[must_use]
 pub fn crossverify_targets(
     main_feed: &[SubscribeInstrument],
 ) -> Vec<crate::dhan_live_crossverify::XverifyTarget> {
-    crossverify_targets_with_skipped(main_feed).0
+    let mut targets = Vec::with_capacity(main_feed.len());
+    let mut unmappable: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for i in main_feed {
+        let Some(instrument) = dhan_instrument_for_segment(i.segment) else {
+            *unmappable.entry(i.segment.as_str()).or_insert(0) += 1;
+            continue;
+        };
+        targets.push(crate::dhan_live_crossverify::XverifyTarget {
+            security_id: i64::try_from(i.security_id).unwrap_or(0),
+            segment: i.segment.as_str().to_string(),
+            instrument: instrument.to_string(),
+        });
+    }
+    for (segment, count) in &unmappable {
+        metrics::counter!(XVERIFY_TARGET_UNMAPPABLE_COUNTER, "segment" => *segment)
+            .increment(*count as u64);
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            segment = *segment,
+            dropped = *count,
+            "cross-verification cannot label these instruments: the segment does not \
+             determine a Dhan `instrument` string, and guessing one would make the \
+             comparator report an absent vendor tape instead of an unverified \
+             instrument. They are EXCLUDED from today's verification and counted here. \
+             Widen SubscribeInstrument with the contract kind to verify them."
+        );
+    }
+    targets
 }
 
 /// Spawns the daily comparator (see [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`]) for the
@@ -9766,6 +9781,110 @@ mod tests {
             targets.iter().all(|t| t.security_id != 0),
             "an out-of-range id must be skipped, never coerced to instrument 0"
         );
+    }
+
+    #[test]
+    fn test_crossverify_labels_an_equity_as_equity_not_index() {
+        // The bite test for the 2026-08-25 fix. Today's universe is ~119 NSE
+        // indices plus ~750 NTM equities; the previous code stamped "INDEX" on
+        // every one, so six of every seven targets asked Dhan for an index bar
+        // on an equity id. Dhan answers that pair with an empty candle set, so
+        // the comparator counted it `missing_rest` — an absent vendor tape
+        // reported where the real fault was our own request.
+        //
+        // Restore `instrument: "INDEX".to_string()` in `crossverify_targets`
+        // and this assertion fails with left: "INDEX", right: "EQUITY".
+        let universe = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 2885,
+                segment: ExchangeSegment::NseEquity,
+            },
+            SubscribeInstrument {
+                security_id: 500_325,
+                segment: ExchangeSegment::BseEquity,
+            },
+        ];
+        let targets = crossverify_targets(&universe);
+        assert_eq!(targets.len(), 3, "every cash segment is labellable");
+        assert_eq!(targets[0].instrument, "INDEX");
+        assert_eq!(targets[1].instrument, "EQUITY");
+        assert_eq!(targets[2].instrument, "EQUITY");
+        // The segment string must keep travelling verbatim: the pair is what
+        // Dhan validates, so a right label on a wrong segment is no better.
+        assert_eq!(targets[1].segment, "NSE_EQ");
+        assert_eq!(targets[2].segment, "BSE_EQ");
+    }
+
+    #[test]
+    fn test_crossverify_drops_a_segment_it_cannot_label_rather_than_guessing() {
+        // An F&O id may be FUTIDX, OPTIDX, FUTSTK or OPTSTK and
+        // `SubscribeInstrument` carries only (security_id, segment), so no
+        // label here can be honest. Dropping it leaves the target UNVERIFIED
+        // and says so; guessing would leave it verified-against-nothing, which
+        // reads identically to a clean run.
+        let universe = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 45_678,
+                segment: ExchangeSegment::NseFno,
+            },
+            SubscribeInstrument {
+                security_id: 84_321,
+                segment: ExchangeSegment::BseFno,
+            },
+        ];
+        let targets = crossverify_targets(&universe);
+        assert_eq!(
+            targets.len(),
+            1,
+            "only the index survives; the two contracts are excluded, not mislabelled"
+        );
+        assert_eq!(targets[0].segment, "IDX_I");
+        assert!(
+            targets
+                .iter()
+                .all(|t| t.instrument != "INDEX" || t.segment == "IDX_I"),
+            "no surviving target may carry INDEX on a non-index segment"
+        );
+    }
+
+    #[test]
+    fn test_dhan_instrument_for_segment_covers_every_variant_deliberately() {
+        // Pins the mapping so a new segment cannot default into a label. Each
+        // arm below is a decision, not an accident.
+        assert_eq!(
+            dhan_instrument_for_segment(ExchangeSegment::IdxI),
+            Some("INDEX")
+        );
+        assert_eq!(
+            dhan_instrument_for_segment(ExchangeSegment::NseEquity),
+            Some("EQUITY")
+        );
+        assert_eq!(
+            dhan_instrument_for_segment(ExchangeSegment::BseEquity),
+            Some("EQUITY")
+        );
+        for ambiguous in [
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::McxComm,
+        ] {
+            assert_eq!(
+                dhan_instrument_for_segment(ambiguous),
+                None,
+                "{} must refuse a label rather than invent one",
+                ambiguous.as_str()
+            );
+        }
     }
 
     #[test]

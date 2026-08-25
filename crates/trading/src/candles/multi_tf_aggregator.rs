@@ -483,50 +483,56 @@ impl MultiTfAggregator {
         // `// O(1) EXEMPT:` hatch instead would be a small lie: this is not
         // exempt FROM O(1), it IS O(1).
         //
-        // `is_finite()` is redundant with the bounds (NaN fails `>= 0.0`,
-        // `+Inf` fails `<= MAX`, `-Inf` fails `>= 0.0`) and kept anyway,
-        // because "is this a real number" is the first question a reader asks.
-        // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
-        #[allow(clippy::manual_range_contains)]
-        let price_is_representable = p.is_finite() && p >= 0.0 && p <= MAX_PLAUSIBLE_LTP;
-        if !price_is_representable {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
-            return ConsumeStats {
-                refused_price: true,
-                ..ConsumeStats::default()
-            };
-        }
-        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
-        // 2026-08-25, and that reordering is the whole fix.
+        // The zero check runs FIRST (2026-08-25). It used to run second,
+        // behind the representability gate — and that ORDER is what let a
+        // widening-collapse value through: it is not `== 0.0`, so it escaped
+        // the sentinel arm, while `f32_to_f64_clean` turned it into `0.0`
+        // anyway a few lines later. One such packet set open/high/low/close to
+        // 0.0 and pinned `low` there for the rest of the bucket: exactly the
+        // poisons-a-bucket class the day fields were hardened against on
+        // 2026-08-24, still live in the PRIMARY price field because that sweep
+        // only touched `TickPrices`.
         //
-        // It used to sit below, which left a hole the drain's own comment
-        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
-        // and returns early, so a packet carrying LTP = 0 AND
-        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
-        // stayed false, the drain classified it `untraded_sentinel` — a
-        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
-        // DESIGNATED timestamp, so that row lands in a year-2106 partition
-        // that retention and archival, which key on the trading day, can never
-        // reach, while every `max(ts)` and range query over `ticks` silently
-        // includes it.
-        //
-        // One malformed or hostile packet was enough. The band check belongs
-        // above every early return that can still produce a persisted row, not
-        // merely above the fold.
-        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
-        {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
-            return ConsumeStats {
-                refused_timestamp: true,
-                ..ConsumeStats::default()
-            };
-        }
+        // Swapping the two arms is behaviour-preserving for every other
+        // value: `-0.0 == 0.0` is true in IEEE-754, so negative zero still
+        // classifies as the untraded sentinel exactly as before, and NaN,
+        // ±Inf, negatives and over-range values all still fail the gate below.
         if p == 0.0 {
             counter!("tv_aggregator_tick_refused_total", "reason" => "untraded_sentinel")
                 .increment(1);
             return ConsumeStats {
                 untraded_sentinel: true,
+                ..ConsumeStats::default()
+            };
+        }
+        // Widened HERE rather than after the slot lookup (2026-08-25), because
+        // the gate below tests the WIDENED value and this is the only way to
+        // do that without paying a second conversion. Steady-state cost is
+        // unchanged — the same single `TickPrices::from_tick` that always ran,
+        // just earlier; a refused tick now pays a conversion it did not,
+        // which is ~2% of arrivals against 100% for the alternative.
+        let prices = TickPrices::from_tick(tick);
+        // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
+        #[allow(clippy::manual_range_contains)]
+        let raw_is_representable = p.is_finite() && p > 0.0 && p <= MAX_PLAUSIBLE_LTP;
+        // The second half is the real fix, and it is deliberately stated as a
+        // property of the OUTPUT rather than a new threshold on the input.
+        //
+        // `f32_to_f64_clean` formats through a 24-byte buffer, and Rust's f32
+        // `Display` never uses scientific notation — so any value whose plain
+        // decimal rendering overflows that buffer parses back as `0.0`. That
+        // is a WIDER class than subnormals: `f32::MIN_POSITIVE` is a perfectly
+        // normal float and still collapses (pinned by
+        // `aggregator_cell::tests::test_tick_prices_subnormal_day_field_collapses_to_sentinel`),
+        // so an `is_normal()` gate would have looked like a fix and let the
+        // headline case straight through. Testing the widened value catches
+        // every member of the class without inventing a lower price bound that
+        // might refuse a legitimate five-paise option premium.
+        let price_is_representable = raw_is_representable && prices.last_traded_price > 0.0;
+        if !price_is_representable {
+            counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
+            return ConsumeStats {
+                refused_price: true,
                 ..ConsumeStats::default()
             };
         }
@@ -622,12 +628,12 @@ impl MultiTfAggregator {
         let baseline = slot.last_cumulative;
         let mut stats = ConsumeStats::default();
 
-        // Widen the tick's prices ONCE, not once per timeframe. The three
-        // source fields are identical across all `TF_COUNT` timeframes, and
-        // `f32_to_f64_clean` costs a decimal round-trip (~50 ns) rather than a
-        // cast — folding it inside this loop multiplied one tick's conversion
-        // cost by `TF_COUNT × 3` for no added information.
-        let prices = TickPrices::from_tick(tick);
+        // `prices` was widened above the price gate — ONCE per tick, not once
+        // per timeframe. The three source fields are identical across all
+        // `TF_COUNT` timeframes, and `f32_to_f64_clean` costs a decimal
+        // round-trip (~50 ns) rather than a cast, so folding it inside this
+        // loop would multiply one tick's conversion cost by `TF_COUNT × 3`
+        // for no added information.
 
         // Same reasoning, and a stronger reason besides: this one is a
         // comparison against the PREVIOUS PACKET, so it is only meaningful
@@ -665,29 +671,17 @@ impl MultiTfAggregator {
         // bucket's baseline matches what was just written — never the
         // truncated `u32` when a `u64` override was supplied.
         //
-        // ADVANCE ONLY. This was an UNCONDITIONAL assignment and that was a
-        // live data-corruption defect, measured 2026-08-24: the same trading
-        // day tiled five ways did not sum to one volume total (1s
-        // 40,397,638,853 vs 1d 4,372,993,982 — the intraday frames were ~9.2x
-        // the day bar, and 6,088 instruments disagreed with their own 1m sum).
-        //
-        // Mechanism: `tick.volume` is DAY-CUMULATIVE. `FeedStrategy::DEFAULT`
-        // is `Refold`, so late ticks are routine (10.0% of live ticks arrive
-        // >1h behind receive time) and every timeframe can return
-        // `DiscardLate` — yet the store below still ran, writing that late
-        // tick's SMALLER cumulative. The next bucket then opened on a baseline
-        // BELOW the volume already traded, and `cumulative - baseline`
-        // double-counted the difference. The regression is silently
-        // self-amplifying because nothing downstream can see a baseline.
-        //
-        // Refusing the regression is the only correct answer: a cumulative
-        // counter cannot legitimately go down within a day, so a smaller value
-        // is stale, never news. It is counted so the correction is visible.
-        if cumulative_volume > slot.last_cumulative {
-            slot.last_cumulative = cumulative_volume;
-        } else if cumulative_volume < slot.last_cumulative {
-            counter!("tv_aggregator_cumulative_regression_total").increment(1);
-        }
+        // MONOTONIC, not last-write-wins (2026-08-25). Cumulative traded
+        // volume only ever rises within a session, so a lower arrival is an
+        // out-of-order packet — and this feed reorders, which is why
+        // `LatePolicy::Refold` exists at all. Last-write-wins let such a
+        // packet LOWER the baseline; the next bucket then opened with a
+        // `bucket_start_cumulative` below the true figure and DOUBLE-COUNTED
+        // the slice already attributed to the bucket before it. The in-bucket
+        // fold was made monotonic on 2026-08-24 (`state.volume.max(..)`), but
+        // that guard sits on the fold path and structurally cannot reach the
+        // open path — this is the other end of the same argument.
+        slot.last_cumulative = slot.last_cumulative.max(cumulative_volume);
         stats
     }
 
@@ -760,6 +754,22 @@ impl MultiTfAggregator {
                     on_seal(feed, sid, seg, tf, state);
                 }
             }
+            // Reset the SLOT's day-scoped state too (2026-08-25).
+            // `force_seal` resets the CELL's day state — `last_seen_day_high`,
+            // `last_seen_day_low`, `last_observed_ts`, `armed_for_day_open` —
+            // but `last_cumulative` lives out here on the slot, and nothing
+            // touched it. Cumulative volume restarts at ~0 each session, so a
+            // process spanning midnight opened day 2's first bucket with
+            // YESTERDAY's final cumulative as the baseline: `saturating_sub`
+            // floored every bucket to 0, and with the monotonic `max` above it
+            // would have STAYED pinned there. D1 is the worst case — its
+            // bucket opens once per day, so the whole daily bar would read
+            // zero volume.
+            //
+            // Masked today only because the box stops at 17:30 and restarts
+            // with `last_cumulative: 0`. A schedule change would have made it
+            // live, silently, with no counter moving.
+            slot.last_cumulative = 0;
         }
         emitted
     }
@@ -1044,6 +1054,210 @@ mod tests {
             s.low,
             s.close,
         )
+    }
+
+    // -- 2026-08-25 volume-baseline + price-gate regressions ----------------
+
+    /// Reads a sealed M1 bar's volume for `bucket_start`, sealing by pushing a
+    /// tick well past the day so every open bucket closes.
+    fn m1_volumes(agg: &mut MultiTfAggregator, sid: u64) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        agg.force_seal_all(|_, s, _, tf, st| {
+            if s == sid && tf == TfIndex::M1 {
+                out.push((st.bucket_start_ist_secs, st.volume));
+            }
+        });
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn test_an_out_of_order_packet_cannot_lower_the_next_buckets_volume_baseline() {
+        // The bite test for the 2026-08-25 baseline fix. Cumulative traded
+        // volume only rises within a session, so a LOWER arrival is a
+        // reordered packet — and this feed reorders, which is why
+        // `LatePolicy::Refold` exists. Under last-write-wins the stale packet
+        // lowered `last_cumulative`; the next bucket then opened with a
+        // baseline below the true figure and DOUBLE-COUNTED the slice already
+        // charged to the bucket before it.
+        //
+        // Revert `slot.last_cumulative.max(cumulative_volume)` back to a plain
+        // assignment and minute two's volume reads 900 instead of 500.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DISCARD);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+
+        // Minute one: cumulative climbs 100 -> 500.
+        let _ = agg.consume_tick(Feed::Dhan, &tick(13, SEG_IDX, OPEN, 100.0, 100), None, sink);
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 30, 101.0, 500),
+            None,
+            sink,
+        );
+        // A reordered straggler carrying a STALE cumulative, still inside
+        // minute one. Its own bar is protected by the in-bucket `max`; the
+        // baseline it leaves behind is what this test is about.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 40, 101.0, 100),
+            None,
+            sink,
+        );
+        // Minute two: cumulative reaches 1000, so the true bucket volume is
+        // 1000 - 500 = 500.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 65, 102.0, 1000),
+            None,
+            sink,
+        );
+
+        let vols = m1_volumes(&mut agg, 13);
+        let minute_two = vols
+            .iter()
+            .find(|(b, _)| *b == OPEN + 60)
+            .expect("minute two sealed");
+        assert_eq!(
+            minute_two.1, 500,
+            "minute two must charge only its own slice (1000-500), never the \
+             400 already charged to minute one"
+        );
+    }
+
+    #[test]
+    fn test_the_day_close_seal_clears_the_slot_volume_baseline() {
+        // `force_seal` resets the CELL's day state; `last_cumulative` lives on
+        // the SLOT and was never reset. A process spanning midnight opened day
+        // two's first bucket with yesterday's final cumulative as baseline —
+        // `saturating_sub` floored every bucket to 0, and with the monotonic
+        // `max` above it would have STAYED pinned there. D1 is the worst case:
+        // one bucket per day, so the entire daily bar reads zero volume.
+        //
+        // Delete the `slot.last_cumulative = 0;` line in `force_seal_all` and
+        // day two's volume reads 0 instead of 300.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DISCARD);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN, 100.0, 9_000),
+            None,
+            sink,
+        );
+        // Session close: this is the production day-boundary seal.
+        let _ = agg.force_seal_all(|_, _, _, _, _| {});
+
+        // Day two — cumulative restarts near zero, as the exchange does.
+        let open2 = OPEN + 86_400;
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, open2, 100.0, 100),
+            None,
+            sink,
+        );
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, open2 + 30, 101.0, 400),
+            None,
+            sink,
+        );
+
+        let mut day2 = None;
+        agg.force_seal_all(|_, s, _, tf, st| {
+            if s == 13 && tf == TfIndex::M1 && st.bucket_start_ist_secs == open2 {
+                day2 = Some(st.volume);
+            }
+        });
+        // 400, not 300: a fresh session's baseline is 0, so the first bar
+        // legitimately owns everything traded since the open — including the
+        // 100 the first packet reported. Without the reset the baseline is
+        // yesterday's 9,000, `saturating_sub` floors both packets, and the bar
+        // reads 0.
+        assert_eq!(
+            day2,
+            Some(400),
+            "day two's first bar must charge the whole session-to-date volume, \
+             not be floored to zero by yesterday's 9,000 cumulative"
+        );
+    }
+
+    #[test]
+    fn test_a_price_that_widens_to_zero_is_refused_rather_than_zeroing_the_bar() {
+        // `f32::MIN_POSITIVE` is finite, greater than zero, and inside the
+        // ceiling — so the old raw-value gate passed it — and it is not
+        // `== 0.0`, so it escaped the untraded-sentinel arm too.
+        // `f32_to_f64_clean` then collapsed it to 0.0 (Rust's f32 Display
+        // never uses scientific notation, so it overflows the 24-byte format
+        // buffer), setting open/high/low/close to zero and PINNING `low` there
+        // for the rest of the bucket.
+        //
+        // Note it is a NORMAL float: an `is_normal()` gate — the obvious fix,
+        // and the one first attempted here — lets this exact value through.
+        // The gate tests the WIDENED value for that reason.
+        //
+        // Drop `&& prices.last_traded_price > 0.0` from the gate and the bar's
+        // low reads 0.0.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DISCARD);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN, 24_000.0, 10),
+            None,
+            sink,
+        );
+        let stats = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 5, f32::MIN_POSITIVE, 11),
+            None,
+            sink,
+        );
+        assert!(
+            stats.refused_price,
+            "a subnormal must be refused as an unrepresentable price"
+        );
+        assert!(
+            !stats.untraded_sentinel,
+            "it is not the zero sentinel — mislabelling it would hide the class"
+        );
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, OPEN + 10, 24_010.0, 12),
+            None,
+            sink,
+        );
+
+        let mut low = None;
+        agg.force_seal_all(|_, s, _, tf, st| {
+            if s == 13 && tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN {
+                low = Some(st.low);
+            }
+        });
+        assert_eq!(
+            low,
+            Some(24_000.0),
+            "the bar's low must be the real low, not a zero left by one \
+             mangled packet"
+        );
+    }
+
+    #[test]
+    fn test_the_zero_sentinel_still_classifies_as_untraded_after_the_gate_swap() {
+        // The zero check moved AHEAD of the representability gate. Pin that
+        // both zeros still land in the sentinel bucket rather than being
+        // relabelled as bad prices — `-0.0 == 0.0` is true in IEEE-754, and
+        // that equality is what keeps negative zero classified correctly.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DISCARD);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        for price in [0.0_f32, -0.0_f32] {
+            let stats =
+                agg.consume_tick(Feed::Dhan, &tick(13, SEG_IDX, OPEN, price, 1), None, sink);
+            assert!(
+                stats.untraded_sentinel,
+                "{price} must be the untraded sentinel, not a refused price"
+            );
+            assert!(!stats.refused_price);
+        }
     }
 
     // -- construction / accessors -------------------------------------------

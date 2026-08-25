@@ -143,9 +143,51 @@ const _: () = assert!(
 /// Dhan's REST tape, being a post-hoc query, always has them.
 pub const TAIL_UNSEALED_MINUTES: i64 = 2;
 
+/// Minutes in the COMPARED session window, derived from this module's own two
+/// bounds so the row cap below can never disagree with the window the
+/// comparator actually classifies against.
+///
+/// **⚠ Deliberately derived from THIS module's 15:30 close, not the fold's.**
+/// `tf_index::MARKET_CLOSE_SECS_OF_DAY_IST` is 15:40 (the 2026-08-03 NSE CAS
+/// change), so live bars in `[15:30, 15:40)` are folded and persisted but
+/// classified `out_of_session` here and never compared. Which bound is right
+/// is a real question about whether Dhan's REST tape publishes 1-minute
+/// candles for the closing-auction window, and it is NOT settled by picking
+/// the larger number: widening this to 15:40 while the REST side has no bars
+/// there would turn ~81 quietly-uncompared rows a day into thousands of
+/// `missing_rest` entries and make the verdict look worse for a reason that is
+/// not loss. Left at 15:30 and recorded, pending evidence from a live tape.
+pub const SESSION_MINUTES: usize =
+    ((SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / SECS_PER_MINUTE) as usize;
+
+/// How many instruments one run can read a FULL day for.
+///
+/// Stated as a coverage promise rather than left implicit in a row count: at
+/// or below this many instruments the live read is complete, and above it the
+/// run reports `partial`. Today's live universe is ~868 distinct instruments
+/// (~119 NSE indices + ~750 NTM constituents), so this carries better than 2×
+/// headroom.
+pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
+
 /// Row cap for the live-side `/exec` read. Beyond it the run is stamped
 /// `partial` rather than silently comparing a truncated day.
-pub const LIVE_ROW_LIMIT: usize = 200_000;
+///
+/// **Derived, not a round number (2026-08-25).** This was the literal
+/// `200_000`, which at today's ~868 instruments covers `200_000 / 868 ≈ 230`
+/// of the session's 385 minutes — and because the query is
+/// `ORDER BY ts ASC LIMIT n`, truncation drops the TAIL: the comparator was
+/// verifying the morning and never the afternoon, every day. It reported
+/// `partial` for it, so this was a coverage limit rather than a false-OK — but
+/// nothing connected the number to the universe it had to cover, so nobody
+/// could see that it had stopped being enough.
+///
+/// **⚠ It does NOT cover the authorized ceiling.** `MAX_DAILY_UNIVERSE_SIZE`
+/// is 25,000, which would need `25_000 × 385 ≈ 9.6M` rows in one response —
+/// not a cap raise but a paginated or per-instrument read, i.e. a design
+/// change. Until then a universe past [`LIVE_COVERED_INSTRUMENTS`] verifies
+/// its morning and says `partial`. Stated here so the next widening does not
+/// discover it from a puzzling verdict.
+pub const LIVE_ROW_LIMIT: usize = LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES;
 
 // ---------------------------------------------------------------------------
 // Config — DEFAULT OFF
@@ -165,9 +207,25 @@ pub const LIVE_ROW_LIMIT: usize = 200_000;
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DhanLiveCrossverifyConfig {
-    /// Master switch. Default OFF.
-    #[serde(default)]
-    pub enabled: bool,
+    // 2026-08-25 — the `enabled: bool` field that stood here is DELETED.
+    //
+    // It documented itself as "Master switch. Default OFF" and defaulted to
+    // `false`, and it had ZERO production readers: a workspace scan found it
+    // referenced only by two of its own tests. The comparator's real and only
+    // gate is `crossverify_deps_installed()` in `dhan_feed_stack`, which
+    // refuses loudly when no provider is installed. So the field asserted the
+    // opposite of the truth in BOTH directions — a reader could set it false
+    // and the comparator would keep running, or read "default OFF" and
+    // conclude the comparator never runs when in fact it runs every day.
+    //
+    // Deleted rather than wired, deliberately. Wiring it would honour its
+    // stated default and SILENTLY STOP the only ground truth a feed with no
+    // sequence number and no snapshot-on-subscribe has — nothing sets it to
+    // true, because the struct is never deserialised from any config file and
+    // has no section in any TOML. Turning the comparator off is an operator
+    // decision with its own dated quote, not a side effect of tidying a
+    // struct. The remaining three knobs ARE read (`run_budget_secs`,
+    // `fetch_timeout_secs` and `tolerance_paise`, all in `run_once`).
     /// OHLC comparison tolerance in PAISE. Default `0` = paise-exact.
     ///
     /// Integer paise, never a float epsilon: a float `|a - b| <= eps` compare
@@ -178,6 +236,17 @@ pub struct DhanLiveCrossverifyConfig {
     /// Per-instrument REST fetch timeout (seconds).
     #[serde(default = "default_fetch_timeout_secs")]
     pub fetch_timeout_secs: u64,
+    /// Timeout for the ONE live-side QuestDB read (seconds).
+    ///
+    /// Separate from [`Self::fetch_timeout_secs`] since 2026-08-25. The live
+    /// read used to share it, which coupled two operations that differ by
+    /// three orders of magnitude: one 8-column REST call for a single
+    /// instrument's day, versus a scan returning up to [`LIVE_ROW_LIMIT`] rows
+    /// for the whole universe. Sharing the knob meant any raise of the row cap
+    /// converted honest truncation into a hard `Err` that aborts the entire
+    /// run — strictly worse than the partial verdict it replaced.
+    #[serde(default = "default_live_read_timeout_secs")]
+    pub live_read_timeout_secs: u64,
     /// Whole-run wall-clock budget (seconds). On elapse the run is stamped
     /// `partial` / `degraded` — never a fabricated clean verdict.
     #[serde(default = "default_run_budget_secs")]
@@ -187,16 +256,40 @@ pub struct DhanLiveCrossverifyConfig {
 const fn default_fetch_timeout_secs() -> u64 {
     10
 }
+/// 60s for one bulk scan of up to [`LIVE_ROW_LIMIT`] rows. Generous on
+/// purpose: this read happens ONCE per day on a cold path at 15:31, an hour
+/// before the box stops, and its failure costs the whole day's verification.
+const fn default_live_read_timeout_secs() -> u64 {
+    60
+}
+/// Whole-run budget.
+///
+/// **Derived from the vendor's own rate limit (2026-08-25), not a round
+/// number.** The REST leg is a SEQUENTIAL loop over every target, and the Dhan
+/// Data API budget is 5 requests/sec (`no-rest-except-live-feed-2026-06-27.md`
+/// §8), so ~868 targets need at least `868 / 5 ≈ 174s` even at a perfect rate.
+/// The old `240` left ~66s of margin for the live read plus every slow
+/// response — and the moment the 2026-08-25 `instrument` fix makes the ~750
+/// equity targets return real bars instead of empty sets, those responses stop
+/// being fast failures and start costing real time. 600s restores real margin
+/// and still finishes well inside the ~2 hours between the 15:31 fire and the
+/// 17:30 stop.
+///
+/// This does NOT make the run cover more instruments than the budget allows —
+/// it stops the budget from being the binding constraint at today's size. Past
+/// ~3,000 targets it becomes binding again, and the run reports
+/// `budget_elapsed` rather than pretending the un-fetched targets were clean.
 const fn default_run_budget_secs() -> u64 {
-    240
+    600
 }
 
 impl Default for DhanLiveCrossverifyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // (no `enabled` field — see the note on the struct)
             tolerance_paise: 0,
             fetch_timeout_secs: default_fetch_timeout_secs(),
+            live_read_timeout_secs: default_live_read_timeout_secs(),
             run_budget_secs: default_run_budget_secs(),
         }
     }
@@ -229,11 +322,25 @@ impl DhanLiveCrossverifyConfig {
                 self.tolerance_paise
             ));
         }
-        if self.fetch_timeout_secs == 0 || self.run_budget_secs == 0 {
+        if self.fetch_timeout_secs == 0
+            || self.run_budget_secs == 0
+            || self.live_read_timeout_secs == 0
+        {
             return Err(
-                "[dhan_live_crossverify] fetch_timeout_secs and run_budget_secs must be > 0"
+                "[dhan_live_crossverify] fetch_timeout_secs, run_budget_secs and \
+                 live_read_timeout_secs must be > 0"
                     .to_string(),
             );
+        }
+        // The live read happens BEFORE the REST loop and inside the same
+        // budget, so a live timeout at or above the budget would spend the
+        // entire run on one query and fetch nothing to compare it against.
+        if self.live_read_timeout_secs >= self.run_budget_secs {
+            return Err(format!(
+                "[dhan_live_crossverify] live_read_timeout_secs ({}) must be below \
+                 run_budget_secs ({}) — otherwise one query can consume the whole run",
+                self.live_read_timeout_secs, self.run_budget_secs
+            ));
         }
         if self.fetch_timeout_secs > self.run_budget_secs {
             return Err(format!(
@@ -975,8 +1082,13 @@ pub async fn run_cross_verification(
     let budget = std::time::Duration::from_secs(cfg.run_budget_secs);
     let fetch_timeout = std::time::Duration::from_secs(cfg.fetch_timeout_secs);
 
-    let (live, truncated, live_malformed) =
-        read_live_side(client, questdb_exec_url, day_start_ist_nanos, fetch_timeout).await?;
+    let (live, truncated, live_malformed) = read_live_side(
+        client,
+        questdb_exec_url,
+        day_start_ist_nanos,
+        std::time::Duration::from_secs(cfg.live_read_timeout_secs),
+    )
+    .await?;
 
     let mut rest: Vec<SideBar> = Vec::new();
     let mut rest_failures = 0usize;
@@ -1688,21 +1800,124 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn config_default_is_off_and_paise_exact() {
+    fn the_live_row_cap_covers_a_whole_day_for_the_stated_instrument_count() {
+        // The cap used to be the literal 200_000, which at today's ~868
+        // instruments covers 230 of the session's 385 minutes — and because
+        // the query is `ORDER BY ts ASC LIMIT n`, truncation drops the TAIL,
+        // so the comparator verified every morning and no afternoon. Nothing
+        // connected the number to the universe it had to cover, so nobody
+        // could see it had stopped being enough.
+        assert_eq!(SESSION_MINUTES, 375, "09:15 to 15:30 is 375 minutes");
+        assert_eq!(
+            LIVE_ROW_LIMIT,
+            LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES,
+            "the cap must stay DERIVED — a literal cannot track the universe"
+        );
+
+        // The promise, stated as arithmetic rather than trusted: a full day
+        // for every instrument up to the covered count fits.
+        const TODAYS_LIVE_UNIVERSE: usize = 868;
+        assert!(
+            TODAYS_LIVE_UNIVERSE * SESSION_MINUTES <= LIVE_ROW_LIMIT,
+            "today's universe must fit without truncation"
+        );
+        assert!(
+            LIVE_COVERED_INSTRUMENTS >= 2 * TODAYS_LIVE_UNIVERSE,
+            "keep real headroom, not a cap that today only just clears"
+        );
+
+        // And the limit of that promise, stated too: the authorized ceiling
+        // does NOT fit, and the fix for that is pagination, not a bigger
+        // number. A run past the covered count reports `partial`.
+        const AUTHORIZED_CEILING: usize = 25_000;
+        assert!(
+            AUTHORIZED_CEILING * SESSION_MINUTES > LIVE_ROW_LIMIT,
+            "if this ever passes, the pagination follow-up was done or the \
+             ceiling moved — update the doc comment either way"
+        );
+    }
+
+    #[test]
+    fn the_live_read_timeout_is_its_own_knob_and_fits_inside_the_budget() {
+        // Sharing `fetch_timeout_secs` coupled a single-instrument REST call
+        // to a whole-universe scan. Any raise of the row cap then turned
+        // honest truncation into a hard error that aborts the entire run —
+        // strictly worse than the partial verdict it replaced.
         let c = DhanLiveCrossverifyConfig::default();
-        assert!(!c.enabled, "the comparator must default OFF (fail-safe)");
+        assert!(
+            c.live_read_timeout_secs > c.fetch_timeout_secs,
+            "a whole-universe scan needs longer than one instrument's fetch"
+        );
+        assert!(
+            c.live_read_timeout_secs < c.run_budget_secs,
+            "one query must not be able to consume the whole run"
+        );
+        // The budget must clear the vendor's 5 req/sec pace for today's
+        // universe, or the REST leg is cut off before it finishes.
+        const TODAYS_TARGETS: u64 = 868;
+        const DHAN_DATA_API_PER_SEC: u64 = 5;
+        assert!(
+            c.run_budget_secs > TODAYS_TARGETS / DHAN_DATA_API_PER_SEC,
+            "the budget must exceed the minimum time the rate limit imposes"
+        );
+
+        let mut bad = c.clone();
+        bad.live_read_timeout_secs = bad.run_budget_secs;
+        assert!(
+            bad.validate().is_err(),
+            "a live timeout at or above the budget must be refused at boot"
+        );
+        let mut zero = c;
+        zero.live_read_timeout_secs = 0;
+        assert!(zero.validate().is_err(), "a zero timeout fails every read");
+    }
+
+    #[test]
+    fn config_default_is_paise_exact() {
+        let c = DhanLiveCrossverifyConfig::default();
         assert_eq!(c.tolerance_paise, 0, "default is paise-exact");
         assert!(c.validate().is_ok());
     }
 
     #[test]
-    fn absent_config_section_deserializes_to_disabled() {
+    fn absent_config_section_deserializes_to_the_working_defaults() {
         // An entirely absent section (no keys at all) must still deserialize
-        // to the disabled default — the fail-safe posture.
+        // to usable knobs rather than zeros — a zero timeout would make every
+        // fetch fail instantly and the run permanently `degraded`.
+        //
+        // This used to additionally assert `!c.enabled`. That field is gone
+        // (2026-08-25): it had no production reader, so it asserted a
+        // "fail-safe posture" the code never implemented. The comparator's
+        // real gate is `crossverify_deps_installed()`.
         let c: DhanLiveCrossverifyConfig =
             serde_json::from_str("{}").expect("absent section deserializes");
-        assert!(!c.enabled);
         assert_eq!(c, DhanLiveCrossverifyConfig::default());
+        assert!(c.fetch_timeout_secs > 0, "a zero timeout fails every fetch");
+        assert!(c.run_budget_secs > 0, "a zero budget completes no target");
+    }
+
+    #[test]
+    fn the_config_carries_no_dead_enabled_switch() {
+        // Pins the 2026-08-25 deletion. A `bool` named `enabled` on this
+        // struct with no reader is worse than no switch at all: it tells the
+        // next reader the comparator can be turned off here, and it cannot.
+        // Re-adding one must come with a real gate and an operator decision,
+        // because honouring its stated default would silently stop the only
+        // ground truth this feed has.
+        let src = include_str!("dhan_live_crossverify.rs");
+        // Assembled at runtime so this line does not match itself — the first
+        // version of this test failed against its own source, which is the
+        // classic way a source-scanning guard reports a defect it invented.
+        let needle = format!("pub {}", "enabled");
+        let decl = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains(&needle));
+        assert!(
+            !decl,
+            "DhanLiveCrossverifyConfig must not declare an `enabled` field \
+             unless something actually reads it"
+        );
     }
 
     #[test]
