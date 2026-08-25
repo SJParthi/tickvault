@@ -877,9 +877,16 @@ day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** wit
   the remedy). Automating the remediation needs its own dated quote that says so in as
   many words.
 - **An `Errors` alarm catches a Lambda that THROWS.** A Lambda that returns success
-  having done nothing useful is invisible to it — `start_watchdog`'s own not-invoked
-  alarm exists because a dropped schedule produces no error at all, and that class is
-  unchanged here.
+  having done nothing useful is invisible to it, because a dropped schedule produces
+  no error at all. **CORRECTED 2026-08-25 (same day, by an adversarial re-read):** an
+  earlier draft of this row claimed `start_watchdog` has "its own not-invoked alarm".
+  It does NOT. A tree-wide scan for `metric_name = "Invocations"` returns exactly TWO
+  alarms — on `dhan-token-minter` and `market-hours-liveness-gate` — and
+  `start-watchdog-lambda.tf` declares one alarm only. So the component that STARTS the
+  trading box every morning is blind to the 2026-07-02 repo-wide scheduler-drop class,
+  and this row asserted the opposite while pointing at it as reassurance. Adding that
+  alarm is a real follow-up; claiming it already existed was exactly the false-OK this
+  file exists to stop.
 
 #### What a PR that violates §2.3f looks like (REJECT)
 
