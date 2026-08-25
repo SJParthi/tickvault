@@ -661,6 +661,64 @@ locals {
       ok_recovery = false # chosen once per boot - an auto-OK means the datapoint aged out, not that the next session widened
       desc        = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 - a 99.98% loss of market data - and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
+
+    # 2026-08-25 (operator: "Fix wbrytjonf dude oaku", given in direct response
+    # to a message whose open-items list named this alarm and said it needed his
+    # go — the §2.3f dated authorization, written before this terraform).
+    #
+    # The 15:41 live-vs-official cross-verification is the ONLY ground truth the
+    # revived Dhan feed has, and until now neither of its failure verdicts
+    # reached anything: `tv_dhan_feed_xverify_runs_total` is in NEITHER EMF
+    # selector copy, and the error line carries WS-GAP-03, which has ~50 emit
+    # sites in dhan_feed_stack.rs.
+    #
+    # FOUR conditions, not the usual two. `$.level = "ERROR"` excludes the info
+    # arms; the two `$.source` values were added by PR #1808 SPECIFICALLY so
+    # this filter could exist, and they appear on exactly these two emits. A
+    # bare `$.code = "WS-GAP-03"` filter would page on every dial failure and
+    # reconnect — the RISK-GAP-03 noise trap (25 pages in one session) with 50x
+    # the surface, and the same mistake §2.3d-i records being approved and then
+    # caught before it shipped.
+    #
+    # Why a log filter and not a metric: the counter name is 31 bytes and needs
+    # 32 with its separating pipe, against 31 free in the user-data budget
+    # (§2.3d-ii). The EMF route misses by ONE byte; this lane costs none.
+    #
+    # ok_recovery = false: the comparison runs ONCE per session, so an auto-OK
+    # an hour later means the datapoint aged out, never that anything compared.
+    # SPLIT INTO TWO ENTRIES, deliberately (2026-08-25, same change).
+    #
+    # The first draft was ONE entry matching both verdicts with
+    # `($.source = "a" || $.source = "b")`. `terraform plan` accepted it — and
+    # that acceptance means nothing here: the provider treats `pattern` as an
+    # opaque string, so filter-pattern SYNTAX is parsed only by the real
+    # PutMetricFilter call at APPLY time. A malformed pattern would therefore
+    # sail through every PR check and break the post-merge apply lane.
+    #
+    # Two single-condition entries use only the shape already proven live by
+    # ws-gap-03-universe-collapse above. It costs one extra alarm (~$0.10/mo)
+    # and buys better triage anyway: the two verdicts have DIFFERENT causes and
+    # different next steps, so naming them separately tells the operator which
+    # one fired without opening the log.
+    "ws-gap-03-xverify-vacuous" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_vacuous\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run compared
+      desc        = "WS-GAP-03 cross-verify VACUOUS: the 15:41 live-vs-official comparison RAN and compared ZERO minutes. This is not a pass with no findings - it is no measurement at all, and a vacuous run rendering as 'no mismatches' is the false-OK class this repo has already retired twice. The comparison is the only ground truth the DHAN live feed has: the one check separating a lane that captures real ticks from one that merely dials. Triage from the same log line: missing_live high means the live lane produced no candles for the window (check tv_dhan_feed_last_tick_age_secs and the no-ticks alarm); missing_rest high means the official REST leg did not serve it (check the spot-1m leg). Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
+
+    "ws-gap-03-xverify-failed" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_failed\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
+      desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 live-vs-official comparison errored out, so the day's captured candles are UNVERIFIED - never assume they are clean. Distinct from the vacuous alarm: that one ran and found nothing to compare; this one did not complete. The comparison is the only ground truth the DHAN live feed has. Triage: the same log line carries the underlying error verbatim in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
   }
 }
 

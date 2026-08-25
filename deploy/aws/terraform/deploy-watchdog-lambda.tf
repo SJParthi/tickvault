@@ -290,3 +290,38 @@ output "binary_sha_stale_alarm_name" {
   description = "B9 deploy provenance: CloudWatch alarm firing when the deployed binary's git SHA lags main HEAD across a full 24h of watchdog samples"
   value       = aws_cloudwatch_metric_alarm.binary_sha_stale.alarm_name
 }
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# None of the six was ever decided about: the seven that ARE alarmed were each
+# added by the PR that created them, and these six by PRs that did not think
+# to. The ratchet added alongside makes that omission fail the build.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_errors" {
+  alarm_name          = "tv-${var.environment}-deploy-watchdog-errors"
+  alarm_description   = "The DEPLOY WATCHDOG itself FAILED - the check that catches a box booted on a STALE BINARY (the 2026-07-09 incident class). While it is broken a stale-binary boot is unreported, so the box can run all day on code nobody shipped. Triage: read the Lambda log group."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.deploy_watchdog.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (the round-14 precedent): these run on a schedule, so the
+  # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
+  # lookback — never that anything was fixed. The telegram-webhook Lambda
+  # forwards every OK as a green "recovered" page, so a symmetric ok_actions
+  # here would produce a Rule-11 false recovery per failure episode. The real
+  # recovery signal is the NEXT scheduled run succeeding.
+  ok_actions = []
+}
