@@ -1096,14 +1096,26 @@ impl LiveIngest {
                     );
                 }
                 info!("tick writer thread exiting — the drain closed its queue");
-                // Last act, and deliberately ignored: if the receiver is gone
-                // the shutdown already timed out and said so.
+                // Last act: tell shutdown the queue is fully drained.
                 //
-                // `let _ =` and not `drop(...)`: `SendError<()>` is `Copy`, so
-                // `drop` on it is a no-op the compiler rejects under
-                // `-D warnings` (`dropping_copy_types`). Caught by CI, because
-                // clippy is not installable on this repo's pinned toolchain.
-                let _ = done_tx.send(());
+                // The result is HANDLED, not discarded, and the crate leaves no
+                // third option — `lib.rs` denies `unused_must_use` AND
+                // `clippy::let_underscore_must_use`, so both `drop(...)` and
+                // `let _ = ...` are rejected here by design. That is the right
+                // rule: a failed send is not nothing, it means the receiver
+                // gave up first.
+                //
+                // Which is worth a line, because it is the one case where the
+                // shutdown's own error over-reports: it will already have said
+                // the writer "did not finish", and this says it did — just too
+                // late. Debug rather than warn, since by then the operator has
+                // the louder message and the spill path has the rows.
+                if done_tx.send(()).is_err() {
+                    tracing::debug!(
+                        "tick writer finished AFTER the shutdown grace expired — \
+                         the timeout already reported; the rows are accounted for"
+                    );
+                }
             })?;
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
