@@ -603,14 +603,94 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
 /// under the same `data/` root so one retention sweep can see all three.
 pub const TICK_SPILL_DIR: &str = "data/spill/ticks";
 
-/// Hard ceiling on the spill directory, in bytes (512 MiB).
+/// Floor for the spill-directory ceiling, in bytes (512 MiB).
 ///
-/// A rescue that can fill the root volume is not a rescue — QuestDB and the
-/// frame WAL share this disk, so an unbounded spill would trade a bounded tick
-/// loss for an unbounded outage of everything. Past the cap the rows ARE
-/// dropped and counted, which is the same honest failure as today rather than
-/// a worse one.
-pub const TICK_SPILL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// This WAS the whole ceiling, a fixed 512 MiB, and it cost 1,695,983 ticks in
+/// one event on the live box on 2026-08-25: at 08:33:44 the boot WAL replay's
+/// flush failed, the rescue was refused with "tick spill dir at or past its
+/// 536870912-byte cap", and `tv_ticks_spilled_total` stayed at 0 — no rescue,
+/// permanent loss. The volume it was protecting is **200 GB**, so the ceiling
+/// that destroyed the data was **0.26% of the disk**.
+///
+/// The rationale for HAVING a ceiling was and remains right — QuestDB and the
+/// frame WAL share this disk, and a rescue that can fill the root volume trades
+/// a bounded tick loss for an unbounded outage of everything. What was wrong is
+/// that the number was pinned to no machine in particular. That is a shape this
+/// repository has already repaired once, for exactly this reason: the RAM-store
+/// budget was a hardcoded 10 GiB "sized against the r8g.xlarge 32 GiB host"
+/// until 2026-08-21, when it became a runtime fraction of the host's real
+/// memory. [`tick_spill_max_bytes`] applies that same pattern here.
+///
+/// Retained as the FLOOR so the ceiling can never end up smaller than it was,
+/// and as the fallback when the volume cannot be measured.
+pub const TICK_SPILL_MIN_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Fraction of the volume the spill tier may occupy: one thirty-second.
+///
+/// Not a round number chosen for looks. It has to satisfy two bounds at once:
+/// large enough that a realistic episode of flush failures is absorbed rather
+/// than dropped, and small enough that the tier can never threaten the database
+/// it is rescuing from. On the live 200 GB volume it yields ~6.25 GB — twelve
+/// times the old ceiling, and still leaving over 96.8% of the disk for QuestDB,
+/// the frame WAL and everything else.
+pub const TICK_SPILL_VOLUME_FRACTION: u64 = 32;
+
+/// Ceiling on the spill directory, in bytes — DERIVED from the volume.
+///
+/// Resolved ONCE into a `OnceLock`, so every subsequent read is O(1) and the
+/// enforcement can never disagree with the number a log line quotes. An
+/// unmeasurable volume falls back to [`TICK_SPILL_MIN_MAX_BYTES`] with a coded
+/// warning, never silently.
+///
+/// # Complexity
+/// O(1) after the first call. The first call spawns one `df`, on the cold
+/// flush-failure path only.
+#[must_use]
+pub fn tick_spill_max_bytes() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let probe_at = std::path::Path::new(TICK_SPILL_DIR);
+        // Probe the deepest EXISTING ancestor: `df` on a path that does not
+        // exist yet fails, and the spill dir is created lazily.
+        let mut probe: &std::path::Path = probe_at;
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent,
+                None => break,
+            }
+        }
+        match crate::disk_health_watcher::probe_disk_free_bytes(probe) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { total_bytes, .. }
+                if total_bytes > 0 =>
+            {
+                let derived = total_bytes / TICK_SPILL_VOLUME_FRACTION;
+                // Never BELOW what the fixed cap already allowed: this change
+                // exists to stop losing ticks, so it must not reduce headroom
+                // on a small volume.
+                let ceiling = derived.max(TICK_SPILL_MIN_MAX_BYTES);
+                tracing::info!(
+                    total_bytes,
+                    ceiling_bytes = ceiling,
+                    fraction = TICK_SPILL_VOLUME_FRACTION,
+                    "tick spill ceiling derived from the volume — a failed flush can be \
+                     rescued to disk up to this size before rows are dropped"
+                );
+                ceiling
+            }
+            _ => {
+                tracing::warn!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    fallback_bytes = TICK_SPILL_MIN_MAX_BYTES,
+                    "could not measure the spill volume, so the tick spill ceiling falls back \
+                     to the fixed floor. Rescues past that size will be refused and their \
+                     ticks dropped — on a large volume this is far more conservative than \
+                     necessary"
+                );
+                TICK_SPILL_MIN_MAX_BYTES
+            }
+        }
+    })
+}
 
 /// Appends a failed flush's ILP payload to the spill directory.
 ///
@@ -642,10 +722,11 @@ fn spill_failed_ilp(
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
 
-    if spill_dir_bytes(dir) >= TICK_SPILL_MAX_BYTES {
+    let ceiling = tick_spill_max_bytes();
+    if spill_dir_bytes(dir) >= ceiling {
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
-            format!("tick spill dir at or past its {TICK_SPILL_MAX_BYTES}-byte cap"),
+            format!("tick spill dir at or past its {ceiling}-byte ceiling"),
         ));
     }
 
@@ -2068,13 +2149,31 @@ mod tests {
     }
 
     #[test]
-    fn the_spill_cap_is_a_real_ceiling_not_a_suggestion() {
+    fn the_spill_ceiling_is_a_real_bound_that_scales_with_the_volume() {
         // A rescue that can fill the root volume is not a rescue: QuestDB and
-        // the frame WAL share this disk. Past the cap the rows are dropped and
-        // counted -- the same honest failure as before, never a worse one.
+        // the frame WAL share this disk. Past the ceiling the rows are dropped
+        // and counted -- an honest failure, never a hidden one.
+        //
+        // But the ceiling must also be big enough to actually rescue. The
+        // fixed 512 MiB it replaced was 0.26% of the 200 GB volume, and on
+        // 2026-08-25 it refused a boot-time rescue and 1,695,983 ticks were
+        // lost permanently in one event.
         assert!(
-            TICK_SPILL_MAX_BYTES > 0 && TICK_SPILL_MAX_BYTES <= 1024 * 1024 * 1024,
-            "the cap must be a real bound well under the 200 GB volume"
+            TICK_SPILL_MIN_MAX_BYTES > 0,
+            "the floor must be a real bound"
+        );
+        let ceiling = tick_spill_max_bytes();
+        assert!(
+            ceiling >= TICK_SPILL_MIN_MAX_BYTES,
+            "the derived ceiling must never be SMALLER than the old fixed cap — \
+             this change exists to stop losing ticks, not to tighten the bound"
+        );
+        // Resolved once: the enforcement can never disagree with a logged value.
+        assert_eq!(ceiling, tick_spill_max_bytes(), "must be memoised");
+        // And it must stay a small fraction, whatever the disk.
+        assert!(
+            TICK_SPILL_VOLUME_FRACTION >= 16,
+            "the tier must never be able to threaten the database it rescues from"
         );
         assert_eq!(TICK_SPILL_DIR, "data/spill/ticks");
     }

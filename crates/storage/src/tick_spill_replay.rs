@@ -44,7 +44,8 @@ use tracing::{error, info, warn};
 
 /// Maximum bytes per `/write` POST.
 ///
-/// A spill file may reach `tick_persistence::TICK_SPILL_MAX_BYTES` (512 MiB),
+/// A spill file may reach `tick_persistence::tick_spill_max_bytes()` (a fraction
+/// of the volume; at least 512 MiB),
 /// and posting that as one body is precisely the write pressure that caused
 /// the spill in the first place. 8 MiB is large enough that a normal rescue is
 /// one or two requests and small enough that a full-cap file is paced across
@@ -328,8 +329,33 @@ async fn run_replay_loop(dir: PathBuf, url: String) {
         }
     };
     register_replay_baseline();
+    // DRAIN FIRST, THEN SLEEP (2026-08-25). This loop slept 300s before its
+    // first round, and that ordering cost 1,695,983 ticks on the live box this
+    // morning — permanently, in a single event.
+    //
+    // The reconstructed sequence, from the box's own log and counters:
+    //
+    // | 08:32:12 | process starts; the boot WAL replay fills the tick buffer |
+    // | 08:33:44 | the flush fails; `discard_pending` tries to rescue; the
+    //              spill dir is refused with "at or past its 536870912-byte
+    //              cap"; **1,695,983 ticks dropped, `tv_ticks_spilled_total`
+    //              stays 0**, i.e. no rescue happened |
+    // | ~08:37:12 | this loop finally wakes and drains 544 MB — more than the
+    //              cap, so it had ample room to free, three and a half minutes
+    //              too late |
+    //
+    // Boot is the WORST possible moment to be asleep: a backlog on disk at
+    // boot is not a coincidence, it is the DEFINING case — yesterday's
+    // undrained spill is sitting there by construction, and the boot WAL
+    // replay is simultaneously the largest single flush the process ever
+    // attempts. So the one moment the dir is most likely to be at cap is the
+    // one moment the drainer had guaranteed itself to be idle.
+    //
+    // The interval is unchanged and its reasoning still holds: a spill exists
+    // because QuestDB was already too slow, so steady-state draining stays
+    // unhurried. That argument is about the SECOND round onward. It never
+    // argued for entering the day with a full dir.
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(REPLAY_INTERVAL_SECS)).await;
         let outcome = replay_spill_dir(&dir, &url, &client).await;
         if outcome.files_replayed > 0 || outcome.files_failed > 0 {
             info!(
@@ -339,6 +365,7 @@ async fn run_replay_loop(dir: PathBuf, url: String) {
                 "tick spill drain round complete"
             );
         }
+        tokio::time::sleep(std::time::Duration::from_secs(REPLAY_INTERVAL_SECS)).await;
     }
 }
 
@@ -582,6 +609,39 @@ mod tests {
         for kind in ["timeout", "connect", "body", "decode", "other"] {
             assert!(decl.contains(kind), "missing kind {kind}");
         }
+    }
+
+    #[test]
+    fn the_drain_loop_replays_before_it_sleeps() {
+        // 2026-08-25. This loop slept `REPLAY_INTERVAL_SECS` BEFORE its first
+        // round, and that ordering cost 1,695,983 ticks on the live box in a
+        // single event: the process started 08:32:12, the boot WAL replay's
+        // flush failed at 08:33:44, the rescue was refused with "tick spill
+        // dir at or past its 536870912-byte cap", and this loop woke at
+        // ~08:37:12 and freed 544 MB — three and a half minutes too late.
+        //
+        // Boot is precisely when a backlog is GUARANTEED to be on disk
+        // (yesterday's undrained spill) and when the largest single flush of
+        // the process is attempted. Sleeping through it is exactly backwards.
+        //
+        // Swap the two statements back and this test fails.
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("async fn run_replay_loop")
+            .nth(1)
+            .expect("the drain loop must exist");
+        let loop_body = &body[body.find("loop {").expect("the loop must exist")..];
+        let first_sleep = loop_body
+            .find("tokio::time::sleep")
+            .expect("the loop must still pace itself");
+        let first_replay = loop_body
+            .find("replay_spill_dir(")
+            .expect("the loop must still drain");
+        assert!(
+            first_replay < first_sleep,
+            "the drain must run BEFORE the first sleep — a boot-time backlog is \
+             the defining case, not an edge case"
+        );
     }
 
     #[test]

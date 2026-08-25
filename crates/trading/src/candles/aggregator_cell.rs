@@ -146,7 +146,15 @@ impl Default for FeedStrategy {
 #[must_use]
 pub fn tick_price_is_sane(tick: &ParsedTick) -> bool {
     let p = tick.last_traded_price;
-    p.is_finite() && p > 0.0 && p <= MAX_PLAUSIBLE_LTP
+    // The widened check is the load-bearing half (2026-08-25). A value can be
+    // finite, positive and inside the ceiling and STILL widen to `0.0`:
+    // `f32_to_f64_clean` formats through a 24-byte buffer and Rust's f32
+    // `Display` never uses scientific notation, so anything whose plain
+    // decimal rendering overflows it parses back as zero. `f32::MIN_POSITIVE`
+    // is the headline case and it is a perfectly NORMAL float, which is why an
+    // `is_normal()` gate would not have caught it. Pinned by
+    // `test_tick_prices_subnormal_day_field_collapses_to_sentinel`.
+    p.is_finite() && p > 0.0 && p <= MAX_PLAUSIBLE_LTP && f32_to_f64_clean(p) > 0.0
 }
 
 // ---------------------------------------------------------------------------
@@ -671,12 +679,21 @@ impl AggregatorCell {
             // together burned the day's one chance at the official open on a
             // tick that could not supply it.
             //
-            // That fires EVERY trading day, not in some corner case. The
-            // persistence window opens at 09:00, so pre-open ticks reach this
-            // fold, and during the pre-open the vendor has no session open to
-            // report — `day_open` is 0. The first such tick burned the arm;
-            // every later bucket then saw `use_day_open == false`; and the
-            // real 09:15 open was never stamped into ANY candle that day.
+            // That fired every trading day for as long as pre-open ticks could
+            // reach this fold: during the pre-open the vendor has no session
+            // open to report, so `day_open` is 0. The first such tick burned
+            // the arm; every later bucket then saw `use_day_open == false`;
+            // and the real 09:15 open was never stamped into ANY candle.
+            //
+            // **Corrected 2026-08-25:** this said "the persistence window
+            // opens at 09:00, so pre-open ticks reach this fold". They no
+            // longer do — `MultiTfAggregator::consume_tick` refuses anything
+            // with `secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST` before it gets
+            // here. The consume-on-use rule below is still right and is kept:
+            // it is what makes the arm robust to ANY tick that cannot supply
+            // an open, and a comment describing a reachable path that is no
+            // longer reachable would send the next reader hunting a defect
+            // that has already been closed upstream.
             //
             // Consuming it only on use means a pre-open tick leaves the arm
             // intact, and the first tick that actually carries a positive
@@ -926,16 +943,34 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
 ///   `tv_candle_open_clamped_total` and reads as a legitimate gap-open.
 ///
 /// Deriving the answer from the CLOCK instead of from seal history closes all
-/// three. It is exact for every timeframe, including the ones 09:15 does not
-/// divide evenly (M30 and M60 resolve to the 09:00 bucket, which is the one
-/// that contains the open) and including D1, whose bucket is the whole day.
+/// three. It is exact for every timeframe and including D1, whose bucket is
+/// the whole day.
+///
+/// **Corrected 2026-08-25.** This paragraph used to say M30 and M60 "resolve to
+/// the 09:00 bucket, which is the one that contains the open". They do not, and
+/// no timeframe has a 09:00 bucket: [`TfIndex::bucket_start`] is anchored at
+/// 09:15, not at the epoch, so M30's first bucket is `[09:15, 09:45)`. A reader
+/// trusting the old wording would conclude this function needs a pre-open
+/// carve-out it does not need. The 09:15 anchoring is also what makes the test
+/// reduce to `bucket_start == day_start + 33_300` for every timeframe.
 ///
 /// # Complexity
 /// O(1) — one remainder, one bucket alignment, one compare.
 #[inline]
 fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
     let day_start = bucket_start - (bucket_start % 86_400);
-    bucket_start == tf.bucket_start(day_start + MARKET_OPEN_SECS_OF_DAY_IST)
+    // `saturating_add`, not `+` (2026-08-25). The release profile is
+    // `overflow-checks = true, panic = "abort"`, so an overflowing add here
+    // does not return a wrong answer — it kills the process, taking all 16
+    // sockets with it, for one tick. `day_start` can reach 4_294_944_000, and
+    // `+ 33_300` exceeds `u32::MAX`.
+    //
+    // Unreachable through today's only caller (the plausibility bounds and the
+    // session gate both block it), and hardened anyway for exactly the reason
+    // `TfIndex::bucket_start` and `catch_up_seal` were: a second call site
+    // would silently reintroduce a remote abort, and the cost of preventing
+    // that is one word.
+    bucket_start == tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))
 }
 
 /// True when `raw` is a usable exchange-published price.
