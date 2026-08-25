@@ -1245,3 +1245,107 @@ fn every_alarm_description_fits_the_aws_ceiling_with_its_suffix() {
         over.join("\n  ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// EVERY alarm_description in EVERY .tf file fits the AWS ceiling
+// (2026-08-25 — found by an adversarial sweep for the NEXT apply-lane freeze.)
+//
+// `every_alarm_description_fits_the_aws_ceiling_with_its_suffix` above reads
+// ONE file: error-code-alarms.tf. A sweep of the other 33 found the three
+// longest descriptions in the whole tree sitting in `live-lane-alarms.tf`,
+// unguarded — the worst at 1014 of 1024 characters. TEN characters of
+// headroom, in the file under the most active editing this week.
+//
+// Why this matters more than a lint: AWS rejects an over-length description at
+// PutMetricAlarm — APPLY time, after merge. `terraform plan` passes it. That is
+// precisely how #1805 froze the entire apply lane for hours, and how every
+// change merged behind it sat undeployed. An eleven-character reword of one
+// alarm would do it again.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_alarm_description_in_every_tf_file_fits_the_aws_ceiling() {
+    const AWS_ALARM_DESCRIPTION_MAX: usize = 1024;
+    // `${var.environment}` renders to "prod" (4) but is 20 characters of
+    // source. Interpolations therefore SHRINK on render, so measuring the
+    // source length is conservative in the safe direction.
+    const WARN_BAND: usize = 900;
+
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let mut checked = 0usize;
+    let mut worst = (0usize, String::new());
+    let mut over: Vec<String> = Vec::new();
+    let mut tight: Vec<String> = Vec::new();
+
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("terraform dir must exist")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("tf"))
+        .collect();
+    files.sort();
+
+    for path in &files {
+        let body = std::fs::read_to_string(path).expect("readable .tf");
+        let stripped = strip_hcl_comments(&body);
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+
+        for (idx, line) in stripped.lines().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("alarm_description") {
+                continue;
+            }
+            // Only single-line literal descriptions; an interpolated-only or
+            // heredoc form is skipped rather than mis-measured.
+            let Some(open) = t.find('"') else { continue };
+            let Some(close) = t.rfind('"') else { continue };
+            if close <= open {
+                continue;
+            }
+            let len = t[open + 1..close].len();
+            checked += 1;
+            let where_ = format!("{file}:{}", idx + 1);
+            if len > worst.0 {
+                worst = (len, where_.clone());
+            }
+            if len > AWS_ALARM_DESCRIPTION_MAX {
+                over.push(format!("{where_} = {len} chars"));
+            } else if len > WARN_BAND {
+                tight.push(format!("{where_} = {len} chars"));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 40,
+        "only {checked} alarm_description literals found across {} .tf files — \
+         this guard would be near-vacuous. Did the parser or the layout change?",
+        files.len()
+    );
+
+    assert!(
+        over.is_empty(),
+        "alarm_description over AWS's {AWS_ALARM_DESCRIPTION_MAX}-character ceiling:\n  {}\n\n\
+         PutMetricAlarm REJECTS these at APPLY time and `terraform plan` does NOT — \
+         so this would merge green and then freeze the whole apply lane, leaving \
+         every later change undeployed (the #1805 failure, verbatim). Shorten it.",
+        over.join("\n  ")
+    );
+
+    // Not a failure — a deliberate, visible record of how close the tree is
+    // running, so the next reword is made with the number in view.
+    println!(
+        "alarm_description: {checked} checked across {} files, worst {} at {}, \
+         {} in the {}+ band: {}",
+        files.len(),
+        worst.0,
+        worst.1,
+        tight.len(),
+        WARN_BAND,
+        if tight.is_empty() {
+            "none".to_string()
+        } else {
+            tight.join(", ")
+        }
+    );
+}
