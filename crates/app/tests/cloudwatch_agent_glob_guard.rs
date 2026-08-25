@@ -106,7 +106,13 @@ fn reference_collect_list() -> Vec<(String, String)> {
 /// loads on the box). Only `"file_path"` lines are considered, so comments
 /// / mkdir lines mentioning `data/logs` can never false-fail the guard.
 fn tftpl_file_paths() -> Vec<String> {
-    let body = read("deploy/aws/terraform/user-data.sh.tftpl");
+    // 2026-08-25: the log-collection config now lives ONLY in
+    // deploy/aws/cloudwatch-agent.json — the ~1.6 KB duplicate inside
+    // user-data.sh.tftpl was removed because it pinned that template at
+    // exactly its 15,872-byte EC2 budget with zero bytes free. The template
+    // keeps a minimal host-only fallback (syslog only) and copies this file
+    // into place after the Step 5 clone.
+    let body = read("deploy/aws/cloudwatch-agent.json");
     body.lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("\"file_path\":")?;
@@ -164,25 +170,42 @@ fn test_reference_agent_config_globs_match_observability_constants() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_userdata_inline_config_globs_match_reference() {
-    // The tftpl also ships /var/log/messages to the system group — that
-    // entry is allowlisted; the remaining app-log globs must byte-match the
-    // reference config (which test 1 pins to the observability constants).
-    let mut app_paths: Vec<String> = tftpl_file_paths()
-        .into_iter()
-        .filter(|p| p != "/var/log/messages")
-        .collect();
-    app_paths.sort();
-    let mut expected = vec![expected_errors_glob(), expected_app_glob()];
-    expected.sort();
-    assert_eq!(
-        app_paths, expected,
-        "Z+ L3 RECONCILE drift-guard: user-data.sh.tftpl is the config the box \
-         ACTUALLY loads (`amazon-cloudwatch-agent-ctl -a fetch-config`); its \
-         app-log collect_list globs drifted from deploy/aws/cloudwatch-agent.json \
-         / the observability constants. The 2026-07-06 incident was exactly this \
-         file tailing globs the app no longer writes."
+fn the_userdata_fallback_tails_syslog_only_and_never_the_app_logs() {
+    // RETIRED-AND-REPLACED 2026-08-25.
+    //
+    // This test used to compare the app-log globs in `user-data.sh.tftpl`
+    // against `cloudwatch-agent.json`, because the template embedded a
+    // byte-identical copy of that config. The copy is gone — it was ~1.6 KB
+    // and it pinned the template at exactly its 15,872-byte EC2 budget with
+    // ZERO bytes free — so the template now writes a MINIMAL host-only
+    // fallback and copies the repo file into place after the Step 5 clone.
+    // Comparing the two today would be the file against itself: vacuously
+    // green, which is worse than absent. Test 1 above already pins the real
+    // config against the observability constants.
+    //
+    // What replaces it is the property the new arrangement needs. The
+    // fallback exists for a box whose clone FAILED — which is precisely the
+    // box that has no app binary and therefore no app logs. A fallback that
+    // declared app-log globs would have the agent tailing paths that cannot
+    // exist, which is the 2026-07-06 incident's exact shape (an agent
+    // configured for globs the app no longer writes), re-created in the one
+    // config that runs when nothing else does.
+    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    assert!(
+        user_data.contains("/var/log/messages"),
+        "the host-only fallback must still ship syslog — it is the only log signal a \
+         box whose clone failed can produce"
     );
+    for app_glob in [expected_errors_glob(), expected_app_glob()] {
+        assert!(
+            !user_data.contains(&app_glob),
+            "the user-data fallback declares the app-log glob `{app_glob}`. That config \
+             is in force ONLY when the repo clone failed — the same failure that means \
+             there is no app binary and no app logs. Tailing a path that cannot exist is \
+             the 2026-07-06 incident's shape. App globs belong in \
+             deploy/aws/cloudwatch-agent.json, which user-data copies in after the clone."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,11 +265,11 @@ fn test_stream_names_are_stable() {
         );
     }
     // Deployed config: both stream names must survive verbatim.
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read("deploy/aws/cloudwatch-agent.json");
     for stream in ["{instance_id}/errors-jsonl", "{instance_id}/app"] {
         assert!(
             user_data.contains(&format!("\"log_stream_name\": \"{stream}\"")),
-            "user-data.sh.tftpl lost the stable log stream name `{stream}`"
+            "cloudwatch-agent.json lost the stable log stream name `{stream}`"
         );
     }
 }
