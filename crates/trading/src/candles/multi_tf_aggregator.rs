@@ -52,7 +52,6 @@
 
 use std::collections::HashMap;
 
-use metrics::counter;
 use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
@@ -371,7 +370,9 @@ impl MultiTfAggregator {
         let capacity = self.effective_capacity();
         if self.slots.len() >= capacity {
             self.slots_exhausted_total = self.slots_exhausted_total.saturating_add(1);
-            counter!("tv_aggregator_slot_exhausted_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .slot_exhausted
+                .increment(1);
             if !self.exhausted_logged {
                 self.exhausted_logged = true;
                 tracing::error!(
@@ -490,7 +491,9 @@ impl MultiTfAggregator {
         #[allow(clippy::manual_range_contains)]
         let price_is_representable = p.is_finite() && p >= 0.0 && p <= MAX_PLAUSIBLE_LTP;
         if !price_is_representable {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "price").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .tick_refused_price
+                .increment(1);
             return ConsumeStats {
                 refused_price: true,
                 ..ConsumeStats::default()
@@ -516,14 +519,17 @@ impl MultiTfAggregator {
         if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
             || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
         {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "timestamp").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .tick_refused_timestamp
+                .increment(1);
             return ConsumeStats {
                 refused_timestamp: true,
                 ..ConsumeStats::default()
             };
         }
         if p == 0.0 {
-            counter!("tv_aggregator_tick_refused_total", "reason" => "untraded_sentinel")
+            crate::candles::fold_counters::fold_counters()
+                .tick_refused_untraded_sentinel
                 .increment(1);
             return ConsumeStats {
                 untraded_sentinel: true,
@@ -617,7 +623,9 @@ impl MultiTfAggregator {
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
             slot.last_cumulative = cumulative_volume;
-            counter!("tv_aggregator_slot_volume_baseline_seeded_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .slot_volume_baseline_seeded
+                .increment(1);
         }
         let baseline = slot.last_cumulative;
         let mut stats = ConsumeStats::default();
@@ -686,7 +694,9 @@ impl MultiTfAggregator {
         if cumulative_volume > slot.last_cumulative {
             slot.last_cumulative = cumulative_volume;
         } else if cumulative_volume < slot.last_cumulative {
-            counter!("tv_aggregator_cumulative_regression_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .cumulative_regression
+                .increment(1);
         }
         stats
     }

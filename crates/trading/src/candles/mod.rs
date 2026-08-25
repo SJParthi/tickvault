@@ -56,6 +56,7 @@
 //! candle DEDUP key.
 
 pub mod aggregator_cell;
+mod fold_counters;
 pub mod live_candle_state;
 pub mod multi_tf_aggregator;
 pub mod seal_ring;
