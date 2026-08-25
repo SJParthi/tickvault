@@ -1123,3 +1123,92 @@ bounded only by `MAX_PACKETS_PER_FRAME = 70,000`.
 `multi_tf_aggregator.rs:348` is a plain `HashMap<CompositeKey, u32>` into a dense `Vec`
 index. Still O(1) average; the claim was wrong about the type, exactly as the
 `instrument_registry` row in that same table was wrong in 2026-08-07.
+
+## ITEM 14 — DECOUPLING THE FLUSH: design, conditions, and why it must NOT ship first (2026-08-25)
+
+Item 13a named the flush-on-drain coupling as THE O(1) defect. A design pass and a hostile
+pass were run in parallel on the fix. They agree on the conditions and disagree on the
+verdict, and the disagreement is the useful part: **the hostile pass found an own-goal that
+means this fix must not land before the amplification is diagnosed.**
+
+### 14a — What the design pass settled (Verified)
+
+Reuse the proven seal-writer shape (`seal_writer_runner.rs` / `_loop.rs` / `_task.rs`), do
+not invent one:
+
+| Element | Decision |
+|---|---|
+| What crosses the boundary | an already-built ILP `Buffer`, **one send per FLUSH**, never per tick — so the per-tick DHAT zero-alloc guarantee is untouched |
+| Channel | bounded `mpsc<TickBatch>`, capacity **DERIVED** (`TICK_SPILL_MAX_BYTES / max_batch_bytes`), never a literal — the `SEAL_MPSC_CAPACITY` lesson, where a 200k literal silently force-dropped 400k seals nightly |
+| Buffer reuse | writer returns emptied buffers on a second bounded channel; steady state allocates nothing |
+| Full-channel policy | **SPILL**, reusing the tick spill that ALREADY exists (`tick_persistence.rs:636` `spill_failed_ilp` writes `Buffer::as_bytes()` verbatim, 512 MiB cap at `:606`, replayed by `tick_spill_replay.rs:359`). Blocking reinstates the defect; dropping violates never-lose-a-tick |
+| Shutdown | preserve the `:2883-2906` order, then drop the sender as EOS and `await` the writer under `timeout(2 x request_timeout)` = 10 s so the 17:30 stop cannot hang; the writer's final act is to spill its tail |
+| Placement | `crates/storage/src/tick_writer_runner.rs` + `tick_writer_loop.rs`; wiring in `dhan_feed_stack.rs` |
+
+**`capture_seq` is already safe and needs no change** (Verified, and this was the biggest
+worry): it is derived from the WAL frame sequence (`ws_frame_spill::packet_capture_seq` ->
+`capture_seq_from_frame_seq`, `dhan_feed_stack.rs:1149,1172,1337`), NOT minted at flush. So
+it is replay-stable and wholly independent of when the flush happens. One writer + one FIFO
+channel preserves batch order, and because the DEDUP key carries `capture_seq` a spilled
+batch replayed later collapses idempotently instead of duplicating.
+
+### 14b — The hostile pass: two corrections and one own-goal
+
+1. **The premise was half right, and the code's own comment is stale self-justification.**
+   `block_in_place` migrates OTHER tasks off the worker and spins a replacement, so the WS
+   read loops are NOT stalled today — only the drain loop itself is. The comment at `:2500`
+   claiming "on a 2-worker host that is HALF the runtime" overstates it. The real defect is
+   **unbounded REPETITION** of 5 s-timeout flushes on a 500 ms timer (~100% occupancy), not
+   any single flush. One stall is survivable: the ring holds 65,536 frames, ~13 s at 5,000
+   fps.
+2. **Today's blocking flush IS backpressure.** It is ugly, but it self-throttles and nothing
+   downstream is silently dropped. Remove it without a correct overflow policy and the drain
+   runs free while the writer falls behind — and the seal analogue this design mirrors,
+   `escalate_refused_seal` (`:4192`), is documented verbatim as *"a synchronous disk append
+   on the fold path"*. Escalating to a synchronous append **on the same saturated EBS volume
+   that caused the backlog** would swap one blocking path for another and add a queue. That
+   is the shell game, and it is avoided only because ticks already have a spill tier.
+3. **THE OWN-GOAL (HIGH, Assumed, unmeasured):** a decoupled writer batches more
+   aggressively, so each commit spans a WIDER `ts` range, which **increases O3 merge work**
+   — the very write amplification Item 12 is trying to remove. Nothing in the repo measures
+   this.
+
+### 14c — Therefore: Item 14 does NOT ship before Item 12's measurement
+
+This is the binding sequencing decision of this plan, and it is deliberate:
+
+**The amplification cause must be identified FIRST.** If the amplifier turns out to be
+commit WIDTH (out-of-order `ts` into closed partitions, strengthened by
+`QDB_CAIRO_O3_MAX_LAG = 60 s`), then wider batches make it worse and the decoupling must
+ship WITH a batch-width cap. If the amplifier is page granularity
+(`QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE = 16 MiB`) or commit COUNT, wider batches help.
+**The same change is beneficial or harmful depending on a fact nobody has measured.**
+Shipping it blind against a saturated disk is the gamble the operator explicitly forbade.
+
+### 14d — Conditions, binding on the implementing PR
+
+- **C1** The overflow policy is SPILL to the existing tick spill tier — never a silent drop,
+  never a blocking append introduced on the fold path.
+- **C2** The drain ships fully-formed, pre-stamped rows; the writer NEVER mints
+  `capture_seq`. (Already true — must not regress.)
+- **C3** `feed_health.record_ticks` and `LAST_TICK_AGE_GAUGE` move to the **writer**, not
+  the drain. **This is rule-gated, not stylistic:** `dhan-rest-only-noise-lock` §2.3b-i
+  chose the age GAUGE over the counter deliberately, and `no_ticks_alarm_gauge_guard.rs`
+  pins it. Stamping at hand-off would silently redefine the only dead-lane alarm from
+  "rows persisted" to "rows decoded" — forging liveness for rows a crash would take. The
+  guard re-bless and a dated §2.3b edit land in the SAME PR.
+- **C4** Shutdown awaits writer completion under a bounded grace; batch width is capped at
+  today's 500 ms span until 14b(3) is measured; `max_buf_size` headroom is const-asserted.
+- **C5** The questdb-rs `max_buf_size` = 100 MiB wedge (`seal_writer_task.rs:229`,
+  `shadow_candle_writer.rs:359`) is reached in ~28 s of stall at the 24,600-instrument rate,
+  and decoupling makes it EASIER to reach because nothing throttles the producer. A
+  size-based cut must fire well before it.
+
+### 14e — An infrastructure blocker on the observability half (Verified)
+
+The design calls for `tv_dhan_tick_writer_queue_depth` / `_high_water` / `_full_total` /
+`_flush_seconds`. **No new EMF metric name can ship**: `user-data.sh.tftpl` renders at
+exactly its 15,872-byte budget with **ZERO free** (measured, `dhan-rest-only-noise-lock`
+§2.3d-ii). Until the boot-path restructure that section describes, backpressure visibility
+must go via the metric-filter/log route (the §2.3d-i precedent), or the queue grows unseen
+— which for a backpressure queue is the worst possible blind spot.
