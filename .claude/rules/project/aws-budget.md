@@ -1048,3 +1048,59 @@ arriving unwatched, which is how these six accumulated in the first place.
 returns success having done nothing useful is invisible to it — `start_watchdog`'s
 separate not-invoked alarm exists precisely because a dropped schedule produces no
 error at all, and that class is unchanged.
+
+## COST NOTE 2026-08-25 (SECOND, same day) — the two disk/WAL gauges that were shipping unwatched (+~$0.20/mo)
+
+**Authorization:** `dhan-rest-only-noise-lock-2026-07-14.md` §2.3g (operator
+2026-08-25, naming "disk rpessure ... ram wal disk spill" and ruling out human
+monitoring). Recorded there before the terraform, per the rule-file-first law.
+
+**What was added:** two CloudWatch alarms, `tv-prod-spill-dir-free-low`
+(`tv_spill_dir_free_bytes` ≤ 20 GiB) and `tv-prod-questdb-wal-suspended`
+(`tv_questdb_wal_suspended_tables` ≥ 1).
+
+**Cost: +2 alarms × $0.10 = ~$0.20/mo. NO new EMF metric name and no
+user-data byte** — both gauges were ALREADY EMF-selected and already reaching
+CloudWatch. This is the cheapest class of fix available on this account, and
+it is the only class available at all: the user-data template renders at
+exactly its 15,872-byte budget with **zero** free (§2.3d-ii of the noise lock),
+so an alarm needing a new EMF name cannot ship today.
+
+**Why it was worth spending.** MEASURED from the live account, 2026-08-25:
+
+| IST | free bytes | suspended tables |
+|---|---:|---:|
+| 08:30 | 38.8 GB | 0 |
+| 09:30 | 14.5 GB | 0 |
+| 10:30 | **20,480** | 3 |
+| 11:30 | 20,480 | **15** |
+| 13:30 | 58.6 GB | 0 |
+
+The account was already paying to publish both series. Neither had an alarm,
+so the hour of warning between 38.8 GB and 14.5 GB reached nobody, and a
+three-hour full disk that suspended fifteen tables surfaced only when the
+operator asked why a table was empty. Paying $0.30/mo to ship a number and
+$0.00 to watch it is the worst of both.
+
+**Bill impact.** The measured high-side month on the current configuration is
+$118.28 (Quote 19 arithmetic: 22 weekdays × $4.06 + 8 weekend days × $2.48,
+plus the 300 GB grow). This adds $0.20 → **$118.48**, still under the operator's
+$125 hard cap (Quote 18) and still **$1.48 ABOVE** the budget's automatic
+`STOP_EC2_INSTANCES` line at 90% of the $130 `limit_amount` = $117.00.
+
+That last figure is unchanged in kind by this note but worth restating rather
+than letting a fifth small addition hide it: **a maximal month now projects
+above the line that switches the trading box off.** August itself is nowhere
+near it (actual $49.90 / forecast $65.42, read live the same day), so nothing
+fires today. The two levers remain what Quote 19 recorded — release the Elastic
+IP (already approved in principle by Quote 10, −$3.60/mo) or align
+`limit_amount` with the $125 cap, which cannot be done as written because 90%
+of 125 is $112.50, below the projected bill.
+
+**⚠ And the kill-switch state is still unverifiable, for the fifth time:**
+`budgets:DescribeBudgetActionsForBudget` remains `AccessDenied` for
+`user/claude-code-agent`, so whether the two `STOP_EC2_INSTANCES` actions
+recorded in `EXECUTION_FAILURE` on 2026-07-31 still fail is **Unknown**. If
+they are broken the $117 line is arithmetic about a switch that does not
+throw; if they are fixed the box gets stopped mid-month. A broken safety net
+is never a reason to cross a threshold.
