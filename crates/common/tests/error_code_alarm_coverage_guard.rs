@@ -232,6 +232,17 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "OMS-GAP-04",
     "OMS-GAP-05",
     "ORDER-EVT-01",
+    // ORDER-EVT-02 is log-sink-only because the Dhan noise lock says so, not
+    // because a hollow decode is unimportant — it means order data is being
+    // silently discarded, which on its face is exactly what should wake
+    // someone. `dhan-rest-only-noise-lock-2026-07-14.md` §1 fixes the Dhan
+    // Telegram family at four items and §3 makes any new Dhan-scoped page a
+    // REJECT without a fresh dated operator quote, so an alarm here is not
+    // this change's to make. Its sibling ORDER-EVT-01 sits in this list for
+    // the same reason. The operator surface is the coded log line, whose
+    // `excerpt` field carries the raw frame — that excerpt, not the page, is
+    // what makes the next occurrence fixable.
+    "ORDER-EVT-02",
     "ORDER-PNL-01",
     "ORDER-READY-01",
     "ORPHAN-POSITION-01",
