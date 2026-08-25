@@ -1013,8 +1013,8 @@ Authority: operator 2026-08-25, *"Fix wbrytjonf dude oaku"*, recorded verbatim i
 `dhan-rest-only-noise-lock-2026-07-14.md` §2.3f BEFORE this terraform, per the
 rule-file-first law.
 
-**+7 alarms ≈ $0.70/mo.** One errcode log-filter alarm
-(`ws-gap-03-xverify-blind`, `error-code-alarms.tf`) plus six `AWS/Lambda` `Errors`
+**+8 alarms ≈ $0.80/mo.** TWO errcode log-filter alarms
+(`ws-gap-03-xverify-vacuous` + `-failed`, `error-code-alarms.tf`) plus six `AWS/Lambda` `Errors`
 alarms. **Zero new EMF names and zero user-data bytes** — the errcode lane derives
 its metric from a log stream that already exists, and the Lambda alarms read an AWS
 namespace we do not publish.

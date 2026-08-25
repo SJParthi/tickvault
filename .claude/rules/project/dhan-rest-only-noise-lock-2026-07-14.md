@@ -809,22 +809,33 @@ each created by a PR that did not think to. Nothing was ever decided about them.
 
 #### What this section authorizes
 
-**(a) The cross-verification verdict becomes a page.** Family (5) gains a ninth signal:
-`tv-<env>-errcode-ws-gap-03-xverify-blind`. The 15:41 live-vs-official comparison is the
-only ground truth the revived Dhan feed has, and both of its failure verdicts — compared
-ZERO minutes, or could not run at all — reach nothing today.
+**(a) The cross-verification verdict becomes a page.** Family (5) gains a ninth and
+tenth signal: `tv-<env>-errcode-ws-gap-03-xverify-vacuous` and
+`tv-<env>-errcode-ws-gap-03-xverify-failed`. The 15:41 live-vs-official comparison is
+the only ground truth the revived Dhan feed has, and both of its failure verdicts —
+compared ZERO minutes, or could not run at all — reach nothing today.
 
-It is a **log-filter** alarm, not a metric alarm, and that is deliberate:
+They are **log-filter** alarms, not metric alarms, and that is deliberate:
 `tv_dhan_feed_xverify_runs_total` is 31 bytes and needs 32 with its separating pipe
 against 31 free in the user-data budget (§2.3d-ii) — so the EMF route misses **by one
 byte**, while the log-filter lane costs no user-data byte at all.
 
-The pattern carries **four** conditions, not the usual two:
+Each pattern carries **three** conditions, not the usual two:
 
 ```
-{ $.code = "WS-GAP-03" && $.level = "ERROR"
-  && ($.source = "xverify_vacuous" || $.source = "xverify_failed") }
+{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_vacuous" }
+{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_failed"  }
 ```
+
+**Two entries rather than one `||` pattern, deliberately.** The first draft matched
+both verdicts in a single `($.source = "a" || $.source = "b")` filter, and
+`terraform plan` accepted it — which means nothing: the provider treats `pattern` as
+an opaque string, so filter-pattern SYNTAX is parsed only by the real
+PutMetricFilter call at APPLY time. A malformed pattern would pass every PR check
+and break the post-merge apply lane. Two single-condition entries use only the shape
+already proven live by `ws-gap-03-universe-collapse`, cost one extra dime, and name
+the two verdicts separately — which is better triage anyway, since they have
+different causes and different next steps.
 
 `WS-GAP-03` has ~50 emit sites in `dhan_feed_stack.rs` — every dial failure, reconnect
 and pool event — so a bare code filter would page on ordinary connection churn. That is
@@ -848,7 +859,7 @@ build until someone decides.
 
 #### Honest cost
 
-7 new alarms at ~$0.10/mo = **~$0.70/mo**. Measured against the live account the same
+8 new alarms at ~$0.10/mo = **~$0.80/mo**. Measured against the live account the same
 day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** with the
 90% `STOP_EC2_INSTANCES` action line at **$117**. No new EMF name, no user-data byte.
 
@@ -872,11 +883,11 @@ day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** wit
 
 #### What a PR that violates §2.3f looks like (REJECT)
 
-- Filters the cross-verify alarm on `WS-GAP-03` alone, or drops the `source` conditions
+- Filters either cross-verify alarm on `WS-GAP-03` alone, or drops the `source` condition
   (pages on every reconnect — the trap this section exists to avoid).
 - Sets `ok_recovery = true` on it (a once-per-session emitter cannot recover by aging).
 - Adds an `aws_lambda_function` without an `Errors` alarm or a declared exemption.
-- Gives any of the seven `ok_actions` (a green "recovered" page for an aged-out
+- Gives any of the eight `ok_actions` (a green "recovered" page for an aged-out
   datapoint is the Rule-11 false-OK the round-14 note records).
 - Ships the EMF name for `tv_dhan_feed_xverify_runs_total` without the byte-budget
   restructure §2.3d-ii describes — it is over by one byte, and shaving an unrelated

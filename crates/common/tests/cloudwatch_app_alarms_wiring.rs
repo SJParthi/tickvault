@@ -2080,10 +2080,10 @@ fn every_ws_gap_03_filter_carries_a_source_discriminator() {
         .collect();
 
     assert!(
-        patterns.len() >= 2,
-        "expected at least the 2 WS-GAP-03 filters known on 2026-08-25 \
-         (universe-collapse, xverify-blind), found {} — if they were renamed or \
-         removed, update this guard deliberately rather than letting it pass \
+        patterns.len() >= 3,
+        "expected at least the 3 WS-GAP-03 filters known on 2026-08-25 \
+         (universe-collapse, xverify-vacuous, xverify-failed), found {} — if they were \
+         renamed or removed, update this guard deliberately rather than letting it pass \
          vacuously",
         patterns.len()
     );
