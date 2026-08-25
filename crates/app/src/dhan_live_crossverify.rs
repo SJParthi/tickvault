@@ -82,14 +82,59 @@ const SECS_PER_MINUTE: i64 = 60;
 
 /// NSE session open — 09:15:00 IST, as seconds-of-day.
 pub const SESSION_OPEN_SECS_OF_DAY_IST: i64 = 9 * 3600 + 15 * 60;
-/// NSE session close — 15:30:00 IST, as seconds-of-day. The window is
-/// half-open `[open, close)`, so the last comparable bucket opens at 15:29.
-pub const SESSION_CLOSE_SECS_OF_DAY_IST: i64 = 15 * 3600 + 30 * 60;
+/// NSE session close — 15:40:00 IST, as seconds-of-day. The window is
+/// half-open `[open, close)`, so the last comparable bucket opens at 15:39.
+///
+/// **CORRECTED 2026-08-25.** This was `15 * 3600 + 30 * 60` (15:30) — a PRIVATE
+/// DUPLICATE of the session end that the 2026-08-07 NSE CAS migration missed.
+/// Every other production site moved 55,800 -> 56,400 that day with a dated
+/// comment (`constants.rs`, `rest_candle_fold.rs`, `tf_consistency_boot.rs`,
+/// `feed_scoreboard_boot.rs`, `trading_pipeline.rs`, `day_ohlc_orchestrator.rs`);
+/// this file kept its own copy and drifted.
+///
+/// The consequence was NOT false findings — `is_in_session` dropped 15:30-15:39
+/// from BOTH sides before the join, so the window was symmetric and the verdict
+/// honest. It was a BLIND SPOT: ten minutes of every session, and specifically
+/// the CAS window the migration was made for, were structurally unverifiable by
+/// the one check the scope-lock calls the revived feed's only ground truth.
+///
+/// It also mis-aimed the tail amnesty: `is_tail_minute` derives from this
+/// constant, so it excused 15:28-15:29 while the genuinely-unsealed tail had
+/// moved to 15:38-15:39. Deriving the value below fixes both at once.
+///
+/// Now DERIVED from the canonical constant rather than restated, so a future
+/// session-hours change cannot leave this file behind again. The const assert
+/// below is the actual guarantee.
+pub const SESSION_CLOSE_SECS_OF_DAY_IST: i64 =
+    tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST as i64;
 
-/// The run's deterministic stamp — 15:31:00 IST, as seconds-of-day. Used as
+// A private duplicate of a session boundary drifted silently for 18 days. This
+// makes that a COMPILE error rather than a blind spot nobody can see.
+const _: () = assert!(
+    SESSION_CLOSE_SECS_OF_DAY_IST
+        == tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST as i64,
+    "the cross-verify session close must track the canonical persistence end"
+);
+const _: () = assert!(
+    SESSION_OPEN_SECS_OF_DAY_IST < SESSION_CLOSE_SECS_OF_DAY_IST,
+    "the comparison window must be non-empty"
+);
+
+/// The run's deterministic stamp — 15:41:00 IST, as seconds-of-day. Used as
 /// the designated audit timestamp regardless of when the run actually fired,
 /// so a catch-up / forced rerun UPSERTs the same rows.
-pub const RUN_SECS_OF_DAY_IST: i64 = 15 * 3600 + 31 * 60;
+///
+/// **CORRECTED 2026-08-25** from 15:31 in lockstep with the close above. It
+/// MUST stay one minute past the close: the stamp and the fire time
+/// (`dhan_feed_stack::XVERIFY_RUN_AT_SECS_OF_DAY_IST`) move together, and a
+/// stamp earlier than the window's end would date the audit row before the
+/// last minute it claims to have compared.
+pub const RUN_SECS_OF_DAY_IST: i64 = SESSION_CLOSE_SECS_OF_DAY_IST + 60;
+
+const _: () = assert!(
+    RUN_SECS_OF_DAY_IST > SESSION_CLOSE_SECS_OF_DAY_IST,
+    "the run must be stamped after the last minute it compares"
+);
 
 /// How many trailing session minutes are excused when absent on the LIVE side.
 ///
@@ -1365,15 +1410,22 @@ mod tests {
         );
         assert!(
             is_in_session(minute(SESSION_CLOSE_SECS_OF_DAY_IST - 60), DAY_START_NANOS),
-            "15:29 is the last in-session bucket"
+            "15:39 is the last in-session bucket"
         );
         assert!(
             !is_in_session(minute(SESSION_CLOSE_SECS_OF_DAY_IST), DAY_START_NANOS),
-            "15:30 is out (half-open window)"
+            "15:40 is out (half-open window)"
         );
-        // 375 comparable minutes in a full session.
+        // 385 comparable minutes in a full session: 09:15-15:40.
+        //
+        // RE-BLESSED 2026-08-25 from 375. That figure was correct for the
+        // pre-CAS 09:15-15:30 session and became wrong on 2026-08-07, when the
+        // NSE CAS migration moved the close to 15:40 everywhere EXCEPT this
+        // file's private duplicate. The ten extra minutes are real session
+        // minutes that were previously dropped from both sides before the join
+        // and therefore never verified at all.
         let total = (SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / 60;
-        assert_eq!(total, 375);
+        assert_eq!(total, 385, "09:15-15:40 is 385 one-minute buckets");
     }
 
     /// I-P1-11: Dhan reuses numeric security_ids across segments, so the join
@@ -1688,12 +1740,15 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_run_ts_nanos_is_1531_ist_regardless_of_fire_time() {
+    fn deterministic_run_ts_nanos_is_one_minute_past_the_close_regardless_of_fire_time() {
         let stamp = deterministic_run_ts_nanos(DAY_START_NANOS);
         assert_eq!(
             secs_of_day(stamp, DAY_START_NANOS),
-            15 * 3600 + 31 * 60,
-            "the audit stamp must be 15:31 IST regardless of actual fire time"
+            SESSION_CLOSE_SECS_OF_DAY_IST + 60,
+            "the audit stamp must be one minute past the session close, whatever \
+             the actual fire time -- DERIVED, not a restated literal, so a \
+             future session-hours change cannot leave it behind the way the \
+             hardcoded 15:31 did through the 2026-08-07 CAS migration"
         );
         // Idempotent: a catch-up rerun produces the identical stamp.
         assert_eq!(stamp, deterministic_run_ts_nanos(DAY_START_NANOS));
