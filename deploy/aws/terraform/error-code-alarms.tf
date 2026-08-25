@@ -240,6 +240,27 @@ locals {
     # ages out can never mean "the candles came back" (Rule-11
     # false-recovery; the PROC-01 precedent). The counter-side pager on
     # tv_seal_writer_drain_total{kind="dropped"} lives in seal-drop-alarm.tf.
+    #
+    # ⚠ DESCRIPTION CORRECTED 2026-08-25 — the code has THREE emit sites, not
+    # one, and the old description named only the first. Two of them are the
+    # sealed-candle family this entry was written for
+    # (seal_writer_loop.rs::record_cycle_observability, the consumer side; and
+    # seal_loss_alarm.rs::record_lost_seal, the producer side added 2026-08-19
+    # for the case where the writer never spawned and the drain counter reads a
+    # flat healthy zero). The THIRD is a different failure entirely:
+    # dhan_feed_stack.rs's 30-second silence-timer arm reports the per-window
+    # DELTAS of aggregator TICK REFUSALS under the same code. An operator paged
+    # by that arm was being handed a runbook about ring/spill/DLQ and disk
+    # space, for an incident about packet sanity checks and instrument-slot
+    # exhaustion. The threshold, period and eval are deliberately UNCHANGED —
+    # only the text an operator reads at 2am.
+    #
+    # That arm also EXCLUDES the by-design `out_of_session` refusal reason at
+    # the emit site, which is why the raw counter
+    # tv_dhan_feed_ingest_refused_total is deliberately NOT alarmed on the
+    # metric side: EMF folds its `reason` label by summing, so a metric alarm
+    # would page on normal pre-open traffic. Recorded in full in
+    # loss-and-retention-alarms.tf.
     "aggregator-drop-01" = {
       pattern     = "{ $.code = \"AGGREGATOR-DROP-01\" && $.level = \"ERROR\" }"
       period      = 300
@@ -247,7 +268,7 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = false # 2026-07-09: discrete permanent data loss - the dropped sealed candles do not come back when the episode ages out (Rule-11 false-recovery; PROC-01 precedent)
-      desc        = "AGGREGATOR-DROP-01: sealed candle(s) DROPPED after ring + spill + DLQ ALL failed (Severity Critical - the only silent-data-loss path for sealed candles; by definition the host is out of memory AND out of disk AND data/dlq/ is unwritable). NO recovered/OK page: the loss is permanent - the auto-OK ~15 min later only means the episode aged out. Triage: docker/host state, df -h /data, ls -la data/spill/ data/dlq/; if the host is healthy and dirs writable, restart the app. Counter-side pager: tv-<env>-seal-writer-dropped (seal-drop-alarm.tf). Runbook: .claude/rules/project/wave-6-error-codes.md"
+      desc        = "AGGREGATOR-DROP-01 fires from TWO places - read the fields to tell them apart. (a) SEALED CANDLES DROPPED (fields security_id/timeframe/cause): ring + spill + DLQ all failed, or no durable tier was installed at all; the log is throttled to powers of two but the FIRST loss always logs. Triage: host state, df -h /data, ls -la data/spill/ data/dlq/. (b) TICKS REFUSED BY THE AGGREGATOR (fields refused_price/refused_timestamp/refused_slot_exhausted), reported every 30s by the live drain: never folded into a candle, never written. Price/timestamp = the packet failed a sanity check; slot_exhausted = instrument capacity is full and NEW instruments are turned away. Both are permanent loss: NO recovered/OK page. Counter-side pager: tv-<env>-seal-writer-dropped. Runbook: .claude/rules/project/wave-6-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply
@@ -781,4 +802,78 @@ resource "aws_cloudwatch_metric_alarm" "preopen_ready_late" {
   # recovery — nothing has been re-measured, and the next attach is a day
   # away. A "recovered" page on that transition is the Rule-11 false-OK the
   # locals comment above describes.
+}
+
+# ---------------------------------------------------------------------------
+# HOT-PATH-02 — the persistence layer's own loss code (2026-08-25)
+#
+# THE GAP: HOT-PATH-02 has TEN `error!` emit sites — five in
+# `tick_persistence.rs`, five in `depth_persistence.rs` — and had no filter in
+# this file. It is the code every persistence-side loss line carries: a tick
+# flush that failed and was rescued to a spill file, a flush whose rescue ALSO
+# failed (permanently lost), a depth flush with no QuestDB connection, a depth
+# flush that failed and discarded its buffer, and the table-ensure failures
+# that can leave `ticks` auto-created WITHOUT its 5-key DEDUP — which silently
+# collapses intra-second ticks. For the DEPTH path it is the only remaining
+# loss signal at all: depth has no spill tier, so a discarded buffer is gone.
+#
+# WHY A STANDALONE PAIR, NOT A `local.error_code_alerts` ENTRY. That map is
+# lockstepped to the documented paging list in
+# `.claude/rules/project/observability-architecture.md` by
+# `error_code_paging_filter_drift_guard.rs::tf_map_and_doc_paging_list_agree_bidirectionally`,
+# so a map entry must land in the same change as its doc line. This change owns
+# terraform only. The standalone form is the same shape the `preopen_ready`
+# pair above uses and behaves identically at runtime. FLAGGED FOLLOW-UP for
+# whoever owns the rules tree next: move this into the map and add the doc
+# line, so "which codes page?" stays answerable from one place.
+#
+# SEVERITY NOTE: HOT-PATH-02 is `Severity::Low` in the enum, so
+# `error_code_alarm_coverage_guard.rs` never required a decision here — which
+# is precisely how ten emit sites on the tick and depth write paths ended up
+# with no pager. The severity is arguably wrong; changing it is a Rust-side
+# call and is deliberately not made from terraform.
+#
+# ALWAYS ARMED, no market-hours gate: the table-ensure arms fire at BOOT
+# (08:30 IST, before the gate opens at 09:20), and a discarded row is a
+# permanently missing row at any hour.
+#
+# eval 3 / dta 1 mirrors the coded entries above: a persistent condition
+# repeat-emits and holds ALARM across <=15-minute gaps, while a single
+# discarded buffer still pages on its own datapoint.
+resource "aws_cloudwatch_log_metric_filter" "hot_path_02" {
+  name           = "tv-${var.environment}-errcode-hot-path-02"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  pattern        = "{ $.code = \"HOT-PATH-02\" && $.level = \"ERROR\" }"
+  metric_transformation {
+    name      = "tv_errcode_hot_path_02"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+    # NO dimensions (errors.jsonl carries no host field and filters cannot emit
+    # constant ones) and NO default_value (that emits a datapoint for every
+    # NON-matching event, making the metric always-billed). Sparse metric +
+    # treat_missing_data = notBreaching is the correct, near-free pairing.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
+  alarm_name          = "tv-${var.environment}-errcode-hot-path-02"
+  alarm_description   = "HOT-PATH-02: the persistence layer lost or could not write rows. Read the fields. `rescued` = a tick flush failed but the rows went to the named spill file; they are NOT in QuestDB and re-ingest is one safe, repeatable command (the ticks dedup key carries capture_seq). `dropped` with a spill_error = the rescue failed too and those ticks are permanently gone. On the DEPTH path `dropped` is always permanent - depth has no spill tier, so the writer discards its buffer to stop one rejected row wedging the session. stage=ensure_client_build or ensure_ddl is the quiet one: the ticks table may have been auto-created WITHOUT its 5-key DEDUP, which silently collapses intra-second ticks until a later ensure succeeds - verify with SHOW COLUMNS / the table's DEDUP keys. Raw frames remain in the write-ahead log. Runbook: docs/error-runbooks/wave-1-error-codes.md"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
+  metric_name         = "tv_errcode_hot_path_02"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  # Dimensionless, matching its filter (see the filter comment).
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. Rows that were discarded do not come back, and rows that
+  # were rescued to a spill file are still not in QuestDB until someone
+  # re-ingests them - so an auto-OK when the datapoint ages out would report a
+  # recovery that nobody performed (Rule 11, the ok_recovery = false precedent
+  # above).
+  ok_actions = []
 }

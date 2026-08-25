@@ -282,12 +282,36 @@ resource "aws_cloudwatch_metric_alarm" "clock_skew_high" {
 # Uses a CloudWatch Metrics Insights query so we do NOT have to pin the
 # CWAgent disk dimensions (device/fstype vary); it selects by InstanceId +
 # mount path only.
+# ---------------------------------------------------------------------------
+# 2026-08-25 — THRESHOLD RAISED 75 -> 90, AND WHY THAT IS NOT A WEAKENING.
+#
+# Measured state on the box: the root volume is structurally stuck at 86%.
+# Retention has never dropped a single partition (partition_archive_audit held
+# 1,000 rows, every one outcome='s3_conflict', zero successes ever — now paged
+# by tv-<env>-partition-archive-failed in loss-and-retention-alarms.tf), so the
+# oldest ticks on a nominal 1-day hot window date to 2026-06-02.
+#
+# At a 75% threshold this alarm has therefore been in ALARM continuously, with
+# no edge, for as long as the condition has existed. A PERMANENTLY LATCHED
+# alarm is worse than no alarm: it cannot transition, so it can never page
+# again, and every day it sits red teaches the operator that red is this
+# alarm's normal colour. By the time 75% meant something the operator had
+# already been trained to scroll past it. That is the same alert-fatigue
+# failure `dhan-rest-only-noise-lock-2026-07-14.md` §2.3a describes, arriving
+# from the opposite direction — not too many pagers, one pager that never stops.
+#
+# 90% restores the EDGE: the alarm is OK today at 86%, so its next transition
+# is a real event. The 4 points of headroom that buys is deliberately thin, and
+# it is not the early warning — 13b below is. Losing sensitivity between 75 and
+# 90 is the price of getting a working transition back, and it is only
+# acceptable BECAUSE a trend alarm now covers the range this one gave up.
+# ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
   alarm_name          = "tv-${var.environment}-disk-used-high"
-  alarm_description   = "Root volume > 75% full. 90-day retention means a 3-month run never auto-evicts, so the disk only grows. Grow online (no downtime): scripts/aws-upgrade-instance.sh --ebs-size N (modify-volume; grown 30->50 on 2026-07-13), then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / (or the next daily boot's cloud-init growpart/resizefs). See may31-inplace-upgrade-and-access.md §2.1."
+  alarm_description   = "Root volume > 90% full - the CEILING, not the early warning (tv-<env>-disk-fill-rate-high is the trend alarm that should fire days before this one). Raised 75->90 on 2026-08-25: the box was structurally stuck at 86%, so at 75 this alarm was permanently latched in ALARM, could never transition, and could never page again. Grow online (no downtime): scripts/aws-upgrade-instance.sh --ebs-size N (modify-volume; grown 30->50 on 2026-07-13, 100->200 on 2026-08-21), then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / (or the next daily boot's cloud-init growpart/resizefs). gp3 grows online and can NEVER shrink. First check whether retention is actually running: SELECT outcome, count() FROM partition_archive_audit. See may31-inplace-upgrade-and-access.md §2.1."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
-  threshold           = 75
+  threshold           = 90
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.app_alarm_actions
   ok_actions          = local.app_alarm_ok
@@ -297,6 +321,84 @@ resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
     period      = 300
     return_data = true
     expression  = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}' AND path = '/'"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 13b. Root volume FILL TREND — the early warning alarm 13 stopped being
+#      (2026-08-25).
+#
+# Alarm 13 answers "are we nearly full?". It cannot answer "are we filling?",
+# and on this box that is the question with lead time in it. The disk moved
+# from comfortable to 86% with a projected mid-session fill date, and the only
+# thing that reported the trajectory was somebody reading the number.
+#
+# WHAT IT MEASURES. RATE() of the same Metrics Insights series alarm 13 uses,
+# scaled by 86,400 so the threshold reads in the operator's own units:
+# PERCENTAGE POINTS PER DAY. Threshold 4 pts/day means "at this rate the
+# remaining headroom is gone inside about a working week" — early enough to
+# grow the volume in a maintenance window instead of mid-session.
+#
+# WHY A 6-HOUR PERIOD AND TWO DATAPOINTS, not the 5 minutes alarm 13 uses. The
+# box runs ~9 hours a weekday, so intraday growth is roughly 2.7x the 24-hour
+# average by construction. A 5-minute rate window would convert any ordinary
+# busy hour into an alarming points-per-day figure and page constantly. Six
+# hours spans most of a session and, across the overnight stop, most of a day;
+# requiring TWO consecutive such windows (~12h of sustained fill) means a
+# compaction burst or one heavy afternoon cannot trip it alone.
+#
+# NOT market-hours gated. Growth is measured across the overnight gap on
+# purpose — that is what makes the 6-hour windows approximate a daily rate
+# rather than a session rate — and the gate would discard exactly those
+# windows.
+#
+# treat_missing_data = notBreaching: a stopped box publishes no disk samples,
+# and a stopped box is not filling. `breaching` would page every night for the
+# absence of a problem.
+#
+# HONEST RESIDUAL, stated rather than discovered at apply time: this is metric
+# math layered on a Metrics Insights query. The Insights query returns a single
+# time series (no GROUP BY), which is the documented precondition, but the
+# combination is not exercised elsewhere in this repo. If CloudWatch rejects
+# it, `terraform apply` fails LOUDLY at plan/apply — it cannot land as a
+# silently-broken alarm, which is the failure mode that would actually matter.
+# The fallback is to alarm the raw CWAgent metric with explicit device/fstype
+# dimensions; alarm 13 uses Insights precisely to avoid pinning those, so that
+# fallback trades one fragility for another and should only be taken if forced.
+#
+# A DROP IS NOT AN ALARM. A partition drop or a volume grow makes the rate
+# strongly negative; GreaterThanThreshold ignores that, which is correct — the
+# disk shrinking is the outcome we want.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "disk_fill_rate_high" {
+  alarm_name          = "tv-${var.environment}-disk-fill-rate-high"
+  alarm_description   = "Root volume is FILLING at more than 4 percentage points per day, sustained across two consecutive 6-hour windows (~12h). This is the early warning: at this rate the headroom below the 90% ceiling is gone inside about a working week, so grow the volume in a maintenance window rather than mid-session. FIRST check whether retention is running at all - the 2026-08-25 state was 1,000 archive attempts, all failed, zero partitions ever dropped, which is a fill trend with a fixable cause: SELECT outcome, count() FROM partition_archive_audit. If archival is healthy and the trend is real ingest growth, grow gp3 online (scripts/aws-upgrade-instance.sh --ebs-size N, then growpart + xfs_growfs) - it can never shrink, so go up in steps. Companion ceiling alarm: tv-<env>-disk-used-high."
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 4
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.app_alarm_actions
+  # NO ok_actions. The rate falling back below 4 pts/day means the disk is
+  # filling more slowly, never that the space came back - and after a real
+  # grow the operator already knows. An auto-OK would read as "resolved" while
+  # the volume is still fuller than it was (Rule 11, no false recovery).
+  ok_actions = []
+
+  metric_query {
+    id          = "disk_pct"
+    period      = 21600
+    return_data = false
+    expression  = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE InstanceId = '${aws_instance.tv_app.id}' AND path = '/'"
+  }
+
+  metric_query {
+    id = "fill_rate_per_day"
+    # RATE() is per SECOND; x86400 renders the threshold in points per day,
+    # which is the unit the operator actually reasons in.
+    expression  = "RATE(disk_pct) * 86400"
+    label       = "root volume fill rate (percentage points per day)"
+    return_data = true
   }
 }
 
