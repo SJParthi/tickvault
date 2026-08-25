@@ -453,7 +453,9 @@ impl AggregatorCell {
             && usable_exchange_price(tick.day_low)
             && tick.day_high < tick.day_low
         {
-            metrics::counter!("tv_candle_session_extremes_inverted_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .session_extremes_inverted
+                .increment(1);
         }
 
         if usable_exchange_price(tick.day_high) {
@@ -466,11 +468,9 @@ impl AggregatorCell {
                 }
                 self.last_seen_day_high = tick.day_high;
             } else if tick.day_high < self.last_seen_day_high {
-                metrics::counter!(
-                    "tv_candle_session_extreme_regressed_total",
-                    "extreme" => "high"
-                )
-                .increment(1);
+                crate::candles::fold_counters::fold_counters()
+                    .session_extreme_regressed_high
+                    .increment(1);
             }
         }
         if usable_exchange_price(tick.day_low) {
@@ -480,11 +480,9 @@ impl AggregatorCell {
                 }
                 self.last_seen_day_low = tick.day_low;
             } else if tick.day_low > self.last_seen_day_low {
-                metrics::counter!(
-                    "tv_candle_session_extreme_regressed_total",
-                    "extreme" => "low"
-                )
-                .increment(1);
+                crate::candles::fold_counters::fold_counters()
+                    .session_extreme_regressed_low
+                    .increment(1);
             }
         }
 
@@ -1040,7 +1038,9 @@ fn open_bucket(
     // range before 2026-08-19. On a calm morning it stays 0; on a gap-open
     // it fires once per instrument per timeframe.
     if open < state.low || open > state.high {
-        metrics::counter!("tv_candle_open_clamped_total").increment(1);
+        crate::candles::fold_counters::fold_counters()
+            .open_clamped
+            .increment(1);
     }
     widen_range_to_include(&mut state, open);
     if first_bucket_of_day {
@@ -1072,14 +1072,18 @@ fn adopt_exchange_day_extremes(state: &mut LiveCandleState, tick: &ParsedTick) {
         let dh = f32_to_f64_clean(tick.day_high);
         if dh > state.high {
             state.high = dh;
-            metrics::counter!("tv_candle_day_high_adopted_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .day_high_adopted
+                .increment(1);
         }
     }
     if usable_exchange_price(tick.day_low) {
         let dl = f32_to_f64_clean(tick.day_low);
         if dl < state.low {
             state.low = dl;
-            metrics::counter!("tv_candle_day_low_adopted_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .day_low_adopted
+                .increment(1);
         }
     }
 }
@@ -1105,13 +1109,17 @@ fn adopt_session_extreme_delta(state: &mut LiveCandleState, delta: SessionExtrem
         && new_high > state.high
     {
         state.high = new_high;
-        metrics::counter!("tv_candle_session_high_recovered_total").increment(1);
+        crate::candles::fold_counters::fold_counters()
+            .session_high_recovered
+            .increment(1);
     }
     if let Some(new_low) = delta.new_low
         && new_low < state.low
     {
         state.low = new_low;
-        metrics::counter!("tv_candle_session_low_recovered_total").increment(1);
+        crate::candles::fold_counters::fold_counters()
+            .session_low_recovered
+            .increment(1);
     }
 }
 
@@ -1161,7 +1169,9 @@ fn fold_in_bucket(
         if tick.open_interest != 0 {
             state.oi = i64::from(tick.open_interest);
         } else if state.oi != 0 {
-            metrics::counter!("tv_candle_oi_zero_ignored_total").increment(1);
+            crate::candles::fold_counters::fold_counters()
+                .oi_zero_ignored
+                .increment(1);
         }
     }
     // Exchange cumulative volume only ever rises, so a bucket's traded volume
@@ -1180,7 +1190,9 @@ fn fold_in_bucket(
     if bucket_volume > state.volume {
         state.volume = bucket_volume;
     } else if bucket_volume < state.volume {
-        metrics::counter!("tv_candle_volume_regression_suppressed_total").increment(1);
+        crate::candles::fold_counters::fold_counters()
+            .volume_regression_suppressed
+            .increment(1);
     }
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
