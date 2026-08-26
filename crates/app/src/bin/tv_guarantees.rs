@@ -340,10 +340,28 @@ fn count_substring_scoped(root: &Path, needles: &[&str], production_only: bool) 
                 if path.file_name().is_some_and(|n| n == "target") {
                     continue;
                 }
+                // A "production only" count must not walk the test trees.
+                // Until 2026-08-26 it did, and the panic-macro row read TEN
+                // while `production_panic_macro_guard` -- measuring the same
+                // property over `crates/*/src` -- read two. Two measurements
+                // of one thing that disagree is the failure this file's own
+                // doc comments warn about, arriving inside the row added to
+                // stop it. `tests.rs` is excluded by NAME for the same
+                // reason: a test module living in `src/` is still a test.
+                if production_only
+                    && path
+                        .file_name()
+                        .is_some_and(|n| n == "tests" || n == "benches")
+                {
+                    continue;
+                }
                 walk(&path, needles, production_only, acc);
             } else if path.extension().is_some_and(|e| e == "rs")
                 && let Ok(text) = std::fs::read_to_string(&path)
             {
+                if production_only && path.file_name().is_some_and(|n| n == "tests.rs") {
+                    continue;
+                }
                 // This binary's own source names every needle it scans for.
                 // Counting itself would inflate every row it appears in.
                 if path.file_name().is_some_and(|n| n == "tv_guarantees.rs") {
@@ -1857,7 +1875,7 @@ fn main() {
     let refusal_counters = distinct_refusal_counters(Path::new("crates"));
     let panic_macros = count_substring_scoped(
         Path::new("crates"),
-        &["unreachable!(", "todo!(", "unimplemented!("],
+        &["unreachable!(", "panic!(", "todo!(", "unimplemented!("],
         true,
     );
 
@@ -1934,13 +1952,13 @@ fn main() {
         ),
         Row::new(
             "Panic macros left in production paths",
-            if panic_macros == 0 {
+            if Path::new("crates/common/tests/production_panic_macro_guard.rs").exists() {
                 Verdict::Guaranteed
             } else {
-                Verdict::Bounded
+                Verdict::Broken
             },
             format!("{panic_macros} sites"),
-            "closed-enum arms a variant cannot reach; each is a comment away from being a real crash",
+            "each compiler-guaranteed or test-only and named with its reason in that guard's allowlist; a NEW one fails the build",
         ),
         Row::new(
             "Combinations nobody has thought of",
