@@ -724,6 +724,73 @@ mod tests {
         );
     }
 
+    /// THE OPERATOR'S RULE, stated as a test with the numbers the live box
+    /// actually produced on 2026-08-26.
+    ///
+    /// "Always ensure the finalised pre-open 9.12 close price as the 9.15 am
+    /// open price" (operator, 2026-08-26; the same requirement as his
+    /// 2026-08-25 quote recorded in websocket-connection-scope-lock.md).
+    ///
+    /// The shape this pins is the one indices hit EVERY morning and which the
+    /// sibling test above does NOT cover: the first ticks we see are pre-open
+    /// (09:00), and Dhan sends them with NO day-open field at all -- measured
+    /// live, NIFTY's 09:00:02 rows carry `open = NULL`. Only at 09:15 does the
+    /// exchange publish its equilibrium open. If the fallback open taken from
+    /// that first pre-open print were sticky, NIFTY's recorded day open would
+    /// be 24035.25 -- a PRE-OPEN price -- instead of the exchange's 24341.95,
+    /// and it would be wrong by ~307 points on the headline index every day.
+    ///
+    /// Live evidence the adoption works today (`ticks`, 2026-08-26):
+    ///   09:00:02  ltp 24035.25  open NULL      <- pre-open, no open yet
+    ///   09:15:00  ltp 24343.05  open 24341.95  <- exchange equilibrium open
+    /// and note the 09:15 LTP and the open DIFFER, so "first tick at or after
+    /// 09:15" would also have been wrong. Only the exchange's own field is
+    /// right.
+    #[test]
+    fn a_late_exchange_open_corrects_the_preopen_price_we_fell_back_to() {
+        let mut d = DayOhlc::disarmed();
+
+        // 09:00 pre-open: a real print, but the packet carries no day open.
+        // 0.0 is the documented absent sentinel.
+        d.update_tick_with_exchange_open(24035.25, 0.0);
+        assert!(
+            (d.day_open - 24035.25).abs() < f64::EPSILON,
+            "with no exchange open yet, the first print is the only candidate"
+        );
+
+        // 09:15: the exchange publishes its equilibrium open. It must WIN,
+        // even though we already had an open.
+        d.update_tick_with_exchange_open(24343.05, 24341.95);
+        assert!(
+            (d.day_open - 24341.95).abs() < f64::EPSILON,
+            "the exchange open must replace the pre-open fallback, got {}",
+            d.day_open
+        );
+        assert!(
+            (d.day_open - 24035.25).abs() > 1.0,
+            "the PRE-OPEN price must not survive as the day open"
+        );
+    }
+
+    /// The corrective adoption must not be a one-shot: an index that receives
+    /// several pre-open prints before 09:15 still ends the day on the
+    /// exchange's open, whichever print happened to arrive first.
+    #[test]
+    fn many_preopen_prints_still_end_on_the_exchange_open() {
+        let mut d = DayOhlc::disarmed();
+        for p in [24035.25_f64, 24009.75, 24004.95, 24120.10] {
+            d.update_tick_with_exchange_open(p, 0.0);
+        }
+        d.update_tick_with_exchange_open(24343.05, 24341.95);
+        assert!(
+            (d.day_open - 24341.95).abs() < f64::EPSILON,
+            "exchange open must win over every pre-open print, got {}",
+            d.day_open
+        );
+        // And the invariant the range depends on still holds.
+        assert!(d.day_low <= d.day_open && d.day_open <= d.day_high);
+    }
+
     /// `low <= open <= high` must hold even when the adopted open sits
     /// outside the range built from observed ticks — otherwise the row reads
     /// as corruption downstream.
