@@ -274,9 +274,40 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
         let slot = by_strike
             .entry((&c.underlying, paise))
             .or_insert((None, None, c.spot));
+        // LOWEST id wins a contested leg, rather than the last row seen.
+        //
+        // A well-formed chain lists one contract per (underlying, expiry,
+        // strike, leg), so this only bites on vendor data that is already
+        // wrong. But "already wrong" is not "cannot happen", and the two
+        // available behaviours differ in a way that matters:
+        //
+        //   last-write-wins  the answer depends on the ORDER the rows
+        //                    arrive in. The query carries no ORDER BY, so
+        //                    two minutes can legitimately return the same
+        //                    rows in a different order and pick different
+        //                    contracts — the socket then swaps back and
+        //                    forth between two ids for the rest of the day,
+        //                    reporting healthy swap counts the whole time.
+        //   lowest id wins   the same input always gives the same answer.
+        //
+        // Neither can tell WHICH id is right; only one of them is stable.
+        // Refusing the strike outright was considered and rejected: it
+        // spends a real depth slot to punish a duplicate that is usually
+        // benign, and the strike is one the operator asked to be covered.
+        //
+        // Found by a property test — the hand-written suite had no
+        // malformed-chain case at all.
         match c.leg.as_str() {
-            "CE" => slot.0 = Some(c.contract_security_id),
-            "PE" => slot.1 = Some(c.contract_security_id),
+            "CE" => {
+                slot.0 = Some(slot.0.map_or(c.contract_security_id, |had| {
+                    had.min(c.contract_security_id)
+                }));
+            }
+            "PE" => {
+                slot.1 = Some(slot.1.map_or(c.contract_security_id, |had| {
+                    had.min(c.contract_security_id)
+                }));
+            }
             // An unrecognised leg. Not a future — those carry no strike and
             // were filtered upstream — so this is a row we cannot place, and
             // placing it on a guess would subscribe the wrong side.
@@ -298,6 +329,17 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
             let (Some(ce), Some(pe)) = (*ce, *pe) else {
                 continue;
             };
+            // One contract cannot be both legs of its own strike. A chain
+            // that says so is malformed, and honouring it would spend TWO of
+            // the 250 authorized depth slots on a single instrument while
+            // the strike's real other leg goes unsubscribed. Dropping the
+            // strike is the same treatment a half-listed strike already
+            // gets, and for the same reason: a CALL socket and a PUT socket
+            // that are not reading two different books are not doing the job
+            // they were dialed for.
+            if ce == pe {
+                continue;
+            }
             spot = *s;
             pairs.push(StrikePair {
                 strike_paise: *paise,
@@ -374,6 +416,10 @@ pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<S
         let (Some(ce), Some(pe)) = pairs[&paise] else {
             continue;
         };
+        // Same refusal as the chain view — see there for why.
+        if ce == pe {
+            continue;
+        }
         let distance = (paise - spot_paise).abs();
         if distance < best_distance {
             best_distance = distance;
