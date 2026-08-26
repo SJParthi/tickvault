@@ -3715,3 +3715,93 @@ because the code got longer. It failed CLOSED (blocking a correct change), which
 is the better direction, but the shape is the same one corrected four times
 already in this branch. It now walks back to the enclosing macro opening, which is
 a real boundary and cannot drift. Bite-proven: deleting the field it pins fails it.
+
+---
+
+## Item 37 — a fixed sweep order starved the tail of the universe forever
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, verbatim: *"ensure to pull evrythign using incrmental or decrmental
+aprpoach ddude okay?"*
+
+The fetch loop walked its target list in FIXED order and `break`s on a hard
+wall-clock budget. Fixed order plus truncation is not "we reach fewer
+instruments" — it is **"we never reach the tail"**, identically, every day,
+while the report shows a respectable coverage percentage and nothing says
+which instruments were skipped.
+
+Today's pacing change (Item 35) is what makes it bite. Measured:
+
+| limiter rate | per-answer | 868 targets need | vs 600 s budget |
+|---|---|---:|---|
+| 4 rps | 0.2 s | 391 s | covers all |
+| 3 rps | 0.4 s | 637 s | **truncates ~6%** |
+| 2 rps | 0.4 s | 781 s | **truncates ~23%** |
+
+At the limiter's floor a specific 23% of the universe would go permanently
+unverified — in the one check that exists to prove nothing was lost.
+
+**The fix is a rotating start, and it is deliberately STATELESS.** A persisted
+cursor resumes exactly and is also a file to lose, corrupt, or have differ
+between a laptop and the box — a new failure mode inside the only loss
+detector. The trading date is state everyone already agrees on.
+
+**The stride is the guarantee.** Consecutive runs cover `[k·s, k·s + c)`;
+their union is the whole list exactly when `c >= s`. At `s = ceil(n/3)` any run
+reaching a third closes the universe in three days, and the measured worst case
+(77%) closes it in two.
+
+### Edge cases
+
+- **Empty target list** — returns 0 rather than dividing by zero. A wrong start
+  is survivable; a panic in the only loss detector takes the day's
+  verification with it.
+- **`n = 1`** — `max(1)` keeps the stride positive.
+- **Year boundary** — days-from-epoch, not day-of-year. Day-of-year snaps to 0
+  every January and re-starves whatever December was working through.
+- **A 25,000 universe** — the day number (~739,000) is reduced modulo `n`
+  BEFORE multiplying by the stride, so the product cannot overflow a 32-bit
+  `usize`.
+
+### Failure modes
+
+**The off-by-one a test caught.** `n / 3` rounds DOWN: at n=868 the stride is
+289, three of which is 867 — leaving exactly one index that three strides never
+reach, starved forever. `div_ceil` closes it. That is the same defect this
+rotation exists to kill, one index wide instead of two hundred.
+
+**Rotation that is not a permutation.** If the wrap skipped or repeated an
+index, an un-truncated run would compare one instrument twice and another
+never. Pinned for n ∈ {1, 2, 7, 868}.
+
+### Test plan
+
+7 tests: empty list does not divide by zero; consecutive days differ; three
+days at exactly one-third coverage reach everything; the measured 77% closes in
+two days; a full sweep is a permutation; a year boundary does not reset;
+a 25,000 universe does not overflow.
+
+**Bite-proven:** pinning the start back to 0 fails **5** of them.
+
+### Rollback
+
+Delete `rotation_start` and iterate `targets` directly. That restores a sweep
+that starves the same tail every day.
+
+### Observability
+
+**No new metric name and no cost.** The coverage fraction the guarantee depends
+on already rides the verdict line as `targets` and the compared count.
+
+### Honest envelope
+
+This converts permanent starvation into eventual coverage. It does **not** make
+any single day complete — a truncated run still leaves that day's tail
+unverified, and only the next runs close it. The three-day guarantee holds only
+while coverage stays above a third; if it falls below, the rotation no longer
+covers everything, and the reported fraction is what would show it. Nothing
+here reduces the 815 fetch failures — that is Item 35's diagnosis, due
+tomorrow.
