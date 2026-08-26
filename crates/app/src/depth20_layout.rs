@@ -182,6 +182,30 @@ pub fn index_window(
 pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) -> Depth20Layout {
     let mut out = Depth20Layout::default();
 
+    // No instrument may appear twice in the WHOLE layout -- and that includes
+    // twice inside ONE index socket, which is the sharpest form of it.
+    //
+    // A duplicate ACROSS two sockets spends two of the 250 slots on one order
+    // book and lands a duplicate subscribe on Dhan's per-connection state. A
+    // duplicate WITHIN one socket is worse: both copies go out in the same
+    // batch on the same connection, and Dhan answers a duplicate subscribe
+    // with an 804, which is Fatal -- the connection drops and does not come
+    // back this session.
+    //
+    // `index_window` emits `ce_security_id` and `pe_security_id` for every
+    // pair in the strike range, so it repeats an id if the chain ever hands
+    // back the same strike twice or a row whose two legs carry one id. The
+    // `LATEST ON ... PARTITION BY underlying, expiry, strike, leg` query makes
+    // the first case unreachable today and the second needs corrupt vendor
+    // data -- but that is a property of the QUERY and of the vendor, not of
+    // this function, and the cost of being wrong is a dead socket.
+    //
+    // This set was previously SEEDED from the finished index sockets, so it
+    // protected the movers from the index and the movers from each other
+    // while carrying any index-internal duplicate straight through. Found by
+    // a property test attacking the tracker downstream, not by reading.
+    let mut seen: std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> =
+        std::collections::HashSet::new();
     for underlying in DEPTH_20_INDEX_UNDERLYINGS {
         let mut instruments =
             index_window(candidates, underlying, DEPTH_20_INDEX_STRIKES_EACH_SIDE);
@@ -191,7 +215,26 @@ pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) 
         // Never more than one connection's worth. A window wider than the
         // socket would spill onto the next one and push the second index
         // underlying off the end entirely.
-        instruments.truncate(DEPTH_20_PER_SOCKET);
+        // Dedupe and cap in ONE pass, because doing them in either order
+        // separately is wrong. Deduping first and truncating after leaves the
+        // socket short of a strike it could have carried; truncating first and
+        // deduping after does the same. And a plain `retain` would claim ids
+        // in `seen` that the truncate then discards -- a movers instrument
+        // would be dropped later on the strength of an index strike that was
+        // never subscribed.
+        //
+        // Taking until the socket is full, claiming only what is kept, has
+        // neither failure.
+        let mut kept = Vec::with_capacity(DEPTH_20_PER_SOCKET);
+        for i in instruments {
+            if kept.len() >= DEPTH_20_PER_SOCKET {
+                break;
+            }
+            if seen.insert((i.security_id, i.segment)) {
+                kept.push(i);
+            }
+        }
+        let instruments = kept;
         // An index socket is emitted EVEN WHEN EMPTY, deliberately.
         //
         // Its position is its identity: socket 0 is NIFTY and socket 1 is
@@ -230,24 +273,17 @@ pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) 
         .chain(out.ranking.tiebreak.iter())
         .collect();
 
-    // No instrument may appear twice in the WHOLE layout.
+    // `seen` continues from the index sockets above -- one running set for
+    // the whole layout, rather than a fresh one seeded from the finished
+    // index sockets.
     //
-    // Two slots spent on one order book is the mild reading. The sharp one
-    // is that two sockets carrying the same instrument means two connections
-    // subscribing it, and on Dhan's per-connection subscription state the
-    // second is a duplicate.
-    //
-    // Reachable when an index underlying also appears in the ranking: its
-    // at-the-money pair would then be taken by both its own index window and
-    // a movers socket. The movers query filters to NSE_EQ and an index is
-    // IDX_I, so that should not happen today — but "should not happen today"
-    // is a property of the QUERY, not of this function, and a later widening
-    // of that filter would land here silently. Found by a property test.
-    let mut seen: std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> = out
-        .sockets
-        .iter()
-        .flat_map(|s| s.instruments.iter().map(|i| (i.security_id, i.segment)))
-        .collect();
+    // The movers case it protects: an index underlying also appearing in the
+    // ranking would have its at-the-money pair taken by both its own index
+    // window and a movers socket. The movers query filters to NSE_EQ and an
+    // index is IDX_I, so that should not happen today -- but "should not
+    // happen today" is a property of the QUERY, not of this function, and a
+    // later widening of that filter would land here silently. Found by a
+    // property test.
 
     let mut mover_instruments = Vec::with_capacity(MOVER_STOCKS_TOTAL * 2);
     for stock in ranked {
@@ -617,6 +653,51 @@ mod tests {
                 "duplicate instrument {i:?} — a repeated id in one batch is an 804"
             );
         }
+    }
+
+    #[test]
+    fn a_chain_that_repeats_one_leg_id_never_subscribes_it_twice() {
+        // The sharpest form of the duplicate: BOTH copies sit in the SAME
+        // index socket, so they go out in one batch on one connection. Dhan
+        // answers a duplicate subscribe with an 804, which is Fatal -- that
+        // connection is gone for the session.
+        //
+        // Reaching it needs a chain that hands back the same contract id for
+        // two different strikes. The `LATEST ON ... PARTITION BY underlying,
+        // expiry, strike, leg` query makes that unreachable today, which is
+        // exactly why it is pinned here rather than assumed: the guarantee
+        // lives in a SQL clause, not in this function, and the cost of it
+        // changing is a dead socket.
+        let mut c = chain("NIFTY", 24_500.0, 50.0, 20, 10_000);
+        // Point a second strike's CE at an id the window already carries.
+        let victim = c
+            .iter()
+            .find(|x| x.leg == "CE")
+            .map(|x| x.contract_security_id)
+            .expect("the chain has a CE");
+        let second = c
+            .iter_mut()
+            .filter(|x| x.leg == "CE")
+            .nth(1)
+            .expect("the chain has a second CE");
+        second.contract_security_id = victim;
+
+        let got = build_depth20_layout(&c, &[]);
+        let flat = got.flattened();
+        let mut seen = std::collections::HashSet::new();
+        for i in &flat {
+            assert!(
+                seen.insert((i.security_id, i.segment)),
+                "duplicate instrument {i:?} inside one socket -- Dhan answers a \
+                 repeated subscribe in one batch with an 804 (Fatal)"
+            );
+        }
+        // And the drop must not leave the socket short: the window has more
+        // strikes available, so the next one takes the freed slot.
+        assert!(
+            !flat.is_empty(),
+            "the window collapsed entirely on a single repeated id"
+        );
     }
 
     #[test]

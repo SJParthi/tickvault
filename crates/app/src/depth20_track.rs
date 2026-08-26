@@ -436,6 +436,25 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
                     } else {
                         socket.held.push(*take);
                     }
+                    // Then purge any FURTHER copy of the released instrument.
+                    // The first one is now `take`, so this removes only the
+                    // extras.
+                    //
+                    // One unsubscribe takes the instrument off the wire
+                    // outright, so a second believed copy is a belief the
+                    // connection does not share — and a believed-held set
+                    // running ahead of the wire is exactly what this module's
+                    // header says costs every future swap on the socket: next
+                    // minute names it as a departure, the guard refuses an
+                    // unsubscribe for something the connection does not hold,
+                    // and the arrival that swap was funding is lost with it.
+                    //
+                    // Duplicates cannot reach here from `build_depth20_layout`
+                    // today — it dedupes the whole layout, index sockets
+                    // included, as of the same change that added this. One
+                    // scan of at most fifty items once a minute is the price
+                    // of not depending on that staying true.
+                    socket.held.retain(|h| *h != *release);
                     metrics::counter!(DEPTH20_SWAPS_SENT).increment(1);
                     sent = sent.saturating_add(1);
                 }
