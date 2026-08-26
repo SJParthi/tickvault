@@ -712,3 +712,72 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
   alarm_actions = local.app_alarm_actions
   ok_actions    = []
 }
+
+# ---------------------------------------------------------------------------
+# 13. DEPTH STEERING STOPPED (2026-08-26)
+# ---------------------------------------------------------------------------
+# Both depth pools re-aim once a minute: depth-200 follows the at-the-money
+# strike, and depth-20 now follows its index windows and the day's movers. Five
+# counters describe how much MOVED. Not one of them answered the question an
+# operator actually has at 14:00 — "is depth steering still running at all?" —
+# and until today none of the five reached CloudWatch either.
+#
+# That question has several causes and exactly one symptom. The task panicked;
+# the loop is wedged on a QuestDB query; every command channel closed; the
+# stack never spawned it. In all four the sockets sit on whatever they held at
+# 09:1x for the rest of the session, every other alarm stays green, and the
+# dashboards show a feed delivering ticks normally — because it is. Depth is
+# simply aimed at yesterday's strikes.
+#
+# WHY A GAUGE, NOT ANOTHER COUNTER. A counter that stops incrementing is
+# indistinguishable from a quiet market, and this repository has already paid
+# to learn the second half: the CloudWatch agent's prometheus pipeline is
+# ambiguous about whether a `_total` arrives as a delta or a running
+# cumulative, so an alarm written for the wrong reading is silently blind. A
+# gauge is published verbatim either way — see alarm 11's header, which
+# corrects exactly this mistake on the tick-flow signal.
+#
+# WHY IT IS PUBLISHED BY A SEPARATE TASK. The rebalance loop stamps a shared
+# timestamp; a small ticker publishes `now - stamp` every 30 seconds. Had the
+# loop published its own gauge, a wedged loop would freeze it at zero, and a
+# frozen zero reads as perfectly healthy. Now a stall makes the number GROW,
+# and a total task death stops the series entirely — which `breaching` catches.
+# Both failure shapes are visible; neither was before.
+#
+# WHY THE GATE. `breaching` is what makes process death visible, but a bare
+# flip to breaching pages every evening at 17:30 and all weekend. Membership in
+# the market-hours gate's ALARM_NAMES list is what makes it safe.
+resource "aws_cloudwatch_metric_alarm" "depth_steering_stalled" {
+  alarm_name        = "tv-${var.environment}-depth-steering-stalled"
+  alarm_description = <<-EOT
+    Depth has stopped re-aiming. The 20-level and 200-level connections are
+    still up and still delivering, but they are pointed at whatever strikes
+    they held when steering stopped — so the deepest book we collect is for
+    contracts the money may have left. Nothing else will report this: every
+    other depth signal describes what moved, and nothing moving is exactly
+    the failure.
+  EOT
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  # 180s against a 60s loop. Two missed minutes is a slow query or a busy
+  # host; three is a stall.
+  threshold          = 180
+  evaluation_periods = 2
+  metric_name        = "tv_depth_rebalance_age_secs"
+  namespace          = local.app_namespace
+  period             = 300
+  # Maximum, not Average: a window holding one fresh reading and four stale
+  # ones is still a window in which steering was stopped, and averaging would
+  # let a single recovered minute erase four dead ones.
+  statistic  = "Maximum"
+  dimensions = local.app_dimensions
+
+  treat_missing_data = "breaching"
+
+  # Actions OFF by default; the market-hours gate Lambda flips them ON.
+  # WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  # Steering resuming is a real, self-explanatory recovery — the sockets
+  # re-aim on the next minute and the age falls back to near zero.
+  ok_actions = local.app_alarm_ok
+}

@@ -475,6 +475,52 @@ pub fn build_movers_query(today_ist_micros: i64) -> String {
     )
 }
 
+/// The pre-open ranking, read from ticks instead of candles.
+///
+/// # Why this exists — the 09:13 gap, measured
+///
+/// The operator's requirement is that depth is connected and subscribed by
+/// **09:13**. Five of the ten depth sockets could not meet it, and the reason
+/// is a boundary two subsystems disagree about:
+///
+/// | Reads | From | Available at 09:13 |
+/// |---|---|---|
+/// | `fetch_spot_prices` | `ticks` | YES — capture starts 09:00 |
+/// | `build_movers_query` | `candles_1m` | **NO** |
+///
+/// Ticks are PERSISTED from 09:00, but the aggregator refuses to FOLD
+/// anything before 09:15:00 (`MARKET_OPEN_SECS_OF_DAY_IST`), so `candles_1m`
+/// is necessarily empty until the 09:15 candle seals around 09:16. Anything
+/// keyed on a ranking was therefore dark for the first three minutes the
+/// operator asked to be covered:
+///
+/// - depth-20's three movers sockets (150 of its 250 instruments)
+/// - depth-200's fifth socket, the day's biggest mover
+///
+/// The at-the-money sockets were unaffected — they read spot, which is there.
+///
+/// **The ranking itself is not missing at 09:13, only its usual source is.**
+/// A tick carries the previous day's close (`day_close`, populated on Quote
+/// and Full packets), and the pre-open equilibrium price is in `ltp` by
+/// 09:12. Percent change is exactly the same arithmetic the candle column
+/// performs — so this reads it one layer lower rather than inventing a
+/// substitute.
+///
+/// `close > 0` is required, not assumed: a Ticker-mode packet carries
+/// `0.0` there by documented design, and dividing by it would rank every
+/// such instrument at infinity — putting the WORST-populated instruments at
+/// the top of the list.
+#[must_use]
+pub fn build_preopen_movers_query(today_ist_micros: i64) -> String {
+    let segment = MOVER_UNDERLYING_SEGMENT.as_str();
+    format!(
+        "SELECT t.security_id, il.symbol_name,          ((t.ltp - t.close) / t.close) * 100.0 AS close_pct_from_prev_day          FROM (SELECT security_id, ltp, close FROM ticks          WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {today_ist_micros}          AND ltp > 0 AND close > 0          LATEST ON ts PARTITION BY security_id) t          JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle          WHERE feed = 'dhan' AND exchange_segment = '{segment}') il          ON t.security_id = il.security_id;"
+    )
+}
+
+/// Which source a minute's ranking came from.
+pub const MOVERS_SOURCE: &str = "tv_depth_movers_source_total";
+
 /// Parse the `/exec` dataset into mover rows.
 ///
 /// Fail-LOUD on a malformed body or a missing `dataset` key, fail-soft per row
@@ -634,6 +680,54 @@ pub struct RebalanceSocket {
 /// session — a bug that would look exactly like normal operation.
 pub const REBALANCE_OFFSET_SECS: u64 = 8;
 
+/// How often the heartbeat ticker republishes the age.
+///
+/// Half the alarm's own period, so every window carries a fresh reading
+/// rather than one that happened to land badly.
+pub const REBALANCE_HEARTBEAT_SECS: u64 = 30;
+
+/// The age to publish, given the last stamp and the time now.
+///
+/// A pure function because the interesting cases are the boundaries — a loop
+/// that has never evaluated, and a clock that went backwards — and neither is
+/// assertable through a `tokio::time` sleep.
+#[must_use]
+pub fn rebalance_age_value(last_stamp_secs: i64, now_secs: i64) -> f64 {
+    if last_stamp_secs <= 0 {
+        // Never evaluated. Reported as the age since the process started
+        // would be a guess; reporting a large constant says "not running"
+        // without inventing a duration.
+        return f64::from(u16::MAX);
+    }
+    // Saturating, and never negative: a backwards clock step must not make a
+    // stalled loop look freshly alive, which is the one direction that
+    // matters.
+    now_secs.saturating_sub(last_stamp_secs).max(0) as f64
+}
+
+/// Seconds since the rebalance loop last completed a minute's evaluation.
+///
+/// # Why a gauge, when five counters already exist
+///
+/// The counters answer "how much moved". None of them answers the question an
+/// operator actually has at 14:00, which is **"is depth steering still
+/// running at all?"** — and that question has several causes with one
+/// symptom: the task panicked, the loop is wedged on a query, every channel
+/// closed, or the whole stack never spawned it. A counter that stops
+/// incrementing is indistinguishable from a quiet market; this is not.
+///
+/// A GAUGE specifically, for a reason this repository has already paid to
+/// learn: the CloudWatch agent's prometheus pipeline is ambiguous about
+/// whether a `_total` arrives as a delta or a running cumulative, and an
+/// alarm written for the wrong one is silently blind. A gauge is published
+/// verbatim either way, so the alarm cannot be disarmed by a pipeline detail
+/// nobody here can check.
+///
+/// Published on EVERY iteration, including quiet ones — a series that only
+/// appears when something moves is missing at exactly the moment it is
+/// needed.
+pub const REBALANCE_AGE_SECS: &str = "tv_depth_rebalance_age_secs";
+
 /// The counter for swaps that actually reached a channel.
 pub const REBALANCE_SWAPS_SENT: &str = "tv_depth_rebalance_swaps_sent_total";
 
@@ -776,13 +870,38 @@ pub async fn fetch_movers(
         );
         return Vec::new();
     };
-    let sql = build_movers_query(today_ist_micros);
-    let body = match client
-        .get(&url)
-        .query(&[("query", sql.as_str())])
-        .send()
-        .await
-    {
+    // Sealed candles first. They are the better source once they exist: a
+    // candle's percent change is the same arithmetic but computed over a
+    // whole minute rather than one instant.
+    let rows = run_movers_query(&client, &url, &build_movers_query(today_ist_micros)).await;
+    if !rows.is_empty() {
+        metrics::counter!(MOVERS_SOURCE, "source" => "candles").increment(1);
+        return rows;
+    }
+
+    // Empty is the NORMAL state before ~09:16, not a fault — the aggregator
+    // refuses to fold anything before 09:15:00, so no candle can have sealed
+    // yet. Falling back to ticks is what lets the movers sockets meet the
+    // 09:13 deadline instead of standing dark for the first three minutes.
+    //
+    // Also reached, deliberately, if the candle query fails mid-session: a
+    // ranking from ticks is worse than one from candles and far better than
+    // none, and "none" leaves five sockets frozen wherever they were.
+    let preopen =
+        run_movers_query(&client, &url, &build_preopen_movers_query(today_ist_micros)).await;
+    metrics::counter!(
+        MOVERS_SOURCE,
+        "source" => if preopen.is_empty() { "none" } else { "ticks" }
+    )
+    .increment(1);
+    preopen
+}
+
+/// Runs one ranking query and parses it. Every failure is a warn plus an
+/// empty result — the caller decides what an empty ranking means, because at
+/// 09:13 it means "try ticks" and at 14:00 it means "keep what you hold".
+async fn run_movers_query(client: &reqwest::Client, url: &str, sql: &str) -> Vec<MoverRow> {
+    let body = match client.get(url).query(&[("query", sql)]).send().await {
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(b) => b,
             Err(err) => {
@@ -864,6 +983,13 @@ pub async fn run_depth_rebalance(
     }
     pre_register_rebalance_counters();
     crate::depth20_track::pre_register_depth20_counters();
+    // The heartbeat, published by a task this loop cannot wedge.
+    //
+    // Registered BEFORE the first iteration: a loop that dies on its very
+    // first pass would otherwise never create the series at all, and a
+    // never-created series reads as missing data rather than as stale.
+    let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    spawn_rebalance_heartbeat(std::sync::Arc::clone(&heartbeat));
     let mut tracker = Depth200AtmTracker::new(Depth200AtmConfig::default());
     // Seed the fifth socket's tracker from what the dial actually put on it.
     //
@@ -926,6 +1052,16 @@ pub async fn run_depth_rebalance(
             }
         }
 
+        // The heartbeat stamp. Written on EVERY iteration — including the
+        // overwhelmingly common quiet one, which is exactly when a signal
+        // that only appears on activity would be missing.
+        //
+        // A STAMP, not the gauge itself: the ticker below publishes the age.
+        // Publishing here would freeze the gauge at its last value if this
+        // loop ever wedged, and a frozen zero reads as perfectly healthy —
+        // the false-OK the gauge exists to prevent.
+        heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+
         let decision = plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers);
         if decision.is_quiet() {
             // The overwhelmingly common minute. No log line: ~375 of these a
@@ -943,6 +1079,30 @@ pub async fn run_depth_rebalance(
             "depth rebalance moved sockets"
         );
     }
+}
+
+/// Seconds since the Unix epoch, or 0 if the clock is unreadable.
+#[must_use]
+fn now_epoch_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Publishes the rebalance age forever, from a task the loop cannot wedge.
+///
+/// Separate from the loop deliberately. If the loop stalls on a query, this
+/// keeps publishing a GROWING age and the alarm fires. If the whole task tree
+/// dies, nothing publishes at all and CloudWatch sees missing data — which,
+/// treated as breaching, fires too. Those are the two ways depth steering can
+/// die, and both are visible.
+// TEST-EXEMPT: spawn wrapper over rebalance_age_value, which is tested directly.
+fn spawn_rebalance_heartbeat(stamp: std::sync::Arc<std::sync::atomic::AtomicI64>) {
+    tokio::spawn(async move {
+        loop {
+            let last = stamp.load(std::sync::atomic::Ordering::Relaxed);
+            metrics::gauge!(REBALANCE_AGE_SECS).set(rebalance_age_value(last, now_epoch_secs()));
+            tokio::time::sleep(std::time::Duration::from_secs(REBALANCE_HEARTBEAT_SECS)).await;
+        }
+    });
 }
 
 /// Everything the attach needs to shape depth, loaded once.
@@ -2238,5 +2398,124 @@ mod current_expiry_tests {
         assert_eq!(nearest_expiry_for(&c, "NIFTY"), Some(NEXT_MONTH));
         assert_eq!(nearest_expiry_for(&c, "BANKNIFTY"), Some(THIS_WEEK));
         assert_eq!(nearest_expiry_for(&c, "MISSING"), None);
+    }
+}
+
+#[cfg(test)]
+mod preopen_readiness_tests {
+    use super::*;
+
+    const TODAY: i64 = 1_700_000_000_000_000;
+
+    #[test]
+    fn the_preopen_ranking_reads_ticks_not_candles() {
+        // The whole point: candles_1m cannot have a row before ~09:16.
+        let sql = build_preopen_movers_query(TODAY);
+        assert!(sql.contains("FROM ticks"), "{sql}");
+        assert!(
+            !sql.contains("candles_1m"),
+            "the fallback reads the very table it exists to avoid: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_zero_previous_close_can_never_reach_the_ranking() {
+        // A Ticker-mode packet carries close = 0.0 by documented design.
+        // Dividing by it ranks the WORST-populated instruments at the top.
+        let sql = build_preopen_movers_query(TODAY);
+        assert!(sql.contains("close > 0"), "{sql}");
+        assert!(sql.contains("ltp > 0"), "{sql}");
+    }
+
+    #[test]
+    fn the_preopen_ranking_computes_the_same_quantity_as_the_candle_column() {
+        // Not a substitute metric — the same arithmetic, one layer lower.
+        let sql = build_preopen_movers_query(TODAY);
+        assert!(
+            sql.contains("((t.ltp - t.close) / t.close) * 100.0"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("AS close_pct_from_prev_day"),
+            "the column must be named what the parser reads: {sql}"
+        );
+    }
+
+    #[test]
+    fn both_rankings_are_bounded_to_today_and_keyed_per_instrument() {
+        // An unbounded LATEST ON walks every partition ever written.
+        for sql in [build_movers_query(TODAY), build_preopen_movers_query(TODAY)] {
+            assert!(sql.contains("ts >= 1700000000000000"), "{sql}");
+            assert!(
+                sql.contains("LATEST ON ts PARTITION BY security_id"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_rankings_agree_on_the_segment_and_the_feed() {
+        // A ranking that changed segment between its two sources would rank
+        // different instruments depending on the time of day.
+        let a = build_movers_query(TODAY);
+        let b = build_preopen_movers_query(TODAY);
+        let seg = MOVER_UNDERLYING_SEGMENT.as_str();
+        for sql in [&a, &b] {
+            assert!(sql.contains(&format!("segment = '{seg}'")), "{sql}");
+            assert!(sql.contains("feed = 'dhan'"), "{sql}");
+            assert!(
+                sql.contains(&format!("exchange_segment = '{seg}'")),
+                "the join side must match too: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preopen_ranking_parses_with_the_same_parser() {
+        // Shipping a second parser is how two readings of one thing drift.
+        let body = r#"{"dataset":[[1234,"RELIANCE",2.5],[5678,"TCS",-1.25]]}"#;
+        let rows = parse_movers_dataset(body).expect("parses");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].security_id, 1234);
+        assert!((rows[0].pct_change - 2.5).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn a_loop_that_never_evaluated_does_not_report_as_fresh() {
+        // Zero would read as "evaluated this instant" — the exact false-OK
+        // this gauge exists to prevent.
+        let v = rebalance_age_value(0, 1_700_000_000);
+        assert!(v > 60.0, "a never-run loop reported an age of {v}");
+    }
+
+    #[test]
+    fn a_running_loop_reports_the_real_gap() {
+        assert!((rebalance_age_value(1_700_000_000, 1_700_000_045) - 45.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_fresh_evaluation_reports_zero() {
+        assert!(rebalance_age_value(1_700_000_000, 1_700_000_000).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_backwards_clock_never_makes_a_stalled_loop_look_alive() {
+        // NTP steps backwards. Reporting a negative age would let a wedged
+        // loop read as healthy, which is the one direction that matters.
+        assert!(rebalance_age_value(1_700_000_100, 1_700_000_000) >= 0.0);
+    }
+
+    #[test]
+    fn the_heartbeat_is_published_more_often_than_an_alarm_period() {
+        assert!(
+            REBALANCE_HEARTBEAT_SECS <= 30,
+            "a heartbeat slower than the alarm period can land badly and \
+             report a value nearly a full period old"
+        );
     }
 }

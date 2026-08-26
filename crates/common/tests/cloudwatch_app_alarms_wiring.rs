@@ -819,10 +819,20 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // gauge would be 41 paid series for a number whose only operative value is
     // the worst one. +$0.30/mo, and it backs a real alarm rather than being a
     // diagnostic-only name (the shape this list has twice refused to ship).
+    // 2026-08-26, PLUS 1: tv_depth_rebalance_age_secs. Both depth pools
+    // re-aim once a minute, and FIVE counters already describe how much
+    // moved -- none of which reaches CloudWatch, and none of which answers
+    // "is steering running at all?". A counter that stops incrementing is
+    // indistinguishable from a quiet market. An AGE gauge is not, and it is
+    // published by a task the rebalance loop cannot wedge, so a stall makes
+    // the number grow rather than freezing it at a healthy-looking zero.
+    // ONE gauge for both pools: they share the loop, so they fail together.
+    // +$0.30/mo, and it backs a real gated alarm rather than being a
+    // diagnostic-only name.
     assert_eq!(
         names.len(),
-        80,
-        "Z+ L2 VERIFY ratchet: expected exactly 80 names in the MAIN EMF \
+        81,
+        "Z+ L2 VERIFY ratchet: expected exactly 81 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \

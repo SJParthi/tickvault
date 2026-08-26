@@ -398,6 +398,19 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 6 alarms.
         aws_cloudwatch_metric_alarm.tick_spill_replay_failing.alarm_name,
         aws_cloudwatch_metric_alarm.ticks_spilling.alarm_name,
+        # 2026-08-26: depth_steering_stalled JOINS the gate, for the same
+        # reason as dhan_live_lane_down and dhan_no_ticks_flowing above.
+        #
+        # Its signal is an AGE gauge and it treats missing data as breaching,
+        # because the two ways depth steering dies are a wedged loop (the age
+        # grows) and a dead task tree (the series stops entirely). Only
+        # `breaching` catches the second, and `breaching` is only safe while
+        # something disables the actions overnight — the box publishes nothing
+        # from 17:30 to 08:30 and all weekend, which without this list is a
+        # page every single evening.
+        #
+        # The gate now arms 7 alarms.
+        aws_cloudwatch_metric_alarm.depth_steering_stalled.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).
