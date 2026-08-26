@@ -2957,3 +2957,97 @@ should not. What comes back is the record that the instrument was seen, plus its
 open interest and bid/ask, and the ability to distinguish "did not trade" from
 "did not capture". If the 825,783 turn out NOT to be zeros, this change is inert
 and the split counter says so on day one.
+
+---
+
+## Item 29 — `/api/feeds/health` reports a working feed as DOWN, every day (2026-08-26)
+
+- [x] **29 — wire `set_connected` from the socket-count choke point**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/app/tests/sp5_dhan_feed_health_wiring_guard.rs` (+1, SP5.2)
+
+### Design
+
+`FeedHealthRegistry::set_connected` had **zero production call sites** — every
+reference in the workspace sat in a test module. The field initialises `false`,
+and `feed_health::classify` tests `if !i.connected` **before** the tick-age
+branch, so the verdict was `Down, "enabled but disconnected — reconnecting"`
+unconditionally.
+
+Captured on prod at one instant, 2026-08-26:
+
+```text
+/health            overall=healthy, websocket={connected, "15 connections"}
+/api/feeds/health  dhan verdict=DOWN connected=false
+                   ticks_total=17,265,688  last_tick_age=1s
+:9091              tv_dhan_ws_alive_connections 15
+                   tv_dhan_feed_stack_up 1
+```
+
+The same JSON object declared the feed down while reporting 17.2 million ticks
+and a one-second-old tick. `/board`, `/dashboard` and `/feeds` all render that
+row, so the operator's at-a-glance surface cried wolf every trading day,
+permanently — the inverse of a false-OK and no less corrosive, because a status
+that is always red is read as decoration.
+
+**This is the THIRD half of one defect**, and the pattern is the finding:
+`set_dhan_lane_running` was fixed 2026-08-14 (*"a status line that cannot vary
+is not a status line"*), `record_ticks` on 2026-08-18 (*"it answered a benign
+Unknown for a corpse"*). Each fix documented the shape and left the next sibling
+in place. `sp5_dhan_feed_health_wiring_guard.rs:42` even named this one and said
+it *"MUST be re-pinned in the PR that wires them"* — this is that PR.
+
+Sited inside `publish_alive_connections` rather than beside
+`set_dhan_lane_running`: that function is **both edges** of
+`AliveConnectionGuard`, so it tracks real socket transitions instead of a coarse
+lane-level flag, and its own doc already claims the single-owner property
+(*"one function owns the health push, so there is no second path to drift"*).
+
+### Edge Cases
+
+- The registry is installed **before** the arming `publish_alive_connections`
+  call. Install after it and the arming transition is silently dropped; on a
+  lane that dials once and stays up, the next socket event is the 17:30
+  shutdown. Ordering is pinned by the test.
+- `OnceLock` mirroring `HEALTH_REPORTER` rather than a new `params` field,
+  because the push site is a free function reached from a `Drop` impl —
+  threading an `Arc` there would need either a guard field or a second push
+  site, and a second site can drift.
+
+### Failure Modes
+
+- A second push site would let the two disagree; the test asserts **exactly
+  one**.
+- Shutdown drives `alive` to 0 and the row correctly goes `false`.
+
+### Test Plan
+
+SP5.2 added to the guard that predicted this gap. **Bite-proven**: removing the
+push fails it and nothing else.
+
+`cargo test -p tickvault-app` → **0 failed** (lib alone 1,404 passed).
+
+**Self-inflicted break, caught and fixed:** the first draft of the fix comment
+contained the literal `#[cfg(test)]`, and 20 source-scan tests split this file
+on that marker to isolate its production half — so my comment truncated their
+view and they failed. Reworded to "a test-only module". The tests were right; a
+comment is part of the file those scans read.
+
+### Rollback
+
+Single revert.
+
+### Observability
+
+No new metric, no new alarm, no EMF entry. It makes an EXISTING operator surface
+tell the truth.
+
+### Honest envelope
+
+Fixes the `connected` dimension only. The sibling `freshness` gap named in the
+same guard doc — a CONNECTED-but-silent feed reading healthy — is separately
+covered by the 30 s silence scan (`RISK-GAP-03`), which has paged since
+2026-08-15. What this does NOT do is make `/health` itself see silence: it
+consults neither tick flow nor the feed registry, so 15 alive sockets receiving
+nothing still reads `healthy` there. The two surfaces had opposite defects and
+only one is fixed here.

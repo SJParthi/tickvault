@@ -243,6 +243,27 @@ pub fn install_health_reporter(health: tickvault_api::state::SharedHealthStatus)
     HEALTH_REPORTER.set(health).is_ok()
 }
 
+/// The process-wide feed-health registry, reachable from the socket-count
+/// choke point.
+///
+/// # Why a `OnceLock` and not another `params` field
+///
+/// `params.feed_health` already exists and is threaded to the drain, but
+/// `publish_alive_connections` is a free function on BOTH edges of
+/// [`AliveConnectionGuard`] — that is the whole reason its own doc calls it
+/// "one function owns the health push, so there is no second path to drift".
+/// Threading an `Arc` down to a `Drop` impl would either add a field to the
+/// guard or add a second push site. This mirrors `HEALTH_REPORTER` directly
+/// above, which solved the identical problem for the same function.
+static FEED_HEALTH: std::sync::OnceLock<Arc<tickvault_common::feed_health::FeedHealthRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Install the feed-health registry. Returns `false` if one was already
+/// installed — first writer wins, same shape as [`install_health_reporter`].
+pub fn install_feed_health(health: Arc<tickvault_common::feed_health::FeedHealthRegistry>) -> bool {
+    FEED_HEALTH.set(health).is_ok()
+}
+
 /// Report whether the tick writer reached the database, for `/health`.
 ///
 /// Sibling of the websocket row and the same defect: `/health` rendered
@@ -286,6 +307,45 @@ fn publish_alive_connections(alive: usize) {
         .set(f64::from(u32::try_from(alive).unwrap_or(u32::MAX)));
     if let Some(health) = HEALTH_REPORTER.get() {
         health.set_websocket_connections(u64::try_from(alive).unwrap_or(u64::MAX));
+    }
+    // THE THIRD SIBLING (2026-08-26).
+    //
+    // `FeedHealthRegistry::set_connected` had ZERO production call sites —
+    // every reference in the workspace was inside a test-only module. The
+    // field initialises `false`, and `feed_health::classify` tests
+    // `if !i.connected` BEFORE it looks at tick age, so `/api/feeds/health`
+    // returned `Down, "enabled but disconnected — reconnecting"`
+    // unconditionally.
+    //
+    // Captured on prod at one instant, 2026-08-26:
+    //
+    // ```text
+    // /health            overall=healthy, websocket={connected, "15 connections"}
+    // /api/feeds/health  dhan verdict=DOWN connected=false
+    //                    ticks_total=17,265,688  last_tick_age=1s
+    // :9091              tv_dhan_ws_alive_connections 15
+    //                    tv_dhan_feed_stack_up 1
+    // ```
+    //
+    // The same JSON object declared the feed down while reporting 17.2 million
+    // ticks and a one-second-old tick. `/board`, `/dashboard` and `/feeds` all
+    // render that row, so the operator's at-a-glance surface cried wolf every
+    // trading day, permanently — the inverse of a false-OK and no less
+    // corrosive, because a status that is always red is read as decoration.
+    //
+    // This is the THIRD half of one defect, and the pattern is the point:
+    // `set_dhan_lane_running` was fixed 2026-08-14 ("a status line that cannot
+    // vary is not a status line") and `record_ticks` 2026-08-18 ("it answered a
+    // benign Unknown for a corpse"). Each fix documented the shape and left the
+    // next sibling in place. `sp5_dhan_feed_health_wiring_guard.rs:42` even
+    // named this one and said it "MUST be re-pinned in the PR that wires them".
+    //
+    // Sited here rather than beside `set_dhan_lane_running` deliberately: this
+    // function is both edges of `AliveConnectionGuard`, so it tracks real
+    // socket transitions instead of a coarse lane-level flag, and it keeps the
+    // single-owner property the function was built for.
+    if let Some(feed_health) = FEED_HEALTH.get() {
+        feed_health.set_connected(tickvault_common::feed::Feed::Dhan, alive > 0);
     }
 }
 
@@ -6669,6 +6729,19 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
     // Deliberately routed through `publish_alive_connections` rather than
     // pushing 0 directly: one function owns the health push, so there is no
     // second path to drift.
+    //
+    // Installed BEFORE that call, so the arming push below is the FIRST thing
+    // to reach the registry. Ordering matters: install after it and the very
+    // first transition — the one that arms the row — is silently dropped, and
+    // the row keeps its boot-time `false` until the next socket event. On a
+    // lane that dials once and stays up, "the next socket event" is the 17:30
+    // shutdown.
+    if !install_feed_health(Arc::clone(&params.feed_health)) {
+        // Already installed. `FEED_STACK_SPAWNED` makes a second spawn
+        // impossible in production, so this can only be a repeat call under
+        // test; the first registry stays authoritative either way.
+        tracing::debug!("Dhan lane feed-health registry was already installed — keeping the first");
+    }
     publish_alive_connections(ALIVE_CONNECTIONS.load(Ordering::SeqCst));
 
     // Installed BEFORE the bring-up task is spawned, so neither the silence
