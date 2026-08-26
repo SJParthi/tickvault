@@ -1021,6 +1021,49 @@ pub fn parse_live_dataset(body: &str, cap: usize) -> Result<(Vec<SideBar>, bool,
     Ok((out, truncated, malformed))
 }
 
+/// Where today's sweep begins in the target list.
+///
+/// The loop has a hard wall-clock budget and `break`s on it. With a FIXED
+/// start that is not "we cover fewer instruments" — it is "we never reach the
+/// tail", identically, every single day. A rotating start converts permanent
+/// starvation into a sweep that comes back around.
+///
+/// **The stride is a third of the list, and that number is the guarantee.**
+/// Consecutive runs cover `[k·s, k·s + c)` for coverage `c`; their union is
+/// the whole list exactly when `c >= s`. At `s = ceil(n/3)` any run reaching a
+/// third of the list gives FULL coverage within three days, and the measured
+/// worst case (77% at the limiter's floor) closes it in two.
+///
+/// **Stateless on purpose.** A persisted cursor would resume exactly, and it
+/// would also be a file to lose, corrupt, or have differ between a laptop and
+/// the box — a new failure mode in the one check that exists to catch
+/// failures. The trading date is state everyone already agrees on.
+///
+/// The guarantee is only as good as the coverage, so the run reports the
+/// fraction it reached: if that ever falls below a third, this rotation no
+/// longer covers everything and the number says so rather than the shape
+/// quietly breaking.
+pub fn rotation_start(trading_date: chrono::NaiveDate, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    // `div_ceil`, NOT `n / 3`. Rounding DOWN leaves `n mod 3` indexes that
+    // three strides never reach — 868 gives stride 289, three of which is
+    // 867, so exactly one instrument stays starved forever. A test caught
+    // that off-by-one; it is the same defect this rotation exists to kill,
+    // one index wide instead of two hundred.
+    let stride = n.div_ceil(3).max(1);
+    // `num_days_from_ce` is monotonic across years, so a year boundary does
+    // not reset the sweep — a January restart would re-starve whatever
+    // December was on.
+    let day = i64::from(chrono::Datelike::num_days_from_ce(&trading_date));
+    // Reduce BEFORE multiplying: `day` is ~739,000 and a large `n` would
+    // overflow the product on a 32-bit usize. Wrong start indexes are
+    // survivable; a panic in the only loss detector is not.
+    let day_mod = day.rem_euclid(n as i64).unsigned_abs() as usize;
+    day_mod.wrapping_mul(stride) % n
+}
+
 /// Adapt Dhan's parsed REST intraday candles into [`SideBar`]s for one
 /// instrument. Returns the bars plus the count of candles rejected as
 /// malformed (non-finite price). Pure.
@@ -1451,7 +1494,33 @@ pub async fn run_cross_verification(
     let mut failure_samples: Vec<String> = Vec::with_capacity(FAILURE_SAMPLE_MAX);
     let mut budget_elapsed = false;
     let target_count = targets.len();
-    for target in targets {
+
+    // ---- the sweep starts somewhere different every day ---------------
+    //
+    // MEASURED DEFECT (2026-08-26). This loop walked `targets` in FIXED order
+    // and `break`s on the budget. Fixed order plus truncation is not "we get
+    // to fewer instruments" — it is "the tail is NEVER reached", on any day,
+    // ever. Coverage would look like a respectable 77% while a specific 23%
+    // of the universe went permanently unverified, and nothing in the report
+    // would say which.
+    //
+    // Today's pacing change is what makes it bite: at the limiter's 2 rps
+    // floor with 0.4s answers, 868 sequential targets need ~781s against a
+    // 600s budget. So the truncation is no longer hypothetical.
+    //
+    // The fix is a rotating start, and it is deliberately STATELESS —
+    // derived from the trading date, not from a cursor file. A file would be
+    // one more thing to lose, corrupt, or have differ between a laptop and
+    // the box; the date is already agreed by everyone. See `rotation_start`
+    // for why the stride is a third.
+    let start = rotation_start(trading_date, target_count);
+    for offset in 0..target_count {
+        // Wrap: the sweep runs to the end of the list and continues from the
+        // front, so a run always covers a CONTIGUOUS window — just not always
+        // the same one.
+        let Some(target) = targets.get((start + offset) % target_count) else {
+            break;
+        };
         if started.elapsed() >= budget {
             // Stop issuing work; the verdict degrades rather than pretending
             // the un-fetched targets were clean.
@@ -3015,5 +3084,117 @@ mod tests {
             "920% must survive to the report — a clamp here would hide a \
              real, already-measured defect"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // THE ROTATING SWEEP — added 2026-08-26
+    //
+    // The loop has a hard budget and breaks on it. With a FIXED start that is
+    // not "fewer instruments" — it is "the tail is NEVER reached", every day,
+    // forever, while coverage reads a respectable 77%.
+    // -----------------------------------------------------------------
+
+    fn day(n: i32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_num_days_from_ce_opt(700_000 + n).unwrap_or_default()
+    }
+
+    #[test]
+    fn an_empty_target_list_does_not_divide_by_zero() {
+        // The only loss detector in the system must not panic on a universe
+        // that failed to resolve. A wrong start is survivable; a panic here
+        // takes the day's verification with it.
+        assert_eq!(rotation_start(day(0), 0), 0);
+        assert_eq!(rotation_start(day(1), 1), 0);
+    }
+
+    #[test]
+    fn the_start_moves_between_consecutive_days() {
+        // The whole point. Same start every day = same tail starved every day.
+        let n = 868;
+        let a = rotation_start(day(0), n);
+        let b = rotation_start(day(1), n);
+        assert_ne!(
+            a, b,
+            "two consecutive days must not begin at the same index"
+        );
+    }
+
+    #[test]
+    fn three_days_cover_the_whole_list_at_one_third_coverage() {
+        // THE GUARANTEE, stated as a test rather than as a comment.
+        //
+        // Consecutive runs cover [k·stride, k·stride + c). Their union is the
+        // whole list exactly when c >= stride. At stride = n/3, a run reaching
+        // a third of the list closes the universe in three days.
+        let n: usize = 868;
+        let coverage = n.div_ceil(3);
+        let mut seen = vec![false; n];
+        for d in 0..3 {
+            let start = rotation_start(day(d), n);
+            for offset in 0..coverage {
+                seen[(start + offset) % n] = true;
+            }
+        }
+        let missed = seen.iter().filter(|s| !**s).count();
+        assert_eq!(
+            missed, 0,
+            "at exactly one-third coverage every instrument must be reached \
+             within three days — {missed} were not"
+        );
+    }
+
+    #[test]
+    fn the_measured_worst_case_closes_in_two_days() {
+        // 77% is the measured floor: the limiter's 2 rps with 0.4s answers
+        // against the 600s budget. It should not need the full three days.
+        let n = 868;
+        let coverage = n * 77 / 100;
+        let mut seen = vec![false; n];
+        for d in 0..2 {
+            let start = rotation_start(day(d), n);
+            for offset in 0..coverage {
+                seen[(start + offset) % n] = true;
+            }
+        }
+        assert_eq!(seen.iter().filter(|s| !**s).count(), 0);
+    }
+
+    #[test]
+    fn a_full_sweep_visits_every_target_exactly_once() {
+        // Rotation must be a PERMUTATION. If it skipped or repeated an index,
+        // an unbudgeted run would quietly compare one instrument twice and
+        // another never — which is the defect wearing a different hat.
+        for n in [1usize, 2, 7, 868] {
+            let start = rotation_start(day(5), n);
+            let mut seen = vec![0u32; n];
+            for offset in 0..n {
+                seen[(start + offset) % n] += 1;
+            }
+            assert!(
+                seen.iter().all(|c| *c == 1),
+                "n={n}: a full sweep must touch every index exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_year_boundary_does_not_reset_the_sweep() {
+        // Day-of-YEAR would snap back to 0 every January and re-starve
+        // whatever December was working through. Days-from-epoch is monotonic,
+        // so 31 Dec and 1 Jan differ like any other pair.
+        let n = 868;
+        let dec31 = chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap_or_default();
+        let jan01 = chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap_or_default();
+        assert_ne!(rotation_start(dec31, n), rotation_start(jan01, n));
+    }
+
+    #[test]
+    fn a_huge_universe_does_not_overflow_the_start_computation() {
+        // `num_days_from_ce` is ~739,000. Multiplied by a large stride before
+        // reduction that overflows a 32-bit usize. The reduction happens
+        // FIRST for exactly this reason; this pins it.
+        let n = 25_000; // the authorized ceiling
+        let start = rotation_start(day(9), n);
+        assert!(start < n, "start must stay inside the list");
     }
 }
