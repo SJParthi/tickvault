@@ -250,6 +250,59 @@ async fn test_spawn_clock_skew_poller_survives_a_failing_probe() {
     handle.abort();
 }
 
+/// The poller must be SUPERVISED, so the fix cannot silently revert to the
+/// bug it fixed.
+///
+/// The first version shipped hours earlier was a bare `tokio::spawn` of the
+/// poll loop. If that task died the gauge simply stopped being written — and
+/// because the Prometheus exporter has no idle timeout, it would go on
+/// rendering the last value on every scrape. A dense, healthy, frozen series:
+/// the exact false-green the poller exists to end, one level up.
+///
+/// Source-scan rather than behavioural, deliberately. Killing an inner task
+/// from outside is not something a test can do without a fault-injection
+/// hook, and adding one to production code to prove a property about
+/// production code is worse than reading the shape. The shape is what the
+/// house supervisors use (`disk_pressure_boot`, `ws_frame_spill`) and it is
+/// what a reviewer would look for.
+#[test]
+fn test_clock_skew_poller_is_supervised_not_bare_spawned() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/infra.rs"),
+    )
+    .expect("infra.rs must be readable"); // APPROVED: test
+
+    let body = src
+        .split("pub fn spawn_clock_skew_poller")
+        .nth(1)
+        .expect("spawn_clock_skew_poller must exist"); // APPROVED: test
+
+    for needle in [
+        // The outer supervisor awaits the inner handle...
+        "handle.await",
+        // ...counts the restart, so a flapping loop is visible...
+        "tv_clock_skew_poller_respawn_total",
+        // ...and backs off rather than spinning.
+        "CLOCK_SKEW_RESPAWN_BACKOFF_SECS",
+    ] {
+        assert!(
+            body.contains(needle),
+            "spawn_clock_skew_poller must SUPERVISE its loop (missing `{needle}`). A bare \
+             tokio::spawn means a dead task leaves tv_clock_skew_seconds frozen at its last \
+             value, and the exporter renders that forever — the same false-green the poller \
+             was written to end. Follow the house shape in disk_pressure_boot."
+        );
+    }
+
+    // A CLEAN return must be treated as a failure too: the inner loop cannot
+    // return on its own, so reaching that arm means something ended it.
+    assert!(
+        body.contains("exited cleanly"),
+        "the supervisor must respawn on a CLEAN return as well as a panic — the inner loop \
+         never returns on its own, so Ok(()) is a failure wearing a success type"
+    );
+}
+
 /// Item 7.3 — pure-function test for `ClockSkewSample::exceeds`. Drives
 /// every boundary case so the threshold-comparison code path is fully
 /// covered. Named to satisfy the pub-fn-test-guard regex `test.*exceeds`.
