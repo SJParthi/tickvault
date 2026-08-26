@@ -888,6 +888,45 @@ day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** wit
   alarm is a real follow-up; claiming it already existed was exactly the false-OK this
   file exists to stop.
 
+  > **⚠ RE-CORRECTED 2026-08-26 — the correction above went stale within HOURS of
+  > being written, and it is now the thing manufacturing a false finding.**
+  >
+  > `start-watchdog-lambda.tf:345` declares
+  > `aws_cloudwatch_metric_alarm.start_watchdog_not_invoked` —
+  > `tv-<env>-start-watchdog-not-invoked`, `Invocations < 1` over 6 hours,
+  > `treat_missing_data = breaching` — and its own `alarm_description` names the
+  > 2026-07-02 scheduler-drop class verbatim. It landed in `cacea254d`
+  > (2026-08-25 19:16:55Z, PR #1817), whose title is literally *"the kill-switch
+  > nobody checked was still running — and a claim in four rule sections was
+  > overstated"*. So the follow-up this bullet calls for was DONE the same day, by
+  > the same change, and this bullet was never updated.
+  >
+  > The tree-wide scan now returns **NINE** occurrences across **SEVEN** files,
+  > producing **EIGHT** distinct not-invoked alarms: boot-heartbeat-gate,
+  > daily-budget-digest, deploy-watchdog, dhan-token-minter, hard-stop-guard,
+  > market-hours-gate, market-open-readiness, start-watchdog.
+  >
+  > **The cost is the same one this bullet was written to warn about, one level
+  > up.** A reader trusting it today concludes the component that starts the
+  > trading box is blind, and goes to build an alarm that already exists —
+  > exactly the wasted work the `day_ohlc_tracker` row (2026-08-12) and the
+  > `WAL-SUSPEND-01` row (2026-08-25) each record. **A correction is a claim
+  > like any other, and it goes stale like any other.** The durable lesson is
+  > not "check harder" — it is that an alarm-existence claim is one `grep`
+  > (`grep -rn 'metric_name *= *"Invocations"' deploy/aws/terraform/`), so it
+  > must be re-run at the moment of writing rather than carried forward, in a
+  > correction just as much as in the sentence it corrects.
+  >
+  > **And it was checkable without even grepping.** The same PR added
+  > `cloudwatch_app_alarms_wiring.rs::
+  > every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption`,
+  > which FAILS THE BUILD if any scheduled Lambda lacks a not-invoked alarm and
+  > has no declared exemption. It has been GREEN ever since. So this bullet did
+  > not merely go stale against the terraform — it contradicted a passing test
+  > in the same repository, on the same day, added by the same commit. When a
+  > prose claim and a green ratchet disagree, the ratchet is the one that
+  > cannot be wrong by inattention.
+
 #### What a PR that violates §2.3f looks like (REJECT)
 
 - Filters either cross-verify alarm on `WS-GAP-03` alone, or drops the `source` condition
