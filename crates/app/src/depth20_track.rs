@@ -98,6 +98,126 @@ impl Depth20Plan {
     }
 }
 
+/// Pairs each wire socket with the layout socket it actually corresponds to.
+///
+/// # Why this is not just the index
+///
+/// It is tempting to assume wire socket N holds layout socket N, and at a full
+/// 250-instrument layout that happens to be true. It is NOT true in general,
+/// and the case where it breaks is ordinary rather than exotic.
+///
+/// `plan_pool` SPREADS a depth set: it shards the flattened list into
+/// `len.div_ceil(connections)` chunks. At 250 that is five chunks of 50, which
+/// lines up with the layout's five sockets exactly. At 230 — one index window
+/// short near a freshly-listed expiry, or fewer than 37 movers resolving,
+/// both routine at 09:13 — it is five chunks of 46, and every boundary after
+/// the first has moved.
+///
+/// Wire socket 1 then holds the tail of NIFTY's window plus the head of
+/// BANKNIFTY's. Diffing it against layout socket 1 finds almost nothing in
+/// common, so the planner would swap nearly the whole socket, every minute,
+/// for the rest of the session — burning the connection's entire capacity on
+/// churn while reporting healthy swap counts the whole time.
+///
+/// Matching on CONTENT removes the assumption instead of documenting it, and
+/// keeps working if `plan_pool`'s sharding ever changes again.
+///
+/// # Two passes, because neither signal is sufficient alone
+///
+/// **Position, where the SHAPE agrees.** Wire socket i holding exactly as
+/// many instruments as layout socket i is not a coincidence — it is the
+/// arrangement the dial produced. This pass exists because overlap ALONE
+/// would refuse the one case that matters most on a movers socket: a ranking
+/// that turned over completely shares nothing with what the socket holds, and
+/// must still be re-aimed rather than frozen for the session.
+///
+/// **Content, for the rest.** A size mismatch means the shard boundaries
+/// moved, so position means nothing and only overlap can say what a socket
+/// is.
+///
+/// Greedy by best overlap, each layout socket claimed at most once: two wire
+/// sockets that both partly overlap one layout socket must not both diff
+/// against it, or the loser would be told to take instruments the winner is
+/// already taking. A wire socket sharing NOTHING with any unclaimed layout
+/// socket is left unpaired — refusing to guess is what makes a genuinely
+/// unrecognisable socket hold position rather than churn.
+///
+/// # Complexity
+///
+/// O(sockets^2 x instruments) — 25 comparisons of at most 50 items, once a
+/// minute. The set sizes here are fixed by the endpoint's own budget.
+#[must_use]
+fn match_sockets_by_overlap(
+    held: &[Vec<SubscribeInstrument>],
+    desired: &Depth20Layout,
+) -> Vec<Option<usize>> {
+    let want_keys: Vec<BTreeSet<Key>> = desired
+        .sockets
+        .iter()
+        .map(|s| s.instruments.iter().copied().map(key_of).collect())
+        .collect();
+    let mut claimed = vec![false; want_keys.len()];
+    let mut out = vec![None; held.len()];
+
+    // PASS 1 — the position, where the SHAPE agrees.
+    //
+    // `plan_pool` shards the flattened layout in order, so when wire socket i
+    // holds exactly as many instruments as layout socket i, position is not a
+    // guess: it is the arrangement the dial produced. Taking it first is what
+    // preserves the legitimate case overlap alone cannot express — a movers
+    // socket whose ENTIRE ranking turned over shares nothing with what it
+    // holds, and must still be re-aimed rather than frozen.
+    for (index, held_here) in held.iter().enumerate() {
+        // DISTINCT count on both sides. Comparing the layout's deduplicated
+        // key count against the wire's RAW item count made a socket carrying
+        // one repeated instrument look like a different shape entirely, so
+        // position was discarded and the socket fell through to an overlap
+        // pass that could not identify it either — leaving it frozen. Found
+        // by the duplicate-subscribe test, which failed for this reason
+        // rather than the one it was written for.
+        let have_distinct = held_here
+            .iter()
+            .copied()
+            .map(key_of)
+            .collect::<BTreeSet<Key>>()
+            .len();
+        if want_keys
+            .get(index)
+            .is_some_and(|k| k.len() == have_distinct)
+            && !claimed[index]
+        {
+            claimed[index] = true;
+            out[index] = Some(index);
+        }
+    }
+
+    // PASS 2 — content, for whatever the shape could not vouch for.
+    //
+    // A size mismatch at position i means the shard boundaries moved, so the
+    // position means nothing and only overlap can say what this socket is.
+    for (index, held_here) in held.iter().enumerate() {
+        if out[index].is_some() {
+            continue;
+        }
+        let have: BTreeSet<Key> = held_here.iter().copied().map(key_of).collect();
+        let mut best: Option<(usize, usize)> = None;
+        for (w, keys) in want_keys.iter().enumerate() {
+            if claimed[w] {
+                continue;
+            }
+            let overlap = keys.intersection(&have).count();
+            if overlap > 0 && best.is_none_or(|(_, b)| overlap > b) {
+                best = Some((w, overlap));
+            }
+        }
+        if let Some((w, _)) = best {
+            claimed[w] = true;
+            out[index] = Some(w);
+        }
+    }
+    out
+}
+
 /// Diffs the desired layout against what the wire holds, per socket.
 ///
 /// # What is deliberately NOT done
@@ -120,10 +240,14 @@ pub fn plan_depth20_minute(
 ) -> Depth20Plan {
     let mut plan = Depth20Plan::default();
 
+    // Which layout socket each wire socket actually IS, by content — never by
+    // position. See `match_sockets_by_overlap`.
+    let pairing = match_sockets_by_overlap(held, desired);
+
     for (index, held_here) in held.iter().enumerate() {
-        let Some(want) = desired.sockets.get(index) else {
-            // The layout produced fewer sockets than the pool has. Nothing to
-            // compare against, so nothing moves.
+        let Some(want) = pairing[index].and_then(|w| desired.sockets.get(w)) else {
+            // No layout socket recognisably corresponds to this connection.
+            // Nothing to compare against, so nothing moves.
             plan.sockets_left_alone += 1;
             continue;
         };
@@ -150,6 +274,27 @@ pub fn plan_depth20_minute(
             .collect();
         departures.sort_unstable_by_key(|i| key_of(*i));
         arrivals.sort_unstable_by_key(|i| key_of(*i));
+        // DEDUP, and this is not defensive tidiness — it is the difference
+        // between a working connection and a dead one.
+        //
+        // Neither list is guaranteed unique. `arrivals` is filtered from the
+        // layout's own Vec, so an underlying appearing twice in one socket —
+        // a stock ranking as both a gainer and a loser, a chain listing a
+        // strike twice — yields the same instrument twice. Both copies pass
+        // the "not already held" filter, and the planner would then pair each
+        // with a different departure and subscribe it TWICE. Dhan answers a
+        // duplicate subscribe with an 804, which is Fatal: the connection
+        // drops and does not come back this session.
+        //
+        // `departures` is deduped for the mirror reason — unsubscribing the
+        // same instrument twice frees one slot while spending two, so the
+        // socket silently ends the minute below its dialed size.
+        //
+        // Caught by attacking this module's own output rather than by
+        // reasoning about it; the first version shipped with both lists
+        // undeduped and eleven tests passing.
+        departures.dedup_by_key(|i| key_of(*i));
+        arrivals.dedup_by_key(|i| key_of(*i));
 
         if departures.is_empty() && arrivals.is_empty() {
             continue;
@@ -622,6 +767,200 @@ mod apply_tests {
             3,
             "the socket grew past its dialed size: {:?}",
             sockets[0].held
+        );
+    }
+}
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+    use crate::depth20_layout::Depth20Socket as DesiredSocket;
+    use tickvault_common::types::ExchangeSegment;
+
+    fn ins(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+        }
+    }
+
+    fn layout(sockets: Vec<Vec<u64>>) -> Depth20Layout {
+        Depth20Layout {
+            sockets: sockets
+                .into_iter()
+                .map(|ids| DesiredSocket {
+                    underlying: None,
+                    instruments: ids.into_iter().map(ins).collect(),
+                })
+                .collect(),
+            ..Depth20Layout::default()
+        }
+    }
+
+    /// A duplicate subscribe is answered with an 804, which is Fatal — the
+    /// connection drops and does not come back this session.
+    ///
+    /// The first version of this module shipped without deduping, with
+    /// eleven tests passing. It was found by attacking the output, not by
+    /// reading the code.
+    #[test]
+    fn a_repeated_instrument_in_the_desired_set_is_never_subscribed_twice() {
+        // Shapes must AGREE for the socket to be paired at all, so the
+        // duplicate sits alongside a real third instrument: two held, three
+        // wanted of which two are distinct.
+        let held = vec![vec![ins(1), ins(2)]];
+        let plan = plan_depth20_minute(&held, &layout(vec![vec![9, 9, 8]]));
+        assert!(
+            !plan.is_quiet(),
+            "the socket was not paired, so nothing was tested"
+        );
+        let takes: Vec<u64> = plan.sockets[0]
+            .swaps
+            .iter()
+            .map(|(_, t)| t.security_id)
+            .collect();
+        let mut uniq = takes.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            takes.len(),
+            "the same instrument was subscribed twice: {takes:?} — an 804 and a dead connection"
+        );
+    }
+
+    #[test]
+    fn a_repeated_instrument_already_held_is_never_unsubscribed_twice() {
+        // Spending two slots to free one ends the minute below dialed size.
+        // Two distinct held (1 repeated, and 2); three distinct wanted.
+        let held = vec![vec![ins(1), ins(1), ins(2)]];
+        let plan = plan_depth20_minute(&held, &layout(vec![vec![8, 9]]));
+        assert!(
+            !plan.is_quiet(),
+            "the socket was not paired, so nothing was tested"
+        );
+        let releases: Vec<u64> = plan.sockets[0]
+            .swaps
+            .iter()
+            .map(|(r, _)| r.security_id)
+            .collect();
+        let mut uniq = releases.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), releases.len(), "released twice: {releases:?}");
+    }
+
+    /// THE MISALIGNMENT. `plan_pool` shards a depth set into
+    /// `len.div_ceil(connections)` chunks, so a layout that is not exactly
+    /// 250 instruments puts different content on wire socket N than layout
+    /// socket N describes.
+    ///
+    /// Index-only pairing would then diff a socket against a set it barely
+    /// shares anything with and swap nearly all of it — every minute, all
+    /// session, while reporting healthy swap counts.
+    /// The case index-only pairing gets WRONG, and this one is not subtle:
+    /// two sockets already holding exactly what the layout wants, in the
+    /// other order.
+    ///
+    /// By position each diffs against the other's set — six swaps to arrive
+    /// at the arrangement already on the wire, repeated every minute for the
+    /// session. By content both are recognised and nothing moves.
+    ///
+    /// Written after the first version of this test passed under BOTH
+    /// pairings and therefore proved nothing; the paired-swap rule turns out
+    /// to absorb most boundary shifts on its own, so a test has to reach
+    /// past it to say anything about the matcher.
+    #[test]
+    fn two_sockets_holding_each_others_sets_are_recognised_not_churned() {
+        let held = vec![
+            vec![ins(1), ins(2), ins(3)],
+            vec![ins(10), ins(11), ins(12), ins(13)],
+        ];
+        // Same two sets, opposite sockets.
+        let want = layout(vec![vec![10, 11, 12, 13], vec![1, 2, 3]]);
+        let plan = plan_depth20_minute(&held, &want);
+        assert!(
+            plan.is_quiet(),
+            "both sockets already hold exactly what is wanted; {} swaps is pure churn: {plan:?}",
+            plan.swap_count()
+        );
+    }
+
+    #[test]
+    fn no_two_wire_sockets_ever_diff_against_the_same_layout_socket() {
+        // The loser would be told to take instruments the winner is already
+        // taking — two subscribes for one instrument across two connections.
+        let want = layout(vec![vec![1, 2, 3, 4]]);
+        let held = vec![vec![ins(1), ins(2)], vec![ins(3), ins(4)]];
+        let plan = plan_depth20_minute(&held, &want);
+        let mut takes: Vec<(u64, u8)> = plan
+            .sockets
+            .iter()
+            .flat_map(|s| {
+                s.swaps
+                    .iter()
+                    .map(|(_, t)| (t.security_id, t.segment as u8))
+            })
+            .collect();
+        let before = takes.len();
+        takes.sort_unstable();
+        takes.dedup();
+        assert_eq!(takes.len(), before, "one instrument taken by two sockets");
+    }
+
+    #[test]
+    fn a_complete_turnover_is_still_re_aimed_when_the_shape_agrees() {
+        // The case pure overlap-matching would freeze forever: a movers
+        // socket whose entire ranking changed shares nothing with what it
+        // holds, and that is exactly when it most needs to move.
+        let held = vec![(0..50).map(ins).collect::<Vec<_>>()];
+        let want = layout(vec![(100..150).collect()]);
+        assert_eq!(plan_depth20_minute(&held, &want).swap_count(), 50);
+    }
+
+    #[test]
+    fn an_unrecognisable_socket_holds_position_rather_than_guessing() {
+        // Different size AND nothing in common: there is no evidence for
+        // what this socket is, and acting on none of it is the safe answer.
+        let held = vec![vec![ins(1), ins(2), ins(3)]];
+        let want = layout(vec![vec![90, 91]]);
+        let plan = plan_depth20_minute(&held, &want);
+        assert!(
+            plan.is_quiet(),
+            "guessed an identity it had no evidence for: {plan:?}"
+        );
+        assert_eq!(plan.sockets_left_alone, 1);
+    }
+
+    #[test]
+    fn the_planner_is_deterministic_across_repeated_runs() {
+        // A swap the guard refuses once is refused forever, so two records of
+        // one minute must produce identical traffic.
+        let held = vec![vec![ins(4), ins(1), ins(3)], vec![ins(9), ins(7), ins(8)]];
+        let want = layout(vec![vec![1, 3, 5], vec![7, 8, 12]]);
+        let a = plan_depth20_minute(&held, &want);
+        for _ in 0..25 {
+            assert_eq!(plan_depth20_minute(&held, &want), a);
+        }
+    }
+
+    #[test]
+    fn an_empty_wire_and_an_empty_layout_are_both_quiet() {
+        assert!(plan_depth20_minute(&[], &layout(vec![])).is_quiet());
+        assert!(plan_depth20_minute(&[vec![]], &layout(vec![])).is_quiet());
+        assert!(plan_depth20_minute(&[], &layout(vec![vec![1]])).is_quiet());
+    }
+
+    #[test]
+    fn a_full_five_socket_session_shape_pairs_one_to_one() {
+        // The real arrangement: 5 sockets x 50, shapes agree everywhere.
+        let held: Vec<Vec<SubscribeInstrument>> = (0..5)
+            .map(|s| (s * 50..s * 50 + 50).map(ins).collect())
+            .collect();
+        let want = layout((0..5).map(|s| (s * 50..s * 50 + 50).collect()).collect());
+        assert!(
+            plan_depth20_minute(&held, &want).is_quiet(),
+            "an unchanged full session produced traffic"
         );
     }
 }
