@@ -141,6 +141,21 @@ pub fn depth_20_strikes_each_side(underlyings: usize) -> usize {
 /// fails rather than quietly re-widening the set.
 pub const DEPTH_200_MAX_SOCKETS: usize = 4;
 
+/// Depth-200 CONNECTIONS the session may open — five, the operator's figure.
+///
+/// Deliberately NOT the same constant as [`DEPTH_200_MAX_SOCKETS`], which is
+/// the budget for at-the-money PAIRS and is even for a reason: a pair costs
+/// two sockets, so an even budget means a whole pair either fits or the budget
+/// is full, and the odd-socket case cannot arise by arithmetic.
+///
+/// Conflating the two would undo that. Raising the pair budget to five lets
+/// the selector reach for a third underlying's pair and stop half-way,
+/// filling the fifth socket with a lone leg — which is precisely the shape the
+/// 2026-08-26 retirement removed. So the fifth connection is budgeted here,
+/// separately, and filled by the day's biggest mover at the dial site rather
+/// than by the pair selector.
+pub const DEPTH_200_TOTAL_SOCKETS: usize = 5;
+
 /// One contract from a chain snapshot, before selection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DepthCandidate {
