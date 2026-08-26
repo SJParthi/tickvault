@@ -765,3 +765,160 @@ mod cap_chain_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod nine_thirteen_readiness_tests {
+    use super::*;
+    use crate::depth_rebalance::MoverRow;
+    use tickvault_common::types::ExchangeSegment;
+
+    const EXPIRY: i64 = 1_900_000_000_000_000;
+
+    fn opt(
+        underlying: &str,
+        strike: f64,
+        leg: &str,
+        id: i64,
+        spot: f64,
+        index: bool,
+    ) -> DepthCandidate {
+        DepthCandidate {
+            underlying: underlying.to_owned(),
+            contract_security_id: id,
+            expiry_micros: EXPIRY,
+            strike,
+            spot,
+            leg: leg.to_owned(),
+            is_index_option: index,
+        }
+    }
+
+    /// A pre-open chain: both index windows plus enough stock ladders to
+    /// fill the three movers sockets.
+    fn preopen_candidates() -> Vec<DepthCandidate> {
+        let mut c = Vec::new();
+        let mut id = 1_000_i64;
+        // The two index windows, wide enough for +/-12 either side.
+        for (u, spot) in [("NIFTY", 24_500.0), ("BANKNIFTY", 54_000.0)] {
+            for k in -14_i64..=14 {
+                #[expect(clippy::cast_precision_loss, reason = "k is tiny")]
+                let strike = (k as f64).mul_add(50.0, spot);
+                c.push(opt(u, strike, "CE", id, spot, true));
+                id += 1;
+                c.push(opt(u, strike, "PE", id, spot, true));
+                id += 1;
+            }
+        }
+        // 80 stocks, one at-the-money pair each — more than the 75 the
+        // movers sockets can take, so the cap is exercised.
+        for s in 0..80_i64 {
+            let sym = format!("STK{s:03}");
+            c.push(opt(&sym, 1_000.0, "CE", id, 1_000.0, false));
+            id += 1;
+            c.push(opt(&sym, 1_000.0, "PE", id, 1_000.0, false));
+            id += 1;
+        }
+        c
+    }
+
+    /// The ranking as the PRE-OPEN source produces it — from ticks, before
+    /// any candle has sealed.
+    fn preopen_movers() -> Vec<MoverRow> {
+        (0..80_i64)
+            .map(|s| MoverRow {
+                security_id: 90_000 + u64::try_from(s).unwrap_or(0),
+                segment: ExchangeSegment::NseEquity,
+                symbol: format!("STK{s:03}"),
+                // Half up, half down, so both gainers and losers resolve.
+                #[expect(clippy::cast_precision_loss, reason = "s is tiny")]
+                pct_change: if s % 2 == 0 {
+                    5.0 - (s as f64) * 0.01
+                } else {
+                    -5.0 + (s as f64) * 0.01
+                },
+            })
+            .collect()
+    }
+
+    /// THE 09:13 PROOF. Given only what exists before the first candle
+    /// seals — a chain with spot prices, and a ranking sourced from ticks —
+    /// every one of the five depth-20 sockets fills.
+    ///
+    /// Before the pre-open ranking existed this same input with an EMPTY
+    /// mover list left three of the five sockets carrying nothing, which is
+    /// the second assertion below.
+    #[test]
+    fn all_five_sockets_fill_from_preopen_inputs_alone() {
+        let layout = build_depth20_layout(&preopen_candidates(), &preopen_movers());
+        assert_eq!(layout.sockets.len(), DEPTH_20_SOCKETS, "{layout:?}");
+        for (i, s) in layout.sockets.iter().enumerate() {
+            assert!(
+                !s.instruments.is_empty(),
+                "socket {i} is empty at 09:13 — it would carry no depth until the first \
+                 candle seals around 09:16: {layout:?}"
+            );
+        }
+        assert_eq!(
+            layout.instrument_count(),
+            DEPTH_20_SOCKETS * DEPTH_20_PER_SOCKET,
+            "the operator's 250 were not all filled: {layout:?}"
+        );
+    }
+
+    /// Non-vacuity, and the finding is worse than "three sockets carry
+    /// nothing": with no ranking the layout does not EMIT the movers sockets
+    /// at all, so three of the five depth-20 connections are never dialed.
+    ///
+    /// This is exactly what 09:13 looked like before the pre-open ranking
+    /// existed — 100 of the operator's 250 instruments, on two connections
+    /// out of five — and it is why that change is not cosmetic.
+    #[test]
+    fn without_a_ranking_three_of_the_five_connections_are_never_dialed() {
+        let layout = build_depth20_layout(&preopen_candidates(), &[]);
+        assert_eq!(
+            layout.sockets.len(),
+            DEPTH_20_INDEX_SOCKETS,
+            "only the index windows should survive an empty ranking: {layout:?}"
+        );
+        assert_eq!(
+            layout.instrument_count(),
+            DEPTH_20_INDEX_SOCKETS * DEPTH_20_PER_SOCKET,
+            "100 of 250 — the movers half is entirely absent"
+        );
+        // The index windows are unaffected: they read spot, not a ranking.
+        for s in &layout.sockets {
+            assert_eq!(s.instruments.len(), DEPTH_20_PER_SOCKET);
+        }
+    }
+
+    /// A ranking that resolves only a few stocks still fills what it can,
+    /// rather than refusing the whole set — the shape a thin pre-open takes.
+    #[test]
+    fn a_partial_ranking_fills_partially_and_says_how_much() {
+        let few: Vec<MoverRow> = preopen_movers().into_iter().take(6).collect();
+        let layout = build_depth20_layout(&preopen_candidates(), &few);
+        assert!(layout.instrument_count() > DEPTH_20_SOCKETS_INDEX_INSTRUMENTS);
+        assert!(
+            layout.instrument_count() < DEPTH_20_SOCKETS * DEPTH_20_PER_SOCKET,
+            "a six-stock ranking should not fill all 150 movers slots: {layout:?}"
+        );
+    }
+
+    /// A ranking naming stocks that have no chain resolves to nothing and is
+    /// COUNTED, never silently dropped.
+    #[test]
+    fn a_ranking_of_stocks_with_no_chain_is_counted_not_hidden() {
+        let ghosts: Vec<MoverRow> = (0..10_i64)
+            .map(|s| MoverRow {
+                security_id: 70_000 + u64::try_from(s).unwrap_or(0),
+                segment: ExchangeSegment::NseEquity,
+                symbol: format!("GHOST{s}"),
+                pct_change: 9.0,
+            })
+            .collect();
+        let layout = build_depth20_layout(&preopen_candidates(), &ghosts);
+        assert!(layout.movers_unresolved > 0, "{layout:?}");
+    }
+
+    const DEPTH_20_SOCKETS_INDEX_INSTRUMENTS: usize = DEPTH_20_INDEX_SOCKETS * DEPTH_20_PER_SOCKET;
+}
