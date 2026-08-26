@@ -244,6 +244,24 @@ pub fn plan_depth20_minute(
     // position. See `match_sockets_by_overlap`.
     let pairing = match_sockets_by_overlap(held, desired);
 
+    // Instruments already claimed by an EARLIER socket in this same plan.
+    //
+    // Per-socket deduplication is not enough. Two layout sockets can list
+    // the same instrument — nothing forbids it, and a movers ranking that
+    // named a stock twice or a chain that repeated a strike would produce
+    // exactly that — and each is then paired to a different connection.
+    // Both would take it in the same minute: two of the 250 authorized
+    // slots spent on one order book, and on Dhan's per-connection
+    // subscription state the second is a duplicate.
+    //
+    // First socket in wire order wins, which is deterministic. The loser
+    // simply has one fewer arrival, so the departure it would have funded
+    // stays put — a slot held rather than wasted.
+    //
+    // Found by a property test, not by reading: the hand-written suite had
+    // a cross-socket case and it happened not to collide.
+    let mut claimed_takes: BTreeSet<Key> = BTreeSet::new();
+
     for (index, held_here) in held.iter().enumerate() {
         let Some(want) = pairing[index].and_then(|w| desired.sockets.get(w)) else {
             // No layout socket recognisably corresponds to this connection.
@@ -295,6 +313,8 @@ pub fn plan_depth20_minute(
         // undeduped and eleven tests passing.
         departures.dedup_by_key(|i| key_of(*i));
         arrivals.dedup_by_key(|i| key_of(*i));
+        // Plan-wide, not just socket-wide. See `claimed_takes`.
+        arrivals.retain(|i| !claimed_takes.contains(&key_of(*i)));
 
         if departures.is_empty() && arrivals.is_empty() {
             continue;
@@ -312,6 +332,9 @@ pub fn plan_depth20_minute(
             unfunded_arrivals: arrivals.len() - paired,
             unused_departures: departures.len() - paired,
         };
+        for (_, take) in &socket_plan.swaps {
+            claimed_takes.insert(key_of(*take));
+        }
         if !socket_plan.swaps.is_empty()
             || socket_plan.unfunded_arrivals > 0
             || socket_plan.unused_departures > 0

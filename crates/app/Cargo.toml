@@ -66,6 +66,14 @@ tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 dhat = { workspace = true }
 
+# Depth-20 steering (2026-08-26): the operator's standing ask is every
+# permutation of exception and condition, and hand-written cases cannot
+# reach that set — three defects in this module were found by attacking its
+# output, not by enumerating shapes. proptest generates the combinations
+# nobody wrote down. An existing workspace pin used by core/trading/storage
+# already, so no new dependency root.
+proptest = { workspace = true }
+
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
 # optional dep) was DELETED with the Dhan instrument-download chain
