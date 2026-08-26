@@ -1551,8 +1551,24 @@ impl LiveIngest {
         // Two refuse only the CANDLE and keep the row — see above. They are
         // mutually exclusive with the three by construction, which is why this
         // reads as a plain `!hard_refusal` rather than repeating them.
+        // `stale_trading_day` joins the candle-only set on 2026-08-26.
+        //
+        // Dhan sends the LAST TRADE TIME, so a dormant contract snapshotted
+        // now carries a timestamp from whenever it last traded (measured mean
+        // ~5 hours, max 34 days). Folding that opens a candle bucket on a day
+        // that already closed — verified live as 8,898 fabricated bars in a
+        // database created empty that same morning — and, worse, leaves a
+        // bucket open so today's real 09:15 tick takes the CONTINUE path and
+        // the day-open arm never fires.
+        //
+        // The ROW is kept, for exactly the reason `untraded_sentinel` is kept:
+        // the tick is not corrupt. It is a real last-traded price with a real
+        // old trade time, carrying live open interest and bid/ask. Discarding
+        // it would lose the ability to tell "did not trade today" from "did
+        // not capture", which is the same false-OK the 2026-08-20 fix removed.
         let candle_only_refusal =
-            (stats.out_of_session || stats.untraded_sentinel) && !hard_refusal;
+            (stats.out_of_session || stats.untraded_sentinel || stats.stale_trading_day)
+                && !hard_refusal;
 
         if hard_refusal {
             let reason = if stats.refused_price {

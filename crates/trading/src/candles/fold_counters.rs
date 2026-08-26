@@ -58,13 +58,21 @@ pub(crate) struct FoldCounters {
     pub(crate) cumulative_regression: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
-    /// `tick_refused` carries a `reason` label with THREE distinct values.
-    /// One field per value, because collapsing them would merge three
+    /// `tick_refused` carries a `reason` label with FOUR distinct values.
+    /// One field per value, because collapsing them would merge four
     /// independent refusal causes into one series and make the counter
     /// useless for telling a bad price from a bad timestamp.
+    ///
+    /// (THREE until 2026-08-26, when `stale_trading_day` was added. The count
+    /// is stated here because it is the kind of number that silently goes
+    /// stale — this file's own neighbours have been corrected for exactly that
+    /// before.)
     pub(crate) tick_refused_price: metrics::Counter,
     pub(crate) tick_refused_timestamp: metrics::Counter,
     pub(crate) tick_refused_untraded_sentinel: metrics::Counter,
+    /// Ticks whose IST DATE was older than the newest date seen — a stale
+    /// last-trade time. Candle-only refusal; the row is still written.
+    pub(crate) tick_refused_stale_trading_day: metrics::Counter,
 }
 
 impl FoldCounters {
@@ -106,6 +114,10 @@ impl FoldCounters {
             tick_refused_untraded_sentinel: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
                 "reason" => "untraded_sentinel"
+            ),
+            tick_refused_stale_trading_day: metrics::counter!(
+                "tv_aggregator_tick_refused_total",
+                "reason" => "stale_trading_day"
             ),
         }
     }

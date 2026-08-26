@@ -2755,3 +2755,112 @@ Dhan does not pong here and the next lever is the watchdog threshold.
 This also removes the need to answer that question defensively: a 10 s client
 ping means we are never silent, so Dhan's 40 s client-silence close cannot be
 reached regardless of whether it would have applied.
+
+---
+
+## Item 27 — a stale last-trade time fabricates candles on closed days (2026-08-26)
+
+- [x] **27a — stale-trading-day gate: candle-only refusal, row kept**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `fold_counters.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/trading/tests/stale_trading_day_gate_guard.rs` (6)
+- [x] **27b — delete the provably-unreachable duplicate timestamp-band check**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`
+
+### Design
+
+Dhan sends the **last trade time**. A contract that last traded days ago is
+snapshotted NOW carrying a timestamp from THEN. Measured across all 20.5M rows
+of one live session: mean `received_at - ts` **~5 hours**, max **34 days**.
+
+The candle-window gate tested `exchange_timestamp % 86_400` — seconds of day
+only, with no notion of WHICH day — against `[09:15:00, 15:40:00)`. A stale
+trade time of *yesterday 15:39:41* is 56,381 s, **inside** that window, so it
+passed as "in session" and opened a bucket dated on a day that had closed.
+
+Verified live, 2026-08-26:
+
+| Evidence | Value |
+|---|---|
+| `candles_1m` bars on past dates | **8,898** |
+| Distinct instruments | **8,898** |
+| Oldest | `2026-07-23T09:39` |
+| QuestDB volume created | **08:59:50 the same morning** |
+
+A database that was empty at 08:59:50 cannot contain July history. Those bars
+were written that day.
+
+Worse than the fabricated rows: with a bucket already open on the stale date,
+today's real 09:15 tick takes the CONTINUE path rather than the OPEN path, so
+**the day-open arm never fires** — across all 24 timeframes.
+
+The watermark is the right reference and needs no clock threaded in: it advances
+only on price-sane, band-checked ticks, and the advance is `>` so a stale tick
+can never move it. Ordered ABOVE the seconds-of-day gate on the same reasoning
+the timestamp band was hoisted above the price gate — a tick bad in both ways is
+attributed to the more actionable cause.
+
+**27b:** a second, byte-identical timestamp-band check stood ~30 lines below the
+first and was provably unreachable (the first returns on the same condition) — a
+merge artifact from the two 2026-08-25 hardening fixes. Deleted: dead code that
+reads as a live safety check invites reasoning about a guard that never runs.
+
+### Edge Cases
+
+- **Same-day earlier ticks still fold.** Only a whole-DAY regression is refused.
+  Intraday out-of-order arrival is normal (different instruments trade at
+  different times) and must not be swept up. Pinned by a negative test.
+- **First tick after boot is never refused.** Watermark starts at 0, so nothing
+  can be older — the same cold-start trap the band check's own comment records
+  having been written and caught once already.
+- Integer division on IST epoch seconds gives the IST day directly;
+  `exchange_timestamp` is already IST, so no offset arithmetic (`data-integrity.md`:
+  "NEVER ADD +5:30 TO ts").
+
+### Failure Modes
+
+- If the watermark could regress, the gate would disarm itself. It cannot (`>`),
+  and that is pinned by its own test rather than assumed.
+- A stale tick from an instrument whose slot does not yet exist is refused before
+  `slot_index`, so a stale-only instrument cannot burn one of the 25,000 slots.
+
+### Test Plan
+
+6 behavioural tests. **Bite-proven**: deleting the gate fails exactly the 4
+tests that assert it, while the 2 negative controls (same-day-earlier,
+first-tick) stay green — proving they are not vacuously asserting "everything is
+refused".
+
+`cargo test -p tickvault-trading --lib` → **1,633 passed / 0 failed**. fmt and
+banned-pattern scan clean.
+
+The exhaustive `ConsumeStats` destructure in
+`test_every_refusal_field_makes_folded_false` refused to compile until the new
+field was wired into `folded()` — the mechanical guard working exactly as its
+own doc says it should.
+
+### Rollback
+
+Single revert of each item; 27a and 27b are independent.
+
+### Observability
+
+`tv_aggregator_tick_refused_total{reason="stale_trading_day"}` — a new label on
+an EXISTING series, so no new metric name and no EMF selector entry (Item 14e:
+`user-data.sh.tftpl` at zero free bytes). The neighbouring doc comment saying the
+label carries "THREE distinct values" was corrected to FOUR in the same change.
+
+### Honest envelope
+
+This stops NEW fabricated bars. It does **not** remove the 8,898 already in
+`candles_1m` — deleting rows is an operator decision, and they are trivially
+identifiable (`ts < today`). It also does not change what `ticks.ts` means: the
+row still carries the true trade time, which is correct and is what
+`data-integrity.md` requires.
+
+**Residual, stated rather than discovered:** the gate is watermark-relative, so
+the window before the session's first in-session tick has no reference to
+compare against. In practice pre-open ticks are already refused by the
+seconds-of-day gate, so the exposure is narrow — but it is not zero, and closing
+it fully would require threading the wall-clock date into `consume_tick`, which
+changes two public signatures and every call site.
