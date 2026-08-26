@@ -77,14 +77,49 @@ pub struct DayOhlc {
     armed: bool,
 }
 
-/// How far the exchange-supplied day open may sit from the same packet's last
-/// traded price before it is refused as CORRUPT.
+/// Smallest exchange-supplied day open treated as a real price.
 ///
-/// This is a corruption bound, not a market bound — see the refusal site in
-/// [`DayOhlc::update_tick_with_exchange_open`] for why 100x is impossible for
-/// a real instrument on an exchange whose circuit limits cap a day's move at
-/// +/-20%.
-pub const DAY_OPEN_CORRUPTION_BAND: f64 = 100.0;
+/// A hundredth of the 0.05 NSE tick, so no real instrument can fall below it,
+/// while every f64 subnormal (the `5e-324` class that is finite and positive
+/// and passes every other check) is refused. Absolute rather than relative
+/// BECAUSE relative was tried first and was wrong: see the refusal site.
+pub const DAY_OPEN_MIN_PLAUSIBLE_PRICE: f64 = 0.000_5;
+
+/// Largest exchange-supplied day open treated as a real price.
+///
+/// One crore rupees. The most expensive scrip ever listed on an Indian
+/// exchange is orders of magnitude below this, and `f32::MAX` (3.4e38) --
+/// the corrupt-payload shape that motivated the band -- is thirty-one orders
+/// of magnitude above it. The gap is deliberately enormous: this bound exists
+/// to reject numbers that are not prices, never to have an opinion about a
+/// price that is.
+pub const DAY_OPEN_MAX_PLAUSIBLE_PRICE: f64 = 10_000_000.0;
+
+/// Is this a plausible rupee price at all?
+///
+/// The single predicate behind BOTH the last-traded-price gate and the
+/// exchange-day-open gate, so the two can never drift apart — which they had,
+/// and the drift was found by the day-open gate's own regression test: a
+/// subnormal `1e-320` was refused as an OPEN and accepted as a PRICE in the
+/// same call, moving `day_low` to a number 320 orders of magnitude below a
+/// paisa.
+///
+/// `is_finite() && > 0.0` is not enough on its own. Every f64 subnormal is
+/// finite and positive, and so is `f32::MAX` widened to f64 — the two shapes
+/// that actually appear in corrupt payloads. This holds NO opinion about how
+/// far a price may move (an option can legitimately go from 5.60 to 0.05 in a
+/// session); it only asks whether the number could be a price on an Indian
+/// exchange at all.
+#[must_use]
+pub fn is_plausible_price(price: f64) -> bool {
+    // Two explicit comparisons rather than a `RangeInclusive::contains`:
+    // identical cost, and the banned-pattern scanner reads any `.contains(` as
+    // the O(n) `Vec` form. Writing what is actually happening is better than
+    // an exemption comment claiming the scanner is wrong.
+    price.is_finite()
+        && price >= DAY_OPEN_MIN_PLAUSIBLE_PRICE
+        && price <= DAY_OPEN_MAX_PLAUSIBLE_PRICE
+}
 
 /// How many exchange day-opens have been refused this process, for the
 /// power-of-two log throttle. Separate from the metric because
@@ -161,7 +196,13 @@ impl DayOhlc {
         // Dormant today (no tick publisher exists) but not hypothetical: the
         // Dhan live main-feed revival was operator-authorized 2026-08-09, and
         // restoring the publisher is precisely what that work does.
-        if !last_price.is_finite() || last_price <= 0.0 {
+        // 2026-08-26: was `!is_finite() || <= 0.0`. That admitted every f64
+        // subnormal -- finite, positive, and 320 orders of magnitude below a
+        // paisa -- straight into `day_low`, where it is absorbing until the
+        // IST-midnight reset. Found by the day-open gate's own regression
+        // test refusing a value as an OPEN that this line accepted as a PRICE
+        // in the same call. One predicate now decides both.
+        if !is_plausible_price(last_price) {
             return;
         }
         if !self.armed {
@@ -231,7 +272,7 @@ impl DayOhlc {
         // the trust this gate exists to withhold. The parsers are PROVEN to
         // emit NaN LTP (`quote.rs:382` asserts it on a real packet shape), so
         // the corrupt-packet case is not hypothetical.
-        let price_accepted = last_price.is_finite() && last_price > 0.0;
+        let price_accepted = is_plausible_price(last_price);
         self.update_tick(last_price);
         if !price_accepted || !self.armed {
             return;
@@ -239,22 +280,34 @@ impl DayOhlc {
         if !exchange_day_open.is_finite() || exchange_day_open <= 0.0 {
             return;
         }
-        // A CORRUPTION band, not a market band. The adopted open WIDENS the
-        // range (see the invariant note above), and that widening is
-        // irreversible until the IST-midnight reset — so a single bad packet
-        // permanently distorts the day's high or low for that instrument.
+        // An ABSOLUTE plausibility band, not a ratio against this packet's own
+        // price. The adopted open WIDENS the range (see the invariant note
+        // above), and that widening is irreversible until the IST-midnight
+        // reset, so a single bad packet permanently distorts the day's high or
+        // low for that instrument. Something must refuse `3.4e38` (f32::MAX)
+        // and the subnormal class, both of which are finite and positive and
+        // pass every check above.
         //
-        // 100x against the same packet's own last traded price is chosen to be
-        // impossible for a real instrument rather than tuned to a market: NSE
-        // circuit limits cap a day's move at +/-20%, so a legitimate
-        // open-to-last ratio lives inside [0.8, 1.25] and this band leaves ~80x
-        // of headroom on both sides. What it does reject is the shape that
-        // actually appears in corrupt f32 payloads — `3.4e38` (f32::MAX) and
-        // the subnormal `1e-38` class, both of which are finite and positive
-        // and so pass every check above.
-        let ratio_ceiling = last_price * DAY_OPEN_CORRUPTION_BAND;
-        let ratio_floor = last_price / DAY_OPEN_CORRUPTION_BAND;
-        if exchange_day_open > ratio_ceiling || exchange_day_open < ratio_floor {
+        // CORRECTED 2026-08-26, hours after the ratio version shipped: a 100x
+        // ratio band was WRONG, and wrong in the direction that re-creates the
+        // bug this whole change exists to fix. Its justification was "NSE
+        // circuit limits cap a day's move at +/-20%" -- true of EQUITIES, and
+        // options have no circuit limit at all. An option opening at 5.60 and
+        // trading at the 0.05 tick floor is a 112x ratio and an utterly
+        // ordinary expiry-day print; the ratio band silently discarded the
+        // exchange's open for it and left the first-observed-tick open in
+        // place, which across ~20,000 subscribed stock options is a systematic
+        // error rather than an edge case. The band also stopped being a bound
+        // at all in the subnormal region, where `last_price / 100.0` underflows
+        // to 0.0 and lets anything positive through.
+        //
+        // An absolute band holds no opinion about how far a price may MOVE, so
+        // it cannot reject a real move however violent. It only asks whether
+        // the number is a plausible rupee price at all. Every instrument on
+        // NSE and BSE lives inside it with orders of magnitude to spare: the
+        // floor is a hundredth of the 0.05 tick, and the ceiling is far above
+        // the most expensive scrip ever listed.
+        if !is_plausible_price(exchange_day_open) {
             metrics::counter!("tv_day_ohlc_exchange_open_refused_total").increment(1);
             // Logged, not only counted: a counter that reaches no operator
             // surface measures the loss and then discards the measurement.
@@ -268,11 +321,11 @@ impl DayOhlc {
                 tracing::warn!(
                     exchange_day_open,
                     last_price,
-                    band = DAY_OPEN_CORRUPTION_BAND,
+                    min = DAY_OPEN_MIN_PLAUSIBLE_PRICE,
+                    max = DAY_OPEN_MAX_PLAUSIBLE_PRICE,
                     occurrences = n,
-                    "exchange day open REFUSED as corrupt -- it sits outside a \
-                     {DAY_OPEN_CORRUPTION_BAND}x band around this packet's own last \
-                     traded price, so adopting it would have widened the day range \
+                    "exchange day open REFUSED as corrupt -- it is not a plausible \
+                     rupee price, so adopting it would have widened the day range \
                      irreversibly until the IST-midnight reset. The previous open is \
                      kept."
                 );
@@ -521,6 +574,58 @@ pub fn ist_seconds_of_day() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// BITE (2026-08-26, second round): the band must never reject a real
+    /// OPTION open.
+    ///
+    /// The first version of this gate was a 100x ratio against the packet's own
+    /// last price, justified by "NSE circuit limits cap a day's move at
+    /// +/-20%". Circuit limits are an EQUITY rule; options have none. An option
+    /// that opens at 5.60 and trades at the 0.05 tick floor is a 112x ratio and
+    /// an ordinary expiry-day print — and the ratio band discarded the
+    /// exchange's open for it, re-creating for ~20,000 stock options exactly
+    /// the systematic error this whole mechanism exists to remove.
+    #[test]
+    fn a_real_option_open_is_never_rejected_however_violent_the_move() {
+        for (open, last) in [
+            (5.60, 0.05),           // expiry-day decay to the tick floor: 112x
+            (12.00, 0.05),          // 240x
+            (0.05, 48.00),          // the other way: a 960x expiry-day spike
+            (0.05, 1_200.00),       // 24,000x — still an ordinary option
+            (24_341.95, 24_343.05), // an index, for contrast
+        ] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(last, open);
+            assert_eq!(
+                d.day_open, open,
+                "open {open} with last {last} is a real print and must be adopted"
+            );
+        }
+    }
+
+    /// BITE: and the band must still refuse what is not a price at all.
+    /// Subnormals are the case the ratio version silently let through, because
+    /// `last_price / 100.0` underflows to 0.0 and stops being a bound.
+    #[test]
+    fn a_number_that_is_not_a_price_is_still_refused() {
+        for (open, last) in [
+            (3.4e38, 100.0),  // f32::MAX
+            (1e-38, 100.0),   // f32 subnormal class
+            (5e-324, 1e-320), // f64 subnormal — the ratio band ACCEPTED this
+            (f64::MAX, 100.0),
+            (1e12, 100.0), // a trillion rupees is not a price
+        ] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(100.0, 100.0);
+            let before = (d.day_open, d.day_high, d.day_low);
+            d.update_tick_with_exchange_open(last, open);
+            assert_eq!(
+                (d.day_open, d.day_high, d.day_low),
+                before,
+                "open {open} with last {last} is not a rupee price and must not widen the range"
+            );
+        }
+    }
 
     /// BITE (2026-08-26): a packet whose LTP is refused must not have its
     /// `day_open` trusted either.

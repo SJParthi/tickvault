@@ -539,6 +539,54 @@ fn redact_param_value(input: &str, key: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Is this string already an ILP-safe SYMBOL value, needing no sanitising?
+///
+/// # Why a `const fn` and not just calling [`sanitize_ilp_symbol`]
+///
+/// The ILP write paths pass CLOSED SETS of `&'static str` labels — the eight
+/// segment names, `d20`/`d200`/`d5`, `bid`/`ask`, the feed names. Running the
+/// sanitiser on them re-derives, at runtime, an answer that was fixed when the
+/// constant was written. `sanitize_ilp_symbol` returns `Cow::Borrowed` for
+/// clean input, so it ALLOCATES NOTHING and DHAT cannot see it — which is
+/// exactly why it went unnoticed: the depth writer calls it FOUR times per row
+/// and the tick writer twice, on a path whose own measured volume is
+/// ~1.53e9 depth rows per session. That is billions of character scans a
+/// session to re-confirm that the literal `"bid"` contains no comma.
+///
+/// This function answers the same question at COMPILE time, so a
+/// `const _: () = assert!(ilp_symbol_is_clean(X));` beside each constant makes
+/// a dirty label a BUILD FAILURE and the runtime scan unnecessary. That is
+/// principle 2 in its literal form: O(1) — in fact zero — or fail at compile
+/// time.
+///
+/// # Deliberately STRICTER than the sanitiser
+///
+/// Any byte outside printable ASCII is rejected, where `sanitize_ilp_symbol`
+/// strips only the specific offenders. A byte scan cannot cheaply decide
+/// `char::is_control` for the U+0080..U+009F range, and getting that wrong in
+/// the permissive direction would emit malformed ILP. So this refuses
+/// everything it is not certain about: a `true` result is a guarantee, a
+/// `false` result only means "use the sanitiser". Every label in this
+/// workspace is printable ASCII.
+#[must_use]
+pub const fn ilp_symbol_is_clean(input: &str) -> bool {
+    if input.len() > ILP_SYMBOL_MAX_BYTES {
+        return false;
+    }
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Below 0x20 is ASCII control; 0x7F is DEL and above it is non-ASCII,
+        // both refused rather than reasoned about. Comma and equals are the
+        // ILP line-protocol delimiters.
+        if b < 0x20 || b >= 0x7F || b == b',' || b == b'=' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 #[cfg(test)]
 mod tests {
     use super::*;
