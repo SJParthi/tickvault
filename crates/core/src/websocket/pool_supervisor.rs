@@ -1321,6 +1321,35 @@ impl SubscribeSwap {
     }
 }
 
+/// A change to what a LIVE socket is subscribed to, sent while it is up.
+///
+/// One channel carries both shapes deliberately. Two optional receivers on
+/// the connection driver would each need their own null check in the drain
+/// loop, and — worse — could deliver an `Extend` and a `Swap` in an order
+/// neither sender chose. One channel gives the sequence the sender wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveSubscriptionCommand {
+    /// Add instruments to a set already on the wire.
+    ///
+    /// The original reason a live command channel exists at all: reaching the
+    /// ~4,150 slots stranded on the boot-dialed spot connection, which is
+    /// exactly what the authorized ATM window was short of. See
+    /// [`SubscribeGuard::try_extend`].
+    Extend(Vec<SubscribeInstrument>),
+    /// Replace one instrument with another, without re-dialing.
+    ///
+    /// The per-minute at-the-money re-selection for depth-200 and depth-20.
+    /// See [`SubscribeGuard::try_swap`] — in particular why the unsubscribe
+    /// must go out before the subscribe.
+    Swap {
+        /// The instrument to drop. Must be one this connection holds, or the
+        /// command is refused fail-closed.
+        old: SubscribeInstrument,
+        /// The instrument to take its place.
+        new: SubscribeInstrument,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Frame sink — THE ONE RULE, made executable
 // ---------------------------------------------------------------------------
@@ -2040,6 +2069,22 @@ pub trait DhanFeedSocket: Send {
         &mut self,
         batch: &[SubscribeInstrument],
     ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Send ONE unsubscribe message for the given batch.
+    ///
+    /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. It
+    /// has a default implementation that REFUSES rather than silently
+    /// succeeding: a transport that cannot unsubscribe must fail the swap
+    /// loudly, because the alternative — reporting success and leaving the old
+    /// instrument subscribed — puts a depth-200 connection over its
+    /// one-instrument limit on the very next subscribe, and Dhan answers that
+    /// with a Fatal 804.
+    fn send_unsubscribe(
+        &mut self,
+        batch: &[SubscribeInstrument],
+    ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+        let _ = batch;
+        async { Err(SocketFailure) }
+    }
     /// Await the next socket event. This is the call that keeps the automatic
     /// pong flowing — nothing may be done between two of these but
     /// [`FrameSink::accept`].
@@ -2089,28 +2134,35 @@ where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = ()> + Send,
 {
-    run_connection_with_topup(socket, supervisor, guard, sink, refresh_token, None).await
+    run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
 }
 
-/// [`run_connection`] plus a channel that can add instruments to the LIVE
-/// subscription.
+/// [`run_connection`] plus a channel that can change the LIVE subscription
+/// while the socket is up.
 ///
-/// See [`SubscribeGuard::try_extend`] for why a live top-up exists at all: it
-/// is the only way to reach the ~4,150 slots stranded on the boot-dialed spot
-/// connection, and those slots are exactly what the authorized ATM ± 25 window
-/// was short of.
+/// Two commands ride it, and they exist for different reasons.
+/// [`LiveSubscriptionCommand::Extend`] is the only way to reach the ~4,150
+/// slots stranded on the boot-dialed spot connection — exactly what the
+/// authorized ATM ± 25 window was short of. [`LiveSubscriptionCommand::Swap`]
+/// is the per-minute at-the-money re-selection: without it, changing which
+/// strike a depth socket carries means re-dialing it, and that is the churn
+/// that redialled one socket 322 times in a single session.
 ///
-/// `topup` is `None` for every connection that has nothing to add — depth
-/// sockets, and main-feed sockets the attach dialed itself with their final
-/// set. A `None` receiver compiles to a select arm that is never ready, so a
-/// connection without a top-up channel behaves byte-identically to before.
-pub async fn run_connection_with_topup<S, K, F, Fut>(
+/// **RENAMED 2026-08-26** from `run_connection_with_topup`. The old name was
+/// accurate when adding was the only thing the channel could do, and became a
+/// name for one of its two jobs — the same class of mistake this file already
+/// records against `FrameSinkOutcome::Captured`.
+///
+/// `commands` is `None` for every connection with nothing to change. A `None`
+/// receiver costs a null check on an enum discriminant per drain iteration and
+/// nothing else, so such a connection behaves byte-identically to before.
+pub async fn run_connection_with_commands<S, K, F, Fut>(
     mut socket: S,
     mut supervisor: ConnectionSupervisor,
     mut guard: SubscribeGuard,
     sink: std::sync::Arc<K>,
     mut refresh_token: F,
-    mut topup: Option<tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>>,
+    mut commands: Option<tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>>,
 ) -> ConnectionExit
 where
     S: DhanFeedSocket,
@@ -2230,7 +2282,7 @@ where
                     sink.as_ref(),
                     action,
                     &mut guard,
-                    topup.as_mut(),
+                    commands.as_mut(),
                 )
                 .await;
             }
@@ -2407,7 +2459,7 @@ async fn drain<S, K>(
     sink: &K,
     mut action: SupervisorAction,
     guard: &mut SubscribeGuard,
-    mut topup: Option<&mut tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>>,
+    mut commands: Option<&mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>>,
 ) -> SupervisorAction
 where
     S: DhanFeedSocket,
@@ -2442,9 +2494,9 @@ where
         // on an enum discriminant, not an atomic, not a syscall. The cost is
         // present only in the handful of iterations between the socket coming
         // up and the attach sending, and it disappears permanently after.
-        if let Some(rx) = topup.as_mut() {
+        if let Some(rx) = commands.as_mut() {
             match rx.try_recv() {
-                Ok(more) => {
+                Ok(LiveSubscriptionCommand::Extend(more)) => {
                     let added = more.len();
                     match guard.try_extend(more) {
                         Ok(start) => {
@@ -2516,12 +2568,92 @@ where
                         }
                     }
                 }
+                Ok(LiveSubscriptionCommand::Swap { old, new }) => {
+                    match guard.try_swap(old, new) {
+                        Ok(swap) if swap.is_no_op() => {
+                            // The socket already carries what was asked for.
+                            // Not counted and not logged: this is the ORDINARY
+                            // minute, and a line per socket per minute would
+                            // be ~1,500 lines a session saying nothing
+                            // happened. The tracker upstream is edge-triggered
+                            // precisely so this case rarely even reaches here.
+                        }
+                        Ok(swap) => {
+                            // UNSUBSCRIBE FIRST. A depth-200 connection holds
+                            // exactly one instrument; subscribing before
+                            // unsubscribing asks for two, and Dhan answers an
+                            // over-limit subscribe with 804 — Fatal, and
+                            // retrying re-sends the same over-limit set
+                            // forever. The order is the safety property.
+                            let mut wire_failed = false;
+                            if let Some(drop_this) = swap.unsubscribe
+                                && socket.send_unsubscribe(&[drop_this]).await.is_err()
+                            {
+                                wire_failed = true;
+                            }
+                            if !wire_failed
+                                && let Some(add_this) = swap.subscribe
+                                && socket.send_subscribe(&[add_this]).await.is_err()
+                            {
+                                wire_failed = true;
+                            }
+                            if wire_failed {
+                                // The guard already carries the NEW instrument
+                                // — see `try_swap` for why it is recorded
+                                // before the wire moves. That is what makes
+                                // this recoverable rather than a silent
+                                // revert: the reconnect replays the CURRENT
+                                // intent, so the socket comes back holding the
+                                // strike that was chosen, not the one it had.
+                                error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    "live subscription swap failed on the wire — the retained \
+                                     set already names the new instrument, so the reconnect \
+                                     replay lands it. One stale minute, not a lost strike."
+                                );
+                                metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
+                            } else {
+                                info!(
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    total = guard.len(),
+                                    "live subscription swapped — this socket now carries the \
+                                     current at-the-money contract without a re-dial"
+                                );
+                                metrics::counter!("tv_dhan_ws_swap_total").increment(1);
+                            }
+                        }
+                        Err(_) => {
+                            // Fail-closed and LOUD at the emit site, for the
+                            // same reason the refused top-up is: `try_swap`
+                            // explains WHY it refused, this says WHAT IT COSTS
+                            // — this socket keeps carrying a strike that is no
+                            // longer at-the-money, and it will look perfectly
+                            // healthy doing it, because a far-from-the-money
+                            // subscription still delivers real depth all day.
+                            error!(
+                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                held = guard.len(),
+                                "live subscription swap REFUSED — this connection does not hold \
+                                 the instrument it was asked to replace, so it keeps the strike \
+                                 it has. That strike is no longer at-the-money and nothing \
+                                 downstream can tell."
+                            );
+                            metrics::counter!("tv_dhan_ws_swap_refused_total").increment(1);
+                        }
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // The attach sent its one overflow and dropped the sender.
+                    // Every sender is gone: the attach sent its one overflow
+                    // and dropped, or the session's re-selection task ended.
                     // Clearing the Option is what makes the steady-state cost
                     // of this whole block exactly zero.
-                    topup = None;
+                    commands = None;
                 }
             }
         }
@@ -4592,6 +4724,13 @@ mod tests {
         connects: usize,
         subscribes: usize,
         closes: usize,
+        unsubscribe_results: VecDeque<bool>,
+        unsubscribes: usize,
+        /// Every wire call in order, so a test can assert that the
+        /// unsubscribe went out BEFORE the subscribe. On a depth-200 socket
+        /// the reverse order asks for two instruments and earns a Fatal 804,
+        /// so the ORDER is the property under test, not the counts.
+        wire_calls: Vec<&'static str>,
     }
 
     struct FakeSocket {
@@ -4615,6 +4754,24 @@ mod tests {
             }
         }
 
+        fn send_unsubscribe(
+            &mut self,
+            _batch: &[SubscribeInstrument],
+        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                let ok = match state.lock() {
+                    Ok(mut s) => {
+                        s.unsubscribes += 1;
+                        s.wire_calls.push("unsubscribe");
+                        s.unsubscribe_results.pop_front().unwrap_or(true)
+                    }
+                    Err(_) => true,
+                };
+                if ok { Ok(()) } else { Err(SocketFailure) }
+            }
+        }
+
         fn send_subscribe(
             &mut self,
             _batch: &[SubscribeInstrument],
@@ -4624,6 +4781,7 @@ mod tests {
                 let ok = match state.lock() {
                     Ok(mut s) => {
                         s.subscribes += 1;
+                        s.wire_calls.push("subscribe");
                         s.subscribe_results.pop_front().unwrap_or(true)
                     }
                     Err(_) => true,
@@ -4886,8 +5044,225 @@ mod tests {
     /// the assertion that matters is the SUBSCRIBE COUNT: 3 messages for the
     /// initial 250, then exactly 2 for the 150 added — never 5, which is what
     /// re-sending the whole set would produce and what Dhan answers with 804.
+    // ------------------------------------------------------------------
+    // Swap over the live command channel (2026-08-26). The pure guard logic
+    // is tested above; these pin the WIRE behaviour, which is where the
+    // 804-shaped mistakes live.
+    // ------------------------------------------------------------------
+
+    fn one_scripted_frame() -> VecDeque<SocketEvent> {
+        VecDeque::from(vec![
+            SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+            SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
+        ])
+    }
+
+    /// THE safety property. A depth-200 connection holds exactly one
+    /// instrument; subscribing before unsubscribing asks for two, and Dhan
+    /// answers an over-limit subscribe with 804 — Fatal, and retrying
+    /// re-sends the identical over-limit set forever.
     #[tokio::test(start_paused = true)]
-    async fn test_run_connection_with_topup_extends_a_live_subscription() {
+    async fn a_swap_unsubscribes_before_it_subscribes() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        // The initial subscribe, then the swap's unsubscribe, then its
+        // subscribe. The ORDER of the last two is the assertion.
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe", "subscribe"],
+            "a swap that subscribes before unsubscribing puts a depth-200 \
+             connection over its one-instrument limit"
+        );
+        assert_eq!(s.connects, 1, "a swap must never re-dial");
+    }
+
+    /// The ordinary minute. An edge-triggered tracker upstream means this
+    /// rarely reaches the socket at all, but when it does it must cost
+    /// nothing — a re-subscribe per socket per minute is ~1,500 needless wire
+    /// messages a session on four sockets.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_to_the_same_instrument_touches_the_wire_not_at_all() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(1),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.unsubscribes, 0, "an unchanged strike sent an unsubscribe");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe"],
+            "only the INITIAL subscribe should be on the wire"
+        );
+    }
+
+    /// A refused swap must leave the socket alone. Sending an unsubscribe for
+    /// an instrument this connection never held would drop nothing and then a
+    /// subscribe would ADD one — turning a refused swap into a silent
+    /// `try_extend`, on a socket whose cap is one.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_swap_sends_nothing_at_all() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(99),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe"],
+            "a refused swap put traffic on the wire"
+        );
+    }
+
+    /// A failed unsubscribe must NOT be followed by the subscribe. Sending it
+    /// anyway is the exact shape that takes a depth-200 connection to two
+    /// instruments and earns the Fatal 804.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_unsubscribe_stops_the_swap_rather_than_subscribing_anyway() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe"],
+            "the subscribe went out after the unsubscribe FAILED — that is the \
+             over-limit shape Dhan answers with a Fatal 804"
+        );
+    }
+
+    /// Frames must keep flowing while a swap is processed. The command block
+    /// runs before the select rather than as an arm of it precisely so it
+    /// cannot be starved — but it must not starve the socket either.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_does_not_eat_the_frames_arriving_around_it() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(
+            sink.accepted.lock().map(|g| g.len()).unwrap_or(0),
+            2,
+            "the swap arm ate frames that should have reached the sink"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_extend_command_grows_the_subscription_without_a_redial() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             recv_events: VecDeque::from(vec![
                 SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
@@ -4901,10 +5276,12 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Queued before the loop starts, so the arm is ready as soon as the
         // scripted frames are drained.
-        tx.send(instruments(150)).await.expect("channel open");
+        tx.send(LiveSubscriptionCommand::Extend(instruments(150)))
+            .await
+            .expect("channel open");
         drop(tx);
 
-        let exit = run_connection_with_topup(
+        let exit = run_connection_with_commands(
             fake(&st),
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
@@ -4931,7 +5308,7 @@ mod tests {
 
     /// A connection given NO channel must behave byte-identically to before.
     #[tokio::test(start_paused = true)]
-    async fn test_run_connection_with_topup_none_is_unchanged_behaviour() {
+    async fn no_command_channel_is_byte_identical_to_before() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa"))]),
             ..FakeState::default()
@@ -4940,7 +5317,7 @@ mod tests {
         let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
             .expect("inside cap");
 
-        let exit = run_connection_with_topup(
+        let exit = run_connection_with_commands(
             fake(&st),
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
