@@ -41,9 +41,13 @@
 use std::collections::HashMap;
 
 use tickvault_common::types::ExchangeSegment;
+use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
-use crate::depth200_atm::{ChainMinute, StrikePair, TopMoverPick};
-use crate::dhan_depth_universe::DepthCandidate;
+use crate::depth200_atm::{
+    ChainMinute, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair, TopMoverPick,
+    TopMoverSocket, plan_swaps,
+};
+use crate::dhan_depth_universe::{DepthCandidate, contract_segment_for_underlying};
 use crate::movers::StockMove;
 
 /// The segment a STOCK option trades in.
@@ -436,6 +440,91 @@ pub fn parse_movers_dataset(body: &str) -> Result<Vec<MoverRow>, String> {
     Ok(out)
 }
 
+/// What one minute's rebalance decided, for all five depth-200 sockets.
+///
+/// Returned rather than sent, so the decision is testable without a socket and
+/// the caller owns every wire call. On an ordinary minute every field is empty
+/// or `None` and the caller does nothing at all — which is the common case and
+/// must stay free.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RebalanceDecision {
+    /// Swaps for the four index at-the-money sockets, in dial order.
+    pub atm_swaps: Vec<PlannedSwap>,
+    /// The fifth socket's swap, when it already carried something.
+    pub top_mover_swap: Option<PlannedSwap>,
+    /// The fifth socket's FIRST subscription. Not a swap: there is nothing to
+    /// unsubscribe, and inventing an `old` to make it look like one would ask
+    /// the guard to drop an instrument the connection never held.
+    pub top_mover_first: Option<SubscribeInstrument>,
+    /// Why the fifth socket stayed put, when it did. Carried rather than
+    /// swallowed: "already right" and "we could not tell" are different states
+    /// and must not share a silence.
+    pub top_mover_idle: Option<NoTopMoverSwitch>,
+}
+
+impl RebalanceDecision {
+    /// Whether this minute costs any wire calls at all.
+    #[must_use]
+    pub fn is_quiet(&self) -> bool {
+        self.atm_swaps.is_empty() && self.top_mover_swap.is_none() && self.top_mover_first.is_none()
+    }
+}
+
+/// One minute of rebalance, decided but not sent.
+///
+/// # Why both engines run on one call
+///
+/// They share a minute and they share a candidate slice. Running them from two
+/// timers would let the index sockets act on one snapshot while the fifth acts
+/// on the next — reading two different moments as though they were one, which
+/// is the sort of skew that shows up as an inexplicable swap in a log weeks
+/// later.
+///
+/// # Why a failed half does not stop the other
+///
+/// An empty `movers` slice leaves the fifth socket where it is and the four
+/// index sockets carry on. The two answers are independent facts about the
+/// market and one being unavailable is not evidence about the other.
+///
+/// # Complexity
+///
+/// O(candidates) to group, O(pairs) per tracked underlying, O(movers) to rank.
+/// Cold path, once a minute.
+#[must_use]
+pub fn plan_minute(
+    tracker: &mut Depth200AtmTracker,
+    top_mover: &mut TopMoverSocket,
+    held: &[SubscribeInstrument],
+    candidates: &[DepthCandidate],
+    movers: &[MoverRow],
+) -> RebalanceDecision {
+    let owned = chain_minutes_from_candidates(candidates);
+    let minutes: Vec<ChainMinute<'_>> = owned.iter().map(OwnedChainMinute::as_minute).collect();
+    let atm_swaps = plan_swaps(tracker, &minutes, held, |underlying| {
+        contract_segment_for_underlying(underlying)
+    });
+
+    let pick = top_mover_pick(movers, candidates);
+    let mut decision = RebalanceDecision {
+        atm_swaps,
+        ..RebalanceDecision::default()
+    };
+    match top_mover.observe(pick.as_ref()) {
+        Ok(switch) => {
+            if let Some(swap) = TopMoverSocket::plan(&switch) {
+                decision.top_mover_swap = Some(swap);
+            } else {
+                // A first adoption. `plan` returns `None` precisely because
+                // there is no old instrument, and the caller needs to know the
+                // difference: a swap unsubscribes first, a first subscription
+                // must not.
+                decision.top_mover_first = Some(switch.to);
+            }
+        }
+        Err(idle) => decision.top_mover_idle = Some(idle),
+    }
+    decision
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,5 +969,328 @@ mod tests {
         assert!(crate::dhan_depth_universe::segment_supports_depth(
             STOCK_OPTION_SEGMENT
         ));
+    }
+}
+
+#[cfg(test)]
+mod plan_minute_tests {
+    use super::*;
+    use crate::depth200_atm::{DEPTH_200_TOP_MOVER_SOCKET, Depth200AtmConfig};
+
+    fn candidate(underlying: &str, strike: f64, leg: &str, id: i64, spot: f64) -> DepthCandidate {
+        DepthCandidate {
+            underlying: underlying.to_owned(),
+            contract_security_id: id,
+            expiry_micros: 1_900_000_000_000_000,
+            strike,
+            spot,
+            leg: leg.to_owned(),
+            is_index_option: underlying == "NIFTY" || underlying == "BANKNIFTY",
+        }
+    }
+
+    fn mover(id: u64, symbol: &str, pct: f64) -> MoverRow {
+        MoverRow {
+            security_id: id,
+            segment: MOVER_UNDERLYING_SEGMENT,
+            symbol: symbol.to_owned(),
+            pct_change: pct,
+        }
+    }
+
+    fn instrument(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment,
+        }
+    }
+
+    /// A NIFTY chain at 50-point spacing around `spot`, plus BANKNIFTY at 100.
+    fn index_chain(nifty_spot: f64, bank_spot: f64) -> Vec<DepthCandidate> {
+        let mut out = Vec::new();
+        for k in 0..5 {
+            let strike = 24_300.0 + f64::from(k) * 50.0;
+            let ce = 1_000 + i64::from(k);
+            let pe = 2_000 + i64::from(k);
+            out.push(candidate("NIFTY", strike, "CE", ce, nifty_spot));
+            out.push(candidate("NIFTY", strike, "PE", pe, nifty_spot));
+        }
+        for k in 0..5 {
+            let strike = 53_800.0 + f64::from(k) * 100.0;
+            let ce = 3_000 + i64::from(k);
+            let pe = 4_000 + i64::from(k);
+            out.push(candidate("BANKNIFTY", strike, "CE", ce, bank_spot));
+            out.push(candidate("BANKNIFTY", strike, "PE", pe, bank_spot));
+        }
+        out
+    }
+
+    /// The four index sockets in dial order: NIFTY call, NIFTY put,
+    /// BANKNIFTY call, BANKNIFTY put.
+    fn held_four(nifty_k: i64, bank_k: i64) -> Vec<SubscribeInstrument> {
+        vec![
+            instrument(
+                u64::try_from(1_000 + nifty_k).expect("positive"),
+                ExchangeSegment::NseFno,
+            ),
+            instrument(
+                u64::try_from(2_000 + nifty_k).expect("positive"),
+                ExchangeSegment::NseFno,
+            ),
+            instrument(
+                u64::try_from(3_000 + bank_k).expect("positive"),
+                ExchangeSegment::NseFno,
+            ),
+            instrument(
+                u64::try_from(4_000 + bank_k).expect("positive"),
+                ExchangeSegment::NseFno,
+            ),
+        ]
+    }
+
+    fn trackers() -> (Depth200AtmTracker, TopMoverSocket) {
+        (
+            Depth200AtmTracker::new(Depth200AtmConfig::default()),
+            TopMoverSocket::default(),
+        )
+    }
+
+    #[test]
+    fn a_settled_minute_costs_nothing_at_all() {
+        let (mut tracker, mut top) = trackers();
+        let candidates = index_chain(24_400.0, 54_000.0);
+        // Seed both engines so nothing is a first adoption.
+        let held = held_four(2, 2);
+        let movers = vec![mover(10, "ALPHA", 5.0)];
+        let alpha = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+        ];
+        let mut all = candidates.clone();
+        all.extend(alpha.iter().cloned());
+        // Run enough minutes for the top mover to adopt and settle.
+        for _ in 0..6 {
+            let _ = plan_minute(&mut tracker, &mut top, &held, &all, &movers);
+        }
+        let quiet = plan_minute(&mut tracker, &mut top, &held, &all, &movers);
+        assert!(
+            quiet.is_quiet(),
+            "an unchanged minute must cost zero wire calls: {quiet:?}"
+        );
+        assert_eq!(
+            quiet.top_mover_idle,
+            Some(NoTopMoverSwitch::AlreadySubscribed)
+        );
+    }
+
+    #[test]
+    fn the_fifth_socket_first_adoption_is_a_subscribe_not_a_swap() {
+        // Nothing is subscribed yet, so there is no `old`. Reporting it as a
+        // swap would ask the guard to drop an instrument the connection never
+        // held, and the guard refuses fail-closed.
+        let (mut tracker, mut top) = trackers();
+        let candidates = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+        ];
+        let movers = vec![mover(10, "ALPHA", 5.0)];
+        let got = plan_minute(&mut tracker, &mut top, &[], &candidates, &movers);
+        assert!(got.top_mover_swap.is_none());
+        assert_eq!(
+            got.top_mover_first,
+            Some(instrument(601, ExchangeSegment::NseFno))
+        );
+        assert!(!got.is_quiet());
+    }
+
+    #[test]
+    fn a_market_with_no_movers_leaves_the_fifth_socket_alone() {
+        // A stale deep book beats an empty one. Unsubscribing here spends a
+        // wire call to end up with less.
+        let (mut tracker, mut top) = trackers();
+        let candidates = index_chain(24_400.0, 54_000.0);
+        let got = plan_minute(&mut tracker, &mut top, &held_four(2, 2), &candidates, &[]);
+        assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
+        assert!(got.top_mover_swap.is_none());
+        assert!(got.top_mover_first.is_none());
+    }
+
+    #[test]
+    fn a_missing_movers_query_does_not_stop_the_index_sockets() {
+        // The two halves are independent facts about the market. One being
+        // unavailable is not evidence about the other.
+        let (mut tracker, mut top) = trackers();
+        // Seed the tracker at the 24,400 strike.
+        let seed = index_chain(24_400.0, 54_000.0);
+        let held = held_four(2, 2);
+        let _ = plan_minute(&mut tracker, &mut top, &held, &seed, &[]);
+        // Spot moves a full strike, with NO movers available at all. The
+        // tracker has its OWN confirmation gate, so this takes more than one
+        // minute — the point of the test is that it happens at all while the
+        // movers half is dark, not that it happens instantly.
+        let moved = index_chain(24_500.0, 54_000.0);
+        let mut swapped = false;
+        for _ in 0..4 {
+            let got = plan_minute(&mut tracker, &mut top, &held, &moved, &[]);
+            assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
+            if !got.atm_swaps.is_empty() {
+                swapped = true;
+                break;
+            }
+        }
+        assert!(
+            swapped,
+            "the index sockets must act on their own evidence even with the \
+             movers query dark"
+        );
+    }
+
+    #[test]
+    fn an_index_socket_swap_names_the_socket_it_is_for() {
+        let (mut tracker, mut top) = trackers();
+        let held = held_four(2, 2);
+        let _ = plan_minute(
+            &mut tracker,
+            &mut top,
+            &held,
+            &index_chain(24_400.0, 54_000.0),
+            &[],
+        );
+        let got = plan_minute(
+            &mut tracker,
+            &mut top,
+            &held,
+            &index_chain(24_500.0, 54_000.0),
+            &[],
+        );
+        for swap in &got.atm_swaps {
+            assert!(
+                swap.socket_index < DEPTH_200_TOP_MOVER_SOCKET,
+                "an index swap must never target the fifth socket: {swap:?}"
+            );
+            assert_ne!(
+                swap.old, swap.new,
+                "a swap to the same instrument is a wasted wire call"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stock_in_the_candidate_slice_never_takes_an_index_socket() {
+        // The four index sockets are NIFTY and BANKNIFTY by operator lock.
+        let (mut tracker, mut top) = trackers();
+        let mut candidates = index_chain(24_400.0, 54_000.0);
+        candidates.push(candidate("ALPHA", 100.0, "CE", 601, 99.0));
+        candidates.push(candidate("ALPHA", 100.0, "PE", 602, 99.0));
+        let held = held_four(2, 2);
+        let _ = plan_minute(&mut tracker, &mut top, &held, &candidates, &[]);
+        let got = plan_minute(&mut tracker, &mut top, &held, &candidates, &[]);
+        assert!(got.atm_swaps.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn an_empty_minute_decides_nothing_and_does_not_panic() {
+        let (mut tracker, mut top) = trackers();
+        let got = plan_minute(&mut tracker, &mut top, &[], &[], &[]);
+        assert!(got.is_quiet());
+        assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
+    }
+
+    #[test]
+    fn a_challenger_waits_out_the_confirmation_gate_before_the_socket_moves() {
+        let (mut tracker, mut top) = trackers();
+        let candidates = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+            candidate("BETA", 200.0, "CE", 701, 199.0),
+            candidate("BETA", 200.0, "PE", 702, 199.0),
+        ];
+        // ALPHA adopts immediately.
+        let first = plan_minute(
+            &mut tracker,
+            &mut top,
+            &[],
+            &candidates,
+            &[mover(10, "ALPHA", 5.0)],
+        );
+        assert_eq!(
+            first.top_mover_first,
+            Some(instrument(601, ExchangeSegment::NseFno))
+        );
+
+        // BETA leads. It must hold the lead, not merely appear at the top.
+        let beta = vec![mover(20, "BETA", 9.0), mover(10, "ALPHA", 5.0)];
+        let mut moved_at = None;
+        for minute in 1..=6 {
+            let got = plan_minute(&mut tracker, &mut top, &[], &candidates, &beta);
+            if got.top_mover_swap.is_some() {
+                moved_at = Some(minute);
+                break;
+            }
+            assert_eq!(
+                got.top_mover_idle,
+                Some(NoTopMoverSwitch::AwaitingConfirmation)
+            );
+        }
+        assert_eq!(
+            moved_at,
+            Some(
+                i32::try_from(crate::depth200_atm::TOP_MOVER_CONFIRM_OBSERVATIONS).expect("small")
+            ),
+            "the socket must move exactly when the gate is satisfied, no sooner"
+        );
+    }
+
+    #[test]
+    fn the_fifth_socket_swap_carries_the_old_instrument_it_actually_held() {
+        // The guard replaces in place and refuses fail-closed if the old
+        // instrument is not on the connection. A swap that invents an old
+        // would be refused every time and the socket would never move.
+        let (mut tracker, mut top) = trackers();
+        let candidates = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+        ];
+        // Adopt the CALL on a riser.
+        let first = plan_minute(
+            &mut tracker,
+            &mut top,
+            &[],
+            &candidates,
+            &[mover(10, "ALPHA", 5.0)],
+        );
+        let adopted = first.top_mover_first.expect("first adoption");
+        assert_eq!(adopted, instrument(601, ExchangeSegment::NseFno));
+
+        // The same stock flips sign. The busy leg is now the put.
+        let flipped = [mover(10, "ALPHA", -5.0)];
+        let mut swap = None;
+        for _ in 0..6 {
+            let got = plan_minute(&mut tracker, &mut top, &[], &candidates, &flipped);
+            if let Some(s) = got.top_mover_swap {
+                swap = Some(s);
+                break;
+            }
+        }
+        let swap = swap.expect("a direction flip must eventually move the socket");
+        assert_eq!(swap.old, adopted, "the old must be what was actually held");
+        assert_eq!(swap.new, instrument(602, ExchangeSegment::NseFno));
+        assert_eq!(swap.socket_index, DEPTH_200_TOP_MOVER_SOCKET);
+    }
+
+    #[test]
+    fn a_leader_whose_ladder_is_missing_is_an_unusable_minute_not_a_switch() {
+        let (mut tracker, mut top) = trackers();
+        // ALPHA leads but no ALPHA contracts exist in the slice.
+        let candidates = index_chain(24_400.0, 54_000.0);
+        let got = plan_minute(
+            &mut tracker,
+            &mut top,
+            &held_four(2, 2),
+            &candidates,
+            &[mover(10, "ALPHA", 8.0)],
+        );
+        assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
+        assert!(got.is_quiet());
     }
 }
