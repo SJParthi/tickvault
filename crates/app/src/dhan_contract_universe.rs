@@ -733,6 +733,14 @@ pub fn select_contract_universe(
 
     // 1 + 2. Futures, ALL expiries at or after today. Never rolled, never
     // trimmed: they are ~700 contracts against a 25,000 envelope.
+    //
+    // Ordered by (expiry, id) rather than by the order the master listed them.
+    // Nothing here is expected to overflow the envelope, but "expected" is not
+    // a property of the data: if it ever does, WHICH futures survive must be a
+    // function of the contracts, not of how the vendor happened to sort its
+    // export that morning.
+    index_futures.sort_unstable_by_key(|c| (c.expiry_ymd, c.security_id));
+    stock_futures.sort_unstable_by_key(|c| (c.expiry_ymd, c.security_id));
     for c in &index_futures {
         match push_contract(c, capacity, &mut chosen, &mut picked) {
             PushOutcome::Added => out.index_futures += 1,
@@ -760,7 +768,53 @@ pub fn select_contract_universe(
         let Some(expiry) = expiry else {
             continue;
         };
-        for c in bucket.options.iter().filter(|c| c.expiry_ymd == expiry) {
+        // NEAREST THE MIDDLE OF THE LADDER FIRST.
+        //
+        // The chain is taken WHOLE — that is what "entire options contracts"
+        // means, and no window is applied here. This ordering therefore
+        // changes nothing on a normal day: every strike is pushed either way.
+        //
+        // It decides what happens on the day the envelope BINDS, and the
+        // comment above this block used to promise that could not happen to an
+        // index chain ("what gives way is the far-from-the-money tail of stock
+        // options, never a future and never an index chain"). That promise
+        // holds only while the chains fit. The scope lock records the
+        // authorized set at ~24,600 against 25,000, with the index chains
+        // explicitly UNCAPPED and their measured depth swinging from 542 legs
+        // to 2,037 — so a breach is a vendor's ordinary decision to list more
+        // strikes, not an exotic scenario.
+        //
+        // Pushed in master order, a breach dropped whichever strikes the file
+        // listed last, which could be the at-the-money ones, and a different
+        // set on a day the vendor re-sorted its export. Ordering by distance
+        // from the ladder's MEDIAN strike makes the survivors the near-the-
+        // money ones and makes the answer a function of the data.
+        //
+        // The median rather than spot, deliberately: index options take no
+        // price input here by design, and inventing a dependency on one to
+        // order a set that is normally taken whole would be the larger change.
+        // Vendors list strikes roughly symmetric about spot, so the middle of
+        // the ladder is the proxy that needs nothing new.
+        //
+        // Found by a property test asserting that reversing the master cannot
+        // change the chosen set.
+        let mut chain: Vec<&Contract<'_>> = bucket
+            .options
+            .iter()
+            .filter(|c| c.expiry_ymd == expiry)
+            .collect();
+        let mut strikes: Vec<i64> = chain.iter().map(|c| c.strike_paise).collect();
+        strikes.sort_unstable();
+        strikes.dedup();
+        let centre = strikes.get(strikes.len() / 2).copied().unwrap_or(0);
+        chain.sort_unstable_by_key(|c| {
+            (
+                c.strike_paise.saturating_sub(centre).saturating_abs(),
+                c.strike_paise,
+                c.security_id,
+            )
+        });
+        for c in chain {
             match push_contract(c, capacity, &mut chosen, &mut picked) {
                 PushOutcome::Added => out.index_options += 1,
                 PushOutcome::Duplicate => out.deduped += 1,
@@ -1567,6 +1621,62 @@ mod tests {
     use super::*;
 
     /// Builds a master row. Only the fields selection reads are meaningful.
+    /// When the envelope binds on an index chain, the strikes that survive are
+    /// the ones near the money — not the ones the master happened to list
+    /// first.
+    ///
+    /// The chain is taken whole on any normal day, so this pins the behaviour
+    /// on the day it cannot be. The scope lock records the authorized set at
+    /// ~24,600 against 25,000 with the index chains explicitly UNCAPPED and
+    /// their measured depth swinging 542 to 2,037 legs, so a breach is a
+    /// vendor listing more strikes, not an exotic case.
+    ///
+    /// Found by a property test asserting that reversing the master cannot
+    /// change the chosen set: pushed in file order it could, and the strikes
+    /// it dropped were whichever came last.
+    #[test]
+    fn a_binding_envelope_keeps_the_index_strikes_nearest_the_money() {
+        // A NIFTY chain from 24,000 to 24,800 in 100-point steps, both legs:
+        // nine strikes, eighteen contracts. Listed FAR STRIKES FIRST, so file
+        // order and money-order disagree.
+        let mut rows = Vec::new();
+        let mut id = 1_u64;
+        let mut strikes: Vec<i64> = (0..9).map(|k| 24_000 + k * 100).collect();
+        strikes.sort_by_key(|s| -(s - 24_400).abs()); // furthest first
+        for strike in strikes {
+            for leg in [OptionLeg::Call, OptionLeg::Put] {
+                rows.push(contract(
+                    id,
+                    InstrumentClass::IndexOption,
+                    "NSE",
+                    "NIFTY",
+                    2026_09_24,
+                    strike,
+                    leg,
+                ));
+                id += 1;
+            }
+        }
+        // Room for three strikes' worth of legs.
+        let sel = select_contract_universe(&rows, &HashMap::new(), 2026_08_26, 6);
+        assert_eq!(sel.instruments.len(), 6);
+        let kept: Vec<i64> = sel
+            .instruments
+            .iter()
+            .filter_map(|i| {
+                rows.iter()
+                    .find(|r| r.security_id == i.security_id)
+                    .map(|r| r.strike_paise / 100)
+            })
+            .collect();
+        for strike in kept {
+            assert!(
+                (strike - 24_400).abs() <= 100,
+                "kept {strike}, which is not one of the three nearest the middle"
+            );
+        }
+    }
+
     fn contract(
         id: u64,
         class: InstrumentClass,
