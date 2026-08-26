@@ -3565,9 +3565,25 @@ This stores what we fetched. It does **not** increase what we fetch — the
 tape is exactly as complete as the run that produced it, so at today's 0.09%
 coverage the stored tape is equally sparse. It also stores only the VENDOR
 side; our own candles already live in the live tables, and joining them is the
-reader's job. Retention is the table's default partitioning — no archival
-policy is registered for it here, so it grows with the hot window like its
-siblings.
+reader's job.
+
+**Retention — the gap this envelope named, now closed (2026-08-26, same
+day).** The first draft of this section said "no archival policy is registered
+for it here, so it grows with the hot window like its siblings", and
+`partition_retention_coverage_guard` failed the build on exactly that: a new
+storage table constant with no retention decision. `dhan_rest_1m_tape` is now
+in `DAY_PARTITIONED_TABLES`, swept by the same detach→archive pass as
+`dhan_live_crossverify_cell_audit` and `dhan_live_crossverify_daily`.
+
+It is registered with its real volume rather than the word "trivial", because
+it is not: the cell table is bounded by DIVERGENCES and is normally near-empty,
+this one is bounded by INSTRUMENTS. One rotation third (~290 of ~865 spots) ×
+375 session minutes ≈ **108K rows/day** at full success, ~30 MB/day at the
+measured ~272 B/row, so **~2.7 GB across the 90-day hot window** — the largest
+per-day writer in that list. At today's measured 50-successful-fetches ceiling
+it is ~19K rows/day, so the number will GROW as the fetch failures are fixed,
+which is the opposite of the usual direction and worth stating before it
+surprises someone.
 
 ---
 
