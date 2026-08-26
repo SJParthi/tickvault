@@ -215,6 +215,87 @@ fn is_nearest_expiry(candidate: &DepthCandidate, nearest: Option<i64>) -> bool {
     }
 }
 
+/// Counts a chain whose rows disagree about one underlying's spot price.
+///
+/// Not an error on its own — see [`consensus_spot`] for why the disagreement
+/// is a normal consequence of the query — but a chain where it climbs is one
+/// where the at-the-money window is being centred on a price most of the
+/// chain no longer quotes.
+pub const SPOT_DISAGREEMENT: &str = "tv_depth_spot_disagreement_total";
+
+/// The spot price the underlying's rows AGREE on: the most common usable
+/// value, ties going to the lower one.
+///
+/// # Why the rows can disagree at all
+///
+/// They can, routinely, and the reason is in the query. `LATEST ON ts
+/// PARTITION BY underlying_security_id, expiry, strike, leg` takes each
+/// strike's own newest row, so a strike the vendor stopped returning at 09:47
+/// keeps 09:47's `underlying_spot` while every actively-quoted strike carries
+/// this minute's. One underlying, one slice, two prices — and by 15:00 they
+/// can be hundreds of points apart.
+///
+/// # Why not first-seen or last-seen
+///
+/// Both were tried here, and both make the answer depend on the ORDER the
+/// rows arrive in. The query carries no `ORDER BY`, and the grouping map is a
+/// `HashMap` whose iteration order is not even stable between runs of the
+/// same process — so the at-the-money strike could differ minute to minute on
+/// identical data, recentring the window and swapping sockets for the rest of
+/// the day while every counter reported healthy activity.
+///
+/// The most common value is order-independent by construction, and it is the
+/// price the chain as a whole is quoting: stale strikes are the ones that
+/// dropped out of the vendor's response, so they are the minority. Ties go to
+/// the lower value — arbitrary between two equally-attested prices, but
+/// deterministic, which is the property that matters.
+///
+/// Refusing the underlying outright on any disagreement was considered and
+/// rejected: under this query a single stale strike is the NORMAL state, so
+/// refusal would drop depth for an underlying the operator asked to be
+/// covered, most days.
+///
+/// Grouping is on the bit pattern, so rows carrying literally the same column
+/// value group exactly and no epsilon has to be invented.
+///
+/// # Complexity
+///
+/// O(candidates), one small map. Cold path, once a minute.
+#[must_use]
+pub fn consensus_spot(
+    candidates: &[DepthCandidate],
+    underlying: &str,
+    nearest: Option<i64>,
+) -> Option<f64> {
+    let mut tally: HashMap<u64, (usize, f64)> = HashMap::new();
+    for c in candidates {
+        if c.underlying != underlying || !is_nearest_expiry(c, nearest) {
+            continue;
+        }
+        if !c.spot.is_finite() || c.spot <= 0.0 {
+            continue;
+        }
+        let slot = tally.entry(c.spot.to_bits()).or_insert((0, c.spot));
+        slot.0 = slot.0.saturating_add(1);
+    }
+    if tally.len() > 1 {
+        metrics::counter!(SPOT_DISAGREEMENT).increment(1);
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for (count, value) in tally.into_values() {
+        let take = match best {
+            None => true,
+            Some((best_count, best_value)) => {
+                count > best_count || (count == best_count && value < best_value)
+            }
+        };
+        if take {
+            best = Some((count, value));
+        }
+    }
+    best.map(|(_, value)| value)
+}
+
 /// Groups a candidate slice into per-underlying chain views.
 ///
 /// # What is dropped, and why each is dropped rather than guessed
@@ -244,8 +325,8 @@ fn is_nearest_expiry(candidate: &DepthCandidate, nearest: Option<i64>) -> bool {
 /// a bucket and the later row wins.
 #[must_use]
 pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<OwnedChainMinute> {
-    // (underlying, strike_paise) -> (ce, pe, spot)
-    let mut by_strike: HashMap<(&str, i64), (Option<i64>, Option<i64>, f64)> = HashMap::new();
+    // (underlying, strike_paise) -> (ce, pe)
+    let mut by_strike: HashMap<(&str, i64), (Option<i64>, Option<i64>)> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
     // CURRENT EXPIRY ONLY, per underlying. Resolved once rather than per row:
     // the slice carries every expiry from today forward, and grouping by
@@ -273,7 +354,7 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
         }
         let slot = by_strike
             .entry((&c.underlying, paise))
-            .or_insert((None, None, c.spot));
+            .or_insert((None, None));
         // LOWEST id wins a contested leg, rather than the last row seen.
         //
         // A well-formed chain lists one contract per (underlying, expiry,
@@ -313,16 +394,25 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
             // placing it on a guess would subscribe the wrong side.
             _ => {}
         }
-        // Latest spot wins for the underlying. Every row of one underlying
-        // carries the same snapshot spot, so this is a copy, not a choice.
-        slot.2 = c.spot;
     }
 
     let mut out = Vec::with_capacity(order.len());
     for underlying in order {
         let mut pairs: Vec<StrikePair> = Vec::new();
-        let mut spot = f64::NAN;
-        for ((u, paise), (ce, pe, s)) in &by_strike {
+        // The spot the underlying's rows AGREE on, not the last one this
+        // loop happened to touch. `by_strike` is a `HashMap`, so its
+        // iteration order is not stable even between runs of the same
+        // process on identical input — last-wins made this function's own
+        // output non-reproducible whenever the rows disagreed, which under
+        // the per-strike `LATEST ON ts` query is routine. See
+        // [`consensus_spot`].
+        let spot = consensus_spot(
+            candidates,
+            underlying,
+            nearest.get(underlying).copied().flatten(),
+        )
+        .unwrap_or(f64::NAN);
+        for ((u, paise), (ce, pe)) in &by_strike {
             if *u != underlying {
                 continue;
             }
@@ -340,7 +430,6 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
             if ce == pe {
                 continue;
             }
-            spot = *s;
             pairs.push(StrikePair {
                 strike_paise: *paise,
                 ce_security_id: ce,
@@ -372,12 +461,17 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
 #[must_use]
 pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<StrikePair> {
     let mut pairs: HashMap<i64, (Option<i64>, Option<i64>)> = HashMap::new();
-    let mut spot = f64::NAN;
     // CURRENT EXPIRY ONLY. Without this the same strike from two expiries
     // shares one map slot and the later row wins — so the socket can land on
     // a far-month contract at a strike chosen from this month's spot. See
     // `is_nearest_expiry`.
     let nearest = nearest_expiry_for(candidates, underlying);
+    // The spot the rows AGREE on. Neither the first nor the last usable
+    // value: both make the at-the-money strike depend on the order the rows
+    // arrived in, and the query carries no `ORDER BY`. See
+    // [`consensus_spot`] — including why disagreement is routine rather than
+    // a data error.
+    let spot = consensus_spot(candidates, underlying, nearest).unwrap_or(f64::NAN);
     for c in candidates {
         if c.underlying != underlying {
             continue;
@@ -390,9 +484,6 @@ pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<S
         };
         if c.contract_security_id <= 0 {
             continue;
-        }
-        if c.spot.is_finite() && c.spot > 0.0 {
-            spot = c.spot;
         }
         let slot = pairs.entry(paise).or_insert((None, None));
         match c.leg.as_str() {
@@ -1235,6 +1326,89 @@ mod tests {
         // pairing a call at 1e30 with a put at 2e30 as one strike.
         assert_eq!(strike_paise(1e30), None);
         assert_eq!(strike_paise(2e30), None);
+    }
+
+    // ---- consensus_spot ----
+
+    /// The ordinary case: every row carries the same price, so there is
+    /// nothing to decide.
+    #[test]
+    fn one_agreed_spot_is_returned_unchanged() {
+        let rows = [
+            candidate("NIFTY", 24_500.0, "CE", 101, 24_480.0),
+            candidate("NIFTY", 24_550.0, "PE", 102, 24_480.0),
+        ];
+        let got = consensus_spot(&rows, "NIFTY", nearest_expiry_for(&rows, "NIFTY"));
+        assert!((got.expect("a spot") - 24_480.0).abs() < f64::EPSILON);
+    }
+
+    /// The stale-strike shape the per-strike `LATEST ON ts` query produces:
+    /// one strike stopped being quoted at 09:47 and kept 09:47's price while
+    /// the rest of the chain moved on. The majority price wins — NOT the
+    /// first row, NOT the last.
+    #[test]
+    fn the_majority_price_wins_over_a_stale_strike() {
+        let rows = [
+            // The stale one, FIRST in the slice — first-wins would take it.
+            candidate("NIFTY", 24_400.0, "CE", 101, 24_100.0),
+            candidate("NIFTY", 24_500.0, "CE", 102, 24_480.0),
+            candidate("NIFTY", 24_550.0, "CE", 103, 24_480.0),
+        ];
+        let got = consensus_spot(&rows, "NIFTY", nearest_expiry_for(&rows, "NIFTY"));
+        assert!((got.expect("a spot") - 24_480.0).abs() < f64::EPSILON);
+    }
+
+    /// Reversing the rows cannot change the answer — the property the whole
+    /// rule exists for, pinned here as a case a reader can see rather than
+    /// only as a generated one.
+    #[test]
+    fn reversing_the_rows_gives_the_same_spot() {
+        let rows = [
+            candidate("NIFTY", 24_400.0, "CE", 101, 24_100.0),
+            candidate("NIFTY", 24_500.0, "CE", 102, 24_480.0),
+            candidate("NIFTY", 24_550.0, "CE", 103, 24_480.0),
+        ];
+        let mut back = rows.clone();
+        back.reverse();
+        let nearest = nearest_expiry_for(&rows, "NIFTY");
+        assert_eq!(
+            consensus_spot(&rows, "NIFTY", nearest).map(f64::to_bits),
+            consensus_spot(&back, "NIFTY", nearest).map(f64::to_bits),
+        );
+    }
+
+    /// A tie between two equally-attested prices goes to the LOWER one.
+    /// Arbitrary between them, deterministic against the input order — which
+    /// is the property that stops the socket alternating all day.
+    #[test]
+    fn an_exact_tie_goes_to_the_lower_price() {
+        let rows = [
+            candidate("NIFTY", 24_500.0, "CE", 101, 24_600.0),
+            candidate("NIFTY", 24_550.0, "CE", 102, 24_400.0),
+        ];
+        let got = consensus_spot(&rows, "NIFTY", nearest_expiry_for(&rows, "NIFTY"));
+        assert!((got.expect("a spot") - 24_400.0).abs() < f64::EPSILON);
+    }
+
+    /// Values that are not prices are not candidates for the consensus at
+    /// all, however many rows carry them.
+    #[test]
+    fn non_prices_never_win_the_vote() {
+        let rows = [
+            candidate("NIFTY", 24_400.0, "CE", 101, 0.0),
+            candidate("NIFTY", 24_450.0, "CE", 102, -1.0),
+            candidate("NIFTY", 24_500.0, "CE", 103, f64::NAN),
+            candidate("NIFTY", 24_550.0, "CE", 104, 24_480.0),
+        ];
+        let got = consensus_spot(&rows, "NIFTY", nearest_expiry_for(&rows, "NIFTY"));
+        assert!((got.expect("a spot") - 24_480.0).abs() < f64::EPSILON);
+    }
+
+    /// No usable price at all is `None`, never a guess.
+    #[test]
+    fn no_usable_price_is_none() {
+        let rows = [candidate("NIFTY", 24_400.0, "CE", 101, 0.0)];
+        assert!(consensus_spot(&rows, "NIFTY", nearest_expiry_for(&rows, "NIFTY")).is_none());
     }
 
     // ---- chain_minutes_from_candidates ----
