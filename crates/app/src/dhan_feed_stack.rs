@@ -159,6 +159,64 @@ pub const ALIVE_CONNECTIONS_GAUGE: &str = "tv_dhan_ws_alive_connections";
 /// Live count behind [`ALIVE_CONNECTIONS_GAUGE`].
 static ALIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Longest ring dwell seen since the last publish, in NANOSECONDS.
+///
+/// A module static rather than a `run_frame_drain` local so that
+/// [`publish_fold_depth`] can drain it without a signature change at its four
+/// call sites — the same shape as [`ALIVE_CONNECTIONS`] above, for the same
+/// reason.
+///
+/// Exactly ONE writer exists (the drain task) and one reader (the publish, on
+/// that same task), so `Relaxed` is sound: there is no other thread whose
+/// writes this value must be ordered against. An uncontended `fetch_max` at
+/// the ~5,000 frames/sec envelope is a few nanoseconds and no allocation —
+/// the cost this module's `DrainCounters` docs exist to keep honest.
+///
+/// Nanoseconds internally, milliseconds at the gauge: the gauge is read by a
+/// human deciding whether the drain is behind, and no human needs nanosecond
+/// resolution to answer that. Storing nanos avoids a division per frame.
+static RING_DWELL_MAX_NANOS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Records one frame's ring dwell. Called once per frame; keeps the maximum.
+///
+/// Free function rather than an inline `fetch_max` at the call site so the
+/// unit conversion and the ordering choice live in ONE place with their
+/// reasoning, instead of as a bare atomic call a later reader has to re-derive.
+pub fn record_ring_dwell(nanos: i64) {
+    RING_DWELL_MAX_NANOS.fetch_max(nanos, Ordering::Relaxed);
+}
+
+/// Takes the maximum dwell and RESETS it, returning milliseconds.
+///
+/// Reset-on-read deliberately: a sticky maximum reads alarming forever after a
+/// single stall, and a signal that is permanently red is a signal nobody
+/// reads. Each published value therefore means "the worst dwell in the window
+/// that just ended", which is the question an operator is actually asking.
+pub fn take_ring_dwell_max_ms() -> f64 {
+    let nanos = RING_DWELL_MAX_NANOS.swap(0, Ordering::Relaxed);
+    // `u32::try_from` then `f64::from`: lossless by construction, and no lossy
+    // `as` cast to justify — the same wording, and the same reason, as
+    // `publish_fold_depth` a few hundred lines down.
+    //
+    // The first draft here was `nanos as f64` under an
+    // `#[allow(clippy::cast_precision_loss)]`, and the banned-pattern scanner
+    // refused it for want of an `// APPROVED:` line. Silencing the lint would
+    // have been the wrong answer twice over: the cast really is lossy above
+    // 2^53, and the sibling function three screens away already shows the
+    // lossless form. An `#[allow]` is a claim that no better shape exists, and
+    // one did.
+    //
+    // Nanos -> whole MICROSECONDS first, so the u32 window is wide enough to
+    // matter: `u32::MAX` micros is ~71 minutes of dwell. Saturating there is
+    // not a limitation worth avoiding — a drain 71 minutes behind has been
+    // catastrophically broken for over an hour, and every other signal on the
+    // dashboard is screaming by then. Truncating sub-microsecond dwell is
+    // likewise deliberate: nobody deciding "is the drain behind?" needs
+    // nanosecond resolution, and the gauge is read by a human.
+    let micros = u32::try_from(nanos / 1_000).unwrap_or(u32::MAX);
+    f64::from(micros) / 1_000.0
+}
+
 /// RAII counter for [`ALIVE_CONNECTIONS`].
 ///
 /// The increment happens OUTSIDE the socket task, deliberately, so the gauge
@@ -2651,6 +2709,45 @@ pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
 /// (~$0.30/mo) that belongs with the alarm that would read it.
 pub const DRAIN_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_feed_abandoned_bytes_total";
 
+/// Gauge: the LONGEST a frame sat in the ring before the drain folded it, in
+/// milliseconds, over the last reporting window.
+///
+/// # Why this one and not the vendor lag
+///
+/// This number was already being computed on every frame — ~5,000 times a
+/// second — and immediately thrown away. `run_frame_drain` derives
+/// `queued_nanos` from the frame's own monotonic receipt stamp solely to
+/// back-date `received_at_nanos`, then drops it. Publishing costs one
+/// comparison per frame and one gauge write per window.
+///
+/// It is the signal that actually predicts the failure the lane is judged on.
+/// `tv_dhan_ws_lag_ms` measures how long DHAN took to deliver — their problem,
+/// unfixable from here, and deliberately excluded from the EMF selector as a
+/// "how much" rather than a "what broke" (see `EMF-METRIC-SELECTOR-NOTES.md`).
+/// Ring dwell measures how far behind OUR OWN drain is, which is the direct
+/// precursor of every loss mechanism the lane has: a drain that stops draining
+/// fills the ring, and a full ring refuses frames.
+///
+/// # MAX, not mean, and not a histogram
+///
+/// A mean hides the stall that matters — one 8-second dwell inside a window of
+/// microsecond dwells averages to nothing. A histogram would ship ~12 bucket
+/// series per dimension and cost roughly an order of magnitude more than the
+/// per-connection latency figure the 2026-08-14 authorization priced at
+/// $4.80/mo; that discrepancy is recorded in the noise lock rather than spent
+/// silently. One gauge is one series.
+///
+/// # Cost on the hot path
+///
+/// One `i64` max against a stack local per frame. No allocation, no registry
+/// lookup, no label — the gauge handle is resolved once and written on the
+/// existing `DRAIN_REPORT_EVERY` path beside `publish_fold_depth`, never per
+/// frame. This is the `DrainCounters` discipline the module already documents.
+///
+/// Reset to zero after each publish, deliberately: a sticky maximum reads
+/// alarming forever after one stall, which is how a signal stops being read.
+pub const RING_DWELL_MAX_MS_GAUGE: &str = "tv_dhan_feed_ring_dwell_max_ms";
+
 /// Gauge: rows appended to the ILP buffer but not yet flushed to QuestDB.
 /// A buffer is a staging area, not storage — a rising value means rows are
 /// accumulating in the process rather than landing in the database.
@@ -3358,6 +3455,12 @@ async fn run_frame_drain(
                 // difference instead of corrupting the sample.
                 let queued_nanos =
                     i64::try_from(frame.received_at.elapsed().as_nanos()).unwrap_or(i64::MAX);
+                // Publish what was already being computed. Until 2026-08-26
+                // this value was derived on EVERY frame — ~5,000 times a
+                // second — used once to back-date `received_at_nanos`, and
+                // then dropped, so the one number that says how far behind our
+                // own drain is existed for a microsecond and reached nothing.
+                record_ring_dwell(queued_nanos);
                 let received_at_nanos = chrono::Utc::now()
                     .timestamp_nanos_opt()
                     .unwrap_or(0)
@@ -4883,6 +4986,12 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(PENDING_ROWS_GAUGE).set(pending);
     metrics::gauge!(SEALS_DROPPED_GAUGE).set(dropped);
     metrics::gauge!(SEQ_REFUSED_GAUGE).set(refused);
+    // Ring dwell rides the SAME periodic publish rather than a timer of its
+    // own. A second timer would be a second `select!` arm on the drain loop,
+    // and the whole point of this measurement is that the drain loop is not
+    // being starved — a signal that adds a new way to starve it would be
+    // measuring a problem it helped cause.
+    metrics::gauge!(RING_DWELL_MAX_MS_GAUGE).set(take_ring_dwell_max_ms());
 }
 
 /// The WebSocket base URL for one MARKET-DATA endpoint type.

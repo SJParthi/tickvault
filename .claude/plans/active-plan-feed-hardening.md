@@ -3149,3 +3149,89 @@ guard DID hold the line it was built to hold, and was then walked around by an
 exception written in good faith from an incomplete reading of the callee. A
 guard is only as strong as the claim its exception rests on, and this one rested
 on a claim nobody re-derived from `LiveIngest::flush`.
+
+---
+
+## Item 31 — the drain's own backlog was measured 5,000 times a second and thrown away
+
+### Design
+
+`run_frame_drain` derives `queued_nanos` — how long a frame sat in the ring
+before the fold reached it — on EVERY frame, uses it once to back-date
+`received_at_nanos`, and drops it.
+
+That number is the lane's best leading indicator and nothing has ever read it.
+Every other ring signal is a post-mortem count: `tv_dhan_ws_ring_full_total`
+and `tv_dhan_ws_frame_refused_total` move only once frames have already been
+turned away. Dwell rises while there is still headroom.
+
+**Fix:** `record_ring_dwell(queued_nanos)` keeps the maximum in a module
+`AtomicI64`; `publish_fold_depth` drains it to
+`tv_dhan_feed_ring_dwell_max_ms` on the existing periodic path. EMF-selected
+(80 names now, +$0.30/mo, priced in the count ratchet) and charted.
+
+**Rejected alternative — shipping `tv_dhan_ws_lag_ms` instead.** That measures
+the same axis from the vendor's side, and two things rule it out. It is an
+EXPLICIT exclusion in `EMF-METRIC-SELECTOR-NOTES.md` ("latency histograms …
+answer 'how much', not 'what broke'"), and a histogram ships ~12 bucket series
+per dimension — so the per-connection form the 2026-08-14 noise-lock
+authorization priced at $4.80/mo is closer to an order of magnitude more. That
+discrepancy is recorded rather than spent silently. Dhan's delivery lag is also
+not ours to fix; our own backlog is.
+
+### Edge cases
+
+- **Quiet window, no frames** — publishes 0, not the previous window's value.
+  Carrying it forward would make an idle lane look identical to a stalled one.
+- **Zero dwell** (the healthy steady state) — recordable, and must not displace
+  a real sample. Pinned.
+- **Clock steps** — none possible: `frame.received_at.elapsed()` is monotonic.
+- **`i64` overflow** — `try_from(...).unwrap_or(i64::MAX)` was already there.
+
+### Failure modes
+
+Two, and both are invisible in the code's shape, which is why the tests are
+behavioural rather than source scans:
+
+1. **Last-value-wins instead of max.** One 8-second stall followed by three
+   1 ms frames would publish 2 ms — the signal says "fine" at the exact moment
+   the drain has stopped. Bite-proven: `fetch_max` → `store` fails two tests.
+2. **Sticky maximum.** A stall from hours ago keeps the chart red forever, and
+   a permanently-red chart costs more than not publishing. Bite-proven:
+   `swap(0)` → `load` fails two tests.
+
+### Test plan
+
+`crates/app/tests/ring_dwell_gauge_guard.rs`, 6 tests: worst-sample-survives,
+reset-on-read, quiet-window-zero, unit direction (ns→ms, not the reverse — the
+error that would read as a 17-day stall and look plausible because "big number,
+bad situation" is self-consistent), zeros-do-not-poison, and one source check
+that the recorder is wired into the drain and the gauge is actually SET —
+which earns its place because the defect being fixed IS "computed and never
+published", so an arithmetic-only suite would pass on the broken code.
+
+Serialised behind an explicit mutex, not `--test-threads=1`: the latter is a
+property of how the suite is invoked, not one anything can rely on.
+
+### Rollback
+
+Delete the two helper calls and the selector/dashboard entries. The lane
+behaves exactly as before — nothing reads this value.
+
+### Observability
+
+The point of the item. `tv_dhan_feed_ring_dwell_max_ms`, EMF-selected, charted
+as "How far behind the drain is (worst frame wait, ms)", `stat = Maximum`.
+
+**Deliberately UNALARMED.** No threshold is defensible yet: the value has never
+been observed, because it has never been published. Picking a number now
+invents it and then trains the operator to ignore the alarm built on it. Chart
+first; threshold when the chart has a baseline.
+
+### Honest envelope
+
+Publishes a number that already existed. It does not make the drain faster, does
+not enlarge the ring, and does not prevent a stall — it makes one visible before
+it costs ticks instead of after. Cost on the hot path is one uncontended atomic
+`fetch_max` per frame (single writer, `Relaxed`), no allocation and no registry
+lookup; the gauge write is on the existing periodic path, never per frame.

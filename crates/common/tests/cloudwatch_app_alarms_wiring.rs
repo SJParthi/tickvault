@@ -808,10 +808,40 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // First-bucket-only -- 0 and 3 today against the session counters' 2,632
     // and 247. Same mechanism at ~1% of the resolution; two more paid series
     // for no added signal.
+    //
+    // 2026-08-26, PLUS 1: tv_dhan_feed_ring_dwell_max_ms (~$0.30/mo).
+    //
+    // The longest a frame sat in the ring before the drain folded it, per
+    // reporting window. Priced deliberately, per the rule this assertion
+    // states, and it earns the byte on the inclusion rule rather than on
+    // interest: it is a SATURATION signal on the one resource whose exhaustion
+    // is the lane's loss mechanism -- a drain that falls behind fills the ring,
+    // and a full ring refuses frames.
+    //
+    // It was ALREADY being computed, ~5,000 times a second, and thrown away:
+    // `run_frame_drain` derived it solely to back-date `received_at_nanos`.
+    // Every other ring signal is an AFTER-the-fact count (`ring_full_total`,
+    // `frame_refused_total`) -- they fire once the loss has happened. This is
+    // the only one that rises BEFORE it.
+    //
+    // Chosen over shipping tv_dhan_ws_lag_ms, which measures the same axis from
+    // the vendor's side. Two reasons, both stated so the choice is checkable:
+    // that histogram is an EXPLICIT exclusion in EMF-METRIC-SELECTOR-NOTES.md
+    // ("latency histograms ... answer 'how much', not 'what broke'"), and a
+    // histogram ships ~12 bucket series per dimension -- so the per-connection
+    // form the 2026-08-14 noise-lock authorization priced at $4.80/mo would in
+    // fact be closer to an order of magnitude more. That discrepancy is
+    // recorded rather than spent.
+    //
+    // NOT alarmed. There is no threshold anyone can defend yet: the value has
+    // never been observed, because it has never been published. Alarming an
+    // unmeasured signal picks a number out of the air and then trains an
+    // operator to ignore it. Charted first; a threshold when there is a
+    // baseline to set it from.
     assert_eq!(
         names.len(),
-        79,
-        "Z+ L2 VERIFY ratchet: expected exactly 79 names in the MAIN EMF \
+        80,
+        "Z+ L2 VERIFY ratchet: expected exactly 80 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \

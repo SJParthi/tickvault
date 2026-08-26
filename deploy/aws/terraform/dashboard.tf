@@ -487,6 +487,40 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
       {
         type   = "metric"
+        x      = 16
+        y      = 64
+        width  = 8
+        height = 6
+        properties = {
+          # The only ring signal that rises BEFORE the loss, not after it.
+          #
+          # Every other ring metric on this dashboard is a post-mortem count:
+          # ring_full_total and frame_refused_total move once frames have
+          # already been turned away. This is how long a frame WAITED before
+          # the drain reached it, so it climbs while there is still headroom
+          # left — which is the only window in which an operator can act.
+          #
+          # MAXIMUM, never Average. A mean hides the stall that matters: one
+          # eight-second dwell inside a window of microsecond dwells averages
+          # to approximately zero, and it is precisely that one frame that
+          # says the drain stopped draining.
+          #
+          # Deliberately UNALARMED for now. The value has never been observed,
+          # because until 2026-08-26 it was computed ~5,000 times a second and
+          # thrown away; picking a threshold before there is a baseline invents
+          # a number and then teaches the operator to ignore the alarm built on
+          # it. Chart first, threshold when the chart has something to read.
+          title  = "How far behind the drain is (worst frame wait, ms)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_ring_dwell_max_ms", { label = "worst ring wait", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
         x      = 8
         y      = 64
         width  = 8
