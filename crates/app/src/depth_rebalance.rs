@@ -851,16 +851,19 @@ pub async fn run_depth_rebalance(
     today_ymd: u32,
     today_ist_micros: i64,
     mut sockets: Vec<RebalanceSocket>,
+    mut depth20: Vec<crate::depth20_track::Depth20LiveSocket>,
 ) {
-    if sockets.is_empty() {
+    if sockets.is_empty() && depth20.is_empty() {
         tracing::error!(
             code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
-            "depth rebalance refused to start: no depth-200 connections were handed to it, so \
-             every at-the-money strike stays wherever it was dialed for the whole session"
+            "depth rebalance refused to start: NEITHER depth pool handed it a steerable \
+             connection, so every at-the-money strike and every index window stays wherever \
+             it was dialed for the whole session"
         );
         return;
     }
     pre_register_rebalance_counters();
+    crate::depth20_track::pre_register_depth20_counters();
     let mut tracker = Depth200AtmTracker::new(Depth200AtmConfig::default());
     // Seed the fifth socket's tracker from what the dial actually put on it.
     //
@@ -899,6 +902,29 @@ pub async fn run_depth_rebalance(
         // the same fact drift, and a drift here produces swaps the guard
         // refuses forever.
         let held: Vec<SubscribeInstrument> = sockets.iter().filter_map(|s| s.held).collect();
+
+        // ---- depth-20: the windows and the movers, every minute ----
+        //
+        // Runs BEFORE the depth-200 quiet check, because that check
+        // `continue`s the loop. Placing depth-20 after it would silently tie
+        // depth-20 tracking to depth-200 having something to do — and the
+        // overwhelmingly common minute is one where depth-200 is quiet.
+        if !depth20.is_empty() {
+            let layout = crate::depth20_layout::build_depth20_layout(&candidates, &movers);
+            let held_20: Vec<Vec<SubscribeInstrument>> =
+                depth20.iter().map(|s| s.held.clone()).collect();
+            let plan_20 = crate::depth20_track::plan_depth20_minute(&held_20, &layout);
+            if !plan_20.is_quiet() {
+                let sent_20 = crate::depth20_track::apply_depth20_plan(&mut depth20, &plan_20);
+                tracing::info!(
+                    sent = sent_20,
+                    planned = plan_20.swap_count(),
+                    sockets_moved = plan_20.sockets.len(),
+                    sockets_left_alone = plan_20.sockets_left_alone,
+                    "depth-20 tracking moved windows"
+                );
+            }
+        }
 
         let decision = plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers);
         if decision.is_quiet() {
