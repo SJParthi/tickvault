@@ -8164,11 +8164,39 @@ fn persist_xverify_report(
     let c = &report.comparison;
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
 
+    // ---- flush in batches -------------------------------------------
+    //
+    // MEASURED, prod 2026-08-26: one run produced 764,003 rows and a
+    // 207,965,278-byte buffer against a 104,857,600-byte ceiling. The flush
+    // failed and **the entire day's comparison was discarded** — in the one
+    // check that exists to prove nothing was lost.
+    //
+    // The scope filter is the root-cause fix and cuts the row count by ~99%.
+    // This is the floor under it: a future day that is legitimately large
+    // loses at most one batch instead of everything. Two independent
+    // mechanisms, because "the row count can never grow again" is exactly the
+    // assumption that produced the ceiling breach.
+    //
+    // 20,000 rows is deliberate, not round: the breached buffer averaged
+    // ~272 bytes/row, so a batch lands near 5 MB — comfortably inside the
+    // 100 MB ceiling with two orders of magnitude of headroom for a row
+    // shape that grows.
+    const PERSIST_BATCH_ROWS: usize = 20_000;
+    let mut batch_errors = 0_usize;
+    let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
+        if w.pending() >= PERSIST_BATCH_ROWS && w.flush().is_err() {
+            // One batch lost, named, and the run continues. Before this the
+            // same failure took the whole day with it.
+            *errs += 1;
+        }
+    };
+
     let mut cell_errors = 0_usize;
     for finding in &c.findings {
         if writer.append_cell(finding).is_err() {
             cell_errors += 1;
         }
+        flush_if_full(&mut writer, &mut batch_errors);
     }
 
     // The vendor's own tape, stored BEFORE any judgement is applied to it.
@@ -8180,6 +8208,7 @@ fn persist_xverify_report(
         if writer.append_rest_tape(row).is_err() {
             tape_errors += 1;
         }
+        flush_if_full(&mut writer, &mut batch_errors);
     }
 
     let daily = xverify_daily_row(c, tolerance_paise);
@@ -8189,7 +8218,7 @@ fn persist_xverify_report(
         Ok(()) => {
             metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
                 .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
-            if cell_errors > 0 || daily_err.is_some() || tape_errors > 0 {
+            if cell_errors > 0 || daily_err.is_some() || tape_errors > 0 || batch_errors > 0 {
                 // Partial writes are reported, never rounded up to success:
                 // an audit table that silently drops rows is worse than one
                 // that is honestly incomplete.
@@ -8198,6 +8227,7 @@ fn persist_xverify_report(
                     source = "xverify_persist_partial",
                     cell_errors,
                     tape_errors,
+                    batch_errors,
                     daily_failed = daily_err.is_some(),
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),

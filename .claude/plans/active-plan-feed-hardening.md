@@ -3912,3 +3912,99 @@ side; our own candles already live in the live tables, and joining them is the
 reader's job. Retention is the table's default partitioning — no archival
 policy is registered for it here, so it grows with the hot window like its
 siblings.
+
+---
+
+## Item 39 — the whole day's cross-verification was discarded, and 99% of it was never data
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Found by reading the live logs rather than waiting for tomorrow's run.
+
+Today's 15:41 IST run **failed to persist at all**:
+
+> `dhan_live_crossverify ILP flush failed — 764003 pending row(s) discarded`
+> `Buffer size of 207965278 exceeds maximum configured allowed size of 104857600`
+
+**The entire day's comparison was lost** — in the one check that exists to
+prove nothing else was.
+
+**Why 764,003 rows.** The verdict line carries `instruments: 8144` beside
+`targets: 865`. The live universe holds every option and future contract; the
+REST leg fetches ~865 spots. `compare_day` built its key set from live ∪ rest
+with **no scope filter**, so every minute of the ~7,279 never-requested
+instruments was recorded as `missing_rest` — *"the vendor is missing this"* —
+for data nobody asked the vendor for.
+
+**757,273 of 764,003 findings (99.1%) were that.**
+
+Two fixes, deliberately independent:
+
+1. **The scope filter** (root cause). `compare_day_in_scope` takes the set the
+   run actually requested; a live instrument outside it produces no findings
+   and is not counted in the reported universe.
+2. **Batched flushing** (floor). 20,000 rows per flush — not a round number:
+   the breached buffer averaged ~272 bytes/row, so a batch lands near 5 MB
+   against a 100 MB ceiling. A future legitimately-large day now loses at most
+   one batch instead of everything.
+
+Two mechanisms because *"the row count can never grow again"* is precisely the
+assumption that produced the ceiling breach.
+
+### Edge cases
+
+- **An empty scope disables the filter**, so every existing caller and test
+  means exactly what it did before.
+- **The scope key pairs `security_id` with `segment`** (I-P1-11). The same
+  numeric id in another segment is a different instrument; matching on the id
+  alone would admit one we never asked for and re-create the defect one
+  instrument at a time.
+- **A requested instrument the vendor did not serve is STILL `missing_rest`.**
+  The filter must not silence the signal it sits beside — that is the one case
+  the category exists to report.
+- **The skip happens BEFORE the instrument count.** Counting it would report a
+  universe far larger than the one verified, which is how `8,144 instruments`
+  sat in the verdict beside 865 targets and read as coverage.
+
+### Failure modes
+
+**The filter hiding real loss** — pinned by the asked-for-and-not-served test.
+
+**A silent regression to the unscoped comparison** — bite-proven: removing the
+filter fails 5 tests.
+
+### Test plan
+
+6 tests: a never-requested instrument produces no findings; it is not counted
+in the universe; a requested-but-unserved one still reports missing; an empty
+scope filters nothing; the key pairs id with segment; and the measured prod
+shape (200 live, 3 targeted) collapses to 3 findings rather than 200.
+
+### Rider — my own guard fired twice, correctly
+
+The single-test-marker guard written this morning caught the helper placement
+**twice**: once for a test-only attribute in production code, and once for a
+comment that merely NAMED that attribute. Both times it was right. That is the
+third instance today of a source scanner unable to tell quoting from doing, and
+the helper now lives inside the test module with nothing spelling the attribute
+out.
+
+### Rollback
+
+Pass an empty scope set and drop the batch flush. That restores a comparison
+that reports 99% noise and loses the day when it grows.
+
+### Observability
+
+**No new metric name and no cost.** `batch_errors` rides the existing
+partial-write error line.
+
+### Honest envelope
+
+This makes the day's comparison **persistable and its findings meaningful**. It
+does **not** improve coverage: the same ~50 instruments still succeed. It does
+not reduce the 815 fetch failures. And it changes what `missing_rest` MEANS —
+historical rows carry the old, inflated definition, so any trend across
+2026-08-26 is a definition change, not a signal.
