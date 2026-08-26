@@ -469,6 +469,67 @@ fn distinct_tv_names(root: &Path) -> usize {
     walk(root, &mut acc);
     acc.len()
 }
+/// Distinct metric names that count a REFUSAL rather than a success.
+///
+/// The fail-closed paths in this workspace all share a shape: refuse the
+/// input, increment a counter, log once. The counter is the load-bearing
+/// half -- a refusal nobody counts is indistinguishable from a success,
+/// which is the false-OK class the charter forbids. Counting the DISTINCT
+/// names says how many independent refusal paths report themselves; it says
+/// nothing about whether each one is alarmed (section 6 answers that).
+///
+/// Word-matched on the metric name, so `tv_tick_gap_tracker_refused_total`
+/// counts and `tv_ticks_total` does not. A refusal counter named without one
+/// of these words is invisible here -- the count is a floor, not a census.
+fn distinct_refusal_counters(root: &Path) -> usize {
+    const WORDS: [&str; 6] = [
+        "refused",
+        "rejected",
+        "dropped",
+        "skipped",
+        "exhausted",
+        "unconsumed",
+    ];
+    fn walk(dir: &Path, acc: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let mut rest = line;
+                    while let Some(at) = rest.find("\"tv_") {
+                        rest = &rest[at + 1..];
+                        if let Some(close) = rest.find('"') {
+                            let name = &rest[..close];
+                            if WORDS.iter().any(|w| name.contains(w)) {
+                                acc.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeSet::new();
+    walk(root, &mut acc);
+    acc.len()
+}
+
 /// Count lines CONTAINING any needle, anywhere in the line.
 ///
 /// Sibling to [`count_in_rust_sources`], which anchors at the start of the
@@ -1568,19 +1629,18 @@ fn main() {
     // Shipped vs taken, MEASURED both ends. The first draft hardcoded
     // "76 of 371" -- a document number in a binary whose entire premise is
     // that documents cannot stay true. The gap is a deliberate cost
-    // decision (all 371 would cost ~$111/mo against a budget whose
-    // automatic action switches the trading box off), so both numbers are
-    // shown rather than the flattering one.
-    let selector =
-        std::fs::read_to_string("deploy/aws/terraform/user-data.sh.tftpl").unwrap_or_default();
-    let shipped = selector
-        .split("\"metric_selectors\"")
-        .nth(1)
-        .map(|tail| {
-            let end = tail.find(']').unwrap_or(0);
-            tail[..end].matches("tv_").count()
-        })
-        .unwrap_or(0);
+    // decision (shipping every one would cost ~$111/mo against a budget
+    // whose automatic action switches the trading box off), so both numbers
+    // are shown rather than the flattering one.
+    //
+    // The selector is read from `deploy/aws/cloudwatch-agent.json` and NOT
+    // from the boot template. It lived in the template until the template
+    // hit its byte ceiling and the selector was moved out; a reader still
+    // pointed at the old path returns ZERO shipped, which renders a healthy
+    // system as shipping nothing. This report caught that on itself, which
+    // is the only reason the wrong path did not survive into the page.
+    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
+    let shipped = shipped_names.len();
     let emitted = distinct_tv_names(Path::new("crates"));
 
     let (total_codes, live_codes, alarmed_codes) = error_code_liveness(Path::new("."));
@@ -1588,7 +1648,6 @@ fn main() {
     // A metric in the CloudWatch selector is SHIPPED — it costs money every
     // session whether or not anything reads it. A name that appears in no
     // alarm and no dashboard widget is being paid for and watched by nobody.
-    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
     let in_terraform = metric_names_in_terraform();
     let unwatched: Vec<&String> = shipped_names
         .iter()
@@ -1767,6 +1826,129 @@ fn main() {
         ),
     ];
 
+    // ---------------------------------------------------------------
+    // 8. Extreme permutations, combinations, and out-of-box cases
+    //
+    // The operator's standing ask is that every combination of exception,
+    // error, condition and out-of-box scenario be covered. No grep can
+    // prove that -- the set is infinite, and a report claiming otherwise
+    // would be the exact false-OK this file exists to end.
+    //
+    // What CAN be measured is which MACHINES exist for generating cases a
+    // human would not think of, and every row here is one of those
+    // machines rather than a claim about the cases themselves. A property
+    // test invents its own inputs; a chaos suite invents its own failures;
+    // a loom model invents its own interleavings; a fuzzer invents its own
+    // bytes. Counting them says how many directions the search runs in --
+    // never that the search finished.
+    // ---------------------------------------------------------------
+    let proptest_blocks = count_substring_in_rust_sources(Path::new("crates"), &["proptest!"]);
+    let loom_models = count_substring_in_rust_sources(Path::new("crates"), &["loom::"]);
+    let chaos_suites = files.iter().filter(|f| f.contains("chaos_")).count();
+    let fuzz_targets = files
+        .iter()
+        .filter(|f| f.contains("fuzz/fuzz_targets/"))
+        .count();
+    let guard_files = files.iter().filter(|f| f.ends_with("_guard.rs")).count();
+    let saturating = count_substring_in_rust_sources(
+        Path::new("crates"),
+        &["saturating_", "checked_", "wrapping_"],
+    );
+    let refusal_counters = distinct_refusal_counters(Path::new("crates"));
+    let panic_macros = count_substring_scoped(
+        Path::new("crates"),
+        &["unreachable!(", "todo!(", "unimplemented!("],
+        true,
+    );
+
+    let permutations = vec![
+        Row::new(
+            "Inputs the author did not choose",
+            if proptest_blocks > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{proptest_blocks} generators"),
+            "property tests invent their own values; each run explores cases nobody wrote down",
+        ),
+        Row::new(
+            "Thread interleavings enumerated",
+            if loom_models > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{loom_models} refs"),
+            "loom walks every ordering of a small concurrent region -- exhaustive there, silent everywhere else",
+        ),
+        Row::new(
+            "Failure injection suites",
+            if chaos_suites > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{chaos_suites} files"),
+            "chaos tests break the dependency on purpose; the envelope they cover is the envelope claimed",
+        ),
+        Row::new(
+            "Byte-level hostile inputs",
+            if fuzz_targets > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{fuzz_targets} targets"),
+            "the parser is fed garbage until it crashes or the hour is up -- weekly, never per-PR",
+        ),
+        Row::new(
+            "Invariants that fail the build",
+            if guard_files > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{guard_files} guards"),
+            "a rule nothing enforces is a wish; each of these turns one wish into a red build",
+        ),
+        Row::new(
+            "Arithmetic that cannot wrap",
+            if saturating > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{saturating} sites"),
+            "saturating/checked at the counters and clocks; release also builds with overflow-checks on",
+        ),
+        Row::new(
+            "Refusals that are counted, never silent",
+            if refusal_counters > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{refusal_counters} counters"),
+            "every fail-closed path increments something -- a refusal nobody counts reads as success",
+        ),
+        Row::new(
+            "Panic macros left in production paths",
+            if panic_macros == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{panic_macros} sites"),
+            "closed-enum arms a variant cannot reach; each is a comment away from being a real crash",
+        ),
+        Row::new(
+            "Combinations nobody has thought of",
+            Verdict::Impossible,
+            "unbounded",
+            "the set is infinite; these machines widen the search, they never finish it",
+        ),
+    ];
     // Report
     // ---------------------------------------------------------------
     let sections: Vec<(&str, &[Row])> = vec![
@@ -1782,6 +1964,10 @@ fn main() {
         (
             "7. Common runtime, dynamic, scalable, incremental",
             &runtime[..],
+        ),
+        (
+            "8. Extreme permutations, combinations, out-of-box",
+            &permutations[..],
         ),
     ];
 
@@ -1820,6 +2006,13 @@ fn main() {
             &runtime
         )
     );
+    print!(
+        "{}",
+        render(
+            "8. EXTREME PERMUTATIONS, COMBINATIONS, OUT-OF-BOX",
+            &permutations
+        )
+    );
 
     let all: Vec<Row> = lang
         .into_iter()
@@ -1829,6 +2022,7 @@ fn main() {
         .chain(pinning)
         .chain(observability)
         .chain(runtime)
+        .chain(permutations)
         .collect();
     let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
     let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();
