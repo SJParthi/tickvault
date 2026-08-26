@@ -2519,3 +2519,169 @@ mod heartbeat_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod expiry_permutation_tests {
+    use super::*;
+
+    const NEAR: i64 = 1_900_000_000_000_000;
+    const FAR: i64 = 1_902_592_000_000_000;
+
+    fn c(underlying: &str, expiry: i64, strike: f64, leg: &str, id: i64) -> DepthCandidate {
+        DepthCandidate {
+            underlying: underlying.to_owned(),
+            contract_security_id: id,
+            expiry_micros: expiry,
+            strike,
+            spot: 24_500.0,
+            leg: leg.to_owned(),
+            is_index_option: true,
+        }
+    }
+
+    /// The mixed case: some rows carry an expiry, some carry the missing
+    /// sentinel. The rows that KNOW their expiry decide, and the ones that do
+    /// not are refused rather than allowed to ride along.
+    ///
+    /// That is the right way round. A row with no expiry could belong to any
+    /// month, so admitting it beside dated rows would put an unknown-month
+    /// contract on a socket reserved for the current one — exactly what the
+    /// filter exists to prevent. Refusing it costs one strike; admitting it
+    /// costs the guarantee.
+    #[test]
+    fn a_row_with_no_expiry_loses_to_siblings_that_have_one() {
+        let rows = vec![
+            c("NIFTY", NEAR, 24_500.0, "CE", 101),
+            c("NIFTY", NEAR, 24_500.0, "PE", 102),
+            c("NIFTY", 0, 24_550.0, "CE", 901),
+            c("NIFTY", 0, 24_550.0, "PE", 902),
+        ];
+        let got = chain_minutes_from_candidates(&rows);
+        assert_eq!(
+            got[0].pairs.len(),
+            1,
+            "the undated strike rode along: {got:?}"
+        );
+        assert_eq!(got[0].pairs[0].ce_security_id, 101);
+    }
+
+    /// A NEGATIVE expiry is the missing sentinel by another name — a parse
+    /// that produced garbage, not a contract that expired before the epoch.
+    #[test]
+    fn a_negative_expiry_is_treated_as_missing_not_as_the_nearest() {
+        let rows = vec![
+            c("NIFTY", -5, 24_450.0, "CE", 901),
+            c("NIFTY", -5, 24_450.0, "PE", 902),
+            c("NIFTY", NEAR, 24_500.0, "CE", 101),
+            c("NIFTY", NEAR, 24_500.0, "PE", 102),
+        ];
+        let got = chain_minutes_from_candidates(&rows);
+        assert_eq!(got[0].pairs.len(), 1);
+        assert_eq!(
+            got[0].pairs[0].ce_security_id, 101,
+            "a negative expiry ranked as 'nearest' and won: {got:?}"
+        );
+    }
+
+    /// Three expiries, not two. The filter takes the nearest, not merely
+    /// "not the farthest".
+    #[test]
+    fn with_three_expiries_only_the_nearest_survives() {
+        let mid = (NEAR + FAR) / 2;
+        let rows = vec![
+            c("NIFTY", FAR, 24_500.0, "CE", 901),
+            c("NIFTY", FAR, 24_500.0, "PE", 902),
+            c("NIFTY", mid, 24_500.0, "CE", 501),
+            c("NIFTY", mid, 24_500.0, "PE", 502),
+            c("NIFTY", NEAR, 24_500.0, "CE", 101),
+            c("NIFTY", NEAR, 24_500.0, "PE", 102),
+        ];
+        let got = chain_minutes_from_candidates(&rows);
+        assert_eq!(got[0].pairs.len(), 1);
+        assert_eq!(got[0].pairs[0].ce_security_id, 101);
+    }
+
+    /// Input order must not decide the outcome. The far expiry listed FIRST
+    /// is the arrangement that would fool a first-wins implementation.
+    #[test]
+    fn the_order_rows_arrive_in_does_not_change_which_expiry_wins() {
+        let far_first = vec![
+            c("NIFTY", FAR, 24_500.0, "CE", 901),
+            c("NIFTY", FAR, 24_500.0, "PE", 902),
+            c("NIFTY", NEAR, 24_500.0, "CE", 101),
+            c("NIFTY", NEAR, 24_500.0, "PE", 102),
+        ];
+        let near_first: Vec<DepthCandidate> = far_first.iter().rev().cloned().collect();
+        let a = chain_minutes_from_candidates(&far_first);
+        let b = chain_minutes_from_candidates(&near_first);
+        assert_eq!(a[0].pairs[0].ce_security_id, 101);
+        assert_eq!(b[0].pairs[0].ce_security_id, 101);
+    }
+
+    /// A strike listed in the near expiry with only ONE leg, and both legs in
+    /// the far one. The single-leg rule and the expiry rule must not combine
+    /// into "fall back to the far month" — that would subscribe exactly what
+    /// the operator ruled out, and only for the strikes where it is least
+    /// noticeable.
+    #[test]
+    fn a_single_legged_near_strike_does_not_fall_back_to_the_far_month() {
+        let rows = vec![
+            c("NIFTY", NEAR, 24_500.0, "CE", 101),
+            c("NIFTY", FAR, 24_500.0, "CE", 901),
+            c("NIFTY", FAR, 24_500.0, "PE", 902),
+        ];
+        let got = chain_minutes_from_candidates(&rows);
+        assert!(
+            got.is_empty() || got[0].pairs.is_empty(),
+            "the far month filled a gap the near month left: {got:?}"
+        );
+    }
+
+    /// Every underlying resolves its own expiry, and one underlying having
+    /// only far-dated rows must not drag another onto its month.
+    #[test]
+    fn one_underlyings_far_expiry_does_not_reach_another() {
+        let rows = vec![
+            c("NIFTY", NEAR, 24_500.0, "CE", 101),
+            c("NIFTY", NEAR, 24_500.0, "PE", 102),
+            c("BANKNIFTY", FAR, 54_000.0, "CE", 201),
+            c("BANKNIFTY", FAR, 54_000.0, "PE", 202),
+        ];
+        let got = chain_minutes_from_candidates(&rows);
+        assert_eq!(got.len(), 2, "an underlying was dropped: {got:?}");
+        for m in &got {
+            assert_eq!(m.pairs.len(), 1, "{m:?}");
+        }
+    }
+
+    /// The at-the-money search and the chain view must agree about which
+    /// expiry is current. Two answers to one question is how a socket ends up
+    /// holding a month the rest of the system is not looking at.
+    #[test]
+    fn the_atm_search_and_the_chain_view_pick_the_same_expiry() {
+        let mut rows = Vec::new();
+        for (exp, base) in [(NEAR, 100_i64), (FAR, 900)] {
+            for k in 0..5_i64 {
+                #[expect(clippy::cast_precision_loss, reason = "k is tiny")]
+                let strike = (k as f64).mul_add(50.0, 24_400.0);
+                rows.push(c("NIFTY", exp, strike, "CE", base + k * 2));
+                rows.push(c("NIFTY", exp, strike, "PE", base + k * 2 + 1));
+            }
+        }
+        let chain = chain_minutes_from_candidates(&rows);
+        let pair = atm_pair_for(&rows, "NIFTY").expect("a pair");
+        assert!(
+            chain[0]
+                .pairs
+                .iter()
+                .any(|p| p.ce_security_id == pair.ce_security_id),
+            "the at-the-money pick is not in the chain view's own expiry: \
+             atm={pair:?} chain={:?}",
+            chain[0].pairs
+        );
+        assert!(
+            pair.ce_security_id < 900,
+            "the at-the-money pick is far-dated"
+        );
+    }
+}
