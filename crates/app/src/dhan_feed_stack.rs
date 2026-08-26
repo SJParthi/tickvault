@@ -112,8 +112,9 @@ use tickvault_core::websocket::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
 };
 use tickvault_core::websocket::pool_supervisor::{
-    CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
-    SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection_with_topup,
+    CapturedFrame, ConnectionSupervisor, LiveSubscriptionCommand, PoolSupervisor, RingByteBudget,
+    SubscribeGuard, SubscribeGuardRefusal, SubscribeInstrument, WalRingSink,
+    run_connection_with_commands,
 };
 use tickvault_storage::depth_persistence::{
     DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
@@ -5753,7 +5754,7 @@ fn top_up_late_contracts(
     sent: &mut std::collections::HashSet<(u64, u8)>,
     slots: &mut [(
         tokio::sync::mpsc::Sender<
-            Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+            tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
         >,
         usize,
     )],
@@ -5812,7 +5813,7 @@ fn top_up_late_contracts(
         }
         let take = (*room).min(delta.len() - cursor);
         let chunk = delta[cursor..cursor + take].to_vec();
-        match tx.try_send(chunk) {
+        match tx.try_send(LiveSubscriptionCommand::Extend(chunk)) {
             Ok(()) => {
                 for instrument in &delta[cursor..cursor + take] {
                     sent.insert(contract_identity(instrument));
@@ -6015,7 +6016,7 @@ async fn attach_depth_when_available(
     // the only slots that exist are the ones already paid for on this socket.
     spot_topup: Option<(
         tokio::sync::mpsc::Sender<
-            Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+            tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
         >,
         usize,
     )>,
@@ -6091,7 +6092,7 @@ async fn attach_depth_when_available(
     // Top-up channels for connections that are already live, with the room
     // left on each. Populated by the contract dial and by the spot
     // connection's leftover after the initial overflow.
-    let mut live_topups: Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)> =
+    let mut live_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     // The contract capacity budget, FROZEN at the first selection.
     //
@@ -6387,7 +6388,7 @@ async fn attach_depth_when_available(
                             // connection task may be mid-frame, and waiting on
                             // it here would stall the depth dial behind a
                             // socket that is doing its job.
-                            match tx.try_send(overflow.to_vec()) {
+                            match tx.try_send(LiveSubscriptionCommand::Extend(overflow.to_vec())) {
                                 Ok(()) => {
                                     spot_topup_used = true;
                                     for instrument in overflow {
@@ -6763,7 +6764,7 @@ struct DialContext<'a> {
     /// later contract attach can reach the slots the spot universe does not
     /// use; the attach passes `None`, because its own connections are dialed
     /// with their final set and have nothing left to add.
-    out_topups: Option<&'a mut Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)>>,
+    out_topups: Option<&'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>>,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -6864,7 +6865,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             // object. Whatever ends this task — a clean return, an early
             // return, or an unwind — the count comes back down.
             let alive = alive;
-            let exit = run_connection_with_topup(
+            let exit = run_connection_with_commands(
                 socket,
                 supervisor,
                 guard,
@@ -7558,7 +7559,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // universe packs onto one connection and leaves the rest of it empty; this
     // is how the later contract attach reaches that room instead of stranding
     // it. See `SubscribeGuard::try_extend`.
-    let mut main_feed_topups: Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)> =
+    let mut main_feed_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     let dialed = dial_planned_connections(
         plan,
@@ -8698,11 +8699,26 @@ mod tests {
     fn topup_slot(
         room: usize,
     ) -> (
-        (tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize),
-        tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>,
+        (tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize),
+        tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         ((tx, room), rx)
+    }
+
+    /// Unwraps the `Extend` payload a top-up sends.
+    ///
+    /// The channel carries a command enum since 2026-08-26 (it also carries
+    /// `Swap`, for the per-minute at-the-money re-selection). A top-up only
+    /// ever sends `Extend`, and a test that received a `Swap` here would be
+    /// reporting a real defect, so this panics rather than returning empty.
+    fn extended(cmd: LiveSubscriptionCommand) -> Vec<SubscribeInstrument> {
+        match cmd {
+            LiveSubscriptionCommand::Extend(more) => more,
+            LiveSubscriptionCommand::Swap { .. } => {
+                panic!("a top-up sent a Swap — it must only ever Extend")
+            }
+        }
     }
 
     #[test]
@@ -8723,7 +8739,7 @@ mod tests {
         assert_eq!(placed, 1, "only the instrument nobody has been told about");
         let got = rx.try_recv().expect("the delta must reach the channel");
         assert_eq!(
-            got,
+            extended(got),
             vec![inst(3, ExchangeSegment::NseFno)],
             "re-sending an already-live instrument is a silent double-subscribe, and Dhan \
              answers an over-limit subscribe with 804 by dropping the connection"
@@ -8773,7 +8789,7 @@ mod tests {
             "keying on security_id alone would withhold the BSE_FNO contract forever"
         );
         assert_eq!(
-            rx.try_recv().expect("a send"),
+            extended(rx.try_recv().expect("a send")),
             vec![inst(42, ExchangeSegment::BseFno)]
         );
     }
@@ -8781,7 +8797,7 @@ mod tests {
     #[test]
     fn top_up_late_contracts_does_not_mark_a_refused_send_as_subscribed() {
         let mut sent = std::collections::HashSet::new();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<LiveSubscriptionCommand>(1);
         drop(rx); // the connection task is gone: every send is refused
         let mut slots = [(tx, 100)];
         let selection = [inst(9, ExchangeSegment::NseFno)];
@@ -8809,8 +8825,16 @@ mod tests {
         let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 5);
-        assert_eq!(rx_first.try_recv().expect("first").len(), 2, "its room");
-        assert_eq!(rx_second.try_recv().expect("second").len(), 3, "the rest");
+        assert_eq!(
+            extended(rx_first.try_recv().expect("first")).len(),
+            2,
+            "its room"
+        );
+        assert_eq!(
+            extended(rx_second.try_recv().expect("second")).len(),
+            3,
+            "the rest"
+        );
         assert_eq!(slots[0].1, 0, "room is decremented as sends succeed");
         assert_eq!(slots[1].1, 7);
     }
@@ -8841,7 +8865,7 @@ mod tests {
         let mut sent = std::collections::HashSet::new();
         let mut slots: [(
             tokio::sync::mpsc::Sender<
-                Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+                tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
             >,
             usize,
         ); 0] = [];
@@ -8957,7 +8981,7 @@ mod tests {
         let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 2, "the repeat must not reach the wire");
-        let got = rx.try_recv().expect("a send");
+        let got = extended(rx.try_recv().expect("a send"));
         assert_eq!(got.len(), 2);
         assert_eq!(
             got.iter().filter(|i| i.security_id == 5).count(),
