@@ -159,25 +159,50 @@ fn the_watchdog_reset_stays_on_the_received_pong_not_on_the_send() {
          always ping, and a reader that stopped draining would never be caught."
     );
 }
-
 #[test]
 fn the_send_is_gated_on_the_endpoint_predicate() {
     // A keepalive sent on every endpoint would add control traffic to three
     // paths that already work, and would make the measurement that justified
     // this change unreproducible.
+    //
+    // 2026-08-26 — this test used to take a fixed 400-byte window BACKWARDS
+    // from the send and require both literals inside it. That is a PROXIMITY
+    // assertion, and proximity is not the invariant: adding a comment between
+    // the gate and the send failed it, while moving the send out of the gate
+    // entirely into a line 399 bytes below the gate would have passed it.
+    // Brittle in the direction that blocks correct edits and permissive in the
+    // direction that matters — the same defect as the sibling test below,
+    // found in the same CI run.
+    //
+    // Rewritten as an ORDER assertion, which is what "gated by" actually
+    // means: both the predicate and the pacing constant must appear BEFORE the
+    // send, and the send must be the FIRST one after them, with no intervening
+    // block close that would put it outside the gate.
     let src = source("websocket/pool_supervisor.rs");
     let send_at = src
         .find("socket.send_ping()")
         .expect("the client keepalive send site must exist");
-    let window = &src[send_at.saturating_sub(400)..send_at];
+    let gate_at = src
+        .find("needs_client_keepalive_ping()\n")
+        .or_else(|| src.find(".needs_client_keepalive_ping()"))
+        .expect("the keepalive send must be gated on the endpoint predicate");
     assert!(
-        window.contains("needs_client_keepalive_ping()"),
-        "the keepalive send must be gated on the endpoint predicate"
+        gate_at < send_at,
+        "the endpoint predicate must be evaluated BEFORE the send, or the \
+         keepalive fires on endpoints that never needed it"
     );
+    let between = &src[gate_at..send_at];
     assert!(
-        window.contains("CLIENT_KEEPALIVE_PING_INTERVAL"),
+        between.contains("CLIENT_KEEPALIVE_PING_INTERVAL"),
         "the keepalive send must be paced by the named interval, not by the \
          1-second idle tick"
+    );
+    // No `}` at the gate's own indentation between them: that would mean the
+    // send escaped the `if` block and runs unconditionally.
+    assert!(
+        !between.contains("\n                }"),
+        "the send must sit INSIDE the gate — a block close between the \
+         predicate and the send means the keepalive fires unconditionally"
     );
 }
 
@@ -186,16 +211,50 @@ fn a_failed_ping_does_not_tear_down_the_socket() {
     // Fail-safe direction. If Dhan does not answer pings on this endpoint the
     // watchdog simply keeps governing the socket exactly as it does today —
     // this change can improve that path, never worsen it.
+    //
+    // 2026-08-26 — this test used to assert the send site `contains("let _ =")`.
+    // It was pinning a SPELLING, and the spelling it pinned is one clippy
+    // rejects (`let_underscore_must_use`, `-D warnings`), so the guard and the
+    // lint were in direct contradiction: satisfying either failed the other.
+    // CI found it, which is the system working, but the lesson is the one this
+    // repo keeps re-learning — a guard that names the characters instead of the
+    // consequence blocks the correct fix as readily as the wrong one.
+    //
+    // Rewritten to assert the CONSEQUENCE: whatever the discard is spelled as,
+    // the statement must not escalate the failure into socket teardown.
     let src = source("websocket/pool_supervisor.rs");
     let send_at = src
         .find("socket.send_ping()")
         .expect("the client keepalive send site must exist");
-    let line_start = src[..send_at].rfind('\n').map_or(0, |i| i + 1);
-    let line = &src[line_start..(send_at + 40).min(src.len())];
+
+    // The statement the send lives in: from the send back to the enclosing
+    // block's opening brace is noisy, so take the send plus what follows it up
+    // to the next statement — that is where an escalation would have to be.
+    let tail = &src[send_at..(send_at + 240).min(src.len())];
+    for forbidden in [
+        "?;",                  // propagate out of the loop
+        "return",              // abandon the socket
+        "break",               // leave the drain loop
+        "SocketAction::Close", // ask the supervisor to tear down
+        "record_failure",      // charge it against the reconnect ladder
+    ] {
+        assert!(
+            !tail.contains(forbidden),
+            "the keepalive send site must not escalate a failed ping (found \
+             `{forbidden}`). Escalating turns 'Dhan does not answer pings on \
+             this endpoint' into a disconnect, which is worse than the \
+             behaviour being fixed"
+        );
+    }
+
+    // And it must genuinely consume the result rather than leaving a
+    // `#[must_use]` warning for `-D warnings` to fail the build on — the exact
+    // collision that produced this rewrite.
     assert!(
-        line.contains("let _ ="),
-        "a failed keepalive must be ignored at the call site: escalating it \
-         would turn 'Dhan does not answer pings here' into a disconnect, which \
-         is worse than the behaviour being fixed"
+        !tail.contains("let _ = socket.send_ping()"),
+        "`let _ =` on the send trips clippy::let_underscore_must_use under \
+         -D warnings and fails Build & Verify. Consume the result explicitly \
+         instead — an exhaustive match documents the ignore AND forces a \
+         decision here if a new outcome is ever added"
     );
 }

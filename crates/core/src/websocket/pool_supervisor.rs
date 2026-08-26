@@ -2521,7 +2521,31 @@ where
                     && last_client_ping.elapsed() >= CLIENT_KEEPALIVE_PING_INTERVAL
                 {
                     last_client_ping = Instant::now();
-                    let _ = socket.send_ping().await;
+                    // Spelled as an exhaustive match rather than `let _ =`,
+                    // and not only to satisfy `clippy::let_underscore_must_use`
+                    // (which is what caught the first draft). `send_ping`
+                    // counts EVERY outcome under
+                    // `CLIENT_KEEPALIVE_PING_METRIC` and logs the failing ones,
+                    // so there is genuinely nothing left for this site to do —
+                    // but a discard says that by accident, whereas a match says
+                    // it on purpose and forces a decision here if a future
+                    // outcome ever appears that the supervisor SHOULD act on.
+                    //
+                    // Escalating a failure here would be wrong in the fail-safe
+                    // direction: it would turn "Dhan does not answer pings on
+                    // this endpoint" into a disconnect, which is worse than the
+                    // behaviour being fixed.
+                    //
+                    // The clock advances BEFORE the await, deliberately. A
+                    // failing send must not be retried on the next 1 s tick:
+                    // `SUBSCRIBE_SEND_TIMEOUT` is 10 s, so a HUNG send holds
+                    // this loop — the loop whose job is to keep polling `recv`
+                    // — for that long. Once per interval is an accepted
+                    // exposure; once per second would be a tenfold increase in
+                    // the very stall this watchdog exists to catch.
+                    match socket.send_ping().await {
+                        Ok(()) | Err(SocketFailure) => {}
+                    }
                 }
                 action = supervisor.poll(Instant::now());
             }
