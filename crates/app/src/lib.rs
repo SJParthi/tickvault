@@ -166,6 +166,7 @@ pub mod disk_pressure_boot;
 /// runs the bounded chain-day rehydrate, and publishes the depth gauges.
 /// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
 pub mod market_ram_store_boot;
+pub mod movers;
 /// REST-era multi-TF candle derivation (operator directive 2026-07-16):
 /// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
 /// timeframes via the shared seal-writer channel + boot catch-up over the

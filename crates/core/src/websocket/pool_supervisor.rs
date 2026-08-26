@@ -1351,6 +1351,31 @@ impl SubscribeSwap {
     }
 }
 
+/// How long ONE wire call of a swap may occupy the drain task.
+///
+/// **THIS BOUND IS THE POINT, and without it the swap is dangerous.** Both
+/// wire calls run ON the drain task — the same task that reads frames off the
+/// socket — and the transport's own `SUBSCRIBE_SEND_TIMEOUT` is **10
+/// seconds**. An unsubscribe followed by a subscribe would therefore be a
+/// worst case of **twenty seconds** of drain occupancy, on the very socket the
+/// swap exists to keep useful. During a stall the socket receive buffer fills,
+/// and Dhan's published architecture skips a slow consumer forward to "the
+/// latest available state" — so the ticks in between are dropped at THEIR
+/// side, with no sequence number for us to detect it. That is tick loss caused
+/// by the mechanism meant to improve coverage.
+///
+/// One second each, so a whole swap is bounded at two. A subscribe message is
+/// a few hundred bytes; a socket that cannot write one in a second is sick,
+/// and the reconnect ladder is the right answer to a sick socket — not
+/// waiting nine more seconds on the drain.
+///
+/// At the ~5,000 packet/sec envelope two seconds is ~10,000 packets, inside
+/// the socket receive buffer. Once a minute per socket, and only on a REAL
+/// at-the-money change — the edge-triggered tracker upstream means an ordinary
+/// minute costs zero wire calls and zero stall.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const SWAP_WIRE_BUDGET: Duration = Duration::from_secs(1);
+
 /// A change to what a LIVE socket is subscribed to, sent while it is up.
 ///
 /// One channel carries both shapes deliberately. Two optional receivers on
@@ -2624,17 +2649,41 @@ where
                             // over-limit subscribe with 804 — Fatal, and
                             // retrying re-sends the same over-limit set
                             // forever. The order is the safety property.
+                            // Both calls bounded by `SWAP_WIRE_BUDGET`. See
+                            // that constant: unbounded, these two would be a
+                            // twenty-second drain stall on the socket the
+                            // swap exists to keep useful.
                             let mut wire_failed = false;
-                            if let Some(drop_this) = swap.unsubscribe
-                                && socket.send_unsubscribe(&[drop_this]).await.is_err()
-                            {
-                                wire_failed = true;
+                            let mut wire_timed_out = false;
+                            if let Some(drop_this) = swap.unsubscribe {
+                                match tokio::time::timeout(
+                                    SWAP_WIRE_BUDGET,
+                                    socket.send_unsubscribe(&[drop_this]),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => wire_failed = true,
+                                    Err(_elapsed) => {
+                                        wire_failed = true;
+                                        wire_timed_out = true;
+                                    }
+                                }
                             }
-                            if !wire_failed
-                                && let Some(add_this) = swap.subscribe
-                                && socket.send_subscribe(&[add_this]).await.is_err()
-                            {
-                                wire_failed = true;
+                            if !wire_failed && let Some(add_this) = swap.subscribe {
+                                match tokio::time::timeout(
+                                    SWAP_WIRE_BUDGET,
+                                    socket.send_subscribe(&[add_this]),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => wire_failed = true,
+                                    Err(_elapsed) => {
+                                        wire_failed = true;
+                                        wire_timed_out = true;
+                                    }
+                                }
                             }
                             if wire_failed {
                                 // The guard already carries the NEW instrument
@@ -2653,6 +2702,15 @@ where
                                      replay lands it. One stale minute, not a lost strike."
                                 );
                                 metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
+                                if wire_timed_out {
+                                    // Separated from an ordinary write error
+                                    // because they mean different things: a
+                                    // write error is a socket that answered,
+                                    // a timeout is a socket that did not —
+                                    // and the second is the one that also
+                                    // cost the drain a full second.
+                                    metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(1);
+                                }
                             } else {
                                 info!(
                                     endpoint = supervisor.slot().endpoint.as_str(),
@@ -5306,6 +5364,122 @@ mod tests {
             vec!["subscribe", "unsubscribe"],
             "the subscribe went out after the unsubscribe FAILED — that is the \
              over-limit shape Dhan answers with a Fatal 804"
+        );
+    }
+
+    /// A socket that never answers must not hold the drain. Unbounded, the
+    /// transport's own 10-second timeout would make one swap a TWENTY-second
+    /// stall on the socket the swap exists to keep useful — and during a
+    /// stall Dhan skips a slow consumer forward, dropping the intervening
+    /// ticks at their side where no counter of ours can see them.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_never_answers_costs_the_drain_two_seconds_not_twenty() {
+        struct HangingSocket {
+            state: std::sync::Arc<Mutex<FakeState>>,
+        }
+        impl DhanFeedSocket for HangingSocket {
+            fn connect(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                async { Ok(()) }
+            }
+            fn send_subscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                let state = std::sync::Arc::clone(&self.state);
+                async move {
+                    let first = match state.lock() {
+                        Ok(mut s) => {
+                            s.subscribes += 1;
+                            s.wire_calls.push("subscribe");
+                            s.subscribes == 1
+                        }
+                        Err(_) => true,
+                    };
+                    // The INITIAL subscribe answers; the swap's does not.
+                    if first {
+                        Ok(())
+                    } else {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                }
+            }
+            fn send_unsubscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                let state = std::sync::Arc::clone(&self.state);
+                async move {
+                    if let Ok(mut s) = state.lock() {
+                        s.unsubscribes += 1;
+                        s.wire_calls.push("unsubscribe");
+                    }
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+            fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send {
+                let state = std::sync::Arc::clone(&self.state);
+                async move {
+                    let next = match state.lock() {
+                        Ok(mut s) => s.recv_events.pop_front(),
+                        Err(_) => None,
+                    };
+                    next.unwrap_or(SocketEvent::Closed {
+                        code: Some(DisconnectCode::AuthenticationFailed),
+                    })
+                }
+            }
+            fn close(&mut self) -> impl std::future::Future<Output = ()> + Send {
+                async {}
+            }
+        }
+
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let started = tokio::time::Instant::now();
+        let _ = run_connection_with_commands(
+            HangingSocket {
+                state: std::sync::Arc::clone(&st),
+            },
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+        let spent = started.elapsed();
+
+        // Paused clock, so this is the virtual time the swap actually
+        // occupied — not wall-clock jitter.
+        assert!(
+            spent < Duration::from_secs(3),
+            "a hanging socket held the drain for {spent:?} — the swap budget \
+             is not bounding it"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe"],
+            "the subscribe went out after the unsubscribe TIMED OUT — that is \
+             the over-limit shape Dhan answers with a Fatal 804"
         );
     }
 
