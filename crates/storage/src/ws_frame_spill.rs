@@ -1070,10 +1070,20 @@ pub fn replay_all_with_budget<P: AsRef<Path>>(
     // replay recovered N, the guarantee held for the last N frames.
     // Parthiban 2026-04-20.
     metrics::counter!("tv_wal_replay_recovered_total").increment(frames.len() as u64);
-    if corrupted > 0 {
-        // APPROVED: cast — corrupted usize is O(segments) ≤ u64 always.
-        metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(corrupted as u64);
-    }
+    // UNCONDITIONAL since 2026-08-26, mirroring the recovered counter one line
+    // above, which has always incremented by a possibly-zero length.
+    //
+    // This used to sit behind `if corrupted > 0`, so on every clean boot the
+    // series was never created — measured on the live box that day: ZERO lines
+    // in /metrics out of 756. The CloudWatch agent computes a counter alarm
+    // value as a DELTA and drops each series' first sample as its baseline, so
+    // the FIRST corrupted WAL segment would have been swallowed and the alarm
+    // would only fire on the SECOND. WAL corruption is precisely the rare,
+    // once-ever event where the first is the only one you get.
+    //
+    // Incrementing by zero is a no-op for the value and creates the series.
+    // APPROVED: cast — corrupted usize is O(segments) ≤ u64 always.
+    metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(corrupted as u64);
 
     // Move processed segments to the IN-PROGRESS staging dir (NOT archive).
     // They remain re-globbable next boot until `confirm_replayed` is called.
