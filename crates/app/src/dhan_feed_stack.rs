@@ -6092,6 +6092,15 @@ async fn attach_depth_when_available(
     // Top-up channels for connections that are already live, with the room
     // left on each. Populated by the contract dial and by the spot
     // connection's leftover after the initial overflow.
+    // One entry per DEPTH connection the attach dials, holding the channel a
+    // swap travels down and the instruments that connection was dialed with.
+    // Collected here rather than derived later because only the dial knows
+    // which connection the pool gave which instruments to.
+    let mut depth_commands: Vec<(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )> = Vec::new();
     let mut live_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     // The contract capacity budget, FROZEN at the first selection.
@@ -6465,6 +6474,7 @@ async fn attach_depth_when_available(
                                 // possible; `top_up_late_contracts` is what
                                 // makes it safe.
                                 out_topups: Some(&mut live_topups),
+                                out_depth_commands: None,
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -6548,6 +6558,7 @@ async fn attach_depth_when_available(
                                 depth_budget: &depth_budget,
                                 ws_audit_tx: Some(&ws_audit_tx),
                                 out_topups: None,
+                                out_depth_commands: Some(&mut depth_commands),
                             },
                         );
                         depth_done = true;
@@ -6765,6 +6776,24 @@ struct DialContext<'a> {
     /// use; the attach passes `None`, because its own connections are dialed
     /// with their final set and have nothing left to add.
     out_topups: Option<&'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>>,
+    /// Collects a command sender for every DEPTH connection dialed, paired
+    /// with the instruments that connection was dialed holding.
+    ///
+    /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. The
+    /// tracker and the swap primitive both existed and had nowhere to send:
+    /// depth sockets were dialed with no command channel at all, so a strike
+    /// chosen at 09:10 stayed chosen until the session ended.
+    ///
+    /// The instruments come back with the sender because a swap must name the
+    /// OLD one, and only the dial knows which connection got which. Deriving
+    /// it later from the selection would be guessing at the pool's packing.
+    out_depth_commands: Option<
+        &'a mut Vec<(
+            DhanEndpointType,
+            tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+            Vec<SubscribeInstrument>,
+        )>,
+    >,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -6777,6 +6806,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         depth_budget,
         ws_audit_tx,
         mut out_topups,
+        mut out_depth_commands,
     } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -6859,6 +6889,23 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                 Some(rx)
             }
             _ => None,
+        };
+        // Depth sockets get their OWN channel, and it stays open for the
+        // session rather than being consumed once. A top-up is a single event
+        // — the contract overflow — so its channel is depth 1 and its sender
+        // is dropped after. A swap channel must survive every minute of the
+        // day, so the sender is held by the re-selection task and the depth
+        // is 4: enough that a busy minute cannot block the sender, small
+        // enough that a wedged connection surfaces as a refused try_send the
+        // caller LOGS rather than as a queue that hides it.
+        let topup_rx = match (endpoint, topup_rx, out_depth_commands.as_deref_mut()) {
+            (DhanEndpointType::Depth20 | DhanEndpointType::Depth200, None, Some(depth_vec)) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
+                depth_vec.push((endpoint, tx, held));
+                Some(rx)
+            }
+            (_, existing, _) => existing,
         };
         tokio::spawn(async move {
             // Moved in, so the socket's lifetime and the guard's are the same
@@ -7572,6 +7619,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             depth_budget: &depth_budget,
             ws_audit_tx: Some(&ws_audit_tx),
             out_topups: Some(&mut main_feed_topups),
+            out_depth_commands: None,
         },
     );
 

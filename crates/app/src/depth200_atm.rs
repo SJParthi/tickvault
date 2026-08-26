@@ -42,6 +42,9 @@
 
 use std::collections::BTreeMap;
 
+use tickvault_common::types::ExchangeSegment;
+use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+
 /// Underlyings whose ATM CE/PE pairs occupy the depth-200 sockets.
 ///
 /// Ordered, and the order is load-bearing when only one pair can fit.
@@ -473,6 +476,105 @@ fn margin_paise(spacing_paise: i64, fraction: f64) -> i64 {
     }
 }
 
+/// One socket's worth of wire work: the instrument to drop and the one to
+/// take its place.
+///
+/// Deliberately expressed in the SUBSCRIBE layer's own type rather than in
+/// this module's `StrikePair`, so the caller hands it straight to
+/// `LiveSubscriptionCommand::Swap` with no re-derivation in between. A
+/// translation step there is a place for the old and new to disagree, and a
+/// swap whose halves disagree unsubscribes one contract and subscribes an
+/// unrelated one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedSwap {
+    /// Which of the four depth-200 sockets this is for, as an index into the
+    /// order the sockets were dialed.
+    pub socket_index: usize,
+    /// The contract to unsubscribe. Sent FIRST — a depth-200 connection holds
+    /// exactly one instrument, and subscribing before unsubscribing asks for
+    /// two, which Dhan answers with a Fatal 804.
+    pub old: SubscribeInstrument,
+    /// The contract to subscribe.
+    pub new: SubscribeInstrument,
+    /// Why, for the log line.
+    pub reason: SwitchReason,
+}
+
+/// Turns one minute's chain snapshot into the swaps the four depth-200
+/// sockets need, if any.
+///
+/// # The socket layout this assumes, and why it is checked rather than
+/// trusted
+///
+/// The four sockets are, in dial order: NIFTY call, NIFTY put, BANKNIFTY
+/// call, BANKNIFTY put. `held` must be that same order. A caller that got the
+/// order wrong would swap NIFTY's call onto BANKNIFTY's socket — a perfectly
+/// valid subscription to entirely the wrong contract, and nothing downstream
+/// could tell. So the OLD instrument in every swap is read from `held`, never
+/// assumed: if the socket does not hold what the tracker thinks it holds, the
+/// guard on the connection refuses the swap fail-closed and says so.
+///
+/// # Returns nothing on an ordinary minute
+///
+/// The tracker is edge-triggered, so a minute where neither at-the-money
+/// strike moved produces an empty vector and therefore zero wire traffic.
+/// That is the common case and it must stay free — ~1,500 needless messages a
+/// session across four sockets otherwise.
+///
+/// # Complexity
+///
+/// O(pairs) per tracked underlying — one pass to find the nearest strike.
+/// Two underlyings, once a minute, on the cold path.
+#[must_use]
+pub fn plan_swaps(
+    tracker: &mut Depth200AtmTracker,
+    minutes: &[ChainMinute<'_>],
+    held: &[SubscribeInstrument],
+    segment_for: impl Fn(&str) -> Option<ExchangeSegment>,
+) -> Vec<PlannedSwap> {
+    let mut out = Vec::new();
+    for minute in minutes {
+        let Ok(switch) = tracker.observe(minute) else {
+            continue;
+        };
+        let Some(segment) = segment_for(minute.underlying) else {
+            // An underlying whose contract segment we cannot name. Refused
+            // rather than guessed: subscribing depth on the wrong segment is
+            // a well-formed request that comes back as SILENCE, which is
+            // indistinguishable from a quiet book.
+            continue;
+        };
+        // Two sockets per underlying — call then put — in dial order.
+        let call_socket = switch.underlying_index.saturating_mul(2);
+        let put_socket = call_socket.saturating_add(1);
+        for (socket_index, new_id) in [
+            (call_socket, switch.to.ce_security_id),
+            (put_socket, switch.to.pe_security_id),
+        ] {
+            let Some(old) = held.get(socket_index).copied() else {
+                continue;
+            };
+            let Ok(new_security_id) = u64::try_from(new_id) else {
+                continue;
+            };
+            let new = SubscribeInstrument {
+                security_id: new_security_id,
+                segment,
+            };
+            if new == old {
+                continue;
+            }
+            out.push(PlannedSwap {
+                socket_index,
+                old,
+                new,
+                reason: switch.reason,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,5 +933,243 @@ mod tests {
         let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
         let sw = t.observe(&minute("NIFTY", 260_000.0, &big)).unwrap();
         assert_eq!(sw.reason, SwitchReason::FirstAdoption);
+    }
+    // ------------------------------------------------------------------
+    // plan_swaps — the bridge from a chain minute to wire work.
+    // ------------------------------------------------------------------
+
+    fn nse_fno(_u: &str) -> Option<ExchangeSegment> {
+        Some(ExchangeSegment::NseFno)
+    }
+
+    fn si(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+        }
+    }
+
+    /// The four sockets in dial order: NIFTY call, NIFTY put, BANKNIFTY call,
+    /// BANKNIFTY put. Getting this order wrong swaps NIFTY's call onto
+    /// BANKNIFTY's socket — a perfectly valid subscription to entirely the
+    /// wrong contract, which nothing downstream could tell.
+    #[test]
+    fn a_nifty_move_touches_the_nifty_sockets_and_not_the_banknifty_ones() {
+        let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
+        let pairs = vec![
+            StrikePair {
+                strike_paise: 24_000_00,
+                ce_security_id: 101,
+                pe_security_id: 102,
+            },
+            StrikePair {
+                strike_paise: 24_100_00,
+                ce_security_id: 111,
+                pe_security_id: 112,
+            },
+        ];
+        let held = vec![si(101), si(102), si(201), si(202)];
+
+        // First adoption at the lower strike.
+        let m0 = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_000.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, &[m0], &held, nse_fno);
+
+        // Move to the upper strike, twice, to clear the confirmation gate.
+        let m1 = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_100.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, std::slice::from_ref(&m1), &held, nse_fno);
+        let swaps = plan_swaps(&mut t, std::slice::from_ref(&m1), &held, nse_fno);
+
+        assert_eq!(swaps.len(), 2, "a NIFTY move must move both NIFTY legs");
+        let sockets: Vec<_> = swaps.iter().map(|s| s.socket_index).collect();
+        assert_eq!(sockets, vec![0, 1], "NIFTY owns sockets 0 and 1");
+        assert_eq!(swaps[0].new.security_id, 111, "call leg");
+        assert_eq!(swaps[1].new.security_id, 112, "put leg");
+    }
+
+    /// The ordinary minute. Edge-triggering upstream is what keeps this free,
+    /// and it must stay free: four sockets asked every minute for a whole
+    /// session is ~1,500 needless wire messages.
+    #[test]
+    fn an_unchanged_at_the_money_plans_no_wire_work_at_all() {
+        let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
+        let pairs = vec![StrikePair {
+            strike_paise: 24_000_00,
+            ce_security_id: 101,
+            pe_security_id: 102,
+        }];
+        let held = vec![si(101), si(102), si(201), si(202)];
+        let m = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_000.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, &[m], &held, nse_fno);
+        for _ in 0..100 {
+            let m = ChainMinute {
+                underlying: "NIFTY",
+                spot: 24_000.0,
+                pairs: &pairs,
+            };
+            assert!(plan_swaps(&mut t, &[m], &held, nse_fno).is_empty());
+        }
+    }
+
+    /// An underlying whose contract segment cannot be named is REFUSED, not
+    /// guessed. Depth on the wrong segment is a well-formed request that comes
+    /// back as silence — indistinguishable from a quiet book.
+    #[test]
+    fn an_unnameable_segment_plans_nothing_rather_than_guessing() {
+        let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
+        let pairs = vec![StrikePair {
+            strike_paise: 24_000_00,
+            ce_security_id: 101,
+            pe_security_id: 102,
+        }];
+        let held = vec![si(1), si(2), si(3), si(4)];
+        let m = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_000.0,
+            pairs: &pairs,
+        };
+        assert!(plan_swaps(&mut t, &[m], &held, |_| None).is_empty());
+    }
+
+    /// The OLD instrument is read from what the socket actually holds, never
+    /// from what the tracker believes. Fewer sockets than expected means the
+    /// dial gave depth less than planned, and planning a swap against a socket
+    /// that does not exist is how a wrong contract reaches a live connection.
+    #[test]
+    fn a_short_socket_list_plans_only_what_exists() {
+        let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
+        let pairs = vec![
+            StrikePair {
+                strike_paise: 24_000_00,
+                ce_security_id: 101,
+                pe_security_id: 102,
+            },
+            StrikePair {
+                strike_paise: 24_100_00,
+                ce_security_id: 111,
+                pe_security_id: 112,
+            },
+        ];
+        let held = vec![si(101)]; // only ONE socket came up
+        let m0 = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_000.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, &[m0], &held, nse_fno);
+        let m1 = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_100.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, std::slice::from_ref(&m1), &held, nse_fno);
+        let swaps = plan_swaps(&mut t, std::slice::from_ref(&m1), &held, nse_fno);
+        assert_eq!(swaps.len(), 1, "planned a swap for a socket that is not up");
+        assert_eq!(swaps[0].socket_index, 0);
+    }
+
+    /// A pair with an unusable contract id is refused WHOLE, so the sockets
+    /// keep the pair they have.
+    ///
+    /// I expected the bad leg to be dropped and the good one to switch — the
+    /// tracker is stricter than that, and it is right to be. Half a pair
+    /// answers no cross-leg question at all (parity, straddle spread, skew),
+    /// so a socket pair holding one current leg and one stale one is worse
+    /// than a pair holding two stale ones: it looks complete and is not.
+    #[test]
+    fn a_pair_with_a_bad_leg_is_refused_whole_and_the_sockets_keep_theirs() {
+        let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
+        let pairs = vec![
+            StrikePair {
+                strike_paise: 24_000_00,
+                ce_security_id: 101,
+                pe_security_id: 102,
+            },
+            StrikePair {
+                strike_paise: 24_100_00,
+                ce_security_id: -5,
+                pe_security_id: 112,
+            },
+        ];
+        let held = vec![si(101), si(102), si(201), si(202)];
+        let m0 = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_000.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, &[m0], &held, nse_fno);
+        let m1 = ChainMinute {
+            underlying: "NIFTY",
+            spot: 24_100.0,
+            pairs: &pairs,
+        };
+        let _ = plan_swaps(&mut t, std::slice::from_ref(&m1), &held, nse_fno);
+        let swaps = plan_swaps(&mut t, std::slice::from_ref(&m1), &held, nse_fno);
+        assert!(
+            swaps.is_empty(),
+            "a pair with an unusable leg must not move either socket — half a \
+             pair looks complete and answers no cross-leg question"
+        );
+    }
+
+    /// Both underlyings in one minute, independently.
+    #[test]
+    fn the_two_underlyings_plan_independently_in_one_pass() {
+        let mut t = Depth200AtmTracker::new(Depth200AtmConfig::default());
+        let n = vec![
+            StrikePair {
+                strike_paise: 24_000_00,
+                ce_security_id: 101,
+                pe_security_id: 102,
+            },
+            StrikePair {
+                strike_paise: 24_100_00,
+                ce_security_id: 111,
+                pe_security_id: 112,
+            },
+        ];
+        let b = vec![
+            StrikePair {
+                strike_paise: 57_000_00,
+                ce_security_id: 201,
+                pe_security_id: 202,
+            },
+            StrikePair {
+                strike_paise: 57_100_00,
+                ce_security_id: 211,
+                pe_security_id: 212,
+            },
+        ];
+        let held = vec![si(101), si(102), si(201), si(202)];
+        let at = |ns: f64, bs: f64| {
+            vec![
+                ChainMinute {
+                    underlying: "NIFTY",
+                    spot: ns,
+                    pairs: &n,
+                },
+                ChainMinute {
+                    underlying: "BANKNIFTY",
+                    spot: bs,
+                    pairs: &b,
+                },
+            ]
+        };
+        let _ = plan_swaps(&mut t, &at(24_000.0, 57_000.0), &held, nse_fno);
+        let _ = plan_swaps(&mut t, &at(24_100.0, 57_100.0), &held, nse_fno);
+        let swaps = plan_swaps(&mut t, &at(24_100.0, 57_100.0), &held, nse_fno);
+        let sockets: Vec<_> = swaps.iter().map(|s| s.socket_index).collect();
+        assert_eq!(sockets, vec![0, 1, 2, 3], "all four sockets move");
     }
 }
