@@ -810,6 +810,10 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // is the state that actually happened. See
                     // `WalLagTracker` for why the signal is growth rather
                     // than magnitude.
+                    // The GAUGE fires every poll (the number an operator asks for
+                    // mid-incident); the growth signal below fires only on a
+                    // sustained climb and so cannot answer "how far behind now".
+                    emit_wal_apply_lag_gauge(&rows);
                     emit_wal_lag(&lag_tracker.observe(&rows));
                     // Attempt recovery, CONDITIONALLY. The module header
                     // above says a resume is an operator decision because it
@@ -1044,8 +1048,104 @@ pub fn spawn_supervised_wal_suspension_watcher(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The worst apply lag across every table in one poll's view. Pure, so the
+/// arithmetic is testable without a metrics recorder.
+///
+/// Rows missing either diagnostic column contribute NOTHING — the columns are
+/// `Option` by design (the probe tolerates a QuestDB that omits them), and a
+/// missing column must never read as an enormous lag. A `writerTxn` somehow
+/// ahead of the sequencer saturates to zero rather than wrapping.
+fn max_apply_lag(rows: &[WalTableRow]) -> i64 {
+    let mut max_lag: i64 = 0;
+    for row in rows {
+        if let (Some(seq), Some(writer)) = (row.sequencer_txn, row.writer_txn) {
+            max_lag = max_lag.max(seq.saturating_sub(writer).max(0));
+        }
+    }
+    max_lag
+}
+
+/// Publish the CURRENT apply lag as a gauge, every poll, unconditionally.
+///
+/// WHY THIS EXISTS — 2026-08-26, live incident. `market_depth` reached
+/// **48,454 transactions behind** and stayed there ~95 minutes: rows accepted
+/// and ACKed by ILP, written to the WAL, and never becoming queryable.
+/// `max(ts)` froze at 11:44:46 while the depth sockets stayed connected and
+/// Dhan kept acking subscriptions. Every dashboard read green, because the
+/// only WAL signal reaching CloudWatch is `tv_questdb_wal_suspended_tables`
+/// and `suspended` was FALSE throughout. The cliff was watched; the slope was
+/// not.
+///
+/// `emit_wal_lag` DID detect it and DID page, but ~85 minutes after the
+/// freeze: its condition is five CONSECUTIVE polls of non-decreasing lag, and
+/// a real backlog oscillates — one poll where apply gains a little resets the
+/// counter to zero. That signal is still worth having; it separates "busy"
+/// from "losing ground". What it cannot answer is "how far behind are we RIGHT
+/// NOW", which is the question an operator actually asks, and which no chart
+/// could answer because the number was never published.
+///
+/// O(1) per poll and no added cardinality: ONE gauge carrying the maximum
+/// across all tables, not a series per table. At ~41 tables a per-table gauge
+/// would be 41 CloudWatch series for a number whose only operative value is
+/// the worst one.
+// TEST-EXEMPT: one metric side effect over the fully-tested `max_apply_lag`.
+fn emit_wal_apply_lag_gauge(rows: &[WalTableRow]) {
+    // APPROVED: cast — a txn lag is bounded by the sequencer counter and is
+    // rendered for a gauge; f64 carries every i64 an operator will ever see.
+    metrics::gauge!("tv_questdb_wal_apply_lag_max").set(max_apply_lag(rows) as f64);
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The gauge must report the WORST table, every poll, whatever the growth
+    /// detector is doing. This is the number the operator asks for during an
+    /// incident ("how far behind are we RIGHT NOW"), and on 2026-08-26 there
+    /// was no way to answer it: `market_depth` sat 48,454 transactions behind
+    /// for ~95 minutes with `suspended = false` and every dashboard green.
+    #[test]
+    fn the_lag_gauge_reports_the_worst_table_not_the_first() {
+        // Shape taken from the live box at 13:31 IST on 2026-08-26.
+        let rows = vec![
+            lag_row("ticks", 60_714, 60_051),         // 663 behind — healthy
+            lag_row("market_depth", 115_503, 67_049), // 48,454 behind
+            lag_row("candles_1m", 1_000, 1_000),      // level
+        ];
+        assert_eq!(
+            max_apply_lag(&rows),
+            48_454,
+            "the gauge must carry the WORST lag"
+        );
+    }
+
+    /// A row missing either diagnostic column contributes nothing rather than
+    /// poisoning the maximum. The columns are `Option` by design — the probe
+    /// tolerates a QuestDB that does not return them — and a missing column
+    /// must never read as an enormous lag.
+    #[test]
+    fn a_row_without_txn_columns_cannot_inflate_the_gauge() {
+        let mut partial = lag_row("mystery", 0, 0);
+        partial.sequencer_txn = None;
+        partial.writer_txn = None;
+        let rows = vec![partial, lag_row("ticks", 5_000, 4_000)];
+        assert_eq!(max_apply_lag(&rows), 1_000);
+    }
+
+    /// An empty or fully-healthy view reports zero, not a stale previous
+    /// value — the gauge is recomputed from the rows on every poll.
+    #[test]
+    fn a_healthy_view_reports_zero_lag() {
+        assert_eq!(max_apply_lag(&[]), 0);
+        assert_eq!(max_apply_lag(&[lag_row("ticks", 42, 42)]), 0);
+    }
+
+    /// writerTxn ahead of sequencerTxn is nonsense QuestDB should never
+    /// produce, but if it does the gauge must saturate at zero rather than
+    /// wrap into a huge positive via an underflow.
+    #[test]
+    fn a_negative_lag_saturates_to_zero_rather_than_wrapping() {
+        assert_eq!(max_apply_lag(&[lag_row("odd", 100, 500)]), 0);
+    }
     use super::*;
     use serde_json::json;
 
