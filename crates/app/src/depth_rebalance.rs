@@ -1,0 +1,884 @@
+//! What the per-minute depth rebalance READS — the source layer between the
+//! database and the two swap engines.
+//!
+//! # Why this module exists (2026-08-26)
+//!
+//! Three pieces of the minute-by-minute depth rebalance already exist and are
+//! tested: the at-the-money tracker and its planner ([`crate::depth200_atm`]),
+//! the top-mover socket, and the gainer/loser ranking ([`crate::movers`]).
+//! Every one of them is a PURE function over data it is handed.
+//!
+//! Nothing handed them anything. They were, in the honest phrase, inert — not
+//! broken, just never fed. This module is the feeding.
+//!
+//! # The two sources, and why only one needs new SQL
+//!
+//! | Engine needs | Comes from | New query? |
+//! |---|---|---|
+//! | Index chain snapshot (spot + CE/PE per strike) | the `DepthCandidate` slice the attach already builds every retry | **no** |
+//! | Today's stock moves, ranked | `candles_1m.close_pct_from_prev_day` joined to the lifecycle master for the symbol | **yes** |
+//!
+//! Reusing `DepthCandidate` for the chain half is not a shortcut. It is the
+//! same slice `select_depth_universe` consumes, so the strikes the rebalance
+//! reasons about are *by construction* the strikes the attach would have
+//! chosen. A second query for the same facts could drift from the first, and a
+//! drift here moves a socket onto a contract the selector never considered.
+//!
+//! # The percentage this ranks on
+//!
+//! `close_pct_from_prev_day` — the move against YESTERDAY'S CLOSE. That is the
+//! column the operator confirmed on 2026-08-26 when he corrected the labelling,
+//! and [`crate::movers`] records at length why the other column produces a
+//! plausible, completely different list. This module's query names that column
+//! and no other.
+//!
+//! # This module is pure
+//!
+//! It builds query strings and parses response bodies. It opens no socket and
+//! holds no state, so every edge below is a unit test rather than a live
+//! surprise.
+
+use std::collections::HashMap;
+
+use tickvault_common::types::ExchangeSegment;
+
+use crate::depth200_atm::{ChainMinute, StrikePair, TopMoverPick};
+use crate::dhan_depth_universe::DepthCandidate;
+use crate::movers::StockMove;
+
+/// The segment a STOCK option trades in.
+///
+/// Not derived per row, and that is deliberate. [`crate::dhan_depth_universe::contract_segment_for_underlying`]
+/// is fail-closed and INDEX-only by design — it refuses `RELIANCE` rather than
+/// guessing, and widening it would blunt the refusal that makes it useful.
+///
+/// For stocks the answer is a property of this system's scope rather than of
+/// the row: the spot universe is NSE-only by construction (the 2026-08-22
+/// narrowing to NSE indices + Nifty Total Market, with BSE excluded and two
+/// tests pinning it), so every F&O stock reachable here trades its options in
+/// `NSE_FNO`. It is also the only stock-option segment that CAN carry a depth
+/// book — `segment_supports_depth` is true for `NSE_FNO` and false for
+/// `BSE_FNO`, because Dhan serves depth on NSE only.
+pub const STOCK_OPTION_SEGMENT: ExchangeSegment = ExchangeSegment::NseFno;
+
+/// The segment the movers query reads.
+///
+/// Pinned in the SQL *and* asserted here rather than parsed back out of the
+/// response. One place to drift is better than two, and a mis-parsed segment
+/// would produce a well-formed ranking of the wrong instruments — id 13 is
+/// NIFTY in `IDX_I` and an unrelated cash stock near ₹7,600 in `NSE_EQ`.
+pub const MOVER_UNDERLYING_SEGMENT: ExchangeSegment = ExchangeSegment::NseEquity;
+
+/// One stock's move, with the symbol kept alongside it.
+///
+/// [`StockMove`] carries only the numeric identity, which is all the ranking
+/// needs. The symbol is what joins a winner back to its option ladder — the
+/// contract rows key on the underlying's SYMBOL, not its id — so it is carried
+/// here and dropped at the ranking boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoverRow {
+    /// Dhan `SecurityId` of the underlying stock.
+    pub security_id: u64,
+    /// Always [`MOVER_UNDERLYING_SEGMENT`]; see that constant.
+    pub segment: ExchangeSegment,
+    /// The stock's trading symbol, as the lifecycle master spells it.
+    pub symbol: String,
+    /// `close_pct_from_prev_day` — the move against yesterday's close.
+    pub pct_change: f64,
+}
+
+impl MoverRow {
+    /// The identity-only view the ranking consumes.
+    #[must_use]
+    pub const fn to_move(&self) -> StockMove {
+        StockMove {
+            security_id: self.security_id,
+            segment: self.segment,
+            pct_change: self.pct_change,
+        }
+    }
+}
+
+/// One underlying's chain view, owning its strikes.
+///
+/// [`ChainMinute`] borrows its pairs so the tracker can read a slice without
+/// copying. Something has to own that slice for the duration of a minute, and
+/// this is it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedChainMinute {
+    /// Canonical underlying symbol.
+    pub underlying: String,
+    /// Underlying spot at this snapshot.
+    pub spot: f64,
+    /// Every strike carrying BOTH legs, ascending.
+    pub pairs: Vec<StrikePair>,
+}
+
+impl OwnedChainMinute {
+    /// The borrowed view the tracker takes.
+    #[must_use]
+    pub fn as_minute(&self) -> ChainMinute<'_> {
+        ChainMinute {
+            underlying: &self.underlying,
+            spot: self.spot,
+            pairs: &self.pairs,
+        }
+    }
+}
+
+/// Strike in paise from a rupee `f64`, or `None` if it cannot be one.
+///
+/// Paise because the tracker compares strikes for EQUALITY, and two chain rows
+/// for one strike must never fail to group through float drift. Rounding
+/// rather than truncating: a strike arriving as `24499.999999` is 24500, and
+/// truncation would file it one paise low and split the pair.
+fn strike_paise(strike: f64) -> Option<i64> {
+    if !strike.is_finite() || strike <= 0.0 {
+        return None;
+    }
+    let paise = (strike * 100.0).round();
+    // Far outside any real strike, but a NaN-free finite check is not enough
+    // on its own: an absurd value would cast to a saturated i64 and compare
+    // equal to another absurd value, silently pairing two different strikes.
+    if paise > 9_000_000_000_000.0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded above by the check on the line above and below by the > 0.0 guard"
+    )]
+    Some(paise as i64)
+}
+
+/// Groups a candidate slice into per-underlying chain views.
+///
+/// # What is dropped, and why each is dropped rather than guessed
+///
+/// - **A strike with only one leg.** The tracker subscribes a CALL socket and
+///   a PUT socket per underlying; a strike that can fill only one of them
+///   would move one socket and strand the other on a different strike, so the
+///   two sockets would no longer be reading the same book.
+/// - **A non-positive or non-finite strike or spot.** There is no nearest
+///   strike to a spot that is not a number.
+/// - **A contract id of zero or below.** Subscribing instrument 0 is a
+///   well-formed request that returns nothing forever and looks healthy.
+///
+/// Everything dropped is dropped SILENTLY at this layer and counted by the
+/// caller against the totals it already has: this function's contract is
+/// "usable pairs only", and a caller that gets fewer underlyings than it
+/// expects knows immediately.
+///
+/// # Complexity
+///
+/// O(candidates) to bucket, then O(k log k) per underlying to order strikes —
+/// cold path, once a minute, over the few hundred rows of an index chain.
+#[must_use]
+pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<OwnedChainMinute> {
+    // (underlying, strike_paise) -> (ce, pe, spot)
+    let mut by_strike: HashMap<(&str, i64), (Option<i64>, Option<i64>, f64)> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for c in candidates {
+        if !c.is_index_option {
+            continue;
+        }
+        let Some(paise) = strike_paise(c.strike) else {
+            continue;
+        };
+        if !c.spot.is_finite() || c.spot <= 0.0 || c.contract_security_id <= 0 {
+            continue;
+        }
+        if !order.contains(&c.underlying.as_str()) {
+            order.push(&c.underlying);
+        }
+        let slot = by_strike
+            .entry((&c.underlying, paise))
+            .or_insert((None, None, c.spot));
+        match c.leg.as_str() {
+            "CE" => slot.0 = Some(c.contract_security_id),
+            "PE" => slot.1 = Some(c.contract_security_id),
+            // An unrecognised leg. Not a future — those carry no strike and
+            // were filtered upstream — so this is a row we cannot place, and
+            // placing it on a guess would subscribe the wrong side.
+            _ => {}
+        }
+        // Latest spot wins for the underlying. Every row of one underlying
+        // carries the same snapshot spot, so this is a copy, not a choice.
+        slot.2 = c.spot;
+    }
+
+    let mut out = Vec::with_capacity(order.len());
+    for underlying in order {
+        let mut pairs: Vec<StrikePair> = Vec::new();
+        let mut spot = f64::NAN;
+        for ((u, paise), (ce, pe, s)) in &by_strike {
+            if *u != underlying {
+                continue;
+            }
+            let (Some(ce), Some(pe)) = (*ce, *pe) else {
+                continue;
+            };
+            spot = *s;
+            pairs.push(StrikePair {
+                strike_paise: *paise,
+                ce_security_id: ce,
+                pe_security_id: pe,
+            });
+        }
+        if pairs.is_empty() || !spot.is_finite() {
+            continue;
+        }
+        pairs.sort_unstable_by_key(|p| p.strike_paise);
+        out.push(OwnedChainMinute {
+            underlying: underlying.to_owned(),
+            spot,
+            pairs,
+        });
+    }
+    out
+}
+
+/// The at-the-money pair for one underlying, from the same candidate slice.
+///
+/// Nearest strike by absolute distance from spot, ties going to the LOWER
+/// strike — a deterministic rule, so an exact midpoint does not flip the socket
+/// between two strikes on alternating minutes.
+///
+/// # Complexity
+///
+/// O(candidates). Called once a minute for one stock.
+#[must_use]
+pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<StrikePair> {
+    let mut pairs: HashMap<i64, (Option<i64>, Option<i64>)> = HashMap::new();
+    let mut spot = f64::NAN;
+    for c in candidates {
+        if c.underlying != underlying {
+            continue;
+        }
+        let Some(paise) = strike_paise(c.strike) else {
+            continue;
+        };
+        if c.contract_security_id <= 0 {
+            continue;
+        }
+        if c.spot.is_finite() && c.spot > 0.0 {
+            spot = c.spot;
+        }
+        let slot = pairs.entry(paise).or_insert((None, None));
+        match c.leg.as_str() {
+            "CE" => slot.0 = Some(c.contract_security_id),
+            "PE" => slot.1 = Some(c.contract_security_id),
+            _ => {}
+        }
+    }
+    if !spot.is_finite() {
+        return None;
+    }
+    let spot_paise = strike_paise(spot)?;
+    let mut best: Option<StrikePair> = None;
+    let mut best_distance = i64::MAX;
+    // Deterministic order, because a `HashMap` iteration is not. Without this
+    // an exact tie would resolve differently run to run, and the socket would
+    // move on a distinction that is not in the data.
+    let mut strikes: Vec<i64> = pairs.keys().copied().collect();
+    strikes.sort_unstable();
+    for paise in strikes {
+        let (Some(ce), Some(pe)) = pairs[&paise] else {
+            continue;
+        };
+        let distance = (paise - spot_paise).abs();
+        if distance < best_distance {
+            best_distance = distance;
+            best = Some(StrikePair {
+                strike_paise: paise,
+                ce_security_id: ce,
+                pe_security_id: pe,
+            });
+        }
+    }
+    best
+}
+
+/// The day's leading mover, resolved to the contracts its at-the-money strike
+/// would subscribe.
+///
+/// # What "leading" means here
+///
+/// The largest move by ABSOLUTE size, in either direction. A stock down 9%
+/// leads a stock up 8%: both have a deep book, and the fifth socket's job is
+/// to watch the one the market is most interested in, not the one that happens
+/// to be rising.
+///
+/// # Every refusal returns `None`, and none of them is a failure
+///
+/// A non-finite move, an exactly-flat move, a stock whose ladder is not in the
+/// candidate slice, or a ladder with no complete at-the-money pair — each
+/// returns `None`, and [`crate::depth200_atm::TopMoverSocket::observe`] treats
+/// that as "keep what you have". A stale deep book beats an empty one, and
+/// unsubscribing spends a wire call to end up with less.
+///
+/// # Complexity
+///
+/// O(rows) to find the leader, then O(candidates) to resolve its pair.
+#[must_use]
+pub fn top_mover_pick(rows: &[MoverRow], candidates: &[DepthCandidate]) -> Option<TopMoverPick> {
+    let mut leader: Option<&MoverRow> = None;
+    for row in rows {
+        if !row.pct_change.is_finite() || row.pct_change == 0.0 {
+            continue;
+        }
+        let better = match leader {
+            None => true,
+            Some(best) => row.pct_change.abs() > best.pct_change.abs(),
+        };
+        if better {
+            leader = Some(row);
+        }
+    }
+    let leader = leader?;
+    let pair = atm_pair_for(candidates, &leader.symbol)?;
+    Some(TopMoverPick {
+        underlying_security_id: leader.security_id,
+        contract_segment: STOCK_OPTION_SEGMENT,
+        pct_change: leader.pct_change,
+        atm_ce_security_id: pair.ce_security_id,
+        atm_pe_security_id: pair.pe_security_id,
+    })
+}
+
+/// The per-minute movers query.
+///
+/// # Why `LATEST ON` and not `max(ts)`
+///
+/// The rebalance runs a few seconds after a minute seals, and not every stock
+/// seals every minute — a thin F&O stock can go minutes without a trade, so
+/// its newest candle is older than the newest candle in the table. Anchoring
+/// on a single minute would silently drop exactly the illiquid names whose
+/// depth is most worth reading. `LATEST ON ts PARTITION BY` gives each stock
+/// its own newest row.
+///
+/// # Why the day bound is not optional
+///
+/// Without `ts >= today` the same `LATEST ON` returns the newest row per stock
+/// from ANY day, so a pre-open caller gets YESTERDAY'S ranking — plausible,
+/// completely stale, and indistinguishable from a real one. This is the same
+/// bound, for the same reason, that
+/// [`crate::dhan_depth_universe::build_depth_candidate_query`] carries.
+///
+/// # Why the join
+///
+/// The ranking needs only the id, but resolving a winner to its option ladder
+/// needs the SYMBOL: contract rows key on the underlying's symbol, not its id.
+/// A LEFT join would return rows with a null symbol that could rank but never
+/// resolve, so this is an inner join — a stock the master cannot name is a
+/// stock this socket cannot subscribe, and it is better absent from the
+/// ranking than present and unusable.
+#[must_use]
+pub fn build_movers_query(today_ist_micros: i64) -> String {
+    let segment = MOVER_UNDERLYING_SEGMENT.as_str();
+    format!(
+        "SELECT c.security_id, il.symbol_name, c.close_pct_from_prev_day \
+         FROM (SELECT security_id, close_pct_from_prev_day FROM candles_1m \
+         WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {today_ist_micros} \
+         LATEST ON ts PARTITION BY security_id) c \
+         JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle \
+         WHERE feed = 'dhan' AND exchange_segment = '{segment}') il \
+         ON c.security_id = il.security_id;"
+    )
+}
+
+/// Parse the `/exec` dataset into mover rows.
+///
+/// Fail-LOUD on a malformed body or a missing `dataset` key, fail-soft per row
+/// — the house pattern. The distinction matters: an empty `Vec` returned for
+/// garbage is indistinguishable from a genuinely flat market, and the caller's
+/// response to those two is different. A flat market keeps the sockets where
+/// they are; a broken query needs saying out loud.
+///
+/// # Errors
+///
+/// Returns `Err` when the body is not JSON or carries no `dataset` array.
+pub fn parse_movers_dataset(body: &str) -> Result<Vec<MoverRow>, String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Err("malformed /exec response: not valid JSON".to_owned());
+    };
+    let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
+        return Err("malformed /exec response: missing dataset array".to_owned());
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(cols) = row.as_array() else { continue };
+        if cols.len() < 3 {
+            continue;
+        }
+        let Some(security_id) = cols[0].as_u64() else {
+            continue;
+        };
+        if security_id == 0 {
+            continue;
+        }
+        let symbol = cols[1].as_str().unwrap_or_default();
+        if symbol.is_empty() {
+            continue;
+        }
+        let Some(pct_change) = cols[2].as_f64() else {
+            continue;
+        };
+        if !pct_change.is_finite() {
+            continue;
+        }
+        out.push(MoverRow {
+            security_id,
+            segment: MOVER_UNDERLYING_SEGMENT,
+            symbol: symbol.to_owned(),
+            pct_change,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(underlying: &str, strike: f64, leg: &str, id: i64, spot: f64) -> DepthCandidate {
+        DepthCandidate {
+            underlying: underlying.to_owned(),
+            contract_security_id: id,
+            expiry_micros: 1_900_000_000_000_000,
+            strike,
+            spot,
+            leg: leg.to_owned(),
+            is_index_option: underlying == "NIFTY" || underlying == "BANKNIFTY",
+        }
+    }
+
+    fn mover(id: u64, symbol: &str, pct: f64) -> MoverRow {
+        MoverRow {
+            security_id: id,
+            segment: MOVER_UNDERLYING_SEGMENT,
+            symbol: symbol.to_owned(),
+            pct_change: pct,
+        }
+    }
+
+    // ---- strike_paise ----
+
+    #[test]
+    fn a_strike_becomes_exact_paise() {
+        assert_eq!(strike_paise(24_500.0), Some(2_450_000));
+        assert_eq!(strike_paise(24_500.5), Some(2_450_050));
+    }
+
+    #[test]
+    fn a_strike_a_hair_under_rounds_up_rather_than_splitting_the_pair() {
+        // The whole reason paise exist here. Truncation would file this one
+        // paise low, and the CE at 24499.999999 would never meet the PE at
+        // 24500.0 — two legs of one strike, silently unpaired.
+        assert_eq!(strike_paise(24_499.999_999), strike_paise(24_500.0));
+    }
+
+    #[test]
+    fn a_strike_that_is_not_a_number_is_refused() {
+        assert_eq!(strike_paise(f64::NAN), None);
+        assert_eq!(strike_paise(f64::INFINITY), None);
+        assert_eq!(strike_paise(0.0), None);
+        assert_eq!(strike_paise(-100.0), None);
+    }
+
+    #[test]
+    fn an_absurd_strike_is_refused_rather_than_saturated() {
+        // Two absurd values both saturate to i64::MAX and would compare EQUAL,
+        // pairing a call at 1e30 with a put at 2e30 as one strike.
+        assert_eq!(strike_paise(1e30), None);
+        assert_eq!(strike_paise(2e30), None);
+    }
+
+    // ---- chain_minutes_from_candidates ----
+
+    #[test]
+    fn both_legs_of_a_strike_become_one_pair() {
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_500.0, "CE", 101, 24_480.0),
+            candidate("NIFTY", 24_500.0, "PE", 102, 24_480.0),
+        ]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].underlying, "NIFTY");
+        assert!((got[0].spot - 24_480.0).abs() < f64::EPSILON);
+        assert_eq!(got[0].pairs.len(), 1);
+        assert_eq!(got[0].pairs[0].ce_security_id, 101);
+        assert_eq!(got[0].pairs[0].pe_security_id, 102);
+    }
+
+    #[test]
+    fn a_strike_with_one_leg_is_dropped_whole() {
+        // Not "subscribe the call and leave the put where it was" — the two
+        // sockets would then be reading different strikes of the same
+        // underlying, which is worse than not moving at all.
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_500.0, "CE", 101, 24_480.0),
+            candidate("NIFTY", 24_600.0, "CE", 103, 24_480.0),
+            candidate("NIFTY", 24_600.0, "PE", 104, 24_480.0),
+        ]);
+        assert_eq!(got[0].pairs.len(), 1);
+        assert_eq!(got[0].pairs[0].strike_paise, 2_460_000);
+    }
+
+    #[test]
+    fn pairs_come_back_in_ascending_strike_order() {
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_600.0, "CE", 103, 24_480.0),
+            candidate("NIFTY", 24_600.0, "PE", 104, 24_480.0),
+            candidate("NIFTY", 24_400.0, "CE", 105, 24_480.0),
+            candidate("NIFTY", 24_400.0, "PE", 106, 24_480.0),
+            candidate("NIFTY", 24_500.0, "CE", 101, 24_480.0),
+            candidate("NIFTY", 24_500.0, "PE", 102, 24_480.0),
+        ]);
+        let strikes: Vec<i64> = got[0].pairs.iter().map(|p| p.strike_paise).collect();
+        assert_eq!(strikes, vec![2_440_000, 2_450_000, 2_460_000]);
+    }
+
+    #[test]
+    fn two_underlyings_stay_separate() {
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_500.0, "CE", 101, 24_480.0),
+            candidate("NIFTY", 24_500.0, "PE", 102, 24_480.0),
+            candidate("BANKNIFTY", 54_000.0, "CE", 201, 53_950.0),
+            candidate("BANKNIFTY", 54_000.0, "PE", 202, 53_950.0),
+        ]);
+        assert_eq!(got.len(), 2);
+        let nifty = got.iter().find(|m| m.underlying == "NIFTY").expect("nifty");
+        let bank = got
+            .iter()
+            .find(|m| m.underlying == "BANKNIFTY")
+            .expect("banknifty");
+        assert_eq!(nifty.pairs[0].ce_security_id, 101);
+        assert_eq!(bank.pairs[0].ce_security_id, 201);
+        assert!((bank.spot - 53_950.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_stock_option_never_reaches_the_index_chain() {
+        // The index tracker's four sockets are NIFTY and BANKNIFTY by
+        // operator lock. A stock leaking in would take one.
+        let mut stock = candidate("RELIANCE", 3_000.0, "CE", 301, 2_990.0);
+        stock.is_index_option = false;
+        let mut stock_pe = candidate("RELIANCE", 3_000.0, "PE", 302, 2_990.0);
+        stock_pe.is_index_option = false;
+        let got = chain_minutes_from_candidates(&[stock, stock_pe]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_zero_contract_id_is_refused_rather_than_subscribed() {
+        // Instrument 0 is a perfectly well-formed subscription that returns
+        // nothing forever and looks completely healthy.
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_500.0, "CE", 0, 24_480.0),
+            candidate("NIFTY", 24_500.0, "PE", 102, 24_480.0),
+        ]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_spot_that_is_not_a_number_drops_the_underlying() {
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_500.0, "CE", 101, f64::NAN),
+            candidate("NIFTY", 24_500.0, "PE", 102, f64::NAN),
+        ]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn an_unrecognised_leg_does_not_fill_either_side() {
+        let got = chain_minutes_from_candidates(&[
+            candidate("NIFTY", 24_500.0, "XX", 101, 24_480.0),
+            candidate("NIFTY", 24_500.0, "PE", 102, 24_480.0),
+        ]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn an_empty_slice_is_an_empty_result_not_a_panic() {
+        assert!(chain_minutes_from_candidates(&[]).is_empty());
+    }
+
+    // ---- atm_pair_for ----
+
+    #[test]
+    fn the_nearest_strike_to_spot_wins() {
+        let rows = vec![
+            candidate("RELIANCE", 2_900.0, "CE", 1, 2_988.0),
+            candidate("RELIANCE", 2_900.0, "PE", 2, 2_988.0),
+            candidate("RELIANCE", 3_000.0, "CE", 3, 2_988.0),
+            candidate("RELIANCE", 3_000.0, "PE", 4, 2_988.0),
+        ];
+        let got = atm_pair_for(&rows, "RELIANCE").expect("a pair");
+        assert_eq!(got.strike_paise, 300_000);
+        assert_eq!(got.ce_security_id, 3);
+        assert_eq!(got.pe_security_id, 4);
+    }
+
+    #[test]
+    fn an_exact_midpoint_resolves_the_same_way_every_time() {
+        // Spot exactly between two strikes. Without the deterministic order
+        // the `HashMap` iteration decides, and the socket flips between two
+        // strikes on alternating minutes over a distinction not in the data.
+        let rows = vec![
+            candidate("RELIANCE", 2_900.0, "CE", 1, 2_950.0),
+            candidate("RELIANCE", 2_900.0, "PE", 2, 2_950.0),
+            candidate("RELIANCE", 3_000.0, "CE", 3, 2_950.0),
+            candidate("RELIANCE", 3_000.0, "PE", 4, 2_950.0),
+        ];
+        let first = atm_pair_for(&rows, "RELIANCE").expect("a pair");
+        for _ in 0..50 {
+            assert_eq!(atm_pair_for(&rows, "RELIANCE"), Some(first));
+        }
+        // And it is the LOWER strike, as documented.
+        assert_eq!(first.strike_paise, 290_000);
+    }
+
+    #[test]
+    fn a_ladder_with_no_complete_pair_yields_nothing() {
+        let rows = vec![
+            candidate("RELIANCE", 2_900.0, "CE", 1, 2_988.0),
+            candidate("RELIANCE", 3_000.0, "CE", 3, 2_988.0),
+        ];
+        assert_eq!(atm_pair_for(&rows, "RELIANCE"), None);
+    }
+
+    #[test]
+    fn an_underlying_absent_from_the_slice_yields_nothing() {
+        let rows = vec![candidate("NIFTY", 24_500.0, "CE", 101, 24_480.0)];
+        assert_eq!(atm_pair_for(&rows, "RELIANCE"), None);
+    }
+
+    #[test]
+    fn a_ladder_with_no_usable_spot_yields_nothing() {
+        let rows = vec![
+            candidate("RELIANCE", 2_900.0, "CE", 1, 0.0),
+            candidate("RELIANCE", 2_900.0, "PE", 2, 0.0),
+        ];
+        assert_eq!(atm_pair_for(&rows, "RELIANCE"), None);
+    }
+
+    // ---- top_mover_pick ----
+
+    #[test]
+    fn the_biggest_absolute_move_leads_in_either_direction() {
+        let rows = vec![mover(10, "ALPHA", 8.0), mover(20, "BETA", -9.0)];
+        let candidates = vec![
+            candidate("BETA", 100.0, "CE", 501, 99.0),
+            candidate("BETA", 100.0, "PE", 502, 99.0),
+        ];
+        let got = top_mover_pick(&rows, &candidates).expect("a pick");
+        assert_eq!(got.underlying_security_id, 20);
+        assert!((got.pct_change + 9.0).abs() < f64::EPSILON);
+        // A faller carries the PUT — the side with the order flow.
+        assert_eq!(got.leg_security_id(), 502);
+    }
+
+    #[test]
+    fn a_riser_carries_the_call() {
+        let rows = vec![mover(10, "ALPHA", 8.21)];
+        let candidates = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+        ];
+        let got = top_mover_pick(&rows, &candidates).expect("a pick");
+        assert_eq!(got.leg_security_id(), 601);
+        assert_eq!(got.contract_segment, ExchangeSegment::NseFno);
+    }
+
+    #[test]
+    fn a_leader_with_no_ladder_leaves_the_socket_alone() {
+        // Refusing is safe; switching on a stock whose contracts we cannot
+        // name is not.
+        let rows = vec![mover(10, "ALPHA", 8.0)];
+        let candidates = vec![
+            candidate("BETA", 100.0, "CE", 501, 99.0),
+            candidate("BETA", 100.0, "PE", 502, 99.0),
+        ];
+        assert_eq!(top_mover_pick(&rows, &candidates), None);
+    }
+
+    #[test]
+    fn a_flat_or_unmeasurable_move_never_leads() {
+        let candidates = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+        ];
+        let rows = vec![
+            mover(10, "ALPHA", 0.0),
+            mover(11, "ALPHA", f64::NAN),
+            mover(12, "ALPHA", f64::INFINITY),
+        ];
+        assert_eq!(top_mover_pick(&rows, &candidates), None);
+    }
+
+    #[test]
+    fn a_flat_leader_does_not_block_a_real_one_behind_it() {
+        let rows = vec![mover(10, "ALPHA", 0.0), mover(20, "BETA", -3.0)];
+        let candidates = vec![
+            candidate("BETA", 100.0, "CE", 501, 99.0),
+            candidate("BETA", 100.0, "PE", 502, 99.0),
+        ];
+        let got = top_mover_pick(&rows, &candidates).expect("a pick");
+        assert_eq!(got.underlying_security_id, 20);
+    }
+
+    #[test]
+    fn an_empty_ranking_yields_nothing() {
+        assert_eq!(top_mover_pick(&[], &[]), None);
+    }
+
+    #[test]
+    fn a_tie_on_absolute_size_keeps_the_first_seen() {
+        // Strictly-greater, not greater-or-equal: an exact tie must not shuffle
+        // the socket every minute between two names that never separate.
+        let rows = vec![mover(10, "ALPHA", 5.0), mover(20, "BETA", -5.0)];
+        let candidates = vec![
+            candidate("ALPHA", 100.0, "CE", 601, 99.0),
+            candidate("ALPHA", 100.0, "PE", 602, 99.0),
+        ];
+        let got = top_mover_pick(&rows, &candidates).expect("a pick");
+        assert_eq!(got.underlying_security_id, 10);
+    }
+
+    // ---- build_movers_query ----
+
+    #[test]
+    fn the_movers_query_ranks_on_the_previous_day_column() {
+        let sql = build_movers_query(1_900_000_000_000_000);
+        assert!(
+            sql.contains("close_pct_from_prev_day"),
+            "the operator's percentage change is against yesterday's close"
+        );
+        assert!(
+            !sql.contains("open_pct"),
+            "open_pct is the PRE-OPEN percentage — a plausible, completely \
+             different ranking: {sql}"
+        );
+    }
+
+    #[test]
+    fn the_movers_query_is_bounded_to_today() {
+        // Without this the same LATEST ON returns yesterday's ranking, which
+        // is indistinguishable from a real one.
+        let sql = build_movers_query(1_900_000_000_000_000);
+        assert!(sql.contains("ts >= 1900000000000000"), "{sql}");
+        assert!(
+            sql.contains("LATEST ON ts PARTITION BY security_id"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn the_movers_query_reads_cash_equities_not_indices() {
+        let sql = build_movers_query(1);
+        assert!(sql.contains("'NSE_EQ'"), "{sql}");
+        assert!(!sql.contains("IDX_I"), "{sql}");
+    }
+
+    #[test]
+    fn the_movers_query_inner_joins_so_an_unnamed_stock_never_ranks() {
+        let sql = build_movers_query(1);
+        assert!(
+            !sql.to_ascii_uppercase().contains("LEFT JOIN"),
+            "a LEFT join returns rows that can rank but never resolve: {sql}"
+        );
+        assert!(sql.contains("instrument_lifecycle"), "{sql}");
+    }
+
+    // ---- parse_movers_dataset ----
+
+    #[test]
+    fn a_well_formed_dataset_parses() {
+        let body = r#"{"dataset":[[2885,"RELIANCE",8.21],[1594,"INFY",-5.93]]}"#;
+        let got = parse_movers_dataset(body).expect("valid dataset");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].security_id, 2885);
+        assert_eq!(got[0].symbol, "RELIANCE");
+        assert!((got[0].pct_change - 8.21).abs() < 1e-9);
+        assert_eq!(got[0].segment, ExchangeSegment::NseEquity);
+        assert!((got[1].pct_change + 5.93).abs() < 1e-9);
+    }
+
+    #[test]
+    fn garbage_is_an_error_not_an_empty_ranking() {
+        // The distinction that matters: an empty Vec for garbage is
+        // indistinguishable from a genuinely flat market, and the response to
+        // those two differs.
+        assert!(parse_movers_dataset("not json").is_err());
+        assert!(parse_movers_dataset(r#"{"columns":[]}"#).is_err());
+    }
+
+    #[test]
+    fn an_empty_dataset_is_a_flat_market_not_an_error() {
+        let got = parse_movers_dataset(r#"{"dataset":[]}"#).expect("valid, empty");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_bad_row_is_skipped_and_the_good_ones_survive() {
+        let body = r#"{"dataset":[
+            [0,"ZEROID",1.0],
+            [2885,"",2.0],
+            [1594,"INFY"],
+            "not a row",
+            [7,"SHORT"],
+            [2885,"RELIANCE",8.21]
+        ]}"#;
+        let got = parse_movers_dataset(body).expect("valid dataset");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].symbol, "RELIANCE");
+    }
+
+    #[test]
+    fn a_null_percentage_is_skipped_rather_than_read_as_flat() {
+        // A stock whose candle carried no baseline. Zero would rank it as
+        // flat, which is a claim; absent is the truth.
+        let body = r#"{"dataset":[[2885,"RELIANCE",null],[1594,"INFY",1.5]]}"#;
+        let got = parse_movers_dataset(body).expect("valid dataset");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].symbol, "INFY");
+    }
+
+    #[test]
+    fn the_row_converts_to_the_identity_the_ranking_takes() {
+        let row = mover(2885, "RELIANCE", 8.21);
+        let m = row.to_move();
+        assert_eq!(m.security_id, 2885);
+        assert_eq!(m.segment, ExchangeSegment::NseEquity);
+        assert!((m.pct_change - 8.21).abs() < f64::EPSILON);
+        assert_eq!(m.key(), (2885, ExchangeSegment::NseEquity));
+    }
+
+    // ---- the borrowed view ----
+
+    #[test]
+    fn the_owned_minute_lends_the_tracker_its_pairs() {
+        let owned = OwnedChainMinute {
+            underlying: "NIFTY".to_owned(),
+            spot: 24_480.0,
+            pairs: vec![StrikePair {
+                strike_paise: 2_450_000,
+                ce_security_id: 101,
+                pe_security_id: 102,
+            }],
+        };
+        let borrowed = owned.as_minute();
+        assert_eq!(borrowed.underlying, "NIFTY");
+        assert!((borrowed.spot - 24_480.0).abs() < f64::EPSILON);
+        assert_eq!(borrowed.pairs.len(), 1);
+        assert_eq!(borrowed.pairs[0].ce_security_id, 101);
+    }
+
+    #[test]
+    fn the_stock_option_segment_can_actually_carry_a_book() {
+        // A segment Dhan does not serve depth on would produce a socket that
+        // dies on connect (200-level) or sits live and silent (20-level).
+        assert!(crate::dhan_depth_universe::segment_supports_depth(
+            STOCK_OPTION_SEGMENT
+        ));
+    }
+}
