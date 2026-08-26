@@ -6894,6 +6894,35 @@ pub fn depth200_rebalance_sockets(
     out
 }
 
+/// The depth-20 connections, in dial order, with what each actually carries.
+///
+/// Unlike its depth-200 sibling this takes connections dialed with ANY number
+/// of instruments — a depth-20 connection legitimately holds up to 50, and a
+/// window that is short near the edge of a freshly-listed expiry holds fewer.
+/// A connection dialed with NONE is skipped: an empty socket has no window to
+/// move, and a swap naming an instrument it does not hold is refused by the
+/// guard anyway.
+#[must_use]
+pub fn depth20_track_sockets(
+    dialed: &[(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )],
+) -> Vec<crate::depth20_track::Depth20LiveSocket> {
+    dialed
+        .iter()
+        .filter(|(endpoint, _, instruments)| {
+            *endpoint == DhanEndpointType::Depth20 && !instruments.is_empty()
+        })
+        .map(
+            |(_, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
+                tx: tx.clone(),
+                held: instruments.clone(),
+            },
+        )
+        .collect()
+}
 /// Spawns the per-minute depth rebalance for the rest of the session.
 // TEST-EXEMPT: spawn wrapper over depth200_rebalance_sockets + run_depth_rebalance, both tested.
 fn spawn_depth_rebalance(
@@ -6905,13 +6934,20 @@ fn spawn_depth_rebalance(
         Vec<SubscribeInstrument>,
     )>,
 ) {
+    let depth20 = depth20_track_sockets(&dialed);
     let sockets = depth200_rebalance_sockets(dialed);
-    if sockets.is_empty() {
-        // Not an error here: a session that dialed no depth-200 connection at
-        // all has nothing to rebalance, and `run_depth_rebalance` would say so
-        // once and exit. Skipping the spawn says the same thing without a
-        // task that exists only to complain.
-        info!("depth rebalance not started: no steerable depth-200 connection was dialed");
+    if sockets.is_empty() && depth20.is_empty() {
+        // Not an error here: a session that dialed NEITHER depth pool has
+        // nothing to rebalance, and the loop would say so once and exit.
+        // Skipping the spawn says the same thing without a task that exists
+        // only to complain.
+        //
+        // The test is on BOTH pools deliberately. The first version returned
+        // on depth-200 alone, which would have killed depth-20 tracking for
+        // the whole session any time the depth-200 dial came back empty —
+        // two independent pools, one of them silently taken down by the
+        // other's bad morning.
+        info!("depth rebalance not started: neither depth pool has a steerable connection");
         return;
     }
     let questdb = questdb.clone();
@@ -6924,6 +6960,7 @@ fn spawn_depth_rebalance(
         today_ymd,
         today_micros,
         sockets,
+        depth20,
     ));
 }
 /// How long to wait before the next late-attach attempt, given the IST second.
@@ -15382,6 +15419,34 @@ mod depth20_layout_wiring_tests {
         source
             .split_once("\n#[cfg(test)]")
             .map_or(source, |(before, _)| before)
+    }
+
+    #[test]
+    fn depth20_tracking_is_wired_into_the_rebalance_spawn() {
+        // Without this the depth-20 layout is a boot-time choice that decays
+        // all session: NIFTY walks off its own +/-12 window on a 150-point
+        // move, and the movers sockets keep a 09:16 ranking.
+        let p = production();
+        assert!(
+            p.contains("depth20_track_sockets(&dialed)"),
+            "the spawn no longer builds the depth-20 sockets, so nothing tracks them"
+        );
+        assert!(
+            p.contains("depth20,"),
+            "the depth-20 sockets are built and then not handed to the loop"
+        );
+    }
+
+    #[test]
+    fn an_empty_depth200_dial_does_not_take_depth20_tracking_down_with_it() {
+        // Two independent pools. The first version of this guard returned on
+        // depth-200 alone, which would have killed depth-20 tracking for the
+        // whole session on any morning the depth-200 dial came back empty.
+        let p = production();
+        assert!(
+            p.contains("sockets.is_empty() && depth20.is_empty()"),
+            "the rebalance spawn gates on one pool, so the other can be silently lost"
+        );
     }
 
     #[test]
