@@ -1,0 +1,22 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Every seed below caught a real defect on 2026-08-26, in this order:
+#   1. two sockets carrying the same instrument (a ranked index taking both
+#      its own window and a movers slot)
+#   2. a leg-level de-duplication that stranded the other half of a pair
+#   3. the at-the-money strike depending on the ORDER the chain rows arrived
+#      in, when a stale strike disagreed with the rest about spot
+#
+# The generator was tightened afterwards (contract ids are now a function of
+# contract identity), so a seed no longer replays the exact shape its comment
+# once described. They are kept because they are cheap and they widen the
+# first cases every run tries.
+cc 761e12739d115895dd6056b07309c0284e5531b0472deade55685fe8a318b70c
+cc 2836e043435ca71871d9ebae2acad7cbf162d8178bb49a32c60637274933950b
+cc 09c052884b8600cd6ea38edd5cfd0d28874e0fda0962af557f26baaa4faffd84
+cc 0be7ad203a4d40963e24f24a4be42e6ef98bb4de13425f68fd8dab52a5947e2c

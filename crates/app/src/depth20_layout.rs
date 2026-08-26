@@ -192,6 +192,20 @@ pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) 
         // socket would spill onto the next one and push the second index
         // underlying off the end entirely.
         instruments.truncate(DEPTH_20_PER_SOCKET);
+        // An index socket is emitted EVEN WHEN EMPTY, deliberately.
+        //
+        // Its position is its identity: socket 0 is NIFTY and socket 1 is
+        // BANKNIFTY, and the rebalance and the per-minute tracker both read
+        // that. Declining to emit an unresolved underlying's socket would
+        // slide a movers socket into index position, so the tracker would
+        // compare a stock ladder against BANKNIFTY's held set and swap the
+        // whole socket — a far worse outcome than a socket that holds
+        // nothing for a minute. `a_missing_index_chain_is_named_not_silently_dropped`
+        // pins this.
+        //
+        // Suppressing it was tried, in the belief that an empty member of a
+        // public list is always a defect. It is not one here, and the pin
+        // above is what said so.
         out.sockets.push(Depth20Socket {
             underlying: Some(underlying.to_owned()),
             instruments,
@@ -216,6 +230,25 @@ pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) 
         .chain(out.ranking.tiebreak.iter())
         .collect();
 
+    // No instrument may appear twice in the WHOLE layout.
+    //
+    // Two slots spent on one order book is the mild reading. The sharp one
+    // is that two sockets carrying the same instrument means two connections
+    // subscribing it, and on Dhan's per-connection subscription state the
+    // second is a duplicate.
+    //
+    // Reachable when an index underlying also appears in the ranking: its
+    // at-the-money pair would then be taken by both its own index window and
+    // a movers socket. The movers query filters to NSE_EQ and an index is
+    // IDX_I, so that should not happen today — but "should not happen today"
+    // is a property of the QUERY, not of this function, and a later widening
+    // of that filter would land here silently. Found by a property test.
+    let mut seen: std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> = out
+        .sockets
+        .iter()
+        .flat_map(|s| s.instruments.iter().map(|i| (i.security_id, i.segment)))
+        .collect();
+
     let mut mover_instruments = Vec::with_capacity(MOVER_STOCKS_TOTAL * 2);
     for stock in ranked {
         let Some(symbol) = symbol_of.get(&stock.key()) else {
@@ -230,17 +263,44 @@ pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) 
             out.movers_unresolved = out.movers_unresolved.saturating_add(1);
             continue;
         };
-        for id in [pair.ce_security_id, pair.pe_security_id] {
-            if let Ok(security_id) = u64::try_from(id)
-                && security_id > 0
-            {
-                mover_instruments.push(SubscribeInstrument {
-                    security_id,
-                    segment: crate::depth_rebalance::STOCK_OPTION_SEGMENT,
-                });
-            }
+        // Both legs or neither.
+        //
+        // A pair is the unit a depth socket subscribes: the tracker moves a
+        // CALL and a PUT together, so admitting one leg strands the other on
+        // a different strike and the two sockets stop reading the same book.
+        // Building the pair first and admitting it whole is what keeps every
+        // socket's instrument count even.
+        let legs: Vec<SubscribeInstrument> = [pair.ce_security_id, pair.pe_security_id]
+            .into_iter()
+            .filter_map(|id| u64::try_from(id).ok())
+            .filter(|id| *id > 0)
+            .map(|security_id| SubscribeInstrument {
+                security_id,
+                segment: crate::depth_rebalance::STOCK_OPTION_SEGMENT,
+            })
+            .collect();
+        let [ce, pe] = legs.as_slice() else {
+            out.movers_unresolved = out.movers_unresolved.saturating_add(1);
+            continue;
+        };
+        // Skip the PAIR when either leg is already on a socket. Skipping the
+        // leg alone would leave the other stranded — which is how the first
+        // version of this deduplication produced odd-sized sockets.
+        if !seen.insert((ce.security_id, ce.segment)) {
+            continue;
         }
+        if !seen.insert((pe.security_id, pe.segment)) {
+            // Undo the CE claim: the pair is refused, so it never took a
+            // slot and must not block a later pair that legitimately holds
+            // that instrument.
+            seen.remove(&(ce.security_id, ce.segment));
+            continue;
+        }
+        mover_instruments.push(*ce);
+        mover_instruments.push(*pe);
     }
+    // Truncate on a PAIR boundary — the cap is an even number of legs, so
+    // this cannot split a pair, and an odd truncation would strand one.
     mover_instruments.truncate(DEPTH_20_MOVER_SOCKETS * DEPTH_20_PER_SOCKET);
 
     for chunk in mover_instruments.chunks(DEPTH_20_PER_SOCKET) {
