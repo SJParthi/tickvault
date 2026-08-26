@@ -8212,13 +8212,25 @@ fn persist_xverify_report(
         }
     }
 
+    // The vendor's own tape, stored BEFORE any judgement is applied to it.
+    // Until 2026-08-26 these rows were compared in memory and dropped, so the
+    // only surviving trace of what the exchange actually said was the subset
+    // that happened to DISAGREE.
+    let mut tape_errors = 0_usize;
+    for row in &report.rest_tape {
+        if writer.append_rest_tape(row).is_err() {
+            tape_errors += 1;
+        }
+    }
+
     let daily = xverify_daily_row(c, tolerance_paise);
     let daily_err = writer.append_daily(&daily).err();
 
     match writer.flush() {
         Ok(()) => {
-            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(c.findings.len() as u64 + 1);
-            if cell_errors > 0 || daily_err.is_some() {
+            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
+                .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
+            if cell_errors > 0 || daily_err.is_some() || tape_errors > 0 {
                 // Partial writes are reported, never rounded up to success:
                 // an audit table that silently drops rows is worse than one
                 // that is honestly incomplete.
@@ -8226,8 +8238,10 @@ fn persist_xverify_report(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "xverify_persist_partial",
                     cell_errors,
+                    tape_errors,
                     daily_failed = daily_err.is_some(),
                     findings = c.findings.len(),
+                    tape_rows = report.rest_tape.len(),
                     "Dhan live-feed cross-verification persisted with gaps — some findings \
                      could not be appended, so the audit tables are incomplete for today"
                 );
@@ -14918,6 +14932,58 @@ mod late_seed_tests {
         assert!(
             before_refold.matches("return;").count() >= 5,
             "the scan window collapsed — it should span every bring-up refusal"
+        );
+    }
+
+    #[test]
+    fn the_fetched_vendor_tape_is_persisted_not_discarded() {
+        // OPERATOR INSTRUCTION 2026-08-26. Until today this comparison
+        // fetched Dhan's tape, judged it in memory, and threw it away — only
+        // the cells that DISAGREED survived. So "what did Dhan say for this
+        // instrument at 09:16?" was unanswerable unless that minute happened
+        // to diverge, and re-verifying meant ~868 more rate-limited requests.
+        //
+        // A source scan rather than a runtime assertion because the persist
+        // sits behind a live QuestDB connection.
+        let src = include_str!("dhan_feed_stack.rs");
+        let marker = "fn persist_xverify_report";
+        let idx = src.find(marker).expect("the persist fn must exist");
+        let body = &src[idx..];
+        let end = body.find("\n}\n").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("append_rest_tape"),
+            "the fetched vendor tape must be written, or this reverts to \
+             fetch-compare-discard and the raw record exists nowhere"
+        );
+        assert!(
+            body.contains("tape_errors"),
+            "a partial tape write must be counted — an audit table that \
+             silently drops rows is worse than one honestly incomplete"
+        );
+    }
+
+    #[test]
+    fn the_tape_is_stamped_per_target_not_once_per_run() {
+        // The fetch loop runs for up to ten minutes. One run-level stamp
+        // would claim the last instrument was fetched at the same instant as
+        // the first, destroying the only number that says how stale the
+        // vendor's own record was when we read it.
+        let src = include_str!("dhan_live_crossverify.rs");
+        let loop_start = src
+            .find("for offset in 0..target_count")
+            .expect("the fetch loop must exist");
+        let loop_body = &src[loop_start..];
+        let stamp = loop_body
+            .find("fetched_at_ist_nanos_now")
+            .expect("the tape must be stamped INSIDE the fetch loop");
+        let push = loop_body
+            .find("rest_tape.extend")
+            .expect("the tape must be built inside the fetch loop");
+        assert!(
+            stamp < push,
+            "the stamp must be taken before the rows that carry it"
         );
     }
 }

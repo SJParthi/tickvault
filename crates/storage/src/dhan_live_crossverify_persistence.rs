@@ -56,6 +56,36 @@ pub const DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE: &str = "dhan_live_crossverify_cell
 /// QuestDB table — one row per run (the divergence TREND + the keep-better target).
 pub const DHAN_LIVE_XVERIFY_DAILY_TABLE: &str = "dhan_live_crossverify_daily";
 
+/// QuestDB table — **the vendor's own minute candles, exactly as fetched.**
+///
+/// Added 2026-08-26 on operator instruction. Until today this comparison
+/// fetched Dhan's tape, compared it in memory, and **threw it away**: only the
+/// cells that DISAGREED survived, on the audit table above. Three consequences,
+/// all of which the operator named:
+///
+/// 1. **No manual verification.** "What did Dhan say for this instrument at
+///    09:16?" was unanswerable unless that minute happened to diverge.
+/// 2. **No re-verification without re-fetching.** Re-running the comparison
+///    meant ~868 more requests against a rate-limited vendor budget — so in
+///    practice it was never re-run.
+/// 3. **No other analysis.** The vendor's own record simply did not exist on
+///    disk in any form.
+///
+/// Storing the pull turns the comparison into a pure function over two stored
+/// tables: fetch once, compare as often as you like, offline.
+pub const DHAN_REST_1M_TAPE_TABLE: &str = "dhan_rest_1m_tape";
+
+/// The `source` in-key wire value for rows written by the daily sweep.
+///
+/// **This column exists because of a defect found the same day it was added.**
+/// The sibling table `rest_spot_1m` carries a `source` column that is NOT in
+/// its DEDUP key — so two legs writing the same instrument-minute from
+/// different sources silently overwrite each other. Writing this sweep into
+/// that table would have destroyed the per-minute leg's index rows with no
+/// error anywhere. Here `source` is in the key from the first line, so the
+/// same collision cannot be introduced later by a second writer.
+pub const DHAN_REST_1M_TAPE_SOURCE_SWEEP: &str = "xverify_daily_sweep";
+
 /// The `feed` in-key wire value (operator override 2026-06-28 — `feed` in the
 /// DEDUP key of EVERY persisted table). Both sides of this comparison are
 /// Dhan, so unlike the cross-BROKER comparators the honest label is the plain
@@ -84,6 +114,21 @@ pub const DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT: &str =
 /// precedent; the caller's keep-better guard additionally refuses to write the
 /// downgrade at all).
 pub const DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY: &str = "ts, trading_date_ist, feed, outcome";
+
+/// Vendor-tape DEDUP key.
+///
+/// * Designated `ts` FIRST, and here `ts` IS the minute the candle belongs to
+///   — so the table partitions and queries by market time, which is what a
+///   human asking "what was the 09:16 price" actually wants.
+/// * `security_id` PAIRED with `segment` (I-P1-11): Dhan reuses numeric ids
+///   across segments, and an unpaired id would collapse two instruments.
+/// * `feed` in-key (the 2026-06-28 feed-in-key lock).
+/// * `source` in-key — see [`DHAN_REST_1M_TAPE_SOURCE_SWEEP`] for the defect
+///   in the sibling table that this prevents.
+///
+/// Re-fetching the same minute overwrites it with the same values, so a rerun
+/// is idempotent rather than duplicating the tape.
+pub const DEDUP_KEY_DHAN_REST_1M_TAPE: &str = "ts, security_id, segment, feed, source";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -260,6 +305,34 @@ pub struct DhanLiveXverifyDailyRow {
     pub outcome: DhanLiveXverifyOutcome,
 }
 
+/// One minute of the vendor's own tape, exactly as fetched.
+///
+/// Deliberately NOT a comparison result — this is the raw pull, stored before
+/// any judgement is applied to it. That separation is the whole point: the
+/// comparison becomes a pure function over stored data instead of a
+/// side-effect of a network call that cannot be repeated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DhanRestTapeRow {
+    /// The minute this candle belongs to — the DESIGNATED timestamp, so the
+    /// table partitions by market time rather than by when we happened to ask.
+    pub minute_ts_ist_nanos: i64,
+    pub trading_date_ist_nanos: i64,
+    pub security_id: i64,
+    pub segment: String,
+    /// The label we asked the vendor with, verbatim. See
+    /// [`REST_1M_TAPE_COLUMNS`] for why this is worth a column.
+    pub instrument: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: i64,
+    /// When we pulled it. Distinct from `minute_ts_ist_nanos`: the gap between
+    /// them is how stale the vendor's own record was when we read it, and it
+    /// is not derivable from anything else on the row.
+    pub fetched_at_nanos: i64,
+}
+
 /// Idempotent `CREATE TABLE` DDL for the cell-audit table. Pure.
 #[must_use]
 pub fn dhan_live_xverify_cell_audit_create_ddl() -> String {
@@ -309,6 +382,51 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
 }
 
 /// Every cell-audit column, for the idempotent `ALTER ADD COLUMN` self-heal.
+/// Idempotent `CREATE TABLE` DDL for the vendor tape. Pure.
+#[must_use]
+pub fn dhan_rest_1m_tape_create_ddl() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {DHAN_REST_1M_TAPE_TABLE} (\
+            ts               TIMESTAMP, \
+            trading_date_ist TIMESTAMP, \
+            feed             SYMBOL, \
+            source           SYMBOL, \
+            security_id      LONG, \
+            segment          SYMBOL, \
+            instrument       SYMBOL, \
+            open             DOUBLE, \
+            high             DOUBLE, \
+            low              DOUBLE, \
+            close            DOUBLE, \
+            volume           LONG, \
+            fetched_at       TIMESTAMP\
+        ) timestamp(ts) PARTITION BY DAY \
+        DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_REST_1M_TAPE});"
+    )
+}
+
+/// Columns added by `ALTER ... ADD COLUMN IF NOT EXISTS` for the vendor tape.
+///
+/// `instrument` is the label we ASKED with, kept verbatim. It is the one
+/// column that makes a wrong-label failure diagnosable after the fact: a
+/// vendor "no candles" answer is identical for a mislabelled instrument and a
+/// genuinely untraded one, and without the label there is nothing to compare
+/// against the master afterwards.
+const REST_1M_TAPE_COLUMNS: &[(&str, &str)] = &[
+    ("trading_date_ist", "TIMESTAMP"),
+    ("feed", "SYMBOL"),
+    ("source", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("segment", "SYMBOL"),
+    ("instrument", "SYMBOL"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("volume", "LONG"),
+    ("fetched_at", "TIMESTAMP"),
+];
+
 const CELL_AUDIT_COLUMNS: &[(&str, &str)] = &[
     ("trading_date_ist", "TIMESTAMP"),
     ("feed", "SYMBOL"),
@@ -350,6 +468,7 @@ pub fn dhan_live_xverify_ddl_statements() -> Vec<String> {
     let mut statements = vec![
         dhan_live_xverify_cell_audit_create_ddl(),
         dhan_live_xverify_daily_create_ddl(),
+        dhan_rest_1m_tape_create_ddl(),
     ];
     for (col, ty) in CELL_AUDIT_COLUMNS {
         statements.push(format!(
@@ -361,9 +480,18 @@ pub fn dhan_live_xverify_ddl_statements() -> Vec<String> {
             "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
         ));
     }
+    for (col, ty) in REST_1M_TAPE_COLUMNS {
+        statements.push(format!(
+            "ALTER TABLE {DHAN_REST_1M_TAPE_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+        ));
+    }
     statements.push(format!(
         "ALTER TABLE {DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE} DEDUP ENABLE \
          UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT});"
+    ));
+    statements.push(format!(
+        "ALTER TABLE {DHAN_REST_1M_TAPE_TABLE} DEDUP ENABLE \
+         UPSERT KEYS({DEDUP_KEY_DHAN_REST_1M_TAPE});"
     ));
     statements.push(format!(
         "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} DEDUP ENABLE \
@@ -560,6 +688,53 @@ impl DhanLiveXverifyAuditWriter {
             .column_i64("diff_paise", f.diff_paise)
             .context("diff_paise")?
             .at(TimestampNanos::new(f.run_ts_ist_nanos))
+            .context("designated timestamp")?;
+        self.pending = self.pending.saturating_add(1);
+        Ok(())
+    }
+
+    /// Appends one row of the vendor's own tape.
+    ///
+    /// Symbols BEFORE columns (the ILP tags-before-fields rule).
+    ///
+    /// # Errors
+    /// Propagates ILP buffer errors (table/column append failure).
+    pub fn append_rest_tape(&mut self, r: &DhanRestTapeRow) -> Result<()> {
+        self.buffer
+            .table(DHAN_REST_1M_TAPE_TABLE)
+            .context("table")?
+            .symbol("feed", DHAN_LIVE_XVERIFY_FEED)
+            .context("feed")?
+            .symbol("source", DHAN_REST_1M_TAPE_SOURCE_SWEEP)
+            .context("source")?
+            .symbol("segment", r.segment.as_str())
+            .context("segment")?
+            .symbol("instrument", r.instrument.as_str())
+            .context("instrument")?
+            .column_ts(
+                "trading_date_ist",
+                TimestampNanos::new(r.trading_date_ist_nanos),
+            )
+            .context("trading_date_ist")?
+            .column_i64("security_id", r.security_id)
+            .context("security_id")?
+            .column_f64("open", r.open)
+            .context("open")?
+            .column_f64("high", r.high)
+            .context("high")?
+            .column_f64("low", r.low)
+            .context("low")?
+            .column_f64("close", r.close)
+            .context("close")?
+            .column_i64("volume", r.volume)
+            .context("volume")?
+            .column_ts("fetched_at", TimestampNanos::new(r.fetched_at_nanos))
+            .context("fetched_at")?
+            // The MINUTE is the designated timestamp, not the run time. A
+            // human asking "what was the 09:16 price" is asking about market
+            // time; stamping the run time would file every candle of the day
+            // under one instant and make that question unanswerable.
+            .at(TimestampNanos::new(r.minute_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
@@ -888,10 +1063,45 @@ mod tests {
     #[test]
     fn dhan_live_xverify_ddl_statements_are_idempotent_and_never_drop() {
         let statements = dhan_live_xverify_ddl_statements();
+
+        // Expressed PER TABLE rather than as one total, so adding a table
+        // needs no literal bumped here — and, more usefully, a table that
+        // arrives with a CREATE but no DEDUP ENABLE fails loudly instead of
+        // sliding under a total that still adds up. An auto-created table has
+        // no dedup at all, which is a silent duplicate-row window.
+        let tables: &[(&str, usize)] = &[
+            (DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE, CELL_AUDIT_COLUMNS.len()),
+            (DHAN_LIVE_XVERIFY_DAILY_TABLE, DAILY_COLUMNS.len()),
+            (DHAN_REST_1M_TAPE_TABLE, REST_1M_TAPE_COLUMNS.len()),
+        ];
+        let mut expected = 0usize;
+        for (table, columns) in tables {
+            let creates = statements
+                .iter()
+                .filter(|s| s.contains("CREATE TABLE IF NOT EXISTS") && s.contains(table))
+                .count();
+            assert_eq!(creates, 1, "{table}: exactly one CREATE");
+            let dedups = statements
+                .iter()
+                .filter(|s| s.contains("DEDUP ENABLE") && s.contains(table))
+                .count();
+            assert_eq!(
+                dedups, 1,
+                "{table}: exactly one DEDUP ENABLE — without it the table \
+                 auto-creates on first write with no dedup at all"
+            );
+            let alters = statements
+                .iter()
+                .filter(|s| s.contains("ADD COLUMN IF NOT EXISTS") && s.contains(table))
+                .count();
+            assert_eq!(alters, *columns, "{table}: one ALTER per declared column");
+            expected += 2 + columns;
+        }
         assert_eq!(
             statements.len(),
-            2 + CELL_AUDIT_COLUMNS.len() + DAILY_COLUMNS.len() + 2,
-            "2 CREATEs + every column ALTER + 2 DEDUP ENABLEs"
+            expected,
+            "every statement must belong to a declared table — a stray one \
+             means a table was half-registered"
         );
         for s in &statements {
             assert!(
@@ -1128,5 +1338,128 @@ mod tests {
             DhanLiveXverifyCellKind::OutOfSession,
         ];
         assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // THE VENDOR TAPE — added 2026-08-26 on operator instruction
+    //
+    // Until today the fetched tape was compared in memory and thrown away:
+    // only DISAGREEMENTS survived. So "what did Dhan say at 09:16?" had no
+    // answer, and re-verifying meant ~868 more rate-limited requests.
+    // -----------------------------------------------------------------
+
+    fn tape_row() -> DhanRestTapeRow {
+        DhanRestTapeRow {
+            minute_ts_ist_nanos: 1_786_233_600 * 1_000_000_000 + 33_360 * 1_000_000_000,
+            trading_date_ist_nanos: 1_786_233_600 * 1_000_000_000,
+            security_id: 25,
+            segment: "NSE_EQ".to_string(),
+            instrument: "RELIANCE".to_string(),
+            open: 1414.2,
+            high: 1420.0,
+            low: 1410.5,
+            close: 1418.75,
+            volume: 91_240,
+            fetched_at_nanos: 1_786_233_600 * 1_000_000_000 + 56_460 * 1_000_000_000,
+        }
+    }
+
+    #[test]
+    fn the_tape_dedup_key_carries_source() {
+        // THE DEFECT THIS TABLE EXISTS TO AVOID.
+        //
+        // The sibling `rest_spot_1m` has a `source` column that is NOT in its
+        // dedup key. Two legs writing the same instrument-minute from
+        // different sources therefore overwrite each other with no error
+        // anywhere — which is why this sweep could not simply be written
+        // there. Dropping `source` from this key re-creates that trap.
+        assert!(
+            DEDUP_KEY_DHAN_REST_1M_TAPE.contains("source"),
+            "source must be in the key, or a second writer silently overwrites \
+             this one — exactly the collision that forced a new table"
+        );
+    }
+
+    #[test]
+    fn the_tape_dedup_key_pairs_security_id_with_segment() {
+        // I-P1-11: Dhan reuses numeric ids across segments. An unpaired id
+        // collapses two different instruments into one row.
+        let k = DEDUP_KEY_DHAN_REST_1M_TAPE;
+        assert!(k.contains("security_id") && k.contains("segment"));
+        assert!(k.contains("feed"), "the 2026-06-28 feed-in-key lock");
+    }
+
+    #[test]
+    fn the_tape_designated_timestamp_is_the_minute_not_the_run() {
+        // If `ts` were the run time, every candle of the day would file under
+        // one instant and "what was the 09:16 price" becomes unanswerable —
+        // which is the question this table was added to answer.
+        assert!(
+            DEDUP_KEY_DHAN_REST_1M_TAPE.starts_with("ts,"),
+            "designated ts first (the 2026-04-28 regression rule)"
+        );
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        let r = tape_row();
+        w.append_rest_tape(&r).expect("append");
+        let wire = w.buffer_utf8();
+        assert!(
+            wire.contains(&r.minute_ts_ist_nanos.to_string()),
+            "the minute must be the row's designated timestamp"
+        );
+    }
+
+    #[test]
+    fn the_tape_row_carries_the_label_we_asked_with() {
+        // A vendor "no candles" answer looks identical for a MISLABELLED
+        // instrument and a genuinely untraded one. Without the label stored,
+        // that ambiguity can never be resolved after the fact.
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_rest_tape(&tape_row()).expect("append");
+        assert!(w.buffer_utf8().contains("RELIANCE"));
+    }
+
+    #[test]
+    fn the_tape_ddl_is_registered_so_the_table_actually_gets_created() {
+        // A writer whose table is never created auto-creates it on first
+        // write WITHOUT dedup — a duplicate-row window the whole key design
+        // above would silently miss.
+        let ddl = dhan_live_xverify_ddl_statements();
+        let joined = ddl.join("\n");
+        assert!(
+            joined.contains(DHAN_REST_1M_TAPE_TABLE),
+            "the tape table must be in the DDL list, or nothing creates it"
+        );
+        assert!(
+            joined.contains(&format!(
+                "ALTER TABLE {DHAN_REST_1M_TAPE_TABLE} DEDUP ENABLE"
+            )),
+            "dedup must be enabled explicitly — an auto-created table has none"
+        );
+    }
+
+    #[test]
+    fn the_tape_write_is_idempotent_by_construction() {
+        // A rerun re-fetches the same minutes. With the key above those
+        // overwrite in place rather than duplicating the tape, so re-running
+        // the comparison is free of side effects.
+        let mut a = DhanLiveXverifyAuditWriter::for_test();
+        let mut b = DhanLiveXverifyAuditWriter::for_test();
+        a.append_rest_tape(&tape_row()).expect("a");
+        b.append_rest_tape(&tape_row()).expect("b");
+        assert_eq!(
+            a.buffer_utf8(),
+            b.buffer_utf8(),
+            "the same input must produce byte-identical rows, or the dedup key \
+             cannot collapse them"
+        );
+    }
+
+    #[test]
+    fn the_tape_table_is_not_the_sibling_table() {
+        // Guard against a future "simplification" that points this writer at
+        // rest_spot_1m. That table's key omits `source`, so the sweep would
+        // silently destroy the per-minute leg's index rows.
+        assert_ne!(DHAN_REST_1M_TAPE_TABLE, "rest_spot_1m");
+        assert_ne!(DHAN_REST_1M_TAPE_TABLE, DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE);
     }
 }
