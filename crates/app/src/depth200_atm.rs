@@ -575,6 +575,263 @@ pub fn plan_swaps(
     out
 }
 
+// ---------------------------------------------------------------------------
+// The fifth depth-200 socket — the day's biggest mover (operator, 2026-08-26)
+// ---------------------------------------------------------------------------
+
+/// Socket index of the fifth deep-book connection.
+///
+/// Sockets 0 to 3 carry the NIFTY and BANKNIFTY at-the-money call and put.
+/// The fifth was idle by the operator's earlier instruction (*"as of now dont
+/// need to conside the fifth one dude jsut go aheaf with 4 aloe"*), then
+/// reopened (*"for dpeth 200 one slot is still missign hwo cna we fix or fill
+/// it up"*) and settled on the recommendation: it watches the day's single
+/// biggest mover.
+pub const DEPTH_200_TOP_MOVER_SOCKET: usize = 4;
+
+/// How many consecutive minutes a new stock must hold the top spot before the
+/// fifth socket moves to it.
+///
+/// **Higher than the strike gate (2), and the reason is the shape of the
+/// signal.** A strike changes when spot drifts across a boundary — a
+/// continuous quantity crossing a line, so two confirmations are enough to
+/// reject noise. The #1 mover is a RANKING, and the top of a ranking flips
+/// between two stocks whose percentages differ in the third decimal. Two
+/// confirmations would leave this socket re-dialing all afternoon on a
+/// distinction nobody can trade.
+///
+/// Three minutes of holding first place is a real lead, and the cost of being
+/// three minutes late to a deep book is far smaller than the cost of never
+/// holding one long enough to read it.
+pub const TOP_MOVER_CONFIRM_OBSERVATIONS: u32 = 3;
+
+/// The day's leading mover, resolved to the two contracts its at-the-money
+/// strike would subscribe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopMoverPick {
+    /// The UNDERLYING stock's id, for the log line — not the thing subscribed.
+    pub underlying_security_id: u64,
+    /// Segment of the CONTRACTS (not of the underlying). Depth subscribes the
+    /// option, and an option's segment is not its stock's.
+    pub contract_segment: ExchangeSegment,
+    /// The move that put it first. Sign chooses the leg.
+    pub pct_change: f64,
+    /// At-the-money call contract id.
+    pub atm_ce_security_id: i64,
+    /// At-the-money put contract id.
+    pub atm_pe_security_id: i64,
+}
+
+impl TopMoverPick {
+    /// The leg this socket should carry: the CALL on a riser, the PUT on a
+    /// faller.
+    ///
+    /// The leg follows the DIRECTION because that is the side with the order
+    /// flow. A stock up 8% has its depth in the calls; watching its puts
+    /// would be a deep book on the quiet side of the move — technically a
+    /// subscription, practically a wasted socket.
+    #[must_use]
+    pub const fn leg_security_id(&self) -> i64 {
+        if self.pct_change > 0.0 {
+            self.atm_ce_security_id
+        } else {
+            self.atm_pe_security_id
+        }
+    }
+}
+
+/// Why the fifth socket moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopMoverSwitchReason {
+    /// Nothing was subscribed yet. Adopted immediately — there is no live
+    /// subscription to protect and waiting leaves the socket empty for
+    /// nothing.
+    FirstAdoption,
+    /// A different stock has led for [`TOP_MOVER_CONFIRM_OBSERVATIONS`]
+    /// consecutive minutes.
+    NewLeader,
+    /// The SAME stock, but its move changed sign, so the busy leg is now the
+    /// other one.
+    ///
+    /// Kept distinct from a new leader because it means something different
+    /// to an operator reading the log: the name did not change, the direction
+    /// did.
+    DirectionFlipped,
+}
+
+/// Why the fifth socket did NOT move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoTopMoverSwitch {
+    /// The socket already carries this contract. The ordinary minute.
+    AlreadySubscribed,
+    /// A challenger leads but has not held the lead long enough yet.
+    AwaitingConfirmation,
+    /// No mover at all — a market that has not opened, or one where nothing
+    /// has moved. The socket KEEPS what it has: a stale deep book beats an
+    /// empty one, and unsubscribing would spend a wire call to end up with
+    /// less.
+    NoMover,
+    /// The pick carried a percentage that is not a finite number, or a
+    /// contract id that cannot be subscribed.
+    UnusablePick,
+}
+
+/// Tracks which contract the fifth depth-200 socket should carry.
+///
+/// Same discipline as [`Depth200AtmTracker`] and for the same reason: it is
+/// asked every minute and answers "nothing to do" almost every time. The
+/// difference is the confirmation count — see
+/// [`TOP_MOVER_CONFIRM_OBSERVATIONS`].
+#[derive(Debug, Clone)]
+pub struct TopMoverSocket {
+    subscribed: Option<SubscribeInstrument>,
+    /// The challenger and how many consecutive minutes it has led. Cleared
+    /// the moment a different challenger appears, so a stock has to hold the
+    /// lead — not merely appear at the top three times in an afternoon.
+    candidate: Option<(SubscribeInstrument, u32)>,
+    confirm_required: u32,
+}
+
+impl Default for TopMoverSocket {
+    fn default() -> Self {
+        Self::new(TOP_MOVER_CONFIRM_OBSERVATIONS)
+    }
+}
+
+impl TopMoverSocket {
+    /// A tracker holding nothing yet.
+    #[must_use]
+    pub const fn new(confirm_required: u32) -> Self {
+        Self {
+            subscribed: None,
+            candidate: None,
+            // At least one: zero would switch on the first sighting, which is
+            // the churn this gate exists to prevent.
+            confirm_required: if confirm_required == 0 {
+                1
+            } else {
+                confirm_required
+            },
+        }
+    }
+
+    /// What this socket currently carries.
+    #[must_use]
+    pub const fn subscribed(&self) -> Option<SubscribeInstrument> {
+        self.subscribed
+    }
+
+    /// Offers this minute's leading mover and returns the swap, if any.
+    ///
+    /// `None` means the ranking produced nobody. The socket keeps what it has
+    /// — see [`NoTopMoverSwitch::NoMover`].
+    ///
+    /// # Complexity
+    ///
+    /// O(1). One comparison and one counter.
+    pub fn observe(
+        &mut self,
+        pick: Option<&TopMoverPick>,
+    ) -> Result<TopMoverSwitch, NoTopMoverSwitch> {
+        let Some(pick) = pick else {
+            // Deliberately does NOT clear the candidate: a single minute with
+            // no ranking (a query that failed, a market pause) should not
+            // restart a challenger's three-minute count from zero.
+            return Err(NoTopMoverSwitch::NoMover);
+        };
+        if !pick.pct_change.is_finite() || pick.pct_change == 0.0 {
+            return Err(NoTopMoverSwitch::UnusablePick);
+        }
+        let Ok(security_id) = u64::try_from(pick.leg_security_id()) else {
+            return Err(NoTopMoverSwitch::UnusablePick);
+        };
+        if security_id == 0 {
+            // Subscribing instrument 0 looks perfectly healthy and returns
+            // nothing forever.
+            return Err(NoTopMoverSwitch::UnusablePick);
+        }
+        let wanted = SubscribeInstrument {
+            security_id,
+            segment: pick.contract_segment,
+        };
+
+        if self.subscribed == Some(wanted) {
+            // Steady state. Clear any half-finished challenge: the incumbent
+            // is back on top, so a challenger's count is stale.
+            self.candidate = None;
+            return Err(NoTopMoverSwitch::AlreadySubscribed);
+        }
+
+        let Some(from) = self.subscribed else {
+            self.subscribed = Some(wanted);
+            self.candidate = None;
+            return Ok(TopMoverSwitch {
+                from: None,
+                to: wanted,
+                reason: TopMoverSwitchReason::FirstAdoption,
+            });
+        };
+
+        // A direction flip on the SAME stock still goes through the gate. It
+        // is a real change of contract, and a stock oscillating around flat
+        // would otherwise churn the socket on every sign change.
+        let same_stock = self
+            .subscribed
+            .map(|s| s.segment == wanted.segment)
+            .unwrap_or(false)
+            && (from.security_id == u64::try_from(pick.atm_ce_security_id).unwrap_or(u64::MAX)
+                || from.security_id == u64::try_from(pick.atm_pe_security_id).unwrap_or(u64::MAX));
+
+        // The identity check is what makes this a HELD lead rather than a
+        // tally. Without it three different challengers in a row add up to a
+        // switch and the socket moves to whoever happens to be third, on a
+        // lead nobody held — found by a bite-proof, pinned by
+        // `three_different_challengers_in_a_row_do_not_add_up_to_a_switch`.
+        let seen = match self.candidate {
+            Some((c, n)) if c == wanted => n.saturating_add(1),
+            _ => 1,
+        };
+        if seen < self.confirm_required {
+            self.candidate = Some((wanted, seen));
+            return Err(NoTopMoverSwitch::AwaitingConfirmation);
+        }
+
+        self.subscribed = Some(wanted);
+        self.candidate = None;
+        Ok(TopMoverSwitch {
+            from: Some(from),
+            to: wanted,
+            reason: if same_stock {
+                TopMoverSwitchReason::DirectionFlipped
+            } else {
+                TopMoverSwitchReason::NewLeader
+            },
+        })
+    }
+
+    /// The wire work this switch implies, ready for the command channel.
+    #[must_use]
+    pub fn plan(switch: &TopMoverSwitch) -> Option<PlannedSwap> {
+        switch.from.map(|old| PlannedSwap {
+            socket_index: DEPTH_200_TOP_MOVER_SOCKET,
+            old,
+            new: switch.to,
+            reason: SwitchReason::SpotMoved,
+        })
+    }
+}
+
+/// A change of contract on the fifth socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopMoverSwitch {
+    /// What was subscribed, or `None` on the first adoption.
+    pub from: Option<SubscribeInstrument>,
+    /// What to subscribe.
+    pub to: SubscribeInstrument,
+    /// Why.
+    pub reason: TopMoverSwitchReason,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,5 +1428,265 @@ mod tests {
         let swaps = plan_swaps(&mut t, &at(24_100.0, 57_100.0), &held, nse_fno);
         let sockets: Vec<_> = swaps.iter().map(|s| s.socket_index).collect();
         assert_eq!(sockets, vec![0, 1, 2, 3], "all four sockets move");
+    }
+    // ------------------------------------------------------------------
+    // The fifth socket — the day's biggest mover (operator, 2026-08-26:
+    // "go ahead with the recommendation").
+    // ------------------------------------------------------------------
+
+    fn pick(stock: u64, pct: f64, ce: i64, pe: i64) -> TopMoverPick {
+        TopMoverPick {
+            underlying_security_id: stock,
+            contract_segment: ExchangeSegment::NseFno,
+            pct_change: pct,
+            atm_ce_security_id: ce,
+            atm_pe_security_id: pe,
+        }
+    }
+
+    /// The leg follows the DIRECTION, because that is the side with the order
+    /// flow. A stock up 8% has its depth in the calls; watching its puts is a
+    /// deep book on the quiet side of the move.
+    #[test]
+    fn a_riser_takes_the_call_and_a_faller_takes_the_put() {
+        assert_eq!(pick(1, 8.0, 101, 102).leg_security_id(), 101);
+        assert_eq!(pick(1, -8.0, 101, 102).leg_security_id(), 102);
+    }
+
+    #[test]
+    fn the_first_minute_adopts_immediately_with_no_waiting() {
+        let mut s = TopMoverSocket::default();
+        let sw = s.observe(Some(&pick(7, 8.0, 101, 102))).expect("adopted");
+        assert_eq!(sw.reason, TopMoverSwitchReason::FirstAdoption);
+        assert_eq!(sw.from, None);
+        assert_eq!(sw.to.security_id, 101);
+        assert!(
+            TopMoverSocket::plan(&sw).is_none(),
+            "a first adoption has nothing to unsubscribe, so it is a plain \
+             subscribe rather than a swap"
+        );
+    }
+
+    /// The ordinary minute. The same leader all afternoon must cost nothing.
+    #[test]
+    fn an_unchanged_leader_costs_no_wire_call_for_a_whole_session() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        for _ in 0..375 {
+            assert_eq!(
+                s.observe(Some(&pick(7, 8.0, 101, 102))),
+                Err(NoTopMoverSwitch::AlreadySubscribed)
+            );
+        }
+    }
+
+    /// THE reason this gate is stricter than the strike gate. The top of a
+    /// ranking flips between two stocks whose percentages differ in the third
+    /// decimal; at two confirmations this socket would re-dial all afternoon
+    /// on a distinction nobody can trade.
+    #[test]
+    fn two_stocks_trading_first_place_never_move_the_socket() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.001, 101, 102)));
+        for minute in 0..120 {
+            let leader = if minute % 2 == 0 {
+                pick(8, 8.002, 201, 202)
+            } else {
+                pick(7, 8.001, 101, 102)
+            };
+            let out = s.observe(Some(&leader));
+            assert!(
+                out.is_err(),
+                "the socket moved on minute {minute} — an alternating lead \
+                 must never reach the confirmation count"
+            );
+        }
+        assert_eq!(
+            s.subscribed().map(|i| i.security_id),
+            Some(101),
+            "the incumbent should still hold the socket"
+        );
+    }
+
+    /// A genuine new leader takes it, after holding the lead.
+    #[test]
+    fn a_challenger_that_holds_the_lead_takes_the_socket() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        let challenger = pick(8, 12.0, 201, 202);
+        for _ in 0..(TOP_MOVER_CONFIRM_OBSERVATIONS - 1) {
+            assert_eq!(
+                s.observe(Some(&challenger)),
+                Err(NoTopMoverSwitch::AwaitingConfirmation)
+            );
+        }
+        let sw = s.observe(Some(&challenger)).expect("confirmed");
+        assert_eq!(sw.reason, TopMoverSwitchReason::NewLeader);
+        assert_eq!(sw.from.map(|i| i.security_id), Some(101));
+        assert_eq!(sw.to.security_id, 201);
+
+        let planned = TopMoverSocket::plan(&sw).expect("a real swap");
+        assert_eq!(planned.socket_index, DEPTH_200_TOP_MOVER_SOCKET);
+        assert_eq!(planned.old.security_id, 101);
+        assert_eq!(planned.new.security_id, 201);
+    }
+
+    /// THREE DIFFERENT challengers in a row must not add up to a switch.
+    ///
+    /// This test exists because a bite-proof found the gap. The alternating
+    /// case above is guarded by the incumbent RETURNING (which clears the
+    /// count), so it passes even when the counter banks across different
+    /// challengers. This is the shape that does not: a churning market where
+    /// the incumbent never regains the top and a different name leads each
+    /// minute. Without the identity check the socket switches to whoever
+    /// happens to be third, on a lead it never held.
+    #[test]
+    fn three_different_challengers_in_a_row_do_not_add_up_to_a_switch() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        for round in 0..40u64 {
+            for who in 0..3u64 {
+                let id = 200 + round * 10 + who;
+                let out = s.observe(Some(&pick(id, 12.0, id as i64, id as i64 + 1)));
+                assert_eq!(
+                    out,
+                    Err(NoTopMoverSwitch::AwaitingConfirmation),
+                    "a different challenger each minute reached the count"
+                );
+            }
+        }
+        assert_eq!(
+            s.subscribed().map(|i| i.security_id),
+            Some(101),
+            "the socket switched on a lead nobody held"
+        );
+    }
+
+    /// The incumbent returning to the top must CLEAR the challenger's count,
+    /// not leave it banked. Otherwise a stock that led minutes 1, 50 and 200
+    /// would take the socket on a lead it never actually held.
+    #[test]
+    fn a_challengers_count_does_not_bank_across_the_incumbent_returning() {
+        let mut s = TopMoverSocket::default();
+        let incumbent = pick(7, 8.0, 101, 102);
+        let challenger = pick(8, 12.0, 201, 202);
+        let _ = s.observe(Some(&incumbent));
+
+        for _ in 0..50 {
+            assert_eq!(
+                s.observe(Some(&challenger)),
+                Err(NoTopMoverSwitch::AwaitingConfirmation)
+            );
+            assert_eq!(
+                s.observe(Some(&incumbent)),
+                Err(NoTopMoverSwitch::AlreadySubscribed)
+            );
+        }
+        assert_eq!(
+            s.subscribed().map(|i| i.security_id),
+            Some(101),
+            "a challenger banked its way in without ever holding the lead"
+        );
+    }
+
+    /// Same stock, sign flipped: the busy leg is now the other one. It still
+    /// goes through the gate — a stock oscillating around flat would
+    /// otherwise churn the socket on every sign change.
+    #[test]
+    fn a_direction_flip_is_gated_and_reported_as_its_own_reason() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        let flipped = pick(7, -3.0, 101, 102);
+        for _ in 0..(TOP_MOVER_CONFIRM_OBSERVATIONS - 1) {
+            assert_eq!(
+                s.observe(Some(&flipped)),
+                Err(NoTopMoverSwitch::AwaitingConfirmation)
+            );
+        }
+        let sw = s.observe(Some(&flipped)).expect("confirmed");
+        assert_eq!(sw.reason, TopMoverSwitchReason::DirectionFlipped);
+        assert_eq!(sw.to.security_id, 102, "the put leg");
+    }
+
+    /// A minute with no ranking keeps the socket. A stale deep book beats an
+    /// empty one, and unsubscribing spends a wire call to end up with less.
+    #[test]
+    fn a_minute_with_no_movers_keeps_what_the_socket_has() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        for _ in 0..100 {
+            assert_eq!(s.observe(None), Err(NoTopMoverSwitch::NoMover));
+        }
+        assert_eq!(s.subscribed().map(|i| i.security_id), Some(101));
+    }
+
+    /// A gap in the ranking must not restart a challenger's count. A failed
+    /// query for one minute is not evidence that the challenger stopped
+    /// leading.
+    #[test]
+    fn a_gap_in_the_ranking_does_not_restart_the_confirmation_count() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        let challenger = pick(8, 12.0, 201, 202);
+        assert_eq!(
+            s.observe(Some(&challenger)),
+            Err(NoTopMoverSwitch::AwaitingConfirmation)
+        );
+        assert_eq!(s.observe(None), Err(NoTopMoverSwitch::NoMover));
+        assert_eq!(
+            s.observe(Some(&challenger)),
+            Err(NoTopMoverSwitch::AwaitingConfirmation)
+        );
+        let sw = s
+            .observe(Some(&challenger))
+            .expect("the gap did not reset it");
+        assert_eq!(sw.to.security_id, 201);
+    }
+
+    /// Every unusable pick leaves the live subscription alone. Refusing to
+    /// switch is safe; switching on garbage is not.
+    #[test]
+    fn an_unusable_pick_never_costs_the_live_subscription() {
+        let mut s = TopMoverSocket::default();
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        for bad in [
+            pick(9, f64::NAN, 301, 302),
+            pick(9, f64::INFINITY, 301, 302),
+            pick(9, 0.0, 301, 302),
+            pick(9, 5.0, 0, 302),
+            pick(9, 5.0, -1, 302),
+            pick(9, -5.0, 301, 0),
+        ] {
+            assert_eq!(
+                s.observe(Some(&bad)),
+                Err(NoTopMoverSwitch::UnusablePick),
+                "a bad pick was accepted"
+            );
+        }
+        assert_eq!(s.subscribed().map(|i| i.security_id), Some(101));
+    }
+
+    /// A zero confirmation count would switch on first sighting — the churn
+    /// this gate exists to prevent. Clamped rather than trusted.
+    #[test]
+    fn a_zero_confirmation_setting_is_clamped_to_one() {
+        let mut s = TopMoverSocket::new(0);
+        let _ = s.observe(Some(&pick(7, 8.0, 101, 102)));
+        let sw = s
+            .observe(Some(&pick(8, 12.0, 201, 202)))
+            .expect("one confirmation is the floor");
+        assert_eq!(sw.to.security_id, 201);
+    }
+
+    /// The gate is deliberately stricter than the strike gate, and the
+    /// constants must not drift together.
+    #[test]
+    fn the_mover_gate_is_stricter_than_the_strike_gate() {
+        assert!(
+            TOP_MOVER_CONFIRM_OBSERVATIONS > ATM_SWITCH_CONFIRM_OBSERVATIONS,
+            "a ranking flips on the third decimal; a strike crosses a \
+             boundary. They must not share a confirmation count."
+        );
+        assert_eq!(DEPTH_200_TOP_MOVER_SOCKET, 4, "sockets 0-3 are the indices");
     }
 }
