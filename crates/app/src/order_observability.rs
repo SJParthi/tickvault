@@ -26,8 +26,8 @@
 //! 2026-08-26): this whole subsystem is code-ready and fully wired, and it
 //! is DORMANT — but NOT for the reason this paragraph gave until today.
 //!
-//! It used to read "DORMANT while `feeds.dhan_enabled = false` (today's prod
-//! default)". That premise is dead: `config/base.toml` has carried
+//! It used to reason from the Dhan feed flag being off, calling that the prod
+//! default. That premise is dead: `config/base.toml` has carried
 //! `dhan_enabled = true` since the 2026-08-11 operator flip. Applied
 //! literally, the old rule now yields the OPPOSITE of the truth — a reader
 //! would conclude this subsystem went live when the flag flipped.
