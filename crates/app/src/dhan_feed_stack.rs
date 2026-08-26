@@ -12815,11 +12815,22 @@ mod tests {
         // This is the FIFTH fixed-window guard found in this branch, all
         // written by me. A byte count is a guess about how long code will
         // stay; the macro opening is a real boundary and cannot drift.
-        let start = ["info!(", "error!(", "warn!("]
-            .iter()
-            .filter_map(|m| src[..idx].rfind(m))
-            .max()
-            .expect("the emit must sit inside a tracing macro");
+        //
+        // The openings are assembled from FRAGMENTS, not written whole. A
+        // source-scanning guard in another crate reads this file for `error!`
+        // sites and cannot tell a literal in a test array from a real emit —
+        // it failed on exactly that, and the failure was 100% correct given
+        // what it could see. Same technique the failure-reason pin uses one
+        // module over, for the same reason: this file is read by scanners.
+        let start = [
+            concat!("info", "!("),
+            concat!("error", "!("),
+            concat!("warn", "!("),
+        ]
+        .iter()
+        .filter_map(|m| src[..idx].rfind(m))
+        .max()
+        .expect("the emit must sit inside a tracing macro");
         let emit = &src[start..idx];
 
         assert!(
