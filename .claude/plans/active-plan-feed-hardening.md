@@ -67,12 +67,49 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Tests: `boot_limit_assertion_guard.rs`
 
 - [ ] **Item 3 — Empty-subscription + partial-subscribe detectors (scenario #75, #62)**
-  - At T+90s after subscribe, assert `frames_received > 0` **per instrument class**;
-    force-cycle the slot and page if a class is dead.
-  - Maintain `expected: HashSet<(sid, segment)>`; at T+120s diff against first-seen.
-    Auto-resubscribe the delta on a spare slot, max 3 rounds, then page **with the list**.
-  - Files: `crates/core/src/websocket/pool_supervisor.rs`
-  - Tests: `subscribe_ack_reconciliation_guard.rs`
+  — **HALF DONE 2026-08-25.** Split below rather than ticked whole: the detection
+  half shipped, the auto-remediation half did not, and one tick on the parent
+  would claim both.
+
+  - [x] **3a — dead-instrument-CLASS detector (DONE 2026-08-25)**
+    - Folds a per-`ExchangeSegment` liveness tally into the silence sweep that
+      already runs every 30s — no second O(n) pass. A segment where every
+      non-sparse instrument is still never-ticked past its warmup window emits
+      `tv_dhan_feed_dead_instrument_class_total{segment}` + the
+      `tv_dhan_feed_dead_instrument_classes` gauge, edge-latched once per
+      episode.
+    - Catches the **2026-08-21 incident directly**: 119 NSE indices subscribed,
+      zero ticks all session, 8,868 tradeables flowing normally. The
+      per-instrument gauge read 119-of-~9,000 — under 1.5%, indistinguishable
+      from thin-instrument quiet — and nothing paged. A human found it.
+    - Files: `crates/app/src/dhan_feed_stack.rs`
+    - Tests: 9 in `dhan_feed_stack::tests` (7 unit on `ClassLiveness`, 1 tally
+      invariant, 1 end-to-end through the live sweep).
+    - **Log-sink-only.** No Telegram page: the Dhan alert family is fixed at
+      four items by `dhan-rest-only-noise-lock-2026-07-14.md` §2 and a fifth
+      needs a dated operator quote there FIRST. The counter and gauge are what
+      an alarm would later read.
+    - **Two findings recorded from bite-testing, both corrections to my own
+      claims:** (1) the `pending == 0` term in `is_dead` is REDUNDANT —
+      implied by `never == eligible` given the fold — so mutating it away
+      changes no verdict; kept for intent, with a test pinning the invariant
+      it rests on. (2) The healthy-class test does NOT guard the
+      `counts_toward_alarm()` denominator trap as its first comment claimed;
+      `a_single_ticking_instrument_keeps_its_class_alive` is the test that
+      actually bites on it. Both comments corrected.
+
+  - [ ] **3b — expected-vs-first-seen delta + auto-resubscribe (NOT DONE)**
+    - Maintain `expected: HashSet<(sid, segment)>`; at T+120s diff against
+      first-seen. Auto-resubscribe the delta on a spare slot, max 3 rounds,
+      then page **with the list**.
+    - **Deliberately deferred, not forgotten.** 3a is pure observation over an
+      existing sweep. This half CHANGES LIVE SUBSCRIBE BEHAVIOUR — it dials a
+      spare slot, so it interacts with the 16-connection budget, `plan_pool`'s
+      fail-closed whole-pool refusal, and the 09:12 pre-open deadline. That
+      deserves its own design pass and its own PR rather than riding along
+      with a detector.
+    - Files: `crates/core/src/websocket/pool_supervisor.rs`
+    - Tests: `subscribe_ack_reconciliation_guard.rs`
 
 - [ ] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
   - Restart at 80% memory, before the kernel's killer decides.
@@ -2012,3 +2049,497 @@ climbing to and holding near the projected figure across a full session, and a
 read from the store must be shown returning the current day's bars. Until an
 RSS reading exists at scale, every number above is arithmetic — correct
 arithmetic, from measured inputs, but not a running system.
+
+---
+
+## Item 13 — the archive worklist starved the heaviest table (2026-08-25)
+
+**Status: DONE.** Found by tracing why the prod volume kept filling after the
+spill-ceiling fix in #1804 landed.
+
+- [x] **Fair-share the per-run archive budget across tables**
+  - Files: `crates/storage/src/partition_archive.rs`
+  - Tests: `fair_share_tests::the_heaviest_table_is_not_starved_by_an_older_backlog`,
+    `each_table_is_still_processed_oldest_first`,
+    `a_zero_cap_means_no_cap_and_keeps_every_item`,
+    `a_cap_smaller_than_the_table_count_still_reaches_more_than_one_table`,
+    `the_output_is_deterministic_across_runs`,
+    `an_empty_worklist_is_empty_and_does_not_hang`
+- [x] **Count list failures in the cycle summary** (a silently unswept table
+      was indistinguishable from a healthy one)
+  - Files: `crates/storage/src/partition_archive.rs`
+- [x] **Resurrect a test that had never run**
+  - Files: `crates/app/src/dhan_depth_universe.rs`
+
+### What was measured, not inferred
+
+| fact | value | source |
+|---|---|---|
+| `market_depth` share of QuestDB | 174 GB of 196 GB | `du` on the box |
+| its partition size | ~17 GB per HOUR | `du` per partition |
+| its archive attempts in 12 h | **0** | CloudWatch, untruncated |
+| `ticks` archive attempts, same window | 87 | same |
+| `ticks` eligible partitions | 185, oldest `2026-07-30` | QuestDB `table_partitions()` |
+| `market_depth` eligible partitions | 4, oldest `2026-08-24` | same |
+| `max_partitions_per_run` | 200 | `config/base.toml` |
+
+### The defect
+
+`archive_and_drop_old_partitions` sorted the whole worklist by partition name —
+a global date order across every table — then truncated to the per-run cap.
+Older-backlog tables therefore consume the entire budget before a newer-backlog
+table gets a single slot. With stuck `2026-06-02` candle partitions at the head
+(they fail `s3_conflict` every run and are re-listed the next one) plus 185
+`ticks` entries, the 200 slots were spent before `market_depth` was reached.
+Deterministic, every run: the one table that could relieve disk pressure was the
+one table guaranteed never to be archived.
+
+### Honest envelope
+
+- Fair-sharing makes `market_depth` reachable. It does **not** make the archiver
+  keep up: ~8 partitions/day at ~17 GB is ~136 GB/day to gzip, upload and
+  SHA-256 verify. Whether one session's budget clears one session's production
+  is UNMEASURED and is the next question.
+- The `s3_conflict` partitions still never converge. They no longer block other
+  tables, but they still fail every run.
+- Depth volume itself (~110 GB/day into a 300 GB volume) is a capacity decision,
+  not an executor's.
+
+### A test flaw the bite-proof caught
+
+The first version of the headline test used 185 + 4 = 189 entries against a cap
+of 200, so nothing was truncated and it passed under the OLD algorithm too —
+i.e. it proved nothing. The reproduction now includes the June candle partitions
+that pushed prod over the cap, and asserts `worklist.len() > 200` so it can
+never silently become vacuous again. Bite-proven both directions: reverted, it
+fails with `market_depth scheduled: 0`.
+
+---
+
+## Item 14 — the pre-open readiness alarm pages on every restart (2026-08-25)
+
+**Status: DONE.** Found by reading why `tv-prod-preopen-ready-late` was in ALARM
+and armed, hours after the eight #1809 alarms finally applied.
+
+### What the live log actually said
+
+```
+09:08:04  attempts: 57  ready_at 32884  deadline 33120  met_deadline: TRUE
+12:37:58  attempts:  1  ready_at 45478  deadline 33120  met_deadline: false
+16:17:30  attempts:  1  ready_at 58650  deadline 33120  met_deadline: false
+17:33:59  attempts:  1  ready_at 63239  deadline 33120  met_deadline: false
+18:17:30  attempts:  1  ready_at 65850  deadline 33120  met_deadline: false
+19:21:34  attempts:  1  ready_at 69694  deadline 33120  met_deadline: false
+```
+
+The morning MET the deadline with four minutes to spare. The five `false` rows
+are restarts on a busy deploy afternoon; `ready_at_ist_secs` is simply "now".
+
+### The defect
+
+`met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS` asked "did this
+attach finish before 09:12?" of EVERY attach, including ones that had not begun
+until the afternoon. A restart cannot pass a test whose pass condition is a time
+already in the past, so the verdict was decided by the wall clock rather than by
+anything about the lane. Each restart fired `WS-GAP-02` and drove the alarm —
+ungated by design — into ALARM.
+
+The alarm's own comment reasoned that "on a restart day the LATEST attach is the
+one that matters". True of a 10:30 re-attach; false of a 19:21 one. The missing
+distinction is not WHEN the attach finished but whether it was ever racing the
+open, and only the START second carries that.
+
+- [x] **Gate the deadline verdict on whether the attach was racing the open**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `contract_attach_tests::the_preopen_deadline_does_not_apply_to_a_mid_session_restart`,
+    `an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns`,
+    `the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on`
+
+### Why no terraform change
+
+The CloudWatch filter is anchored on `{ $.fields.ready_at_ist_secs = * }`. The
+mid-session arm reports its completion second as `attached_at_ist_secs`
+instead, so it produces no datapoint at all. The alarm's threshold, statistic
+and `notBreaching` semantics are untouched, and the gauge is skipped on that
+arm for the reason its own doc already gives for the give-up paths: there is no
+readiness second, and publishing the wall clock as one reads as a permanently
+missed deadline.
+
+### Guarantee matrix
+
+Carried by reference from this plan's shared matrix (15-row + 7-row). Rows that
+move for this item: **monitoring** (an armed alarm stops firing on normal
+operation), **logging** (the mid-session arm gets its own line and field),
+**alerting** (`WS-GAP-02` no longer fires on a restart), **scenarios**
+(restart-after-deadline is now a covered case), **extreme check** (three tests,
+all bite-proven). No hot-path, schema, DEDUP-key, or WebSocket-count change, so
+the 7-row resilience matrix is unmoved.
+
+### Honest envelope
+
+- This removes a FALSE page. It does not make any attach faster, and a genuinely
+  late pre-open still fires exactly as before — pinned by
+  `an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns`.
+- Keyed on the attach START, so an attach beginning at 09:11 and finishing at
+  09:20 is still judged. Excusing that would hollow the alarm out from the other
+  side while fixing the false pages.
+- UNVERIFIED-LIVE: the fix is proven in tests and by source scan against the
+  real filter pattern; that the alarm actually stays quiet across tomorrow's
+  restarts is measured tomorrow, not claimed here.
+
+---
+
+## Item 15 — the silence detector was blind to 96% of the universe (2026-08-25)
+
+**Status: DONE.** Found while verifying that the 2026-08-21 IDX_I Quote-mode fix
+had worked. It had (`never_ticked: 0`, vs 119 the day before) — but the same log
+lines carried the real finding.
+
+### Measured
+
+```
+08:31:09  refused: 1,276,658  tracked: 865
+12:37:47  refused: 1,211,764  tracked: 865
+```
+
+865 is exactly the spot universe. Today's subscribed set was **23,044**
+(868 spot + 22,176 contracts).
+
+### The defect
+
+`LiveIngest::new(writer, capacity)` uses one number for two things with
+opposite semantics: a SOFT pre-size for the fold, and a HARD cap for the
+detector (`TickGapDetector::with_capacity` — "Never grows; never reallocates").
+The boot site computes `capacity` from the main-feed set BEFORE any socket
+opens, which is the spot universe; the ~22,000 contracts attach minutes later
+via `run_contract_attach`. Every contract tick was then refused a slot.
+
+Consequence, in the detector's own words: `scan_silence`'s `silent` and
+`never_ticked` counts "describe only the instruments it still tracks, while
+reading exactly as though they describe all of them". A contract that was
+silently never subscribed could not be reported by anything.
+
+- [x] **Size the detector at the authorized ceiling, not the boot-time count**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `tests::the_detector_outlives_the_boot_time_universe_when_given_the_ceiling`,
+    `a_detector_at_its_ceiling_still_refuses_and_still_counts`,
+    `the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling`
+
+### Why the ceiling and not a bigger boot-time count
+
+The ceiling does not depend on WHEN the universe is counted, so this cannot
+silently re-break the next time instruments are added after boot — which is
+exactly how it broke the first time. Cost: ~2 MB of slots plus its index,
+against a 32 GiB host.
+
+### Guarantee matrix
+
+Carried by reference from this plan's shared matrix. Rows that move:
+**monitoring** (silence detection now covers the whole subscribed set),
+**scenarios** (grow-after-boot is a covered case), **extreme check** (three
+tests, bite-proven). Fail-closed behaviour at the ceiling is explicitly
+preserved and pinned — a tracked instrument is still never evicted.
+
+### Honest envelope
+
+- This makes the detector ABLE to see contracts. It does not prove any
+  contract is actually ticking, and it adds no alarm: the refusal gauge is not
+  EMF-selected (user-data byte budget), so the coded log line remains the only
+  operator surface.
+- It does not address loss UPSTREAM at the vendor: Dhan publishes no sequence
+  number and skips a slow consumer forward, so ticks discarded on their side
+  are invisible to every counter we own. The 15:31 cross-verification remains
+  the only ground truth for that class.
+
+---
+
+> **MERGE NOTE 2026-08-25 (second occurrence).** Two items were appended to
+> this file in parallel and the numbering collided again — main's silence-detector
+> item is numbered 15 while the audit-findings item below is numbered 23. Both
+> are kept verbatim; neither is renumbered, for the same reason the 2026-08-25
+> note above the two "Item 12" sections gives: a plan file is an audit trail,
+> and renumbering a landed item breaks every reference to it. Read them by
+> title, not by number.
+
+## ITEM 23 — The nine audit findings, fixed (2026-08-25, operator: "fix and resolve evrythignd dude okay? meanhwiel ensure to pull the latest merged changes and only then do ti dude okay? i mean fix and resolve all of them dude okay?")
+
+The 2026-08-25 five-agent audit produced nine verified findings. This item
+closes all nine. Seven of them were the SAME defect: a table, a constant or a
+comment that was declared, given a schema or a doc, and never wired to
+anything — invisible precisely because it looks finished.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 01 | The 15:41 cross-verify — the feed's only proof of correctness — was logged and discarded. Both writers and the DDL had ZERO callers, and a comment claimed the opposite | WIRED + comment retracted |
+| 02 | `instrument_lifecycle_audit`, the 5-year regulatory chain, had no writer | WIRED |
+| 03 | The disk alert was a fixed 10 GiB justified as "~10% of the 100 GB volume"; the volume is 300 GB | DERIVED from the measured volume |
+| 04 | 22,996 of 25,000 slots used; overflow refuses the WHOLE subscription | HEADROOM WARNING added |
+| 05 | Fourteen tables stopped applying rows on 2026-08-25 and the alarm stayed silent | LAG DETECTOR + BLIND SENTINEL |
+| 06 | 305 of 381 metrics never leave the box; blocked at 0 free user-data bytes | 2,515 BYTES FREED |
+| 07 | Array indexing was not lint-blocked on the packet-decode path | DENIED, 23 reviewed allows |
+| 08 | `MAX_DAILY_UNIVERSE_SIZE` had zero production readers | READ, with a drift warning |
+| 09 | The reset command destroys the SEBI tables with no export | EXPORT-OR-ABORT added |
+
+## Design (Item 23)
+
+Each fix is the smallest change that makes the declared thing true, and every
+one is pinned by a test that fails the build if it is undone.
+
+**01** — `CrossverifyDeps` gains the ILP write config; `persist_xverify_report`
+writes findings + a daily row after every run, INCLUDING vacuous ones ("we
+could not measure today" is a fact about the feed). `ensure_dhan_live_crossverify_tables`
+is called at boot beside the ticks/depth DDL, so ILP cannot auto-create either
+table without its DEDUP key.
+
+**02** — `KnownInstrument` carries the full prior `LifecycleState`, not just a
+boolean. `classify_lifecycle_transition` is a NEW classifier rather than a
+reuse of `lifecycle_reconciler::classify_transition`, deliberately: that one
+answers "is the row present in today's CSV?", and the Dhan master keeps expired
+contracts IN the file with a past expiry date — so the reconciler returns
+`None` for the single most common transition in the product.
+
+**03** — `spill_disk_free_critical_threshold(total)` = `max(10 GiB, total/10)`.
+The floor means the threshold can only move UP relative to today.
+
+**04/08** — `report_universe_headroom` warns below 10% free and cross-checks
+the caller's capacity against `MAX_DAILY_UNIVERSE_SIZE`, which had no reader.
+
+**05** — `WalLagTracker` flags tables whose apply lag is above a floor AND
+non-decreasing for five consecutive polls. Growth, not magnitude: this repo has
+never measured a normal session's peak lag, and guessing an absolute number is
+the failure being corrected. Separately, five consecutive probe failures set
+the suspended-tables gauge to −1 instead of leaving a stale `0` standing.
+
+**06** — user-data writes a minimal host-only agent config and copies
+`deploy/aws/cloudwatch-agent.json` into place after the Step 5 clone. One copy
+cannot drift from itself, and the lockstep guard inverts to pin the new shape.
+
+**07** — `deny(clippy::indexing_slicing)` on the nine Dhan parser modules,
+`cfg_attr(not(test))` like the existing unwrap/expect bans. 23 reviewed allows.
+
+**09** — Both destructive actions export the four SEBI tables to a directory
+outside the volume before touching it, and ABORT if a table exists and cannot
+be exported.
+
+## Edge Cases (Item 23)
+
+- Vacuous/blind cross-verify run → still persisted, stamped from the run, not `now()`.
+- No findings → daily row still written, no fabricated timestamp.
+- Rerun of either writer → UPSERTs, because both DEDUP keys carry the run stamp.
+- Unchanged instrument → NO audit row (else the chain becomes a 150,000-row daily snapshot).
+- `Delisted` → never auto-audited; it is an operator-set terminal state.
+- Small dev disk → keeps the 10 GiB floor; degenerate `total = 0` cannot disarm the alarm.
+- Busy-but-healthy table with oscillating lag → never pages (asserted with ten oscillating samples).
+- Missing `writerTxn`/`sequencerTxn` → no lag verdict, never a fabricated zero.
+- QuestDB unreachable during a reset → export skipped LOUDLY and the reset proceeds; it is also the remedy for a wedged QuestDB.
+- Clone fails → host metrics still flow from the fallback config.
+
+## Failure Modes (Item 23)
+
+| If this breaks | Consequence | Bound |
+|---|---|---|
+| xverify persist fails | today's comparison exists only in the log | pages via the alarmed `xverify_failed` label |
+| lifecycle audit write fails | today's history missing; STATE unaffected | logged + counted, never fails the state write |
+| lag detector threshold wrong | false pages, or a missed stall | edge-latched; growth-based, so a catching-up table clears it |
+| blind sentinel wrong | gauge reads −1 while healthy | one successful probe clears it |
+| SEBI export wrong | a reset destroys regulatory data | ABORTS rather than proceeding |
+| CW agent copy fails | app metrics absent | host metrics still flow; two WARNING lines say which |
+
+## Test Plan (Item 23)
+
+`derived_threshold_scales_with_the_volume` (5 cases + monotonicity) ·
+`growing_lag_fires_on_a_stuck_table_and_stays_quiet_on_a_busy_one` (the
+2026-08-25 shape replayed, plus ten healthy oscillations) ·
+`a_recovered_table_can_page_again_on_a_second_episode` ·
+`the_blind_gauge_sentinel_can_never_collide_with_a_real_reading` ·
+`the_daily_row_carries_every_comparison_total` (distinct values per field so a
+transposition cannot pass) · `the_cross_verification_findings_are_actually_persisted` ·
+`the_audit_chain_records_every_state_change_and_nothing_else` ·
+`a_delisted_instrument_is_never_audited_automatically` ·
+`the_documented_universe_ceiling_is_actually_read_and_matches_its_derivation` ·
+`destructive_actions_export_the_sebi_tables_before_destroying_the_volume`
+(asserts ORDER, not just presence) · `user_data_carries_no_second_copy_of_the_selector` ·
+`the_deployed_agent_config_is_the_repo_file_and_has_no_second_copy`.
+The indexing deny is bite-proven: removing one allow produces 8 errors.
+
+## Rollback (Item 23)
+
+Every change is additive or a guard inversion; `git revert` restores the prior
+behaviour with no schema migration. The two new tables are `CREATE TABLE IF NOT
+EXISTS` and are never read by anything else, so leaving them behind costs
+nothing. The user-data change is the only one that touches the boot path: the
+fallback config means a revert is never required to keep host metrics flowing.
+
+## Observability (Item 23)
+
+New: `tv_dhan_feed_xverify_rows_total`, `tv_dhan_feed_xverify_persist_errors_total`,
+`tv_instrument_lifecycle_audit_rows_total` — all local-only, deliberately NOT
+EMF-selected. Each already pages through an existing log filter, and a metric
+shipped with nothing watching it is the paid-for-and-unwatched shape these
+alarms were added to end. One new CloudWatch alarm,
+`tv-<env>-wal-suspension-probe-blind`, on a gauge that is already selected:
+~$0.10/mo, no new metric name, no user-data byte.
+
+### Per-Item Guarantee Matrix (Item 23)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +
+7-row). Coverage: 12 new tests across 5 crates; audit coverage: two tables that
+had no writer now have one; performance: no hot-path change (the indexing deny
+generates identical code); security: no new external surface, the SEBI export
+writes locally with no credentials; O(1): the lag tracker is O(tables) on a
+60s timer over ~30 rows, the threshold derivation is O(1), the audit builder is
+O(rows) with one hash lookup each — all cold path.
+
+**Honest envelope:** 100% inside the tested envelope, with ratcheted regression
+coverage. NOT claimed: that the WAL-suspension silence of 2026-08-25 is now
+explained — the recorded txn evidence is consistent with the lag path and the
+blind-probe path, and the day cannot be replayed, so BOTH are fixed rather than
+one being declared the cause. NOT claimed: that the lag threshold is calibrated
+— no normal-session baseline exists, which is why the signal is growth and not
+magnitude; the first session with real lag data is what validates it. NOT
+claimed: that the user-data restructure is live-verified — no instance has
+booted with it, and the fallback exists precisely because that is unproven.
+
+
+---
+
+## Item 24 — the ILP flush leaves the frame-drain task (2026-08-25)
+
+- [x] `TickWriter::split_for_offload` — producer keeps the buffer and the row
+      accounting; a new `TickWriterSink` takes the ILP `Sender`
+  - Files: `crates/storage/src/tick_persistence.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `offloaded_flush_hands_the_rows_off_and_does_not_touch_the_network`,
+    `a_full_queue_keeps_the_rows_and_never_reports_them_as_dropped`,
+    `the_sink_reports_zero_rows_when_the_flush_fails`,
+    `a_writer_that_was_never_split_behaves_exactly_as_before`,
+    `an_offloaded_flush_never_touches_the_network_from_the_drain`,
+    `the_writer_thread_is_joined_at_shutdown_so_the_tail_batch_lands`,
+    `test_drain_never_flushes_bare_on_the_async_worker` (re-blessed, 3 bites)
+
+### Design
+
+`TickWriter::flush` is a synchronous ILP-over-HTTP round trip with a 5 s
+timeout, and it ran ON the frame-drain task. `blocking_flush`/`block_in_place`
+bounded the damage to the RUNTIME — the other tasks keep their workers — but
+did nothing for the drain itself, and the drain is the only consumer of the
+frame ring. So a slow database stopped the fold, the socket receive buffer
+filled, and Dhan — whose published behaviour is to skip a slow consumer forward
+to "the latest available state", with no sequence number — discarded the
+intermediate ticks at THEIR side. That loss is invisible to every counter we
+own, and no amount of provisioned disk throughput removes it, because the
+coupling is structural rather than a matter of speed.
+
+The writer is now split across a bounded `sync_channel` (`FLUSH_QUEUE_DEPTH`
+= 4) with a named OS thread `tv-tick-writer` on the far side. The drain's flush
+becomes a `try_send`.
+
+### Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Queue full | `OffloadOutcome::QueueFull` — rows RETAINED and still pending, `Ok(())` returned, next flush retries. Counted by `tv_tick_flush_queue_full_total`. Never reported as loss, because none happened. |
+| Queue full past `MAX_PRODUCER_BUFFER_BYTES` (64 MiB) | Stops accumulating and rescues through the existing `discard_pending` path — durable, counted, re-ingestable. Bounds the memory an hour-long stall can consume. |
+| Writer thread gone | Rescue + `Err`, never a silent success. |
+| Writer never split | Byte-for-byte the previous synchronous behaviour, pinned by its own test. |
+| Shutdown | `shutdown_offload_writer` closes the queue and JOINS, after the tail flush. |
+
+### Failure Modes
+
+The tail flush was the sharp one: it hands the last batch to the queue, so
+without a join the process could exit with that batch in flight — re-creating,
+one queue further out, exactly the loss the tail flush exists to prevent. The
+join handle therefore lives inside `LiveIngest`, where the drain that owns the
+tail flush can reach it, and a source-scan assertion pins the call.
+
+Spawn failure is non-fatal and non-silent: the lane falls back to the
+synchronous path with a coded error. Degraded beats refusing to boot.
+
+### Test Plan
+
+132 test binaries green across `tickvault-storage` + `tickvault-app` with
+`--no-fail-fast`, zero failures. The structural guard was bite-proven three
+ways — a bare blocking flush, a never-wired boot site, and a removed shutdown
+join each turn it red, and each restores green.
+
+### Rollback
+
+Delete the `spawn_offload_writer` call at the boot site. Everything else is
+inert: `flush` branches on `offload.is_some()`, which is `None` on every
+constructor.
+
+### Observability
+
+New: `tv_tick_flush_offloaded_total`, `tv_tick_flush_queue_full_total` — local
+exporter only, deliberately NOT EMF-selected and NOT alarmed. **The loss path
+they sit on is already alarmed**: a stall long enough to matter crosses the
+producer ceiling and increments `tv_ticks_dropped_total`, which carries
+`tv-<env>-ticks-dropped`, plus `tv_ticks_spilled_total` and the coded
+`HOT-PATH-02` error. A transient full queue is backpressure, not loss, and
+paging on it would train the operator to ignore the counter that means loss.
+No new rule row is needed because no new page is added.
+
+### Per-Item Guarantee Matrix (Item 24)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +
+7-row). Coverage: 6 new tests + 1 re-blessed guard, bite-proven 3 ways. Zero
+tick-drop path added — the queue-full arm is the proof, and it retains rows.
+O(1): the hand-off is one `try_send` and one `mem::replace`; no allocation is
+added to the per-tick path (the replacement `Buffer` is minted once per FLUSH,
+at 500 ms cadence, not per row).
+
+**Honest envelope:** 100% inside the tested envelope, with ratcheted regression
+coverage: the drain's flush no longer performs network I/O, a full queue
+retains rows rather than blocking or dropping, and the session tail is joined
+before exit. **NOT claimed:** that this removes tick loss — it removes ONE
+mechanism (drain stall → socket backpressure → vendor-side skip-forward), and
+the vendor's skip-forward remains undetectable to us because the India feed
+carries no sequence number. **NOT claimed:** that it is measured live — no
+instance has run it; the ~25× write amplification that makes the disk saturate
+in the first place is untouched and is the next item. **NOT claimed:** clippy
+clean locally — the component is not installed in this container; CI's Build &
+Verify is the check.
+
+### Item 24 — compliance with Item 14d's five binding conditions
+
+Item 14 recorded this design on 2026-08-25 and bound the implementing PR to
+five conditions. Audited one by one rather than asserted:
+
+| | Condition | Status |
+|---|---|---|
+| **C1** | Overflow SPILLS, never a silent drop, never a blocking append on the fold path | **PASS** — `try_send`, never `send`; every cut routes through the existing rescue tier |
+| **C2** | The drain ships pre-stamped rows; the writer never mints `capture_seq` | **PASS** — `FlushBatch` carries a finished `Buffer`; the sink only calls `sender.flush()` |
+| **C3** | `record_ticks` and `LAST_TICK_AGE_GAUGE` move to the writer | **PASS, by construction** — `record_ticks` is on the thread, and the gauge is *derived* from `feed_health.last_tick_age_secs`, so it follows the registry the writer stamps. `no_ticks_alarm_gauge_guard.rs` passes unchanged, so no re-bless and no dated §2.3b edit are needed — the alarm still means "rows persisted" |
+| **C4** | Bounded shutdown grace; batch width capped; `max_buf_size` headroom const-asserted | **PASS — and this was the one the first draft FAILED** |
+| **C5** | A size cut must fire well before the 100 MiB questdb-rs wedge | **PASS** — `MAX_PRODUCER_BUFFER_BYTES` is const-asserted at ≤ half of `QUESTDB_MAX_BUF_SIZE_BYTES` |
+
+**C4 is worth writing out, because the first draft of Item 24 shipped without
+it and would have made the disk problem worse.** Item 14's hostile pass had
+flagged the own-goal: a decoupled writer accumulates under pressure, so each
+commit spans a wider row range — and wider commits are what the amplification
+is made of. It bound the implementation to cap width *until 14b(3) was
+measured*. Item 15/f638bb66 then measured it: `ticks` is `PARTITION BY HOUR` on
+the exchange last-TRADE time, and **10.0% of one day's 64.3M ticks carried a
+`ts` more than an hour behind arrival**, so one commit in ten reopens a closed
+hourly partition and rewrites it. **Commit width is the amplifier**, which is
+the branch of 14b(3) that makes the cap mandatory rather than optional.
+
+Three fixes followed:
+
+1. `MAX_RETAINED_FLUSH_SPANS = 2` — the producer may retain across two flush
+   spans, then stops widening and spills. Enforced on the retain path, not
+   merely declared, and pinned by the structural guard.
+2. `OFFLOAD_SHUTDOWN_GRACE = 30 s` — `JoinHandle::join` has no timeout, so a
+   writer wedged on a hung socket would have hung the box's shutdown. Worse,
+   on a host whose auto-stop is a cost control, than losing the tail batch.
+3. `MAX_PRODUCER_BUFFER_BYTES` 64 MiB → **32 MiB**. The const assertion
+   *refused to compile* at 64 — the assertion doing its job, on the first
+   number I picked.
+
+`OffloadOutcome::WidthCapped` is a distinct arm from `SinkGone` because the
+writer is alive and well during a width cut; reporting "the writer thread is
+gone" would send an operator to diagnose a healthy thread.
+
+**14e** (no new EMF metric name may ship — `user-data.sh.tftpl` at zero free
+bytes) is honoured: all three new counters are local-exporter only. The loss
+path they sit on already pages through `tv_ticks_dropped_total`.

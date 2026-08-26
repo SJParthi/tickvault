@@ -1006,3 +1006,142 @@ them), so "the disk is healthy again" is a true statement worth sending.
 **NOT claimed:** that this prevents a full disk. It reports that the automation has
 reached the end of what it is permitted to do. The remedy — grow the volume, or cut
 ingest scope — is the operator's, deliberately.
+
+## COST NOTE 2026-08-25 — cross-verify blind pages + 6 unwatched Lambdas (+~$0.80/mo)
+
+Authority: operator 2026-08-25, *"Fix wbrytjonf dude oaku"*, recorded verbatim in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3f BEFORE this terraform, per the
+rule-file-first law.
+
+**+8 alarms ≈ $0.80/mo.** TWO errcode log-filter alarms
+(`ws-gap-03-xverify-vacuous` + `-failed`, `error-code-alarms.tf`) plus six `AWS/Lambda` `Errors`
+alarms. **Zero new EMF names and zero user-data bytes** — the errcode lane derives
+its metric from a log stream that already exists, and the Lambda alarms read an AWS
+namespace we do not publish.
+
+**Measured against the live account the same day**, rather than against the planning
+envelope: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130**
+with the 90% `STOP_EC2_INSTANCES` action line at **$117**. The Quote 19 hard maximum
+is $150. Eighty cents is inside every one of those with room to spare, and it is
+named here rather than absorbed because this file's own history shows round "it's
+only a dime" additions accumulating into the ~$3.27/mo CloudWatch line that the
+2026-07-31 ruling then had to account for.
+
+**Why the cross-verify dime earns itself.** The 15:41 comparison is the only ground
+truth the revived Dhan feed has — the one check that distinguishes a lane that is
+capturing real ticks from one that is merely dialling. Both of its failure verdicts
+reached nothing: the counter is in neither EMF selector copy, and the log line
+carries `WS-GAP-03`, a code with ~50 emit sites. A vacuous run reporting "no
+mismatches" is the false-OK class this repo has retired twice.
+
+**Why the six Lambda dimes earn themselves.** They were not a decision. 13
+`aws_lambda_function` resources, 7 alarmed, 6 not — each of the six created by a PR
+that did not think to add one. Among them: the Lambda that STARTS the trading box
+every morning, and the one that force-stops it when it runs out of window or over
+budget. A throwing invocation writes to its own log group and stops there.
+
+**The ratchet is the part that lasts.** Six alarms fix today's list;
+`every_lambda_has_an_errors_alarm_or_a_declared_exemption` stops the seventh Lambda
+arriving unwatched, which is how these six accumulated in the first place.
+
+**NOT claimed:** an `Errors` alarm catches a Lambda that THROWS. A Lambda that
+returns success having done nothing useful is invisible to it — `start_watchdog`'s
+separate not-invoked alarm exists precisely because a dropped schedule produces no
+error at all, and that class is unchanged.
+
+## COST NOTE 2026-08-25 (SECOND, same day) — the two disk/WAL gauges that were shipping unwatched (+~$0.20/mo)
+
+**Authorization:** `dhan-rest-only-noise-lock-2026-07-14.md` §2.3g (operator
+2026-08-25, naming "disk rpessure ... ram wal disk spill" and ruling out human
+monitoring). Recorded there before the terraform, per the rule-file-first law.
+
+**What was added:** two CloudWatch alarms, `tv-prod-spill-dir-free-low`
+(`tv_spill_dir_free_bytes` ≤ 20 GiB) and `tv-prod-questdb-wal-suspended`
+(`tv_questdb_wal_suspended_tables` ≥ 1).
+
+**Cost: +2 alarms × $0.10 = ~$0.20/mo. NO new EMF metric name and no
+user-data byte** — both gauges were ALREADY EMF-selected and already reaching
+CloudWatch. This is the cheapest class of fix available on this account, and
+it is the only class available at all: the user-data template renders at
+exactly its 15,872-byte budget with **zero** free (§2.3d-ii of the noise lock),
+so an alarm needing a new EMF name cannot ship today.
+
+**Why it was worth spending.** MEASURED from the live account, 2026-08-25:
+
+| IST | free bytes | suspended tables |
+|---|---:|---:|
+| 08:30 | 38.8 GB | 0 |
+| 09:30 | 14.5 GB | 0 |
+| 10:30 | **20,480** | 3 |
+| 11:30 | 20,480 | **15** |
+| 13:30 | 58.6 GB | 0 |
+
+The account was already paying to publish both series. Neither had an alarm,
+so the hour of warning between 38.8 GB and 14.5 GB reached nobody, and a
+three-hour full disk that suspended fifteen tables surfaced only when the
+operator asked why a table was empty. Paying $0.30/mo to ship a number and
+$0.00 to watch it is the worst of both.
+
+**Bill impact.** The measured high-side month on the current configuration is
+$118.28 (Quote 19 arithmetic: 22 weekdays × $4.06 + 8 weekend days × $2.48,
+plus the 300 GB grow). This adds $0.20 → **$118.48**, still under the operator's
+$125 hard cap (Quote 18) and still **$1.48 ABOVE** the budget's automatic
+`STOP_EC2_INSTANCES` line at 90% of the $130 `limit_amount` = $117.00.
+
+That last figure is unchanged in kind by this note but worth restating rather
+than letting a fifth small addition hide it: **a maximal month now projects
+above the line that switches the trading box off.** August itself is nowhere
+near it (actual $49.90 / forecast $65.42, read live the same day), so nothing
+fires today. The two levers remain what Quote 19 recorded — release the Elastic
+IP (already approved in principle by Quote 10, −$3.60/mo) or align
+`limit_amount` with the $125 cap, which cannot be done as written because 90%
+of 125 is $112.50, below the projected bill.
+
+**⚠ And the kill-switch state is still unverifiable, for the fifth time:**
+`budgets:DescribeBudgetActionsForBudget` remains `AccessDenied` for
+`user/claude-code-agent`, so whether the two `STOP_EC2_INSTANCES` actions
+recorded in `EXECUTION_FAILURE` on 2026-07-31 still fail is **Unknown**. If
+they are broken the $117 line is arithmetic about a switch that does not
+throw; if they are fixed the box gets stopped mid-month. A broken safety net
+is never a reason to cross a threshold.
+
+## COST NOTE 2026-08-25 (THIRD, same day) — the byte budget that blocked three counters was already freed (+~$1.00/mo)
+
+Authorization: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3h, operator quote
+2026-08-25 ("Yes go ahead fix and resolve everything"), recorded before the
+change per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_wal_suspension_probe_failed_total` EMF name | $0.30 |
+| `tv_candle_session_high_recovered_total` EMF name | $0.30 |
+| `tv_candle_session_low_recovered_total` EMF name | $0.30 |
+| `tv-<env>-questdb-wal-probe-failed` alarm | $0.10 |
+| **Total** | **~$1.00/mo** |
+
+**Zero user-data bytes**, which is the part worth recording. Every prior note on
+this surface priced an EMF name at 33 bytes against a template with none to
+spare — §2.3d-ii measured it at exactly 15,872 of 15,872 on 2026-08-22. #1815
+then moved the selector OUT of `user-data.sh.tftpl` into
+`deploy/aws/cloudwatch-agent.json`, `cp`'d in after the Step 5 clone, and
+`cw_agent_selector_lockstep_guard` now FORBIDS a second copy. The template
+renders **13,869** today. The byte cost of an EMF name is now nil, and the
+figure that said otherwise was repeated by citation four times after it stopped
+being true.
+
+**Two names deliberately NOT shipped**, saving $0.60/mo:
+`tv_candle_day_high_adopted_total` and `day_low_adopted_total` fire on the first
+bucket of a session only — 0 and 3 today against the session counters' 2,632 and
+247. Same mechanism at ~1% of the resolution.
+
+**Budget position, stated rather than absorbed.** The COST NOTE above (SECOND,
+same day) put a maximal month at **$118.28** against the 90%
+`STOP_EC2_INSTANCES` line of **$117.00** at the live `limit_amount` of $130 —
+already $1.28 over. This takes it to **~$119.28**, about $2.28 over. The live
+account is far below that (MTD **$48.87**, forecast **$61.51**, both measured
+2026-08-25), so no stop is imminent, but the maximal-month arithmetic crosses
+the automatic action line and widens with each addition. The levers are
+unchanged and neither is taken here: the already-approved Quote 10 EIP release
+(−$3.60/mo, bundled with an instance recreate), or an operator decision on
+`limit_amount` — which Quote 18 forbids raising above 125, and which cannot be
+set to 125 because 90% of that is $112.50, below the bill.

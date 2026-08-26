@@ -38,9 +38,52 @@ done"#,
 ];
 
 /// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.
-pub const DOCKER_RESET_COMMANDS: [&str; 17] = [
+pub const DOCKER_RESET_COMMANDS: [&str; 18] = [
     r#"set +e"#,
     r#"systemctl stop tickvault || true"#,
+    // ---- SEBI PRESERVE (added 2026-08-25) ----
+    //
+    // The sibling `wipe-questdb` action carefully allowlists ONLY market-data
+    // tables, so the 5-year regulatory tables survive it. This action destroys
+    // the whole `tv-questdb-data` volume, which takes them with it — with no
+    // exclusion and nothing exported first. The typed-confirm guard and the
+    // market-hours guard both exist and are unchanged; what did not exist was
+    // any way to get the regulatory history back afterwards.
+    //
+    // Exports to a directory OUTSIDE the volume and outside every `rm -rf`
+    // path in this action, so the data survives the reset with no credentials
+    // and no S3 dependency.
+    //
+    // The abort rule is deliberately asymmetric. QuestDB unreachable =>
+    // continue: this action exists partly to recover a wedged QuestDB, and
+    // there is nothing to export from a server that cannot answer. A table
+    // that EXISTS and fails to export => abort: that is data we could have
+    // saved and chose not to.
+    r#"QDB='http://127.0.0.1:9000'
+OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
+SEBI='instrument_lifecycle instrument_lifecycle_audit index_constituency order_audit'
+ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
+if [ -z "$ALL" ]; then
+  echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — nothing could be exported. Proceeding, because this action is also the remedy for a wedged QuestDB.'
+else
+  mkdir -p "$OUT" || true
+  FAIL=0
+  for t in $SEBI; do
+    if printf '%s\n' "$ALL" | grep -qx "$t"; then
+      if curl -fsS --max-time 300 --get --data-urlencode "query=SELECT * FROM $t" "$QDB/exp" -o "$OUT/$t.csv"; then
+        echo "SEBI-PRESERVED $t $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+      else
+        echo "SEBI-PRESERVE-FAILED $t"; FAIL=1
+      fi
+    else
+      echo "SEBI-ABSENT $t"
+    fi
+  done
+  if [ "$FAIL" = 1 ]; then
+    echo 'ABORTED: a 5-year SEBI table exists and could NOT be exported — refusing to destroy the database volume. Fix the export, or move the table aside deliberately, then re-run.'
+    exit 1
+  fi
+fi"#,
     r#"docker ps -aq --filter volume=tv-questdb-data | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker rm -f tv-questdb tv-loki tv-alloy 2>/dev/null || true"#,
     r#"cd /opt/tickvault/repo/deploy/docker || exit 0"#,
@@ -59,10 +102,53 @@ pub const DOCKER_RESET_COMMANDS: [&str; 17] = [
 ];
 
 /// legacy: `lambda_handler docker-nuke-bare cmds` (handler.py:1338-1368) — captured from the RUNNING oracle.
-pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 11] = [
+pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 12] = [
     r#"set +e"#,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
+    // ---- SEBI PRESERVE (added 2026-08-25) ----
+    //
+    // The sibling `wipe-questdb` action carefully allowlists ONLY market-data
+    // tables, so the 5-year regulatory tables survive it. This action destroys
+    // the whole `tv-questdb-data` volume, which takes them with it — with no
+    // exclusion and nothing exported first. The typed-confirm guard and the
+    // market-hours guard both exist and are unchanged; what did not exist was
+    // any way to get the regulatory history back afterwards.
+    //
+    // Exports to a directory OUTSIDE the volume and outside every `rm -rf`
+    // path in this action, so the data survives the reset with no credentials
+    // and no S3 dependency.
+    //
+    // The abort rule is deliberately asymmetric. QuestDB unreachable =>
+    // continue: this action exists partly to recover a wedged QuestDB, and
+    // there is nothing to export from a server that cannot answer. A table
+    // that EXISTS and fails to export => abort: that is data we could have
+    // saved and chose not to.
+    r#"QDB='http://127.0.0.1:9000'
+OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
+SEBI='instrument_lifecycle instrument_lifecycle_audit index_constituency order_audit'
+ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
+if [ -z "$ALL" ]; then
+  echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — nothing could be exported. Proceeding, because this action is also the remedy for a wedged QuestDB.'
+else
+  mkdir -p "$OUT" || true
+  FAIL=0
+  for t in $SEBI; do
+    if printf '%s\n' "$ALL" | grep -qx "$t"; then
+      if curl -fsS --max-time 300 --get --data-urlencode "query=SELECT * FROM $t" "$QDB/exp" -o "$OUT/$t.csv"; then
+        echo "SEBI-PRESERVED $t $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+      else
+        echo "SEBI-PRESERVE-FAILED $t"; FAIL=1
+      fi
+    else
+      echo "SEBI-ABSENT $t"
+    fi
+  done
+  if [ "$FAIL" = 1 ]; then
+    echo 'ABORTED: a 5-year SEBI table exists and could NOT be exported — refusing to destroy the database volume. Fix the export, or move the table aside deliberately, then re-run.'
+    exit 1
+  fi
+fi"#,
     r#"docker ps -aq | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker images -aq | xargs -r docker rmi -f 2>/dev/null || true"#,
     r#"docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true"#,

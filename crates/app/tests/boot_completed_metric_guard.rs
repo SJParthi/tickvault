@@ -129,7 +129,15 @@ fn boot_completed_emit_sites_are_gated_on_live_feed() {
 
 #[test]
 fn test_metric_is_in_cloudwatch_scrape_filter() {
-    let tftpl = read_repo("deploy/aws/terraform/user-data.sh.tftpl");
+    // 2026-08-25: the deployed CloudWatch-agent config is
+    // `deploy/aws/cloudwatch-agent.json`. It used to be duplicated inside
+    // `user-data.sh.tftpl` and this guard read that copy — but the duplicate
+    // was ~1.6 KB and it pinned the template at exactly its 15,872-byte EC2
+    // budget with ZERO bytes free, so it was removed. The template now writes
+    // a minimal host-only fallback and copies this file into place after the
+    // Step 5 clone; `cw_agent_selector_lockstep_guard.rs` pins that the copy
+    // still happens and that no second selector reappears.
+    let tftpl = read_repo("deploy/aws/cloudwatch-agent.json");
     // 2026-07-02 root-cause fix (B1): the metric-name regex now lives ONLY in
     // `metric_selectors`. The old shape duplicated it into `label_matcher`
     // with `source_labels: ["__name__"]` — but `__name__` is not a series

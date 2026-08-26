@@ -1,15 +1,30 @@
 //! Ratchet: every metric named in `deploy/aws/terraform/app-alarms.tf`
 //! must be emitted somewhere in the Rust codebase, AND must be present
-//! in the CloudWatch agent's prometheus EMF metric_declaration filter
-//! in `deploy/aws/terraform/user-data.sh.tftpl`.
+//! in the CloudWatch agent's prometheus EMF metric_declaration filter.
 //!
 //! Three-way drift check:
 //!   1. alarm metric_name → has matching `counter!` / `gauge!` call in crates/
-//!   2. alarm metric_name → appears in user-data EMF filter list
+//!   2. alarm metric_name → appears in the EMF filter list
 //!   3. EMF filter list metric → appears in at least one alarm
 //!
 //! Without this guard, renaming a Rust metric (or dropping it from the
 //! EMF filter) silently breaks the alarm — operator gets no Telegram.
+//!
+//! # 2026-08-25: where "deployed" now lives
+//!
+//! Until 2026-08-25 the agent config was embedded in
+//! `deploy/aws/terraform/user-data.sh.tftpl` AND duplicated in
+//! `deploy/aws/cloudwatch-agent.json`, with a separate lockstep guard keeping
+//! the two byte-identical. That duplicate was ~1.6 KB and it pinned the
+//! user-data template at EXACTLY its 15,872-byte budget with zero bytes free,
+//! which blocked every further boot-script change.
+//!
+//! The template now writes a minimal host-only fallback and copies the repo
+//! file into place after the Step 5 clone, so `deploy/aws/cloudwatch-agent.json`
+//! IS the deployed config — there is one copy and it cannot drift from
+//! itself. Every check below therefore reads that file. That the template
+//! still installs it (and no longer embeds a selector of its own) is pinned
+//! separately by `cw_agent_selector_lockstep_guard.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +41,14 @@ fn read(rel: &str) -> String {
     let p = workspace_root().join(rel);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())) // APPROVED: test
 }
+
+/// The CloudWatch agent config the box actually loads.
+///
+/// Copied into `/opt/aws/amazon-cloudwatch-agent/etc/` by user-data Step
+/// 5b-ii, after the repo clone. Before 2026-08-25 this content was embedded in
+/// the user-data template and this constant pointed there; see the module
+/// header for why it moved.
+const DEPLOYED_CW_AGENT_CONFIG: &str = "deploy/aws/cloudwatch-agent.json";
 
 /// Pull every `metric_name = "tv_..."` literal out of the app-level alarm
 /// terraform files. 2026-07-06 (silent-feed incident hardening): scope
@@ -236,7 +259,7 @@ fn test_every_alarm_metric_has_a_rust_emit_site() {
 
 #[test]
 fn test_every_alarm_metric_is_in_emf_filter_list() {
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read(DEPLOYED_CW_AGENT_CONFIG);
     let names = alarm_metric_names();
     let mut missing = Vec::new();
     for name in &names {
@@ -326,10 +349,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
     // references a REAL label (`host`, stamped by prometheus.yaml's
     // static_configs) with `label_matcher` pinned to its literal value;
     // `metric_selectors` alone filters metric NAMES.
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             body.contains("\"source_labels\": [\"host\"]"),
@@ -562,7 +582,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // need the market-hours window gate's ALARM_NAMES list (its own terraform
     // change) and a sustained baseline these series do not yet have. Recorded
     // here rather than left to be discovered from a quiet dashboard.
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read(DEPLOYED_CW_AGENT_CONFIG);
     let names = emf_declared_names(&user_data, "metric_selectors");
     // 2026-08-14: 64 -> 65. ONE name added, `tv_dhan_ws_lag_excluded_total`,
     // alongside the first live-socket delivery-lag measurement. Cost ~$0.30/mo
@@ -764,10 +784,34 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // ratchet's own stated rule applied to its own exception. The counter is
     // still emitted and still on the box's /metrics; only its CloudWatch
     // series is gone, and live-lane-alarms.tf records that.
+    //
+    // 2026-08-25 (§2.3h), 76 -> 79. Three names, ~+$0.90/mo, and ZERO
+    // user-data bytes -- the constraint that blocked this until today is gone.
+    // #1815 moved the selector OUT of user-data.sh.tftpl into
+    // deploy/aws/cloudwatch-agent.json (cp'd in after the Step 5 clone), which
+    // cw_agent_selector_lockstep_guard now FORBIDS duplicating, so the 33-byte
+    // cost per name no longer exists. The "15,872 of 15,872, zero free" figure
+    // recorded in the noise lock §2.3d-ii was measured 2026-08-22 and was
+    // repeated by citation four times after it stopped being true; the template
+    // renders 13,869 today.
+    //
+    //   tv_wal_suspension_probe_failed_total    -- ALARMED (§2.3h). Guards the
+    //     WAL gauge, whose producer could once fail open.
+    //   tv_candle_session_high_recovered_total  -- metric only, deliberately
+    //   tv_candle_session_low_recovered_total   -- NOT alarmed: a flat session
+    //     legitimately sets no new day high, so zero recoveries is a NORMAL
+    //     reading. A pager that fires on a quiet market is the noise trap this
+    //     file records repeatedly. Charted so the mechanism is observable;
+    //     breakage of the fold itself is covered by tv_indicator_tick_rejected_total.
+    //
+    // NOT shipped: tv_candle_day_high_adopted_total and day_low_adopted_total.
+    // First-bucket-only -- 0 and 3 today against the session counters' 2,632
+    // and 247. Same mechanism at ~1% of the resolution; two more paid series
+    // for no added signal.
     assert_eq!(
         names.len(),
-        76,
-        "Z+ L2 VERIFY ratchet: expected exactly 76 names in the MAIN EMF \
+        79,
+        "Z+ L2 VERIFY ratchet: expected exactly 79 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -882,10 +926,7 @@ fn test_boundary_catchup_emf_declaration_stays_retired() {
     // declaration was a dead selector. Negative pin: neither agent config
     // may re-declare the metric (re-adding it without a live writer would
     // ship a permanently-empty paid series).
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             !body.contains("tv_boundary_catchup_total"),
@@ -948,7 +989,7 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
     // 2026-07-06: union across ALL metric_declaration entries. (2026-07-17:
     // the per-feed [host,feed] boundary-catchup declaration + its alarm
     // retired with the stage-3 tick-aggregator deletion.)
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read(DEPLOYED_CW_AGENT_CONFIG);
     let declared = emf_all_declared_names(&user_data);
     let alarms = alarm_metric_names();
     let missing: Vec<&String> = alarms.iter().filter(|a| !declared.contains(a)).collect();
@@ -961,50 +1002,38 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
 }
 
 #[test]
-fn test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration() {
-    // Drift-guard: `deploy/aws/cloudwatch-agent.json` is a REFERENCE copy of
-    // the DEPLOYED inline config in user-data.sh.tftpl (the file that
-    // `amazon-cloudwatch-agent-ctl -a fetch-config` actually loads). The
-    // grafana-cloud README cites the reference file as ground truth, so it
-    // must not drift. Pin the two EMF declarations to the same name-set.
+fn the_deployed_agent_config_is_the_repo_file_and_has_no_second_copy() {
+    // RETIRED-AND-REPLACED 2026-08-25.
+    //
+    // This test used to compare the EMF name-set in `cloudwatch-agent.json`
+    // against a byte-identical duplicate embedded in `user-data.sh.tftpl`.
+    // That duplicate is gone: the template now writes a minimal host-only
+    // fallback and copies the repo file into place after the Step 5 clone, so
+    // there is exactly ONE declaration and a drift comparison would be the
+    // file against itself — vacuously green, which is worse than absent.
+    //
+    // What replaces it is the property that actually has to hold now: the
+    // template must not re-embed a selector, and it must still install the
+    // repo file. Dropping the install while the selector stays absent would
+    // leave every box on the host-only fallback publishing no app metrics at
+    // all — a much quieter failure than drift ever was, so it needs a pin.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
-    let reference = read("deploy/aws/cloudwatch-agent.json");
-    let deployed_names = emf_declared_names(&user_data, "metric_selectors");
-    let reference_names = emf_declared_names(&reference, "metric_selectors");
+    let reference_names = emf_declared_names(&read(DEPLOYED_CW_AGENT_CONFIG), "metric_selectors");
     assert!(
         !reference_names.is_empty(),
-        "ratchet self-check: could not parse metric_selectors from cloudwatch-agent.json"
+        "ratchet self-check: could not parse metric_selectors from {DEPLOYED_CW_AGENT_CONFIG}"
     );
-    assert_eq!(
-        deployed_names,
-        reference_names,
-        "Z+ L3 RECONCILE drift-guard: the reference deploy/aws/cloudwatch-agent.json EMF \
-         name-set has drifted from the DEPLOYED user-data.sh.tftpl EMF name-set. The \
-         grafana-cloud README cites the reference file, so it must stay byte-in-sync with \
-         what the box actually loads.\n  deployed-only: {:?}\n  reference-only: {:?}",
-        deployed_names
-            .iter()
-            .filter(|n| !reference_names.contains(n))
-            .collect::<Vec<_>>(),
-        reference_names
-            .iter()
-            .filter(|n| !deployed_names.contains(n))
-            .collect::<Vec<_>>(),
+    assert!(
+        emf_declared_names(&user_data, "metric_selectors").is_empty(),
+        "the EMF metric-selector list is back inside user-data.sh.tftpl. Two copies means \
+         two things to keep in sync, and the ~1.6 KB duplicate is what pinned that template \
+         at exactly 0 bytes free under the EC2 16 KiB cap."
     );
-    // 2026-07-06: compare the union across ALL declarations in both files.
-    // (2026-07-17, stage-3 dead-WS sweep: the per-feed
-    // tv_boundary_catchup_total declaration retired with the tick
-    // aggregator — the union check now covers whatever declarations remain,
-    // and the boundary-catchup-must-exist assert died with the declaration;
-    // its stays-retired negative pin lives in
-    // test_boundary_catchup_emf_declaration_stays_retired.)
-    let deployed_all = emf_all_declared_names(&user_data);
-    let reference_all = emf_all_declared_names(&reference);
-    assert_eq!(
-        deployed_all, reference_all,
-        "Z+ L3 RECONCILE drift-guard: the UNION of EMF-declared names (all \
-         metric_declaration entries) has drifted between the deployed \
-         user-data.sh.tftpl and the reference cloudwatch-agent.json."
+    assert!(
+        user_data.contains(DEPLOYED_CW_AGENT_CONFIG) && user_data.contains("fetch-config"),
+        "user-data must copy {DEPLOYED_CW_AGENT_CONFIG} into place after the clone AND \
+         apply it with amazon-cloudwatch-agent-ctl -a fetch-config. Without both, the box \
+         runs the host-only fallback forever and no app metric reaches CloudWatch."
     );
 }
 
@@ -1013,10 +1042,7 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     // The alarms in app-alarms.tf all key on namespace="Tickvault/Prod".
     // If the agent's emf_processor.metric_namespace ever changes, every
     // metric lands in a namespace no alarm reads → silent 0 datapoints.
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             body.contains("\"metric_namespace\": \"Tickvault/Prod\""),
@@ -1082,10 +1108,7 @@ fn test_cw_agent_collects_machine_log_paths() {
     // 0-byte machine/app.log placeholder, tailing only real rotated files.
     let errors_glob = format!("/opt/tickvault/{errors_dir}/errors.jsonl.2*");
     let app_glob = format!("/opt/tickvault/{app_dir}/app.2*");
-    for rel in [
-        "deploy/aws/terraform/user-data.sh.tftpl",
-        "deploy/aws/cloudwatch-agent.json",
-    ] {
+    for rel in [DEPLOYED_CW_AGENT_CONFIG, "deploy/aws/cloudwatch-agent.json"] {
         let body = read(rel);
         assert!(
             body.contains(&errors_glob),
@@ -1300,7 +1323,7 @@ fn test_hcl_stripper_and_join_locator_reject_commented_out_members() {
 // lives in test_boundary_catchup_emf_declaration_stays_retired.
 
 #[test]
-fn test_app_alarms_count_is_twenty_two() {
+fn test_app_alarms_count_is_seven() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -1410,13 +1433,1322 @@ fn test_app_alarms_count_is_twenty_two() {
     // all four alarms were permanently-dead monitors. Cost: -4 alarms
     // (~-$0.40/mo) — dated notes in app-alarms.tf + aws-budget.md
     // (COST NOTE 2026-07-18).
+    // 7 (was 5) since 2026-08-25: ADDED tv_spill_dir_free_bytes (alarm
+    // tv-<env>-spill-dir-free-low) and tv_questdb_wal_suspended_tables
+    // (tv-<env>-questdb-wal-suspended). Authorized by
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.3g. Both gauges were ALREADY
+    // EMF-selected and reaching CloudWatch; neither had an alarm. MEASURED on
+    // the live account that day: free bytes went 38.8 GB -> 14.5 GB -> 20,480
+    // BYTES across two hours, the volume sat full for three, and 15 QuestDB
+    // tables suspended themselves -- which keeps ACKing ILP writes while
+    // silently discarding rows, so no other alarm in the tree could see it.
+    // Cost: +2 alarms (~+$0.20/mo), NO new EMF name and no user-data byte --
+    // dated note in aws-budget.md (COST NOTE 2026-08-25).
+    //
+    // 2026-08-25 (§2.3h), 7 -> 8: questdb-wal-probe-failed. The alarm above
+    // reads a GAUGE whose PRODUCER could once fail open -- parse_wal_tables_
+    // response returned Ok(vec![]) when every row was skipped, and the gauge
+    // then published a confident 0 while tables were suspended. #1816 made
+    // that fail loud; this alarm is the other half, because a loud failure
+    // reported to a counter nobody reads leaves the gauge simply not updating,
+    // which on notBreaching reads as health. An alarm whose input can silently
+    // stop is not an alarm. Cost: +1 alarm (~+$0.10/mo) + 1 EMF name below.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 5,
-        "Z+ L2 VERIFY ratchet: expected exactly 5 app-level CloudWatch alarm \
+        count, 8,
+        "Z+ L2 VERIFY ratchet: expected exactly 8 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \
          AND this guard."
     );
+}
+
+// ---------------------------------------------------------------------------
+// FULL-CORPUS, CONST-AWARE DEAD-MONITOR CHECK (added 2026-08-25)
+//
+// `test_every_alarm_metric_has_a_rust_emit_site` above is the original
+// dead-monitor ratchet and it is NOT weakened here — it stays exactly as it
+// was. What it cannot do was measured on 2026-08-25 and is worth stating
+// precisely, because the shape is the one this repository has now been caught
+// by eight times: THE GUARD DECIDES WHAT TO READ FROM A HARDCODED LIST.
+//
+//   * its corpus is two files, named literally at `alarm_metric_names()` —
+//     and one of them (`silent-feed-alarms.tf`) has held zero alarms since its
+//     retirement, so the effective corpus is ONE file. The tree has 20 files
+//     declaring 55 alarm resources; it inspects 5 metric names, about 11% of
+//     the ~45 distinct `tv_*` alarm metrics;
+//   * its parser is line-wise, so a `metric_name` nested inside a
+//     `metric_query { metric { … } }` is invisible — three alarms in the one
+//     file it does read are unexamined for that reason;
+//   * its needle is `counter!("name"` — LITERAL ONLY. Nine of the fourteen
+//     metrics in `live-lane-alarms.tf` are emitted through a `const`
+//     (`gauge!(FEED_STACK_UP_GAUGE)`), so merely widening the file list would
+//     have produced ~11 false "missing emit site" failures on perfectly
+//     healthy metrics — which is why the widening had to come WITH the
+//     const resolution, not before it.
+//
+// The hole that mattered most is none of those three individually. It is that
+// a metric name can be declared as a `const`, listed in the EMF selector, and
+// alarmed on — and NEVER PASSED TO AN EMIT MACRO. `emf_selector_producer_guard`
+// matches the const DECLARATION literal and is satisfied;
+// `alarm_metric_has_a_route_guard` checks the TRANSPORT and is satisfied; and
+// the ratchet above cannot see consts at all. Three guards, all green, over a
+// metric nothing writes.
+//
+// This test closes that. It reads every `.tf` in the terraform directory,
+// takes every `tv_*` metric name (nesting included, since it is not line-
+// scoped), and requires each to reach ONE of four honest routes.
+// ---------------------------------------------------------------------------
+
+/// Every `metric_name = "tv_..."` in every terraform file, nesting included.
+///
+/// Deliberately NOT block-scoped to alarm resources: a name declared by a
+/// `metric_transformation` is classified as log-derived below and passes
+/// trivially, so including it costs nothing and removes a parser that could
+/// drift. Terraform-interpolated names (`tv_errcode_${each.key}`) are skipped —
+/// they are a template, not a metric.
+fn every_tf_metric_name() -> Vec<String> {
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        panic!("terraform directory unreadable: {}", dir.display());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in strip_line_comments(&body).lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("metric_name") else {
+                continue;
+            };
+            if !rest.trim_start().starts_with('=') {
+                continue;
+            }
+            if let Some(start) = rest.find('"')
+                && let Some(end) = rest[start + 1..].find('"')
+            {
+                let name = &rest[start + 1..start + 1 + end];
+                if name.starts_with("tv_") && !name.contains("${") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Names a `metric_transformation` block publishes — i.e. metrics CloudWatch
+/// derives from a log filter, which legitimately have no Rust emit macro.
+fn log_filter_derived_names() -> Vec<String> {
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let stripped = strip_line_comments(&body);
+        // A `metric_transformation` block is short; 400 bytes covers its
+        // name/namespace/value/default_value without reaching the next
+        // resource.
+        //
+        // The attribute is `name`, NOT `metric_name` — that is the terraform
+        // spelling, and getting it wrong made three genuinely log-derived
+        // metrics (`tv_seal_writer_drain_dropped_total`,
+        // `tv_orders_placed_delta_total`, `tv_errcode_hot_path_02`) look like
+        // dead monitors on the first run of this guard. `namespace` also
+        // begins with "name", so the `=` check below is what separates them.
+        for (at, _) in stripped.match_indices("metric_transformation") {
+            let end = (at + 400).min(stripped.len());
+            for line in stripped[at..end].lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix("name") else {
+                    continue;
+                };
+                if !rest.trim_start().starts_with('=') {
+                    continue;
+                }
+                if let Some(start) = rest.find('"')
+                    && let Some(stop) = rest[start + 1..].find('"')
+                {
+                    let name = &rest[start + 1..start + 1 + stop];
+                    // A terraform-interpolated name (`tv_errcode_${...}`) is a
+                    // template; record the literal PREFIX so the concrete
+                    // alarm names it expands to are recognised as derived.
+                    let literal = name.split("${").next().unwrap_or(name);
+                    if literal.starts_with("tv_") {
+                        out.push(literal.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Production Rust sources only — `tests/`, `benches/` and `fuzz/` excluded.
+///
+/// The ratchet above walks all of `crates/`, so an emit-shaped string inside a
+/// test file satisfies it. That is the difference between "someone wrote this
+/// metric" and "the running binary writes this metric", and only the second
+/// one keeps an alarm from being green over nothing.
+fn production_sources() -> Vec<(PathBuf, String)> {
+    let mut paths = Vec::new();
+    collect_rs_sources(&workspace_root().join("crates"), &mut paths);
+    paths
+        .into_iter()
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            !s.contains("/tests/") && !s.contains("/benches/") && !s.contains("/fuzz/")
+        })
+        .filter_map(|p| {
+            fs::read_to_string(&p).ok().map(|body| {
+                let code_only = strip_line_comments(&body);
+                let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
+                (p, compact)
+            })
+        })
+        .collect()
+}
+
+/// Identifiers bound to `name` by a `const IDENT: &str = "name";` declaration.
+///
+/// Both `&str` and `&'static str` compact to something ending in `str=` before
+/// the literal, so the search anchors on the literal and walks BACK to the
+/// `const` keyword — which is stable under either spelling and under any
+/// visibility modifier.
+fn const_aliases_for(name: &str, sources: &[(PathBuf, String)]) -> Vec<String> {
+    let literal = format!("=\"{name}\";");
+    let mut out = Vec::new();
+    for (_, compact) in sources {
+        for (at, _) in compact.match_indices(&literal) {
+            let back = &compact[at.saturating_sub(200)..at];
+            let Some(kw) = back.rfind("const") else {
+                continue;
+            };
+            let after = &back[kw + "const".len()..];
+            let Some(colon) = after.find(':') else {
+                continue;
+            };
+            let ident = &after[..colon];
+            if !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.push(ident.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Is `arg` a reference to `ident`, allowing any path prefix?
+///
+/// `counter!(NAME)`, `counter!(self::NAME)` and `counter!(crate::a::b::NAME)`
+/// are all the same emit; matching on the bare identifier alone would miss the
+/// qualified forms, and matching on a substring would let `OTHER_NAME` pass.
+fn arg_names(arg: &str, ident: &str) -> bool {
+    arg == ident || arg.ends_with(&format!("::{ident}"))
+}
+
+/// Does any production source pass `ident` (or `"literal"`) as the FIRST
+/// argument of a metrics emit macro?
+fn is_emitted_as(first_arg_matches: &dyn Fn(&str) -> bool, sources: &[(PathBuf, String)]) -> bool {
+    for macro_name in ["counter!(", "gauge!(", "histogram!("] {
+        for (_, compact) in sources {
+            for (at, _) in compact.match_indices(macro_name) {
+                let rest = &compact[at + macro_name.len()..];
+                // The first argument ends at the first `,` or the closing `)`.
+                let stop = rest
+                    .find(|c| c == ',' || c == ')')
+                    .unwrap_or(rest.len().min(120));
+                if first_arg_matches(&rest[..stop]) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn every_alarm_metric_reaches_an_emit_or_a_declared_route() {
+    let sources = production_sources();
+    assert!(
+        sources.len() > 50,
+        "ratchet self-check: production source walk returned {} files — the \
+         crates/ walk or the tests/ filter is broken, and a guard that reads \
+         nothing passes everything",
+        sources.len()
+    );
+
+    let names = every_tf_metric_name();
+    assert!(
+        names.len() >= 30,
+        "ratchet self-check: only {} tv_* metric names found across the \
+         terraform tree — the previous measurement was ~45, so the parser or \
+         the directory walk has regressed",
+        names.len()
+    );
+
+    let log_derived = log_filter_derived_names();
+
+    // Metrics published by a Lambda through PutMetricData rather than by the
+    // app through a metrics macro. Scoped to the lambda crate so an ordinary
+    // app metric can never be excused this way.
+    let lambda_sources: Vec<(PathBuf, String)> = sources
+        .iter()
+        .filter(|(p, _)| p.to_string_lossy().contains("/aws-lambdas/"))
+        .cloned()
+        .collect();
+
+    // DORMANT: alarmed on purpose ahead of its producer. Each entry needs a
+    // reason, and the anti-drift assertions below delete it the moment the
+    // reason stops being true.
+    let dormant: &[(&str, &str)] = &[(
+        "tv_order_fill_lag_seconds",
+        "order fill lag — the order path is paper-mode; declared dormant in \
+         alarm_metric_has_a_route_guard.rs and cloudwatch_dormant_alarms_guard.rs",
+    )];
+
+    let mut missing = Vec::new();
+    for name in &names {
+        // An entry ending in `_` came from a terraform-interpolated name, so it
+        // is a PREFIX covering every concrete metric that template expands to
+        // (`tv_errcode_` → `tv_errcode_hot_path_02`, and every other coded
+        // error). Anything else must match exactly — a full metric name used
+        // as a prefix would silently excuse its neighbours.
+        if log_derived
+            .iter()
+            .any(|d| d == name || (d.ends_with('_') && name.starts_with(d.as_str())))
+        {
+            continue;
+        }
+        if dormant.iter().any(|(d, _)| d == name) {
+            continue;
+        }
+        let literal = format!("\"{name}\"");
+        if is_emitted_as(&|arg: &str| arg == literal, &sources) {
+            continue;
+        }
+        let aliases = const_aliases_for(name, &sources);
+        if aliases
+            .iter()
+            .any(|ident| is_emitted_as(&|arg: &str| arg_names(arg, ident), &sources))
+        {
+            continue;
+        }
+        if lambda_sources
+            .iter()
+            .any(|(_, compact)| compact.contains(&literal))
+        {
+            continue;
+        }
+        missing.push(name.clone());
+    }
+
+    assert!(
+        missing.is_empty(),
+        "DEAD MONITOR: these terraform metrics have no emit macro (literal or \
+         const), are not log-filter-derived, are not published by a Lambda, and \
+         are not declared dormant. An alarm on such a metric sits permanently \
+         green over a signal nothing writes — the exact false-OK this \
+         repository has retired twice. Missing: {missing:?}"
+    );
+
+    // Anti-drift on the dormant list: an entry that gained a producer, or whose
+    // alarm was deleted, must be removed rather than left as a standing excuse.
+    for (name, reason) in dormant {
+        assert!(
+            names.iter().any(|n| n == name),
+            "dormant entry `{name}` is no longer a terraform metric — delete it \
+             from this list ({reason})"
+        );
+        let literal = format!("\"{name}\"");
+        assert!(
+            !is_emitted_as(&|arg: &str| arg == literal, &sources),
+            "dormant entry `{name}` has a live emit site now — delete it from \
+             this list ({reason})"
+        );
+    }
+}
+
+#[test]
+fn the_dead_monitor_check_resolves_consts_not_just_literals() {
+    // Anti-vacuity. `tv_dhan_feed_stack_up` is emitted ONLY through the const
+    // `FEED_STACK_UP_GAUGE`; if const resolution silently stopped working, the
+    // test above would report it (and ten of its neighbours) as dead monitors
+    // rather than passing — a loud failure, but for the wrong reason. This
+    // pins the mechanism itself, so a resolution regression is diagnosed here
+    // instead of read as eleven real defects.
+    let sources = production_sources();
+
+    let literal = "\"tv_dhan_feed_stack_up\"".to_string();
+    assert!(
+        !is_emitted_as(&|arg: &str| arg == literal, &sources),
+        "tv_dhan_feed_stack_up is expected to be emitted through a const, not a \
+         literal — if it gained a literal emit, pick another const-only metric \
+         for this self-test"
+    );
+
+    let aliases = const_aliases_for("tv_dhan_feed_stack_up", &sources);
+    assert!(
+        !aliases.is_empty(),
+        "const resolution found no identifier bound to tv_dhan_feed_stack_up — \
+         the declaration parser has regressed"
+    );
+    assert!(
+        aliases
+            .iter()
+            .any(|ident| is_emitted_as(&|arg: &str| arg_names(arg, ident), &sources)),
+        "const resolution found {aliases:?} but none is passed to an emit macro \
+         — the macro-argument matcher has regressed"
+    );
+
+    // A name nothing declares must resolve to nothing, or the parser is
+    // matching on something other than the name.
+    assert!(
+        const_aliases_for("tv_guard_vacuity_sentinel_comment_only_total", &sources).is_empty(),
+        "const resolution invented an alias for a metric that is not declared"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every Lambda is watched — or its exemption is written down
+// (2026-08-25, operator "Fix wbrytjonf dude oaku"; the dated authorization is
+//  §2.3f of dhan-rest-only-noise-lock-2026-07-14.md).
+//
+// A Lambda with no `Errors` alarm fails SILENTLY. Nothing else reports it: a
+// throwing invocation writes to its own log group and stops there, and for the
+// scheduled ones the next signal is simply the absence of whatever they were
+// supposed to do — a box that did not start, a digest that did not arrive, a
+// gate that never disarmed.
+//
+// This was measured, not assumed: 13 `aws_lambda_function` resources, 7 with
+// an Errors alarm, SIX without — start_watchdog, hard_stop_guard,
+// boot_heartbeat_gate, deploy_watchdog, daily_budget_digest and
+// questdb_console_proxy. All six are alarmed in the same change as this guard.
+//
+// The guard is the part that lasts. Six alarms fix today's list; they do not
+// stop the SEVENTH Lambda from arriving unwatched next month, which is exactly
+// how these six accumulated — each added by a PR that did not think to, and
+// nothing ever decided otherwise. The house failure mode is a set nobody
+// enumerated; this enumerates it on every build.
+// ---------------------------------------------------------------------------
+
+/// Lambdas deliberately shipped without an `Errors` alarm, each with the
+/// reason. EMPTY TODAY — every Lambda in the tree is alarmed.
+///
+/// Kept as a declared escape hatch rather than a hard rule so a future
+/// genuinely-exempt Lambda has an honest home instead of forcing someone to
+/// weaken the guard. An entry costs a written reason and is checked from both
+/// ends below: it must name a Lambda that still exists AND that is still
+/// unalarmed, so an exemption can never outlive what it excuses.
+const LAMBDA_ERRORS_ALARM_EXEMPT: &[(&str, &str)] = &[
+    // These three DO have an `Errors` alarm; what they lack is an SNS route,
+    // so they change state in the console and page nobody. Until 2026-08-25
+    // the guard counted them as watched, which certified three dead pagers.
+    //
+    // They are listed rather than routed because all three are operator
+    // CONVENIENCE surfaces, not the trading path: a 3am page because a console
+    // proxy threw while nobody was looking at the console is noise, and this
+    // file has spent the day removing noise, not adding it. What was wrong was
+    // never the choice — it was that the choice was invisible.
+    //
+    // NOTE the asymmetry deliberately preserved: `questdb_console_front` and
+    // `operator_control` predate this work and were always action-less;
+    // `questdb_console_proxy` was added on 2026-08-25 mirroring its front
+    // sibling exactly. Giving one half of a two-Lambda surface a pager while
+    // the other stays silent is a worse inconsistency than either state.
+    (
+        "questdb_console_front",
+        "dashboard-only by design: operator console surface, alarm exists without \
+         alarm_actions. Pre-dates 2026-08-25.",
+    ),
+    (
+        "questdb_console_proxy",
+        "dashboard-only by design: mirrors questdb_console_front, including its \
+         lack of alarm_actions. Added 2026-08-25.",
+    ),
+    (
+        "operator_control",
+        "dashboard-only by design: operator control surface, alarm exists without \
+         alarm_actions. Pre-dates 2026-08-25.",
+    ),
+];
+
+/// Every `resource "aws_lambda_function" "<name>"` in the terraform directory.
+fn declared_lambda_resources(bodies: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_file, body) in bodies {
+        for line in body.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("resource \"aws_lambda_function\" \"") else {
+                continue;
+            };
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Extract the `aws_lambda_function.<name>` referenced immediately after a
+/// `FunctionName` dimension. Tolerates the `[0]` count-index form and the
+/// single-line `dimensions = { FunctionName = ... }` form, both of which are
+/// live in this tree.
+fn function_name_ref(block: &str) -> Option<String> {
+    let at = block.find("FunctionName")?;
+    let rest = &block[at..];
+    let at = rest.find("aws_lambda_function.")?;
+    let rest = &rest[at + "aws_lambda_function.".len()..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(rest[..end].to_string())
+}
+
+/// Lambdas covered by an `Errors` alarm on the `AWS/Lambda` namespace.
+///
+/// Block-scoped rather than line-scoped: `metric_name = "Errors"`,
+/// `namespace = "AWS/Lambda"` and the `FunctionName` dimension are three
+/// separate lines, and pairing them by proximity would mis-associate two
+/// adjacent alarms. Top-level resources in this tree close on a bare `}` at
+/// column 0, which is what delimits a block here.
+fn lambdas_with_errors_alarm(bodies: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("resource \"aws_cloudwatch_metric_alarm\"") {
+                inside = true;
+                block.clear();
+            }
+            if inside {
+                block.push_str(line);
+                block.push('\n');
+                if line == "}" {
+                    inside = false;
+                    let is_lambda_errors =
+                        block.contains("\"Errors\"") && block.contains("\"AWS/Lambda\"");
+                    // COVERAGE REQUIRES A ROUTE, not just an alarm (2026-08-25).
+                    //
+                    // An adversarial re-read found this guard counted
+                    // `questdb_console_proxy_errors` as "watched" while it has
+                    // no `alarm_actions` at all — it changes state in the
+                    // console and pages nobody. The guard therefore certified
+                    // a dead pager, which is the exact false-OK its own rule
+                    // section forbids elsewhere. A dashboard-only alarm is a
+                    // legitimate CHOICE; it just has to be a declared one, so
+                    // it goes in DASHBOARD_ONLY_ALARM_LAMBDAS below rather
+                    // than passing silently as a pager.
+                    let has_route = block.lines().any(|l| {
+                        let t = l.trim();
+                        t.starts_with("alarm_actions") && !t.contains("= []") && !t.ends_with('[')
+                    });
+                    if is_lambda_errors && has_route {
+                        if let Some(name) = function_name_ref(&block) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn terraform_bodies() -> Vec<(String, String)> {
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        panic!("terraform directory unreadable: {}", dir.display()); // APPROVED: test
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        // Strip `#` comments: this guard's OWN comment blocks name Lambdas,
+        // and a commented mention must never satisfy or trip it.
+        out.push((name, strip_hcl_comments(&body)));
+    }
+    assert!(
+        !out.is_empty(),
+        "terraform corpus is EMPTY — the guard would pass vacuously"
+    );
+    out
+}
+
+#[test]
+fn every_lambda_has_an_errors_alarm_or_a_declared_exemption() {
+    let bodies = terraform_bodies();
+    let lambdas = declared_lambda_resources(&bodies);
+    let covered = lambdas_with_errors_alarm(&bodies);
+
+    assert!(
+        lambdas.len() >= 13,
+        "expected at least the 13 Lambdas known on 2026-08-25, found {} — \
+         did the enumerator stop matching? A guard that finds no Lambdas \
+         passes vacuously, which is the failure this test exists to prevent",
+        lambdas.len()
+    );
+
+    let mut unwatched: Vec<&str> = Vec::new();
+    for l in &lambdas {
+        if covered.iter().any(|c| c == l) {
+            continue;
+        }
+        if LAMBDA_ERRORS_ALARM_EXEMPT.iter().any(|(n, _)| n == l) {
+            continue;
+        }
+        unwatched.push(l);
+    }
+
+    assert!(
+        unwatched.is_empty(),
+        "these Lambdas have no ROUTED `Errors` alarm and no declared exemption: {unwatched:?}\n\
+         (An alarm with no `alarm_actions` does not count — it pages nobody. Either give \
+         it an SNS route, or add it to LAMBDA_ERRORS_ALARM_EXEMPT with a written reason.)\n\
+         A Lambda that throws writes to its own log group and stops there — nothing pages, \
+         and for a scheduled one the only other signal is the absence of whatever it was \
+         supposed to do.\n\
+         Fix: add an `aws_cloudwatch_metric_alarm` with metric_name=\"Errors\", \
+         namespace=\"AWS/Lambda\" and a FunctionName dimension (copy the \
+         `market_open_readiness_lambda_errors` block), or add an entry with a reason to \
+         LAMBDA_ERRORS_ALARM_EXEMPT."
+    );
+
+    // Both ends of every exemption — an exemption that outlives its reason is
+    // a lie that reads like a decision.
+    for (name, reason) in LAMBDA_ERRORS_ALARM_EXEMPT {
+        assert!(
+            !reason.trim().is_empty(),
+            "exemption for {name} carries no reason"
+        );
+        assert!(
+            lambdas.iter().any(|l| l == name),
+            "LAMBDA_ERRORS_ALARM_EXEMPT names {name}, which is no longer a Lambda in the \
+             terraform — delete the stale entry"
+        );
+        assert!(
+            !covered.iter().any(|c| c == name),
+            "LAMBDA_ERRORS_ALARM_EXEMPT still excuses {name}, but it now HAS an Errors \
+             alarm — delete the entry so the exemption list keeps meaning something"
+        );
+    }
+}
+
+/// Lambdas covered by an `Invocations` alarm on the `AWS/Lambda` namespace.
+///
+/// Same block-scoped shape as `lambdas_with_errors_alarm`, and deliberately a
+/// separate function rather than a `metric` parameter on that one: the two ask
+/// different questions and their *route* requirements could reasonably diverge
+/// later (a dashboard-only Errors alarm is a defensible choice; a
+/// dashboard-only "did it run" alarm is not, because nobody opens a console to
+/// discover that a schedule stopped firing). Keeping them apart means that
+/// divergence is an edit rather than a re-parameterisation.
+fn lambdas_with_invocations_alarm(bodies: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("resource \"aws_cloudwatch_metric_alarm\"") {
+                inside = true;
+                block.clear();
+            }
+            if inside {
+                block.push_str(line);
+                block.push('\n');
+                if line == "}" {
+                    inside = false;
+                    let is_lambda_invocations =
+                        block.contains("\"Invocations\"") && block.contains("\"AWS/Lambda\"");
+                    let has_route = block.lines().any(|l| {
+                        let t = l.trim();
+                        t.starts_with("alarm_actions") && !t.contains("= []") && !t.ends_with('[')
+                    });
+                    // `treat_missing_data = "breaching"` is not optional here
+                    // and is checked as part of COVERAGE, not as a separate
+                    // style rule. The condition being detected is the ABSENCE
+                    // of a datapoint: a Lambda whose schedule was dropped
+                    // publishes no Invocations datapoint at all, so under the
+                    // default `missing` the alarm sits in INSUFFICIENT_DATA
+                    // forever and pages nobody. An alarm that cannot fire on
+                    // the one case it exists for is not coverage, and counting
+                    // it as coverage is the false-OK this file polices
+                    // everywhere else.
+                    let breaches_on_missing = block.contains("\"breaching\"");
+                    if is_lambda_invocations && has_route && breaches_on_missing {
+                        if let Some(name) = function_name_ref(&block) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Lambdas that an EventBridge **schedule** invokes.
+///
+/// Two hops, because terraform states it in two places: an
+/// `aws_cloudwatch_event_rule` carrying a `schedule_expression` (as opposed to
+/// an `event_pattern`, which is reactive and has no "should have run by now"),
+/// and an `aws_cloudwatch_event_target` pointing that rule at a Lambda ARN.
+/// Pairing them is what distinguishes "runs on a clock" from "runs when
+/// something happens" — and only the first kind can be *missing*.
+fn schedule_driven_lambdas(bodies: &[(String, String)]) -> Vec<String> {
+    let mut scheduled_rules: Vec<String> = Vec::new();
+    let mut targets: Vec<(String, String)> = Vec::new(); // (rule, lambda)
+
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut kind: Option<&str> = None;
+        let mut name = String::new();
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("resource \"aws_cloudwatch_event_rule\" \"") {
+                kind = Some("rule");
+                name = rest.split('"').next().unwrap_or_default().to_string();
+                block.clear();
+            } else if line.starts_with("resource \"aws_cloudwatch_event_target\"") {
+                kind = Some("target");
+                block.clear();
+            }
+            if kind.is_some() {
+                block.push_str(line);
+                block.push('\n');
+                if line == "}" {
+                    match kind {
+                        Some("rule") if block.contains("schedule_expression") => {
+                            scheduled_rules.push(name.clone());
+                        }
+                        Some("target") => {
+                            let rule = block
+                                .split("aws_cloudwatch_event_rule.")
+                                .nth(1)
+                                .map(|r| {
+                                    r.chars()
+                                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default();
+                            let lambda = block
+                                .split("aws_lambda_function.")
+                                .nth(1)
+                                .map(|r| {
+                                    r.chars()
+                                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default();
+                            if !rule.is_empty() && !lambda.is_empty() {
+                                targets.push((rule, lambda));
+                            }
+                        }
+                        _ => {}
+                    }
+                    kind = None;
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<String> = targets
+        .into_iter()
+        .filter(|(rule, _)| scheduled_rules.iter().any(|r| r == rule))
+        .map(|(_, lambda)| lambda)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Scheduled Lambdas deliberately left without a "did it run" alarm.
+///
+/// Empty, and that is the intended steady state. An entry here is a decision
+/// that a given clock-driven Lambda may silently stop running — which is a
+/// real choice for something purely cosmetic, and never one for anything on a
+/// safety or money path.
+const LAMBDA_INVOCATIONS_ALARM_EXEMPT: &[(&str, &str)] = &[];
+
+#[test]
+fn every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption() {
+    // WHY THIS EXISTS, and why an `Errors` alarm is not a substitute.
+    //
+    // On 2026-07-02 EventBridge dropped scheduled rules repo-wide. A Lambda
+    // whose schedule stops firing throws no error, writes no log line, and
+    // publishes no datapoint — so its `Errors` alarm, which this file already
+    // requires of all thirteen Lambdas, reads PERFECTLY HEALTHY for exactly as
+    // long as the component is completely dead. The two alarms are therefore
+    // not redundant: `Errors` catches a Lambda that runs and fails,
+    // `Invocations` catches one that never runs at all, and only the second
+    // covers the failure this repo has actually experienced.
+    //
+    // Found by the same 2026-08-25 sweep that added the thirteen Errors
+    // alarms: a tree-wide scan for `metric_name = "Invocations"` returned
+    // exactly TWO, on the token minter and the market-hours gate. The budget
+    // kill-switch and the Lambda that starts the trading box each morning were
+    // both blind, which is the worst possible pair to be blind about.
+    let bodies = terraform_bodies();
+    let scheduled = schedule_driven_lambdas(&bodies);
+    let covered = lambdas_with_invocations_alarm(&bodies);
+
+    assert!(
+        scheduled.len() >= 6,
+        "expected at least the 6 schedule-driven Lambdas known on 2026-08-25, found {} — \
+         did the two-hop rule->target enumerator stop matching? A guard that finds no \
+         scheduled Lambdas passes vacuously, which is the failure it exists to prevent",
+        scheduled.len()
+    );
+
+    let mut blind: Vec<&str> = Vec::new();
+    for l in &scheduled {
+        if covered.iter().any(|c| c == l) {
+            continue;
+        }
+        if LAMBDA_INVOCATIONS_ALARM_EXEMPT.iter().any(|(n, _)| n == l) {
+            continue;
+        }
+        blind.push(l);
+    }
+
+    assert!(
+        blind.is_empty(),
+        "these Lambdas run on a SCHEDULE but have no routed `Invocations` alarm and no \
+         declared exemption: {blind:?}\n\
+         A dropped EventBridge schedule is silent by construction — no invocation means no \
+         error, so the `Errors` alarm this file already requires cannot see it, and the \
+         component reads healthy for as long as it is entirely dead (the 2026-07-02 \
+         repo-wide scheduler-drop class).\n\
+         Fix: add an `aws_cloudwatch_metric_alarm` with metric_name=\"Invocations\", \
+         namespace=\"AWS/Lambda\", a FunctionName dimension, a routed `alarm_actions`, and \
+         `treat_missing_data = \"breaching\"` (copy the `start_watchdog_not_invoked` \
+         block) — or add an entry with a written reason to \
+         LAMBDA_INVOCATIONS_ALARM_EXEMPT."
+    );
+
+    // Both ends of every exemption, same as the Errors list: an exemption that
+    // outlives its reason is a lie that reads like a decision.
+    for (name, reason) in LAMBDA_INVOCATIONS_ALARM_EXEMPT {
+        assert!(
+            !reason.trim().is_empty(),
+            "exemption for {name} carries no reason"
+        );
+        assert!(
+            scheduled.iter().any(|l| l == name),
+            "LAMBDA_INVOCATIONS_ALARM_EXEMPT names {name}, which is no longer a \
+             schedule-driven Lambda — delete the stale entry"
+        );
+        assert!(
+            !covered.iter().any(|c| c == name),
+            "LAMBDA_INVOCATIONS_ALARM_EXEMPT still excuses {name}, but it now HAS a routed \
+             Invocations alarm — delete the entry so the list keeps meaning something"
+        );
+    }
+}
+
+#[test]
+fn the_two_switches_that_matter_most_are_covered_by_name() {
+    // The list-based test above is generic, and a generic test can be
+    // satisfied by an enumerator that quietly stops matching. These two are
+    // named outright because they are the ones whose silence costs the most:
+    // one stops a runaway bill, the other starts the trading day.
+    let bodies = terraform_bodies();
+    let covered = lambdas_with_invocations_alarm(&bodies);
+    for critical in ["tv_hard_stop_guard", "start_watchdog"] {
+        assert!(
+            covered.iter().any(|c| c == critical),
+            "{critical} has no routed, breaching-on-missing `Invocations` alarm.\n\
+             This is the budget kill-switch / the box-starter: while its schedule is \
+             dropped there is no spend ceiling in force, or no trading day, and NOTHING \
+             else reports it."
+        );
+    }
+}
+
+#[test]
+fn invocations_extraction_self_test() {
+    // Proves each half of the coverage rule bites independently, so a real
+    // regression is reported rather than silently absorbed. Written after
+    // finding that the sibling Errors extractor had been counting a
+    // route-less alarm as coverage for weeks.
+    let full = vec![(
+        "x.tf".to_string(),
+        "resource \"aws_cloudwatch_metric_alarm\" \"a\" {\n  metric_name = \"Invocations\"\n  \
+         namespace = \"AWS/Lambda\"\n  treat_missing_data = \"breaching\"\n  dimensions = {\n    \
+         FunctionName = aws_lambda_function.good.function_name\n  }\n  alarm_actions = \
+         [aws_sns_topic.tv_alerts.arn]\n}\n"
+            .to_string(),
+    )];
+    assert_eq!(lambdas_with_invocations_alarm(&full), vec!["good"]);
+
+    // No route -> not coverage (it pages nobody).
+    let routeless = vec![(
+        "x.tf".to_string(),
+        full[0].1.replace("[aws_sns_topic.tv_alerts.arn]", "[]"),
+    )];
+    assert!(
+        lambdas_with_invocations_alarm(&routeless).is_empty(),
+        "an Invocations alarm with no SNS route was counted as coverage"
+    );
+
+    // Missing-data default -> not coverage (it can never fire on absence).
+    let not_breaching = vec![(
+        "x.tf".to_string(),
+        full[0].1.replace("\"breaching\"", "\"notBreaching\""),
+    )];
+    assert!(
+        lambdas_with_invocations_alarm(&not_breaching).is_empty(),
+        "an Invocations alarm that does not treat missing data as breaching was counted \
+         as coverage — it cannot fire on the absence it exists to detect"
+    );
+
+    // A rule with an event_pattern is reactive, not scheduled: nothing is
+    // "missing" when nothing happened, so it must not be demanded of.
+    let reactive = vec![(
+        "y.tf".to_string(),
+        "resource \"aws_cloudwatch_event_rule\" \"r\" {\n  event_pattern = \"{}\"\n}\n\
+         resource \"aws_cloudwatch_event_target\" \"t\" {\n  rule = \
+         aws_cloudwatch_event_rule.r.name\n  arn = aws_lambda_function.reactive.arn\n}\n"
+            .to_string(),
+    )];
+    assert!(
+        schedule_driven_lambdas(&reactive).is_empty(),
+        "a Lambda driven by an event_pattern rule was reported as schedule-driven"
+    );
+
+    let timed = vec![(
+        "y.tf".to_string(),
+        reactive[0].1.replace(
+            "event_pattern = \"{}\"",
+            "schedule_expression = \"rate(1 hour)\"",
+        ),
+    )];
+    assert_eq!(schedule_driven_lambdas(&timed), vec!["reactive"]);
+}
+
+#[test]
+fn lambda_errors_alarm_extraction_self_test() {
+    // Proves the two extractors bite, so a real regression is reported as
+    // itself rather than as an empty corpus.
+    let fixture = r#"
+resource "aws_lambda_function" "alpha" {
+  function_name = "tv-prod-alpha"
+}
+
+resource "aws_lambda_function" "beta" {
+  count         = var.enabled ? 1 : 0
+  function_name = "tv-prod-beta"
+}
+
+resource "aws_cloudwatch_metric_alarm" "alpha_errors" {
+  metric_name   = "Errors"
+  namespace     = "AWS/Lambda"
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  dimensions = {
+    FunctionName = aws_lambda_function.alpha.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "delta_errors" {
+  metric_name   = "Errors"
+  namespace     = "AWS/Lambda"
+  alarm_actions = []
+  dimensions = {
+    FunctionName = aws_lambda_function.delta.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "unrelated" {
+  metric_name = "Errors"
+  namespace   = "Tickvault/Prod"
+  dimensions  = { FunctionName = aws_lambda_function.beta[0].function_name }
+}
+"#;
+    let bodies = vec![("fixture.tf".to_string(), fixture.to_string())];
+    assert_eq!(declared_lambda_resources(&bodies), vec!["alpha", "beta"]);
+
+    // `beta` is NOT covered: its alarm is on the Tickvault namespace, not
+    // AWS/Lambda, so it is not a Lambda-Errors alarm at all. This is the case
+    // a namespace-blind matcher would get wrong.
+    assert_eq!(lambdas_with_errors_alarm(&bodies), vec!["alpha"]);
+
+    // `delta` has a textbook Lambda-Errors alarm and `alarm_actions = []`, so
+    // it pages NOBODY and must NOT count as covered. Before 2026-08-25 it
+    // would have — that is how three dead pagers were certified as watched.
+    assert!(
+        !lambdas_with_errors_alarm(&bodies).contains(&"delta".to_string()),
+        "an alarm with `alarm_actions = []` routes nowhere and must not count as coverage"
+    );
+
+    // The `[0]` count-index form must resolve to the bare resource name.
+    let indexed = "FunctionName = aws_lambda_function.gamma[0].function_name }";
+    assert_eq!(function_name_ref(indexed).as_deref(), Some("gamma"));
+
+    // A block with no FunctionName yields nothing rather than panicking.
+    assert_eq!(function_name_ref("metric_name = \"Errors\""), None);
+}
+
+// ---------------------------------------------------------------------------
+// A WS-GAP-03 filter must name WHICH WS-GAP-03
+// (2026-08-25, §2.3f REJECT row: "Filters the cross-verify alarm on
+//  `WS-GAP-03` alone, or drops the `source` conditions".)
+//
+// WS-GAP-03 is the WebSocket connection-state code, and it has ~50 emit sites
+// in dhan_feed_stack.rs alone — every dial failure, every reconnect, every
+// pool-supervisor event. A `{ $.code = "WS-GAP-03" }` filter therefore pages on
+// ordinary connection churn, which is the RISK-GAP-03 noise trap (25 pages in
+// one session) with fifty times the surface.
+//
+// §2.3d-i records that exact filter being approved by the operator on a
+// recommendation, and caught only because someone counted the emit sites before
+// writing the terraform. Nothing pinned the outcome, so the next person to add a
+// WS-GAP-03 alarm would have had to rediscover it. This pins it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_ws_gap_03_filter_carries_a_source_discriminator() {
+    let body = read("deploy/aws/terraform/error-code-alarms.tf");
+    let stripped = strip_hcl_comments(&body);
+
+    let patterns: Vec<&str> = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("pattern") && l.contains("WS-GAP-03"))
+        .collect();
+
+    assert!(
+        patterns.len() >= 3,
+        "expected at least the 3 WS-GAP-03 filters known on 2026-08-25 \
+         (universe-collapse, xverify-vacuous, xverify-failed), found {} — if they were \
+         renamed or removed, update this guard deliberately rather than letting it pass \
+         vacuously",
+        patterns.len()
+    );
+
+    for p in patterns {
+        assert!(
+            p.contains("$.source"),
+            "this WS-GAP-03 filter has no `$.source` discriminator, so it matches all \
+             ~50 connection-state emit sites and will page on every reconnect:\n  {p}\n\
+             Add the `$.source = \"...\"` condition that identifies the specific emit \
+             (see ws-gap-03-universe-collapse / ws-gap-03-xverify-blind)."
+        );
+    }
+}
+
+#[test]
+fn ws_gap_03_discriminator_guard_self_test() {
+    // The stripper must not let a COMMENTED-OUT bare filter satisfy or trip the
+    // check — this guard's own §2.3f comment quotes the bad pattern verbatim.
+    let commented = strip_hcl_comments("  # pattern = \"{ $.code = \\\"WS-GAP-03\\\" }\"\n");
+    assert!(
+        !commented.contains("pattern"),
+        "a commented pattern line must be stripped, else the guard reads its own prose"
+    );
+
+    // And a real bare filter must be detectable as missing the discriminator.
+    let bare = "      pattern     = \"{ $.code = \\\"WS-GAP-03\\\" && $.level = \\\"ERROR\\\" }\"";
+    assert!(bare.contains("WS-GAP-03") && !bare.contains("$.source"));
+}
+
+// ---------------------------------------------------------------------------
+// A Metrics Insights alarm must fit inside AWS's 3-hour evaluation cap
+// (2026-08-25 — found by reading the terraform APPLY log after PR #1809
+//  merged, not by any PR check.)
+//
+// `aws_cloudwatch_metric_alarm.disk_fill_rate_high` shipped in #1805 with
+// `period = 21600` (6h) x `evaluation_periods = 2` = 12 hours. AWS caps a
+// Metrics Insights alarm — one whose metric_query uses a `SELECT ... FROM`
+// expression — at a 3-hour evaluation range, and rejected it:
+//
+//     ValidationError: MetricsInsights monitors cannot be checked across
+//     more than 3 hours
+//
+// `terraform validate` and `terraform plan` both PASSED it. The window is
+// checked only by the real PutMetricAlarm call at APPLY time — exactly like a
+// CloudWatch filter PATTERN, which plan also treats as an opaque string.
+//
+// The consequence is the part worth pinning. Terraform stops at the first
+// failing resource, so from the moment #1805 merged the apply lane was red and
+// EVERY terraform change merged after it sat on main UNDEPLOYED — including
+// the eight alarms from #1809, which were green, merged, and doing nothing.
+// A red apply lane is not one broken alarm; it is a silent freeze on all
+// infrastructure delivery, and nothing in the PR gates can see it.
+// ---------------------------------------------------------------------------
+
+/// AWS's documented ceiling for a Metrics Insights alarm's evaluation range.
+const METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS: u64 = 3 * 60 * 60;
+
+/// Pull `(name, period, evaluation_periods, is_metrics_insights)` for every
+/// alarm resource in the terraform directory.
+///
+/// Block-scoped for the same reason as the Lambda guard: the three facts sit
+/// on separate lines and pairing them by proximity would mis-associate
+/// adjacent alarms.
+fn alarm_eval_windows(bodies: &[(String, String)]) -> Vec<(String, u64, u64, bool)> {
+    let mut out = Vec::new();
+    for (_file, body) in bodies {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("resource \"aws_cloudwatch_metric_alarm\"") {
+                inside = true;
+                block.clear();
+            }
+            if !inside {
+                continue;
+            }
+            block.push_str(line);
+            block.push('\n');
+            if line != "}" {
+                continue;
+            }
+            inside = false;
+
+            // A Metrics Insights alarm is one whose EXPRESSION is a query.
+            //
+            // Deliberately scoped to the `expression =` line, not the whole
+            // block. An adversarial re-read found that `block.contains("SELECT ")`
+            // also matches PROSE: `partition_archive_failed` is a plain alarm
+            // whose alarm_description quotes "SELECT outcome, count() FROM
+            // partition_archive_audit". That misclassified it as Insights (a
+            // false failure waiting on any legal window widening) AND let it
+            // satisfy the non-vacuity assertion below, so deleting every real
+            // Insights alarm would have left this guard "passing" on a comment.
+            let is_insights = block.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with("expression") && t.contains("SELECT ") && t.contains(" FROM ")
+            });
+            if !is_insights {
+                continue;
+            }
+
+            let name = block
+                .lines()
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("resource \"aws_cloudwatch_metric_alarm\" \"")
+                        .and_then(|r| r.find('"').map(|e| r[..e].to_string()))
+                })
+                .unwrap_or_else(|| "<unnamed>".to_string());
+
+            // Returns (parsed value, saw_the_key_but_could_not_parse).
+            //
+            // MAX, not first-match. An alarm may carry several `period` lines
+            // (a metric_query with a plain `metric {}` block alongside one with
+            // a SELECT). Taking the FIRST let a 60-second decorative period
+            // mask a 21600-second query period — a 12-hour window reported as
+            // 120 seconds, i.e. the exact defect this guard exists to catch,
+            // sailing through it.
+            let num = |key: &str| -> (Option<u64>, bool) {
+                let mut best: Option<u64> = None;
+                let mut unparsed = false;
+                for l in block.lines() {
+                    let t = l.trim();
+                    let Some(rest) = t.strip_prefix(key) else {
+                        continue;
+                    };
+                    let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                        continue;
+                    };
+                    match rest.trim().split_whitespace().next().map(str::parse::<u64>) {
+                        Some(Ok(v)) => best = Some(best.map_or(v, |b: u64| b.max(v))),
+                        // A `period = local.six_hours` or `= var.x` parsed to
+                        // None and then `unwrap_or(0)` reported a ZERO-second
+                        // window, which always passes. Absent is safe; present
+                        // but unreadable is NOT, and must fail loudly.
+                        _ => unparsed = true,
+                    }
+                }
+                (best, unparsed)
+            };
+
+            let (period_opt, period_unparsed) = num("period");
+            let (evals_opt, evals_unparsed) = num("evaluation_periods");
+            assert!(
+                !period_unparsed && !evals_unparsed,
+                "Metrics Insights alarm `{name}` has a non-literal `period` or \
+                 `evaluation_periods` (an interpolation or variable), so this guard \
+                 CANNOT verify it stays inside AWS's 3-hour cap.\n\
+                 Use a literal, or extend this guard to resolve the value — do not \
+                 leave it unverifiable, because an over-wide window is rejected only \
+                 at APPLY time and freezes the entire apply lane."
+            );
+            let period = period_opt.unwrap_or(0);
+            let evals = evals_opt.unwrap_or(1);
+            out.push((name, period, evals, true));
+        }
+    }
+    out
+}
+
+#[test]
+fn metrics_insights_alarms_stay_inside_the_three_hour_cap() {
+    let bodies = terraform_bodies();
+    let windows = alarm_eval_windows(&bodies);
+
+    assert!(
+        !windows.is_empty(),
+        "no Metrics Insights alarm found — this guard would pass vacuously. \
+         If the last one was removed, delete this test deliberately."
+    );
+
+    for (name, period, evals, _) in &windows {
+        let range = period.saturating_mul(*evals);
+        assert!(
+            range <= METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS,
+            "Metrics Insights alarm `{name}` evaluates across {range}s \
+             (period {period} x {evals} periods), over AWS's {}s cap.\n\
+             PutMetricAlarm will REJECT it with `MetricsInsights monitors cannot be \
+             checked across more than 3 hours` — and terraform plan will NOT catch \
+             that, so the whole apply lane goes red and every later terraform change \
+             stops deploying.\n\
+             Fix: shrink `period` (and/or `evaluation_periods`) so their product is \
+             at most {}s.",
+            METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS,
+            METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS
+        );
+    }
+}
+
+#[test]
+fn metrics_insights_window_guard_self_test() {
+    // The extractor must find the query, the period and the evaluation count,
+    // and must ignore a NON-Insights alarm (which has no such cap).
+    let over = r#"
+resource "aws_cloudwatch_metric_alarm" "too_wide" {
+  evaluation_periods = 2
+  metric_query {
+    id          = "q"
+    period      = 21600
+    expression  = "SELECT MAX(disk_used_percent) FROM \"CWAgent\" WHERE path = '/'"
+  }
+}
+"#;
+    let bodies = vec![("f.tf".to_string(), over.to_string())];
+    let w = alarm_eval_windows(&bodies);
+    assert_eq!(w.len(), 1, "the Insights alarm must be found");
+    assert_eq!(w[0].0, "too_wide");
+    assert_eq!(w[0].1 * w[0].2, 43200, "12h must be computed as 12h");
+    assert!(w[0].1 * w[0].2 > METRICS_INSIGHTS_MAX_EVAL_RANGE_SECS);
+
+    // A plain metric alarm has no Insights cap and must not be collected —
+    // otherwise every long-window alarm in the tree becomes a false failure.
+    let plain = r#"
+resource "aws_cloudwatch_metric_alarm" "plain" {
+  evaluation_periods = 24
+  period             = 21600
+  metric_name        = "Errors"
+  namespace          = "AWS/Lambda"
+}
+"#;
+    let bodies = vec![("f.tf".to_string(), plain.to_string())];
+    assert!(
+        alarm_eval_windows(&bodies).is_empty(),
+        "a non-Insights alarm must not be subject to the Insights cap"
+    );
+
+    // --- The three bypasses an adversarial re-read found on 2026-08-25 ---
+    // Each defeated the guard at exactly the job it exists for. Pinned here so
+    // they cannot come back quietly.
+
+    // BYPASS 1: two metric_query blocks, the SHORT decorative period first.
+    // `find_map` took 60 and reported a 120s window for a real 43200s one.
+    let two_queries = r#"
+resource "aws_cloudwatch_metric_alarm" "masked" {
+  evaluation_periods = 2
+  metric_query {
+    id = "a"
+    metric {
+      period = 60
+    }
+  }
+  metric_query {
+    id          = "b"
+    period      = 21600
+    expression  = "SELECT MAX(x) FROM \"CWAgent\" WHERE y = 'z'"
+  }
+}
+"#;
+    let w = alarm_eval_windows(&[("f.tf".to_string(), two_queries.to_string())]);
+    assert_eq!(w.len(), 1, "the Insights alarm must still be found");
+    assert_eq!(
+        w[0].1 * w[0].2,
+        43200,
+        "MAX period must win: a decorative 60s period must not mask the 21600s \
+         query period (this reported 120s before the fix)"
+    );
+
+    // BYPASS 3: `SELECT ... FROM` quoted in PROSE must not classify a plain
+    // alarm as Insights. This is live in the tree (partition_archive_failed).
+    let prose = r#"
+resource "aws_cloudwatch_metric_alarm" "prose_only" {
+  evaluation_periods = 1
+  period             = 21600
+  metric_name        = "Errors"
+  alarm_description  = "check retention: SELECT outcome, count() FROM partition_archive_audit"
+}
+"#;
+    assert!(
+        alarm_eval_windows(&[("f.tf".to_string(), prose.to_string())]).is_empty(),
+        "a SELECT quoted in an alarm_description must NOT be treated as a Metrics \
+         Insights query — it caused both a false failure and a vacuity hole"
+    );
+}
+
+#[test]
+#[should_panic(expected = "CANNOT verify")]
+fn metrics_insights_guard_refuses_an_unreadable_window() {
+    // BYPASS 2: a non-literal period parsed to None, then `unwrap_or(0)`
+    // reported a ZERO-second window, which passes every cap. Absent is safe;
+    // present-but-unreadable must fail loudly rather than silently pass.
+    let interpolated = r#"
+resource "aws_cloudwatch_metric_alarm" "unreadable" {
+  evaluation_periods = 2
+  metric_query {
+    id          = "q"
+    period      = local.six_hours
+    expression  = "SELECT MAX(x) FROM \"CWAgent\" WHERE y = 'z'"
+  }
+}
+"#;
+    let _ = alarm_eval_windows(&[("f.tf".to_string(), interpolated.to_string())]);
 }

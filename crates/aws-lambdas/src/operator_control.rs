@@ -3338,6 +3338,92 @@ mod tests {
             );
         }
     }
+    /// The 2026-08-25 finding: `wipe-questdb` allowlists only market-data
+    /// tables, so the 5-year regulatory tables survive it — while
+    /// `docker-reset` and `docker-nuke-bare` delete the whole QuestDB volume
+    /// and take them with it, with nothing exported first.
+    ///
+    /// Two things are asserted, and the second is the one that matters:
+    /// the export happens, and it happens BEFORE anything destructive. An
+    /// export placed after `docker volume rm` would pass a naive "contains"
+    /// check while preserving nothing.
+    #[test]
+    fn destructive_actions_export_the_sebi_tables_before_destroying_the_volume() {
+        const SEBI: [&str; 4] = [
+            "instrument_lifecycle",
+            "instrument_lifecycle_audit",
+            "index_constituency",
+            "order_audit",
+        ];
+        for (name, cmds) in [
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let preserve_at = cmds
+                .iter()
+                .position(|c| c.contains("SEBI-PRESERVED"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} destroys the QuestDB volume without exporting the 5-year \
+                         regulatory tables first. `wipe-questdb` spares them by allowlist; \
+                         this action must export them, because it deletes the volume they \
+                         live in."
+                    )
+                });
+
+            // Every destructive step must come after the export.
+            for (i, c) in cmds.iter().enumerate() {
+                let destroys = c.contains("docker volume rm")
+                    || c.contains("docker volume ls")
+                    || c.contains("compose down -v")
+                    || c.contains("system prune");
+                assert!(
+                    !destroys || i > preserve_at,
+                    "{name}: step {i} destroys data but runs BEFORE the SEBI export at \
+                     step {preserve_at} — an export that runs afterwards preserves nothing"
+                );
+            }
+
+            let block = cmds.join("\n");
+            for t in SEBI {
+                assert!(
+                    block.contains(t),
+                    "{name} must export the regulatory table `{t}` before destroying the volume"
+                );
+            }
+            // It must REFUSE when a table exists and cannot be exported —
+            // otherwise the export is decoration and the data is still lost.
+            assert!(
+                block.contains("SEBI-PRESERVE-FAILED") && block.contains("exit 1"),
+                "{name}: a failed export of an EXISTING regulatory table must abort the \
+                 action, not be logged and stepped over"
+            );
+            // And it must NOT refuse when QuestDB is simply unreachable —
+            // this action is also the remedy for a wedged QuestDB, and a
+            // recovery tool that cannot run during the failure it recovers
+            // from is not a recovery tool.
+            assert!(
+                block.contains("SEBI-PRESERVE-UNAVAILABLE"),
+                "{name}: an unreachable QuestDB must be reported and stepped over, never \
+                 treated as unexported data"
+            );
+            // The export target must be outside every path this action wipes.
+            assert!(
+                block.contains("/opt/tickvault/data/sebi-preserve/"),
+                "{name}: the export must land outside the volume and outside every rm -rf \
+                 path in this action"
+            );
+            for c in cmds.iter() {
+                if c.contains("rm -rf") {
+                    assert!(
+                        !c.contains("sebi-preserve"),
+                        "{name}: an rm -rf step must never sweep the preservation directory"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_docker_reset_and_bare_nuke_remove_feed_capture_sources() {
         // The full nuke + bare nuke must ALSO sweep the feed capture/replay

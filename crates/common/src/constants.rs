@@ -2655,6 +2655,35 @@ pub const WS_WAL_ARCHIVE_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 /// Cadence of the WAL archive prune task (6 hours in seconds).
 pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;
 
+/// Age bound on the ACTIVE `<wal_dir>/*.wal` set — 2 days (2026-08-25).
+///
+/// Until this existed, ONLY `archive/` was bounded. The active directory had
+/// no age bound and no byte bound, because the design assumed it drains
+/// itself: replay at boot → `replaying/` → confirm → `archive/` → pruned
+/// there.
+///
+/// It does not drain. `WAL_REPLAY_MAX_BYTES` caps a boot replay at 512 MiB —
+/// five segments — while the live lane writes continuously all session.
+/// Everything past the newest 512 MiB is never replayed, never confirmed,
+/// never archived, and so was eligible for no bound at all. Measured on the
+/// prod box: **244 active segments, 31 GB, oldest dated 08-24**, against a
+/// 1.9 GB archive its own bounds were holding correctly. The volume was 94%
+/// full and free space was cycling down to 1.94 GB.
+///
+/// **Why 2 days rather than the archive's 3.** These segments are
+/// PRE-confirmation, so the set is larger and turns over faster, and their
+/// recovery value decays faster too: a crash is recovered from the current
+/// session's tail. Two days keeps the previous session for triage while
+/// guaranteeing the bound cannot race the replay budget — at any retention of
+/// a full day or more, nothing a prune pass can delete is reachable by the
+/// next boot's 512 MiB replay window.
+///
+/// The BYTE half of the bound is deliberately NOT a constant here: see
+/// `ws_frame_spill::ws_wal_active_max_bytes`, which derives it from the
+/// volume. A ceiling pinned to no machine is what this session was spent
+/// repairing.
+pub const WS_WAL_ACTIVE_RETENTION_SECS: u64 = 172_800;
+
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
 // ---------------------------------------------------------------------------
@@ -4669,3 +4698,35 @@ mod tests {
 
 #[cfg(test)]
 mod cadence_native_retry_hedge_tests {}
+
+/// Packets we will walk within one main-feed message before declaring the
+/// message malformed.
+///
+/// **The arithmetic here was wrong until 2026-08-14** and is worth stating
+/// rather than quietly fixing. The comment claimed "the 1 MiB frame cap over
+/// the smallest (16-byte) packet bounds a legitimate message well under this".
+/// Two errors: the cap is `MAIN_FEED_MAX_FRAME_BYTES` = 162 × 5,000 × 2 =
+/// 1,620,000 bytes (~1.55 MiB, not 1 MiB), and 1,620,000 / 16 = **101,250**,
+/// which is ABOVE this ceiling, not well under it. A maximum-size frame made
+/// entirely of 16-byte ticker packets would be truncated here, its remainder
+/// counted as unparseable.
+///
+/// The ceiling is nonetheless kept, because it is a defence against a hostile
+/// or malfunctioning peer rather than a capacity limit, and the shape it
+/// bounds cannot occur legitimately: a socket carries at most
+/// `MAIN_FEED_INSTRUMENTS_PER_CONNECTION` (5,000) subscriptions, so a
+/// legitimate frame carries on the order of 5,000 packets — 14× below this —
+/// and reaching 101,250 would require the peer to send ~20 packets per
+/// subscribed instrument in a single message. Raising the ceiling to clear the
+/// theoretical maximum would weaken the defence to buy nothing.
+///
+/// What changed is only the honesty of the justification: the bound is a
+/// deliberate policy ceiling, not the arithmetic consequence the old comment
+/// asserted.
+///
+/// **Moved from `crates/app` to `common` on 2026-08-25.** It now bounds TWO
+/// walks over the same bytes: the frame drain that decodes packets, and the
+/// classifier that walks looking for a stacked disconnect. A second copy
+/// could drift, and a classifier that stops walking earlier than the drain
+/// would miss exactly the disconnect the drain goes on to decode.
+pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;

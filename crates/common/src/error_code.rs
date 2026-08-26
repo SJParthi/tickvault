@@ -163,6 +163,34 @@ pub enum ErrorCode {
     HotPath01SyncFsFailed,
     /// HOT-PATH-02: hot-path writer queue full / closed / uninitialized.
     HotPath02WriterQueueDrop,
+    /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
+    /// QuestDB and has been quarantined so the rest of the backlog can drain.
+    ///
+    /// The spill tier exists so a failed ILP flush costs disk instead of data.
+    /// That guarantee has a second half nobody had exercised: the file has to
+    /// be replayable. A malformed file is refused with an HTTP 4xx, which no
+    /// amount of retrying can change — and before this code existed the drain
+    /// stopped the whole round on ANY failure, so one bad file stranded every
+    /// file behind it, indefinitely.
+    ///
+    /// Found live 2026-08-25: a single torn line in a 401 KB file blocked a
+    /// 512 MB file holding 1,662,318 rescued ticks. The big file was
+    /// perfectly intact; it had simply never been attempted. `replayed_bytes`
+    /// read 0 while `replay_failed` climbed every five minutes, and both
+    /// files sat on disk for hours.
+    ///
+    /// The tear itself came from a PARTIAL APPEND while the volume was full:
+    /// one buffer's last line was cut mid-field and the next buffer's first
+    /// line ran straight into it, producing `lasticks`. So the rescue path
+    /// corrupted its own output under exactly the condition it exists for.
+    ///
+    /// Quarantine, never delete: the surviving lines are recoverable by hand
+    /// (1,292 of 1,293 were), and a rescue tier that deletes what it cannot
+    /// parse is worse than the loss it was built to prevent. Cold path only;
+    /// log-sink-only delivery. Severity::High, auto-triage-safe — the file is
+    /// already set aside and the queue is already moving; the operator
+    /// decides what to salvage.
+    TickSpill01FileQuarantined,
     // PR #5 (2026-05-19): PHASE2-01 + PHASE2-02 variants RETIRED.
     // Phase 2 dispatcher chain (phase2_scheduler + phase2_delta +
     // phase2_emit_guard + phase2_readiness_check + phase2_recovery) is
@@ -874,6 +902,26 @@ pub enum ErrorCode {
     /// auto-triage-safe (the degrade already happened; DEDUP-idempotent
     /// re-appends and the next event self-heal — the operator inspects).
     OrderEvt01PersistFailed,
+    /// ORDER-EVT-02 — an order-update frame PARSED but decoded HOLLOW: the
+    /// core identity fields (`order_no`, `status`, `security_id`) all came
+    /// out empty while the frame itself was well-formed JSON with a `Data`
+    /// object. `OrderUpdate` carries `#[serde(default)]` on EVERY field, so
+    /// a key-name mismatch — a Dhan schema change, an undocumented message
+    /// shape, a super-order leg frame — produces a full struct of defaults
+    /// and NO error. Found live 2026-08-25: ten captured rows whose only
+    /// populated fields were `ref_ltp`, `tick_size`, `mkt_type`,
+    /// `multiplier`, `good_till_days_date` and `algo_ord_no`, with the
+    /// operator's manual super order nowhere in them.
+    ///
+    /// This code exists because the raw frame was DISCARDED at parse time,
+    /// so the failure was undiagnosable after the fact. The emit carries a
+    /// BOUNDED, client-id-redacted excerpt of the raw JSON precisely so the
+    /// next occurrence can be read rather than guessed at. Cold path only;
+    /// log-sink-only delivery (no CloudWatch filter, no Telegram — the
+    /// 2026-07-14 Dhan noise-lock posture, whose 4-item family is
+    /// unchanged). Severity::High, auto-triage-safe: nothing is retried,
+    /// the row is still captured, and the operator reads the excerpt.
+    OrderEvt02DecodedHollow,
     /// ORDER-PNL-01 — per-leg option P&L persistence degraded (the
     /// `stage` field names the failing leg).
     OrderPnl01PersistFailed,
@@ -1001,6 +1049,7 @@ impl ErrorCode {
             // Wave 1 (PR #393)
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
+            Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
@@ -1128,6 +1177,7 @@ impl ErrorCode {
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded => "RAMSTORE-01",
             Self::OrderEvt01PersistFailed => "ORDER-EVT-01",
+            Self::OrderEvt02DecodedHollow => "ORDER-EVT-02",
             Self::OrderPnl01PersistFailed => "ORDER-PNL-01",
             Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
             Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
@@ -1288,6 +1338,9 @@ impl ErrorCode {
             // check ran degraded or blind. Loud (High), never a halt; the
             // feed and tick capture are unaffected.
             Self::DhanLiveXverify01RunDegraded => Severity::High,
+            // TICK-SPILL-01: rescued ticks are on disk and unreplayable until
+            // someone looks. High because the spill tier IS the loss guarantee.
+            Self::TickSpill01FileQuarantined => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1310,7 +1363,7 @@ impl ErrorCode {
             // a halt (cold path; QuestDB stays the durable truth and the
             // next boot re-fills). LOG-SINK-ONLY.
             Self::RamStore01Degraded => Severity::High,
-            Self::OrderEvt01PersistFailed => Severity::High,
+            Self::OrderEvt01PersistFailed | Self::OrderEvt02DecodedHollow => Severity::High,
             Self::OrderPnl01PersistFailed => Severity::High,
             // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
             // exit-order layer degraded / the MPP verify ladder exhausted
@@ -1442,6 +1495,9 @@ impl ErrorCode {
             | Self::AuthGapDisconnectTokenMap
             | Self::StorageGapTickDedupSegment
             | Self::StorageGapF32F64Precision => ".claude/rules/project/gap-enforcement.md",
+            Self::TickSpill01FileQuarantined => {
+                "docs/error-runbooks/tick-spill-replay-error-codes.md"
+            }
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
             | Self::PrevClose01IlpFailed
@@ -1600,7 +1656,7 @@ impl ErrorCode {
             Self::OrderPnl01PersistFailed => {
                 "docs/error-runbooks/order-leg-pnl-error-codes.md"
             }
-            Self::OrderEvt01PersistFailed => {
+            Self::OrderEvt01PersistFailed | Self::OrderEvt02DecodedHollow => {
                 "docs/error-runbooks/order-update-events-error-codes.md"
             }
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
@@ -1737,6 +1793,7 @@ impl ErrorCode {
             Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
+            Self::TickSpill01FileQuarantined,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
             Self::PrevClose02FirstSeenInconsistency,
@@ -1832,6 +1889,7 @@ impl ErrorCode {
             // RAM residency stores (operator 2026-07-16, PR-2)
             Self::RamStore01Degraded,
             Self::OrderEvt01PersistFailed,
+            Self::OrderEvt02DecodedHollow,
             Self::OrderPnl01PersistFailed,
             // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
             Self::ExitOrder01ExecutionDegraded,
@@ -2255,7 +2313,11 @@ mod tests {
                 // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
                 || s.starts_with("CADENCE-")
                 // The revived Dhan feed's live-vs-REST ground-truth check
-                || s.starts_with("DHAN-LIVE-XVERIFY-");
+                || s.starts_with("DHAN-LIVE-XVERIFY-")
+                // 2026-08-25: the tick spill tier's replay path — a rescued
+                // file QuestDB will never accept, set aside so the rest of
+                // the backlog can drain.
+                || s.starts_with("TICK-SPILL-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

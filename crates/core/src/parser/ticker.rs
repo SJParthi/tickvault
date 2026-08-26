@@ -15,6 +15,7 @@ use super::types::{PacketHeader, ParseError};
 /// # Performance
 /// O(1) — two `from_le_bytes` reads.
 #[inline]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by TICKER_PACKET_SIZE check above
 pub fn parse_ticker_packet(
     raw: &[u8],
@@ -52,6 +53,7 @@ pub fn parse_ticker_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;

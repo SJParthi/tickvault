@@ -197,3 +197,61 @@ This rule activates when editing:
   `OrderUpdateEventRecord`, `PositionUpdateEventRecord`, `next_event_seq`,
   `order_update_events`, `position_update_events`, or
   `tv_order_update_events_`
+
+---
+
+## ORDER-EVT-02 — an order-update frame parsed but decoded HOLLOW
+
+`ErrorCode::OrderEvt02DecodedHollow` (`code_str() == "ORDER-EVT-02"`).
+**Severity:** High. **Auto-triage safe:** YES — nothing is retried, the row
+is still captured, and the operator reads the excerpt. **Delivery:**
+log-sink-only (no CloudWatch filter, no Telegram — the 2026-07-14 Dhan
+noise-lock posture; its 4-item alert family is UNCHANGED by this code).
+
+**Trigger.** `parse_order_update` returned `Ok`, but `order_no`, `status`
+and `security_id` are ALL empty. `OrderUpdate` carries `#[serde(default)]`
+on every field and `#[serde(rename_all = "PascalCase")]`, so a frame whose
+key names do not match deserializes into a full struct of defaults and
+returns success. There is no parse error to catch: the decode genuinely
+succeeded and produced nothing.
+
+**The incident that created this code (2026-08-25).** The operator placed a
+manual super intraday order and asked why it was in no table. Two distinct
+faults were stacked:
+
+1. The disk had filled, QuestDB had WAL-suspended 14 tables, and suspended
+   tables keep ACKing ILP writes while discarding them. Fixed by growing the
+   volume (Quote 19) and `RESUME WAL`; the rows then appeared.
+2. The recovered rows were **empty**. Of ~48 columns, only `ref_ltp`
+   (11.15), `tick_size` (0.05), `mkt_type` (`XX`), `multiplier` (1),
+   `good_till_days_date` and `algo_ord_no` (`0`) carried anything. Every
+   core identity field was blank.
+
+Fault 2 was **undiagnosable after the fact**, because the raw frame is
+dropped at the parse site and never logged, and the consumer downstream only
+ever sees the already-decoded struct. This code exists to make the next
+occurrence readable rather than a matter of guesswork.
+
+**Triage.**
+1. `mcp__tickvault-logs__tail_errors` — find `ORDER-EVT-02`. The `excerpt`
+   field is the RAW frame: client-id VALUE redacted, key preserved, bounded
+   to 1 KiB, truncated on a character boundary.
+2. Compare the excerpt's key set against `OrderUpdate` in
+   `crates/common/src/order_types.rs` and against
+   `docs/dhan-ref/10-live-order-update-websocket.md`. The mismatch is the
+   defect; the excerpt is what a schema fix must be written against.
+3. **Do not infer Dhan's field names from a single frame.** The observed
+   shape is equally consistent with a Dhan schema change, an undocumented
+   message type, and a super-order leg-context frame. Collect several
+   excerpts before changing the struct.
+4. `tv_order_update_hollow_decode_total` is the rate signal — a steady count
+   means every frame of that shape is hollow, an occasional one means a
+   distinct message type is being decoded as an order update.
+
+**Honest envelope.** This code detects and preserves; it does not repair.
+A hollow frame still broadcasts downstream and still writes its (empty)
+`order_audit` and `order_update_events` rows — deliberately, because
+dropping it would trade one silent loss for another. What it changes is that
+the frame is now visible. The detector is three `is_empty()` calls on an
+already-decoded struct and builds the excerpt ONLY on the hollow branch, so
+a healthy frame pays nothing beyond the compares.

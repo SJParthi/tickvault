@@ -80,7 +80,7 @@
 //! minute — `websocket-connection-scope-lock.md` §E) are Dhan-side and are
 //! NOT fixed by any of this.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -88,9 +88,7 @@ use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-    DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, MAX_PLAUSIBLE_LTP,
-    OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, SPOT_1M_REST_INDICES,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICKER_PACKET_SIZE,
+    MAX_PLAUSIBLE_LTP, SPOT_1M_REST_INDICES, TICK_PERSIST_END_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -854,6 +852,17 @@ pub struct LiveIngest {
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
+    /// Edge latch for the dead-class detector: one bit per segment, set while
+    /// that class is reported dead.
+    ///
+    /// An `AtomicU8` rather than a plain `[bool; 8]` because the sweep runs
+    /// behind `&self` — and a bitmask because eight classes fit in one byte,
+    /// so the whole latch is a single relaxed load. Edge-latched, not
+    /// level-triggered: the sweep runs every 30 seconds and a dead class stays
+    /// dead all session, so a level trigger would emit ~1,100 identical lines
+    /// per class per session. One line per episode is the signal; the rest is
+    /// noise that buries it.
+    dead_class_latch: AtomicU8,
     aggregator: MultiTfAggregator,
     writer: TickWriter,
     seq_refused: u64,
@@ -892,6 +901,30 @@ pub struct LiveIngest {
     /// staging area, NOT storage: without a flush the rows never leave the
     /// process, so this counter is what makes the flush happen at all.
     pending_rows: u64,
+    /// True once [`Self::spawn_offload_writer`] has moved the blocking ILP
+    /// round trip onto a thread of its own.
+    ///
+    /// Read by `flush_and_record`, which must NOT record feed health from an
+    /// offloaded flush: the number that comes back is rows HANDED OFF, and
+    /// health is defined as rows LANDED. The writer thread reports it instead.
+    writer_offloaded: bool,
+    /// The writer thread's join handle, held HERE rather than at the boot site
+    /// so the drain — which owns the tail flush — can wait for the last batch
+    /// to land.
+    ///
+    /// This is not tidiness. The shutdown tail exists because "the tail of the
+    /// session is exactly the data a naive shutdown loses"; offloading it
+    /// without a join would have re-created that loss one queue further out,
+    /// with the batch dying in a detached thread as the process exits.
+    writer_thread: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the writer thread as its LAST act, so shutdown can wait
+    /// with a bounded grace instead of a `join` that has no timeout.
+    ///
+    /// `JoinHandle::join` blocks forever by contract. A writer wedged on a
+    /// hung socket would therefore hang the whole shutdown — trading a lost
+    /// tail batch for a box that never stops, which is the worse failure on a
+    /// host whose auto-stop is a cost control.
+    writer_done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl LiveIngest {
@@ -908,6 +941,45 @@ impl LiveIngest {
         self
     }
 
+    /// Sizes the silence detector's slot table independently of the fold's
+    /// pre-size.
+    ///
+    /// # The blind spot this exists to close (MEASURED live, 2026-08-25)
+    ///
+    /// `new`'s `capacity` is a SOFT pre-size for the fold and a HARD cap for
+    /// the detector — `TickGapDetector::with_capacity` never grows and never
+    /// reallocates. That asymmetry is invisible at the call site, and it is
+    /// the whole defect: the boot site computes `capacity` from the
+    /// main-feed set as it stands BEFORE any socket opens, which is the SPOT
+    /// universe. The ~22,000 contracts arrive minutes later, through
+    /// `run_contract_attach`. Live that day:
+    ///
+    /// ```text
+    /// 08:31:09  refused: 1,276,658  tracked: 865
+    /// 12:37:47  refused: 1,211,764  tracked: 865
+    /// ```
+    ///
+    /// 865 is exactly the spot universe. Every contract tick was refused a
+    /// slot, so `scan_silence`'s `silent` and `never_ticked` counts described
+    /// 865 instruments while reading as though they described all ~23,000 —
+    /// the detector's own edge-latched error says precisely this, and it fired
+    /// every session. A contract that was silently never subscribed could not
+    /// be reported by anything.
+    ///
+    /// Sizing at the authorized ceiling rather than at a boot-time count is
+    /// the point: the ceiling does not depend on WHEN the universe is counted,
+    /// so this cannot silently re-break the next time instruments are added
+    /// after boot. Cost is ~2 MB of slots plus its index, against a 32 GiB
+    /// host.
+    ///
+    /// Must be called during construction, before any [`Self::seed`] — it
+    /// REPLACES the detector, discarding whatever it had learned.
+    #[must_use]
+    pub fn with_detector_capacity(mut self, capacity: usize) -> Self {
+        self.detector = TickGapDetector::with_capacity(capacity.max(1), DetectorConfig::default());
+        self
+    }
+
     /// Builds the fold, pre-sized for `capacity` instruments so the slot table
     /// and the detector index never realloc mid-session.
     #[must_use]
@@ -916,6 +988,7 @@ impl LiveIngest {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            dead_class_latch: AtomicU8::new(0),
             aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
             writer,
             seq_refused: 0,
@@ -928,6 +1001,9 @@ impl LiveIngest {
             seals_rescued: 0,
             seals_dropped: 0,
             pending_rows: 0,
+            writer_offloaded: false,
+            writer_thread: None,
+            writer_done: None,
         }
     }
 
@@ -956,6 +1032,149 @@ impl LiveIngest {
     /// Returns the number of rows the flush covered. A failed flush DISCARDS
     /// the buffer by `TickWriter` contract — loudly, so the loss is counted
     /// rather than silently re-sent forever.
+    /// Moves the blocking ILP round trip onto a dedicated OS thread.
+    ///
+    /// # The coupling this removes
+    ///
+    /// `TickWriter::flush` is a synchronous HTTP call with a 5 s timeout, and
+    /// it ran ON the frame-drain task. `blocking_flush` wrapped it in
+    /// `block_in_place`, which is a real mitigation for the RUNTIME — the
+    /// other tasks keep their workers — but it does nothing for the drain
+    /// itself, and the drain is the only thing emptying the socket. So a slow
+    /// QuestDB stopped the fold; the receive buffer filled; and Dhan, whose
+    /// published behaviour is to skip a slow consumer forward to "the latest
+    /// available state" with no sequence number, discarded the intermediate
+    /// ticks at their side. The loss was therefore invisible to every counter
+    /// we own, and no amount of provisioned disk throughput removes it,
+    /// because the coupling is structural.
+    ///
+    /// After this call the drain's flush is a bounded-queue hand-off: it
+    /// never waits on the network, and when the queue is full it keeps the
+    /// rows and retries rather than blocking or dropping.
+    ///
+    /// # An OS thread, not `spawn_blocking`
+    ///
+    /// The writer runs for the life of the process doing a blocking wait.
+    /// Parking a tokio blocking-pool thread on it forever is exactly what
+    /// that pool is not for, and a named OS thread shows up in `top` as
+    /// `tv-tick-writer`, which is worth something at 3 a.m.
+    ///
+    /// # Health is reported HERE
+    ///
+    /// The thread — not the drain — calls `record_ticks`, with rows that
+    /// actually LANDED. Reporting on hand-off instead would forge liveness
+    /// during a database outage: the queue would accept batches happily while
+    /// nothing reached the database, and `feed_health` would read green for
+    /// precisely as long as the data was going nowhere.
+    pub fn spawn_offload_writer(
+        &mut self,
+        feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    ) -> std::io::Result<()> {
+        let placeholder = TickWriter::for_test(Feed::Dhan);
+        let live = std::mem::replace(&mut self.writer, placeholder);
+        let (producer, mut sink, rx) = live.split_for_offload();
+        self.writer = producer;
+        self.writer_offloaded = true;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("tv-tick-writer".to_owned())
+            .spawn(move || {
+                // `recv` ends only when every sender is dropped, i.e. when the
+                // drain itself is gone. There is no other exit, deliberately:
+                // a writer that could stop on its own would leave the producer
+                // handing rows to a closed queue.
+                while let Ok(mut batch) = rx.recv() {
+                    let landed = sink.write(&mut batch);
+                    report_tick_persistence(landed > 0);
+                    feed_health.record_ticks(
+                        Feed::Dhan,
+                        landed as u64,
+                        chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+                    );
+                }
+                info!("tick writer thread exiting — the drain closed its queue");
+                // Last act: tell shutdown the queue is fully drained.
+                //
+                // The result is HANDLED, not discarded, and the crate leaves no
+                // third option — `lib.rs` denies `unused_must_use` AND
+                // `clippy::let_underscore_must_use`, so both `drop(...)` and
+                // `let _ = ...` are rejected here by design. That is the right
+                // rule: a failed send is not nothing, it means the receiver
+                // gave up first.
+                //
+                // Which is worth a line, because it is the one case where the
+                // shutdown's own error over-reports: it will already have said
+                // the writer "did not finish", and this says it did — just too
+                // late. Debug rather than warn, since by then the operator has
+                // the louder message and the spill path has the rows.
+                if done_tx.send(()).is_err() {
+                    tracing::debug!(
+                        "tick writer finished AFTER the shutdown grace expired — \
+                         the timeout already reported; the rows are accounted for"
+                    );
+                }
+            })?;
+        self.writer_thread = Some(handle);
+        self.writer_done = Some(done_rx);
+        Ok(())
+    }
+
+    /// Closes the hand-off queue and WAITS for the writer thread to finish.
+    ///
+    /// Call once, after the shutdown tail flush. The order is load-bearing:
+    /// the tail flush hands the last batch to the queue, closing the queue
+    /// tells the writer there is no more, and the join is what guarantees that
+    /// batch reaches QuestDB (or the spill tier) before the process goes away.
+    /// Skipping the join loses exactly the rows the tail flush exists to save.
+    ///
+    /// Idempotent and safe on a lane that was never offloaded.
+    pub fn shutdown_offload_writer(&mut self) {
+        self.writer.close_offload();
+        self.writer_offloaded = false;
+        let Some(handle) = self.writer_thread.take() else {
+            return;
+        };
+        // BOUNDED, not `join()`. The grace is generous against the ILP client's
+        // own 5 s request timeout — one in-flight flush plus the queue behind
+        // it — but it is finite, because a writer wedged on a hung socket must
+        // not be able to hang the box's shutdown.
+        let finished = self
+            .writer_done
+            .take()
+            .is_some_and(|rx| rx.recv_timeout(OFFLOAD_SHUTDOWN_GRACE).is_ok());
+        if !finished {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                grace_secs = OFFLOAD_SHUTDOWN_GRACE.as_secs(),
+                "the tick writer did not finish within the shutdown grace — the \
+                 final batch of the session may not have reached QuestDB. Check \
+                 the tick spill directory; the rows are re-ingestable if they \
+                 were rescued."
+            );
+            // Deliberately NOT joined after a timeout: joining here is exactly
+            // the unbounded wait the grace exists to avoid. The thread is
+            // detached and the process is going away.
+            return;
+        }
+        if handle.join().is_err() {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the tick writer thread PANICKED — the final batch of the session \
+                 may not have reached QuestDB. Check the tick spill directory."
+            );
+        }
+    }
+
+    /// Has the blocking flush been moved off the drain task?
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the offload wiring tests below.
+    pub const fn writer_is_offloaded(&self) -> bool {
+        self.writer_offloaded
+    }
+
     pub fn flush(&mut self) -> u64 {
         // Flush the inline-depth sink FIRST, and unconditionally.
         //
@@ -1248,7 +1467,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -1445,7 +1664,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -1585,7 +1804,25 @@ impl LiveIngest {
         let mut silent = 0u64;
         let mut never = 0u64;
         let mut named = 0usize;
+        let mut classes = ClassLiveness::default();
         self.detector.scan_silence(now_millis, |report| {
+            // CLASS ROLLUP — folded here, BEFORE the alarm filter below, and
+            // deliberately not behind `counts_toward_alarm()`.
+            //
+            // That filter is `!sparse && (Exceeded | NeverTicked)`, so it
+            // drops HEALTHY instruments. Reusing it as the class denominator
+            // would leave a denominator of "only the troubled ones", making
+            // `never == eligible` true the moment any instrument in a segment
+            // had never ticked — the detector would fire on a healthy lane
+            // every sweep. The rollup therefore does its own classification
+            // from the raw report, and rides this sweep rather than adding a
+            // second O(n) pass over the universe.
+            classes.observe(
+                report.key.1,
+                report.sparse,
+                report.verdict == SilenceVerdict::NeverTicked,
+                report.silent_millis > report.expected_millis,
+            );
             if !report.counts_toward_alarm() {
                 return;
             }
@@ -1622,7 +1859,58 @@ impl LiveIngest {
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
+        self.report_dead_classes(&classes);
         (silent, never, named)
+    }
+
+    /// Reports any instrument class that produced NOTHING, once per episode.
+    ///
+    /// Edge-latched per segment: the rising edge emits, the falling edge
+    /// clears the latch so a later recurrence emits again. The gauge is set
+    /// unconditionally every sweep, so a dashboard shows the live state while
+    /// the log carries one line per episode.
+    ///
+    /// Log-sink-only by construction. This adds NO Telegram page: the Dhan
+    /// alert family is fixed at four items by
+    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2, and adding a fifth needs
+    /// a dated operator quote in that file FIRST. The counter and gauge are
+    /// what an alarm would later read.
+    fn report_dead_classes(&self, classes: &ClassLiveness) {
+        let previous = self.dead_class_latch.load(Ordering::Relaxed);
+        let mut current = 0u8;
+        let mut dead_now = 0u64;
+
+        for index in 0..SEGMENT_CLASS_COUNT {
+            if !classes.is_dead(index) {
+                continue;
+            }
+            let Some(segment) = segment_class_at(index) else {
+                continue;
+            };
+            dead_now = dead_now.saturating_add(1);
+            let bit = 1u8 << index;
+            current |= bit;
+
+            if previous & bit != 0 {
+                // Already reported this episode — count nothing, log nothing.
+                continue;
+            }
+            metrics::counter!(DEAD_CLASS_METRIC, "segment" => segment.as_str()).increment(1);
+            error!(
+                code = ErrorCode::RiskGapTickGap.code_str(),
+                segment = segment.as_str(),
+                instruments = classes.eligible[index],
+                "instrument class produced NOTHING since subscribe — every \
+                 non-sparse instrument in this segment is still never-ticked \
+                 past its warmup window, which is what a subscribe that did \
+                 not take looks like; there is no payload to parse and no \
+                 error to log, so absence against a seeded key is the only \
+                 evidence"
+            );
+        }
+
+        metrics::gauge!(DEAD_CLASSES_GAUGE).set(dead_now as f64);
+        self.dead_class_latch.store(current, Ordering::Relaxed);
     }
 
     /// Seals every bucket the watermark has moved past, mid-session.
@@ -1700,7 +1988,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_thirteen`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -2311,6 +2599,154 @@ pub const INSTRUMENTS_SILENT_GAUGE: &str = "tv_dhan_feed_instruments_silent";
 /// error to log. Absence against a seeded key is the only evidence.
 pub const INSTRUMENTS_NEVER_TICKED_GAUGE: &str = "tv_dhan_feed_instruments_never_ticked";
 
+/// Counter: an entire instrument CLASS produced nothing, once per episode.
+///
+/// # Why a class detector exists beside a per-instrument one
+///
+/// [`INSTRUMENTS_NEVER_TICKED_GAUGE`] counts instruments. It cannot answer
+/// the question that actually matters when a subscribe silently fails for one
+/// SEGMENT: on 2026-08-21 the lane subscribed 119 NSE indices and received
+/// **zero** ticks from any of them for the whole session, while 8,868
+/// tradeable instruments flowed normally at 17.5M ticks. The per-instrument
+/// gauge read 119 out of ~9,000 — under 1.5%, indistinguishable at a glance
+/// from ordinary thin-instrument quiet, and nothing paged. It was found by a
+/// human reading logs.
+///
+/// A whole class producing nothing is a different fact with a different
+/// cause: the subscribe did not take for that segment. `IDX_I` in Full mode
+/// is the known instance — an index has no order book, so asking for depth-5
+/// requests something that does not exist and Dhan answers with silence
+/// rather than an error. That failure is invisible to every other signal the
+/// lane produces, because absence has no payload to parse and no error to
+/// log.
+pub const DEAD_CLASS_METRIC: &str = "tv_dhan_feed_dead_instrument_class_total";
+
+/// Gauge: instrument classes currently judged dead. `0` is the healthy value.
+pub const DEAD_CLASSES_GAUGE: &str = "tv_dhan_feed_dead_instrument_classes";
+
+/// Number of [`ExchangeSegment`] variants — the width of the class tallies.
+///
+/// A fixed array rather than a map: the count is a compile-time property of
+/// the enum, so the rollup stays O(1) per report and allocation-free, which
+/// matters because it rides inside the O(n) silence sweep rather than adding
+/// a second pass over the universe.
+const SEGMENT_CLASS_COUNT: usize = 8;
+
+/// Dense index for a segment. Explicit match, never a discriminant cast, so
+/// re-ordering the enum cannot silently re-label a class's tallies.
+const fn segment_class_index(segment: ExchangeSegment) -> usize {
+    match segment {
+        ExchangeSegment::IdxI => 0,
+        ExchangeSegment::NseEquity => 1,
+        ExchangeSegment::NseFno => 2,
+        ExchangeSegment::NseCurrency => 3,
+        ExchangeSegment::BseEquity => 4,
+        ExchangeSegment::McxComm => 5,
+        ExchangeSegment::BseCurrency => 6,
+        ExchangeSegment::BseFno => 7,
+    }
+}
+
+/// Inverse of [`segment_class_index`], for labelling an episode.
+const fn segment_class_at(index: usize) -> Option<ExchangeSegment> {
+    match index {
+        0 => Some(ExchangeSegment::IdxI),
+        1 => Some(ExchangeSegment::NseEquity),
+        2 => Some(ExchangeSegment::NseFno),
+        3 => Some(ExchangeSegment::NseCurrency),
+        4 => Some(ExchangeSegment::BseEquity),
+        5 => Some(ExchangeSegment::McxComm),
+        6 => Some(ExchangeSegment::BseCurrency),
+        7 => Some(ExchangeSegment::BseFno),
+        _ => None,
+    }
+}
+
+/// Per-segment liveness tally, folded from the silence sweep.
+///
+/// # The three buckets, and why a naive two-bucket version is wrong
+///
+/// `eligible` is the denominator: every seeded instrument in the segment that
+/// we are willing to judge. `never` is the numerator: those that have
+/// produced nothing AND have had a fair chance to. `pending` is the ones
+/// still inside their fair-chance window.
+///
+/// `pending` is what stops a false page on every boot. Between subscribing
+/// and the first tick every instrument is legitimately never-ticked, so a
+/// detector without this bucket would declare every class dead a few seconds
+/// after connect, every single morning.
+///
+/// **Sparse instruments are excluded from ALL THREE.** Far-month futures and
+/// INDIA VIX are legitimately quiet for minutes at a time and the scope lock
+/// already excludes them from the silent count; judging them here would
+/// manufacture the alarm this detector exists to make trustworthy. Excluding
+/// them from the denominator too — not just the numerator — is the part that
+/// is easy to get wrong: leaving them in the denominator would make
+/// `never == eligible` unreachable for any segment containing one, and the
+/// detector would silently never fire. That is the false-OK class this
+/// repository has retired twice.
+#[derive(Debug, Default, Clone, Copy)]
+struct ClassLiveness {
+    eligible: [u32; SEGMENT_CLASS_COUNT],
+    never: [u32; SEGMENT_CLASS_COUNT],
+    pending: [u32; SEGMENT_CLASS_COUNT],
+}
+
+impl ClassLiveness {
+    /// Folds one silence report. O(1), no allocation.
+    fn observe(
+        &mut self,
+        segment: ExchangeSegment,
+        sparse: bool,
+        never_ticked: bool,
+        past_window: bool,
+    ) {
+        if sparse {
+            return;
+        }
+        let i = segment_class_index(segment);
+        self.eligible[i] = self.eligible[i].saturating_add(1);
+        if never_ticked {
+            if past_window {
+                self.never[i] = self.never[i].saturating_add(1);
+            } else {
+                self.pending[i] = self.pending[i].saturating_add(1);
+            }
+        }
+    }
+
+    /// True when this segment produced NOTHING and every member has had its
+    /// fair chance.
+    ///
+    /// An instrument that ticked and then went quiet carries the `Exceeded`
+    /// verdict, not `NeverTicked`, so it counts in `eligible` and keeps the
+    /// class alive: this fires for "never produced anything", never for "has
+    /// gone quiet".
+    ///
+    /// # The `pending` term is REDUNDANT, and that is recorded rather than hidden
+    ///
+    /// `pending == 0` reads like the warmup guard, and it was written as one.
+    /// It is not load-bearing: `observe` increments `eligible` for every
+    /// non-sparse instrument but `never` only for past-window ones, so
+    /// `pending > 0` already forces `never < eligible` and the equality below
+    /// fails on its own. Mutating this term away does not change a single
+    /// verdict — proven by bite-testing it, which is how the redundancy was
+    /// found at all.
+    ///
+    /// It is KEPT because it states the intent that the arithmetic only
+    /// implies, and it costs one comparison on a path that runs eight times
+    /// per 30-second sweep. What makes that safe rather than decorative is
+    /// `the_tally_invariant_that_makes_the_pending_term_redundant_holds`,
+    /// which pins the relationship the redundancy depends on — so a future
+    /// change to the fold that broke it would fail a test instead of silently
+    /// turning this into the warmup guard everyone already believes it is.
+    fn is_dead(&self, index: usize) -> bool {
+        self.eligible[index] > 0
+            && self.pending[index] == 0
+            && self.never[index] == self.eligible[index]
+    }
+}
+
 /// How many silent instruments a single episode may NAME in the log.
 ///
 /// The page fires once per episode behind a 30-minute cooldown, so this bounds
@@ -2429,6 +2865,18 @@ pub const SILENCE_DETECTOR_REFUSED_GAUGE: &str = "tv_dhan_feed_silence_detector_
 /// during one, the feed genuinely is not delivering.
 ///
 /// [`FeedHealthRegistry`]: tickvault_common::feed_health::FeedHealthRegistry
+/// How long shutdown waits for the tick writer to finish its last batch.
+///
+/// Sized against the ILP client's own 5 s request timeout: one flush already
+/// on the wire, plus the queue behind it, plus slack. Finite by requirement —
+/// `JoinHandle::join` has no timeout, and a writer wedged on a hung socket
+/// would otherwise hang a shutdown that the host's cost control depends on.
+pub const OFFLOAD_SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// [`OFFLOAD_SHUTDOWN_GRACE_SECS`] as a `Duration`.
+pub const OFFLOAD_SHUTDOWN_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(OFFLOAD_SHUTDOWN_GRACE_SECS);
+
 pub const LAST_TICK_AGE_GAUGE: &str = "tv_dhan_feed_last_tick_age_secs";
 
 /// The value [`LAST_TICK_AGE_GAUGE`] publishes.
@@ -2590,6 +3038,17 @@ fn flush_and_record(
     ingest: &mut LiveIngest,
     feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
 ) -> u64 {
+    // OFFLOADED: the flush is a bounded-queue hand-off with no network in it,
+    // so there is nothing to move off-worker and — more importantly — nothing
+    // to report health from. `rows` here means rows HANDED OFF, and health is
+    // defined three paragraphs up as rows FLUSHED. Recording on hand-off would
+    // forge liveness for exactly as long as the database was unreachable: the
+    // queue accepts batches, the sink fails every write, and the one signal an
+    // operator checks reads green. The writer thread records instead, from the
+    // rows that actually landed — see `LiveIngest::spawn_offload_writer`.
+    if ingest.writer_is_offloaded() {
+        return ingest.flush();
+    }
     let rows = blocking_flush(|| ingest.flush());
     feed_health.record_ticks(
         Feed::Dhan,
@@ -3252,6 +3711,11 @@ async fn run_frame_drain(
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
     let tail = flush_and_record(&mut ingest, &feed_health);
+    // Close the hand-off queue and WAIT. The tail flush above only handed the
+    // batch to the writer thread; without this join the process can exit while
+    // that batch is still in flight, which would lose precisely the rows the
+    // tail flush exists to save. No-op on a lane that was never offloaded.
+    ingest.shutdown_offload_writer();
     flush_depth(depth_ingest.as_mut());
     publish_fold_depth(&ingest);
     let depth_dropped = depth_ingest.as_ref().map_or(0, DepthIngest::dropped_rows);
@@ -3364,8 +3828,8 @@ pub fn drain_main_feed_frame(
 ) -> FrameOutcome {
     let mut out = FrameOutcome::default();
     // A single WebSocket message may carry SEVERAL stacked packets — the
-    // frame cap is sized for ~1,600 of them. Walking the frame packet by
-    // packet is what stops packets 2..N being silently discarded.
+    // frame cap is `MAX_PACKETS_PER_FRAME` (70,000) of them. Walking the frame
+    // packet by packet is what stops packets 2..N being silently discarded.
     let mut offset = 0usize;
     let mut packets = 0u32;
     while offset < frame.bytes.len() {
@@ -4005,31 +4469,10 @@ pub struct DrainOutcome {
     pub unparseable: u64,
 }
 
-/// Packets we will walk within one main-feed message before declaring the
-/// message malformed.
-///
-/// **The arithmetic here was wrong until 2026-08-14** and is worth stating
-/// rather than quietly fixing. The comment claimed "the 1 MiB frame cap over
-/// the smallest (16-byte) packet bounds a legitimate message well under this".
-/// Two errors: the cap is `MAIN_FEED_MAX_FRAME_BYTES` = 162 × 5,000 × 2 =
-/// 1,620,000 bytes (~1.55 MiB, not 1 MiB), and 1,620,000 / 16 = **101,250**,
-/// which is ABOVE this ceiling, not well under it. A maximum-size frame made
-/// entirely of 16-byte ticker packets would be truncated here, its remainder
-/// counted as unparseable.
-///
-/// The ceiling is nonetheless kept, because it is a defence against a hostile
-/// or malfunctioning peer rather than a capacity limit, and the shape it
-/// bounds cannot occur legitimately: a socket carries at most
-/// `MAIN_FEED_INSTRUMENTS_PER_CONNECTION` (5,000) subscriptions, so a
-/// legitimate frame carries on the order of 5,000 packets — 14× below this —
-/// and reaching 101,250 would require the peer to send ~20 packets per
-/// subscribed instrument in a single message. Raising the ceiling to clear the
-/// theoretical maximum would weaken the defence to buy nothing.
-///
-/// What changed is only the honesty of the justification: the bound is a
-/// deliberate policy ceiling, not the arithmetic consequence the old comment
-/// asserted.
-pub const MAX_PACKETS_PER_FRAME: u32 = 70_000;
+/// Re-exported so the drain and the WS classifier walk the SAME bound. The
+/// declaration moved to `common` on 2026-08-25 (see there for the arithmetic
+/// correction and why the ceiling is a policy bound, not a capacity one).
+pub use tickvault_common::constants::MAX_PACKETS_PER_FRAME;
 
 /// Prometheus histogram of exchange→receipt delivery lag on the LIVE socket.
 ///
@@ -4311,29 +4754,11 @@ pub enum WsLag {
     ClampedNegative,
 }
 
-/// Byte length of the main-feed packet starting at `bytes`, from its response
-/// code. `None` for an unknown code or a header too short to classify.
-///
-/// The header carries its own message length at bytes 1..3, but that field is
-/// vendor-supplied: trusting it would let a malformed length walk the parser
-/// off the end of one packet and into the middle of the next. The code→size
-/// table is ours and is fixed by the protocol.
-fn main_feed_packet_len(bytes: &[u8]) -> Option<usize> {
-    let code = *bytes.first()?;
-    let size = match code {
-        // Ticker (2), previous close (6), OI (5), disconnect (50), market
-        // status (7) — sizes from `crates/common/src/constants.rs`.
-        2 => TICKER_PACKET_SIZE,
-        4 => QUOTE_PACKET_SIZE,
-        5 => OI_PACKET_SIZE,
-        6 => PREVIOUS_CLOSE_PACKET_SIZE,
-        7 => MARKET_STATUS_PACKET_SIZE,
-        8 => FULL_QUOTE_PACKET_SIZE,
-        50 => DISCONNECT_PACKET_SIZE,
-        _ => return None,
-    };
-    Some(size)
-}
+/// Re-exported so the drain and the WS classifier walk the SAME packet
+/// boundaries. Moved to `core` on 2026-08-25: two walks that disagree let the
+/// drain decode a disconnect the classifier never saw, which is exactly how a
+/// stacked 804 escaped Fatal classification for a full session.
+pub use tickvault_core::parser::dispatcher::main_feed_packet_len;
 
 /// Republishes the fold's depth gauges. Reads only — never mutates the fold.
 ///
@@ -4630,6 +5055,49 @@ pub const DEPTH_ATTACH_PREOPEN_RETRY_SECS: u64 = 15;
 /// ~230 messages sent back-to-back with no pacing, so under a second in
 /// practice, and the rest is margin.
 pub const PREOPEN_READY_DEADLINE_IST_SECS: u32 = 9 * 3_600 + 12 * 60;
+
+/// Whether the pre-open readiness deadline APPLIES to an attach that began at
+/// `attach_started_ist_secs`.
+///
+/// # The false page this closes (MEASURED live, 2026-08-25)
+///
+/// The deadline verdict was `ready_at <= PREOPEN_READY_DEADLINE_IST_SECS` and
+/// nothing else, so it asked "did this attach finish before 09:12?" of EVERY
+/// attach — including one that had not started until the afternoon. A restart
+/// cannot pass a test whose pass condition is a time already in the past, so
+/// the verdict was decided by the clock rather than by anything about the
+/// lane. Live that day, on a busy deploy afternoon:
+///
+/// ```text
+/// 09:08:04  attempts: 57  ready_at 32884  deadline 33120  met_deadline: TRUE
+/// 12:37:58  attempts:  1  ready_at 45478  deadline 33120  met_deadline: false
+/// 16:17:30  attempts:  1  ready_at 58650  deadline 33120  met_deadline: false
+/// 17:33:59  attempts:  1  ready_at 63239  deadline 33120  met_deadline: false
+/// 18:17:30  attempts:  1  ready_at 65850  deadline 33120  met_deadline: false
+/// 19:21:34  attempts:  1  ready_at 69694  deadline 33120  met_deadline: false
+/// ```
+///
+/// The morning MET the deadline with four minutes to spare. Five restarts
+/// then each fired `WS-GAP-02` and drove `tv-<env>-preopen-ready-late` into
+/// ALARM — armed, since that alarm is ungated by design — so the one alarm
+/// built to report a late pre-open reported instead that the box had been
+/// redeployed. An alarm that fires on normal operation is the mirror image of
+/// the false-OK this repo spends its guards on: it teaches the operator to
+/// ignore the one line that would have mattered on a genuinely late morning.
+///
+/// The alarm's own comment reasoned that "on a restart day the LATEST attach
+/// is the one that matters", which is true of a 10:30 re-attach and false of a
+/// 19:21 one. The distinction it needed is not WHEN the attach finished but
+/// whether it was ever RACING the open, and only the start second carries
+/// that.
+///
+/// Deliberately keyed on the START, not on "is it before the market open":
+/// an attach that begins at 09:11 and finishes at 09:20 genuinely missed, and
+/// keying on the finish would excuse exactly the case the deadline exists for.
+#[must_use]
+pub fn preopen_deadline_applies(attach_started_ist_secs: u32) -> bool {
+    attach_started_ist_secs < PREOPEN_READY_DEADLINE_IST_SECS
+}
 
 /// Gauge: IST second-of-day at which BOTH halves reached the wire.
 ///
@@ -5108,6 +5576,12 @@ async fn attach_depth_when_available(
     crate::dhan_contract_universe::pre_register_contract_failure_counters();
     crate::dhan_depth_universe::pre_register_depth_failure_counters();
 
+    // The IST second at which this attach sequence BEGAN.
+    //
+    // This exists to answer one question the deadline verdict below cannot
+    // answer for itself: is this attach the PRE-OPEN one at all? See
+    // `preopen_deadline_applies`.
+    let attach_started_ist = ist_second_of_day_now();
     let mut attempts: u32 = 0;
     // Whether the PREVIOUS attempt resolved something dialable.
     //
@@ -5656,31 +6130,66 @@ async fn attach_depth_when_available(
                 // real time, and reporting the second we STARTED looking would
                 // flatter every measurement by however long the work took.
                 let ready_at = ist_second_of_day_now();
-                metrics::gauge!(PREOPEN_READY_GAUGE).set(f64::from(ready_at));
-                let met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS;
-                info!(
-                    attempts,
-                    ready_at_ist_secs = ready_at,
-                    deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
-                    met_deadline,
-                    "late-attach complete: contracts and depth are both on the wire"
-                );
-                if !met_deadline {
-                    // An ERROR, not a warning, and deliberately so: everything
-                    // subscribed before the open is the stated requirement, and
-                    // a session that misses it trades the first minutes without
-                    // its contracts. Coded so a metric filter can page on it —
-                    // the gauge alone cannot say WHY, and a log line nothing
-                    // reads is how the previous deadline went unnoticed.
-                    error!(
-                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                // Whether the pre-open deadline is a question worth asking of
+                // THIS attach — see `preopen_deadline_applies` for the five
+                // false pages that made this gate necessary.
+                if !preopen_deadline_applies(attach_started_ist) {
+                    // A mid-session (re)start. It has a completion second but
+                    // no readiness VERDICT: it was never racing the open.
+                    //
+                    // The field is `attached_at_ist_secs`, NOT
+                    // `ready_at_ist_secs`, and that rename is the whole fix on
+                    // the alarm side: the CloudWatch metric filter is anchored
+                    // on `{ $.fields.ready_at_ist_secs = * }`, so a line that
+                    // does not carry that field produces no datapoint and the
+                    // alarm stays sparse to genuine pre-open attaches. No
+                    // terraform change, and the alarm's threshold semantics
+                    // are untouched.
+                    //
+                    // The gauge is skipped for the same reason its own doc
+                    // gives for skipping the give-up paths: there is no
+                    // readiness second here, and publishing the wall clock as
+                    // one would read as a missed deadline forever after.
+                    //
+                    // NOT an early `continue`: the late top-up work below runs
+                    // on this iteration too, and a mid-session restart is
+                    // exactly the shape that most needs it.
+                    info!(
+                        attempts,
+                        attached_at_ist_secs = ready_at,
+                        attach_started_ist_secs = attach_started_ist,
+                        deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
+                        "late-attach complete on a mid-session start: contracts and depth are \
+                         both on the wire. The pre-open readiness deadline does not apply — \
+                         this attach began after it had already passed."
+                    );
+                } else {
+                    metrics::gauge!(PREOPEN_READY_GAUGE).set(f64::from(ready_at));
+                    let met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS;
+                    info!(
+                        attempts,
                         ready_at_ist_secs = ready_at,
                         deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
-                        attempts,
-                        "late-attach finished AFTER the pre-open readiness deadline — the \
+                        met_deadline,
+                        "late-attach complete: contracts and depth are both on the wire"
+                    );
+                    if !met_deadline {
+                        // An ERROR, not a warning, and deliberately so: everything
+                        // subscribed before the open is the stated requirement, and
+                        // a session that misses it trades the first minutes without
+                        // its contracts. Coded so a metric filter can page on it —
+                        // the gauge alone cannot say WHY, and a log line nothing
+                        // reads is how the previous deadline went unnoticed.
+                        error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            ready_at_ist_secs = ready_at,
+                            deadline_ist_secs = PREOPEN_READY_DEADLINE_IST_SECS,
+                            attempts,
+                            "late-attach finished AFTER the pre-open readiness deadline — the \
                          session opened without its full contract and depth set on the wire. \
                          Everything dialed, just late."
-                    );
+                        );
+                    }
                 }
                 readiness_published = true;
             }
@@ -6374,7 +6883,38 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
     )
+    // The fold keeps the boot-time pre-size above; the DETECTOR gets the
+    // authorized ceiling, because its capacity is a hard cap and the universe
+    // grows ~26x after boot when contracts attach. See
+    // `with_detector_capacity` for the 1.2M refusals this fixes.
+    .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb));
+
+    // Move the blocking ILP round trip off the drain task, BEFORE any socket
+    // opens. See `LiveIngest::spawn_offload_writer` for why a flush on the
+    // drain is not merely slow but a tick-loss mechanism.
+    //
+    // A spawn failure is NOT fatal and NOT silent: the lane falls back to the
+    // synchronous path it has always used, which is degraded rather than
+    // broken, and says so with a coded error. Refusing to boot over it would
+    // trade a real feed for a better-shaped one.
+    match ingest.spawn_offload_writer(Arc::clone(&params.feed_health)) {
+        Ok(()) => {
+            info!(
+                "tick writer: the ILP flush now runs on its own thread — a slow \
+                 database can no longer stall the frame drain"
+            );
+        }
+        Err(err) => {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                error = %err,
+                "tick writer thread could not be spawned — the ILP flush stays ON \
+                 the frame drain, where a slow database stalls the fold and ticks \
+                 are lost upstream at the vendor. The lane still runs."
+            );
+        }
+    }
 
     // Seed BEFORE any socket opens, so an instrument that never delivers a
     // single tick is reported as silent rather than being invisible to the gap
@@ -6746,6 +7286,14 @@ pub struct CrossverifyDeps {
     pub jwt_provider: Box<dyn Fn() -> Option<String> + Send + Sync>,
     /// Comparator knobs.
     pub config: crate::dhan_live_crossverify::DhanLiveCrossverifyConfig,
+    /// QuestDB connection used to PERSIST the run's findings.
+    ///
+    /// Separate from `questdb_exec_url` above because that one is the HTTP
+    /// `/exec` READ endpoint and this is the ILP WRITE config — the same
+    /// server, two protocols. Added 2026-08-25 with the persistence wiring:
+    /// before it, this comparator produced its verdict, logged it, and threw
+    /// it away.
+    pub questdb: tickvault_common::config::QuestDbConfig,
 }
 
 static CROSSVERIFY_DEPS: std::sync::OnceLock<CrossverifyDeps> = std::sync::OnceLock::new();
@@ -7006,9 +7554,19 @@ pub fn spawn_daily_crossverify(
                     //
                     // The single most important measurement in the system was
                     // the one number the log could not carry. Named fields are
-                    // bounded by construction and queryable; the findings are
-                    // already persisted to the audit table, which is where
-                    // per-cell detail belongs.
+                    // bounded by construction and queryable; the per-cell
+                    // detail belongs in the audit table, which is what the
+                    // `persist_xverify_report` call below writes.
+                    //
+                    // ⚠ CORRECTED 2026-08-25. This comment previously read
+                    // "the findings are already persisted to the audit table"
+                    // — and that was FALSE. `append_cell`, `append_daily` and
+                    // even `ensure_dhan_live_crossverify_tables` had ZERO
+                    // production callers: the two tables were never created,
+                    // nothing was ever written, and the only record of the
+                    // feed's one ground-truth check was this log line. A
+                    // comment asserting persistence is worse than no comment,
+                    // because the next reader stops looking.
                     info!(
                         targets = targets.len(),
                         outcome = ?c.outcome,
@@ -7031,11 +7589,47 @@ pub fn spawn_daily_crossverify(
                         "Dhan live-feed cross-verification finished — this is the honest \
                          measure of whether the revived feed agrees with Dhan's own record"
                     );
+                    // PERSIST, before any early-return branch below. A
+                    // vacuous or degraded verdict is exactly the one worth
+                    // keeping: "we could not measure today" is a fact about
+                    // the feed, and a table that only records the good days
+                    // cannot answer "how often were we blind last month".
+                    persist_xverify_report(&deps.questdb, &report, deps.config.tolerance_paise);
                     if c.is_vacuous() {
                         // A run that compared nothing proves nothing, and the
                         // outcome field alone does not say so loudly enough.
+                        //
+                        // `source` is what makes this line REACHABLE by an
+                        // alarm. `WS-GAP-03` has 25 emit sites in this file
+                        // alone — ordinary dial failures, reconnects and pool
+                        // supervisor events all carry it — so a filter keyed
+                        // on the code alone would page on connection churn,
+                        // which is the noise trap
+                        // `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d-i
+                        // records (a bare-code filter was proposed there,
+                        // approved, and then found wrong for exactly this
+                        // reason). The shape that works is the three-condition
+                        // one that section settled on:
+                        // `{ $.code = "WS-GAP-03" && $.level = "ERROR" &&
+                        //    $.source = "xverify_vacuous" }` — and it cannot
+                        // be written at all until the field exists here.
+                        //
+                        // Adding the field is NOT adding a page: nothing
+                        // filters on it yet. The alarm itself still needs a
+                        // dated operator quote per that file's §3, and the
+                        // metric route is blocked by ONE BYTE, measured
+                        // 2026-08-25: the EMF selector lives in a user-data
+                        // template whose render is 15,841 of a 15,872-byte
+                        // budget, so 31 bytes are free — and
+                        // `tv_dhan_feed_xverify_runs_total` is 31 characters,
+                        // which with its separating pipe needs 32. So the
+                        // counter is in neither selector copy and never
+                        // reaches CloudWatch, and it cannot be added without
+                        // first removing something or moving the selector out
+                        // of user-data entirely.
                         error!(
                             code = ErrorCode::WsGapConnectionState.code_str(),
+                            source = "xverify_vacuous",
                             targets = targets.len(),
                             missing_live = c.missing_live,
                             missing_rest = c.missing_rest,
@@ -7049,6 +7643,7 @@ pub fn spawn_daily_crossverify(
                     counters().xverify_failed.increment(1);
                     error!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "xverify_failed",
                         %err,
                         "Dhan live-feed cross-verification FAILED to run — the day's captured \
                          candles are UNVERIFIED, never assume they are clean"
@@ -7072,6 +7667,132 @@ pub fn spawn_daily_crossverify(
 /// 15:40, so ten minutes that had not happened yet would be scored as missing on
 /// BOTH sides — turning a silent blind spot into a flood of false loss findings
 /// in the one check that exists to detect real loss.
+/// Writes one cross-verification run to its two audit tables.
+///
+/// # Why this exists, and why it is best-effort
+///
+/// The 15:41 comparison is the ONLY ground truth the revived Dhan feed has:
+/// the India feed carries no sequence number and offers no
+/// snapshot-on-subscribe, so packet loss is undetectable at the protocol
+/// level. Until 2026-08-25 the result of that comparison was written to a log
+/// line and discarded — `append_cell`, `append_daily` and
+/// `ensure_dhan_live_crossverify_tables` all had zero production callers, so
+/// there was no history, no trend, and no way to ask how often the feed
+/// disagreed with Dhan's own record last month.
+///
+/// Best-effort by construction: a persistence failure logs and returns. This
+/// runs once a day on a cold-path task, long after the market has closed, and
+/// failing the task would lose the log line too — which is strictly worse than
+/// losing the table row, since the log line is what the operator sees today.
+///
+/// Complexity is O(findings) with one ILP buffer; the row count is bounded by
+/// the comparison itself (one row per divergent/missing cell), and the
+/// findings vector already exists in memory — this adds no allocation beyond
+/// the ILP buffer.
+// TEST-EXEMPT: thin ILP-write shell over the fully-tested writer (append_cell / append_daily / flush are unit-tested in tickvault_storage) and a pure row mapping asserted by `the_daily_row_carries_every_comparison_total` below.
+fn persist_xverify_report(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    report: &crate::dhan_live_crossverify::RunReport,
+    tolerance_paise: i64,
+) {
+    use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyAuditWriter;
+
+    let c = &report.comparison;
+    let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+
+    let mut cell_errors = 0_usize;
+    for finding in &c.findings {
+        if writer.append_cell(finding).is_err() {
+            cell_errors += 1;
+        }
+    }
+
+    let daily = xverify_daily_row(c, tolerance_paise);
+    let daily_err = writer.append_daily(&daily).err();
+
+    match writer.flush() {
+        Ok(()) => {
+            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(c.findings.len() as u64 + 1);
+            if cell_errors > 0 || daily_err.is_some() {
+                // Partial writes are reported, never rounded up to success:
+                // an audit table that silently drops rows is worse than one
+                // that is honestly incomplete.
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_persist_partial",
+                    cell_errors,
+                    daily_failed = daily_err.is_some(),
+                    findings = c.findings.len(),
+                    "Dhan live-feed cross-verification persisted with gaps — some findings \
+                     could not be appended, so the audit tables are incomplete for today"
+                );
+            }
+        }
+        Err(err) => {
+            let discarded = writer.discard_pending();
+            metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                // Deliberately the SAME label the run-failure arm uses, not a
+                // new one. The operator consequence is identical — there is
+                // no verdict on record for today — and `xverify_failed` is
+                // one of only two xverify labels an alarm matches on. A
+                // distinct label would be better triage and would page
+                // nobody, which is the trade this repository has got wrong
+                // before. The message below is what separates the causes.
+                source = "xverify_failed",
+                ?err,
+                discarded,
+                "Dhan live-feed cross-verification could NOT be persisted — today's \
+                 comparison exists only in this log stream. The feed's one ground-truth \
+                 record has no row for today; check QuestDB before the next session."
+            );
+        }
+    }
+}
+
+/// Maps a finished comparison onto its daily audit row. Pure.
+///
+/// Separated from the write so the mapping is testable without QuestDB — the
+/// failure this guards against is a column silently carrying the wrong total,
+/// which no integration test would notice and no log line would show.
+#[must_use]
+fn xverify_daily_row(
+    c: &crate::dhan_live_crossverify::DayComparison,
+    tolerance_paise: i64,
+) -> tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyDailyRow {
+    use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyDailyRow;
+    // Every finding carries the run stamp and the trading day the comparison
+    // was FOR, so the daily row is stamped from the same source rather than
+    // from `now()` — a rerun must UPSERT onto the same row, not append a
+    // second one an hour later.
+    let (run_ts, day_ts) = c
+        .findings
+        .first()
+        .map_or((0, 0), |f| (f.run_ts_ist_nanos, f.trading_date_ist_nanos));
+    DhanLiveXverifyDailyRow {
+        run_ts_ist_nanos: run_ts,
+        trading_date_ist_nanos: day_ts,
+        instruments: c.instruments,
+        minutes_compared: c.minutes_compared,
+        cells_diverged: c.cells_diverged,
+        missing_live: c.missing_live,
+        missing_rest: c.missing_rest,
+        tail_unsealed: c.tail_unsealed,
+        out_of_session: c.out_of_session,
+        noise_p50_paise: c.noise_p50_paise,
+        noise_p95_paise: c.noise_p95_paise,
+        noise_max_paise: c.noise_max_paise,
+        tolerance_paise,
+        outcome: c.outcome,
+    }
+}
+
+/// Rows successfully written to the cross-verification audit tables.
+pub const XVERIFY_PERSIST_ROWS_COUNTER: &str = "tv_dhan_feed_xverify_rows_total";
+/// Runs whose findings could not be persisted at all.
+pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_errors_total";
+
 pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 =
     crate::dhan_live_crossverify::RUN_SECS_OF_DAY_IST as u64;
 
@@ -7147,6 +7868,10 @@ pub fn now_ist_secs_of_day() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickvault_common::constants::{
+        DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE,
+        QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
+    };
     // Test-only: production stopped importing this when the silence gate moved
     // from the persistence window (09:00) to the continuous session (09:15).
     // The tests still need it — proving 09:00 is OUTSIDE the gate is exactly
@@ -9059,6 +9784,117 @@ mod tests {
     /// new alarm, no operator quote. The remaining surfaces are recorded above
     /// rather than quietly fixed, because an alarm needs a dated operator
     /// quote per `dhan-rest-only-noise-lock-2026-07-14.md` §3.
+    /// The daily audit row must carry EVERY total the comparison produced.
+    ///
+    /// A mapping that drops or transposes a column is the one failure mode
+    /// this table cannot survive and no integration test would catch: the row
+    /// lands, the count looks right, and the trend it exists to show is
+    /// silently wrong. Distinct values per field so a transposition cannot
+    /// pass by coincidence.
+    #[test]
+    fn the_daily_row_carries_every_comparison_total() {
+        use tickvault_storage::dhan_live_crossverify_persistence::{
+            DhanLiveXverifyCellFinding, DhanLiveXverifyCellKind, DhanLiveXverifyOutcome,
+        };
+
+        let finding = DhanLiveXverifyCellFinding {
+            run_ts_ist_nanos: 1_724_000_000_000_000_000,
+            trading_date_ist_nanos: 1_723_900_000_000_000_000,
+            security_id: 13,
+            segment: "IDX_I".to_owned(),
+            minute_ts_ist_nanos: 1_723_950_000_000_000_000,
+            kind: DhanLiveXverifyCellKind::Diverged,
+            field: "close",
+            live_value: 100.5,
+            rest_value: 100.25,
+            live_volume: 7,
+            rest_volume: 9,
+            diff_paise: 25,
+        };
+        let c = crate::dhan_live_crossverify::DayComparison {
+            outcome: DhanLiveXverifyOutcome::Diverged,
+            findings: vec![finding.clone()],
+            instruments: 11,
+            minutes_compared: 22,
+            cells_diverged: 33,
+            missing_live: 44,
+            missing_rest: 55,
+            tail_unsealed: 66,
+            out_of_session: 77,
+            noise_p50_paise: 88,
+            noise_p95_paise: 99,
+            noise_max_paise: 111,
+        };
+
+        let row = xverify_daily_row(&c, 5);
+        assert_eq!(row.instruments, 11);
+        assert_eq!(row.minutes_compared, 22);
+        assert_eq!(row.cells_diverged, 33);
+        assert_eq!(row.missing_live, 44);
+        assert_eq!(row.missing_rest, 55);
+        assert_eq!(row.tail_unsealed, 66);
+        assert_eq!(row.out_of_session, 77);
+        assert_eq!(row.noise_p50_paise, 88);
+        assert_eq!(row.noise_p95_paise, 99);
+        assert_eq!(row.noise_max_paise, 111);
+        assert_eq!(row.tolerance_paise, 5);
+        assert_eq!(row.outcome, DhanLiveXverifyOutcome::Diverged);
+
+        // The stamps come from the findings, NOT from `now()`, so a rerun
+        // upserts onto the same row instead of appending a second verdict for
+        // the same day an hour later.
+        assert_eq!(row.run_ts_ist_nanos, finding.run_ts_ist_nanos);
+        assert_eq!(row.trading_date_ist_nanos, finding.trading_date_ist_nanos);
+
+        // A vacuous run has no findings and therefore no stamp to borrow.
+        // It must still produce a row — "we could not measure today" is a
+        // fact worth keeping — and it must not fabricate a timestamp.
+        let blind = crate::dhan_live_crossverify::DayComparison {
+            outcome: DhanLiveXverifyOutcome::Blind,
+            findings: Vec::new(),
+            minutes_compared: 0,
+            ..c
+        };
+        let blind_row = xverify_daily_row(&blind, 0);
+        assert_eq!(blind_row.outcome, DhanLiveXverifyOutcome::Blind);
+        assert_eq!(blind_row.minutes_compared, 0);
+    }
+
+    /// The comment that said the findings "are already persisted" was false
+    /// for the entire life of the feature. This pins that the wiring which
+    /// makes it true is actually present — in all three places it has to be,
+    /// because any one of them missing puts the system straight back to
+    /// logging a verdict into the void.
+    #[test]
+    fn the_cross_verification_findings_are_actually_persisted() {
+        let src = include_str!("dhan_feed_stack.rs");
+        assert!(
+            src.contains("persist_xverify_report(&deps.questdb, &report"),
+            "the cross-verification run must call the persister; without this call the \
+             feed's only ground-truth check is a log line again"
+        );
+        assert!(
+            !src.contains("findings are\n                    // already persisted"),
+            "the retracted false comment must not return"
+        );
+
+        // The DDL must run at boot, or ILP auto-creates both tables WITHOUT
+        // their DEDUP keys and a rerun appends duplicate verdicts instead of
+        // replacing them.
+        let boot = include_str!("main.rs");
+        assert!(
+            boot.contains("ensure_dhan_live_crossverify_tables"),
+            "boot must create the cross-verification audit tables; ILP would otherwise \
+             auto-create them without the DEDUP keys that make a rerun idempotent"
+        );
+
+        // And the write-side config must reach the task.
+        assert!(
+            src.contains("pub questdb: tickvault_common::config::QuestDbConfig"),
+            "CrossverifyDeps must carry the ILP write config"
+        );
+    }
+
     #[test]
     fn xverify_counter_separates_a_measured_run_from_a_vacuous_one() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -9087,6 +9923,134 @@ mod tests {
             window.contains("c.is_vacuous()"),
             "the vacuous counter must be gated on is_vacuous(), so the counter and \
              the log field cannot disagree"
+        );
+    }
+
+    /// The two cross-verify `error!` lines carry a `source` DISCRIMINATOR.
+    ///
+    /// Without it these lines are unreachable by any alarm and unfindable by
+    /// any triage query. `WS-GAP-03` is emitted from 25 sites in this file —
+    /// dial failures, reconnects, pool-supervisor events — so the only filter
+    /// shape that can single one out is the three-condition
+    /// code + level + source form that
+    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d-i settled on after a
+    /// bare-code filter was approved and then found wrong. That section is
+    /// the precedent; this test is what stops the field being dropped by a
+    /// later edit, which would silently un-write a future alarm.
+    ///
+    /// The values must also be DISTINCT: "the check ran and measured nothing"
+    /// and "the check could not run" have different causes and different
+    /// remedies, and collapsing them to one label would merge two independent
+    /// failures into one series — the same defect
+    /// `fold_counters::the_two_labelled_extremes_are_separate_handles`
+    /// guards on the metric side.
+    ///
+    /// This test does NOT claim an alarm exists. None does — the alarm needs
+    /// a dated operator quote per §3 of that file, and the counter route is
+    /// blocked separately (the metric is in neither EMF selector copy). What
+    /// is asserted here is only that the field a future alarm must match on
+    /// is present and unambiguous.
+    #[test]
+    fn the_xverify_error_lines_carry_a_source_an_alarm_can_match_on() {
+        let src = include_str!("dhan_feed_stack.rs");
+
+        for (marker, label) in [
+            ("counters().xverify_vacuous.increment(1)", "xverify_vacuous"),
+            ("counters().xverify_failed.increment(1)", "xverify_failed"),
+        ] {
+            assert!(
+                src.contains(marker),
+                "the {label} counter arm must exist — the log field is only half \
+                 the signal"
+            );
+
+            // Anchor on the EMITTED field, not on a byte distance from the
+            // counter. The two are ~70 lines apart in the vacuous arm and
+            // adjacent in the failed one, so any fixed forward window is a
+            // number that has to be re-tuned every time the prose above the
+            // emit grows — and a window that silently became too short would
+            // pass by finding nothing to check.
+            let field = format!("source = \"{label}\"");
+            let at = src
+                .match_indices(&field)
+                // Skip the filter-shape comment, which spells the same field
+                // as `$.source = "…"` inside a CloudWatch pattern.
+                .find(|(i, _)| !src[..*i].ends_with("$."))
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the {label} error! must carry `source = \"{label}\"` — \
+                         WS-GAP-03 has 25 emit sites in this file, so a filter \
+                         keyed on the code alone would page on ordinary \
+                         connection churn"
+                    )
+                });
+
+            // `code =` sits directly above `source =` in a tracing field list.
+            // 200 bytes is one or two field lines, so this cannot drift into a
+            // neighbouring emit and pass on someone else's code field.
+            let above = &src[at.saturating_sub(200)..at];
+            assert!(
+                above.contains("ErrorCode::WsGapConnectionState.code_str()"),
+                "the {label} source must sit on the SAME emit as the coded error \
+                 a filter pairs it with — a source field on an uncoded line \
+                 matches no three-condition filter"
+            );
+        }
+
+        // Distinct values, not one shared label.
+        assert_ne!(
+            src.matches("source = \"xverify_vacuous\"").count(),
+            0,
+            "the vacuous label must be present"
+        );
+        assert_ne!(
+            src.matches("source = \"xverify_failed\"").count(),
+            0,
+            "the failed label must be present"
+        );
+        // Exactly two REAL emissions. The needle also matches the `$.source =`
+        // inside the filter-shape comment above the vacuous arm, so that one is
+        // subtracted rather than the needle being narrowed — a narrower needle
+        // (say, a fixed indentation prefix) would stop biting the moment
+        // rustfmt moved the line, which is the failure mode this file's own
+        // O(1) table records five separate times about line numbers.
+        // 2026-08-25: the persistence wiring added two more emit sites, so
+        // the assertion moved from "exactly two emissions" to "exactly this
+        // SET of labels" — which is the property that actually matters and
+        // does not have to be re-counted every time an arm is added.
+        let mut labels: Vec<&str> = Vec::new();
+        for (idx, _) in src.match_indices("source = \"xverify_") {
+            let rest = &src[idx + "source = \"".len()..];
+            if let Some(end) = rest.find('"') {
+                labels.push(&rest[..end]);
+            }
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels,
+            vec![
+                "xverify_failed",
+                "xverify_persist_partial",
+                "xverify_vacuous"
+            ],
+            "the xverify source labels changed. Two of these are matched by CloudWatch \
+             metric filters (`xverify_vacuous`, `xverify_failed`) and page; \
+             `xverify_persist_partial` deliberately does not, because a partial write \
+             still lands the daily verdict row and adding an alarm needs a dated \
+             operator quote per dhan-rest-only-noise-lock-2026-07-14.md §3. A new label \
+             here means a new failure mode that pages nobody — decide that deliberately."
+        );
+
+        // The TOTAL-loss persist arm must reuse the ALARMED label. A distinct
+        // label would give better triage and reach no alarm, which is exactly
+        // how the audit found a comment claiming persistence that never
+        // happened: the failure would be invisible again.
+        assert!(
+            !src.contains("source = \"xverify_persist_failed\""),
+            "a total persistence failure must page through the alarmed `xverify_failed` \
+             label, not a private one nothing matches"
         );
     }
 
@@ -9254,6 +10218,329 @@ mod tests {
     /// A seeded-but-never-ticked instrument must be reported.
     ///
     /// This is the partial-subscribe detector's whole reason to exist: a
+    // -----------------------------------------------------------------
+    // Dead-instrument-class detector (Item 3)
+    //
+    // The unit tests below drive `ClassLiveness` directly because the
+    // interesting cases are about the SHAPE of the tally, and a pure test can
+    // state each one exactly. The end-to-end test that follows them proves
+    // the fold is actually wired into the live sweep — without it, all of
+    // these could pass against a struct nothing calls.
+    // -----------------------------------------------------------------
+
+    /// The 2026-08-21 incident, reduced to its essentials.
+    ///
+    /// Every index never ticked; every option did. The detector must name the
+    /// index class and stay silent about the option class.
+    #[test]
+    fn a_class_where_nothing_ever_ticked_is_dead_and_a_live_class_beside_it_is_not() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..119 {
+            c.observe(ExchangeSegment::IdxI, false, true, true);
+        }
+        for _ in 0..8_868 {
+            c.observe(ExchangeSegment::NseFno, false, false, true);
+        }
+
+        assert!(
+            c.is_dead(segment_class_index(ExchangeSegment::IdxI)),
+            "119 indices subscribed and not one tick past warmup is the \
+             subscribe-did-not-take signature — this is the live incident the \
+             per-instrument gauge showed as 119-of-9000 and nobody paged on"
+        );
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::NseFno)),
+            "the option class was flowing normally and must never be swept up \
+             with the dead one"
+        );
+    }
+
+    /// A fully healthy lane must report NOTHING.
+    ///
+    /// # What this actually catches, measured
+    ///
+    /// Bite-tested rather than assumed, and the first version of this comment
+    /// was WRONG about it. This test catches an INVERTED verdict (`never !=
+    /// eligible`), which makes it fail immediately.
+    ///
+    /// It does NOT catch the `counts_toward_alarm()` denominator trap
+    /// described on [`ClassLiveness`]. Under that mutation a healthy class has
+    /// `eligible == 0`, so `eligible > 0` is false and this test still passes.
+    /// The test that actually bites on that trap is
+    /// `a_single_ticking_instrument_keeps_its_class_alive` — verified by
+    /// mutating the denominator and watching exactly that one fail.
+    ///
+    /// Recorded because a comment claiming a test protects something it does
+    /// not is the same false-OK this detector was written to end.
+    #[test]
+    fn a_healthy_class_is_never_reported_dead() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..500 {
+            c.observe(ExchangeSegment::NseEquity, false, false, true);
+        }
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::NseEquity)),
+            "a class where every instrument has ticked is alive — reporting it \
+             dead would train the operator to ignore this signal, which is \
+             worse than not having it"
+        );
+    }
+
+    /// No false page during warmup — the every-morning failure mode.
+    #[test]
+    fn a_class_still_inside_its_warmup_window_is_not_yet_judged() {
+        let mut c = ClassLiveness::default();
+        // Every instrument never-ticked, but none past its fair-chance window.
+        for _ in 0..50 {
+            c.observe(ExchangeSegment::IdxI, false, true, false);
+        }
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::IdxI)),
+            "between subscribing and the first tick EVERY instrument is \
+             legitimately never-ticked; judging here would declare every class \
+             dead seconds after connect, every single morning"
+        );
+
+        // One straggler still warming is enough to withhold the verdict.
+        let mut mixed = ClassLiveness::default();
+        for _ in 0..49 {
+            mixed.observe(ExchangeSegment::IdxI, false, true, true);
+        }
+        mixed.observe(ExchangeSegment::IdxI, false, true, false);
+        assert!(
+            !mixed.is_dead(segment_class_index(ExchangeSegment::IdxI)),
+            "a single instrument still inside its window means the class has \
+             not finished starting up — the verdict waits rather than guesses"
+        );
+    }
+
+    /// Pins the invariant that makes `is_dead`'s `pending` term redundant.
+    ///
+    /// Found by bite-testing: mutating `pending == 0` away changed no verdict,
+    /// because `eligible` counts every non-sparse instrument while `never`
+    /// counts only past-window ones, so `pending > 0` already forces
+    /// `never < eligible`. That reasoning is only sound while every counted
+    /// instrument passes through `eligible` — this asserts exactly that, so a
+    /// future fold that broke it fails here instead of silently demoting the
+    /// warmup guard to decoration.
+    #[test]
+    fn the_tally_invariant_that_makes_the_pending_term_redundant_holds() {
+        let mut c = ClassLiveness::default();
+        c.observe(ExchangeSegment::IdxI, false, true, true); // never
+        c.observe(ExchangeSegment::IdxI, false, true, false); // pending
+        c.observe(ExchangeSegment::IdxI, false, false, true); // ticked
+        c.observe(ExchangeSegment::IdxI, true, true, true); // sparse: counted nowhere
+
+        let i = segment_class_index(ExchangeSegment::IdxI);
+        assert_eq!(c.eligible[i], 3, "sparse must not reach any bucket");
+        assert_eq!(c.never[i], 1);
+        assert_eq!(c.pending[i], 1);
+        assert!(
+            c.never[i].saturating_add(c.pending[i]) <= c.eligible[i],
+            "never + pending must never exceed eligible — the moment it can, \
+             `pending == 0` stops being implied by the equality and the \
+             documented redundancy argument becomes false"
+        );
+
+        // The implication itself, stated directly: a pending instrument makes
+        // the dead-verdict equality unreachable on its own.
+        assert!(
+            c.never[i] < c.eligible[i],
+            "with one instrument still warming, the equality cannot hold, \
+             which is precisely why the explicit pending check never changes \
+             a verdict"
+        );
+    }
+
+    /// One live instrument keeps the whole class alive.
+    ///
+    /// # This is the test that guards the denominator trap
+    ///
+    /// `counts_toward_alarm()` is `!sparse && (Exceeded | NeverTicked)`, so it
+    /// DROPS healthy instruments. Had the rollup reused it as the denominator,
+    /// the one ticking instrument below would be filtered out, leaving
+    /// `eligible == 99 == never` — and the class would read dead while it was
+    /// demonstrably alive.
+    ///
+    /// Verified by mutation: making `eligible` count only never-ticked
+    /// instruments fails THIS test and no other. That makes this the
+    /// load-bearing guard on the single most dangerous mistake available in
+    /// this fold, which is worth knowing before someone "simplifies" it.
+    #[test]
+    fn a_single_ticking_instrument_keeps_its_class_alive() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..99 {
+            c.observe(ExchangeSegment::BseFno, false, true, true);
+        }
+        c.observe(ExchangeSegment::BseFno, false, false, true);
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::BseFno)),
+            "this detector answers 'did the subscribe take for this segment', \
+             and one tick proves it did — 99 quiet instruments are the \
+             per-instrument gauge's business, not this one's"
+        );
+    }
+
+    /// An instrument that ticked and then went quiet is NOT never-ticked.
+    #[test]
+    fn a_class_that_has_gone_quiet_is_not_a_class_that_never_started() {
+        let mut c = ClassLiveness::default();
+        // `Exceeded` instruments reach the fold as never_ticked = false.
+        for _ in 0..30 {
+            c.observe(ExchangeSegment::NseFno, false, false, true);
+        }
+        assert!(
+            !c.is_dead(segment_class_index(ExchangeSegment::NseFno)),
+            "gone-quiet and never-started have different causes and different \
+             fixes; conflating them would make this signal unactionable"
+        );
+    }
+
+    /// Sparse instruments leave BOTH sides of the ratio.
+    ///
+    /// This is the subtle half. Far-month futures and INDIA VIX are
+    /// legitimately quiet and the scope lock excludes them from the silent
+    /// count. Excluding them from the NUMERATOR only — while leaving them in
+    /// the denominator — would make `never == eligible` unreachable for any
+    /// segment containing one, and the detector would silently never fire.
+    /// That is a false-OK, and it is invisible without this test.
+    #[test]
+    fn sparse_instruments_leave_both_sides_of_the_ratio() {
+        let mut c = ClassLiveness::default();
+        for _ in 0..10 {
+            c.observe(ExchangeSegment::NseFno, false, true, true);
+        }
+        // Two legitimately-sparse contracts in the same segment.
+        c.observe(ExchangeSegment::NseFno, true, true, true);
+        c.observe(ExchangeSegment::NseFno, true, false, true);
+
+        let i = segment_class_index(ExchangeSegment::NseFno);
+        assert_eq!(
+            c.eligible[i], 10,
+            "sparse instruments must not inflate the denominator"
+        );
+        assert!(
+            c.is_dead(i),
+            "the ten judgeable instruments all produced nothing, so the class \
+             is dead — if sparse entries had been left in the denominator this \
+             would read alive and the detector would never fire at all"
+        );
+
+        // A segment made up ENTIRELY of sparse instruments is unjudgeable,
+        // and must report nothing rather than guess either way.
+        let mut all_sparse = ClassLiveness::default();
+        all_sparse.observe(ExchangeSegment::BseFno, true, true, true);
+        assert!(
+            !all_sparse.is_dead(segment_class_index(ExchangeSegment::BseFno)),
+            "with nothing judgeable there is no evidence, and absence of \
+             evidence must not render as a verdict"
+        );
+    }
+
+    /// An unseeded class is not a dead class.
+    #[test]
+    fn a_class_we_never_subscribed_is_not_reported_dead() {
+        let c = ClassLiveness::default();
+        for index in 0..SEGMENT_CLASS_COUNT {
+            assert!(
+                !c.is_dead(index),
+                "an empty tally means we subscribed nothing in that segment; \
+                 reporting it dead would page about instruments that do not \
+                 exist"
+            );
+        }
+    }
+
+    /// The index mapping must be a bijection.
+    ///
+    /// If two segments ever collided on one slot their tallies would merge and
+    /// a dead class could be masked by a live one sharing its index — a silent
+    /// wrong answer with no other symptom.
+    #[test]
+    fn every_segment_maps_to_its_own_slot_and_back() {
+        let all = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        assert_eq!(all.len(), SEGMENT_CLASS_COUNT, "the array width must match");
+
+        let mut seen = [false; SEGMENT_CLASS_COUNT];
+        for segment in all {
+            let i = segment_class_index(segment);
+            assert!(!seen[i], "two segments collided on slot {i}");
+            seen[i] = true;
+            assert_eq!(
+                segment_class_at(i),
+                Some(segment),
+                "index and inverse must agree, or an episode names the wrong \
+                 class"
+            );
+        }
+        assert!(seen.iter().all(|s| *s), "every slot must be claimed");
+        assert_eq!(
+            segment_class_at(SEGMENT_CLASS_COUNT),
+            None,
+            "out of range must be None, never a wrapped segment"
+        );
+    }
+
+    /// END TO END: the fold is actually wired into the live sweep.
+    ///
+    /// Every unit test above would still pass if `ClassLiveness` were dead
+    /// code nothing called. This one drives the real `LiveIngest` sweep, so it
+    /// fails if the rollup is ever unhooked from `scan_silence_named`.
+    #[test]
+    fn the_dead_class_rollup_is_wired_into_the_live_silence_sweep() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let seeded_at = 1_000u64;
+        for sid in [13u64, 25, 51] {
+            assert!(
+                ingest.seed(sid, ExchangeSegment::IdxI, seeded_at),
+                "precondition: the index is tracked"
+            );
+        }
+
+        let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+
+        // Inside the window: the class must not be judged yet, and the latch
+        // must stay clear so a later real episode can still raise an edge.
+        let _ = ingest.scan_silence(seeded_at);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            0,
+            "no class may be latched while every instrument is still inside \
+             its warmup window"
+        );
+
+        // Past the window with nothing received: the class is dead and the
+        // latch records it exactly once.
+        let _ = ingest.scan_silence(seeded_at + floor + 1);
+        let bit = 1u8 << segment_class_index(ExchangeSegment::IdxI);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            bit,
+            "three seeded indices past warmup with zero ticks is a dead class, \
+             and the live sweep must be the thing that notices"
+        );
+
+        // Edge-latched: a second sweep in the same episode must not re-raise.
+        let before = ingest.dead_class_latch.load(Ordering::Relaxed);
+        let _ = ingest.scan_silence(seeded_at + floor + 2);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            before,
+            "the sweep runs every 30s and a dead class stays dead all session; \
+             re-reporting would emit ~1,100 identical lines per session and \
+             bury the signal it exists to raise"
+        );
+    }
+
     /// subscribe that silently did not take produces no payload to count, no
     /// parse to fail and no error to log, so the ONLY evidence is absence
     /// measured against a key we know we asked for.
@@ -9489,6 +10776,99 @@ mod tests {
     /// growing set — so a full detector returns a small, calm number that
     /// reads exactly like health. This accessor is the only way a caller can
     /// tell "nothing is silent" from "I can no longer see".
+    /// The detector must be sized for the universe the lane will EVER carry,
+    /// not for the one that exists at boot.
+    ///
+    /// MEASURED live 2026-08-25: `refused: 1,276,658` against `tracked: 865`.
+    /// 865 is exactly the spot universe — the ~22,000 contracts attach minutes
+    /// after boot, and every one of their ticks was refused a detector slot,
+    /// so the silence counts described 4% of the subscribed set while reading
+    /// as though they described all of it.
+    #[test]
+    fn the_detector_outlives_the_boot_time_universe_when_given_the_ceiling() {
+        // Boot-time pre-size of 2 — the shape `new` is handed at construction.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 2)
+            .with_detector_capacity(super::AGGREGATOR_MAX_SLOTS);
+
+        // Seed far more instruments than the boot-time figure: this is the
+        // late-attach growth that used to hit the hard cap.
+        let mut seeded = 0usize;
+        for sid in 0..5_000u64 {
+            if ingest.seed(sid, ExchangeSegment::NseFno, 1_000) {
+                seeded += 1;
+            }
+        }
+
+        assert_eq!(
+            seeded, 5_000,
+            "every instrument past the boot-time pre-size must still get a slot"
+        );
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "a detector sized at the ceiling turns nobody away below the ceiling"
+        );
+        assert_eq!(ingest.tracked_instruments(), 5_000);
+    }
+
+    /// The ceiling is still a ceiling — this is a re-size, not an uncapping.
+    ///
+    /// Fail-closed is the deliberate shape here (evicting a tracked instrument
+    /// would silently reset its gap state and hide the next gap), so past the
+    /// bound it must still refuse and still count.
+    #[test]
+    fn a_detector_at_its_ceiling_still_refuses_and_still_counts() {
+        let mut ingest =
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 1).with_detector_capacity(3);
+
+        for sid in 0..3u64 {
+            assert!(ingest.seed(sid, ExchangeSegment::NseFno, 1_000));
+        }
+        assert_eq!(
+            ingest.detector_refused(),
+            0,
+            "nothing refused under the cap"
+        );
+
+        assert!(
+            !ingest.seed(99, ExchangeSegment::NseFno, 1_000),
+            "the instrument past the cap must be refused, not silently accepted"
+        );
+        assert_eq!(
+            ingest.detector_refused(),
+            1,
+            "and the refusal must be counted — a blind detector that says nothing \
+             is the failure this whole path exists to make visible"
+        );
+        assert_eq!(
+            ingest.tracked_instruments(),
+            3,
+            "a tracked instrument is never evicted to make room"
+        );
+    }
+
+    /// The boot site must hand the detector the CEILING, not the boot-time
+    /// count — the fix is worthless if only the builder exists.
+    #[test]
+    fn the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling() {
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        assert_eq!(
+            src.matches(".with_detector_capacity(").count(),
+            1,
+            "exactly one production call site — a second would make the detector's size \
+             depend on which one ran last"
+        );
+        assert!(
+            src.contains(".with_detector_capacity(AGGREGATOR_MAX_SLOTS)"),
+            "the detector must be sized at the authorized ceiling, never at the boot-time \
+             universe: `capacity` is computed before any socket opens, so it counts the spot \
+             set and misses every contract that attaches later"
+        );
+    }
+
     #[test]
     fn detector_refused_separates_a_quiet_universe_from_a_blind_detector() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 2);
@@ -9791,6 +11171,110 @@ mod tests {
             targets.iter().all(|t| t.security_id != 0),
             "an out-of-range id must be skipped, never coerced to instrument 0"
         );
+    }
+
+    #[test]
+    fn test_crossverify_labels_an_equity_as_equity_not_index() {
+        // The bite test for the 2026-08-25 fix. Today's universe is ~119 NSE
+        // indices plus ~750 NTM equities; the previous code stamped "INDEX" on
+        // every one, so six of every seven targets asked Dhan for an index bar
+        // on an equity id. Dhan answers that pair with an empty candle set, so
+        // the comparator counted it `missing_rest` — an absent vendor tape
+        // reported where the real fault was our own request.
+        //
+        // Restore `instrument: "INDEX".to_string()` in `crossverify_targets`
+        // and this assertion fails with left: "INDEX", right: "EQUITY".
+        let universe = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 2885,
+                segment: ExchangeSegment::NseEquity,
+            },
+            SubscribeInstrument {
+                security_id: 500_325,
+                segment: ExchangeSegment::BseEquity,
+            },
+        ];
+        let targets = crossverify_targets(&universe);
+        assert_eq!(targets.len(), 3, "every cash segment is labellable");
+        assert_eq!(targets[0].instrument, "INDEX");
+        assert_eq!(targets[1].instrument, "EQUITY");
+        assert_eq!(targets[2].instrument, "EQUITY");
+        // The segment string must keep travelling verbatim: the pair is what
+        // Dhan validates, so a right label on a wrong segment is no better.
+        assert_eq!(targets[1].segment, "NSE_EQ");
+        assert_eq!(targets[2].segment, "BSE_EQ");
+    }
+
+    #[test]
+    fn test_crossverify_drops_a_segment_it_cannot_label_rather_than_guessing() {
+        // An F&O id may be FUTIDX, OPTIDX, FUTSTK or OPTSTK and
+        // `SubscribeInstrument` carries only (security_id, segment), so no
+        // label here can be honest. Dropping it leaves the target UNVERIFIED
+        // and says so; guessing would leave it verified-against-nothing, which
+        // reads identically to a clean run.
+        let universe = vec![
+            SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            },
+            SubscribeInstrument {
+                security_id: 45_678,
+                segment: ExchangeSegment::NseFno,
+            },
+            SubscribeInstrument {
+                security_id: 84_321,
+                segment: ExchangeSegment::BseFno,
+            },
+        ];
+        let targets = crossverify_targets(&universe);
+        assert_eq!(
+            targets.len(),
+            1,
+            "only the index survives; the two contracts are excluded, not mislabelled"
+        );
+        assert_eq!(targets[0].segment, "IDX_I");
+        assert!(
+            targets
+                .iter()
+                .all(|t| t.instrument != "INDEX" || t.segment == "IDX_I"),
+            "no surviving target may carry INDEX on a non-index segment"
+        );
+    }
+
+    #[test]
+    fn test_dhan_intraday_instrument_for_covers_every_variant_deliberately() {
+        // Pins the mapping so a new segment cannot default into a label. Each
+        // arm below is a decision, not an accident.
+        assert_eq!(
+            dhan_intraday_instrument_for(ExchangeSegment::IdxI),
+            Some("INDEX")
+        );
+        assert_eq!(
+            dhan_intraday_instrument_for(ExchangeSegment::NseEquity),
+            Some("EQUITY")
+        );
+        assert_eq!(
+            dhan_intraday_instrument_for(ExchangeSegment::BseEquity),
+            Some("EQUITY")
+        );
+        for ambiguous in [
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::McxComm,
+        ] {
+            assert_eq!(
+                dhan_intraday_instrument_for(ambiguous),
+                None,
+                "{} must refuse a label rather than invent one",
+                ambiguous.as_str()
+            );
+        }
     }
 
     #[test]
@@ -10115,6 +11599,74 @@ mod tests {
     // -- structural proofs --------------------------------------------------
 
     #[test]
+    fn an_offloaded_flush_never_touches_the_network_from_the_drain() {
+        // `for_test` has NO ILP sender. Un-offloaded, a flush with pending
+        // rows therefore takes the "QuestDB unreachable" arm, rescues the
+        // buffer to disk and reports the rows as gone. Offloaded, the same
+        // flush must be a queue hand-off that completes immediately — which
+        // is the whole behavioural difference this change buys.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(Arc::clone(&health))
+            .expect("the writer thread must spawn");
+
+        assert!(
+            ingest.writer_is_offloaded(),
+            "the split must be observable — `flush_and_record` reads this flag \
+             to decide whether the returned row count means LANDED or HANDED OFF"
+        );
+
+        let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let parsed = dispatch_frame(&packet, 1_779_355_000_000_000_000)
+            .expect("a well-formed ticker packet must parse");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+        assert_eq!(ingest.pending_rows(), 1, "the tick must be buffered");
+
+        let covered = ingest.flush();
+
+        assert_eq!(covered, 1, "the flush covered the buffered row");
+        assert_eq!(
+            ingest.pending_rows(),
+            0,
+            "the rows left the drain's buffer on hand-off"
+        );
+
+        // Shutdown order under test: close the queue, then wait. This is the
+        // step that makes the tail of a session durable rather than in-flight.
+        ingest.shutdown_offload_writer();
+        assert!(
+            !ingest.writer_is_offloaded(),
+            "after shutdown the lane falls back to the synchronous arm, so a \
+             late flush rescues to disk instead of handing to a closed queue"
+        );
+    }
+
+    #[test]
+    fn the_writer_thread_is_joined_at_shutdown_so_the_tail_batch_lands() {
+        // A thread that outlives its producer is a leak, and a thread that
+        // exits EARLY is worse: the producer would keep handing rows to a
+        // closed queue, which rescues every batch to disk while the lane looks
+        // healthy. The only correct exit is "every sender is gone", so pin it.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(health)
+            .expect("the writer thread must spawn");
+
+        // `shutdown_offload_writer` joins. It would hang forever if closing
+        // the queue did not actually wake the writer's blocking `recv`, so
+        // reaching the next line at all is the assertion.
+        ingest.shutdown_offload_writer();
+
+        // Idempotent: a second call must not panic on an already-taken handle.
+        ingest.shutdown_offload_writer();
+    }
+
+    #[test]
     fn test_drain_never_flushes_bare_on_the_async_worker() {
         // The drain task owns the ONLY consumer of the frame ring. Its
         // `flush()` is a SYNCHRONOUS blocking ILP-over-HTTP call bounded by
@@ -10167,18 +11719,100 @@ mod tests {
              module's drain tests are bare #[tokio::test]"
         );
 
-        // The load-bearing assertion: no production call site may invoke
-        // flush() bare. Written as a search for the bare form so that adding a
-        // FOURTH flush site without the helper fails here rather than in prod.
+        // The load-bearing assertion: no production call site may invoke a
+        // BLOCKING flush() bare. Written as a search for the bare form so that
+        // adding a further flush site without the helper fails here rather
+        // than in prod.
+        //
+        // 2026-08-25 — one exception now exists, and it is the opposite of the
+        // defect this test was written for. When the writer has been SPLIT
+        // (`LiveIngest::spawn_offload_writer`), `ingest.flush()` performs no
+        // network I/O at all: it hands the ILP buffer to a bounded queue that
+        // a dedicated OS thread drains. Wrapping THAT in `block_in_place`
+        // would ask the runtime to spin up a replacement worker for a
+        // `try_send`, which is pure cost for no benefit.
+        //
+        // So the exception is counted EXPLICITLY rather than by loosening the
+        // equality. `bare == wrapped` would have been the tempting edit and it
+        // is the wrong one: it stops noticing a genuinely bare blocking flush,
+        // which is the entire point of the test. Instead the offloaded form is
+        // recognised by its own literal, and anything that is neither wrapped
+        // nor that literal still fails.
         let bare = production_half.matches("ingest.flush()").count();
         let wrapped = production_half
             .matches("blocking_flush(|| ingest.flush())")
             .count();
+        let offloaded = production_half.matches("return ingest.flush();").count();
         assert_eq!(
-            bare, wrapped,
-            "every production ingest.flush() must be wrapped in blocking_flush; \
-             found {bare} call(s) and {wrapped} wrapped — the difference is a \
-             blocking HTTP call sitting on the async drain task"
+            offloaded, 1,
+            "expected exactly ONE non-blocking flush — the early return inside \
+             `flush_and_record` taken when the writer has been offloaded. Found \
+             {offloaded}: either the offload branch was deleted (the flush is \
+             back on the drain) or a second site started bypassing the helper"
+        );
+        assert_eq!(
+            bare,
+            wrapped + offloaded,
+            "every production ingest.flush() must be either wrapped in \
+             blocking_flush (the synchronous fallback) or the offloaded early \
+             return; found {bare} call(s), {wrapped} wrapped and {offloaded} \
+             offloaded — the difference is a blocking HTTP call sitting on the \
+             async drain task"
+        );
+
+        // The offload must be WIRED, not merely available. Seven of the nine
+        // findings fixed on 2026-08-25 were the same shape — a mechanism that
+        // existed and was never plugged in — so a declaration on its own
+        // proves nothing here either.
+        assert!(
+            production_half.contains("fn spawn_offload_writer"),
+            "the writer-thread split must exist"
+        );
+        assert!(
+            production_half.contains("ingest.spawn_offload_writer("),
+            "the boot site must actually spawn the writer thread — a split that \
+             is never performed leaves the blocking flush on the drain while \
+             every symbol needed to move it sits right there unused"
+        );
+        // C4 of the recorded design, and the condition the LIVE MEASUREMENT
+        // made load-bearing. A decoupled writer that accumulates without bound
+        // widens each commit, and commit width is the measured amplifier — 10%
+        // of a day's ticks carry an exchange timestamp over an hour behind
+        // arrival, so a wide commit reopens closed hourly partitions and
+        // rewrites them. Without the cap this change makes the disk pressure
+        // it exists to relieve WORSE, which is why it is pinned here and not
+        // left to a comment.
+        let storage_src = include_str!("../../storage/src/tick_persistence.rs");
+        assert!(
+            storage_src.contains("MAX_RETAINED_FLUSH_SPANS"),
+            "the batch-WIDTH cap must exist — unbounded accumulation under \
+             backpressure is the own-goal this design was flagged for"
+        );
+        assert!(
+            storage_src.contains("self.retained_spans > MAX_RETAINED_FLUSH_SPANS"),
+            "the width cap must be ENFORCED on the retain path, not merely \
+             declared — a constant nothing reads is the defect this repo has \
+             now recorded seven times"
+        );
+        assert!(
+            production_half.contains("OFFLOAD_SHUTDOWN_GRACE"),
+            "the shutdown wait must be BOUNDED: `JoinHandle::join` has no \
+             timeout, so a writer wedged on a hung socket would hang the box's \
+             shutdown — worse, on a host whose auto-stop is a cost control, \
+             than losing the tail batch"
+        );
+        assert!(
+            production_half.contains("ingest.shutdown_offload_writer()"),
+            "the drain must JOIN the writer thread after its tail flush — that \
+             flush only HANDS OFF the last batch of the session, so without the \
+             join the process can exit with it still in flight, losing exactly \
+             the rows the tail flush exists to save"
+        );
+        assert!(
+            production_half.contains("if ingest.writer_is_offloaded()"),
+            "`flush_and_record` must gate on the offload flag: an offloaded \
+             flush returns rows HANDED OFF, and recording those as feed health \
+             forges liveness for exactly as long as the database is unreachable"
         );
 
         // 2026-08-18: the drain's three flush sites now route through
@@ -11514,6 +13148,104 @@ mod contract_attach_tests {
         assert!(
             src.contains("&& !past_preopen_ready_deadline;"),
             "the quorum wait must actually consult the deadline"
+        );
+    }
+
+    /// A mid-session restart is not a late pre-open, and must not be reported
+    /// as one.
+    ///
+    /// MEASURED 2026-08-25: the morning attach completed at 09:08:04 and MET
+    /// the 09:12 deadline, and five afternoon restarts each fired `WS-GAP-02`
+    /// and drove `tv-<env>-preopen-ready-late` into ALARM. The alarm is
+    /// ungated by design, so it stayed armed. Every one of those pages was
+    /// reporting a redeploy.
+    #[test]
+    fn the_preopen_deadline_does_not_apply_to_a_mid_session_restart() {
+        // The real morning: the loop began well before the deadline.
+        assert!(
+            super::preopen_deadline_applies(8 * 3_600 + 35 * 60),
+            "an attach that begins at 08:35 is racing the open and IS judged"
+        );
+        // The five real restarts from that afternoon, by their start second.
+        for (label, started) in [
+            ("12:37", 12 * 3_600 + 37 * 60),
+            ("16:17", 16 * 3_600 + 17 * 60),
+            ("17:33", 17 * 3_600 + 33 * 60),
+            ("18:17", 18 * 3_600 + 17 * 60),
+            ("19:21", 19 * 3_600 + 21 * 60),
+        ] {
+            assert!(
+                !super::preopen_deadline_applies(started),
+                "the {label} restart began after 09:12 and cannot be judged against it"
+            );
+        }
+    }
+
+    /// Keyed on the START, never the finish.
+    ///
+    /// An attach that begins at 09:11 and drags past 09:12 is the exact case
+    /// the deadline exists for; excusing it would hollow the alarm out from
+    /// the other side while fixing the false pages.
+    #[test]
+    fn an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns() {
+        let d = super::PREOPEN_READY_DEADLINE_IST_SECS;
+        assert!(
+            super::preopen_deadline_applies(d - 1),
+            "one second before the deadline still counts as racing it"
+        );
+        assert!(
+            !super::preopen_deadline_applies(d),
+            "an attach that begins AT the deadline has already lost the race it would be \
+             judged on — it is a restart, not a late pre-open"
+        );
+        assert!(!super::preopen_deadline_applies(d + 1));
+    }
+
+    /// The alarm-side half of the fix, pinned in source.
+    ///
+    /// The CloudWatch metric filter is `{ $.fields.ready_at_ist_secs = * }`.
+    /// The mid-session arm must therefore NOT carry that field name, or the
+    /// datapoint still lands and the gate changes nothing that the operator
+    /// can see. Bite-proven: renaming `attached_at_ist_secs` back to
+    /// `ready_at_ist_secs` fails this test.
+    #[test]
+    fn the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on() {
+        let full = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        let gate = src
+            .find("if !preopen_deadline_applies(attach_started_ist) {")
+            .expect("the mid-session gate must exist");
+        let els = src[gate..]
+            .find("} else {")
+            .expect("the judged arm must be the else of that gate")
+            + gate;
+        // Comment lines are stripped before asserting: this arm's own comment
+        // QUOTES the CloudWatch filter pattern verbatim, so a raw substring
+        // scan matches the documentation rather than the code. Caught by this
+        // test failing on its first run, which is the right way round.
+        let mid_arm: String = src[gate..els]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mid_arm = mid_arm.as_str();
+
+        assert!(
+            mid_arm.contains("attached_at_ist_secs = ready_at"),
+            "the mid-session arm must report its completion second under a DIFFERENT field"
+        );
+        assert!(
+            !mid_arm.contains("ready_at_ist_secs ="),
+            "the mid-session arm must not emit `ready_at_ist_secs` — that field is what the \
+             CloudWatch filter matches, so emitting it re-creates the false page"
+        );
+        assert!(!mid_arm.contains("error!"), "a restart is not an error");
+        assert!(
+            !mid_arm.contains("metrics::gauge!(PREOPEN_READY_GAUGE)"),
+            "there is no readiness second on a restart; publishing the wall clock as one \
+             would read as a permanently missed deadline"
         );
     }
 

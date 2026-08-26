@@ -1220,7 +1220,76 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
     max_bytes: u64,
     now: std::time::SystemTime,
 ) -> ArchivePruneOutcome {
-    let archive_dir = wal_dir.as_ref().join(ARCHIVE_SUBDIR);
+    prune_wal_dir_at(
+        &wal_dir.as_ref().join(ARCHIVE_SUBDIR),
+        retention_secs,
+        max_bytes,
+        now,
+    )
+}
+
+/// Bounds the ACTIVE `<wal_dir>/*.wal` set by age and bytes — the sibling of
+/// [`prune_archived_segments_at`], added 2026-08-25.
+///
+/// # The leak this closes
+///
+/// Until now ONLY `archive/` was bounded. The active directory had no age
+/// bound and no byte bound, because the design assumed it drains itself:
+/// segments are replayed at boot, moved to `replaying/`, confirmed, moved to
+/// `archive/`, and pruned there.
+///
+/// It does not drain. [`WAL_REPLAY_MAX_BYTES`] caps a boot replay at 512 MiB —
+/// five segments — while the live lane writes segments continuously all
+/// session. Anything past the newest 512 MiB is never replayed, never
+/// confirmed, never archived, and so was never eligible for any bound.
+///
+/// Measured on the prod box 2026-08-25: **244 active segments, 31 GB, the
+/// oldest dated 08-24** — against a 1.9 GB archive that its own bounds were
+/// holding correctly. The volume was 94% full and free space was cycling down
+/// to 1.94 GB, which is the condition that makes an ILP flush fail, which is
+/// what the tick-spill rescue exists for.
+///
+/// # Why deleting these is safe
+///
+/// A segment is written BEFORE parse and broadcast, as a crash-recovery copy.
+/// On a session that did not crash, the live lane folded those same frames in
+/// real time, so an un-replayed segment from a previous session is redundant —
+/// its frames were already processed. Replay exists for the crash case, and a
+/// crash is recovered from the CURRENT session's tail, never from a segment
+/// days old that the 512 MiB budget could not have reached in any case.
+///
+/// The age bound is what makes this provable rather than probable: at any
+/// retention of one full day or more, nothing this pass can delete is
+/// reachable by the next boot's replay budget.
+#[must_use]
+pub fn prune_active_segments_at<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+) -> ArchivePruneOutcome {
+    prune_wal_dir_at(wal_dir.as_ref(), retention_secs, max_bytes, now)
+}
+
+/// The shared age-then-bytes prune, over ONE directory of `*.wal` segments.
+///
+/// Extracted 2026-08-25 so the active directory gets the identical, already
+/// hardened logic rather than a second implementation that would drift from
+/// it — including the failure accounting that stops a single un-deletable
+/// file from making the byte pass over-delete newer segments.
+///
+/// Non-recursive by construction: it reads one directory and touches only
+/// `*.wal`. Applied to the WAL root that means `archive/` and `replaying/`
+/// are subdirectories it never descends into, which is what keeps the
+/// staged-but-unconfirmed set out of its reach.
+#[must_use]
+fn prune_wal_dir_at(
+    dir: &Path,
+    retention_secs: u64,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+) -> ArchivePruneOutcome {
+    let archive_dir = dir.to_path_buf();
     let mut outcome = ArchivePruneOutcome::default();
     // Segments surviving the age pass, as (mtime, len, path) — the byte
     // ceiling's candidate set.
@@ -1365,6 +1434,103 @@ pub fn prune_archived_segments<P: AsRef<Path>>(
         );
     }
     outcome
+}
+
+/// Wall-clock wrapper over [`prune_active_segments_at`]. Cold path — called
+/// from the same periodic prune task as the archive sweep.
+#[must_use]
+pub fn prune_active_segments<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    max_bytes: u64,
+) -> ArchivePruneOutcome {
+    let outcome = prune_active_segments_at(
+        wal_dir,
+        retention_secs,
+        max_bytes,
+        std::time::SystemTime::now(),
+    );
+    if outcome.deleted > 0 || outcome.failed > 0 || outcome.size_deleted > 0 {
+        metrics::counter!("tv_ws_wal_active_pruned_total")
+            .increment((outcome.deleted + outcome.size_deleted) as u64);
+        info!(
+            deleted = outcome.deleted,
+            size_deleted = outcome.size_deleted,
+            failed = outcome.failed,
+            kept = outcome.kept,
+            bytes_after = outcome.bytes_after,
+            retention_secs,
+            max_bytes,
+            "WAL ACTIVE prune pass complete — un-replayed segments past retention. \
+             These are crash-recovery copies of frames the live lane already folded; \
+             the boot replay budget could not have reached them."
+        );
+    }
+    outcome
+}
+
+/// Byte ceiling on the ACTIVE `<wal_dir>/*.wal` set — DERIVED from the volume.
+///
+/// Resolved once into a `OnceLock`, so every read is O(1) and the enforcement
+/// can never disagree with a logged value.
+///
+/// **Why derived rather than a constant.** The archive's sibling ceiling is a
+/// hardcoded 50 GB whose own doc concedes it "DOES engage" at the target
+/// instrument count — a number chosen against one traffic level and one disk.
+/// This session was spent on the consequence of exactly that shape: a 512 MiB
+/// spill ceiling pinned to no machine, on a 200 GB volume, refusing a rescue
+/// and losing 1,695,983 ticks. Repeating it here for the LARGEST directory on
+/// the box would be repeating a mistake with the evidence already in hand.
+///
+/// One eighth of the volume: 25 GB on the prod 200 GB disk. That is generous
+/// enough that a normal session never touches it, and small enough that the
+/// active set can no longer be what fills the disk — it reached 31 GB before
+/// this bound existed.
+///
+/// # Complexity
+/// O(1) after the first call.
+#[must_use]
+pub fn ws_wal_active_max_bytes<P: AsRef<Path>>(wal_dir: P) -> u64 {
+    /// Floor, and the fallback when the volume cannot be measured.
+    const FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    /// Fraction of the volume the active WAL set may occupy.
+    const VOLUME_FRACTION: u64 = 8;
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if let Some(v) = RESOLVED.get() {
+        return *v;
+    }
+    // Probe the deepest EXISTING ancestor: `df` on a path that does not exist
+    // yet fails, and the WAL directory is created lazily.
+    let mut probe: &Path = wal_dir.as_ref();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break,
+        }
+    }
+    let resolved = match crate::disk_health_watcher::probe_disk_free_bytes(probe) {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok { total_bytes, .. }
+            if total_bytes > 0 =>
+        {
+            let derived = (total_bytes / VOLUME_FRACTION).max(FLOOR_BYTES);
+            info!(
+                total_bytes,
+                ceiling_bytes = derived,
+                fraction = VOLUME_FRACTION,
+                "active WAL byte ceiling derived from the volume"
+            );
+            derived
+        }
+        _ => {
+            warn!(
+                fallback_bytes = FLOOR_BYTES,
+                "could not measure the WAL volume — the active-WAL byte ceiling falls back \
+                 to its floor"
+            );
+            FLOOR_BYTES
+        }
+    };
+    *RESOLVED.get_or_init(|| resolved)
 }
 
 fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
@@ -2348,6 +2514,114 @@ mod tests {
         f.set_times(std::fs::FileTimes::new().set_modified(mtime))
             .unwrap();
         path
+    }
+
+    // ---- ACTIVE-dir prune (2026-08-25) -----------------------------------
+
+    /// Plants a segment in the ACTIVE dir (the WAL root), not `archive/`.
+    fn plant_active_file(dir: &Path, name: &str, now: SystemTime, age_secs: u64) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, b"segment-bytes").unwrap();
+        let mtime = now - Duration::from_secs(age_secs);
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn active_prune_deletes_past_retention_and_keeps_the_current_session() {
+        // The leak this closes: ONLY `archive/` was ever bounded. The active
+        // dir had no age bound and no byte bound, on the assumption that boot
+        // replay drains it — but the replay budget is 512 MiB per boot against
+        // continuous writing, so everything past the newest five segments was
+        // never replayed, never confirmed, never archived, and eligible for no
+        // bound. Measured on the prod box: 244 files, 31 GB, oldest from the
+        // previous day, volume 94% full.
+        let dir = tmp_dir("active-prune-age");
+        let now = SystemTime::now();
+        let stale = plant_active_file(&dir, "ws-frames-00000000000000000010.wal", now, 259_200);
+        let todays = plant_active_file(&dir, "ws-frames-00000000000000000011.wal", now, 600);
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        assert_eq!(outcome.deleted, 1);
+        assert!(!stale.exists(), "a segment older than retention must go");
+        assert!(
+            todays.exists(),
+            "the current session's segments must never be touched — they are \
+             the crash-recovery copy that replay actually reads"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_prune_can_never_reach_what_the_next_boot_replay_would_read() {
+        // The safety property that makes this provable rather than probable.
+        // A boot replay is capped at WAL_REPLAY_MAX_BYTES (512 MiB) of the
+        // NEWEST segments. The retention floor is a full day. So no segment
+        // this pass can delete is reachable by the next replay — the pass and
+        // the replay operate on disjoint ends of the same directory.
+        assert!(
+            tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS >= 86_400,
+            "retention below one day could race the boot replay window"
+        );
+        // Non-vacuous: a segment inside one replay budget of the newest is
+        // young enough to survive, whatever its size.
+        let dir = tmp_dir("active-prune-replay-safe");
+        let now = SystemTime::now();
+        let recent = plant_active_file(&dir, "ws-frames-00000000000000000020.wal", now, 3_600);
+        let outcome = prune_active_segments_at(
+            &dir,
+            tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
+            u64::MAX,
+            now,
+        );
+        assert_eq!(outcome.deleted, 0);
+        assert!(recent.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_prune_never_descends_into_archive_or_replaying() {
+        // `replaying/` holds STAGED-but-unconfirmed segments — deleting one
+        // loses frames the lane is mid-way through confirming. `archive/` has
+        // its own bounds. The pass reads ONE directory and touches only
+        // `*.wal`, so both subdirectories are out of reach by construction;
+        // this pins that rather than trusting it.
+        let dir = tmp_dir("active-prune-subdirs");
+        let now = SystemTime::now();
+        let archived = plant_archive_file(&dir, "ws-frames-00000000000000000030.wal", now, 999_999);
+        let staging = dir.join("replaying");
+        std::fs::create_dir_all(&staging).unwrap();
+        let staged =
+            plant_active_file(&staging, "ws-frames-00000000000000000031.wal", now, 999_999);
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        assert_eq!(outcome.deleted, 0, "nothing in the ROOT to delete");
+        assert!(archived.exists(), "archive/ has its own bounds");
+        assert!(
+            staged.exists(),
+            "replaying/ holds unconfirmed frames — never touchable by this pass"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_active_byte_ceiling_is_derived_and_never_below_its_floor() {
+        // The archive's sibling ceiling is a hardcoded 50 GB whose own doc
+        // concedes it engages at the target instrument count. This session was
+        // spent on the consequence of that shape — a 512 MiB spill ceiling
+        // pinned to no machine, refusing a rescue and losing 1,695,983 ticks.
+        let ceiling = ws_wal_active_max_bytes(".");
+        assert!(
+            ceiling >= 8 * 1024 * 1024 * 1024,
+            "the ceiling must never fall below its floor"
+        );
+        assert_eq!(ceiling, ws_wal_active_max_bytes("."), "must be memoised");
+        // And it must actually bound the set that reached 31 GB unbounded.
+        assert!(
+            ceiling < 100 * 1024 * 1024 * 1024,
+            "a ceiling this large would not bound anything on a 200 GB volume"
+        );
     }
 
     // ---- byte ceiling (2026-08-19) ---------------------------------------
