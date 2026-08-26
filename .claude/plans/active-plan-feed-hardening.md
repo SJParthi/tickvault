@@ -3715,3 +3715,312 @@ because the code got longer. It failed CLOSED (blocking a correct change), which
 is the better direction, but the shape is the same one corrected four times
 already in this branch. It now walks back to the enclosing macro opening, which is
 a real boundary and cannot drift. Bite-proven: deleting the field it pins fails it.
+
+---
+
+## Item 37 — a fixed sweep order starved the tail of the universe forever
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, verbatim: *"ensure to pull evrythign using incrmental or decrmental
+aprpoach ddude okay?"*
+
+The fetch loop walked its target list in FIXED order and `break`s on a hard
+wall-clock budget. Fixed order plus truncation is not "we reach fewer
+instruments" — it is **"we never reach the tail"**, identically, every day,
+while the report shows a respectable coverage percentage and nothing says
+which instruments were skipped.
+
+Today's pacing change (Item 35) is what makes it bite. Measured:
+
+| limiter rate | per-answer | 868 targets need | vs 600 s budget |
+|---|---|---:|---|
+| 4 rps | 0.2 s | 391 s | covers all |
+| 3 rps | 0.4 s | 637 s | **truncates ~6%** |
+| 2 rps | 0.4 s | 781 s | **truncates ~23%** |
+
+At the limiter's floor a specific 23% of the universe would go permanently
+unverified — in the one check that exists to prove nothing was lost.
+
+**The fix is a rotating start, and it is deliberately STATELESS.** A persisted
+cursor resumes exactly and is also a file to lose, corrupt, or have differ
+between a laptop and the box — a new failure mode inside the only loss
+detector. The trading date is state everyone already agrees on.
+
+**The stride is the guarantee.** Consecutive runs cover `[k·s, k·s + c)`;
+their union is the whole list exactly when `c >= s`. At `s = ceil(n/3)` any run
+reaching a third closes the universe in three days, and the measured worst case
+(77%) closes it in two.
+
+### Edge cases
+
+- **Empty target list** — returns 0 rather than dividing by zero. A wrong start
+  is survivable; a panic in the only loss detector takes the day's
+  verification with it.
+- **`n = 1`** — `max(1)` keeps the stride positive.
+- **Year boundary** — days-from-epoch, not day-of-year. Day-of-year snaps to 0
+  every January and re-starves whatever December was working through.
+- **A 25,000 universe** — the day number (~739,000) is reduced modulo `n`
+  BEFORE multiplying by the stride, so the product cannot overflow a 32-bit
+  `usize`.
+
+### Failure modes
+
+**The off-by-one a test caught.** `n / 3` rounds DOWN: at n=868 the stride is
+289, three of which is 867 — leaving exactly one index that three strides never
+reach, starved forever. `div_ceil` closes it. That is the same defect this
+rotation exists to kill, one index wide instead of two hundred.
+
+**Rotation that is not a permutation.** If the wrap skipped or repeated an
+index, an un-truncated run would compare one instrument twice and another
+never. Pinned for n ∈ {1, 2, 7, 868}.
+
+### Test plan
+
+7 tests: empty list does not divide by zero; consecutive days differ; three
+days at exactly one-third coverage reach everything; the measured 77% closes in
+two days; a full sweep is a permutation; a year boundary does not reset;
+a 25,000 universe does not overflow.
+
+**Bite-proven:** pinning the start back to 0 fails **5** of them.
+
+### Rollback
+
+Delete `rotation_start` and iterate `targets` directly. That restores a sweep
+that starves the same tail every day.
+
+### Observability
+
+**No new metric name and no cost.** The coverage fraction the guarantee depends
+on already rides the verdict line as `targets` and the compared count.
+
+### Honest envelope
+
+This converts permanent starvation into eventual coverage. It does **not** make
+any single day complete — a truncated run still leaves that day's tail
+unverified, and only the next runs close it. The three-day guarantee holds only
+while coverage stays above a third; if it falls below, the rotation no longer
+covers everything, and the reported fraction is what would show it. Nothing
+here reduces the 815 fetch failures — that is Item 35's diagnosis, due
+tomorrow.
+
+---
+
+## Item 38 — the vendor's own tape was fetched, judged, and thrown away
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, verbatim: *"see to save this also you need a separte tabel right
+becuase onl yfrom there ou can do the cross evrificationa dn even stroe the
+hisotircla data right even for manaul verificaiton also right dude am ii rght
+dude okay?"*
+
+He is right, and checking confirmed it. `fetch_rest_side_for_target` pulls the
+exchange's own minute candles, `compare_day` judges them, and the bars are
+**dropped**. Only the cells that DISAGREED survive, on the cell-audit table.
+Three consequences, all of which he named:
+
+1. **No manual verification.** "What did Dhan say for this instrument at
+   09:16?" is unanswerable unless that minute happened to diverge.
+2. **No re-verification without re-fetching.** Re-running the comparison means
+   ~868 more requests against a rate-limited vendor budget — so in practice it
+   was never re-run.
+3. **No other analysis.** The vendor's own record did not exist on disk in any
+   form.
+
+Storing the pull turns the comparison into a pure function over two stored
+tables: fetch once, compare as often as you like, offline.
+
+**⚠ The trap that forced a NEW table.** `rest_spot_1m` already exists with
+exactly the right shape — and its DEDUP key is
+`(ts, security_id, exchange_segment, feed)`, which **omits its own `source`
+column**. Writing this 868-instrument sweep there would have silently
+overwritten the per-minute leg's index rows, with no error anywhere. That is
+the third silent-overwrite risk found today. The new table carries `source`
+**in the key from its first line**, so the same collision cannot be introduced
+later by a second writer.
+
+### Edge cases
+
+- **The designated timestamp is the MINUTE, not the run time.** A run-level
+  stamp would file every candle of the day under one instant and make "what
+  was the 09:16 price" unanswerable — the exact question the table was added
+  for.
+- **`fetched_at` is stamped PER TARGET.** The loop runs up to ten minutes; one
+  run-level stamp would claim the last instrument was fetched at the same
+  instant as the first, destroying the only number that says how stale the
+  vendor's record was when read.
+- **`fetched_at` uses the existing IST helper**, not a second clock. The
+  offset rule is already applied there, and a private copy is how the
+  timestamp class that started this whole session gets re-created.
+- **`instrument` is stored verbatim.** A vendor "no candles" answer is
+  identical for a mislabelled instrument and a genuinely untraded one; without
+  the label there is nothing to check against the master afterwards.
+- **Memory.** The bars already exist in memory — carrying them out is a move,
+  not a copy. At full coverage the tape is ~333,000 rows ≈ 37 MB, and today's
+  coverage makes it far smaller.
+
+### Failure modes
+
+**A future "simplification" pointing this writer at the sibling table** —
+pinned by a test asserting the table names differ, with the collision spelled
+out at the assertion.
+
+**A half-registered table.** A table whose CREATE lands without a DEDUP ENABLE
+auto-creates on first write with **no dedup at all** — a silent duplicate-row
+window. The DDL test now checks per table (one CREATE, one DEDUP ENABLE, one
+ALTER per declared column) rather than one total, so a half-registered table
+fails loudly instead of sliding under a sum that still adds up.
+
+**Silent reversion to fetch-and-discard** — pinned by a source scan of the
+persist function.
+
+### Test plan
+
+7 storage tests: `source` is in the key; `security_id` is paired with
+`segment` and `feed` is in-key; the designated timestamp is the minute; the
+asked-with label survives; the DDL is registered with dedup enabled; two
+identical rows produce byte-identical wire output; the table is not the
+sibling table.
+
+2 app wiring tests: the tape is persisted and partial writes counted; the
+stamp is taken inside the fetch loop, before the rows that carry it.
+
+**Bite-proven:** dropping `source` from the key fails 2; disabling the persist
+call fails 2.
+
+### Rollback
+
+Delete the table constants, DDL, writer method, the `rest_tape` field, and the
+persist loop. That restores a comparison whose raw input exists nowhere.
+
+### Observability
+
+**No new metric name and no cost.** Tape rows count into the existing persist
+counter; partial tape writes ride the existing partial-write error line.
+
+### Honest envelope
+
+This stores what we fetched. It does **not** increase what we fetch — the
+tape is exactly as complete as the run that produced it, so at today's 0.09%
+coverage the stored tape is equally sparse. It also stores only the VENDOR
+side; our own candles already live in the live tables, and joining them is the
+reader's job.
+
+**Retention — the gap this envelope named, now closed (2026-08-26, same
+day).** The first draft of this section said "no archival policy is registered
+for it here, so it grows with the hot window like its siblings", and
+`partition_retention_coverage_guard` failed the build on exactly that: a new
+storage table constant with no retention decision. `dhan_rest_1m_tape` is now
+in `DAY_PARTITIONED_TABLES`, swept by the same detach→archive pass as
+`dhan_live_crossverify_cell_audit` and `dhan_live_crossverify_daily`.
+
+It is registered with its real volume rather than the word "trivial", because
+it is not: the cell table is bounded by DIVERGENCES and is normally near-empty,
+this one is bounded by INSTRUMENTS. One rotation third (~290 of ~865 spots) ×
+375 session minutes ≈ **108K rows/day** at full success, ~30 MB/day at the
+measured ~272 B/row, so **~2.7 GB across the 90-day hot window** — the largest
+per-day writer in that list. At today's measured 50-successful-fetches ceiling
+it is ~19K rows/day, so the number will GROW as the fetch failures are fixed,
+which is the opposite of the usual direction and worth stating before it
+surprises someone.
+
+---
+
+## Item 39 — the whole day's cross-verification was discarded, and 99% of it was never data
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Found by reading the live logs rather than waiting for tomorrow's run.
+
+Today's 15:41 IST run **failed to persist at all**:
+
+> `dhan_live_crossverify ILP flush failed — 764003 pending row(s) discarded`
+> `Buffer size of 207965278 exceeds maximum configured allowed size of 104857600`
+
+**The entire day's comparison was lost** — in the one check that exists to
+prove nothing else was.
+
+**Why 764,003 rows.** The verdict line carries `instruments: 8144` beside
+`targets: 865`. The live universe holds every option and future contract; the
+REST leg fetches ~865 spots. `compare_day` built its key set from live ∪ rest
+with **no scope filter**, so every minute of the ~7,279 never-requested
+instruments was recorded as `missing_rest` — *"the vendor is missing this"* —
+for data nobody asked the vendor for.
+
+**757,273 of 764,003 findings (99.1%) were that.**
+
+Two fixes, deliberately independent:
+
+1. **The scope filter** (root cause). `compare_day_in_scope` takes the set the
+   run actually requested; a live instrument outside it produces no findings
+   and is not counted in the reported universe.
+2. **Batched flushing** (floor). 20,000 rows per flush — not a round number:
+   the breached buffer averaged ~272 bytes/row, so a batch lands near 5 MB
+   against a 100 MB ceiling. A future legitimately-large day now loses at most
+   one batch instead of everything.
+
+Two mechanisms because *"the row count can never grow again"* is precisely the
+assumption that produced the ceiling breach.
+
+### Edge cases
+
+- **An empty scope disables the filter**, so every existing caller and test
+  means exactly what it did before.
+- **The scope key pairs `security_id` with `segment`** (I-P1-11). The same
+  numeric id in another segment is a different instrument; matching on the id
+  alone would admit one we never asked for and re-create the defect one
+  instrument at a time.
+- **A requested instrument the vendor did not serve is STILL `missing_rest`.**
+  The filter must not silence the signal it sits beside — that is the one case
+  the category exists to report.
+- **The skip happens BEFORE the instrument count.** Counting it would report a
+  universe far larger than the one verified, which is how `8,144 instruments`
+  sat in the verdict beside 865 targets and read as coverage.
+
+### Failure modes
+
+**The filter hiding real loss** — pinned by the asked-for-and-not-served test.
+
+**A silent regression to the unscoped comparison** — bite-proven: removing the
+filter fails 5 tests.
+
+### Test plan
+
+6 tests: a never-requested instrument produces no findings; it is not counted
+in the universe; a requested-but-unserved one still reports missing; an empty
+scope filters nothing; the key pairs id with segment; and the measured prod
+shape (200 live, 3 targeted) collapses to 3 findings rather than 200.
+
+### Rider — my own guard fired twice, correctly
+
+The single-test-marker guard written this morning caught the helper placement
+**twice**: once for a test-only attribute in production code, and once for a
+comment that merely NAMED that attribute. Both times it was right. That is the
+third instance today of a source scanner unable to tell quoting from doing, and
+the helper now lives inside the test module with nothing spelling the attribute
+out.
+
+### Rollback
+
+Pass an empty scope set and drop the batch flush. That restores a comparison
+that reports 99% noise and loses the day when it grows.
+
+### Observability
+
+**No new metric name and no cost.** `batch_errors` rides the existing
+partial-write error line.
+
+### Honest envelope
+
+This makes the day's comparison **persistable and its findings meaningful**. It
+does **not** improve coverage: the same ~50 instruments still succeed. It does
+not reduce the 815 fetch failures. And it changes what `missing_rest` MEANS —
+historical rows carry the old, inflated definition, so any trend across
+2026-08-26 is a definition change, not a signal.

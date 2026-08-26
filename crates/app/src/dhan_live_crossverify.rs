@@ -619,9 +619,31 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
 /// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
 #[must_use]
-pub fn compare_day(
+/// Compares one day's live capture against the vendor's own tape.
+///
+/// `in_scope` is the set of `(security_id, segment)` pairs the run actually
+/// ASKED the vendor for. **Live instruments outside it are skipped entirely.**
+///
+/// # Why the scope filter exists (MEASURED, prod, 2026-08-26)
+///
+/// The live universe carries ~8,144 instruments (spots AND every option and
+/// future contract); the REST leg fetches ~865 spot targets. Without this
+/// filter every minute of the ~7,279 never-requested instruments was recorded
+/// as `missing_rest` — *"the vendor is missing this"* — for data we never
+/// asked the vendor for.
+///
+/// That was not a cosmetic mislabel. It produced **757,273 of the run's
+/// 764,003 findings (99.1%)**, and the resulting ILP buffer reached
+/// **207,965,278 bytes against a 104,857,600-byte ceiling**, so the flush
+/// failed and **the entire day's comparison was discarded** — in the one check
+/// that exists to prove nothing was lost.
+///
+/// An empty `in_scope` disables the filter, which keeps every existing caller
+/// and test meaning exactly what it did before.
+pub fn compare_day_in_scope(
     live: &[SideBar],
     rest: &[SideBar],
+    in_scope: &std::collections::BTreeSet<(i64, String)>,
     day_start_ist_nanos: i64,
     run_ts_ist_nanos: i64,
     tolerance_paise: i64,
@@ -640,6 +662,13 @@ pub fn compare_day(
     let mut out_of_session: i64 = 0;
 
     for b in live {
+        // Out of scope = never requested. Skipping BEFORE the instrument
+        // count matters: counting it would report a universe far larger than
+        // the one actually verified, which is how "8,144 instruments" sat in
+        // the verdict beside 865 targets and read as coverage.
+        if !in_scope.is_empty() && !in_scope.contains(&(b.security_id, b.segment.clone())) {
+            continue;
+        }
         instruments.insert((b.security_id, b.segment.clone()));
         if !is_in_session(b.minute_ts_ist_nanos, day_start_ist_nanos) {
             out_of_session = out_of_session.saturating_add(1);
@@ -1021,6 +1050,49 @@ pub fn parse_live_dataset(body: &str, cap: usize) -> Result<(Vec<SideBar>, bool,
     Ok((out, truncated, malformed))
 }
 
+/// Where today's sweep begins in the target list.
+///
+/// The loop has a hard wall-clock budget and `break`s on it. With a FIXED
+/// start that is not "we cover fewer instruments" — it is "we never reach the
+/// tail", identically, every single day. A rotating start converts permanent
+/// starvation into a sweep that comes back around.
+///
+/// **The stride is a third of the list, and that number is the guarantee.**
+/// Consecutive runs cover `[k·s, k·s + c)` for coverage `c`; their union is
+/// the whole list exactly when `c >= s`. At `s = ceil(n/3)` any run reaching a
+/// third of the list gives FULL coverage within three days, and the measured
+/// worst case (77% at the limiter's floor) closes it in two.
+///
+/// **Stateless on purpose.** A persisted cursor would resume exactly, and it
+/// would also be a file to lose, corrupt, or have differ between a laptop and
+/// the box — a new failure mode in the one check that exists to catch
+/// failures. The trading date is state everyone already agrees on.
+///
+/// The guarantee is only as good as the coverage, so the run reports the
+/// fraction it reached: if that ever falls below a third, this rotation no
+/// longer covers everything and the number says so rather than the shape
+/// quietly breaking.
+pub fn rotation_start(trading_date: chrono::NaiveDate, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    // `div_ceil`, NOT `n / 3`. Rounding DOWN leaves `n mod 3` indexes that
+    // three strides never reach — 868 gives stride 289, three of which is
+    // 867, so exactly one instrument stays starved forever. A test caught
+    // that off-by-one; it is the same defect this rotation exists to kill,
+    // one index wide instead of two hundred.
+    let stride = n.div_ceil(3).max(1);
+    // `num_days_from_ce` is monotonic across years, so a year boundary does
+    // not reset the sweep — a January restart would re-starve whatever
+    // December was on.
+    let day = i64::from(chrono::Datelike::num_days_from_ce(&trading_date));
+    // Reduce BEFORE multiplying: `day` is ~739,000 and a large `n` would
+    // overflow the product on a 32-bit usize. Wrong start indexes are
+    // survivable; a panic in the only loss detector is not.
+    let day_mod = day.rem_euclid(n as i64).unsigned_abs() as usize;
+    day_mod.wrapping_mul(stride) % n
+}
+
 /// Adapt Dhan's parsed REST intraday candles into [`SideBar`]s for one
 /// instrument. Returns the bars plus the count of candles rejected as
 /// malformed (non-finite price). Pure.
@@ -1239,6 +1311,15 @@ pub struct RunReport {
     pub malformed_rows: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
+    /// The vendor's own minute candles, exactly as fetched — added
+    /// 2026-08-26 on operator instruction.
+    ///
+    /// These bars ALREADY existed in memory: the comparison built them,
+    /// judged them, and dropped them. Carrying them out is a move, not a
+    /// copy, so it costs no extra allocation — and it is the difference
+    /// between a comparison that can be re-run offline and one that must
+    /// re-fetch ~868 rate-limited requests to say anything twice.
+    pub rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow>,
 }
 
 /// Read the live side out of QuestDB via `/exec`, bounded by `timeout`.
@@ -1441,6 +1522,13 @@ pub async fn run_cross_verification(
     .await?;
 
     let mut rest: Vec<SideBar> = Vec::new();
+    // The vendor tape, captured as it arrives. Stamped PER TARGET rather than
+    // once for the run: this loop runs for up to ten minutes, so a single
+    // run-level stamp would claim the last instrument was fetched at the same
+    // instant as the first and destroy the one number that says how stale the
+    // vendor's own record was when we read it.
+    let mut rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow> =
+        Vec::new();
     let mut rest_failures = 0usize;
     let mut rest_failure_breakdown = RestFailureBreakdown::default();
     // Bounded sample of the actual messages. A run can fail 815 times; logging
@@ -1451,7 +1539,33 @@ pub async fn run_cross_verification(
     let mut failure_samples: Vec<String> = Vec::with_capacity(FAILURE_SAMPLE_MAX);
     let mut budget_elapsed = false;
     let target_count = targets.len();
-    for target in targets {
+
+    // ---- the sweep starts somewhere different every day ---------------
+    //
+    // MEASURED DEFECT (2026-08-26). This loop walked `targets` in FIXED order
+    // and `break`s on the budget. Fixed order plus truncation is not "we get
+    // to fewer instruments" — it is "the tail is NEVER reached", on any day,
+    // ever. Coverage would look like a respectable 77% while a specific 23%
+    // of the universe went permanently unverified, and nothing in the report
+    // would say which.
+    //
+    // Today's pacing change is what makes it bite: at the limiter's 2 rps
+    // floor with 0.4s answers, 868 sequential targets need ~781s against a
+    // 600s budget. So the truncation is no longer hypothetical.
+    //
+    // The fix is a rotating start, and it is deliberately STATELESS —
+    // derived from the trading date, not from a cursor file. A file would be
+    // one more thing to lose, corrupt, or have differ between a laptop and
+    // the box; the date is already agreed by everyone. See `rotation_start`
+    // for why the stride is a third.
+    let start = rotation_start(trading_date, target_count);
+    for offset in 0..target_count {
+        // Wrap: the sweep runs to the end of the list and continues from the
+        // front, so a run always covers a CONTIGUOUS window — just not always
+        // the same one.
+        let Some(target) = targets.get((start + offset) % target_count) else {
+            break;
+        };
         if started.elapsed() >= budget {
             // Stop issuing work; the verdict degrades rather than pretending
             // the un-fetched targets were clean.
@@ -1468,7 +1582,25 @@ pub async fn run_cross_verification(
         )
         .await
         {
-            Ok(mut bars) => rest.append(&mut bars),
+            Ok(mut bars) => {
+                let fetched_at_nanos = crate::spot_1m_rest_boot::fetched_at_ist_nanos_now();
+                rest_tape.extend(bars.iter().map(|b| {
+                    tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
+                        minute_ts_ist_nanos: b.minute_ts_ist_nanos,
+                        trading_date_ist_nanos: day_start_ist_nanos,
+                        security_id: b.security_id,
+                        segment: b.segment.clone(),
+                        instrument: target.instrument.clone(),
+                        open: b.bar.open_r,
+                        high: b.bar.high_r,
+                        low: b.bar.low_r,
+                        close: b.bar.close_r,
+                        volume: b.bar.volume,
+                        fetched_at_nanos,
+                    }
+                }));
+                rest.append(&mut bars);
+            }
             Err(failure) => {
                 // The reason used to die here as `Err(_)`. See
                 // `XverifyFetchFailureKind` for what that cost.
@@ -1486,9 +1618,19 @@ pub async fn run_cross_verification(
 
     let degraded = truncated || budget_elapsed || rest_failures > 0;
     let run_ts = deterministic_run_ts_nanos(day_start_ist_nanos);
-    let comparison = compare_day(
+    // The scope set: exactly what this run ASKED the vendor for. A live
+    // instrument outside it was never requested, so calling its minutes
+    // "missing from the vendor" is a scope mismatch dressed as data loss —
+    // and on 2026-08-26 that dressing produced 757,273 of 764,003 findings
+    // and blew the write buffer past its ceiling, discarding the whole day.
+    let in_scope: std::collections::BTreeSet<(i64, String)> = targets
+        .iter()
+        .map(|t| (t.security_id, t.segment.clone()))
+        .collect();
+    let comparison = compare_day_in_scope(
         &live,
         &rest,
+        &in_scope,
         day_start_ist_nanos,
         run_ts,
         cfg.tolerance_paise,
@@ -1514,6 +1656,7 @@ pub async fn run_cross_verification(
         degraded,
         malformed_rows: live_malformed,
         budget_elapsed,
+        rest_tape,
     })
 }
 
@@ -1530,6 +1673,37 @@ mod tests {
 
     fn minute(secs_of_day: i64) -> i64 {
         DAY_START_NANOS.saturating_add(secs_of_day * NANOS_PER_SEC)
+    }
+
+    /// Unscoped comparison — every live instrument participates.
+    ///
+    /// Retained so the existing tests read unchanged; production goes through
+    /// [`compare_day_in_scope`] with the run's real target set.
+    ///
+    /// Lives INSIDE the test module rather than carrying a test-only
+    /// attribute in production code. A guard written this morning asserts
+    /// this file has exactly ONE test-module marker, and it fired twice while
+    /// this helper was being placed: once for the attribute itself, and once
+    /// for a comment that merely NAMED the attribute. Both times it was
+    /// right — a source scanner cannot tell quoting from doing, so nothing
+    /// here spells that attribute out.
+    pub fn compare_day(
+        live: &[SideBar],
+        rest: &[SideBar],
+        day_start_ist_nanos: i64,
+        run_ts_ist_nanos: i64,
+        tolerance_paise: i64,
+        degraded: bool,
+    ) -> DayComparison {
+        compare_day_in_scope(
+            live,
+            rest,
+            &std::collections::BTreeSet::new(),
+            day_start_ist_nanos,
+            run_ts_ist_nanos,
+            tolerance_paise,
+            degraded,
+        )
     }
 
     fn bar(o: f64, h: f64, l: f64, c: f64) -> PaiseBar {
@@ -2700,6 +2874,7 @@ mod tests {
             degraded: true,
             malformed_rows: 0,
             budget_elapsed: true,
+            rest_tape: Vec::new(),
         };
         assert!(report.degraded);
         assert!(report.budget_elapsed);
@@ -3014,6 +3189,266 @@ mod tests {
             cmp.volume_capture_p50_pct, 920,
             "920% must survive to the report — a clamp here would hide a \
              real, already-measured defect"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // THE ROTATING SWEEP — added 2026-08-26
+    //
+    // The loop has a hard budget and breaks on it. With a FIXED start that is
+    // not "fewer instruments" — it is "the tail is NEVER reached", every day,
+    // forever, while coverage reads a respectable 77%.
+    // -----------------------------------------------------------------
+
+    fn day(n: i32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_num_days_from_ce_opt(700_000 + n).unwrap_or_default()
+    }
+
+    #[test]
+    fn an_empty_target_list_does_not_divide_by_zero() {
+        // The only loss detector in the system must not panic on a universe
+        // that failed to resolve. A wrong start is survivable; a panic here
+        // takes the day's verification with it.
+        assert_eq!(rotation_start(day(0), 0), 0);
+        assert_eq!(rotation_start(day(1), 1), 0);
+    }
+
+    #[test]
+    fn the_start_moves_between_consecutive_days() {
+        // The whole point. Same start every day = same tail starved every day.
+        let n = 868;
+        let a = rotation_start(day(0), n);
+        let b = rotation_start(day(1), n);
+        assert_ne!(
+            a, b,
+            "two consecutive days must not begin at the same index"
+        );
+    }
+
+    #[test]
+    fn three_days_cover_the_whole_list_at_one_third_coverage() {
+        // THE GUARANTEE, stated as a test rather than as a comment.
+        //
+        // Consecutive runs cover [k·stride, k·stride + c). Their union is the
+        // whole list exactly when c >= stride. At stride = n/3, a run reaching
+        // a third of the list closes the universe in three days.
+        let n: usize = 868;
+        let coverage = n.div_ceil(3);
+        let mut seen = vec![false; n];
+        for d in 0..3 {
+            let start = rotation_start(day(d), n);
+            for offset in 0..coverage {
+                seen[(start + offset) % n] = true;
+            }
+        }
+        let missed = seen.iter().filter(|s| !**s).count();
+        assert_eq!(
+            missed, 0,
+            "at exactly one-third coverage every instrument must be reached \
+             within three days — {missed} were not"
+        );
+    }
+
+    #[test]
+    fn the_measured_worst_case_closes_in_two_days() {
+        // 77% is the measured floor: the limiter's 2 rps with 0.4s answers
+        // against the 600s budget. It should not need the full three days.
+        let n = 868;
+        let coverage = n * 77 / 100;
+        let mut seen = vec![false; n];
+        for d in 0..2 {
+            let start = rotation_start(day(d), n);
+            for offset in 0..coverage {
+                seen[(start + offset) % n] = true;
+            }
+        }
+        assert_eq!(seen.iter().filter(|s| !**s).count(), 0);
+    }
+
+    #[test]
+    fn a_full_sweep_visits_every_target_exactly_once() {
+        // Rotation must be a PERMUTATION. If it skipped or repeated an index,
+        // an unbudgeted run would quietly compare one instrument twice and
+        // another never — which is the defect wearing a different hat.
+        for n in [1usize, 2, 7, 868] {
+            let start = rotation_start(day(5), n);
+            let mut seen = vec![0u32; n];
+            for offset in 0..n {
+                seen[(start + offset) % n] += 1;
+            }
+            assert!(
+                seen.iter().all(|c| *c == 1),
+                "n={n}: a full sweep must touch every index exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_year_boundary_does_not_reset_the_sweep() {
+        // Day-of-YEAR would snap back to 0 every January and re-starve
+        // whatever December was working through. Days-from-epoch is monotonic,
+        // so 31 Dec and 1 Jan differ like any other pair.
+        let n = 868;
+        let dec31 = chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap_or_default();
+        let jan01 = chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap_or_default();
+        assert_ne!(rotation_start(dec31, n), rotation_start(jan01, n));
+    }
+
+    #[test]
+    fn a_huge_universe_does_not_overflow_the_start_computation() {
+        // `num_days_from_ce` is ~739,000. Multiplied by a large stride before
+        // reduction that overflows a 32-bit usize. The reduction happens
+        // FIRST for exactly this reason; this pins it.
+        let n = 25_000; // the authorized ceiling
+        let start = rotation_start(day(9), n);
+        assert!(start < n, "start must stay inside the list");
+    }
+
+    // -----------------------------------------------------------------
+    // THE SCOPE FILTER — added 2026-08-26 from a live total data loss
+    //
+    // Prod produced 764,003 findings and a 207,965,278-byte buffer against a
+    // 104,857,600-byte ceiling; the flush failed and the ENTIRE day's
+    // comparison was discarded. 757,273 of those findings (99.1%) were
+    // `missing_rest` for instruments the run never asked the vendor for.
+    // -----------------------------------------------------------------
+
+    fn scope_of(pairs: &[(i64, &str)]) -> std::collections::BTreeSet<(i64, String)> {
+        pairs
+            .iter()
+            .map(|(id, s)| (*id, (*s).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_instrument_never_requested_produces_no_findings_at_all() {
+        // THE DEFECT, in one assertion. Live carries contracts we never fetch;
+        // calling their minutes "missing from the vendor" is a scope mismatch
+        // dressed as data loss.
+        let live = vec![
+            side(13, OPEN, bar(100.0, 101.0, 99.0, 100.5)),
+            side(999, OPEN, bar(50.0, 51.0, 49.0, 50.5)),
+        ];
+        let rest = vec![side(13, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+        let cmp = compare_day_in_scope(
+            &live,
+            &rest,
+            &scope_of(&[(13, "IDX_I")]),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            false,
+        );
+        assert_eq!(
+            cmp.missing_rest, 0,
+            "instrument 999 was never requested — it must produce NO finding, \
+             not a 'the vendor is missing this' row"
+        );
+        assert_eq!(
+            cmp.minutes_compared, 1,
+            "the in-scope instrument still compares"
+        );
+    }
+
+    #[test]
+    fn an_out_of_scope_instrument_is_not_counted_in_the_universe() {
+        // `instruments: 8144` sat in the verdict beside `targets: 865` and
+        // read as coverage. It was the live universe, not the verified one.
+        let live = vec![
+            side(13, OPEN, bar(100.0, 101.0, 99.0, 100.5)),
+            side(999, OPEN, bar(50.0, 51.0, 49.0, 50.5)),
+            side(777, OPEN, bar(10.0, 11.0, 9.0, 10.5)),
+        ];
+        let cmp = compare_day_in_scope(
+            &live,
+            &[],
+            &scope_of(&[(13, "IDX_I")]),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            false,
+        );
+        assert_eq!(
+            cmp.instruments, 1,
+            "the reported universe must be the VERIFIED one, not everything \
+             the feed happened to carry"
+        );
+    }
+
+    #[test]
+    fn a_requested_instrument_the_vendor_did_not_serve_is_still_missing_rest() {
+        // The filter must not silence the real signal it sits beside. An
+        // instrument we DID ask for and the vendor did not serve is the one
+        // case `missing_rest` exists to report.
+        let live = vec![side(13, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+        let cmp = compare_day_in_scope(
+            &live,
+            &[],
+            &scope_of(&[(13, "IDX_I")]),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            false,
+        );
+        assert_eq!(
+            cmp.missing_rest, 1,
+            "asked for and not served MUST still be reported — otherwise the \
+             filter hides the very loss it was added beside"
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_disables_the_filter() {
+        // Every existing caller and test passes an empty set and must mean
+        // exactly what it meant before.
+        let live = vec![side(999, OPEN, bar(50.0, 51.0, 49.0, 50.5))];
+        let cmp = compare_day_in_scope(
+            &live,
+            &[],
+            &std::collections::BTreeSet::new(),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            false,
+        );
+        assert_eq!(cmp.missing_rest, 1, "an empty scope filters nothing");
+    }
+
+    #[test]
+    fn the_scope_key_pairs_security_id_with_segment() {
+        // I-P1-11. The same numeric id in a different segment is a DIFFERENT
+        // instrument; matching on the id alone would admit one we never asked
+        // for and re-create the defect one instrument at a time.
+        let live = vec![side(13, OPEN, bar(100.0, 101.0, 99.0, 100.5))];
+        let cmp = compare_day_in_scope(
+            &live,
+            &[],
+            &scope_of(&[(13, "NSE_EQ")]), // same id, WRONG segment
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            false,
+        );
+        assert_eq!(
+            cmp.instruments, 0,
+            "id 13 in IDX_I is not id 13 in NSE_EQ — the pair is the key"
+        );
+    }
+
+    #[test]
+    fn the_measured_prod_shape_collapses_by_two_orders_of_magnitude() {
+        // The real numbers: ~8,144 live instruments, 865 targeted. Findings
+        // should follow the TARGETED set, not the carried one.
+        let mut live = Vec::new();
+        for id in 0..200_i64 {
+            live.push(side(id, OPEN, bar(100.0, 101.0, 99.0, 100.5)));
+        }
+        let scope = scope_of(&[(0, "IDX_I"), (1, "IDX_I"), (2, "IDX_I")]);
+        let cmp = compare_day_in_scope(&live, &[], &scope, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(
+            cmp.missing_rest, 3,
+            "3 targeted instruments produce 3 findings — not 200. That ratio \
+             is what took the buffer from 208 MB back under its ceiling"
         );
     }
 }
