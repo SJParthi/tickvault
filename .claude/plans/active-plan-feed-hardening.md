@@ -3051,3 +3051,101 @@ covered by the 30 s silence scan (`RISK-GAP-03`), which has paged since
 consults neither tick flow nor the feed registry, so 15 alive sockets receiving
 nothing still reads `healthy` there. The two surfaces had opposite defects and
 only one is fixed here.
+
+---
+
+## Item 30 — the offload left a 5-second blocking HTTP call on the drain
+
+### Design
+
+`flush_and_record` early-returns `ingest.flush()` **bare** when the tick writer
+has been offloaded, on a comment reading *"the flush is a bounded-queue hand-off
+with no network in it, so there is nothing to move off-worker"*.
+
+That is true of the tick writer and false of the callee. `LiveIngest::flush`
+flushes the inline-depth sink FIRST and unconditionally, above its own
+`pending_rows == 0` early return — its body says so and explains why — and
+`DepthIngest::flush` is a blocking ILP-over-HTTP round trip bounded by the
+conf-pinned `request_timeout=5000`.
+
+So the offload, landed on 2026-08-25 precisely to get blocking HTTP off the
+drain task, left blocking HTTP on the drain task, on the **only path production
+takes**: the boot site calls `spawn_offload_writer` and `with_inline_depth` on
+the same builder chain, so both halves are live on every real run and this early
+return was reached on every flush.
+
+**Fix:** wrap it. `return blocking_flush(|| ingest.flush());`
+
+Wrapped unconditionally rather than gated on "is there depth pending": a gate
+needs a second accessor kept in step with what `LiveIngest::flush` actually
+does, and keeping those two pieces of knowledge in separate places is what
+produced this bug. The cost of being wrong the cheap way is one worker swap at
+~5 flushes/sec; the cost of being wrong the other way is a 5-second worker pin.
+
+### Edge cases
+
+- **Current-thread runtime** — `block_in_place` panics there, which is why
+  `blocking_flush` guards on `runtime_flavor()`. This module's drain tests are
+  bare `#[tokio::test]`. Unchanged by this item; the helper already handled it.
+- **Depth buffer empty** — the wrap still happens. Deliberate, see above.
+- **Non-offloaded fallback** — already wrapped; untouched.
+- **Flush failure** — unchanged. `LiveIngest::flush` counts and logs the
+  inline-depth failure and does not propagate it, so the tick flush is never
+  skipped because the depth writer had a bad moment.
+
+### Failure modes
+
+The mechanism is the one `blocking_flush`'s own docs describe, and it is not
+"the flush is slow": a stalled QuestDB pins a tokio worker for up to 5 s; on a
+low-worker host that is a large fraction of the runtime; the WS read loops
+sharing that worker stop pumping pongs and the socket is dropped; the drain
+stops draining and the ring fills. A third-party database stall becomes tick
+loss plus a disconnect.
+
+### Test plan
+
+Two tests, and the split is the point.
+
+1. `test_drain_never_flushes_bare_on_the_async_worker` (source scan) — the
+   `offloaded` count is inverted from 1 to **0**, and a new assertion requires
+   `return blocking_flush(|| ingest.flush());` to still EXIST so that deleting
+   the offload branch entirely also fails. The `wrapped` equality moves 1 → 2:
+   both arms of the one helper now wrap. Bite-proven — restoring the bare
+   return fails it by name.
+2. `the_offloaded_path_still_flushes_the_inline_depth_sink` (behavioural, NEW) —
+   builds an offloaded `LiveIngest` with an inline-depth sink holding 10 rows
+   and zero tick rows, flushes, and asserts the depth sink's `dropped_rows`
+   reached 10. `DepthWriter::for_test` has no sender, so a discard is proof the
+   flush was attempted.
+
+   Bite-proven by moving the inline-depth flush BELOW the `pending_rows == 0`
+   early return: **every source scan still passed and only this test failed.**
+   That is the whole reason it exists — the defect was in a *claim about
+   behaviour*, and a text match cannot check a claim.
+
+### Rollback
+
+Revert the one-line wrap plus the two guard edits. The bare form is what
+shipped before; reverting restores a known (bad) state, not an unknown one.
+
+### Observability
+
+None added, deliberately. There is no metric that distinguishes "the drain is
+blocked in HTTP" from "the drain has nothing to do" — both look like an idle
+task. The existing signals already cover the consequences: ring-full refusals,
+`tv_ticks_dropped_total`, the WAL drop counter revived in Item 25, and the
+depth flush-failure counter. Adding a fourth that fires only in the same
+window would be noise.
+
+### Honest envelope
+
+Removes ONE blocking call from ONE task. It does not make the flush faster, does
+not reduce the ~94:1 write amplification, and does not stop QuestDB stalling —
+it stops a QuestDB stall from also costing ticks and a socket. `flush_depth`
+(the dedicated depth pools) was already wrapped and is unchanged.
+
+**The reusable lesson, recorded because it outlives the fix:** the source-scan
+guard DID hold the line it was built to hold, and was then walked around by an
+exception written in good faith from an incomplete reading of the callee. A
+guard is only as strong as the claim its exception rests on, and this one rested
+on a claim nobody re-derived from `LiveIngest::flush`.

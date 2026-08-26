@@ -3116,16 +3116,45 @@ fn flush_and_record(
     ingest: &mut LiveIngest,
     feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
 ) -> u64 {
-    // OFFLOADED: the flush is a bounded-queue hand-off with no network in it,
-    // so there is nothing to move off-worker and — more importantly — nothing
-    // to report health from. `rows` here means rows HANDED OFF, and health is
-    // defined three paragraphs up as rows FLUSHED. Recording on hand-off would
-    // forge liveness for exactly as long as the database was unreachable: the
-    // queue accepts batches, the sink fails every write, and the one signal an
-    // operator checks reads green. The writer thread records instead, from the
-    // rows that actually landed — see `LiveIngest::spawn_offload_writer`.
+    // OFFLOADED: health is NOT recorded here. `rows` on this path means rows
+    // HANDED OFF, and health is defined three paragraphs up as rows FLUSHED.
+    // Recording on hand-off would forge liveness for exactly as long as the
+    // database was unreachable: the queue accepts batches, the sink fails
+    // every write, and the one signal an operator checks reads green. The
+    // writer thread records instead, from the rows that actually landed —
+    // see `LiveIngest::spawn_offload_writer`.
+    //
+    // CORRECTED 2026-08-26 — the sentence that opened this comment used to
+    // read "the flush is a bounded-queue hand-off with no network in it, so
+    // there is nothing to move off-worker", and it returned `ingest.flush()`
+    // BARE on the strength of that. It was half true and the half it missed
+    // is the one with the network in it: `LiveIngest::flush` flushes the
+    // inline-depth sink FIRST and unconditionally (see its own body, which
+    // says so and explains why it sits above the early return), and
+    // `DepthIngest::flush` is a blocking ILP-over-HTTP round trip bounded by
+    // the conf-pinned `request_timeout=5000`.
+    //
+    // So the offload — landed precisely to get blocking HTTP off this task —
+    // left a blocking HTTP call on this task, on the ONLY path production
+    // takes. Production enables both halves: `spawn_offload_writer` at boot
+    // and `with_inline_depth` on the same builder chain, so
+    // `writer_is_offloaded()` is true and `inline_depth` is `Some` on every
+    // real run, and this early return was reached every flush.
+    //
+    // The consequence is the mechanism `blocking_flush`'s own docs describe:
+    // a stalled QuestDB pins a tokio worker for up to 5 s, the WS read loops
+    // sharing that worker stop pumping pongs, the drain stops draining, and
+    // the ring fills. It is not merely slow — it is a tick-loss and
+    // disconnect path, which is the whole reason the helper exists.
+    //
+    // Wrapped UNCONDITIONALLY rather than gated on "is there depth pending":
+    // a gate needs a second accessor that must be kept in step with what
+    // `LiveIngest::flush` actually does, and the last time these two pieces
+    // of knowledge were kept in separate places is what produced this bug.
+    // The cost of being wrong the cheap way is one worker swap at ~5 flushes
+    // per second; the cost of being wrong the other way is this comment.
     if ingest.writer_is_offloaded() {
-        return ingest.flush();
+        return blocking_flush(|| ingest.flush());
     }
     let rows = blocking_flush(|| ingest.flush());
     feed_health.record_ticks(
@@ -11815,40 +11844,58 @@ mod tests {
         // adding a further flush site without the helper fails here rather
         // than in prod.
         //
-        // 2026-08-25 — one exception now exists, and it is the opposite of the
-        // defect this test was written for. When the writer has been SPLIT
-        // (`LiveIngest::spawn_offload_writer`), `ingest.flush()` performs no
-        // network I/O at all: it hands the ILP buffer to a bounded queue that
-        // a dedicated OS thread drains. Wrapping THAT in `block_in_place`
-        // would ask the runtime to spin up a replacement worker for a
-        // `try_send`, which is pure cost for no benefit.
+        // 2026-08-25 — an exception was carved for the offloaded early return,
+        // on the reasoning that when the writer has been SPLIT
+        // (`LiveIngest::spawn_offload_writer`) `ingest.flush()` performs no
+        // network I/O: it hands the ILP buffer to a bounded queue that a
+        // dedicated OS thread drains, so wrapping THAT in `block_in_place`
+        // would spin up a replacement worker for a `try_send`.
         //
-        // So the exception is counted EXPLICITLY rather than by loosening the
-        // equality. `bare == wrapped` would have been the tempting edit and it
-        // is the wrong one: it stops noticing a genuinely bare blocking flush,
-        // which is the entire point of the test. Instead the offloaded form is
-        // recognised by its own literal, and anything that is neither wrapped
-        // nor that literal still fails.
+        // 2026-08-26 — THE EXCEPTION IS WITHDRAWN, because the reasoning was
+        // wrong about what `LiveIngest::flush` does. It flushes the
+        // inline-depth sink FIRST and unconditionally, above its own
+        // `pending_rows == 0` early return, and `DepthIngest::flush` IS a
+        // blocking ILP-over-HTTP round trip (`request_timeout=5000`). So the
+        // carve-out did not exempt a queue hand-off — it exempted a 5-second
+        // blocking HTTP call, on the ONLY path production takes, inside the
+        // very test written to stop exactly that.
+        //
+        // This is worth more than the fix: the test DID hold the line it was
+        // built to hold, and was then walked around by an exception written in
+        // good faith from an incomplete reading of the callee. A guard is only
+        // as strong as the claim its exception rests on, and this one rested
+        // on a claim nobody re-derived from `LiveIngest::flush`.
+        //
+        // The invariant is therefore back to its original, unexceptional form:
+        // EVERY production `ingest.flush()` is wrapped. `offloaded` is still
+        // counted — pinned at ZERO — rather than deleted, so re-introducing
+        // the bare early return fails here by name instead of quietly
+        // rebalancing the equality.
         let bare = production_half.matches("ingest.flush()").count();
         let wrapped = production_half
             .matches("blocking_flush(|| ingest.flush())")
             .count();
         let offloaded = production_half.matches("return ingest.flush();").count();
         assert_eq!(
-            offloaded, 1,
-            "expected exactly ONE non-blocking flush — the early return inside \
-             `flush_and_record` taken when the writer has been offloaded. Found \
-             {offloaded}: either the offload branch was deleted (the flush is \
-             back on the drain) or a second site started bypassing the helper"
+            offloaded, 0,
+            "found {offloaded} BARE offloaded flush(es). `LiveIngest::flush` \
+             flushes the inline-depth sink unconditionally and that is a \
+             blocking ILP-over-HTTP call — a bare `return ingest.flush();` puts \
+             it straight back on the async drain task, which is a tick-loss and \
+             disconnect path, not merely a slow one"
+        );
+        assert!(
+            production_half.contains("return blocking_flush(|| ingest.flush());"),
+            "the offloaded early return must still EXIST and must be wrapped — \
+             if it is gone entirely the writer split was deleted and the full \
+             flush is back on the drain"
         );
         assert_eq!(
             bare,
             wrapped + offloaded,
-            "every production ingest.flush() must be either wrapped in \
-             blocking_flush (the synchronous fallback) or the offloaded early \
-             return; found {bare} call(s), {wrapped} wrapped and {offloaded} \
-             offloaded — the difference is a blocking HTTP call sitting on the \
-             async drain task"
+            "every production ingest.flush() must be wrapped in blocking_flush; \
+             found {bare} call(s), {wrapped} wrapped and {offloaded} bare — the \
+             difference is a blocking HTTP call sitting on the async drain task"
         );
 
         // The offload must be WIRED, not merely available. Seven of the nine
@@ -11905,7 +11952,6 @@ mod tests {
              flush returns rows HANDED OFF, and recording those as feed health \
              forges liveness for exactly as long as the database is unreachable"
         );
-
         // 2026-08-18: the drain's three flush sites now route through
         // `flush_and_record`, which pairs the flush with the feed-health
         // report, so exactly ONE wrapped `ingest.flush()` remains — inside
@@ -11918,12 +11964,22 @@ mod tests {
         // separately below. Loosening `wrapped` alone would have been the
         // wrong edit — it would stop noticing a bare flush entirely — which is
         // why the equality above is kept and this pair replaces the count.
+        //
+        // 2026-08-26: TWO, not one. `flush_and_record` has two arms — the
+        // offloaded early return and the synchronous fallback — and BOTH now
+        // wrap, because the callee flushes the inline-depth sink over the
+        // network on either path. Both wrapped calls are still inside the one
+        // helper, so the choke-point property this assertion actually protects
+        // is unchanged; only the arm count moved. Kept as an exact equality
+        // rather than `>= 1` for the same reason it was exact before: a `>=`
+        // would stop noticing the helper being inlined back into the drain.
         assert_eq!(
-            wrapped, 1,
-            "expected exactly ONE wrapped ingest.flush() — the single one \
-             inside `flush_and_record`. Found {wrapped}: either a flush site \
-             bypassed the helper, or the helper was inlined back into the \
-             drain (which re-opens the four-sites-to-keep-in-sync problem)"
+            wrapped, 2,
+            "expected exactly TWO wrapped ingest.flush() calls — the offloaded \
+             early return and the synchronous fallback, both inside \
+             `flush_and_record`. Found {wrapped}: either a flush site bypassed \
+             the helper, or the helper was inlined back into the drain (which \
+             re-opens the four-sites-to-keep-in-sync problem)"
         );
         let recorded_sites = production_half
             .matches("flush_and_record(&mut ingest, &feed_health)")
@@ -14041,6 +14097,97 @@ mod inline_depth_tests {
         assert!(
             ingest.inline_depth.is_some(),
             "the sink must survive the flush for the next packet"
+        );
+    }
+
+    /// `LiveIngest::flush` flushes the inline-depth sink EVEN WHEN the tick
+    /// writer has been offloaded — which is the fact a source-scan exception
+    /// got wrong on 2026-08-25 and left a blocking HTTP call on the drain.
+    ///
+    /// The exception in `flush_and_record` read the offloaded path as "a
+    /// bounded-queue hand-off with no network in it" and returned
+    /// `ingest.flush()` bare on that basis. It was reasoning about the TICK
+    /// writer, which is true of it, and never re-derived what the callee also
+    /// does: the depth sink is flushed first, unconditionally, above the
+    /// `pending_rows == 0` early return, and `DepthIngest::flush` is a real
+    /// blocking ILP-over-HTTP round trip (`request_timeout=5000`).
+    ///
+    /// This is written as a BEHAVIOURAL test on purpose. The invariant is also
+    /// pinned by a source scan a few hundred lines up, but a source scan
+    /// asserts the shape of the code, and the defect here was in a CLAIM about
+    /// the code's behaviour — the exact thing a text match cannot check. If
+    /// someone ever "optimises" `LiveIngest::flush` by moving the inline-depth
+    /// flush below the early return, every source scan still passes and this
+    /// test is the only thing that notices.
+    ///
+    /// `DepthWriter::for_test` has no sender, so its flush discards and errors
+    /// — which is precisely the signal we want: `dropped_rows` rising is proof
+    /// the flush was ATTEMPTED, and nothing else in this path moves it.
+    #[test]
+    fn the_offloaded_path_still_flushes_the_inline_depth_sink() {
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 100.5,
+            ask_price: 100.75,
+        }; 5];
+        let appended = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            1_700_000_000_000_000_000,
+            0,
+            0,
+            counters(),
+        );
+        assert_eq!(appended, 10, "fixture must actually buffer depth rows");
+        assert_eq!(
+            sink.dropped_rows(),
+            0,
+            "nothing may have been discarded before the flush, or the \
+             assertion below proves nothing"
+        );
+
+        let mut ingest =
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8).with_inline_depth(sink);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(health)
+            .expect("offload writer must spawn");
+        assert!(
+            ingest.writer_is_offloaded(),
+            "this test is only meaningful on the OFFLOADED path — the one \
+             production takes and the one the withdrawn exception exempted"
+        );
+
+        // ZERO tick rows pending, so `LiveIngest::flush` returns 0 by its own
+        // early return. The depth sink must still have been flushed.
+        assert_eq!(ingest.flush(), 0, "no tick rows to cover");
+        let depth = ingest
+            .inline_depth
+            .as_ref()
+            .expect("the sink must survive the flush");
+        assert_eq!(
+            depth.dropped_rows(),
+            10,
+            "the inline-depth flush must run on the OFFLOADED path too. Zero \
+             here means `LiveIngest::flush` skipped the depth sink, and the \
+             `flush_and_record` fast path would then be free of network I/O — \
+             which is what the 2026-08-25 exception assumed and what left a \
+             5-second blocking HTTP call on the async drain task"
+        );
+        assert_eq!(
+            depth.pending_rows(),
+            0,
+            "a discarded buffer must not still read as pending"
         );
     }
 }
