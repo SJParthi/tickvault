@@ -296,6 +296,98 @@ fn error_code_liveness(root: &Path) -> (usize, usize, usize) {
 ///
 /// Walks with `std::fs` rather than shelling out to a search tool, so the
 /// report has no dependency on which binaries the host happens to carry.
+/// Counts LINES anywhere in the Rust sources containing any needle.
+///
+/// Deliberately substring-matching rather than line-start, unlike
+/// [`count_in_rust_sources`]: the things this is used for (`#[cfg(target_os`,
+/// a capped-map constant) appear mid-line as often as they start one, and a
+/// line-start scan would report a confident zero for a real occurrence --
+/// which is the false-OK this binary exists to refuse.
+fn count_substring_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
+    count_substring_scoped(root, needles, false)
+}
+
+/// As [`count_substring_in_rust_sources`], but `production_only` stops
+/// counting at each file's `mod tests`.
+///
+/// # Why this exists, and its honest limit
+///
+/// The first version of the "OS-conditional code" row reported **5 lines**
+/// and read as a common-runtime break. It was neither:
+///
+/// * **Two were this file counting itself.** The scanner's own needle literal
+///   is a line of Rust containing the needle. A report about false numbers
+///   producing one by self-reference is the sharpest possible version of the
+///   mistake, so the report's own path is excluded by name.
+/// * **The rest were `#[cfg(test)]` assertions** about macOS DNS resolving
+///   invalid hostnames differently from Linux. Production has no OS branch at
+///   all, which is the thing the row exists to check.
+///
+/// The cutoff is `mod tests`, which assumes this repo's convention of putting
+/// the test module last in a file. That is an APPROXIMATION: a `#[cfg(test)]`
+/// block placed above other code would be counted as production, and a
+/// production item below `mod tests` would be missed. Both are the safe
+/// direction for the first and the unsafe one for the second, so it is stated
+/// rather than presented as exact.
+fn count_substring_scoped(root: &Path, needles: &[&str], production_only: bool) -> usize {
+    fn walk(dir: &Path, needles: &[&str], production_only: bool, acc: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&path, needles, production_only, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                // This binary's own source names every needle it scans for.
+                // Counting itself would inflate every row it appears in.
+                if path.file_name().is_some_and(|n| n == "tv_guarantees.rs") {
+                    continue;
+                }
+                for line in text.lines() {
+                    let t = line.trim_start();
+                    if production_only && t.starts_with("mod tests") {
+                        break;
+                    }
+                    // A commented-out occurrence is prose, not code. Counting
+                    // it would let a deleted mechanism keep its number.
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    if needles.iter().any(|n| line.contains(n)) {
+                        *acc += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(root, needles, production_only, &mut acc);
+    acc
+}
+
+/// Distinct `[section]` headers in `config/base.toml`.
+///
+/// The count of surfaces an operator can retune WITHOUT a rebuild -- which is
+/// the only honest reading of "dynamic" for a compiled binary. It is a
+/// breadth measure, not a quality one: it says how much is reachable from
+/// config, never whether the right things are.
+fn config_sections(root: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(root.join("config/base.toml")) else {
+        return 0;
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('[') && l.ends_with(']') && !l.starts_with("[["))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 fn count_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
     fn walk(dir: &Path, needles: &[&str], acc: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1593,6 +1685,88 @@ fn main() {
     ];
 
     // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // 7. The operator's four words, measured rather than asserted
+    //
+    // `z-plus-defense-doctrine.md` sets a four-word test — common runtime,
+    // dynamic, scalable, incremental — and until now this report answered
+    // none of it. The four have been repeated across sessions as a
+    // requirement, and a requirement that nothing measures is a wish.
+    //
+    // Every row here is deliberately narrow. "Scalable" cannot be proven by
+    // a grep; what a grep CAN prove is that the structures which grow per
+    // instrument have a declared ceiling rather than growing until the host
+    // dies, which is the specific failure this repo has recorded five times.
+    // ---------------------------------------------------------------
+    let os_conditional = count_substring_scoped(Path::new("crates"), &["#[cfg(target_os"], true);
+    let compose_files = files
+        .iter()
+        .filter(|f| f.ends_with("docker-compose.yml"))
+        .count();
+    let tunable = config_sections(Path::new("."));
+    let capped = count_substring_in_rust_sources(
+        Path::new("crates"),
+        &[
+            "MAX_TRACKED_",
+            "MAX_INDICATOR_INSTRUMENTS",
+            "MAX_SPOT_BAR_SLOTS",
+            "AGGREGATOR_MAX_SLOTS",
+            "MAX_DAILY_UNIVERSE_SIZE",
+        ],
+    );
+    let host_derived = count_substring_in_rust_sources(Path::new("crates"), &["MemTotal"]);
+
+    let runtime = vec![
+        Row::new(
+            "Same container set, dev and prod",
+            if compose_files == 1 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{compose_files} compose"),
+            "one file describes both; a second would be two runtimes wearing one name",
+        ),
+        Row::new(
+            "OS-conditional code under crates/",
+            if os_conditional == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{os_conditional} lines"),
+            "PRODUCTION only — test-module OS branches are excluded; a Mac branch and a Linux branch in the runtime are two runtimes",
+        ),
+        Row::new(
+            "Retunable without a rebuild",
+            Verdict::Bounded,
+            format!("{tunable} sections"),
+            "config surfaces an operator can change and restart into; breadth, not quality",
+        ),
+        Row::new(
+            "Sizing derived from the host it runs on",
+            if host_derived > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{host_derived} refs"),
+            "RAM budget reads min(MemTotal, cgroup) -- not a constant pinned to one machine",
+        ),
+        Row::new(
+            "Per-entity growth has a declared ceiling",
+            Verdict::Bounded,
+            format!("{capped} refs"),
+            "fail-closed caps on the maps that grow per instrument; a ceiling, never O(1) space",
+        ),
+        Row::new(
+            "Incremental delivery",
+            Verdict::Bounded,
+            "operator",
+            "one PR at a time, each independently revertible -- a process fact, not a measured one",
+        ),
+    ];
+
     // Report
     // ---------------------------------------------------------------
     let sections: Vec<(&str, &[Row])> = vec![
@@ -1604,6 +1778,10 @@ fn main() {
         (
             "6. Data — stored, deduped, searchable, watched",
             &observability[..],
+        ),
+        (
+            "7. Common runtime, dynamic, scalable, incremental",
+            &runtime[..],
         ),
     ];
 
@@ -1635,6 +1813,13 @@ fn main() {
             &observability
         )
     );
+    print!(
+        "{}",
+        render(
+            "7. COMMON RUNTIME, DYNAMIC, SCALABLE, INCREMENTAL",
+            &runtime
+        )
+    );
 
     let all: Vec<Row> = lang
         .into_iter()
@@ -1643,6 +1828,7 @@ fn main() {
         .chain(testing)
         .chain(pinning)
         .chain(observability)
+        .chain(runtime)
         .collect();
     let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
     let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();
