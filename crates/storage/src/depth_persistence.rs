@@ -135,7 +135,6 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
-use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 
 /// The `market_depth` table name.
@@ -192,6 +191,49 @@ pub const DEPTH_SIDE_BID: &str = "bid";
 
 /// `side` SYMBOL value for the sell side (feed response code 51).
 pub const DEPTH_SIDE_ASK: &str = "ask";
+
+// COMPILE-TIME proof that every closed-set ILP label is already safe, so the
+// write paths can pass them through with ZERO runtime work.
+//
+// Adding a label with a comma, an equals sign, a control byte or a non-ASCII
+// character is a BUILD FAILURE here, not a malformed row discovered in
+// QuestDB. That is what makes it sound for `append_row` to skip the sanitiser
+// for these values — the check did not disappear, it moved to the compiler.
+const _: () = {
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_20
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_200
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_5
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_SIDE_BID
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_SIDE_ASK
+    ));
+    // EXHAUSTIVE over the whole byte space: whatever segment code the wire
+    // carries, its label is clean. Not a sample — all 256.
+    let mut code = 0u16;
+    while code <= u8::MAX as u16 {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            tickvault_common::segment::segment_code_to_str(code as u8)
+        ));
+        code += 1;
+    }
+    // Every feed label, from the enum's own exhaustive list.
+    let feeds = Feed::ALL;
+    let mut i = 0;
+    while i < feeds.len() {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            feeds[i].as_str()
+        ));
+        i += 1;
+    }
+};
 
 /// Timeout for the idempotent QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -730,25 +772,37 @@ impl DepthWriter {
     /// Appends one prepared [`DepthRow`] to the ILP buffer (no flush).
     ///
     /// ILP requires every SYMBOL before any field column, so the four symbols
-    /// are written first. All four come from closed `&'static str` sets, and
-    /// all four are still routed through `sanitize_ilp_symbol` as defence in
-    /// depth against line-protocol injection — the same discipline `ticks`
-    /// applies to its own closed sets.
+    /// are written first. All four come from closed `&'static str` sets whose
+    /// ILP-safety is proven at COMPILE TIME by the `const _` block near the top
+    /// of this file, so none of them is re-checked per row. See the note at the
+    /// call site for why that mattered.
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
         let feed = self.feed.as_str();
+        // Passed through WITHOUT `sanitize_ilp_symbol`, deliberately.
+        //
+        // All four are `&'static str` from CLOSED SETS, and the `const _` block
+        // near the top of this file proves at COMPILE TIME that every member of
+        // every one of those sets is already ILP-safe -- exhaustively, over all
+        // 256 segment codes and every `Feed::ALL` entry. The sanitiser returns
+        // `Cow::Borrowed` for clean input, so it allocated nothing and DHAT
+        // could not see it; what it DID do was walk the characters of the
+        // literal `"bid"` to re-derive an answer fixed when the constant was
+        // written -- four times per row, on a path this module's own header
+        // measures at ~1.53e9 rows per session. The check did not disappear; it
+        // moved to the compiler, which is principle 2 in its literal form.
         self.buffer
             .table(MARKET_DEPTH_TABLE)
             .context("table")?
-            .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
+            .symbol("segment", row.segment)
             .context("segment")?
-            .symbol("depth_kind", sanitize_ilp_symbol(row.depth_kind).as_ref())
+            .symbol("depth_kind", row.depth_kind)
             .context("depth_kind")?
-            .symbol("side", sanitize_ilp_symbol(row.side).as_ref())
+            .symbol("side", row.side)
             .context("side")?
-            .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
+            .symbol("feed", feed)
             .context("feed")?
             .column_i64("security_id", row.security_id)
             .context("security_id")?

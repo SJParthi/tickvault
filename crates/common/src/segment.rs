@@ -13,7 +13,7 @@ use crate::constants::{
 ///
 /// Uses the same mapping as the Dhan API (vendor SDK ref).
 /// Note: code 6 is unused/skipped in Dhan's protocol.
-pub fn segment_code_to_str(code: u8) -> &'static str {
+pub const fn segment_code_to_str(code: u8) -> &'static str {
     match code {
         EXCHANGE_SEGMENT_IDX_I => "IDX_I",
         EXCHANGE_SEGMENT_NSE_EQ => "NSE_EQ",

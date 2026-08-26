@@ -353,8 +353,10 @@ impl WalSuspensionTracker {
     /// `complete` is false when the parse skipped one or more malformed rows.
     /// A partial observation may ADD knowledge (a table it did see suspended
     /// is really suspended, so the rising edge still fires) but must never
-    /// SUBTRACT it: the falling edge is derived from ABSENCE, and a table
-    /// absent because its row failed to parse is not a table that recovered.
+    /// SUBTRACT it on SILENCE: the falling edge is derived from ABSENCE, and a
+    /// table absent because its row failed to parse is not a table that
+    /// recovered. A table that IS in `rows` saying `suspended: false` is a
+    /// first-hand recovery report and IS honoured, partial view or not.
     ///
     /// Before 2026-08-26 there was only the complete form, so a single
     /// malformed row for a latched table produced a false "recovered" `info!`,
@@ -372,15 +374,39 @@ impl WalSuspensionTracker {
         if complete {
             return delta;
         }
-        // Put back every name the partial view could not see. `observe` has
-        // already replaced the latch with what it saw, so the restore is a
-        // union of that with the names it reported as recovered.
+        // Restore ONLY the names this view could not SEE.
+        //
+        // `delta.recovered` mixes two different things: a table absent because
+        // its row failed to parse, and a table PRESENT in `rows` saying
+        // `suspended: false`. The second is a real, first-hand recovery report
+        // and must be honoured; the first is silence and must not be read as
+        // one.
+        //
+        // CORRECTED 2026-08-26, hours after the first version shipped: that
+        // version restored every name in `delta.recovered` without checking,
+        // so a table that explicitly reported HEALTHY on a partial poll was
+        // re-latched. With drift that makes every poll partial -- exactly the
+        // `AllRowsSkipped` shape this module already has a variant for -- the
+        // falling edge became unreachable and the gauge stuck above zero
+        // forever, turning the alarm into a permanent page for a healthy
+        // table. Strictly worse than the false recovery it replaced: a false
+        // alarm that can never clear trains an operator to ignore the one
+        // detector for silent WAL loss.
         for name in &delta.recovered {
-            self.suspended.insert(name.clone());
+            let seen_healthy = rows.iter().any(|r| &r.name == name);
+            if !seen_healthy {
+                self.suspended.insert(name.clone());
+            }
         }
+        let recovered: Vec<String> = delta
+            .recovered
+            .iter()
+            .filter(|name| rows.iter().any(|r| &r.name == *name))
+            .cloned()
+            .collect();
         WalSuspensionDelta {
             newly_suspended: delta.newly_suspended,
-            recovered: Vec::new(),
+            recovered,
             currently_suspended: self.suspended.len(),
         }
     }
@@ -413,6 +439,16 @@ pub const WAL_APPLY_LAG_MIN_TXN: i64 = 1_000;
 /// Consecutive polls of NON-DECREASING lag (above the floor) before the
 /// growing-lag signal fires. At the 60s poll interval this is five minutes.
 pub const WAL_APPLY_LAG_GROWING_POLLS: u32 = 5;
+
+/// Hard ceiling on distinct table names the lag tracker will follow.
+///
+/// This product has ~41 QuestDB tables; 256 leaves an order of magnitude of
+/// room while making the map's memory a fixed, known quantity rather than a
+/// function of whatever strings the server returns.
+pub const MAX_LAG_TRACKED_TABLES: usize = 256;
+
+/// Refusal count for the power-of-two log throttle on the cap above.
+static LAG_REFUSED_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Consecutive failed probes before the watcher declares itself BLIND.
 ///
@@ -495,6 +531,34 @@ impl WalLagTracker {
                 continue;
             };
             let lag = seq.saturating_sub(writer);
+            // A CAP, because "bounded by the table count" is caller convention,
+            // not a bound — the exact wording class CLAUDE.md's own table
+            // records as insufficient for `oms/engine` and `order_runtime`.
+            // `row.name` is server-supplied, so a QuestDB that starts reporting
+            // per-partition or per-WAL-segment names would grow this map for
+            // the process lifetime with nothing to stop it.
+            //
+            // Refusal is the right shape here, unlike the position map: a table
+            // this tracker never admits simply has no lag verdict, which the
+            // `continue` above already treats as "no reading, never a
+            // fabricated zero". Nothing is lost that was ever held.
+            if !self.state.contains_key(&row.name) && self.state.len() >= MAX_LAG_TRACKED_TABLES {
+                metrics::counter!("tv_wal_lag_tracker_refused_total").increment(1);
+                let n = LAG_REFUSED_SEEN
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(1);
+                if n.is_power_of_two() {
+                    warn!(
+                        table = %row.name,
+                        tracked = self.state.len(),
+                        max = MAX_LAG_TRACKED_TABLES,
+                        occurrences = n,
+                        "WAL lag tracker is FULL — refusing a new table; it gets no \
+                         growing-lag verdict. Already-tracked tables are unaffected."
+                    );
+                }
+                continue;
+            }
             let entry = self.state.entry(row.name.clone()).or_insert(LagState {
                 last_lag: lag,
                 growing_polls: 0,
@@ -530,6 +594,14 @@ impl WalLagTracker {
 
     /// Tables currently latched as growing — exposed for tests and for the
     /// startup log line.
+    /// How many distinct tables the lag map currently holds. Exists so the
+    /// cap above is assertable — a ceiling nothing can observe is a promise,
+    /// not a bound.
+    #[must_use]
+    pub fn tracked_len(&self) -> usize {
+        self.state.len()
+    }
+
     #[must_use]
     pub fn reported_count(&self) -> usize {
         self.state.values().filter(|s| s.reported).count()
@@ -1366,6 +1438,85 @@ mod tests {
         }
     }
 
+    /// BITE (2026-08-26, second round): a table that SAYS it is healthy on a
+    /// partial poll must be believed.
+    ///
+    /// The first version of `observe_with_completeness` restored every name in
+    /// `delta.recovered` without asking whether the table had actually been
+    /// ABSENT. So a table present in `rows` with `suspended: false` — a
+    /// first-hand recovery report — was re-latched. With drift that makes every
+    /// poll partial (the `AllRowsSkipped` shape this module already has a
+    /// variant for), the falling edge became unreachable and the gauge stuck
+    /// above zero forever: a permanent page for a healthy table, which is
+    /// strictly worse than the false recovery it replaced.
+    #[test]
+    fn a_partial_view_still_believes_a_table_that_reports_itself_healthy() {
+        let mut t = WalSuspensionTracker::new();
+        t.observe(&[row("ticks", true), row("market_depth", true)]);
+        assert_eq!(t.currently_suspended(), 2);
+
+        // Partial poll: `ticks` is PRESENT and says healthy; `market_depth`'s
+        // row failed to parse and is simply absent.
+        let d = t.observe_with_completeness(&[row("ticks", false)], false);
+        assert_eq!(
+            d.recovered,
+            vec!["ticks".to_string()],
+            "a table that reported itself healthy recovered, partial view or not"
+        );
+        assert_eq!(
+            d.currently_suspended, 1,
+            "only the table the view could not SEE stays latched"
+        );
+        assert_eq!(t.currently_suspended(), 1);
+    }
+
+    /// And the leak: permanent drift must not make the latch permanent.
+    #[test]
+    fn persistent_drift_does_not_strand_a_healthy_table_in_the_latch_forever() {
+        let mut t = WalSuspensionTracker::new();
+        t.observe(&[row("ticks", true)]);
+        assert_eq!(t.currently_suspended(), 1);
+        // 500 consecutive PARTIAL polls, every one of them reporting `ticks`
+        // healthy. The gauge must reach zero and stay there.
+        for i in 0..500 {
+            let d = t.observe_with_completeness(&[row("ticks", false)], false);
+            assert_eq!(
+                d.currently_suspended, 0,
+                "poll {i}: ticks reported healthy and must not be re-latched"
+            );
+        }
+        assert_eq!(t.currently_suspended(), 0);
+    }
+
+    /// The lag map's own doc claimed it was "bounded by the table count
+    /// (~30 in this product)" — caller convention, not a bound. `row.name` is
+    /// server-supplied, so a QuestDB that starts reporting per-partition names
+    /// would grow it for the process lifetime.
+    #[test]
+    fn the_lag_tracker_refuses_a_new_table_past_its_ceiling() {
+        let mut t = WalLagTracker::new();
+        // Fill to the ceiling.
+        let rows: Vec<WalTableRow> = (0..MAX_LAG_TRACKED_TABLES)
+            .map(|i| lag_row(&format!("t{i}"), 100, 100))
+            .collect();
+        t.observe(&rows);
+        assert_eq!(t.tracked_len(), MAX_LAG_TRACKED_TABLES);
+        // One more distinct name is REFUSED, not admitted.
+        t.observe(&[lag_row("one_too_many", 100, 100)]);
+        assert_eq!(
+            t.tracked_len(),
+            MAX_LAG_TRACKED_TABLES,
+            "past the ceiling a NEW table is refused; the map is a fixed size"
+        );
+        // An ALREADY-tracked table keeps working — refusal must not blind the
+        // detector to what it was already watching.
+        let fired = t.observe(&[lag_row("t0", 500_000, 100)]);
+        assert!(
+            fired.is_empty(),
+            "one poll is not yet the growing condition"
+        );
+        assert_eq!(t.tracked_len(), MAX_LAG_TRACKED_TABLES);
+    }
     /// BITE (2026-08-26): a PARTIAL view must never report a recovery.
     ///
     /// The falling edge is derived from ABSENCE, and `parse_wal_tables_response`

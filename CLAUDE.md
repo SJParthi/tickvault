@@ -175,6 +175,19 @@ crates/
 > the paths. Rows below are the real modules; descriptions are taken from each module's own
 > `//!` header. Ratcheted by
 > `crates/common/tests/claude_md_codebase_map_guard.rs`.>
+>
+> **⚠ CORRECTED 2026-08-26 — two of the seven names above are BACK, and this row
+> has been asserting they "do not exist" while they are the two largest writers
+> in the process.** `crates/storage/src/tick_persistence.rs` (143,733 bytes) and
+> `crates/storage/src/depth_persistence.rs` (72,468 bytes, the `deep_depth`
+> class under a shorter name) both returned with the 2026-08-09 Dhan live-WS
+> revival and the 2026-08-15 depth-capture authorization. The depth module's own
+> header measures **1,530,651,649 rows per session against 64,349,753 ticks —
+> 24x the tick volume and the largest payload in the process.** This is the
+> `day_ohlc_tracker` failure inverted: that row was stale in the alarming
+> direction and manufactured a false finding, this one is stale in the
+> REASSURING direction and would tell the next reader that depth has no writer.
+> Rows added below.
 > **Corrected 2026-08-21 (the Groww feed removal):** this table carried a row for
 > `brutex_crossverify_persistence.rs` / `spot_crossverify_persistence.rs`,
 > "Cross-verification audit tables". Both are DELETED. Each was a cross-BROKER
@@ -216,6 +229,8 @@ crates/
 | `index_constituency_persistence.rs` | `index_constituency` table (SEBI point-in-time) |
 | `lifecycle_reconciler.rs` | Pure `classify_transition` — lifecycle state-transition classification |
 | `disk_health_watcher.rs` / `oom_monitor.rs` / `resource_monitor.rs` / `wal_suspension_watcher.rs` | Host + QuestDB resource watchdogs |
+| `tick_persistence.rs` | `ticks` ILP append + flush, the tick spill/replay tier. RE-ADDED 2026-08-26 to this table; live since the 2026-08-09 revival |
+| `depth_persistence.rs` | `market_depth` ILP append + flush, the depth spill tier. RE-ADDED 2026-08-26; ~24x the tick row volume and the largest payload in the process |
 | `boot_probe.rs` / `http_client.rs` | Boot-time QuestDB probe + shared HTTP client |
 
 ### crates/api — HTTP Server (12 routes)
