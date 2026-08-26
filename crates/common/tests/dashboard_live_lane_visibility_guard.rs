@@ -69,9 +69,15 @@ const DELIBERATELY_NOT_CHARTED: &[(&str, &str)] = &[
          REJECTs without a dated row in THAT file first. Charting it here \
          would be the better half of the fix and is a one-widget follow-up; \
          listing it keeps the gap WRITTEN DOWN in the meantime, which is the \
-         entire point of this list. It carries an `outcome` label whose \
-         `refused` and `dropped` values answer 'did a depth level that \
-         arrived fail to reach the table' — the two worth a chart first.",
+         entire point of this list. SHARPENED 2026-08-26: charting it is NOT \
+         a one-widget follow-up. EMF folds its labels by summing, and its \
+         arms are `rows` (the success path, large) plus `refused`, `dropped`, \
+         `shed_inline`, `shed_dedicated`, `disconnects`, `length_mismatch` \
+         and `truncated` (failures, expected zero). A folded line is therefore \
+         dominated by successes and could not show a failure spike at all, so \
+         a plain chart would close this entry while creating the exact false \
+         comfort the entry exists to prevent. Splitting it needs per-outcome \
+         metric NAMES, which is its own change.",
     ),
     (
         "tv_dhan_ws_lag_excluded_total",
@@ -123,7 +129,7 @@ fn emf_selected_names(user_data: &str) -> Vec<String> {
 }
 
 #[test]
-fn every_published_live_lane_metric_is_visible_somewhere() {
+fn every_published_metric_is_visible_somewhere() {
     let selected = emf_selected_names(&read(USER_DATA));
     let dashboard = read(DASHBOARD);
 
@@ -156,13 +162,26 @@ fn every_published_live_lane_metric_is_visible_somewhere() {
          it was added to close"
     );
 
-    let lane_metrics: Vec<&String> = selected
-        .iter()
-        .filter(|n| n.starts_with("tv_dhan_"))
-        .collect();
-
+    // SCOPE WIDENED 2026-08-26 — was `.filter(|n| n.starts_with("tv_dhan_"))`.
+    //
+    // The rule this guard enforces ("a metric we PAY to ship must reach a
+    // human somewhere") was never specific to the lane, but the filter was.
+    // So the gate held for one prefix and drifted silently for the other
+    // eight: a sweep on 2026-08-26 found TEN shipped metrics that were on no
+    // dashboard and in no alarm — cadence fallbacks, a refused option mark, a
+    // degraded identity check, two candle-recovery counters, and two resource
+    // gauges. None of them could have failed this test, because none of them
+    // began with `tv_dhan_`.
+    //
+    // Two of the ten had a further sting: `dhan-rest-only-noise-lock` §2.3h
+    // records the candle-recovery pair as "charted so the mechanism is
+    // observable". They were not charted. A reader checking that claim by
+    // reading would have found it satisfied.
+    //
+    // Every selected name is now in scope. That is the whole change; the
+    // charted / alarmed / excused logic below is untouched.
     let mut invisible: Vec<String> = Vec::new();
-    for name in &lane_metrics {
+    for name in &selected {
         // A `"name"` occurrence in a `metrics = [...]` position is what puts a
         // line on a chart. A bare mention inside a `#` comment is not, so the
         // quoted form is the right thing to look for: comments in this file
@@ -196,16 +215,18 @@ fn every_published_live_lane_metric_is_visible_somewhere() {
             };
             squeezed == format!("metric_name = \"{name}\"")
         });
-        let excused = DELIBERATELY_NOT_CHARTED.iter().any(|(m, _)| m == *name);
+        let excused = DELIBERATELY_NOT_CHARTED
+            .iter()
+            .any(|(m, _)| *m == name.as_str());
 
         if !charted && !alarmed && !excused {
-            invisible.push((*name).clone());
+            invisible.push(name.clone());
         }
     }
 
     assert!(
         invisible.is_empty(),
-        "these live-lane metrics are PUBLISHED to CloudWatch (~$0.30/mo each) \
+        "these metrics are PUBLISHED to CloudWatch (~$0.30/mo each) \
          but appear on no dashboard and are in no alarm — money spent on \
          numbers nobody can see:\n  {}\n\nEither add a widget in {DASHBOARD}, \
          or add the name to DELIBERATELY_NOT_CHARTED in this file with a \
