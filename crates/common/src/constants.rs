@@ -3563,6 +3563,44 @@ const _: () = assert!(
     "MARKET_CLOSE_IST_NANOS must match TICK_PERSIST_END_SECS_OF_DAY_IST × 1e9"
 );
 
+// Compile-time consistency (2026-08-26): the tick PERSIST window must open
+// STRICTLY BEFORE the candle FOLD window. This is the one relationship in the
+// session-constant family that must be an INEQUALITY rather than an equality,
+// and that is exactly why it was the one nobody pinned — the close side above
+// is an equality pin and reads as though it covers the pair.
+//
+// It carries an operator requirement verbatim: "the entire websocket
+// connections should be fully started to receive the ticks starting from 9 am
+// pre market price and even market price starting 9.15 am also"
+// (2026-08-11, `websocket-connection-scope-lock.md`). The 09:00 pre-open
+// session is where NSE discovers the equilibrium price that BECOMES the 09:15
+// open — the operator has stated that requirement three separate times
+// (2026-08-25 twice, 2026-08-26) — so those ticks must reach `ticks`.
+//
+// The two windows are deliberately DIFFERENT, and both halves are load-bearing:
+//
+//   * `TICK_PERSIST_START` (09:00) opens the WRITER, so pre-open ticks are
+//     captured and queryable.
+//   * `MARKET_OPEN_IST_NANOS` (09:15) opens the FOLD, so those same ticks are
+//     NOT folded into candle HIGH/LOW/CLOSE. That carve-out is explicit in the
+//     2026-08-25 scope-lock section: "it authorizes the OPEN only".
+//
+// Collapsing them to one value looks like a tidy-up — 09:15 is *the* market
+// open and 09:00 reads as arbitrary — and it would silently end pre-open
+// capture. Nothing else would report it: the lane stays up, ticks flow from
+// 09:15, every loss counter reads zero, and the 15:41 cross-verification
+// compares in-session minutes only. The data would simply not be there.
+//
+// Today the gap is 900 s (09:00:00 -> 09:15:00). The assertion pins the
+// ORDERING, not the width, so a genuine NSE pre-open timing change stays a
+// one-line edit while zeroing the window stays a build failure.
+const _: () = assert!(
+    (TICK_PERSIST_START_SECS_OF_DAY_IST as i64) * 1_000_000_000 < MARKET_OPEN_IST_NANOS,
+    "the tick persist window must OPEN before the candle fold window — otherwise \
+     the 09:00-09:15 pre-open session is never written to `ticks` and the \
+     exchange's own equilibrium open has no captured prices behind it"
+);
+
 const _: () = assert!(
     MARKET_OPEN_IST_NANOS < MARKET_CLOSE_IST_NANOS,
     "Session open must be strictly before session close"
