@@ -3407,3 +3407,90 @@ Makes the loss COUNTABLE, not smaller. It does not recover a discarded tick and
 does not change which ticks are discarded — the amend/discard boundary is
 untouched. Nothing pages on it, so it is only visible to someone already
 looking at `/metrics`.
+
+---
+
+## Item 34 — we shipped the ring's denominator and withheld its numerator
+
+### Design
+
+The frame ring is bounded twice: by frame COUNT (65,536) and by BYTES
+(`RingByteBudget`). `tv_dhan_feed_ring_max_bytes` — the CAPACITY — has been
+EMF-selected since 2026-08-15. The OCCUPANCY was not published at all:
+`RingByteBudget::resident()` existed with call sites only in its own unit
+tests, the fifth instance in this lane of code that exists, is tested, and is
+never invoked.
+
+**Fix:** `tv_dhan_feed_ring_resident_pct` — worst of the two pools —
+published on the same 30 s tick as the dwell and deaf-socket gauges. Per-pool
+detail goes to an UNSELECTED name, so `/metrics` keeps the attribution and
+CloudWatch pays for one series.
+
+**Percent, not bytes.** The two budgets are sized 3:1, so raw bytes are not
+comparable between them and a raw gauge would be dominated by whichever pool
+is larger regardless of which is in trouble.
+
+**It pairs with the dwell gauge, and the pair is the diagnosis:**
+
+| dwell | fill | reading |
+|---|---|---|
+| flat | flat | healthy |
+| up | up | the drain cannot keep up |
+| flat | up | large frames, not a slow drain |
+| up | flat | slow drain on small frames |
+
+Neither number says that alone, which is why they are charted side by side.
+
+### Edge cases
+
+- **Zero capacity** — returns 0.0 rather than dividing. Unreachable in
+  production (both caps derive from a non-zero host figure), but a NaN on a
+  gauge is silently unchartable, and "the chart went blank" is worse than "the
+  chart read zero": blank looks like the app died and sends an operator to
+  diagnose the wrong thing mid-incident.
+- **Over capacity** — clamps to 100. `RingByteBudget` uses a CAS loop
+  specifically so `resident` cannot exceed `cap`, so this should be
+  unreachable; a gauge reading 340% would look like a unit bug and be
+  dismissed at the exact moment the ring is in trouble.
+- **Both pools idle** — reads 0, which is correct and not a stale value.
+
+### Failure modes
+
+**Reporting the average instead of the worst.** With main-feed at 1% and depth
+at 95% the average reads 48% — healthy-looking — while one pool is about to
+refuse frames. Bite-proven: `main_pct.max(depth_pct)` → `(a+b)/2.0` fails the
+wiring test.
+
+### Test plan
+
+`crates/app/tests/ring_fill_gauge_guard.rs`, 5 tests: empty/full/quarter, zero
+capacity is finite and zero, over-capacity clamps, worst-of-two surfaces, and
+the publish reads the LIVE budgets (publishing `cap()` as occupancy would give
+a permanently-100% chart that reads as a crisis and is a bug).
+
+### Rollback
+
+Delete the const, the helper, the three gauge writes, the selector entry and
+the widget.
+
+### Observability
+
+`tv_dhan_feed_ring_resident_pct` EMF-selected (82 names, +$0.30/mo) and charted
+as "Ring fill (% of byte budget, worst pool)" beside the dwell chart.
+`tv_dhan_feed_ring_resident_pct_by_pool{pool}` on `/metrics`, unselected.
+
+**NOT alarmed.** The ring already pages on the after-the-fact case
+(`tv_dhan_ws_ring_full_total`, `tv_dhan_ws_ring_bytes_full_total`), so the loss
+is covered today; this is its leading edge, and a leading-edge threshold needs
+a baseline that does not exist yet.
+
+**THREE names added today (~$0.90/mo) and that is the stopping point.** The
+maximal month already projects above the line where an AWS budget action stops
+the trading box. Everything else found today stays on `/metrics`.
+
+### Honest envelope
+
+Publishes a number that already existed, on a path that already ran. It does
+not enlarge the ring, speed the drain, or prevent a refusal. Sampling is the
+30 s tick, so a sub-30-second fill spike is invisible — the after-the-fact
+counters remain the only signal for that, and they page.

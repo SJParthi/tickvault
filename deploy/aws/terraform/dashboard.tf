@@ -556,6 +556,38 @@ resource "aws_cloudwatch_dashboard" "operator" {
       {
         type   = "metric"
         x      = 8
+        y      = 70
+        width  = 8
+        height = 6
+        properties = {
+          # The other half of the ring. Read this WITH the dwell chart, never
+          # alone — the pair is the diagnosis and neither number gives it:
+          #
+          #   both flat            -> healthy
+          #   both climbing        -> the drain cannot keep up
+          #   dwell flat, this up  -> large frames, not a slow drain
+          #   dwell up, this flat  -> the drain is slow on small frames
+          #
+          # Until 2026-08-26 CloudWatch had tv_dhan_feed_ring_max_bytes (the
+          # CAPACITY) and nothing for the occupancy — the denominator without
+          # the numerator. `RingByteBudget::resident()` existed the whole time
+          # with call sites only in its own unit tests.
+          #
+          # Percent rather than bytes because the two pools are sized 3:1, so
+          # raw bytes are not comparable and the larger pool would dominate the
+          # chart regardless of which one is in trouble.
+          title  = "Ring fill (% of byte budget, worst pool)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_ring_resident_pct", { label = "worst pool", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
         y      = 64
         width  = 8
         height = 6

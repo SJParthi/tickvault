@@ -3810,6 +3810,26 @@ async fn run_frame_drain(
                     )
                     .map_or(-1.0, |secs| f64::from(u32::try_from(secs).unwrap_or(u32::MAX))),
                 );
+                // Ring OCCUPANCY, the companion to the dwell gauge above.
+                //
+                // Published here rather than in `publish_fold_depth` because
+                // the budgets live on the drain's own frame, not on the
+                // ingest, and threading them through that function's signature
+                // would touch four call sites to move two atomic loads.
+                //
+                // Per-pool detail is published unselected alongside the
+                // worst-of-two: labels are free on `/metrics` and cost a
+                // CloudWatch dimension each, so the pair that answers "is the
+                // ring filling?" ships and the pair that answers "which one?"
+                // stays local, where whoever is triaging is already looking.
+                let main_pct =
+                    budget_fill_pct(main_feed_budget.resident(), main_feed_budget.cap());
+                let depth_pct = budget_fill_pct(depth_budget.resident(), depth_budget.cap());
+                metrics::gauge!(RING_RESIDENT_PCT_GAUGE).set(main_pct.max(depth_pct));
+                metrics::gauge!("tv_dhan_feed_ring_resident_pct_by_pool", "pool" => "main_feed")
+                    .set(main_pct);
+                metrics::gauge!("tv_dhan_feed_ring_resident_pct_by_pool", "pool" => "depth")
+                    .set(depth_pct);
                 // Gauges publish unconditionally — a dashboard reading zero
                 // outside market hours is correct, and gating the gauge would
                 // make "no data" and "nothing wrong" indistinguishable.
@@ -4976,6 +4996,60 @@ pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
 /// from "all fresh" on the chart. A gauge that renders both as 0 is the
 /// false-OK shape this repo has retired repeatedly.
 pub const WORST_CONN_TICK_AGE_GAUGE: &str = "tv_dhan_ws_worst_conn_tick_age_secs";
+
+/// Gauge: how FULL the ring byte budget is, as a percentage, worst of the two
+/// pools.
+///
+/// # The half of the ring we were not publishing
+///
+/// The ring is bounded twice — by frame COUNT (65,536) and by BYTES
+/// (`RingByteBudget`). `tv_dhan_feed_ring_max_bytes` has been EMF-selected
+/// since 2026-08-15, so the CAPACITY reaches CloudWatch and the OCCUPANCY does
+/// not: we ship the denominator and withhold the numerator.
+/// `RingByteBudget::resident()` existed the whole time with call sites only in
+/// its own unit tests — the fifth instance in this lane of code that exists,
+/// is tested, and is never invoked.
+///
+/// # Percent, and worst-of-two
+///
+/// A percentage rather than raw bytes because the two budgets are sized
+/// differently (main-feed and depth split 3:1), so raw bytes are not
+/// comparable and a single raw gauge would be dominated by whichever pool is
+/// larger regardless of which is in trouble.
+///
+/// Worst-of-two rather than one gauge per pool for the reason the deaf-socket
+/// gauge is worst-of-sixteen: two dimensions cost twice one to answer a
+/// question one answers, and per-pool detail stays on `/metrics` where whoever
+/// is triaging will already be looking.
+///
+/// # It pairs with the dwell gauge, and the pair is the diagnosis
+///
+/// Dwell says how far behind the drain is in TIME; this says how full the ring
+/// is in BYTES. Both climbing is a drain that cannot keep up. Dwell flat while
+/// this climbs is large frames rather than a slow drain — a different problem
+/// with a different fix. Neither number says that alone.
+pub const RING_RESIDENT_PCT_GAUGE: &str = "tv_dhan_feed_ring_resident_pct";
+
+/// Fill percentage of one budget, `0.0..=100.0`.
+///
+/// A zero-capacity budget reads 0.0 rather than dividing — that combination is
+/// unreachable in production (both caps are derived from a non-zero host
+/// figure) but a NaN reaching a gauge is silently unchartable, and "the chart
+/// went blank" is a worse failure than "the chart read zero".
+#[must_use]
+pub fn budget_fill_pct(resident: usize, cap: usize) -> f64 {
+    if cap == 0 {
+        return 0.0;
+    }
+    // `u32::try_from` then `f64::from`, lossless by construction — the house
+    // pattern, and the same reason `take_ring_dwell_max_ms` uses it. Ring
+    // budgets are gigabyte-scale at most, so the u32 ceiling of ~4.29e9 is
+    // never approached; saturating there would read as full, which is the
+    // safe direction for a saturation gauge.
+    let r = f64::from(u32::try_from(resident).unwrap_or(u32::MAX));
+    let c = f64::from(u32::try_from(cap).unwrap_or(u32::MAX));
+    (r / c * 100.0).min(100.0)
+}
 static WS_LAG_HANDLES: OnceLock<WsLagHandles> = OnceLock::new();
 
 fn ws_lag_handles() -> &'static WsLagHandles {

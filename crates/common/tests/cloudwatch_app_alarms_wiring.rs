@@ -867,10 +867,42 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the trading box. Adding a pager is a spending decision the operator
     // should take knowingly, not one an executor slips in. Charted now so the
     // signal exists the moment he says yes.
+    //
+    // 2026-08-26, PLUS 1 FINAL: tv_dhan_feed_ring_resident_pct (~$0.30/mo).
+    //
+    // How FULL the ring byte budget is, worst of the two pools. This one is
+    // not a new signal so much as the missing half of an existing one:
+    // tv_dhan_feed_ring_max_bytes -- the CAPACITY -- has been selected since
+    // 2026-08-15, so CloudWatch has had the denominator and not the numerator.
+    // `RingByteBudget::resident()` existed the whole time with call sites only
+    // in its own unit tests.
+    //
+    // A PERCENTAGE, because the two budgets are sized 3:1 and raw bytes are
+    // not comparable between them -- a raw gauge would be dominated by
+    // whichever pool is larger regardless of which is in trouble. Worst-of-two
+    // rather than one name per pool, for the same reason the deaf-socket gauge
+    // is worst-of-sixteen; per-pool detail is published under its own
+    // UNSELECTED name and stays on /metrics.
+    //
+    // It pairs with tv_dhan_feed_ring_dwell_max_ms and the PAIR is the
+    // diagnosis: both climbing is a drain that cannot keep up, dwell flat
+    // while this climbs is large frames rather than a slow drain -- a
+    // different problem with a different fix. Neither says that alone.
+    //
+    // NOT alarmed, same reasoning as the two above: the ring already has
+    // after-the-fact alarms on tv_dhan_ws_ring_full_total and
+    // tv_dhan_ws_ring_bytes_full_total, so the loss case pages today. This is
+    // the leading edge of it, and a leading-edge threshold needs a baseline
+    // that does not exist yet.
+    //
+    // THREE names added today (~$0.90/mo) and that is the stopping point. The
+    // maximal month already projects above the line where an AWS budget action
+    // stops the trading box; further names are a spending decision the
+    // operator takes knowingly. Everything else found today stays on /metrics.
     assert_eq!(
         names.len(),
-        81,
-        "Z+ L2 VERIFY ratchet: expected exactly 81 names in the MAIN EMF \
+        82,
+        "Z+ L2 VERIFY ratchet: expected exactly 82 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
