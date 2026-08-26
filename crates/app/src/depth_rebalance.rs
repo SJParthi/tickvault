@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 
 use tickvault_common::types::ExchangeSegment;
-use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+use tickvault_core::websocket::pool_supervisor::{LiveSubscriptionCommand, SubscribeInstrument};
 
 use crate::depth200_atm::{
     ChainMinute, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair, TopMoverPick,
@@ -524,6 +524,140 @@ pub fn plan_minute(
         Err(idle) => decision.top_mover_idle = Some(idle),
     }
     decision
+}
+
+/// One depth-200 connection the rebalance can steer.
+///
+/// The channel and what the connection currently holds, kept together because
+/// the two must never disagree: the guard replaces IN PLACE and refuses
+/// fail-closed if the old instrument is not on the connection, so a `held`
+/// that has drifted from the wire produces a swap that is refused every time
+/// and a socket that never moves again.
+pub struct RebalanceSocket {
+    /// Where a swap travels.
+    pub tx: tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+    /// What this connection holds. A depth-200 connection holds exactly one
+    /// instrument; `None` only before its first subscription.
+    pub held: Option<SubscribeInstrument>,
+}
+
+/// How often the rebalance looks — once a minute, offset past the boundary.
+///
+/// The offset is not politeness. A candle seals AT the boundary and the writer
+/// needs a moment to flush it, so a query fired at :00 reads the minute before
+/// last and the whole loop runs one minute behind the market for the entire
+/// session — a bug that would look exactly like normal operation.
+pub const REBALANCE_OFFSET_SECS: u64 = 8;
+
+/// The counter for swaps that actually reached a channel.
+pub const REBALANCE_SWAPS_SENT: &str = "tv_depth_rebalance_swaps_sent_total";
+
+/// The counter for swaps that could not be sent, by reason.
+pub const REBALANCE_SWAPS_REFUSED: &str = "tv_depth_rebalance_swaps_refused_total";
+
+/// Reasons a decided swap never reached the wire. Every one is COUNTED — a
+/// swap that is decided and then quietly dropped is the worst outcome
+/// available, because the socket stays on a stale contract while every log
+/// line says the rebalance is working.
+pub const REBALANCE_REFUSAL_REASONS: [&str; 3] = ["no_socket", "channel_full", "channel_closed"];
+
+/// Pre-register the counters so a session that never refuses anything still
+/// publishes a zero, rather than a gap an alarm cannot distinguish from a dead
+/// process.
+pub fn pre_register_rebalance_counters() {
+    metrics::counter!(REBALANCE_SWAPS_SENT).increment(0);
+    for reason in REBALANCE_REFUSAL_REASONS {
+        metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => reason).increment(0);
+    }
+}
+
+/// Sends one decided swap, updating what the socket is believed to hold.
+///
+/// # Why `try_send` and never `send().await`
+///
+/// This runs on its own task, but the channel's other end is the connection's
+/// read loop — the same task that drains frames. An `await` here on a full
+/// channel would apply backpressure to a socket whose job is to never fall
+/// behind, and Dhan skips a slow consumer forward to the latest available
+/// state with no sequence number for us to detect the loss. A full channel is
+/// a refusal, counted, and retried next minute; a stalled drain is tick loss.
+fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
+    let command = LiveSubscriptionCommand::Swap {
+        old: swap.old,
+        new: swap.new,
+    };
+    match socket.tx.try_send(command) {
+        Ok(()) => {
+            // Believed-held moves only on a SUCCESSFUL send. Moving it
+            // optimistically would leave the next minute's swap naming an old
+            // instrument the connection never received, and the guard would
+            // refuse it — one dropped message costing every future swap.
+            socket.held = Some(swap.new);
+            metrics::counter!(REBALANCE_SWAPS_SENT).increment(1);
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "channel_full").increment(1);
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                socket_index = swap.socket_index,
+                "depth rebalance: the command channel is full, so this minute's swap is \
+                 dropped rather than awaited. Awaiting would apply backpressure to the \
+                 frame drain, and a stalled drain is tick loss. Retried next minute."
+            );
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "channel_closed").increment(1);
+            tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                socket_index = swap.socket_index,
+                "depth rebalance: the command channel is CLOSED — this connection is gone \
+                 and its socket will never move again this session."
+            );
+            false
+        }
+    }
+}
+
+/// Applies one minute's decision to the sockets.
+///
+/// Returns how many swaps reached a channel. Split from [`plan_minute`] so the
+/// decision stays testable without a socket and the sending stays testable
+/// without a market.
+pub fn apply_decision(sockets: &mut [RebalanceSocket], decision: &RebalanceDecision) -> usize {
+    let mut sent = 0usize;
+    for swap in &decision.atm_swaps {
+        let Some(socket) = sockets.get_mut(swap.socket_index) else {
+            metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "no_socket").increment(1);
+            tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                socket_index = swap.socket_index,
+                sockets = sockets.len(),
+                "depth rebalance decided a swap for a socket that does not exist"
+            );
+            continue;
+        };
+        if send_swap(socket, swap) {
+            sent = sent.saturating_add(1);
+        }
+    }
+    if let Some(swap) = &decision.top_mover_swap {
+        match sockets.get_mut(swap.socket_index) {
+            Some(socket) => {
+                if send_swap(socket, swap) {
+                    sent = sent.saturating_add(1);
+                }
+            }
+            None => {
+                metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "no_socket").increment(1);
+            }
+        }
+    }
+    sent
 }
 #[cfg(test)]
 mod tests {
@@ -1292,5 +1426,204 @@ mod plan_minute_tests {
         );
         assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
         assert!(got.is_quiet());
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::depth200_atm::SwitchReason;
+
+    fn instrument(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment,
+        }
+    }
+
+    fn swap(socket_index: usize, old: u64, new: u64) -> PlannedSwap {
+        PlannedSwap {
+            socket_index,
+            old: instrument(old, ExchangeSegment::NseFno),
+            new: instrument(new, ExchangeSegment::NseFno),
+            reason: SwitchReason::SpotMoved,
+        }
+    }
+
+    fn socket(
+        capacity: usize,
+        held: u64,
+    ) -> (
+        RebalanceSocket,
+        tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        (
+            RebalanceSocket {
+                tx,
+                held: Some(instrument(held, ExchangeSegment::NseFno)),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn a_swap_reaches_its_own_socket_and_no_other() {
+        let (s0, mut r0) = socket(4, 1_000);
+        let (s1, mut r1) = socket(4, 2_000);
+        let mut sockets = vec![s0, s1];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(1, 2_000, 2_001)],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &decision), 1);
+        assert!(r0.try_recv().is_err(), "socket 0 must be untouched");
+        match r1.try_recv().expect("socket 1 receives") {
+            LiveSubscriptionCommand::Swap { old, new } => {
+                assert_eq!(old.security_id, 2_000);
+                assert_eq!(new.security_id, 2_001);
+            }
+            other => panic!("expected a swap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_send_advances_what_the_socket_is_believed_to_hold() {
+        let (s0, _r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        apply_decision(&mut sockets, &decision);
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_001, ExchangeSegment::NseFno))
+        );
+    }
+
+    #[test]
+    fn a_dropped_send_does_not_advance_the_believed_hold() {
+        // The failure this prevents is permanent, not transient: if `held`
+        // moved on a dropped message, every future swap would name an old
+        // instrument the connection never received, the guard would refuse
+        // each one fail-closed, and the socket would never move again.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let mut sockets = vec![RebalanceSocket {
+            tx,
+            held: Some(instrument(1_000, ExchangeSegment::NseFno)),
+        }];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &decision), 0);
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_000, ExchangeSegment::NseFno)),
+            "a swap that never reached the wire must not move the believed hold"
+        );
+    }
+
+    #[test]
+    fn a_full_channel_drops_this_minute_rather_than_blocking() {
+        // Awaiting here would apply backpressure to the frame drain, and a
+        // stalled drain is tick loss at Dhan's side with no sequence number to
+        // detect it. Dropping costs one stale minute.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(LiveSubscriptionCommand::Extend(vec![]))
+            .expect("fills the channel");
+        let mut sockets = vec![RebalanceSocket {
+            tx,
+            held: Some(instrument(1_000, ExchangeSegment::NseFno)),
+        }];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &decision), 0);
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_000, ExchangeSegment::NseFno))
+        );
+    }
+
+    #[test]
+    fn a_swap_for_a_socket_that_does_not_exist_is_counted_not_panicked() {
+        // The fifth socket is not dialed at attach — nothing exists to put on
+        // it before a leader emerges — so a top-mover swap can legitimately
+        // arrive with no socket to carry it.
+        let (s0, _r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision {
+            top_mover_swap: Some(swap(4, 9_000, 9_001)),
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &decision), 0);
+    }
+
+    #[test]
+    fn a_quiet_minute_sends_nothing() {
+        let (s0, mut r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision::default();
+        assert!(decision.is_quiet());
+        assert_eq!(apply_decision(&mut sockets, &decision), 0);
+        assert!(r0.try_recv().is_err());
+    }
+
+    #[test]
+    fn every_socket_in_a_multi_swap_minute_gets_exactly_its_own() {
+        let (s0, mut r0) = socket(4, 1_000);
+        let (s1, mut r1) = socket(4, 2_000);
+        let (s2, mut r2) = socket(4, 3_000);
+        let (s3, mut r3) = socket(4, 4_000);
+        let mut sockets = vec![s0, s1, s2, s3];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![
+                swap(0, 1_000, 1_001),
+                swap(1, 2_000, 2_001),
+                swap(2, 3_000, 3_001),
+                swap(3, 4_000, 4_001),
+            ],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &decision), 4);
+        for (rx, expected) in [
+            (&mut r0, 1_001_u64),
+            (&mut r1, 2_001),
+            (&mut r2, 3_001),
+            (&mut r3, 4_001),
+        ] {
+            match rx.try_recv().expect("one command") {
+                LiveSubscriptionCommand::Swap { new, .. } => {
+                    assert_eq!(new.security_id, expected);
+                }
+                other => panic!("expected a swap, got {other:?}"),
+            }
+            assert!(rx.try_recv().is_err(), "exactly one command per socket");
+        }
+    }
+
+    #[test]
+    fn the_offset_clears_the_boundary_the_writer_needs() {
+        // A query fired at :00 reads the minute before last, because the
+        // candle seals AT the boundary and the writer has not flushed yet.
+        // The whole loop would then run a minute behind the market all
+        // session, looking exactly like normal operation.
+        assert!(REBALANCE_OFFSET_SECS > 0);
+        assert!(REBALANCE_OFFSET_SECS < 60);
+    }
+
+    #[test]
+    fn every_refusal_reason_is_a_registered_label() {
+        // A reason string that is not in the list is a counter nothing
+        // pre-registers, so its series appears only after the first failure —
+        // and an absent series is indistinguishable from a dead process.
+        assert!(REBALANCE_REFUSAL_REASONS.contains(&"no_socket"));
+        assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_full"));
+        assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_closed"));
+        pre_register_rebalance_counters();
     }
 }

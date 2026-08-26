@@ -909,12 +909,55 @@ pub fn ymd_to_epoch_micros(ymd: u32) -> Option<i64> {
 /// # Errors
 ///
 /// None — every failure degrades to `None` and is logged with its reason.
-// TEST-EXEMPT: async composition of read_contract_artifact + fetch_spot_prices + depth_candidates_from_master + select_depth_universe, each separately tested.
+// TEST-EXEMPT: async composition of load_depth_candidates + select_depth_universe, each separately tested.
 pub async fn load_depth_universe_from_master(
     questdb: &tickvault_common::config::QuestDbConfig,
     date_ist: &str,
     today_ymd: u32,
 ) -> Option<DepthSelection> {
+    let candidates = load_depth_candidates(questdb, date_ist, today_ymd).await;
+    if candidates.is_empty() {
+        return None;
+    }
+    let selection = select_depth_universe(&candidates);
+    if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        source = "contract_artifact",
+        candidates = candidates.len(),
+        depth_20 = selection.depth_20.len(),
+        depth_200 = selection.depth_200.len(),
+        "depth universe resolved from the daily artifact — no wait for the 09:16 chain"
+    );
+    Some(selection)
+}
+
+/// The candidate slice the depth selector consumes, resolved from the daily
+/// contract artifact plus live spot prices.
+///
+/// # Why this is its own function
+///
+/// The per-minute rebalance ([`crate::depth_rebalance`]) needs the SAME slice
+/// the attach selected from. Otherwise the strikes it reasons about could
+/// drift from the strikes actually subscribed, and a socket would move onto a
+/// contract the selector never considered — a well-formed subscription to the
+/// wrong instrument, which nothing downstream could tell apart from the right
+/// one. Extracting it is what makes "one path" a fact rather than a comment.
+///
+/// # Returns an empty slice on every failure
+///
+/// An unreadable artifact, no underlying priced yet, or a master with no
+/// usable options all produce an empty `Vec`, each logged with its reason.
+/// Empty is the honest answer here: the rebalance's response to "we could not
+/// tell" is to keep what it has, which is the same as its response to
+/// "nothing changed", so the two need not be distinguished by this layer.
+// TEST-EXEMPT: async composition of read_contract_artifact + fetch_spot_prices + parse_symbol_map + depth_candidates_from_master, each separately tested.
+pub async fn load_depth_candidates(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    today_ymd: u32,
+) -> Vec<DepthCandidate> {
     let rows = match crate::dhan_contract_universe::read_contract_artifact(date_ist) {
         Ok(r) => r,
         Err(err) => {
@@ -924,7 +967,7 @@ pub async fn load_depth_universe_from_master(
                 "depth: contract artifact unreadable, falling back to the option chain \
                  (which cannot publish before 09:16 IST)"
             );
-            return None;
+            return Vec::new();
         }
     };
     let prices = crate::dhan_contract_universe::fetch_spot_prices(questdb, {
@@ -945,25 +988,15 @@ pub async fn load_depth_universe_from_master(
         // Pre-open has not settled yet (or the feed is not delivering). This
         // is the NORMAL state before ~09:08 and must not be an error.
         tracing::debug!("depth: no underlying priced yet — nothing to centre a window on");
-        return None;
+        return Vec::new();
     }
     let candidates = depth_candidates_from_master(&rows, &spot, today_ymd);
-    if candidates.is_empty() {
-        return None;
-    }
-    let selection = select_depth_universe(&candidates);
-    if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
-        return None;
-    }
-    tracing::info!(
-        source = "contract_artifact",
+    tracing::debug!(
         priced_underlyings = spot.len(),
         candidates = candidates.len(),
-        depth_20 = selection.depth_20.len(),
-        depth_200 = selection.depth_200.len(),
-        "depth universe resolved from the daily artifact — no wait for the 09:16 chain"
+        "depth candidates resolved from the daily artifact"
     );
-    Some(selection)
+    candidates
 }
 
 /// Counter: a depth-universe resolution that ended with ZERO sockets.
