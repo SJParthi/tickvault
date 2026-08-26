@@ -5845,31 +5845,90 @@ async fn attach_depth_when_available(
         // exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it afterwards would
         // need the pool a second time, which one task cannot hold twice.
         let mut selection = selection;
-        if !depth_done
-            && selection.depth_200.len() == crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS
-        {
-            if let Some(fifth) = crate::depth_rebalance::top_mover_instrument(
+        if !depth_done {
+            // ONE load for both halves. Two loads a few seconds apart can
+            // disagree, and a disagreement here fills the movers sockets from
+            // one moment's ranking while the fifth depth-200 socket is chosen
+            // from another's.
+            let inputs = crate::depth_rebalance::load_attach_inputs(
                 &questdb,
                 &today_date,
                 ymd_from_ist_date(&today_date),
                 today_nanos / 1_000,
             )
-            .await
-            {
-                selection.depth_200.push(fifth);
+            .await;
+
+            // ---- depth-20: the operator's layout, when it can be built ----
+            //
+            // The adaptive selection stays as the FALLBACK, and that ordering
+            // is deliberate. Before the chain publishes, the layout has no
+            // strikes to centre on and returns nothing; overwriting a working
+            // selection with an empty one would trade "the wrong 250" for
+            // "no depth at all", which is strictly worse. So the layout is
+            // taken only when it actually produced instruments.
+            let layout =
+                crate::depth20_layout::build_depth20_layout(&inputs.candidates, &inputs.movers);
+            if layout.instrument_count() > 0 {
+                let flattened = layout.flattened();
                 info!(
-                    security_id = fifth.security_id,
-                    "depth-200: the fifth socket takes the day's biggest mover"
+                    instruments = flattened.len(),
+                    sockets = layout.sockets.len(),
+                    index_unresolved = layout.index_underlyings_unresolved.len(),
+                    movers_unresolved = layout.movers_unresolved,
+                    gainers = layout.ranking.gainers.len(),
+                    losers = layout.ranking.losers.len(),
+                    "depth-20: using the operator layout — index windows plus today's movers"
                 );
+                selection.depth_20 = flattened;
             } else {
-                // Normal before the open and on a flat morning: no stock has a
-                // measurable move yet, so there is nothing to put on it. The
-                // retry loop asks again; if the whole session stays flat the
-                // socket simply goes unused, which is honest.
+                // Normal before ~09:16, when no chain has published yet.
                 tracing::debug!(
-                    "depth-200: no leading mover yet — the fifth socket stays undialed this \
-                     attempt"
+                    adaptive_instruments = selection.depth_20.len(),
+                    "depth-20: the operator layout has nothing to build from yet — keeping \
+                     the adaptive selection for this attempt"
                 );
+            }
+
+            // ---- depth-200: the fifth socket ----
+            //
+            // Appended BEFORE planning, not dialed separately, because
+            // `plan_pool` assigns instruments to connections in order: five
+            // depth-200 instruments become five connections at indices 0..4,
+            // and index 4 is exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it
+            // afterwards would need the pool a second time, which one task
+            // cannot hold twice.
+            if selection.depth_200.len() == crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS {
+                match crate::depth_rebalance::top_mover_pick(&inputs.movers, &inputs.candidates)
+                    .and_then(|pick| {
+                        u64::try_from(pick.leg_security_id())
+                            .ok()
+                            .filter(|id| *id > 0)
+                            .map(|security_id| {
+                                tickvault_core::websocket::pool_supervisor::SubscribeInstrument {
+                                    security_id,
+                                    segment: pick.contract_segment,
+                                }
+                            })
+                    }) {
+                    Some(fifth) => {
+                        selection.depth_200.push(fifth);
+                        info!(
+                            security_id = fifth.security_id,
+                            "depth-200: the fifth socket takes the day's biggest mover"
+                        );
+                    }
+                    None => {
+                        // Normal before the open and on a flat morning: no
+                        // stock has a measurable move yet, so there is nothing
+                        // to put on it. The retry loop asks again; if the
+                        // whole session stays flat the socket simply goes
+                        // unused, which is honest.
+                        tracing::debug!(
+                            "depth-200: no leading mover yet — the fifth socket stays \
+                             undialed this attempt"
+                        );
+                    }
+                }
             }
         }
 
@@ -14606,6 +14665,77 @@ mod depth_rebalance_wiring_tests {
                 && production.contains("std::mem::take(&mut depth_commands)"),
             "the attach must MOVE its depth channels into the rebalance; dropping them \
              closes every channel and the machinery goes silently inert"
+        );
+    }
+}
+
+#[cfg(test)]
+mod depth20_layout_wiring_tests {
+    fn production() -> &'static str {
+        let source = include_str!("dhan_feed_stack.rs");
+        source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before)
+    }
+
+    #[test]
+    fn the_attach_dials_the_operator_layout_not_the_adaptive_window() {
+        // The adaptive window fills all 250 slots with two indices at strikes
+        // fifty steps out and carries no stock at all. It is a valid selection
+        // and completely the wrong one.
+        assert!(
+            production().contains("crate::depth20_layout::build_depth20_layout("),
+            "the attach must build the operator layout for depth-20"
+        );
+    }
+
+    #[test]
+    fn an_empty_layout_never_wipes_a_working_selection() {
+        // Before the chain publishes the layout has no strikes to centre on
+        // and returns nothing. Overwriting a working adaptive selection with
+        // an empty one trades "the wrong 250" for "no depth at all", which is
+        // strictly worse — and it would look like the layout succeeding.
+        let p = production();
+        let guarded = p.contains("if layout.instrument_count() > 0 {");
+        assert!(
+            guarded,
+            "the layout must be taken only when it produced instruments"
+        );
+    }
+
+    #[test]
+    fn both_halves_read_one_load_so_they_cannot_disagree() {
+        // Two loads a few seconds apart fill the movers sockets from one
+        // moment's ranking and choose the fifth depth-200 socket from
+        // another's.
+        let p = production();
+        assert!(
+            p.contains("crate::depth_rebalance::load_attach_inputs("),
+            "the attach must load candidates and movers once for both halves"
+        );
+        assert_eq!(
+            p.matches("crate::depth_rebalance::load_attach_inputs(")
+                .count(),
+            1,
+            "exactly one load — a second call is a second moment"
+        );
+    }
+
+    #[test]
+    fn the_fifth_socket_is_appended_before_planning_not_dialed_after() {
+        // plan_pool assigns instruments to connections in order, so the
+        // append is what puts the top mover at index 4. Dialing it afterwards
+        // needs the pool a second time, which one task cannot hold twice.
+        let p = production();
+        let append = p
+            .find("selection.depth_200.push(fifth);")
+            .expect("the fifth socket must be appended");
+        let plan = p
+            .find("&selection.depth_200,")
+            .expect("the plan must read depth_200");
+        assert!(
+            append < plan,
+            "the fifth socket must be appended BEFORE the pool is planned"
         );
     }
 }

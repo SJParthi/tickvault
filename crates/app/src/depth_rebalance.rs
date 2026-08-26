@@ -835,46 +835,34 @@ pub async fn run_depth_rebalance(
     }
 }
 
-/// The instrument the fifth depth-200 socket should be dialed with.
+/// Everything the attach needs to shape depth, loaded once.
 ///
-/// Composes the same three pieces the per-minute rebalance uses — the
-/// candidate slice, the movers ranking, and [`top_mover_pick`] — so the
-/// contract dialed at attach is chosen by exactly the rule that will steer it
-/// afterwards. A different rule here would mean the socket's first contract is
-/// one the rebalance would never have picked, and its first minute would be a
-/// swap away from it.
-///
-/// `None` on a flat or unreadable morning, which is the NORMAL state before
-/// the open: no stock has a measurable move yet, so there is nothing to put on
-/// the socket and dialing it with a guess would subscribe a book nobody asked
-/// for.
-// TEST-EXEMPT: async composition of load_depth_candidates + fetch_movers + top_mover_pick, each separately tested.
-pub async fn top_mover_instrument(
+/// Both halves — the depth-20 layout and the fifth depth-200 socket — need the
+/// same candidate slice and the same ranking. Loading them once is not only
+/// cheaper: two loads a few seconds apart can disagree, and a disagreement
+/// here means the fifth socket is chosen from one moment's ranking while the
+/// movers sockets are filled from another's.
+#[derive(Debug, Clone, Default)]
+pub struct AttachInputs {
+    /// The contract slice the depth selector consumes.
+    pub candidates: Vec<DepthCandidate>,
+    /// Today's stock moves, unranked.
+    pub movers: Vec<MoverRow>,
+}
+
+/// Loads both halves in one pass.
+// TEST-EXEMPT: async composition of load_depth_candidates + fetch_movers, both tested.
+pub async fn load_attach_inputs(
     questdb: &tickvault_common::config::QuestDbConfig,
     date_ist: &str,
     today_ymd: u32,
     today_ist_micros: i64,
-) -> Option<SubscribeInstrument> {
-    let movers = fetch_movers(questdb, today_ist_micros).await;
-    if movers.is_empty() {
-        return None;
+) -> AttachInputs {
+    AttachInputs {
+        candidates: crate::dhan_depth_universe::load_depth_candidates(questdb, date_ist, today_ymd)
+            .await,
+        movers: fetch_movers(questdb, today_ist_micros).await,
     }
-    let candidates =
-        crate::dhan_depth_universe::load_depth_candidates(questdb, date_ist, today_ymd).await;
-    let pick = top_mover_pick(&movers, &candidates)?;
-    let security_id = u64::try_from(pick.leg_security_id()).ok()?;
-    if security_id == 0 {
-        // Instrument 0 is a well-formed subscription that returns nothing
-        // forever and looks entirely healthy. `top_mover_pick` already refuses
-        // a non-positive id, so reaching here means the pair carried one leg
-        // that was usable and one that was not; refusing is the only honest
-        // answer for the leg we actually need.
-        return None;
-    }
-    Some(SubscribeInstrument {
-        security_id,
-        segment: pick.contract_segment,
-    })
 }
 #[cfg(test)]
 mod tests {
@@ -1951,9 +1939,10 @@ mod fifth_socket_tests {
             .split_once("\n#[cfg(test)]")
             .map_or(source, |(before, _)| before);
         assert!(
-            production.contains("crate::depth_rebalance::top_mover_instrument("),
-            "the fifth socket must be dialed by top_mover_instrument, which composes the \
-             same pieces the per-minute rebalance uses"
+            production.contains("crate::depth_rebalance::top_mover_pick("),
+            "the fifth socket must be dialed by top_mover_pick — the SAME function \
+             plan_minute calls, so the dialed contract is one the rebalance would \
+             have chosen"
         );
     }
 
