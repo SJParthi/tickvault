@@ -112,13 +112,19 @@ pub const DAY_OPEN_MAX_PLAUSIBLE_PRICE: f64 = 10_000_000.0;
 /// exchange at all.
 #[must_use]
 pub fn is_plausible_price(price: f64) -> bool {
-    // Two explicit comparisons rather than a `RangeInclusive::contains`:
-    // identical cost, and the banned-pattern scanner reads any `.contains(` as
-    // the O(n) `Vec` form. Writing what is actually happening is better than
-    // an exemption comment claiming the scanner is wrong.
-    price.is_finite()
-        && price >= DAY_OPEN_MIN_PLAUSIBLE_PRICE
-        && price <= DAY_OPEN_MAX_PLAUSIBLE_PRICE
+    if !price.is_finite() {
+        return false;
+    }
+    // Two gates disagree about the next line and only an exemption satisfies
+    // both: the banned-pattern scanner reads any `.contains(` as the O(n) `Vec`
+    // form, while clippy's `manual_range_contains` rejects the two-comparison
+    // spelling. The exemption is honest rather than a way around a check --
+    // `RangeInclusive::contains` on an `f64` IS two comparisons, with no
+    // iteration and no allocation. Split from the `is_finite` guard so the
+    // exemption sits on the line immediately above the call, which is the only
+    // place the scanner reads it.
+    // O(1) EXEMPT: RangeInclusive::contains on a scalar is two comparisons, not a scan.
+    (DAY_OPEN_MIN_PLAUSIBLE_PRICE..=DAY_OPEN_MAX_PLAUSIBLE_PRICE).contains(&price)
 }
 
 /// How many exchange day-opens have been refused this process, for the
