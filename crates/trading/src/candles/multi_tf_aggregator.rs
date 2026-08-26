@@ -521,6 +521,41 @@ impl MultiTfAggregator {
                 ..ConsumeStats::default()
             };
         }
+        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
+        // 2026-08-25, and that reordering is the whole fix.
+        //
+        // It used to sit below, which left a hole the drain's own comment
+        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
+        // and returns early, so a packet carrying LTP = 0 AND
+        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
+        // stayed false, the drain classified it `untraded_sentinel` — a
+        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
+        // DESIGNATED timestamp, so that row lands in a year-2106 partition
+        // that retention and archival, which key on the trading day, can never
+        // reach, while every `max(ts)` and range query over `ticks` silently
+        // includes it.
+        //
+        // One malformed or hostile packet was enough. The band check belongs
+        // above every early return that can still produce a persisted row, not
+        // merely above the fold.
+        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
+        {
+            // MERGE RESOLUTION 2026-08-26: this branch added the call with the
+            // `counter!` macro; main meanwhile moved every fold counter to the
+            // pre-resolved `fold_counters()` registry and dropped the import.
+            // The registry already carries `tick_refused_timestamp`, so this
+            // uses it rather than re-adding a lone macro call — matching the
+            // convention AND skipping the sharded-registry lookup the registry
+            // exists to remove.
+            crate::candles::fold_counters::fold_counters()
+                .tick_refused_timestamp
+                .increment(1);
+            return ConsumeStats {
+                refused_timestamp: true,
+                ..ConsumeStats::default()
+            };
+        }
         if p == 0.0 {
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_untraded_sentinel
