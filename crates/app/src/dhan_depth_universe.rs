@@ -371,17 +371,118 @@ fn strike_key(strike: f64) -> i64 {
         i64::MAX
     }
 }
-/// Distance from at-the-money. `f64::MAX` for unusable prices so they sort last
-/// and are refused before selection rather than silently ranked first.
-fn atm_distance(candidate: &DepthCandidate) -> f64 {
-    if !candidate.strike.is_finite()
-        || !candidate.spot.is_finite()
-        || candidate.strike <= 0.0
-        || candidate.spot <= 0.0
+/// Distance from at-the-money, against a spot supplied by the CALLER.
+///
+/// `f64::MAX` for an unusable strike or price, so it sorts last and is refused
+/// before selection rather than silently ranked first.
+///
+/// The spot is a PARAMETER rather than read off the candidate, because spot
+/// belongs to the underlying and the chain merely stamps a copy on every row.
+/// The no-parameter version was deleted with the per-row refusal rule it
+/// served. See [`consensus_spot_by_underlying`].
+fn atm_distance_at(candidate: &DepthCandidate, spot: f64) -> f64 {
+    if !candidate.strike.is_finite() || !spot.is_finite() || candidate.strike <= 0.0 || spot <= 0.0
     {
         return f64::MAX;
     }
-    (candidate.strike - candidate.spot).abs()
+    (candidate.strike - spot).abs()
+}
+
+/// Distance from at-the-money as a FRACTION of spot, for ranking ACROSS
+/// underlyings.
+///
+/// WHY NOT RAW RUPEES — 2026-08-26, live. `atm_distance_at` returns
+/// `|strike - spot|`, and `select_depth_universe` sorted one pool mixing every
+/// underlying by it. Absolute rupee distance is not comparable between a
+/// ~24,000 index and a ~57,000 one with different strike spacings: a FINNIFTY
+/// strike 50 points from spot outranked a BANKNIFTY strike 100 points from a
+/// spot more than twice as large, though the BANKNIFTY strike is nearer in
+/// every sense that matters and far more liquid.
+///
+/// The result on the box that day: FINNIFTY and MIDCPNIFTY took four of the
+/// five 200-level sockets, NIFTY took one lone leg, and **BANKNIFTY took
+/// none**. Two of those sockets carried FINNIFTY strikes delivering ~125x
+/// fewer rows than the others, which then tripped the 50-second idle-silence
+/// watchdog into 322 redials between them.
+///
+/// Normalising by spot makes the comparison dimensionless and therefore
+/// meaningful across underlyings. `atm_distance_at` is UNCHANGED and still
+/// ranks WITHIN an underlying, where raw rupees are already comparable.
+fn atm_distance_fraction_at(candidate: &DepthCandidate, spot: f64) -> f64 {
+    let raw = atm_distance_at(candidate, spot);
+    if !raw.is_finite() || !spot.is_finite() || spot <= 0.0 {
+        return f64::MAX;
+    }
+    raw / spot
+}
+
+/// One spot per underlying: the most common usable value its rows carry,
+/// ties to the lower.
+///
+/// # Why a row's own spot is not the right price
+///
+/// Spot is a property of the UNDERLYING, not of a contract row — but the
+/// chain query stamps a copy on every row, and `LATEST ON ts PARTITION BY
+/// underlying_security_id, expiry, strike, leg` takes each strike's own newest
+/// row. A strike the vendor stopped returning at 09:47 therefore keeps 09:47's
+/// `underlying_spot` while the rest of the chain carries this minute's, and a
+/// row whose spot went NULL parses to `NaN`.
+///
+/// Refusing per row makes that a selection defect rather than a data note. A
+/// BANKNIFTY PUT whose single row carried an unusable spot used to be refused
+/// on its own, which left its strike with no whole pair — and the operator's
+/// locked NIFTY/BANKNIFTY-first rule then handed the 200-level socket to
+/// MIDCPNIFTY, silently, on a chain that plainly listed a usable BANKNIFTY
+/// pair. Found by a property test asserting a priority underlying is never
+/// displaced while it can supply a whole pair.
+///
+/// The most common value is order-independent by construction and is the price
+/// the chain as a whole is quoting; stale rows are the ones that dropped out of
+/// the vendor's response, so they are the minority. Grouping is on the bit
+/// pattern, so rows carrying literally the same column value group exactly and
+/// no epsilon has to be invented.
+///
+/// An underlying with NO usable row anywhere is absent from the map, and every
+/// one of its contracts is then refused as before — a missing price is still a
+/// refusal, just not one decided by which row happened to carry it.
+///
+/// # Complexity
+///
+/// O(candidates). Cold path, once per attach.
+fn consensus_spot_by_underlying(
+    candidates: &[DepthCandidate],
+) -> std::collections::HashMap<String, f64> {
+    let mut tally: std::collections::HashMap<String, std::collections::HashMap<u64, (usize, f64)>> =
+        std::collections::HashMap::new();
+    for c in candidates {
+        if !c.spot.is_finite() || c.spot <= 0.0 {
+            continue;
+        }
+        let slot = tally
+            .entry(c.underlying.trim().to_ascii_uppercase())
+            .or_default()
+            .entry(c.spot.to_bits())
+            .or_insert((0, c.spot));
+        slot.0 = slot.0.saturating_add(1);
+    }
+    tally
+        .into_iter()
+        .filter_map(|(underlying, votes)| {
+            let mut best: Option<(usize, f64)> = None;
+            for (count, value) in votes.into_values() {
+                let take = match best {
+                    None => true,
+                    Some((best_count, best_value)) => {
+                        count > best_count || (count == best_count && value < best_value)
+                    }
+                };
+                if take {
+                    best = Some((count, value));
+                }
+            }
+            best.map(|(_, value)| (underlying, value))
+        })
+        .collect()
 }
 
 /// Underlyings that claim depth-200 sockets before any other, in this order.
@@ -408,33 +509,6 @@ fn depth_200_priority_rank(underlying: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Distance from at-the-money as a FRACTION of spot, for ranking ACROSS
-/// underlyings.
-///
-/// WHY NOT RAW RUPEES — 2026-08-26, live. `atm_distance` returns
-/// `|strike - spot|`, and `select_depth_universe` sorted one pool mixing every
-/// underlying by it. Absolute rupee distance is not comparable between a
-/// ~24,000 index and a ~57,000 one with different strike spacings: a FINNIFTY
-/// strike 50 points from spot outranked a BANKNIFTY strike 100 points from a
-/// spot more than twice as large, though the BANKNIFTY strike is nearer in
-/// every sense that matters and far more liquid.
-///
-/// The result on the box that day: FINNIFTY and MIDCPNIFTY took four of the
-/// five 200-level sockets, NIFTY took one lone leg, and **BANKNIFTY took
-/// none**. Two of those sockets carried FINNIFTY strikes delivering ~125x
-/// fewer rows than the others, which then tripped the 50-second idle-silence
-/// watchdog into 322 redials between them.
-///
-/// Normalising by spot makes the comparison dimensionless and therefore
-/// meaningful across underlyings. `atm_distance` is UNCHANGED and still ranks
-/// WITHIN an underlying, where raw rupees are already comparable.
-fn atm_distance_fraction(candidate: &DepthCandidate) -> f64 {
-    let raw = atm_distance(candidate);
-    if !raw.is_finite() || !candidate.spot.is_finite() || candidate.spot <= 0.0 {
-        return f64::MAX;
-    }
-    raw / candidate.spot
-}
 /// Choose the depth-20 and depth-200 sets from one chain snapshot.
 ///
 /// Pure, so every refusal rule is testable without a database or a socket.
@@ -450,6 +524,20 @@ fn atm_distance_fraction(candidate: &DepthCandidate) -> f64 {
 #[must_use]
 pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     let mut out = DepthSelection::default();
+
+    // ONE spot per underlying, decided before anything is refused.
+    //
+    // A contract is refused for its own bad strike or its own missing id, but
+    // NEVER for a stale copy of a price that belongs to the underlying — see
+    // `consensus_spot_by_underlying` for the socket that was silently lost to
+    // exactly that.
+    let spots = consensus_spot_by_underlying(candidates);
+    let spot_of = |c: &DepthCandidate| -> f64 {
+        spots
+            .get(&c.underlying.trim().to_ascii_uppercase())
+            .copied()
+            .unwrap_or(f64::NAN)
+    };
 
     // ── Refuse first, so nothing unusable can reach the ranking. ──
     let mut usable: Vec<(&DepthCandidate, ExchangeSegment)> = Vec::new();
@@ -476,7 +564,7 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             out.refused_depth_ineligible_segment += 1;
             continue;
         }
-        if atm_distance(c) == f64::MAX {
+        if atm_distance_at(c, spot_of(c)) == f64::MAX {
             out.refused_bad_price += 1;
             continue;
         }
@@ -554,7 +642,7 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
                 let d = by_strike
                     .get(&strike_key(*s))
                     .and_then(|legs| legs.first())
-                    .map_or(f64::MAX, |(c, _)| atm_distance(c));
+                    .map_or(f64::MAX, |(c, _)| atm_distance_at(c, spot_of(c)));
                 (d, *s)
             })
             .collect();
@@ -598,7 +686,7 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
                 pair_pool.push((
                     ce_c.underlying.trim().to_ascii_uppercase(),
                     depth_200_priority_rank(&ce_c.underlying),
-                    atm_distance_fraction(ce_c),
+                    atm_distance_fraction_at(ce_c, spot_of(ce_c)),
                     SubscribeInstrument {
                         security_id: ce_c.contract_security_id as SecurityId,
                         segment: *ce_seg,
@@ -1304,14 +1392,15 @@ mod tests {
         let finnifty = candidate_at("FINNIFTY", 2, 26_250.0, "CE", 26_200.0); // 50 pts
 
         assert!(
-            atm_distance(&banknifty) > atm_distance(&finnifty),
+            atm_distance_at(&banknifty, banknifty.spot) > atm_distance_at(&finnifty, finnifty.spot),
             "raw rupees rank BANKNIFTY as further — this is the trap"
         );
         assert!(
-            atm_distance_fraction(&banknifty) < atm_distance_fraction(&finnifty),
+            atm_distance_fraction_at(&banknifty, banknifty.spot)
+                < atm_distance_fraction_at(&finnifty, finnifty.spot),
             "normalised by spot, BANKNIFTY is NEARER: {} vs {}",
-            atm_distance_fraction(&banknifty),
-            atm_distance_fraction(&finnifty)
+            atm_distance_fraction_at(&banknifty, banknifty.spot),
+            atm_distance_fraction_at(&finnifty, finnifty.spot)
         );
     }
 
@@ -1322,8 +1411,11 @@ mod tests {
     fn an_unusable_spot_sorts_last_in_the_normalised_ranking() {
         let zero_spot = candidate_at("NIFTY", 3, 24_300.0, "CE", 0.0);
         let nan_spot = candidate_at("NIFTY", 4, 24_300.0, "CE", f64::NAN);
-        assert_eq!(atm_distance_fraction(&zero_spot), f64::MAX);
-        assert_eq!(atm_distance_fraction(&nan_spot), f64::MAX);
+        assert_eq!(
+            atm_distance_fraction_at(&zero_spot, zero_spot.spot),
+            f64::MAX
+        );
+        assert_eq!(atm_distance_fraction_at(&nan_spot, nan_spot.spot), f64::MAX);
     }
     use super::*;
 
@@ -1677,18 +1769,82 @@ mod tests {
         );
     }
 
-    /// A NaN or non-positive price cannot be ranked against ATM. Ranking it
+    /// A NaN or non-positive STRIKE cannot be ranked against ATM. Ranking it
     /// anyway would sort it to an arbitrary position and could put garbage at
     /// the front of the depth-200 pair pool.
+    ///
+    /// **Amended 2026-08-26.** This test used to assert that a row carrying a
+    /// zero SPOT was refused too, and counted BOTH refusals. That was the
+    /// per-row rule, and it cost a socket: spot belongs to the UNDERLYING and
+    /// the chain merely stamps a copy on every row, so one stale or NULL copy
+    /// refused a real contract. Here NIFTY is quoted at 100 by the other row,
+    /// so the contract at strike 100 is a genuine at-the-money contract and is
+    /// now chosen. Only the NaN strike — a defect of the contract itself — is
+    /// refused. See `consensus_spot_by_underlying`.
     #[test]
-    fn test_non_finite_prices_are_refused_and_counted() {
+    fn test_non_finite_strikes_are_refused_and_counted() {
         let mut nan_strike = candidate("NIFTY", 7, f64::NAN, "CE");
         nan_strike.spot = 100.0;
         let mut zero_spot = candidate("NIFTY", 8, 100.0, "PE");
         zero_spot.spot = 0.0;
         let sel = select_depth_universe(&[nan_strike, zero_spot]);
+        assert_eq!(
+            sel.refused_bad_price, 1,
+            "only the NaN strike is the contract's own fault"
+        );
+        assert_eq!(
+            sel.depth_20
+                .iter()
+                .map(|i| i.security_id)
+                .collect::<Vec<_>>(),
+            vec![8],
+            "the contract at the money is chosen from the underlying's quoted price"
+        );
+    }
+
+    /// An underlying with NO usable price ANYWHERE still refuses every one of
+    /// its contracts.
+    ///
+    /// The amendment above narrows what a bad price refuses; it must not
+    /// remove the refusal. With nothing to centre on, a window is centred on a
+    /// guess, and a guessed window subscribes the wrong strikes and reads as a
+    /// quiet book.
+    #[test]
+    fn test_an_underlying_with_no_price_at_all_is_still_refused() {
+        let mut a = candidate("NIFTY", 7, 100.0, "CE");
+        a.spot = 0.0;
+        let mut b = candidate("NIFTY", 8, 100.0, "PE");
+        b.spot = f64::NAN;
+        let sel = select_depth_universe(&[a, b]);
         assert_eq!(sel.refused_bad_price, 2);
         assert!(sel.depth_20.is_empty());
+        assert!(sel.depth_200.is_empty());
+    }
+
+    /// The stale-copy case, end to end, on the shape that actually lost a
+    /// socket: BANKNIFTY offers a whole pair but one leg's row carries an
+    /// unusable spot, while MIDCPNIFTY offers a clean pair.
+    ///
+    /// Under the per-row rule the BANKNIFTY PUT was refused, its strike had no
+    /// whole pair left, and the operator's locked NIFTY/BANKNIFTY-first order
+    /// handed the 200-level sockets to MIDCPNIFTY — on a chain that plainly
+    /// listed a usable BANKNIFTY pair. Found by a property test.
+    #[test]
+    fn test_a_stale_spot_on_one_leg_does_not_cost_a_priority_underlying_its_socket() {
+        let mut bank_ce = candidate("BANKNIFTY", 101, 57_500.0, "CE");
+        bank_ce.spot = 57_500.0;
+        let mut bank_pe = candidate("BANKNIFTY", 102, 57_500.0, "PE");
+        bank_pe.spot = 0.0; // the NULL/stale copy
+        let mut mid_ce = candidate("MIDCPNIFTY", 201, 12_600.0, "CE");
+        mid_ce.spot = 12_600.0;
+        let mut mid_pe = candidate("MIDCPNIFTY", 202, 12_600.0, "PE");
+        mid_pe.spot = 12_600.0;
+        let sel = select_depth_universe(&[bank_ce, bank_pe, mid_ce, mid_pe]);
+        let chosen: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
+        assert!(
+            chosen.contains(&101) && chosen.contains(&102),
+            "BANKNIFTY lost its socket to a stale price copy: {chosen:?}"
+        );
     }
 
     /// Ranking is by distance from spot, not by strike order — otherwise the
