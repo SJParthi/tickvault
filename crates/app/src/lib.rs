@@ -101,6 +101,7 @@ pub mod boot_helpers;
 /// the 15:40 timeframe check's catch-up arm consults them so a
 /// post-15:40 restart never re-fires an already-delivered daily card.
 pub mod daily_task_marker;
+pub mod depth200_atm;
 /// `[groww_universe]` process-global daily Groww watch-set + shared-master
 /// rider (2026-07-15 live-feed retirement re-home of the activation daily
 /// build loop + the sole persist_groww_instruments caller).

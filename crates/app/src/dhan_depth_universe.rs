@@ -115,31 +115,31 @@ pub fn depth_20_strikes_each_side(underlyings: usize) -> usize {
 
 /// Instruments depth-200 subscribes, across all underlyings.
 ///
-/// depth-200 allows ONE instrument per connection and 5 connections, so 5 is
-/// the vendor ceiling AND the budget — an odd number against a market that
-/// trades in CE/PE pairs. Filling it means 2 whole pairs plus one lone leg.
+/// **FOUR since 2026-08-26, by operator instruction** — not the vendor
+/// ceiling of five. Verbatim: *"as fo now dont need to conside the fifth one
+/// dude jsut go aheaf with 4 aloe"*, following his specification of the set
+/// as *"only nifty atm ce atm pr and banknifty atm ce and atm pe"*.
 ///
-/// **This deliberately reverses an earlier decision, so the reversal is
-/// recorded rather than quietly applied.** The constant used to be
-/// `DEPTH_200_MAX_PAIRS = 2`, taking 4 sockets and leaving the 5th empty, on
-/// the stated grounds that a lone leg "cannot answer the spread and fill
-/// questions this data exists for" and would be "analytically unusable".
+/// Four is exactly two CE/PE pairs: NIFTY ATM and BANKNIFTY ATM. The fifth
+/// authorized socket is deliberately left IDLE, which is a real cost stated
+/// plainly rather than quietly absorbed — one of five paid-for 200-level
+/// connections carries nothing.
 ///
-/// That reasoning was half right and overstated the half it got wrong. A
-/// 200-level book on a lone leg genuinely cannot answer CE-vs-PE questions —
-/// synthetic parity, straddle spread, relative skew — because those need both
-/// legs at the same strike simultaneously. But the questions a 200-level book
-/// answers MOST of the time are within-leg: how much size rests at each of 200
-/// levels, where the real liquidity cliff is, what a large order would sweep.
-/// A lone leg answers all of those completely. "Unusable" was the wrong word;
-/// "narrower" was the right one, and the difference decides whether the 5th
-/// socket is worth opening.
+/// **This retires the lone-leg design**, and the reversal is recorded rather
+/// than silently applied. The constant was 5 with the odd socket filled by a
+/// next-nearest lone CE, on the reasoning that a 200-level book on a single
+/// leg still answers every WITHIN-leg question (resting size per level, the
+/// liquidity cliff, what a large order would sweep) even though it cannot
+/// answer CE-vs-PE parity or skew. That reasoning was and remains correct.
+/// What overrides it is the operator's requirement that this feed carry a
+/// SPECIFIC, ATM-tracking set: a lone leg on a third strike is not part of
+/// that set, and filling the socket with one would mean the depth-200 feed
+/// no longer means one thing.
 ///
-/// So the 5th socket is filled with the next-nearest-ATM CE — see
-/// [`DepthSelection::depth_200_lone_leg`], which reports whether a lone leg
-/// was taken so the limitation is visible at the point of USE rather than
-/// only here in a comment.
-pub const DEPTH_200_MAX_SOCKETS: usize = 5;
+/// [`DepthSelection::depth_200_lone_leg`] is RETAINED and must now always be
+/// false; a test pins that, so a future change that re-enables a lone leg
+/// fails rather than quietly re-widening the set.
+pub const DEPTH_200_MAX_SOCKETS: usize = 4;
 
 /// One contract from a chain snapshot, before selection.
 #[derive(Debug, Clone, PartialEq)]
@@ -653,16 +653,18 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     }
     let mut remaining_pairs = pair_pool.into_iter();
     for (_, _, _, ce, pe) in remaining_pairs.by_ref() {
-        // `+ 2` because a pair costs two sockets; a pair that would overflow
-        // the budget is skipped, and the loop falls through to the lone-leg
-        // step below rather than truncating the pair here.
+        // `+ 2` because a pair costs two sockets. The budget is EVEN (4) since
+        // 2026-08-26, so a whole pair always either fits or the budget is
+        // already full — the odd-socket case cannot arise by arithmetic.
+        //
+        // The lone-leg fill that used to live here is RETIRED with the fifth
+        // socket (see DEPTH_200_MAX_SOCKETS). It is not merely unreachable at
+        // today's budget: it must not come back if the budget ever changes
+        // again, because a lone third-strike leg is not part of the set the
+        // operator specified. `depth_200_lone_leg` therefore stays false and a
+        // test pins it, so re-enabling one is a build failure rather than a
+        // quiet re-widening.
         if out.depth_200.len().saturating_add(2) > DEPTH_200_MAX_SOCKETS {
-            // The CE of this rejected pair is the nearest-ATM leg still
-            // unspent, which makes it the best candidate for the odd socket.
-            if out.depth_200.len() < DEPTH_200_MAX_SOCKETS {
-                out.depth_200.push(ce);
-                out.depth_200_lone_leg = true;
-            }
             break;
         }
         out.depth_200.push(ce);
@@ -1221,10 +1223,16 @@ mod tests {
             !ids.contains(&72982) && !ids.contains(&72983),
             "MIDCPNIFTY must not take a socket either. Got {ids:?}"
         );
-        assert_eq!(ids.len(), 5, "all five sockets must be filled, got {ids:?}");
+        assert_eq!(
+            ids.len(),
+            4,
+            "FOUR sockets since the operator's 2026-08-26 instruction — two whole \
+             pairs, no fifth. Got {ids:?}"
+        );
         assert!(
-            sel.depth_200_lone_leg,
-            "the odd 5th socket is a lone leg and must SAY so"
+            !sel.depth_200_lone_leg,
+            "the lone leg is RETIRED with the fifth socket; a set that reports one \
+             is no longer the set the operator specified"
         );
     }
 
@@ -1472,21 +1480,21 @@ mod tests {
         assert_eq!(
             sel.depth_200.len(),
             DEPTH_200_MAX_SOCKETS,
-            "all five authorized 200-level sockets must be used"
+            "all FOUR authorized 200-level sockets must be used"
         );
-        // Nearest-ATM pairs (spot 100) are (1,2) then (3,4); the 5th socket
-        // takes the CE of the next pair — id 5, not id 6.
+        // Nearest-ATM pairs (spot 100) are (1,2) then (3,4). The third pair
+        // (5,6) does not fit and — since 2026-08-26 — its CE is NOT promoted
+        // to a lone leg; the budget simply ends at two whole pairs.
         let ids: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
         assert_eq!(
             ids,
-            vec![1, 2, 3, 4, 5],
-            "two whole pairs first, then the nearest unspent CE"
+            vec![1, 2, 3, 4],
+            "two whole pairs, and nothing after them"
         );
         assert!(
-            sel.depth_200_lone_leg,
-            "the lone leg must be REPORTED — a consumer computing a cross-leg \
-             quantity from an unpartnered book would be computing from half \
-             the data with no way to know it"
+            !sel.depth_200_lone_leg,
+            "the lone-leg fill is RETIRED: an even budget can only end on a whole \
+             pair, and a third-strike leg is not part of the operator's set"
         );
     }
 
