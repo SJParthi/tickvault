@@ -2543,3 +2543,112 @@ gone" would send an operator to diagnose a healthy thread.
 **14e** (no new EMF metric name may ship — `user-data.sh.tftpl` at zero free
 bytes) is honoured: all three new counters are local-exporter only. The loss
 path they sit on already pages through `tv_ticks_dropped_total`.
+
+---
+
+## Item 25 — three dead loss-signals on the durable floor (2026-08-26)
+
+- [x] **25a — `init_metrics` moved above STAGE-C so cached counter handles are real**
+  - Files: `crates/app/src/main.rs`
+  - Tests: `crates/app/tests/metrics_recorder_install_order_guard.rs` (5)
+- [x] **25b — the channel-FULL drop arm carries `code = WS-SPILL-02`**
+  - Files: `crates/storage/src/ws_frame_spill.rs`
+  - Tests: `crates/storage/tests/durable_floor_signal_guard.rs` (2 of 7)
+- [x] **25c — depth spill ceiling derived from the volume, not a literal**
+  - Files: `crates/storage/src/depth_persistence.rs`
+  - Tests: `crates/storage/tests/durable_floor_signal_guard.rs` (5 of 7)
+
+### Design
+
+The frame WAL is the durable floor, and the design believes it has four
+independent detectors on it. Live measurement on prod 2026-08-26 found **one**
+working, by accident.
+
+| # | Signal | State found | Cause |
+|---|---|---|---|
+| 1 | `tv_ws_frame_spill_drop_critical` → `durable-floor-breach` leg | **dead** | handle cached pre-recorder |
+| 2 | `tv_ticks_lost_total` → dedicated alarm | **dead** | same |
+| 3 | `error!` on channel-FULL → `{ $.code = "WS-SPILL-02" }` | **never matched** | no `code` field on that arm |
+| 4 | `tv_dhan_ws_wal_dropped_total` | alive | a *different* module keeps its own mirror |
+
+**25a.** `metrics::counter!` resolved before a recorder is installed returns
+`Counter { inner: None }`; `increment` is `if let Some(..)`, so it is a no-op
+forever. `SpillDropCounters::new` **caches** those handles (deliberately — the
+drop path must not allocate) and ran inside `WsFrameSpill::new` at `main.rs:913`,
+35 lines above `init_metrics` at `:948`. Verified live: both series absent from
+`/metrics` entirely while neighbours registered post-install rendered at 0.
+
+This is the SECOND occurrence in this file — the 2026-07-14 PR-C3 note records
+the same loss for `tv_ws_frame_wal_replay_total`, repaired by moving the
+*increment*. That fixes one instance and leaves the ordering hazard, which is
+why it recurred. Moving the *install* retires the class.
+
+**25b.** The `Disconnected` arm has always carried the code; the `Full` arm has
+not. FULL is the arm production reaches — it is what a writer stalled behind a
+saturated disk produces — so the un-pageable arm was the likely one.
+
+**25c.** `DEPTH_SPILL_MAX_BYTES` is a literal whose own doc cites a volume "86%
+full … ~28 GB free". Measured 2026-08-26: **300 GB, 255 GB free**. The premise
+expired and the number could not follow it.
+
+| tier | ceiling | sized by | rows/s | outage covered |
+|---|---|---|---|---|
+| tick | ~9.4 GB | volume ÷ 32 | 2,706 | **~5.2 h** |
+| depth | 512 MiB | a literal | 51,000 | **~75 s** |
+
+19× the volume, 250× less coverage. The tick tier became host-derived on
+2026-08-21 for exactly this reason; depth was not moved with it. Same fraction,
+same `OnceLock`, floor retained so it can never shrink.
+
+### Edge Cases
+
+- Unmeasurable volume → falls back to the 512 MiB floor with a coded warn, never
+  silently (mirrors the tick tier).
+- Small volume → `.max(DEPTH_SPILL_MAX_BYTES)` guarantees the derived ceiling is
+  never *below* what the literal already allowed.
+- `OnceLock` → the `df` probe runs at most once, on the cold failure path, so the
+  enforced number and the number a log line quotes can never disagree.
+- Comment-stripping in the ordering guard: the fix ships with prose naming both
+  symbols; a scanner that matched comments would pass a genuinely broken file.
+  Pinned by a self-test.
+
+### Failure Modes
+
+- 25a moves `init_metrics` ahead of the fail-closed WAL halt. Metrics init does
+  not depend on the WAL, and a boot that halts having installed a recorder is
+  strictly more observable than one that halts without.
+- 25c raises a ceiling on a shared volume. Bounded at 1/32, leaving 96.8% for
+  QuestDB and the frame WAL — the same share the tick tier already takes, and the
+  original "a rescue must not become the incident" reasoning is preserved.
+
+### Test Plan
+
+12 new tests, all green. **Bite-proven by reverting each fix:**
+
+| Revert | Result |
+|---|---|
+| `code =` removed from the Full arm | **2 FAILED** (`channel_full_drop_carries…`, `both_drop_arms_are_coded…`) |
+| `init_metrics` moved back below STAGE-C | **3 FAILED**; the 2 scanner self-tests correctly stayed green |
+
+Scoped suites (`testing-scope.md`): `tickvault-app` **1,797 passed / 0 failed**,
+`tickvault-storage` **0 failed**. `cargo fmt --check` clean. Clippy runs in CI
+(not installed on this toolchain).
+
+### Rollback
+
+Three independent, self-contained reverts; no schema, config, terraform or wire
+change. Reverting 25c restores the 512 MiB literal exactly.
+
+### Observability
+
+No new metric name and no new EMF selector entry — honouring Item 14e
+(`user-data.sh.tftpl` at zero free bytes). This item makes **existing** signals
+work rather than adding more: two counters that never emitted now emit, and one
+`error!` becomes matchable by the filter that was already deployed for it.
+
+### Honest envelope
+
+Fixes DETECTION, not loss. The 75-second depth cliff becomes ~23 minutes on
+today's volume; it does not become infinite, and past the ceiling depth rows are
+still dropped — counted and paged, as before. Nothing here addresses the disk
+saturation (~94:1 amplification) that makes a stall likely in the first place.
