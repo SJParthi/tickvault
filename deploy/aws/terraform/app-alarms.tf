@@ -646,6 +646,56 @@ resource "aws_cloudwatch_metric_alarm" "questdb_wal_suspended" {
 }
 
 
+
+# ---------------------------------------------------------------------------
+# WAL APPLY LAG — the slope, not the cliff.
+#
+# ADDED 2026-08-26 after a live incident the operator found by asking, not by
+# being paged in time. `market_depth` reached 48,454 transactions behind and
+# stayed there ~95 minutes: rows accepted and ACKed by ILP, written to the WAL,
+# and never becoming queryable. `max(ts)` froze at 11:44:46 while the depth
+# sockets stayed connected and Dhan kept acking subscriptions.
+#
+# tv-<env>-questdb-wal-suspended could not see it: `suspended` was FALSE
+# throughout. Suspension is the cliff; this is the slope, and the slope is
+# where an operator can still act.
+#
+# The app-side growth detector (WAL-SUSPEND-01, source=apply_lag_growing) DID
+# fire and DID page - 85 minutes late, because its condition is five
+# CONSECUTIVE polls of non-decreasing lag and a real backlog oscillates: one
+# poll where apply gains a little resets the counter to zero. That signal
+# stays; it is the one that distinguishes "busy" from "losing ground". This
+# alarm is the complement - a MAGNITUDE threshold that fires on a large
+# backlog however jagged its shape.
+#
+# THRESHOLD, and why not lower: a busy table is always somewhat behind - that
+# is what asynchronous WAL apply means - and the app-side floor for "worth
+# considering at all" is WAL_APPLY_LAG_MIN_TXN = 1,000. 10,000 is an order of
+# magnitude above that floor and a fifth of the observed incident, so it fires
+# well inside a session while a healthy busy table never reaches it. Measured
+# reference: ticks ran 663 behind at the same moment market_depth was at
+# 48,454.
+#
+# ok_actions is deliberately EMPTY. The backlog drains on its own after market
+# close when writes stop, so a green "recovered" at 16:00 would say the problem
+# was handled when what actually happened is that the day ended.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "questdb_wal_apply_lag" {
+  alarm_name          = "tv-${var.environment}-questdb-wal-apply-lag"
+  alarm_description   = "QuestDB WAL apply is falling behind: rows are ACKed and written to the WAL but are NOT yet queryable, so max(ts) on the affected table freezes while every ingest counter reads healthy and `suspended` stays FALSE. Triage: SELECT name, writerTxn, sequencerTxn, sequencerTxn-writerTxn AS behind FROM wal_tables() ORDER BY behind DESC. Nothing is LOST while this fires - the rows are on disk in the WAL and become visible when apply catches up - but a backlog that grows all session means intra-session queries on that table are stale by however long it has been behind. Check disk headroom and QuestDB CPU first; the usual cause on this box is market_depth arriving faster than apply can materialise it. Do NOT restart QuestDB mid-session to 'fix' it: the WAL is already durable and a restart risks the queued transactions for no gain."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "tv_questdb_wal_apply_lag_max"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 10000
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = []
+}
+
 # The WAL-suspension alarm above reads a GAUGE. This alarm watches the PRODUCER
 # of that gauge, and it exists because the gauge could once lie.
 #

@@ -835,10 +835,21 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // First-bucket-only -- 0 and 3 today against the session counters' 2,632
     // and 247. Same mechanism at ~1% of the resolution; two more paid series
     // for no added signal.
+    // 2026-08-26, PLUS 1: tv_questdb_wal_apply_lag_max. The WAL layer shipped
+    // a SUSPENSION gauge and no LAG gauge, so the only QuestDB backpressure
+    // signal reaching CloudWatch was binary — stuck or not. A table can be
+    // 48,454 transactions behind, with 95 minutes of accepted-but-invisible
+    // rows, while `suspended` reads FALSE and every dashboard is green; that
+    // is what happened on the live box this day, and the operator found it by
+    // asking rather than by being paged. ONE gauge carrying the MAXIMUM lag
+    // across all tables, never a series per table: at ~41 tables a per-table
+    // gauge would be 41 paid series for a number whose only operative value is
+    // the worst one. +$0.30/mo, and it backs a real alarm rather than being a
+    // diagnostic-only name (the shape this list has twice refused to ship).
     assert_eq!(
         names.len(),
-        79,
-        "Z+ L2 VERIFY ratchet: expected exactly 79 names in the MAIN EMF \
+        80,
+        "Z+ L2 VERIFY ratchet: expected exactly 80 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -1480,10 +1491,30 @@ fn test_app_alarms_count_is_seven() {
     // reported to a counter nobody reads leaves the gauge simply not updating,
     // which on notBreaching reads as health. An alarm whose input can silently
     // stop is not an alarm. Cost: +1 alarm (~+$0.10/mo) + 1 EMF name below.
+    // 9 (was 8) since 2026-08-26: added `tv_questdb_wal_apply_lag_max`
+    // (tv-<env>-questdb-wal-apply-lag). The operator found a live incident by
+    // ASKING, not by being paged in time: market_depth ran 48,454 transactions
+    // behind for ~95 minutes with `suspended = FALSE`, so rows were ACKed and
+    // written to the WAL but never became queryable — max(ts) frozen at
+    // 11:44:46 while the sockets stayed connected and Dhan kept acking. The
+    // suspension alarm cannot see that state by construction; it watches the
+    // cliff, and this watches the slope. The app-side growth detector
+    // (WAL-SUSPEND-01, source=apply_lag_growing) DID page but 85 minutes late,
+    // because its condition is five CONSECUTIVE non-decreasing polls and a real
+    // backlog oscillates. This is the magnitude complement.
+    // Cost: +1 alarm (~$0.10/mo) + 1 EMF name below (~$0.30/mo) = ~$0.40/mo.
+    // HONEST BUDGET NOTE: §2.3c of dhan-rest-only-noise-lock-2026-07-14.md
+    // already records a maximal month at $118.28 against a 90%
+    // STOP_EC2_INSTANCES action line of $117.00 — i.e. $1.28 OVER before this
+    // change, ~$1.68 after. The live account is far below it (August MTD
+    // $48.87, forecast $61.51), so no stop is imminent, but the maximal-month
+    // arithmetic crosses the automatic action line and this widens it. The
+    // levers remain the already-approved Quote 10 EIP release (-$3.60/mo) or an
+    // operator decision on limit_amount. Neither is taken here.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 8,
-        "Z+ L2 VERIFY ratchet: expected exactly 8 app-level CloudWatch alarm \
+        count, 9,
+        "Z+ L2 VERIFY ratchet: expected exactly 9 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal). Found {count}. If you intentionally \
          added or removed one, update aws-budget.md custom-metric cost line \
