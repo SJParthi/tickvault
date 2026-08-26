@@ -3494,3 +3494,119 @@ Publishes a number that already existed, on a path that already ran. It does
 not enlarge the ring, speed the drain, or prevent a refusal. Sampling is the
 30 s tick, so a sub-30-second fill spike is invisible — the after-the-fact
 counters remain the only signal for that, and they page.
+
+---
+
+## Item 35 — the cross-verification runs 94% blind and cannot say why
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+The 15:41 IST comparator against Dhan's own REST tape is, by this repository's
+own doctrine, the **only ground truth the revived feed has** — the India feed
+carries no sequence number and no snapshot-on-subscribe, so packet loss is
+undetectable at the protocol level and nothing inside our pipeline can prove a
+tick never arrived.
+
+Read from the live box, two consecutive sessions:
+
+| session | targets | `rest_failures` | actually compared | diverged | typical gap |
+|---|---:|---:|---:|---:|---:|
+| 2026-08-24 | 864 | **814** | ~50 | 61 | 35 paise |
+| 2026-08-25 | 865 | **815** | ~50 | 23 | 25 paise |
+
+**94% of the only ground truth fails every day.** Where it does compare, we
+agree with Dhan closely — 25 paise on prices in the thousands. The comparison
+is not failing; it is barely running.
+
+And the reason was **unknowable from the box**. `fetch_rest_side_for_target`
+has always built a precise reason string for every failure mode; its only
+caller matched `Err(_)`, counted `rest_failures += 1`, and dropped it. A count
+without a cause is a symptom that cannot be treated, and it had gone untreated
+for at least two sessions.
+
+Two changes:
+
+1. **Typed failure kinds** (`XverifyFetchFailureKind`, a closed 7-variant set:
+   `no_candles`, `rate_limited`, `http_4xx`, `http_5xx`, `timeout`,
+   `transport`, `other`), tallied per run into a fixed-width
+   `RestFailureBreakdown` and logged on the same line as the verdict, plus a
+   bounded 3-entry sample of real messages. HTTP status is classified from the
+   REAL `StatusCode` via a pure, directly-tested `classify_http_status` — never
+   a substring scan of a rendered message.
+2. **Pacing.** The loop issued ~865 requests back-to-back with no pacing at all
+   against a documented 5-per-second vendor budget, while both sibling REST
+   legs have gone through the shared self-tuning limiter since 2026-07-14. This
+   leg was the odd one out. A new `fetch_rest_side_paced` wrapper acquires the
+   shared limiter and feeds the self-tuner on a real 429.
+
+### Edge cases
+
+- **429 is a client error**, so a naive `is_client_error()` branch first would
+  swallow it into `http_4xx` and hide the one reason that is directly
+  actionable. Order is asserted, and the test states why.
+- **`no_candles` is ambiguous by construction** — a wrong instrument label and
+  a genuinely untraded instrument produce the identical 2xx-with-no-candle
+  response. The count is what separates them: 815 of 865 is not 865 untraded
+  instruments. Documented at the variant rather than papered over.
+- **Empty breakdown** renders `none`, so a clean run stays short.
+- **Zero-count kinds are omitted**, dominant kind first, so one line answers
+  "why" at a glance.
+
+### Failure modes
+
+**Pacing could push the run past its 600 s budget.** At the limiter's 3 rps
+that is ~288 s of pacing floor for 865 targets, inside the budget; the loop
+already breaks on budget with `budget_elapsed = true`, which is honest rather
+than silent. Watched, not assumed.
+
+**The two changes could confound each other** — they do not. The breakdown
+labels the outcome that actually occurred, so if tomorrow reports
+`rate_limited=0` then pacing was never the cause and the dominant label names
+the real one.
+
+### Test plan
+
+5 tests in `dhan_live_crossverify.rs`: distinct stable labels; a real 429
+classifies as `rate_limited` and not as a generic 4xx; the breakdown total
+always equals the failure count; the summary leads with the dominant reason and
+omits zeroes; and the regression pin that the loop tallies the reason, never
+discards it, and goes through the paced wrapper.
+
+**Bite-proven both directions:** reverting the paced call fails the pin;
+deleting the tally line fails the pin.
+
+The pin scans the **production half only** — `include_str!` reads this file
+including its own tests, whose assertion strings contain the banned pattern, so
+the first run failed on itself. The test-module marker is assembled from
+fragments rather than written whole, because spelling it out put a second copy
+in the file and split the source in the wrong place — the second run failed on
+that. Both are recorded at the test: a self-scanning guard fails OPEN, and this
+one would have passed while reading nothing.
+
+### Rollback
+
+Revert to `Err(_) => rest_failures += 1` and drop the wrapper. That restores a
+comparator that reports 94% blindness without a cause.
+
+### Observability
+
+**No new metric name, no new EMF selector entry, no cost.** The breakdown rides
+the existing `cross-verification finished` line as `rest_failure_reasons`, plus
+one `warn!` carrying the reasons and a 3-entry sample. Deliberate: EMF folds
+labels to `{host}` by summing, so a labelled counter would surface only the
+total — which the log already carries — while costing ~$0.30/mo, and the
+maximal month already projects above the line where a budget action stops the
+trading box.
+
+### Honest envelope
+
+This makes the blindness **explainable**, not smaller. Tomorrow's run names the
+dominant cause; fixing that cause is the next change, not this one. Pacing is
+hygiene on a documented budget, **not a claimed cure** — whether rate limiting
+is what blinded the comparator is exactly what the breakdown answers.
+
+Nothing here improves agreement with Dhan. Where the comparison does run we
+already agree to ~25 paise; the problem was never the matching, it was the
+coverage.

@@ -8020,6 +8020,12 @@ pub fn spawn_daily_crossverify(
                         noise_max_paise = c.noise_max_paise,
                         findings = c.findings.len(),
                         rest_failures = report.rest_failures,
+                        // Added 2026-08-26. `rest_failures` alone reported
+                        // 814-of-864 and 815-of-865 on consecutive sessions
+                        // and gave nobody a way to act on it: the reason was
+                        // discarded at the fetch site. This field names the
+                        // dominant cause on the same line as the verdict.
+                        rest_failure_reasons = %report.rest_failure_breakdown.summary(),
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
                         degraded = report.degraded,
