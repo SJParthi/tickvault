@@ -219,6 +219,37 @@ async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
     }
 }
 
+/// 2026-08-26 — `spawn_clock_skew_poller` must SURVIVE a failing probe.
+///
+/// The defect this poller closes is a gauge frozen at its boot value. A
+/// poller that exits on the first failed probe re-creates that defect
+/// exactly, while looking wired in every source scan — so the property
+/// worth pinning is not "it probes" but "it is still probing after a
+/// probe fails".
+///
+/// Drives it against an unreachable QuestDB on a 10ms interval, waits
+/// several intervals, and asserts the task has neither finished nor
+/// panicked. Named to satisfy the pub-fn-test-guard regex
+/// `test.*spawn_clock_skew_poller`.
+#[tokio::test]
+async fn test_spawn_clock_skew_poller_survives_a_failing_probe() {
+    let cfg = unreachable_questdb_config();
+    let handle =
+        tickvault_app::infra::spawn_clock_skew_poller(cfg, std::time::Duration::from_millis(10));
+
+    // First tick is consumed immediately by the poller (deliberate: the
+    // boot gate has just sampled), so this covers several real probes.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    assert!(
+        !handle.is_finished(),
+        "the clock-skew poller exited. A poller that stops on a failed probe \
+         leaves tv_clock_skew_seconds frozen at its last value, which is the \
+         exact false-green it was written to end."
+    );
+    handle.abort();
+}
+
 /// Item 7.3 — pure-function test for `ClockSkewSample::exceeds`. Drives
 /// every boundary case so the threshold-comparison code path is fully
 /// covered. Named to satisfy the pub-fn-test-guard regex `test.*exceeds`.

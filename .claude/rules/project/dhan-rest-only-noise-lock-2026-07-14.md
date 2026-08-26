@@ -1075,6 +1075,41 @@ charted so the mechanism is observable, and the thing that would actually indica
 breakage (the fold refusing input) is already covered by
 `tv_indicator_tick_rejected_total`.
 
+> ### ⚠ CORRECTED 2026-08-26 — "They are charted" was FALSE
+>
+> The two counters were shipped to CloudWatch and charted **nowhere**.
+> `grep tv_candle_session_high_recovered_total deploy/aws/terraform/dashboard.tf`
+> returned **0**; the names appeared only in the EMF selector. So they were paid
+> for (~$0.60/mo), alarmed by nothing *by design*, and visible on no surface at
+> all — the "measured but unwatched" class §2.3b was written to end, sitting
+> inside the very section that reports closing it.
+>
+> This is worse than an ordinary gap, and the reason is worth stating: anyone
+> auditing the claim **by reading** would have found it satisfied. A wrong
+> sentence in this file does not merely fail to warn — it certifies. That is the
+> same cost the `day_ohlc_tracker` row records on 2026-08-12 and the
+> `WAL-SUSPEND-01` row records on 2026-08-25, arriving a third time.
+>
+> **FIXED the same day.** Both counters are charted in `dashboard.tf` Row 13,
+> deliberately NOT under that row's "every line should sit flat at zero"
+> heading — a quiet market legitimately sets no new day highs, so zero here is
+> normal and a rising line is the fold working. The paragraph's reasoning about
+> not alarming them stands unchanged and is re-verified; only the claim that
+> they were charted was false.
+>
+> **The durable half is not the widget.** The same sweep found **ten** shipped
+> metrics that were on no dashboard and in no alarm, and the guard meant to
+> prevent exactly this — `dashboard_live_lane_visibility_guard.rs` — could not
+> have caught any of them: it filtered to `tv_dhan_*`, so it held for one prefix
+> and drifted silently for the other eight. Its scope is now **every** selected
+> name, bite-proven against a metric that could not have failed the old version.
+> Eight of the ten are charted; the two left off are recorded there with reasons,
+> one of them sharpened (`tv_dhan_feed_depth_total` folds its success and failure
+> arms into a single summed line, so a plain chart could not show a failure spike
+> at all — charting it would close the entry while creating the false comfort the
+> entry exists to prevent).
+
+
 #### Honest cost
 
 3 EMF names ≈ **$0.90/mo**, 1 alarm ≈ **$0.10/mo** ⇒ **~$1.00/mo**, zero

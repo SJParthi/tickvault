@@ -190,7 +190,7 @@ fn count_third_party_actions() -> usize {
 /// becomes one only if something ALARMS on it, and the paging drift guard
 /// already fails the build for exactly that ("a CODED tf entry with ZERO real
 /// emit sites"). Measured 2026-08-22: none of the 68 is alarmed.
-fn error_code_liveness(root: &Path) -> (usize, usize) {
+fn error_code_liveness(root: &Path) -> (usize, usize, usize) {
     let enum_src =
         std::fs::read_to_string(root.join("crates/common/src/error_code.rs")).unwrap_or_default();
     // Variant lines are exactly four-space-indented `Name,` inside the enum.
@@ -237,11 +237,60 @@ fn error_code_liveness(root: &Path) -> (usize, usize) {
     let mut sources = String::new();
     slurp(&root.join("crates"), &mut sources);
 
-    let live = variants
+    let live_variants: Vec<&String> = variants
         .iter()
         .filter(|v| sources.contains(&format!("ErrorCode::{v}")))
+        .collect();
+
+    // How many of the LIVE ones would actually reach a phone.
+    //
+    // A different question from liveness, and the more important one: the rest
+    // of this binary measures what the system GUARANTEES, this measures what it
+    // would REPORT. Every incident this repository has recorded lived in the
+    // gap — a fault that fires correctly, logs correctly, and reaches nobody.
+    //
+    // A CloudWatch metric-filter pattern is the ONLY path from a coded ERROR to
+    // a page. The escaped-quote form (`$.code = \"X\"` inside the HCL string)
+    // is what separates a real pattern from prose: `error-code-alarms.tf`
+    // explains at length why a bare `WS-GAP-03` filter would page on every
+    // reconnect, so a scan that counted COMMENTS would report the opposite of
+    // the truth — the exact false-OK this binary exists to refuse.
+    let mut tf = String::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("deploy/aws/terraform")) {
+        for entry in entries.flatten() {
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                tf.push_str(&text);
+                tf.push('\n');
+            }
+        }
+    }
+    let mut alarmed_codes: Vec<&str> = Vec::new();
+    for part in tf.split("$.code = \\\"").skip(1) {
+        if let Some(code) = part.split("\\\"").next()
+            && !code.is_empty()
+            && !alarmed_codes.contains(&code)
+        {
+            alarmed_codes.push(code);
+        }
+    }
+    // Map each live variant to its `code_str()` arm, then ask whether that
+    // string is one an alarm watches.
+    let alarmed = live_variants
+        .iter()
+        .filter(|v| {
+            enum_src
+                .lines()
+                .find_map(|l| {
+                    let t = l.trim();
+                    let (lhs, rhs) = t.split_once(" => \"")?;
+                    (lhs.trim_start_matches("Self::").trim() == v.as_str())
+                        .then(|| rhs.split('"').next().unwrap_or_default())
+                })
+                .is_some_and(|code| alarmed_codes.contains(&code))
+        })
         .count();
-    (variants.len(), live)
+
+    (variants.len(), live_variants.len(), alarmed)
 }
 /// Count occurrences of a needle across a directory tree of `.rs` files.
 ///
@@ -1442,7 +1491,7 @@ fn main() {
         .unwrap_or(0);
     let emitted = distinct_tv_names(Path::new("crates"));
 
-    let (total_codes, live_codes) = error_code_liveness(Path::new("."));
+    let (total_codes, live_codes, alarmed_codes) = error_code_liveness(Path::new("."));
 
     // A metric in the CloudWatch selector is SHIPPED — it costs money every
     // session whether or not anything reads it. A name that appears in no
@@ -1520,6 +1569,26 @@ fn main() {
             Verdict::Bounded,
             format!("{} of {}", unwatched.len(), shipped_names.len()),
             "billed every session, named in no alarm and no widget",
+        ),
+        Row::new(
+            "Live codes that reach a phone",
+            if alarmed_codes > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{alarmed_codes} of {live_codes}"),
+            "named in a CloudWatch metric-filter pattern -- the only path from a coded ERROR to a page",
+        ),
+        Row::new(
+            "Live codes that are log-sink-only",
+            Verdict::Bounded,
+            format!(
+                "{} of {}",
+                live_codes.saturating_sub(alarmed_codes),
+                live_codes
+            ),
+            "they fire, they log, and at 09:15 nobody is reading the log",
         ),
     ];
 

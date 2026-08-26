@@ -681,7 +681,20 @@ async fn probe_via_questdb_now(questdb_config: &QuestDbConfig) -> Result<ClockSk
 pub async fn probe_clock_skew(
     questdb_config: &QuestDbConfig,
 ) -> Result<ClockSkewSample, ClockSkewError> {
-    match probe_via_chronyc() {
+    // `probe_via_chronyc` shells out with the BLOCKING `Command::output()`,
+    // which has no timeout. Called once at boot that is harmless; called on a
+    // 30s loop for the life of the session it would park a tokio worker on
+    // every tick and, if chronyc ever hung, park it permanently. Hand it to
+    // the blocking pool so a stuck probe costs a blocking thread rather than
+    // a runtime worker. `join_error` can only be a panic here (nothing
+    // cancels this handle), and a panicking probe is reported as a probe
+    // failure rather than propagated — the caller's contract is "degrade and
+    // proceed", not "take the process down".
+    let chronyc = match tokio::task::spawn_blocking(probe_via_chronyc).await {
+        Ok(result) => result,
+        Err(join_error) => Err(format!("chronyc probe task failed: {join_error}")),
+    };
+    match chronyc {
         Ok(sample) => {
             // Emit a Prometheus gauge so dashboards can plot drift over
             // time. `tv_clock_skew_seconds` is the canonical metric name.
@@ -725,6 +738,76 @@ pub async fn enforce_clock_skew_at_boot(
         });
     }
     Ok(sample)
+}
+
+/// Re-samples wall-clock skew every
+/// [`CLOCK_SKEW_POLL_INTERVAL_SECS`] for the life of the process, so
+/// `tv_clock_skew_seconds` tracks LIVE drift instead of freezing at its boot
+/// value.
+///
+/// # Why this is not optional
+///
+/// [`probe_clock_skew`] sets a `metrics` gauge. The Prometheus exporter is
+/// built with no idle timeout, so a gauge renders its last value on every
+/// scrape forever. With the boot gate as the only caller, CloudWatch received
+/// the 08:30 reading on every scrape until the box stopped — a dense, healthy
+/// series that could not move. `tv-<env>-clock-skew-high` and the dashboard
+/// panel both read it, and both were therefore reporting a number taken
+/// before the market opened. Drift that developed at 11:00 was invisible to
+/// every surface that exists to catch it.
+///
+/// This does NOT change the boot gate: BOOT-03 still halts a boot that starts
+/// out of tolerance. It changes what happens for the nine hours afterwards.
+///
+/// # Honest envelope
+///
+/// This makes the EXISTING alarm able to see drift; it adds no alarm, no
+/// metric name and no page. A probe that starts failing mid-session (chrony
+/// stopped, QuestDB unreachable) leaves the last good value rendering — the
+/// same staleness in miniature — so the failure is logged with the BOOT-03
+/// code at a power-of-two throttle rather than passing silently. It is
+/// counted by nothing and pages nobody, which is stated here rather than
+/// discovered later.
+pub fn spawn_clock_skew_poller(
+    questdb_config: QuestDbConfig,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick of a tokio interval fires immediately; the boot gate
+        // has just sampled, so skip it rather than probe twice in a second.
+        ticker.tick().await;
+        let mut failures: u64 = 0;
+        loop {
+            ticker.tick().await;
+            match probe_clock_skew(&questdb_config).await {
+                Ok(sample) => {
+                    failures = 0;
+                    debug!(
+                        skew_secs = sample.skew_secs,
+                        source = sample.source,
+                        "clock-skew re-sampled"
+                    );
+                }
+                Err(err) => {
+                    failures = failures.saturating_add(1);
+                    // Power-of-two throttle: a probe that fails every 30s for
+                    // a whole session would otherwise write ~1,000 identical
+                    // lines into a sink whose whole purpose is signal.
+                    if failures.is_power_of_two() {
+                        warn!(
+                            code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded
+                                .code_str(),
+                            consecutive_failures = failures,
+                            error = %err,
+                            "clock-skew re-sample FAILED — tv_clock_skew_seconds is now \
+                             stale and the alarm on it is reading an old value"
+                        );
+                    }
+                }
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
