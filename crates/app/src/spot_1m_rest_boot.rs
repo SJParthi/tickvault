@@ -1278,7 +1278,7 @@ pub(crate) fn today_ist() -> NaiveDate {
 
 /// Retrieval wall-clock instant as IST nanoseconds (`Utc::now()` source ⇒
 /// ADD the IST offset per `data-integrity.md`).
-fn fetched_at_ist_nanos_now() -> i64 {
+pub(crate) fn fetched_at_ist_nanos_now() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or(0)

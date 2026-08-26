@@ -1282,6 +1282,15 @@ pub struct RunReport {
     pub malformed_rows: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
+    /// The vendor's own minute candles, exactly as fetched — added
+    /// 2026-08-26 on operator instruction.
+    ///
+    /// These bars ALREADY existed in memory: the comparison built them,
+    /// judged them, and dropped them. Carrying them out is a move, not a
+    /// copy, so it costs no extra allocation — and it is the difference
+    /// between a comparison that can be re-run offline and one that must
+    /// re-fetch ~868 rate-limited requests to say anything twice.
+    pub rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow>,
 }
 
 /// Read the live side out of QuestDB via `/exec`, bounded by `timeout`.
@@ -1484,6 +1493,13 @@ pub async fn run_cross_verification(
     .await?;
 
     let mut rest: Vec<SideBar> = Vec::new();
+    // The vendor tape, captured as it arrives. Stamped PER TARGET rather than
+    // once for the run: this loop runs for up to ten minutes, so a single
+    // run-level stamp would claim the last instrument was fetched at the same
+    // instant as the first and destroy the one number that says how stale the
+    // vendor's own record was when we read it.
+    let mut rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow> =
+        Vec::new();
     let mut rest_failures = 0usize;
     let mut rest_failure_breakdown = RestFailureBreakdown::default();
     // Bounded sample of the actual messages. A run can fail 815 times; logging
@@ -1537,7 +1553,25 @@ pub async fn run_cross_verification(
         )
         .await
         {
-            Ok(mut bars) => rest.append(&mut bars),
+            Ok(mut bars) => {
+                let fetched_at_nanos = crate::spot_1m_rest_boot::fetched_at_ist_nanos_now();
+                rest_tape.extend(bars.iter().map(|b| {
+                    tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
+                        minute_ts_ist_nanos: b.minute_ts_ist_nanos,
+                        trading_date_ist_nanos: day_start_ist_nanos,
+                        security_id: b.security_id,
+                        segment: b.segment.clone(),
+                        instrument: target.instrument.clone(),
+                        open: b.bar.open_r,
+                        high: b.bar.high_r,
+                        low: b.bar.low_r,
+                        close: b.bar.close_r,
+                        volume: b.bar.volume,
+                        fetched_at_nanos,
+                    }
+                }));
+                rest.append(&mut bars);
+            }
             Err(failure) => {
                 // The reason used to die here as `Err(_)`. See
                 // `XverifyFetchFailureKind` for what that cost.
@@ -1583,6 +1617,7 @@ pub async fn run_cross_verification(
         degraded,
         malformed_rows: live_malformed,
         budget_elapsed,
+        rest_tape,
     })
 }
 
@@ -2769,6 +2804,7 @@ mod tests {
             degraded: true,
             malformed_rows: 0,
             budget_elapsed: true,
+            rest_tape: Vec::new(),
         };
         assert!(report.degraded);
         assert!(report.budget_elapsed);

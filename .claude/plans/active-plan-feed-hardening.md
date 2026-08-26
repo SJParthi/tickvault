@@ -3805,3 +3805,110 @@ while coverage stays above a third; if it falls below, the rotation no longer
 covers everything, and the reported fraction is what would show it. Nothing
 here reduces the 815 fetch failures — that is Item 35's diagnosis, due
 tomorrow.
+
+---
+
+## Item 38 — the vendor's own tape was fetched, judged, and thrown away
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, verbatim: *"see to save this also you need a separte tabel right
+becuase onl yfrom there ou can do the cross evrificationa dn even stroe the
+hisotircla data right even for manaul verificaiton also right dude am ii rght
+dude okay?"*
+
+He is right, and checking confirmed it. `fetch_rest_side_for_target` pulls the
+exchange's own minute candles, `compare_day` judges them, and the bars are
+**dropped**. Only the cells that DISAGREED survive, on the cell-audit table.
+Three consequences, all of which he named:
+
+1. **No manual verification.** "What did Dhan say for this instrument at
+   09:16?" is unanswerable unless that minute happened to diverge.
+2. **No re-verification without re-fetching.** Re-running the comparison means
+   ~868 more requests against a rate-limited vendor budget — so in practice it
+   was never re-run.
+3. **No other analysis.** The vendor's own record did not exist on disk in any
+   form.
+
+Storing the pull turns the comparison into a pure function over two stored
+tables: fetch once, compare as often as you like, offline.
+
+**⚠ The trap that forced a NEW table.** `rest_spot_1m` already exists with
+exactly the right shape — and its DEDUP key is
+`(ts, security_id, exchange_segment, feed)`, which **omits its own `source`
+column**. Writing this 868-instrument sweep there would have silently
+overwritten the per-minute leg's index rows, with no error anywhere. That is
+the third silent-overwrite risk found today. The new table carries `source`
+**in the key from its first line**, so the same collision cannot be introduced
+later by a second writer.
+
+### Edge cases
+
+- **The designated timestamp is the MINUTE, not the run time.** A run-level
+  stamp would file every candle of the day under one instant and make "what
+  was the 09:16 price" unanswerable — the exact question the table was added
+  for.
+- **`fetched_at` is stamped PER TARGET.** The loop runs up to ten minutes; one
+  run-level stamp would claim the last instrument was fetched at the same
+  instant as the first, destroying the only number that says how stale the
+  vendor's record was when read.
+- **`fetched_at` uses the existing IST helper**, not a second clock. The
+  offset rule is already applied there, and a private copy is how the
+  timestamp class that started this whole session gets re-created.
+- **`instrument` is stored verbatim.** A vendor "no candles" answer is
+  identical for a mislabelled instrument and a genuinely untraded one; without
+  the label there is nothing to check against the master afterwards.
+- **Memory.** The bars already exist in memory — carrying them out is a move,
+  not a copy. At full coverage the tape is ~333,000 rows ≈ 37 MB, and today's
+  coverage makes it far smaller.
+
+### Failure modes
+
+**A future "simplification" pointing this writer at the sibling table** —
+pinned by a test asserting the table names differ, with the collision spelled
+out at the assertion.
+
+**A half-registered table.** A table whose CREATE lands without a DEDUP ENABLE
+auto-creates on first write with **no dedup at all** — a silent duplicate-row
+window. The DDL test now checks per table (one CREATE, one DEDUP ENABLE, one
+ALTER per declared column) rather than one total, so a half-registered table
+fails loudly instead of sliding under a sum that still adds up.
+
+**Silent reversion to fetch-and-discard** — pinned by a source scan of the
+persist function.
+
+### Test plan
+
+7 storage tests: `source` is in the key; `security_id` is paired with
+`segment` and `feed` is in-key; the designated timestamp is the minute; the
+asked-with label survives; the DDL is registered with dedup enabled; two
+identical rows produce byte-identical wire output; the table is not the
+sibling table.
+
+2 app wiring tests: the tape is persisted and partial writes counted; the
+stamp is taken inside the fetch loop, before the rows that carry it.
+
+**Bite-proven:** dropping `source` from the key fails 2; disabling the persist
+call fails 2.
+
+### Rollback
+
+Delete the table constants, DDL, writer method, the `rest_tape` field, and the
+persist loop. That restores a comparison whose raw input exists nowhere.
+
+### Observability
+
+**No new metric name and no cost.** Tape rows count into the existing persist
+counter; partial tape writes ride the existing partial-write error line.
+
+### Honest envelope
+
+This stores what we fetched. It does **not** increase what we fetch — the
+tape is exactly as complete as the run that produced it, so at today's 0.09%
+coverage the stored tape is equally sparse. It also stores only the VENDOR
+side; our own candles already live in the live tables, and joining them is the
+reader's job. Retention is the table's default partitioning — no archival
+policy is registered for it here, so it grows with the hot window like its
+siblings.
