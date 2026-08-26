@@ -45,7 +45,7 @@ use tickvault_core::websocket::pool_supervisor::{LiveSubscriptionCommand, Subscr
 
 use crate::depth200_atm::{
     ChainMinute, Depth200AtmConfig, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair,
-    TopMoverPick, TopMoverSocket, plan_swaps,
+    TOP_MOVER_CONFIRM_OBSERVATIONS, TopMoverPick, TopMoverSocket, plan_swaps,
 };
 use crate::dhan_depth_universe::{DepthCandidate, contract_segment_for_underlying};
 use crate::dhan_feed_stack::ist_second_of_day_now;
@@ -774,7 +774,21 @@ pub async fn run_depth_rebalance(
     }
     pre_register_rebalance_counters();
     let mut tracker = Depth200AtmTracker::new(Depth200AtmConfig::default());
-    let mut top_mover = TopMoverSocket::default();
+    // Seed the fifth socket's tracker from what the dial actually put on it.
+    //
+    // A fresh tracker holds nothing, so its first minute would report a first
+    // adoption and subscribe a contract the connection is already holding.
+    // Dhan answers a duplicate subscription with an 804, which is Fatal and
+    // drops the connection — losing the socket on its first minute from a
+    // message that was never needed. Read from the socket rather than passed
+    // in, so the seed cannot disagree with the wire.
+    let mut top_mover = match sockets
+        .get(crate::depth200_atm::DEPTH_200_TOP_MOVER_SOCKET)
+        .and_then(|s| s.held)
+    {
+        Some(held) => TopMoverSocket::seeded(held, TOP_MOVER_CONFIRM_OBSERVATIONS),
+        None => TopMoverSocket::default(),
+    };
     tracing::info!(
         sockets = sockets.len(),
         offset_secs = REBALANCE_OFFSET_SECS,
@@ -815,6 +829,48 @@ pub async fn run_depth_rebalance(
             "depth rebalance moved sockets"
         );
     }
+}
+
+/// The instrument the fifth depth-200 socket should be dialed with.
+///
+/// Composes the same three pieces the per-minute rebalance uses — the
+/// candidate slice, the movers ranking, and [`top_mover_pick`] — so the
+/// contract dialed at attach is chosen by exactly the rule that will steer it
+/// afterwards. A different rule here would mean the socket's first contract is
+/// one the rebalance would never have picked, and its first minute would be a
+/// swap away from it.
+///
+/// `None` on a flat or unreadable morning, which is the NORMAL state before
+/// the open: no stock has a measurable move yet, so there is nothing to put on
+/// the socket and dialing it with a guess would subscribe a book nobody asked
+/// for.
+// TEST-EXEMPT: async composition of load_depth_candidates + fetch_movers + top_mover_pick, each separately tested.
+pub async fn top_mover_instrument(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    today_ymd: u32,
+    today_ist_micros: i64,
+) -> Option<SubscribeInstrument> {
+    let movers = fetch_movers(questdb, today_ist_micros).await;
+    if movers.is_empty() {
+        return None;
+    }
+    let candidates =
+        crate::dhan_depth_universe::load_depth_candidates(questdb, date_ist, today_ymd).await;
+    let pick = top_mover_pick(&movers, &candidates)?;
+    let security_id = u64::try_from(pick.leg_security_id()).ok()?;
+    if security_id == 0 {
+        // Instrument 0 is a well-formed subscription that returns nothing
+        // forever and looks entirely healthy. `top_mover_pick` already refuses
+        // a non-positive id, so reaching here means the pair carried one leg
+        // that was usable and one that was not; refusing is the only honest
+        // answer for the leg we actually need.
+        return None;
+    }
+    Some(SubscribeInstrument {
+        security_id,
+        segment: pick.contract_segment,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -1837,5 +1893,78 @@ mod schedule_tests {
         // step behind all session — which looks exactly like working.
         assert!(MOVERS_QUERY_TIMEOUT_SECS < 60);
         assert!(MOVERS_QUERY_TIMEOUT_SECS > 0);
+    }
+}
+
+#[cfg(test)]
+mod fifth_socket_tests {
+    use super::*;
+    use crate::depth200_atm::DEPTH_200_TOP_MOVER_SOCKET;
+
+    #[test]
+    fn the_fifth_socket_index_is_the_last_of_the_authorized_connections() {
+        // The index the planner names and the connection the dial creates must
+        // be the same socket. `plan_pool` assigns instruments to connections
+        // in order, so five depth-200 instruments become indices 0..4 — and 4
+        // is where the top mover belongs. Off by one here and the top mover
+        // would land on BANKNIFTY's put socket, which is a valid subscription
+        // to entirely the wrong contract.
+        assert_eq!(
+            DEPTH_200_TOP_MOVER_SOCKET,
+            crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS - 1
+        );
+    }
+
+    #[test]
+    fn the_pair_budget_stays_even_so_no_lone_leg_can_strand() {
+        // The reason the two budgets are separate constants. An odd PAIR
+        // budget lets the selector reach for a third underlying and stop
+        // half-way, filling the fifth socket with a lone leg — the exact shape
+        // the 2026-08-26 retirement removed.
+        assert_eq!(crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS % 2, 0);
+        assert!(
+            crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS
+                < crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS
+        );
+    }
+
+    #[test]
+    fn the_four_pair_sockets_and_the_fifth_together_are_the_whole_budget() {
+        assert_eq!(
+            crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS + 1,
+            crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS
+        );
+    }
+
+    #[test]
+    fn the_attach_dials_the_fifth_socket_from_the_same_rule_that_steers_it() {
+        // If the dial picked by a different rule, the socket's first contract
+        // would be one the rebalance would never have chosen, and its first
+        // real minute would be a swap away from it — a wasted wire call on
+        // every session start.
+        let source = include_str!("dhan_feed_stack.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("crate::depth_rebalance::top_mover_instrument("),
+            "the fifth socket must be dialed by top_mover_instrument, which composes the \
+             same pieces the per-minute rebalance uses"
+        );
+    }
+
+    #[test]
+    fn the_loop_seeds_its_tracker_from_the_socket_rather_than_a_parameter() {
+        // A seed passed in can disagree with the wire; a seed read from the
+        // socket cannot. And an unseeded tracker re-subscribes what the dial
+        // already placed, which Dhan answers with a Fatal 804.
+        let source = include_str!("depth_rebalance.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("TopMoverSocket::seeded(held,"),
+            "the rebalance loop must seed the top-mover tracker from what the socket holds"
+        );
     }
 }

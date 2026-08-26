@@ -6255,6 +6255,49 @@ async fn attach_depth_when_available(
             }
         };
 
+        // The FIFTH depth-200 socket: the day's biggest mover.
+        //
+        // It cannot come from the pair selector. That selector fills in PAIRS
+        // and its budget is even precisely so a half-filled pair can never
+        // strand a lone leg on an odd socket. So the fifth is appended here,
+        // from a different question entirely — which stock has moved furthest
+        // today — and only when the four ATM sockets are already accounted
+        // for.
+        //
+        // Appended BEFORE planning, not dialed separately, because `plan_pool`
+        // assigns instruments to connections in order: five depth-200
+        // instruments become five connections at indices 0..4, and index 4 is
+        // exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it afterwards would
+        // need the pool a second time, which one task cannot hold twice.
+        let mut selection = selection;
+        if !depth_done
+            && selection.depth_200.len() == crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS
+        {
+            if let Some(fifth) = crate::depth_rebalance::top_mover_instrument(
+                &questdb,
+                &today_date,
+                ymd_from_ist_date(&today_date),
+                today_nanos / 1_000,
+            )
+            .await
+            {
+                selection.depth_200.push(fifth);
+                info!(
+                    security_id = fifth.security_id,
+                    "depth-200: the fifth socket takes the day's biggest mover"
+                );
+            } else {
+                // Normal before the open and on a flat morning: no stock has a
+                // measurable move yet, so there is nothing to put on it. The
+                // retry loop asks again; if the whole session stays flat the
+                // socket simply goes unused, which is honest.
+                tracing::debug!(
+                    "depth-200: no leading mover yet — the fifth socket stays undialed this \
+                     attempt"
+                );
+            }
+        }
+
         // The contract universe rides the SAME retry loop, and that is not a
         // convenience — both wait on evidence that only exists after the open
         // (depth on the chain leg's first publish, contracts on the first

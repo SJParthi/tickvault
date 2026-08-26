@@ -715,6 +715,34 @@ impl TopMoverSocket {
         }
     }
 
+    /// A tracker that already holds what the dial put on its socket.
+    ///
+    /// # Why this is not the same as `new` followed by a first observation
+    ///
+    /// A fresh tracker holds nothing, so its first minute reports a FIRST
+    /// ADOPTION and asks the caller to subscribe. If the connection was dialed
+    /// WITH that contract — which it now is, the fifth socket being dialed
+    /// with the leading mover — that subscribe is a duplicate: Dhan answers a
+    /// second subscription for an instrument the connection already holds with
+    /// an 804, which is Fatal and drops the connection. Losing the socket on
+    /// its first minute, from a redundant message, is a poor way to start.
+    ///
+    /// Seeding also makes the first REAL switch a swap rather than an
+    /// adoption, which is what the wire needs: the old contract must be
+    /// unsubscribed before the new one is added, or the connection briefly
+    /// holds two and earns the same 804.
+    #[must_use]
+    pub const fn seeded(subscribed: SubscribeInstrument, confirm_required: u32) -> Self {
+        Self {
+            subscribed: Some(subscribed),
+            candidate: None,
+            confirm_required: if confirm_required == 0 {
+                1
+            } else {
+                confirm_required
+            },
+        }
+    }
     /// What this socket currently carries.
     #[must_use]
     pub const fn subscribed(&self) -> Option<SubscribeInstrument> {
@@ -1688,5 +1716,91 @@ mod tests {
              boundary. They must not share a confirmation count."
         );
         assert_eq!(DEPTH_200_TOP_MOVER_SOCKET, 4, "sockets 0-3 are the indices");
+    }
+}
+
+#[cfg(test)]
+mod seeded_tests {
+    use super::*;
+
+    fn instrument(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+        }
+    }
+
+    fn pick(id: u64, pct: f64, ce: i64, pe: i64) -> TopMoverPick {
+        TopMoverPick {
+            underlying_security_id: id,
+            contract_segment: ExchangeSegment::NseFno,
+            pct_change: pct,
+            atm_ce_security_id: ce,
+            atm_pe_security_id: pe,
+        }
+    }
+
+    #[test]
+    fn a_seeded_socket_does_not_re_subscribe_what_it_already_holds() {
+        // The failure this prevents is immediate and fatal: Dhan answers a
+        // duplicate subscription with an 804, which drops the connection. A
+        // fresh tracker would report a first adoption on minute one and ask
+        // the caller to subscribe a contract the dial already put on the wire.
+        let mut socket = TopMoverSocket::seeded(instrument(601), TOP_MOVER_CONFIRM_OBSERVATIONS);
+        let same = pick(10, 5.0, 601, 602);
+        assert_eq!(
+            socket.observe(Some(&same)),
+            Err(NoTopMoverSwitch::AlreadySubscribed)
+        );
+    }
+
+    #[test]
+    fn a_seeded_socket_reports_its_seed_as_subscribed() {
+        let socket = TopMoverSocket::seeded(instrument(601), TOP_MOVER_CONFIRM_OBSERVATIONS);
+        assert_eq!(socket.subscribed(), Some(instrument(601)));
+    }
+
+    #[test]
+    fn the_first_real_change_on_a_seeded_socket_is_a_swap_not_an_adoption() {
+        // The wire needs the old contract unsubscribed before the new one is
+        // added, or the connection briefly holds two and earns the same 804.
+        // An adoption carries no old and would skip the unsubscribe.
+        let mut socket = TopMoverSocket::seeded(instrument(601), TOP_MOVER_CONFIRM_OBSERVATIONS);
+        let challenger = pick(20, 9.0, 701, 702);
+        let mut switch = None;
+        for _ in 0..TOP_MOVER_CONFIRM_OBSERVATIONS + 1 {
+            if let Ok(s) = socket.observe(Some(&challenger)) {
+                switch = Some(s);
+                break;
+            }
+        }
+        let switch = switch.expect("a held challenger must eventually switch");
+        assert_eq!(
+            switch.from,
+            Some(instrument(601)),
+            "a seeded socket must swap FROM its seed"
+        );
+        assert_eq!(switch.to, instrument(701));
+        assert_ne!(switch.reason, TopMoverSwitchReason::FirstAdoption);
+        assert!(
+            TopMoverSocket::plan(&switch).is_some(),
+            "a swap must produce wire work; an adoption would not"
+        );
+    }
+
+    #[test]
+    fn a_zero_confirmation_seed_is_clamped_like_a_fresh_one() {
+        let mut socket = TopMoverSocket::seeded(instrument(601), 0);
+        let challenger = pick(20, 9.0, 701, 702);
+        // Clamped to one, so the FIRST sighting of a challenger switches —
+        // but it must still be one sighting, not zero.
+        assert!(socket.observe(Some(&challenger)).is_ok());
+    }
+
+    #[test]
+    fn a_seeded_socket_with_no_ranking_keeps_its_seed() {
+        let mut socket = TopMoverSocket::seeded(instrument(601), TOP_MOVER_CONFIRM_OBSERVATIONS);
+        assert_eq!(socket.observe(None), Err(NoTopMoverSwitch::NoMover));
+        assert_eq!(socket.subscribed(), Some(instrument(601)));
     }
 }
