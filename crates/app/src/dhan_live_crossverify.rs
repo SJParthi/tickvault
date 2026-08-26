@@ -541,6 +541,42 @@ pub struct DayComparison {
     pub noise_p50_paise: i64,
     pub noise_p95_paise: i64,
     pub noise_max_paise: i64,
+
+    // ---- volume, added 2026-08-26 ----------------------------------
+    //
+    // Until today the comparison checked open/high/low/close and NOTHING
+    // else. Volume rode along on every finding row and was never once
+    // compared, so "does our volume agree with the exchange's?" had no
+    // answer anywhere in the system — while a live volume defect measured
+    // on 2026-08-24 had the intraday frames at ~9.2x the day bar with 6,088
+    // instruments disagreeing with their own minute sums.
+    //
+    // Volume is reported as a CAPTURE PERCENTAGE (ours as a share of
+    // theirs), not as a pass/fail. That is the honest shape for this pair:
+    // our live feed is a conflated ~1/sec sample and theirs is the full
+    // tape, so under-capture is STRUCTURAL and expected. A strict equality
+    // check would flag nearly every cell and drown the price signal it sits
+    // beside.
+    //
+    // It deliberately does NOT feed `cells_diverged` or the outcome. A
+    // threshold needs a baseline, and no baseline exists yet — this is the
+    // measurement that creates one. Same discipline the price side already
+    // applies by quantifying its noise instead of asserting a limit.
+    /// Cells where both sides carried a usable volume (theirs > 0).
+    pub volume_cells: i64,
+    /// Of those, how many matched to the unit.
+    pub volume_exact: i64,
+    /// Our volume as a percentage of theirs — median, and the 5th
+    /// percentile (the bad tail). 100 means we saw everything they did.
+    pub volume_capture_p50_pct: i64,
+    pub volume_capture_p05_pct: i64,
+    /// Worst SINGLE cell. Added after a test caught the gap: `percentile`
+    /// here is linear-rank, so at n=20 the 5th percentile lands on the
+    /// second-smallest value and one catastrophic minute is invisible to
+    /// it. p05 describes the distribution; this describes the worst thing
+    /// that actually happened. The price side reports `max` for exactly
+    /// the same reason — volume's bad direction is simply down.
+    pub volume_capture_min_pct: i64,
 }
 
 impl DayComparison {
@@ -624,6 +660,9 @@ pub fn compare_day(
     let mut diffs: Vec<i64> = Vec::new();
     let mut minutes_compared: i64 = 0;
     let mut cells_diverged: i64 = 0;
+    let mut volume_cells: i64 = 0;
+    let mut volume_exact: i64 = 0;
+    let mut volume_capture: Vec<i64> = Vec::new();
     let mut missing_live: i64 = 0;
     let mut missing_rest: i64 = 0;
     let mut tail_unsealed: i64 = 0;
@@ -661,6 +700,32 @@ pub fn compare_day(
                             diff_paise: diff,
                         });
                     }
+                }
+
+                // Volume — MEASURED, never a verdict. See the volume block
+                // on `DayComparison` for why this is a capture percentage
+                // and not a pass/fail.
+                //
+                // Their volume is the denominator, so a zero or negative one
+                // is skipped rather than divided by: a minute the vendor
+                // reports as untraded says nothing about our capture, and
+                // counting it as 0% would drag the median toward a number
+                // that means "no trades happened", not "we missed them".
+                if r.bar.volume > 0 {
+                    volume_cells = volume_cells.saturating_add(1);
+                    if l.bar.volume == r.bar.volume {
+                        volume_exact = volume_exact.saturating_add(1);
+                    }
+                    // Integer arithmetic throughout — a float ratio here
+                    // would be the one place in this module that compares
+                    // by epsilon, which its own header forbids.
+                    let pct = l
+                        .bar
+                        .volume
+                        .saturating_mul(100)
+                        .checked_div(r.bar.volume)
+                        .unwrap_or(0);
+                    volume_capture.push(pct);
                 }
             }
             (None, Some(r)) => {
@@ -711,6 +776,10 @@ pub fn compare_day(
     }
 
     diffs.sort_unstable();
+    volume_capture.sort_unstable();
+    let volume_capture_p50_pct = percentile(&volume_capture, 0.50);
+    let volume_capture_p05_pct = percentile(&volume_capture, 0.05);
+    let volume_capture_min_pct = volume_capture.first().copied().unwrap_or(0);
     let noise_p50_paise = percentile(&diffs, 0.50);
     let noise_p95_paise = percentile(&diffs, 0.95);
     let noise_max_paise = diffs.last().copied().unwrap_or(0);
@@ -782,6 +851,11 @@ pub fn compare_day(
         noise_p50_paise,
         noise_p95_paise,
         noise_max_paise,
+        volume_cells,
+        volume_exact,
+        volume_capture_p50_pct,
+        volume_capture_p05_pct,
+        volume_capture_min_pct,
     }
 }
 
@@ -988,12 +1062,176 @@ pub struct XverifyTarget {
     pub instrument: String,
 }
 
+// ---------------------------------------------------------------------------
+// REST fetch failure — typed, because the reason used to be thrown away
+// ---------------------------------------------------------------------------
+
+/// Why one target's REST fetch did not produce comparable bars.
+///
+/// # Why this type exists (measured, 2026-08-26)
+///
+/// [`fetch_rest_side_for_target`] has always built a precise reason string for
+/// every failure mode — and its only caller matched it as `Err(_)`, counted
+/// `rest_failures += 1`, and dropped the reason on the floor. The consequence
+/// was visible on the live box and unexplainable from it:
+///
+/// | session | targets | `rest_failures` | actually compared |
+/// |---|---:|---:|---:|
+/// | 2026-08-24 | 864 | **814** | ~50 |
+/// | 2026-08-25 | 865 | **815** | ~50 |
+///
+/// So the lane's ONLY ground truth ran every day at 94% blind, reported the
+/// blindness honestly as a single number, and gave nobody a way to act on it.
+/// A count without a cause is a symptom you cannot treat.
+///
+/// The kinds below are a CLOSED, bounded set so the breakdown can be logged
+/// (and, if it ever earns a metric, labelled) without unbounded cardinality —
+/// an HTTP status is folded to its class, never carried verbatim.
+///
+/// [`Self::RateLimited`] is derived from the REAL [`reqwest::StatusCode`],
+/// never a substring scan of the message — the same discipline the spot-1m leg
+/// records for feeding its self-tuner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XverifyFetchFailureKind {
+    /// The vendor answered 2xx with a body carrying no usable candle for the
+    /// day. This is the shape a WRONG `instrument` label produces, and it is
+    /// also the shape a genuinely untraded instrument produces — the two are
+    /// indistinguishable from one response, which is why the count matters.
+    NoCandles,
+    /// HTTP 429 — the Dhan Data-API budget was exceeded.
+    RateLimited,
+    /// Any other 4xx. A wrong request shape, a bad token, a rejected id.
+    Http4xx,
+    /// Any 5xx — the vendor's own failure.
+    Http5xx,
+    /// The request or the body read exceeded the per-fetch timeout.
+    Timeout,
+    /// Transport-level failure before a status existed (DNS, TLS, reset).
+    Transport,
+    /// Anything the arms above do not cover — kept so the set is total and a
+    /// future arm can never silently fold into a neighbour's count.
+    Other,
+}
+
+impl XverifyFetchFailureKind {
+    /// Stable, lowercase, bounded label — safe for a log field or a metric.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandles => "no_candles",
+            Self::RateLimited => "rate_limited",
+            Self::Http4xx => "http_4xx",
+            Self::Http5xx => "http_5xx",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every kind, in report order. Used by the breakdown so a new arm cannot
+    /// be added without appearing in the log line.
+    #[must_use]
+    pub const fn all() -> [Self; 7] {
+        [
+            Self::NoCandles,
+            Self::RateLimited,
+            Self::Http4xx,
+            Self::Http5xx,
+            Self::Timeout,
+            Self::Transport,
+            Self::Other,
+        ]
+    }
+}
+
+/// A typed fetch failure: the bounded kind for counting, plus the full message
+/// for a bounded log sample.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XverifyFetchFailure {
+    pub kind: XverifyFetchFailureKind,
+    pub msg: String,
+}
+
+impl XverifyFetchFailure {
+    fn new(kind: XverifyFetchFailureKind, msg: impl Into<String>) -> Self {
+        Self {
+            kind,
+            msg: msg.into(),
+        }
+    }
+}
+
+/// Per-kind tally of one run's REST failures.
+///
+/// Deliberately a fixed-width array over [`XverifyFetchFailureKind::all`], not
+/// a map: the kind set is closed, so the tally is O(1) in space and the log
+/// line's shape is stable from run to run — an operator comparing two days is
+/// comparing the same fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestFailureBreakdown {
+    counts: [usize; 7],
+}
+
+impl RestFailureBreakdown {
+    /// Records one failure.
+    pub fn record(&mut self, kind: XverifyFetchFailureKind) {
+        let idx = XverifyFetchFailureKind::all()
+            .iter()
+            .position(|k| *k == kind)
+            .unwrap_or(XverifyFetchFailureKind::all().len() - 1);
+        if let Some(slot) = self.counts.get_mut(idx) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// Count for one kind.
+    #[must_use]
+    pub fn get(&self, kind: XverifyFetchFailureKind) -> usize {
+        XverifyFetchFailureKind::all()
+            .iter()
+            .position(|k| *k == kind)
+            .and_then(|i| self.counts.get(i))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Total across every kind — must equal `RunReport::rest_failures`.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.counts.iter().fold(0usize, |a, b| a.saturating_add(*b))
+    }
+
+    /// `kind=count` pairs, dominant kind FIRST, for the log line. Zero-count
+    /// kinds are omitted so a quiet run stays short; an all-zero breakdown
+    /// renders as `none`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut pairs: Vec<(XverifyFetchFailureKind, usize)> = XverifyFetchFailureKind::all()
+            .into_iter()
+            .map(|k| (k, self.get(k)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
+        if pairs.is_empty() {
+            return "none".to_string();
+        }
+        pairs
+            .into_iter()
+            .map(|(k, n)| format!("{}={n}", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// What one run did — returned to the caller for logging and metrics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunReport {
     pub comparison: DayComparison,
     /// Targets whose REST fetch failed, timed out, or returned no candles.
     pub rest_failures: usize,
+    /// Per-reason tally of those failures. Added 2026-08-26: `rest_failures`
+    /// alone said 815-of-865 without ever saying WHY.
+    pub rest_failure_breakdown: RestFailureBreakdown,
     /// `true` when any leg failed, the live read truncated, or the run budget
     /// elapsed — forces the verdict down to `partial` / `degraded`.
     pub degraded: bool,
@@ -1035,6 +1273,28 @@ pub async fn read_live_side(
     parse_live_dataset(&body, LIVE_ROW_LIMIT)
 }
 
+/// Maps a non-success HTTP status to a bounded failure kind. Pure.
+///
+/// Split out of the fetch path so it is directly testable — the alternative is
+/// a guard that greps for the branch spelling, and this session has already
+/// found three such guards asserting a spelling while the consequence was free
+/// to change underneath them.
+///
+/// Classification is from the REAL [`reqwest::StatusCode`], never a substring
+/// scan of a rendered message.
+#[must_use]
+pub fn classify_http_status(status: reqwest::StatusCode) -> XverifyFetchFailureKind {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        XverifyFetchFailureKind::RateLimited
+    } else if status.is_client_error() {
+        XverifyFetchFailureKind::Http4xx
+    } else if status.is_server_error() {
+        XverifyFetchFailureKind::Http5xx
+    } else {
+        XverifyFetchFailureKind::Other
+    }
+}
+
 /// Fetch ONE target's official 1-minute tape from Dhan, bounded by `timeout`.
 ///
 /// The ONLY endpoint this module ever contacts:
@@ -1052,10 +1312,11 @@ pub async fn fetch_rest_side_for_target(
     target: &XverifyTarget,
     trading_date: chrono::NaiveDate,
     timeout: std::time::Duration,
-) -> Result<Vec<SideBar>, String> {
+) -> Result<Vec<SideBar>, XverifyFetchFailure> {
+    use XverifyFetchFailureKind as K;
     let next_day = trading_date
         .succ_opt()
-        .ok_or_else(|| "trading date has no successor".to_string())?;
+        .ok_or_else(|| XverifyFetchFailure::new(K::Other, "trading date has no successor"))?;
     let body = crate::dhan_intraday_parse::intraday_request_body(
         &target.security_id.to_string(),
         &target.segment,
@@ -1071,25 +1332,76 @@ pub async fn fetch_rest_side_for_target(
         .send();
     let resp = tokio::time::timeout(timeout, fut)
         .await
-        .map_err(|_| "rest fetch timed out".to_string())?
+        .map_err(|_| XverifyFetchFailure::new(K::Timeout, "rest fetch timed out"))?
         // The token never appears in the error: reqwest renders the URL, not
         // headers, and the URL carries no query params here.
-        .map_err(|e| format!("rest fetch transport: {e}"))?;
+        .map_err(|e| {
+            XverifyFetchFailure::new(K::Transport, format!("rest fetch transport: {e}"))
+        })?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("rest fetch http {status}"));
+        // Classified from the REAL StatusCode, never a substring scan of the
+        // rendered message — the discipline the spot-1m leg records for
+        // feeding its self-tuner, and the reason `rate_limited` here can be
+        // trusted as an answer rather than a guess.
+        return Err(XverifyFetchFailure::new(
+            classify_http_status(status),
+            format!("rest fetch http {status}"),
+        ));
     }
     let text = tokio::time::timeout(timeout, resp.text())
         .await
-        .map_err(|_| "rest body timed out".to_string())?
-        .map_err(|e| format!("rest body: {e}"))?;
+        .map_err(|_| XverifyFetchFailure::new(K::Timeout, "rest body timed out"))?
+        .map_err(|e| XverifyFetchFailure::new(K::Transport, format!("rest body: {e}")))?;
     let candles = crate::dhan_intraday_parse::parse_intraday_1m_candles(&text);
     let (bars, malformed) =
         rest_candles_to_side_bars(&candles, target.security_id, &target.segment);
     if bars.is_empty() && malformed == 0 {
-        return Err("rest returned no candles".to_string());
+        return Err(XverifyFetchFailure::new(
+            K::NoCandles,
+            "rest returned no candles",
+        ));
     }
     Ok(bars)
+}
+
+/// [`fetch_rest_side_for_target`], paced against the shared Dhan Data-API
+/// budget and feeding the self-tuner on a real 429.
+///
+/// # Why this wrapper exists (2026-08-26)
+///
+/// The run's fetch loop issued its targets **back-to-back with no pacing at
+/// all** — ~865 requests against a documented 5-per-second Data-API budget —
+/// while the two sibling REST legs (spot-1m and the option chain) have both
+/// gone through the shared self-tuning limiter since 2026-07-14. This leg was
+/// the odd one out, and an unpaced burst is a defect on its own terms whether
+/// or not it is the cause of any particular day's failures.
+///
+/// **Stated honestly: this is hygiene, not a claimed cure.** Whether rate
+/// limiting is what blinded the comparator is exactly what the new
+/// [`RestFailureBreakdown`] answers — and the two changes do not confound each
+/// other, because the breakdown labels the outcome that actually occurred. If
+/// tomorrow reports `rate_limited=0`, pacing was never the cause and the
+/// dominant label names the real one.
+async fn fetch_rest_side_paced(
+    client: &reqwest::Client,
+    intraday_url: &str,
+    jwt: &str,
+    target: &XverifyTarget,
+    trading_date: chrono::NaiveDate,
+    timeout: std::time::Duration,
+) -> Result<Vec<SideBar>, XverifyFetchFailure> {
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
+    let out =
+        fetch_rest_side_for_target(client, intraday_url, jwt, target, trading_date, timeout).await;
+    if let Err(f) = &out
+        && f.kind == XverifyFetchFailureKind::RateLimited
+    {
+        crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+    }
+    out
 }
 
 /// Run one full cross-verification and return the report. COLD PATH.
@@ -1130,7 +1442,15 @@ pub async fn run_cross_verification(
 
     let mut rest: Vec<SideBar> = Vec::new();
     let mut rest_failures = 0usize;
+    let mut rest_failure_breakdown = RestFailureBreakdown::default();
+    // Bounded sample of the actual messages. A run can fail 815 times; logging
+    // 815 lines would bury the verdict it exists to deliver, and logging none
+    // is what left the failure unexplainable for two sessions. Three is enough
+    // to read the shape and small enough to never flood.
+    const FAILURE_SAMPLE_MAX: usize = 3;
+    let mut failure_samples: Vec<String> = Vec::with_capacity(FAILURE_SAMPLE_MAX);
     let mut budget_elapsed = false;
+    let target_count = targets.len();
     for target in targets {
         if started.elapsed() >= budget {
             // Stop issuing work; the verdict degrades rather than pretending
@@ -1138,7 +1458,7 @@ pub async fn run_cross_verification(
             budget_elapsed = true;
             break;
         }
-        match fetch_rest_side_for_target(
+        match fetch_rest_side_paced(
             client,
             intraday_url,
             jwt,
@@ -1149,7 +1469,18 @@ pub async fn run_cross_verification(
         .await
         {
             Ok(mut bars) => rest.append(&mut bars),
-            Err(_) => rest_failures = rest_failures.saturating_add(1),
+            Err(failure) => {
+                // The reason used to die here as `Err(_)`. See
+                // `XverifyFetchFailureKind` for what that cost.
+                rest_failures = rest_failures.saturating_add(1);
+                rest_failure_breakdown.record(failure.kind);
+                if failure_samples.len() < FAILURE_SAMPLE_MAX {
+                    failure_samples.push(format!(
+                        "{}/{} {}: {}",
+                        target.segment, target.security_id, target.instrument, failure.msg
+                    ));
+                }
+            }
         }
     }
 
@@ -1164,9 +1495,22 @@ pub async fn run_cross_verification(
         degraded,
     );
 
+    if rest_failures > 0 {
+        // ONE line, not 815. The breakdown answers "why", the sample shows
+        // what one looks like, and both live beside the verdict rather than in
+        // a separate stream the operator would have to correlate by hand.
+        tracing::warn!(
+            rest_failures,
+            targets = target_count,
+            reasons = %rest_failure_breakdown.summary(),
+            sample = ?failure_samples,
+            "Dhan cross-verification could not fetch the vendor tape for some targets —              each one is an instrument captured but NOT verified today"
+        );
+    }
     Ok(RunReport {
         comparison,
         rest_failures,
+        rest_failure_breakdown,
         degraded,
         malformed_rows: live_malformed,
         budget_elapsed,
@@ -2352,6 +2696,7 @@ mod tests {
         let report = RunReport {
             comparison: degraded,
             rest_failures: 3,
+            rest_failure_breakdown: RestFailureBreakdown::default(),
             degraded: true,
             malformed_rows: 0,
             budget_elapsed: true,
@@ -2359,5 +2704,316 @@ mod tests {
         assert!(report.degraded);
         assert!(report.budget_elapsed);
         assert!(!report.comparison.outcome.is_pass());
+    }
+
+    // -----------------------------------------------------------------
+    // REST failure classification — added 2026-08-26
+    //
+    // The comparator ran at 94% blind on two consecutive sessions
+    // (814/864 then 815/865 fetches failed) and could not say why,
+    // because its only caller matched `Err(_)` and dropped the reason.
+    // These tests pin the reason surviving.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn every_failure_kind_has_a_distinct_stable_label() {
+        let all = XverifyFetchFailureKind::all();
+        let labels: std::collections::BTreeSet<&str> = all.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            all.len(),
+            "two kinds share a label — their counts would silently merge, \
+             which is the collapse this classification exists to prevent"
+        );
+        for l in &labels {
+            assert!(
+                !l.is_empty()
+                    && l.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "label {l:?} must stay a bounded lowercase token — it is a log field \
+                 and a candidate metric label"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_429_classifies_as_rate_limited_not_as_a_generic_4xx() {
+        // The distinction is the whole point: `rate_limited` is actionable
+        // (pace the loop), a generic 4xx is not (fix the request).
+        assert_eq!(
+            classify_http_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            XverifyFetchFailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_http_status(reqwest::StatusCode::BAD_REQUEST),
+            XverifyFetchFailureKind::Http4xx
+        );
+        assert_eq!(
+            classify_http_status(reqwest::StatusCode::UNAUTHORIZED),
+            XverifyFetchFailureKind::Http4xx
+        );
+        assert_eq!(
+            classify_http_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            XverifyFetchFailureKind::Http5xx
+        );
+        assert_eq!(
+            classify_http_status(reqwest::StatusCode::BAD_GATEWAY),
+            XverifyFetchFailureKind::Http5xx
+        );
+        // 429 is a client error, so a naive `is_client_error()` first would
+        // swallow it. Order matters, and this asserts the order.
+        assert!(reqwest::StatusCode::TOO_MANY_REQUESTS.is_client_error());
+    }
+
+    #[test]
+    fn breakdown_total_always_equals_the_failure_count() {
+        let mut b = RestFailureBreakdown::default();
+        assert_eq!(b.total(), 0);
+        assert_eq!(b.summary(), "none");
+        for _ in 0..815 {
+            b.record(XverifyFetchFailureKind::NoCandles);
+        }
+        for _ in 0..4 {
+            b.record(XverifyFetchFailureKind::RateLimited);
+        }
+        b.record(XverifyFetchFailureKind::Timeout);
+        assert_eq!(b.get(XverifyFetchFailureKind::NoCandles), 815);
+        assert_eq!(b.get(XverifyFetchFailureKind::RateLimited), 4);
+        assert_eq!(b.get(XverifyFetchFailureKind::Timeout), 1);
+        assert_eq!(b.get(XverifyFetchFailureKind::Http5xx), 0);
+        assert_eq!(
+            b.total(),
+            820,
+            "the breakdown must account for EVERY failure — a total that \
+             undercounts would let a whole reason class hide"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_dominant_reason_first_and_omits_the_zeroes() {
+        let mut b = RestFailureBreakdown::default();
+        b.record(XverifyFetchFailureKind::Timeout);
+        for _ in 0..9 {
+            b.record(XverifyFetchFailureKind::NoCandles);
+        }
+        let s = b.summary();
+        assert!(
+            s.starts_with("no_candles=9"),
+            "the dominant reason must lead — an operator reading one line \
+             should see the cause first, got {s:?}"
+        );
+        assert!(s.contains("timeout=1"), "got {s:?}");
+        assert!(
+            !s.contains("http_5xx"),
+            "a zero-count reason must not appear — a quiet run stays short, got {s:?}"
+        );
+    }
+
+    /// The regression pin that matters: the fetch loop must TALLY the reason,
+    /// never discard it.
+    ///
+    /// This asserts a CONSEQUENCE (the tally call exists, and the exact
+    /// discard pattern does not), not a spelling or a proximity window.
+    #[test]
+    fn the_fetch_loop_never_discards_the_failure_reason_again() {
+        let src = include_str!("dhan_live_crossverify.rs");
+        // Scan the PRODUCTION half only. `include_str!` reads this file
+        // INCLUDING these tests, and the assertion strings below contain the
+        // very pattern being banned — without this split the test reads its
+        // own message and fails on itself. It did, on the first run.
+        //
+        // The marker is assembled from fragments rather than written whole,
+        // for the same reason one level deeper: spelling it out here would
+        // put a second copy in the file and split the source in the wrong
+        // place. That also failed, on the second run. Both are recorded
+        // because a self-scanning test is a genuinely easy thing to get
+        // subtly wrong, and it fails OPEN — it would have passed while
+        // reading nothing.
+        let marker = concat!("#[cfg(", "test)]");
+        assert_eq!(
+            src.matches(marker).count(),
+            1,
+            "the production/test split below assumes a single marker"
+        );
+        let production = src.split(marker).next().expect("production half");
+        let body = production
+            .split("pub async fn run_cross_verification")
+            .nth(1)
+            .expect("run_cross_verification must exist");
+        // Bound the scan to the function, not the rest of the file.
+        let end = body.find("\n}\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("rest_failure_breakdown.record("),
+            "run_once must tally the failure kind"
+        );
+        assert!(
+            !body.contains("Err(_) =>"),
+            "run_once must not throw a fetch reason away — that discard is \
+             what left 815 daily failures unexplainable for two sessions"
+        );
+        assert!(
+            body.contains("fetch_rest_side_paced("),
+            "the loop must go through the PACED wrapper: ~865 unpaced requests \
+             against a 5-per-second vendor budget is the shape both sibling \
+             REST legs were fixed out of on 2026-07-14"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // VOLUME — added 2026-08-26
+    //
+    // Until today this comparison checked open/high/low/close and nothing
+    // else. Volume rode along on every finding row and was never once
+    // compared, so "does our volume agree with the exchange's?" had no
+    // answer anywhere in the system.
+    // -----------------------------------------------------------------
+
+    /// Builds on the existing `bar` helper rather than calling the
+    /// constructor again, so this file gains no second fallible-unwrap site.
+    fn bar_vol(o: f64, h: f64, l: f64, c: f64, v: i64) -> PaiseBar {
+        let mut b = bar(o, h, l, c);
+        b.volume = v;
+        b
+    }
+
+    #[test]
+    fn volume_is_compared_at_all() {
+        // The whole point. Before today this assertion was unwritable:
+        // there was no field to read.
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 700))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.volume_cells, 1, "the cell must be counted");
+        assert_eq!(cmp.volume_exact, 0, "700 is not 1000");
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 70,
+            "we saw 700 of their 1000 — that is 70% capture, and saying so \
+             is the entire deliverable"
+        );
+    }
+
+    #[test]
+    fn a_volume_disagreement_never_becomes_a_price_divergence() {
+        // The trap this design exists to avoid. Our feed is a conflated
+        // ~1/sec sample and theirs is the full tape, so under-capture is
+        // STRUCTURAL. Folding it into `cells_diverged` would flag nearly
+        // every cell and drown the price signal beside it.
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 9_999))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(
+            cmp.cells_diverged, 0,
+            "prices agree exactly — a volume gap must not be reported as a \
+             price divergence"
+        );
+        assert!(
+            cmp.outcome.is_pass(),
+            "and it must not flip the verdict: a threshold needs a baseline, \
+             and this measurement is what creates one"
+        );
+        assert_eq!(cmp.volume_capture_p50_pct, 0, "1 of 9,999 rounds to 0%");
+    }
+
+    #[test]
+    fn a_minute_the_vendor_reports_as_untraded_is_skipped_not_scored_zero() {
+        // Their volume is the denominator. A zero one says the vendor saw no
+        // trades that minute — which says NOTHING about our capture. Scoring
+        // it 0% would drag the median toward "we missed everything" when the
+        // truth is "there was nothing to miss".
+        let live = vec![
+            side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
+            side(2, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
+        ];
+        let rest = vec![
+            side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
+            side(2, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(
+            cmp.volume_cells, 1,
+            "only the traded minute counts toward the profile"
+        );
+        assert_eq!(cmp.volume_exact, 1);
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 100,
+            "a clean capture must read 100, not be dragged down by a minute \
+             nobody traded in"
+        );
+    }
+
+    #[test]
+    fn capturing_everything_reads_as_one_hundred_percent() {
+        let live: Vec<SideBar> = (0..10)
+            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 250)))
+            .collect();
+        let rest = live.clone();
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.volume_cells, 10);
+        assert_eq!(cmp.volume_exact, 10);
+        assert_eq!(cmp.volume_capture_p50_pct, 100);
+        assert_eq!(
+            cmp.volume_capture_p05_pct, 100,
+            "the bad tail of a perfect run is still perfect"
+        );
+    }
+
+    #[test]
+    fn the_fifth_percentile_surfaces_the_bad_tail_the_median_hides() {
+        // Nine good minutes and one terrible one. The median says everything
+        // is fine; only the tail says an instrument had a hole in it. That
+        // asymmetry is why both are reported.
+        let mut live: Vec<SideBar> = (0..19)
+            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)))
+            .collect();
+        live.push(side(1, OPEN + 19 * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 20)));
+        let rest: Vec<SideBar> = (0..20)
+            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)))
+            .collect();
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.volume_cells, 20);
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 100,
+            "the median is blind to one bad minute in twenty"
+        );
+        // And so is the 5th percentile, at this sample size. `percentile` is
+        // linear-rank: at n=20 it lands on the SECOND-smallest value, so one
+        // catastrophic minute never reaches it. This test was written
+        // asserting 2 here, failed, and that failure is what added
+        // `volume_capture_min_pct` — the statistic that does surface it.
+        assert_eq!(
+            cmp.volume_capture_p05_pct, 100,
+            "p05 describes the distribution, and at n=20 one bad cell is not \
+             the distribution"
+        );
+        assert_eq!(
+            cmp.volume_capture_min_pct, 2,
+            "the MINIMUM is what surfaces one bad minute — 20 of 1,000 is 2%, \
+             and without this field that hole was invisible in every reported \
+             number"
+        );
+    }
+
+    #[test]
+    fn over_capture_is_reported_rather_than_clamped() {
+        // Reading ABOVE 100% is not noise to be tidied away — it means our
+        // volume exceeds the vendor's own tape for that minute, which cannot
+        // happen honestly. It is the signature of the double-counting defect
+        // measured on 2026-08-24 (intraday frames at ~9.2x the day bar), and
+        // clamping it to 100 would erase the only evidence of it.
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 9_200))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 920,
+            "920% must survive to the report — a clamp here would hide a \
+             real, already-measured defect"
+        );
     }
 }

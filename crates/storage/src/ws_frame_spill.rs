@@ -471,7 +471,16 @@ impl WsFrameSpill {
             Ok(()) => AppendOutcome::Spilled,
             Err(TrySendError::Full(_)) => {
                 let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
+                // `code` added 2026-08-26. Without it this line carried only
+                // `ws_type` and `drop_count`, so the CloudWatch metric filter
+                // `{ $.code = "WS-SPILL-02" }` (error-code-alarms.tf) never
+                // matched it — while the sibling `Disconnected` arm 20 lines
+                // below has always carried the field. Channel-FULL is the more
+                // likely of the two in production (it is what a writer stalled
+                // behind a saturated disk produces), so the arm that could not
+                // page was the one most likely to fire.
                 error!(
+                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
                     ws_type = ws_type.as_str(),
                     drop_count = prev + 1,
                     "CRITICAL: WAL spill channel FULL — frame dropped (writer stalled)"

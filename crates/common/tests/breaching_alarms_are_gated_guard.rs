@@ -168,3 +168,62 @@ resource "aws_cloudwatch_metric_alarm" "beta" {
         "comment stripping must drop commented settings, or prose satisfies the scan"
     );
 }
+
+/// The deaf-socket alarm needs the gate too, and the guard above cannot see it.
+///
+/// Everything above checks `breaching` alarms, on the reasoning that absence
+/// must not page overnight. `dhan_worst_socket_deaf` is `notBreaching`, so it
+/// is invisible to that scan — and it needs the gate just as badly, for a
+/// different and MORE frequent reason.
+///
+/// Its gauge is a per-socket age that only climbs. After the 15:30 close every
+/// socket legitimately stops delivering, so the age crosses its 600 s
+/// threshold within ten minutes and the alarm fires on a market that is simply
+/// shut — **every single trading day, at about 15:40**. The breaching alarms
+/// misfire nightly at shutdown; this one would misfire two hours earlier, in
+/// the middle of a working evening, which is if anything more corrosive.
+///
+/// The general rule ("any alarm whose metric legitimately climbs after close
+/// must be gated") is not mechanically decidable — nothing in terraform says
+/// which gauges do that. So this alarm is pinned by name, with the reason
+/// written down, rather than left to a scan that cannot know.
+#[test]
+fn the_deaf_socket_alarm_is_gated_even_though_it_is_not_breaching() {
+    let gate = code_only(GATE);
+    let names_at = gate
+        .find("ALARM_NAMES")
+        .expect("the gate Lambda must still take an ALARM_NAMES env list");
+    let tail = &gate[names_at..];
+    let block_end = tail.find("])").expect("ALARM_NAMES must be a join() list");
+    let list = &tail[..block_end];
+
+    assert!(
+        list.contains("dhan_worst_socket_deaf"),
+        "`dhan_worst_socket_deaf` must appear INSIDE the gate's ALARM_NAMES \
+         join() list. It is notBreaching, so the scan above cannot catch this \
+         omission — and without the gate it pages EVERY TRADING DAY at ~15:40, \
+         when every socket legitimately stops delivering after the close. \
+         Found list:\n{list}"
+    );
+
+    // And it must ship disarmed, or the gate has nothing to enable.
+    let lane = code_only(LIVE_LANE);
+    let at = lane
+        .find(r#"resource "aws_cloudwatch_metric_alarm" "dhan_worst_socket_deaf""#)
+        .expect("the deaf-socket alarm must exist");
+    let body = &lane[at..];
+    let body = &body[..body.find("\n}").unwrap_or(body.len())];
+    assert!(
+        body.contains("actions_enabled = false"),
+        "the deaf-socket alarm must ship with actions OFF — the gate ENABLES \
+         actions during the session and cannot disarm an alarm that ships armed"
+    );
+    // The threshold is inherited from the lane-level alarm, not invented. If
+    // someone lowers it, that is a decision needing a measured baseline.
+    assert!(
+        body.contains("threshold           = 600") || body.contains("threshold = 600"),
+        "the deaf-socket threshold must stay 600 s — the same ten minutes the \
+         lane-level no-ticks alarm uses (300 s x 2 periods), so it is inherited \
+         rather than invented. Lowering it needs a measured baseline"
+    );
+}

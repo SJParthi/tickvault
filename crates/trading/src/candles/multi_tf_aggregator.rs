@@ -182,10 +182,68 @@ pub struct ConsumeStats {
     /// folded (a zero would corrupt the OHLC), and the caller still writes the
     /// tick row.
     pub untraded_sentinel: bool,
+    /// `true` when `exchange_timestamp` is EXACTLY `0` — the vendor's "no last
+    /// trade time" sentinel, the timestamp twin of [`Self::untraded_sentinel`].
+    ///
+    /// Added 2026-08-26 after the live box discarded **825,783 ticks in one
+    /// session (4.0% of every tick decoded)** on this shape, with **no row at
+    /// all** — not a missing candle, but no record the instrument was even
+    /// seen.
+    ///
+    /// The 2026-08-20 fix had already made this decision correctly for the
+    /// PRICE sentinel, and its reasoning applies here verbatim: discarding the
+    /// row loses the ability to tell "did not trade" from "did not capture",
+    /// and costs the packet's open interest and bid/ask with it. An instrument
+    /// that has never traded has no last price AND no last trade time — the two
+    /// sentinels co-occur — but the timestamp check ran first and hard-refused,
+    /// silently defeating that fix for exactly the instruments it was for.
+    ///
+    /// CANDLE-only, like its price twin: folding a zero timestamp would place
+    /// the bar in 1970. The ROW is safe because
+    /// `tick_persistence::row_timestamp_ist_nanos` already falls back to
+    /// `received_at` for any out-of-band value, so it lands in TODAY's
+    /// partition.
+    pub untraded_timestamp: bool,
     /// `true` when `exchange_timestamp` fell outside
     /// `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]`.
     /// Nothing was folded and the watermark was NOT advanced.
     pub refused_timestamp: bool,
+    /// `true` when the tick's IST **date** is older than the newest date this
+    /// aggregator has seen — a stale last-trade time, not a stale packet.
+    ///
+    /// # The bug this closes (measured on prod, 2026-08-26)
+    ///
+    /// Dhan sends the **last trade time**, so a contract that last traded days
+    /// or weeks ago is snapshotted NOW carrying a timestamp from THEN. Measured
+    /// across all 20.5M rows in one session: mean `received_at - ts` was
+    /// **~5 hours**, max **34 days**.
+    ///
+    /// The session gate above tests `exchange_timestamp % 86_400` — SECONDS OF
+    /// DAY ONLY, with no notion of which day. A stale trade time of
+    /// *yesterday 15:39:41* yields 56,381, which is inside the
+    /// `[09:15:00, 15:40:00)` window, so it passed as "in session" and opened a
+    /// candle bucket **dated on the stale day**.
+    ///
+    /// Two consequences, both verified live:
+    ///
+    /// 1. **Fabricated history.** `candles_1m` held **8,898 bars on past
+    ///    dates** — 8,898 distinct instruments, oldest `2026-07-23T09:39` — in a
+    ///    QuestDB volume that was created empty at **08:59:50 that same
+    ///    morning**. They cannot be history; they were written that day.
+    /// 2. **The day open is destroyed.** With a bucket already open on the
+    ///    stale date, today's real 09:15 tick takes the CONTINUE path instead
+    ///    of the OPEN path, so the day-open arm never fires — across all 24
+    ///    timeframes for that instrument.
+    ///
+    /// # Why this is a CANDLE-only refusal
+    ///
+    /// The tick is not corrupt. It is a real last-traded price with a real
+    /// (old) trade time, and it carries live open interest and bid/ask. The
+    /// row is kept for exactly the reason `untraded_sentinel` is kept:
+    /// discarding it would lose the ability to tell "did not trade today" from
+    /// "did not capture". Only the FOLD is skipped, because folding it is what
+    /// fabricates a bar on a day that already closed.
+    pub stale_trading_day: bool,
 }
 
 impl ConsumeStats {
@@ -205,6 +263,8 @@ impl ConsumeStats {
             && !self.slot_exhausted
             && !self.refused_timestamp
             && !self.untraded_sentinel
+            && !self.stale_trading_day
+            && !self.untraded_timestamp
     }
 }
 
@@ -510,6 +570,64 @@ impl MultiTfAggregator {
         // is now attributed to `timestamp` rather than `price`, which is the
         // more actionable of the two — a bad price costs one candle, a bad
         // timestamp poisons a partition.
+        // ZERO is the vendor's "no last trade time" sentinel, NOT corruption —
+        // separated from the band check on 2026-08-26.
+        //
+        // Measured on prod that day:
+        // `tv_dhan_feed_ingest_refused_total{reason="timestamp"}` = **825,783**
+        // in one session — 4.0% of every tick decoded — and the drain treats a
+        // timestamp refusal as a HARD refusal, so all 825,783 were discarded
+        // with NO ROW AT ALL. Not a missing candle: no record that the
+        // instrument was even seen.
+        //
+        // That is the exact mistake the 2026-08-20 fix removed for the PRICE
+        // sentinel, whose reasoning applies here word for word: *"discarding
+        // the ROW loses the ability to tell 'did not trade' from 'did not
+        // capture', and costs the packet's open interest and bid/ask with it."*
+        // An instrument that has never traded has no last price AND no last
+        // trade time; the two sentinels co-occur. But the timestamp check ran
+        // FIRST and hard-refused, so the price sentinel's careful
+        // keep-the-row decision was silently defeated for exactly the
+        // instruments it was written for.
+        //
+        // Safe to keep the row because the stamp is not the sentinel:
+        // `tick_persistence::row_timestamp_ist_nanos` falls back to
+        // `received_at` for any out-of-band value, so this row lands in
+        // TODAY's partition — never a 1970 one. That fallback already existed;
+        // this change simply stops discarding the row before it can be used.
+        //
+        // Deliberately EXACTLY zero. Any other below-floor or above-ceiling
+        // value is genuine corruption (`0xFFFFFFFF` is ~year 2106) and stays a
+        // hard refusal — writing it would put a row under a garbage designated
+        // timestamp, which is worse than losing it.
+        //
+        // AND deliberately gated on a real receipt time, which is what makes
+        // this compatible with the 2026-08-09/08-25 adversarial regressions
+        // rather than a reversal of them. Their requirement is that a row must
+        // never be written under a garbage designated timestamp — and that
+        // holds here BY CONSTRUCTION, not by assertion: `row_timestamp_ist_nanos`
+        // substitutes the receipt time for an out-of-band LTT, but only when
+        // the caller has one (`(tick.received_at_nanos != 0).then_some(..)`),
+        // falling back to the raw value otherwise. Without this guard a ts=0
+        // tick that also lacked a receipt time would land in a 1970 partition
+        // — the same unreachable-partition defect as year-2106, from the other
+        // end of the number line.
+        //
+        // So the two layers now agree on exactly one condition: the fold keeps
+        // the row precisely when the writer can stamp it safely. The
+        // persistence side already anticipated this case — its own comment
+        // calls the fallback "the fallback designated timestamp for a row whose
+        // LTT is the vendor's never-traded sentinel" — but the fold refused
+        // those rows before they could reach it, so that path was unreachable.
+        if tick.exchange_timestamp == 0 && tick.received_at_nanos != 0 {
+            crate::candles::fold_counters::fold_counters()
+                .tick_untraded_timestamp
+                .increment(1);
+            return ConsumeStats {
+                untraded_timestamp: true,
+                ..ConsumeStats::default()
+            };
+        }
         if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
             || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
         {
@@ -521,41 +639,20 @@ impl MultiTfAggregator {
                 ..ConsumeStats::default()
             };
         }
-        // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
-        // 2026-08-25, and that reordering is the whole fix.
+        // A SECOND, byte-identical copy of the timestamp-band check stood here
+        // until 2026-08-26 and was PROVABLY UNREACHABLE: the copy above tests
+        // the same condition and returns, so this one could never evaluate
+        // true. It was a merge artifact — two hardening fixes landed on the
+        // same gates from opposite directions on 2026-08-25 and both inserted
+        // the check.
         //
-        // It used to sit below, which left a hole the drain's own comment
-        // claims is closed. `p == 0.0` is the documented "untraded" sentinel
-        // and returns early, so a packet carrying LTP = 0 AND
-        // LTT = 0xFFFFFFFF never reached this check: `refused_timestamp`
-        // stayed false, the drain classified it `untraded_sentinel` — a
-        // CANDLE-ONLY refusal — and wrote the row anyway. `ticks.ts` is the
-        // DESIGNATED timestamp, so that row lands in a year-2106 partition
-        // that retention and archival, which key on the trading day, can never
-        // reach, while every `max(ts)` and range query over `ticks` silently
-        // includes it.
-        //
-        // One malformed or hostile packet was enough. The band check belongs
-        // above every early return that can still produce a persisted row, not
-        // merely above the fold.
-        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
-        {
-            // MERGE RESOLUTION 2026-08-26: this branch added the call with the
-            // `counter!` macro; main meanwhile moved every fold counter to the
-            // pre-resolved `fold_counters()` registry and dropped the import.
-            // The registry already carries `tick_refused_timestamp`, so this
-            // uses it rather than re-adding a lone macro call — matching the
-            // convention AND skipping the sharded-registry lookup the registry
-            // exists to remove.
-            crate::candles::fold_counters::fold_counters()
-                .tick_refused_timestamp
-                .increment(1);
-            return ConsumeStats {
-                refused_timestamp: true,
-                ..ConsumeStats::default()
-            };
-        }
+        // Deleted rather than left in place because dead code that reads as a
+        // live safety check is worse than no comment at all: it invites the
+        // next reader to reason about a guard that never runs, and this file's
+        // own history records exactly that class of cost. The surviving copy
+        // above carries the full reasoning (it must precede every early return
+        // that can still produce a PERSISTED row — including the untraded
+        // sentinel, which is candle-only and writes the tick anyway).
         if p == 0.0 {
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_untraded_sentinel
@@ -636,6 +733,41 @@ impl MultiTfAggregator {
 
         if tick.exchange_timestamp > self.watermark_secs {
             self.watermark_secs = tick.exchange_timestamp;
+        }
+
+        // STALE TRADING DAY gate — runs BEFORE the seconds-of-day gate.
+        //
+        // The gate below tests `exchange_timestamp % 86_400` and therefore
+        // cannot see WHICH DAY a tick belongs to. Dhan sends the LAST TRADE
+        // TIME, so a dormant contract snapshotted now carries a timestamp from
+        // whenever it last traded — measured mean 5 hours, max 34 days. A stale
+        // trade time of yesterday 15:39:41 is 56,381 seconds-of-day, inside the
+        // [09:15:00, 15:40:00) window, so it passed as "in session" and opened a
+        // bucket dated on a day that had already closed.
+        //
+        // The watermark is the right reference and needs no clock threaded in:
+        // it advances ONLY on price-sane, band-checked ticks, and the advance
+        // just above is `>` so a stale tick can never move it. Comparing after
+        // that advance is therefore safe — an older tick leaves the watermark
+        // exactly where it was.
+        //
+        // Ordered ABOVE the seconds-of-day gate on the same reasoning the
+        // timestamp band was hoisted above the price gate: a tick that is bad
+        // in both ways is attributed to the MORE actionable cause. "Out of
+        // session" reads as a benign pre-open packet; "stale trading day" names
+        // the thing that fabricates a bar on a closed day.
+        //
+        // Integer division on IST epoch seconds gives the IST day directly —
+        // `exchange_timestamp` is already IST (never add the offset to it; see
+        // `data-integrity.md`), so no timezone arithmetic is needed or wanted.
+        if tick.exchange_timestamp / 86_400 < self.watermark_secs / 86_400 {
+            crate::candles::fold_counters::fold_counters()
+                .tick_refused_stale_trading_day
+                .increment(1);
+            return ConsumeStats {
+                stale_trading_day: true,
+                ..ConsumeStats::default()
+            };
         }
 
         // Candle-window gate. The bucket grid is 09:15-ANCHORED
@@ -727,6 +859,22 @@ impl MultiTfAggregator {
                 }
                 ConsumeOutcome::DiscardLate => {
                     stats.late_count = stats.late_count.saturating_add(1);
+                    // A tick discarded here is DATA LOSS for this timeframe:
+                    // the bar it should have contributed to is now missing a
+                    // trade. `late_count` has carried that fact since the
+                    // aggregator was written and had ZERO production readers
+                    // until 2026-08-26 — every consumer reads `sealed_count`
+                    // and `amended_count`, and `IngestOutcome::Folded` carries
+                    // only those two, so the drop was computed on every tick
+                    // and reached nothing.
+                    //
+                    // Pre-resolved handle, per this module's whole reason for
+                    // existing: this arm sits inside the 24-timeframe loop on
+                    // the per-tick path, which is the one place a bare
+                    // `counter!` macro must never appear.
+                    crate::candles::fold_counters::fold_counters()
+                        .tick_discarded_late
+                        .increment(1);
                 }
             }
         }
@@ -1921,6 +2069,8 @@ mod tests {
             slot_exhausted: _,
             refused_timestamp: _,
             untraded_sentinel: _,
+            stale_trading_day: _,
+            untraded_timestamp: _,
         } = ConsumeStats::default();
 
         assert!(
@@ -1961,6 +2111,20 @@ mod tests {
                 "untraded_sentinel",
                 ConsumeStats {
                     untraded_sentinel: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "stale_trading_day",
+                ConsumeStats {
+                    stale_trading_day: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "untraded_timestamp",
+                ConsumeStats {
+                    untraded_timestamp: true,
                     ..ConsumeStats::default()
                 },
             ),

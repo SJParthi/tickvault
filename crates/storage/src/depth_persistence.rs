@@ -419,6 +419,96 @@ pub const DEPTH_SPILL_DIR: &str = "data/spill/depth";
 /// rescue becomes the incident.
 pub const DEPTH_SPILL_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Fraction of the volume the depth spill may occupy: one thirty-second.
+///
+/// Deliberately the SAME fraction as [`crate::tick_persistence::TICK_SPILL_VOLUME_FRACTION`],
+/// so the two rescue tiers scale together instead of drifting apart again.
+pub const DEPTH_SPILL_VOLUME_FRACTION: u64 = 32;
+
+/// Ceiling on the depth spill directory, in bytes — DERIVED from the volume.
+///
+/// # Why this stopped being a constant (2026-08-26)
+///
+/// [`DEPTH_SPILL_MAX_BYTES`] is retained above as the FLOOR and the fallback,
+/// and its reasoning was sound *when written*: it cites a volume "86% full on
+/// 2026-08-24" with "~28 GB free", and argues that 24 GB of depth spill on
+/// such a volume "is how a rescue becomes the incident". That is correct — on
+/// that volume.
+///
+/// The volume is no longer that volume. It was grown to 300 GB and measured at
+/// **255 GB free (16% used)** on 2026-08-26. The constant now encodes a disk
+/// state that has not existed for two days, and it encodes it invisibly: the
+/// number reads as a deliberate safety bound rather than as a snapshot of a
+/// disk that has since changed underneath it.
+///
+/// The asymmetry it produced is the reason this is a defect and not a
+/// preference. Measured on prod the same day:
+///
+/// | tier | ceiling | how sized | rows/s it protects | outage covered |
+/// |---|---|---|---|---|
+/// | tick  | ~9.4 GB | volume ÷ 32 | 2,706 | **~5.2 hours** |
+/// | depth | 512 MiB | a literal | 51,000 | **~75 seconds** |
+///
+/// The stream carrying **19× the volume** was given **250× less coverage**,
+/// and the tick tier was made host-derived on 2026-08-21 for precisely this
+/// reason — the depth tier simply was not moved with it. Deriving it restores
+/// the original intent (a bound that cannot threaten the database it rescues
+/// from) while letting the bound follow the disk: at 1/32 it still leaves
+/// **96.8%** of the volume to QuestDB and the frame WAL, exactly as the tick
+/// tier does.
+///
+/// An unmeasurable volume falls back to the floor with a coded warning, never
+/// silently — same discipline as the tick tier.
+///
+/// # Complexity
+/// O(1) after the first call (`OnceLock`). The first call spawns one `df`, on
+/// the cold flush-failure path only.
+#[must_use]
+pub fn depth_spill_max_bytes() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        // Probe the deepest EXISTING ancestor: `df` on a path that does not
+        // exist yet fails, and the spill dir is created lazily.
+        let mut probe: &std::path::Path = std::path::Path::new(DEPTH_SPILL_DIR);
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent,
+                None => break,
+            }
+        }
+        match crate::disk_health_watcher::probe_disk_free_bytes(probe) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { total_bytes, .. }
+                if total_bytes > 0 =>
+            {
+                let derived = total_bytes / DEPTH_SPILL_VOLUME_FRACTION;
+                // Never BELOW the old fixed cap: this change exists to stop
+                // losing depth rows, so it must not reduce headroom on a
+                // small volume.
+                let ceiling = derived.max(DEPTH_SPILL_MAX_BYTES);
+                tracing::info!(
+                    total_bytes,
+                    ceiling_bytes = ceiling,
+                    fraction = DEPTH_SPILL_VOLUME_FRACTION,
+                    "depth spill ceiling derived from the volume — a failed flush can be \
+                     rescued to disk up to this size before depth rows are dropped"
+                );
+                ceiling
+            }
+            _ => {
+                tracing::warn!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    fallback_bytes = DEPTH_SPILL_MAX_BYTES,
+                    "could not measure the spill volume, so the depth spill ceiling falls \
+                     back to the fixed floor. Rescues past that size will be refused and \
+                     their depth rows dropped — on a large volume this is far more \
+                     conservative than necessary"
+                );
+                DEPTH_SPILL_MAX_BYTES
+            }
+        }
+    })
+}
+
 /// Total bytes currently held in the depth spill directory.
 ///
 /// Non-recursive and best-effort: an unreadable entry contributes 0 rather
@@ -787,7 +877,7 @@ impl DepthWriter {
             self.buffer.as_bytes(),
             self.feed,
             now,
-            DEPTH_SPILL_MAX_BYTES,
+            depth_spill_max_bytes(),
         ) {
             Ok(path) => {
                 self.rescued = self.rescued.saturating_add(rows as u64);
@@ -828,7 +918,7 @@ impl DepthWriter {
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
                     dropped = rows,
-                    cap_bytes = DEPTH_SPILL_MAX_BYTES,
+                    cap_bytes = depth_spill_max_bytes(),
                     spill_dir = %self.spill_dir.display(),
                     spill_error = %err,
                     "market_depth flush failed AND the depth spill rescue also failed — \

@@ -76,7 +76,7 @@ use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, next_frame_seq};
 use tracing::{error, info, warn};
 
-use super::idle_watchdog::IdleWatchdog;
+use super::idle_watchdog::{IDLE_RECONNECT_TIMEOUT_SECS, IdleWatchdog};
 use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
@@ -106,6 +106,36 @@ pub const TOKEN_STALE_REDIAL_FLOOR_MS: u64 = 5_000;
 /// timer wake per connection per second.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
 pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often a client-originated keepalive ping is sent, on the endpoints that
+/// need one ([`DhanEndpointType::needs_client_keepalive_ping`]).
+///
+/// 10 seconds, matching `DHAN_SERVER_PING_INTERVAL_SECS` — the cadence Dhan
+/// documents for its OWN server-side ping on the endpoints where it actually
+/// sends one. Using their number rather than inventing one keeps a single
+/// stated cadence across the pool.
+///
+/// The relationship that must hold is with the watchdog, and it is asserted
+/// below: at 10s we get roughly **2.7 pings inside every 27-second window**,
+/// so a single dropped ping or pong cannot expire a healthy socket. It also
+/// keeps us well inside Dhan's documented 40-second client-silence close,
+/// which on this endpoint we were previously relying on the watchdog to
+/// pre-empt rather than avoid.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `IDLE_POLL_INTERVAL` above.
+pub const CLIENT_KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(10);
+
+const _: () = {
+    assert!(
+        CLIENT_KEEPALIVE_PING_INTERVAL.as_secs() * 2 < IDLE_RECONNECT_TIMEOUT_SECS,
+        "at least two keepalive pings must fit inside the idle window, so one \
+         lost ping or pong can never expire a healthy socket"
+    );
+    assert!(
+        CLIENT_KEEPALIVE_PING_INTERVAL.as_secs() >= IDLE_POLL_INTERVAL.as_secs(),
+        "the keepalive is driven by the idle ticker, so it can never be sent \
+         more often than that ticker fires"
+    );
+};
 
 /// Counter: connection dropped and is being re-dialed. Labels: `endpoint`, `reason`.
 pub const RECONNECT_METRIC: &str = "tv_dhan_ws_reconnect_total";
@@ -1892,6 +1922,17 @@ pub trait DhanFeedSocket: Send {
         &mut self,
         batch: &[SubscribeInstrument],
     ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Send ONE client-originated keepalive Ping.
+    ///
+    /// Required, not defaulted, deliberately: a default that quietly returned
+    /// `Ok(())` would let a transport claim keepalive support it does not have,
+    /// and the failure would look exactly like a healthy socket. The compiler
+    /// asking every implementor is the point.
+    ///
+    /// Driven ONLY for endpoints where
+    /// [`DhanEndpointType::needs_client_keepalive_ping`] is true. The watchdog
+    /// reset stays on the RECEIVED pong, never on this send.
+    fn send_ping(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
     /// Await the next socket event. This is the call that keeps the automatic
     /// pong flowing — nothing may be done between two of these but
     /// [`FrameSink::accept`].
@@ -2277,6 +2318,15 @@ where
     // worth hearing about even if the previous one already reported.
     let mut ring_full_seen: u64 = 0;
 
+    // When we last sent a client keepalive ping on this socket.
+    //
+    // Seeded to NOW rather than to the epoch so a freshly-dialled socket does
+    // not ping on its very first tick: the subscribe is still in flight at
+    // that moment, and adding a control frame to that window buys nothing.
+    // Monotonic `Instant`, never wall time — same reason the watchdog is:
+    // an NTP step must not be able to conjure or suppress a keepalive.
+    let mut last_client_ping = Instant::now();
+
     while action == SupervisorAction::Continue {
         // Top-up check, BEFORE the select and deliberately not an arm of it.
         //
@@ -2450,6 +2500,53 @@ where
                 }
             }
             _ = ticker.tick() => {
+                // Client-originated keepalive, for the endpoints Dhan does not
+                // ping (measured: depth-200 receives zero server control
+                // frames — see `needs_client_keepalive_ping`).
+                //
+                // Sited on the EXISTING 1s ticker rather than a second timer:
+                // one more `select!` arm on the drain loop would be a second
+                // place that can hold this task away from `recv`, and the
+                // whole reason this watchdog exists is to catch a reader that
+                // stopped polling. Reusing the tick costs nothing and adds no
+                // new way to stall.
+                //
+                // The send is awaited but bounded by SUBSCRIBE_SEND_TIMEOUT
+                // inside the socket, and its failure is deliberately ignored
+                // here: if Dhan does not answer pings on this endpoint the
+                // watchdog keeps governing the socket exactly as it does
+                // today. This path can improve that behaviour, never worsen
+                // it.
+                if supervisor.slot().endpoint.needs_client_keepalive_ping()
+                    && last_client_ping.elapsed() >= CLIENT_KEEPALIVE_PING_INTERVAL
+                {
+                    last_client_ping = Instant::now();
+                    // Spelled as an exhaustive match rather than `let _ =`,
+                    // and not only to satisfy `clippy::let_underscore_must_use`
+                    // (which is what caught the first draft). `send_ping`
+                    // counts EVERY outcome under
+                    // `CLIENT_KEEPALIVE_PING_METRIC` and logs the failing ones,
+                    // so there is genuinely nothing left for this site to do —
+                    // but a discard says that by accident, whereas a match says
+                    // it on purpose and forces a decision here if a future
+                    // outcome ever appears that the supervisor SHOULD act on.
+                    //
+                    // Escalating a failure here would be wrong in the fail-safe
+                    // direction: it would turn "Dhan does not answer pings on
+                    // this endpoint" into a disconnect, which is worse than the
+                    // behaviour being fixed.
+                    //
+                    // The clock advances BEFORE the await, deliberately. A
+                    // failing send must not be retried on the next 1 s tick:
+                    // `SUBSCRIBE_SEND_TIMEOUT` is 10 s, so a HUNG send holds
+                    // this loop — the loop whose job is to keep polling `recv`
+                    // — for that long. Once per interval is an accepted
+                    // exposure; once per second would be a tenfold increase in
+                    // the very stall this watchdog exists to catch.
+                    match socket.send_ping().await {
+                        Ok(()) | Err(SocketFailure) => {}
+                    }
+                }
                 action = supervisor.poll(Instant::now());
             }
         }
@@ -4305,6 +4402,7 @@ mod tests {
         connects: usize,
         subscribes: usize,
         closes: usize,
+        pings: usize,
     }
 
     struct FakeSocket {
@@ -4325,6 +4423,18 @@ mod tests {
                     Err(_) => true,
                 };
                 if ok { Ok(()) } else { Err(SocketFailure) }
+            }
+        }
+
+        fn send_ping(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                if let Ok(mut s) = state.lock() {
+                    s.pings += 1;
+                }
+                Ok(())
             }
         }
 

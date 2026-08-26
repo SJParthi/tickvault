@@ -159,6 +159,64 @@ pub const ALIVE_CONNECTIONS_GAUGE: &str = "tv_dhan_ws_alive_connections";
 /// Live count behind [`ALIVE_CONNECTIONS_GAUGE`].
 static ALIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Longest ring dwell seen since the last publish, in NANOSECONDS.
+///
+/// A module static rather than a `run_frame_drain` local so that
+/// [`publish_fold_depth`] can drain it without a signature change at its four
+/// call sites — the same shape as [`ALIVE_CONNECTIONS`] above, for the same
+/// reason.
+///
+/// Exactly ONE writer exists (the drain task) and one reader (the publish, on
+/// that same task), so `Relaxed` is sound: there is no other thread whose
+/// writes this value must be ordered against. An uncontended `fetch_max` at
+/// the ~5,000 frames/sec envelope is a few nanoseconds and no allocation —
+/// the cost this module's `DrainCounters` docs exist to keep honest.
+///
+/// Nanoseconds internally, milliseconds at the gauge: the gauge is read by a
+/// human deciding whether the drain is behind, and no human needs nanosecond
+/// resolution to answer that. Storing nanos avoids a division per frame.
+static RING_DWELL_MAX_NANOS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Records one frame's ring dwell. Called once per frame; keeps the maximum.
+///
+/// Free function rather than an inline `fetch_max` at the call site so the
+/// unit conversion and the ordering choice live in ONE place with their
+/// reasoning, instead of as a bare atomic call a later reader has to re-derive.
+pub fn record_ring_dwell(nanos: i64) {
+    RING_DWELL_MAX_NANOS.fetch_max(nanos, Ordering::Relaxed);
+}
+
+/// Takes the maximum dwell and RESETS it, returning milliseconds.
+///
+/// Reset-on-read deliberately: a sticky maximum reads alarming forever after a
+/// single stall, and a signal that is permanently red is a signal nobody
+/// reads. Each published value therefore means "the worst dwell in the window
+/// that just ended", which is the question an operator is actually asking.
+pub fn take_ring_dwell_max_ms() -> f64 {
+    let nanos = RING_DWELL_MAX_NANOS.swap(0, Ordering::Relaxed);
+    // `u32::try_from` then `f64::from`: lossless by construction, and no lossy
+    // `as` cast to justify — the same wording, and the same reason, as
+    // `publish_fold_depth` a few hundred lines down.
+    //
+    // The first draft here was `nanos as f64` under an
+    // `#[allow(clippy::cast_precision_loss)]`, and the banned-pattern scanner
+    // refused it for want of an `// APPROVED:` line. Silencing the lint would
+    // have been the wrong answer twice over: the cast really is lossy above
+    // 2^53, and the sibling function three screens away already shows the
+    // lossless form. An `#[allow]` is a claim that no better shape exists, and
+    // one did.
+    //
+    // Nanos -> whole MICROSECONDS first, so the u32 window is wide enough to
+    // matter: `u32::MAX` micros is ~71 minutes of dwell. Saturating there is
+    // not a limitation worth avoiding — a drain 71 minutes behind has been
+    // catastrophically broken for over an hour, and every other signal on the
+    // dashboard is screaming by then. Truncating sub-microsecond dwell is
+    // likewise deliberate: nobody deciding "is the drain behind?" needs
+    // nanosecond resolution, and the gauge is read by a human.
+    let micros = u32::try_from(nanos / 1_000).unwrap_or(u32::MAX);
+    f64::from(micros) / 1_000.0
+}
+
 /// RAII counter for [`ALIVE_CONNECTIONS`].
 ///
 /// The increment happens OUTSIDE the socket task, deliberately, so the gauge
@@ -243,6 +301,27 @@ pub fn install_health_reporter(health: tickvault_api::state::SharedHealthStatus)
     HEALTH_REPORTER.set(health).is_ok()
 }
 
+/// The process-wide feed-health registry, reachable from the socket-count
+/// choke point.
+///
+/// # Why a `OnceLock` and not another `params` field
+///
+/// `params.feed_health` already exists and is threaded to the drain, but
+/// `publish_alive_connections` is a free function on BOTH edges of
+/// [`AliveConnectionGuard`] — that is the whole reason its own doc calls it
+/// "one function owns the health push, so there is no second path to drift".
+/// Threading an `Arc` down to a `Drop` impl would either add a field to the
+/// guard or add a second push site. This mirrors `HEALTH_REPORTER` directly
+/// above, which solved the identical problem for the same function.
+static FEED_HEALTH: std::sync::OnceLock<Arc<tickvault_common::feed_health::FeedHealthRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Install the feed-health registry. Returns `false` if one was already
+/// installed — first writer wins, same shape as [`install_health_reporter`].
+pub fn install_feed_health(health: Arc<tickvault_common::feed_health::FeedHealthRegistry>) -> bool {
+    FEED_HEALTH.set(health).is_ok()
+}
+
 /// Report whether the tick writer reached the database, for `/health`.
 ///
 /// Sibling of the websocket row and the same defect: `/health` rendered
@@ -286,6 +365,45 @@ fn publish_alive_connections(alive: usize) {
         .set(f64::from(u32::try_from(alive).unwrap_or(u32::MAX)));
     if let Some(health) = HEALTH_REPORTER.get() {
         health.set_websocket_connections(u64::try_from(alive).unwrap_or(u64::MAX));
+    }
+    // THE THIRD SIBLING (2026-08-26).
+    //
+    // `FeedHealthRegistry::set_connected` had ZERO production call sites —
+    // every reference in the workspace was inside a test-only module. The
+    // field initialises `false`, and `feed_health::classify` tests
+    // `if !i.connected` BEFORE it looks at tick age, so `/api/feeds/health`
+    // returned `Down, "enabled but disconnected — reconnecting"`
+    // unconditionally.
+    //
+    // Captured on prod at one instant, 2026-08-26:
+    //
+    // ```text
+    // /health            overall=healthy, websocket={connected, "15 connections"}
+    // /api/feeds/health  dhan verdict=DOWN connected=false
+    //                    ticks_total=17,265,688  last_tick_age=1s
+    // :9091              tv_dhan_ws_alive_connections 15
+    //                    tv_dhan_feed_stack_up 1
+    // ```
+    //
+    // The same JSON object declared the feed down while reporting 17.2 million
+    // ticks and a one-second-old tick. `/board`, `/dashboard` and `/feeds` all
+    // render that row, so the operator's at-a-glance surface cried wolf every
+    // trading day, permanently — the inverse of a false-OK and no less
+    // corrosive, because a status that is always red is read as decoration.
+    //
+    // This is the THIRD half of one defect, and the pattern is the point:
+    // `set_dhan_lane_running` was fixed 2026-08-14 ("a status line that cannot
+    // vary is not a status line") and `record_ticks` 2026-08-18 ("it answered a
+    // benign Unknown for a corpse"). Each fix documented the shape and left the
+    // next sibling in place. `sp5_dhan_feed_health_wiring_guard.rs:42` even
+    // named this one and said it "MUST be re-pinned in the PR that wires them".
+    //
+    // Sited here rather than beside `set_dhan_lane_running` deliberately: this
+    // function is both edges of `AliveConnectionGuard`, so it tracks real
+    // socket transitions instead of a coarse lane-level flag, and it keeps the
+    // single-owner property the function was built for.
+    if let Some(feed_health) = FEED_HEALTH.get() {
+        feed_health.set_connected(tickvault_common::feed::Feed::Dhan, alive > 0);
     }
 }
 
@@ -1551,8 +1669,26 @@ impl LiveIngest {
         // Two refuse only the CANDLE and keep the row — see above. They are
         // mutually exclusive with the three by construction, which is why this
         // reads as a plain `!hard_refusal` rather than repeating them.
-        let candle_only_refusal =
-            (stats.out_of_session || stats.untraded_sentinel) && !hard_refusal;
+        // `stale_trading_day` joins the candle-only set on 2026-08-26.
+        //
+        // Dhan sends the LAST TRADE TIME, so a dormant contract snapshotted
+        // now carries a timestamp from whenever it last traded (measured mean
+        // ~5 hours, max 34 days). Folding that opens a candle bucket on a day
+        // that already closed — verified live as 8,898 fabricated bars in a
+        // database created empty that same morning — and, worse, leaves a
+        // bucket open so today's real 09:15 tick takes the CONTINUE path and
+        // the day-open arm never fires.
+        //
+        // The ROW is kept, for exactly the reason `untraded_sentinel` is kept:
+        // the tick is not corrupt. It is a real last-traded price with a real
+        // old trade time, carrying live open interest and bid/ask. Discarding
+        // it would lose the ability to tell "did not trade today" from "did
+        // not capture", which is the same false-OK the 2026-08-20 fix removed.
+        let candle_only_refusal = (stats.out_of_session
+            || stats.untraded_sentinel
+            || stats.stale_trading_day
+            || stats.untraded_timestamp)
+            && !hard_refusal;
 
         if hard_refusal {
             let reason = if stats.refused_price {
@@ -2573,6 +2709,45 @@ pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
 /// (~$0.30/mo) that belongs with the alarm that would read it.
 pub const DRAIN_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_feed_abandoned_bytes_total";
 
+/// Gauge: the LONGEST a frame sat in the ring before the drain folded it, in
+/// milliseconds, over the last reporting window.
+///
+/// # Why this one and not the vendor lag
+///
+/// This number was already being computed on every frame — ~5,000 times a
+/// second — and immediately thrown away. `run_frame_drain` derives
+/// `queued_nanos` from the frame's own monotonic receipt stamp solely to
+/// back-date `received_at_nanos`, then drops it. Publishing costs one
+/// comparison per frame and one gauge write per window.
+///
+/// It is the signal that actually predicts the failure the lane is judged on.
+/// `tv_dhan_ws_lag_ms` measures how long DHAN took to deliver — their problem,
+/// unfixable from here, and deliberately excluded from the EMF selector as a
+/// "how much" rather than a "what broke" (see `EMF-METRIC-SELECTOR-NOTES.md`).
+/// Ring dwell measures how far behind OUR OWN drain is, which is the direct
+/// precursor of every loss mechanism the lane has: a drain that stops draining
+/// fills the ring, and a full ring refuses frames.
+///
+/// # MAX, not mean, and not a histogram
+///
+/// A mean hides the stall that matters — one 8-second dwell inside a window of
+/// microsecond dwells averages to nothing. A histogram would ship ~12 bucket
+/// series per dimension and cost roughly an order of magnitude more than the
+/// per-connection latency figure the 2026-08-14 authorization priced at
+/// $4.80/mo; that discrepancy is recorded in the noise lock rather than spent
+/// silently. One gauge is one series.
+///
+/// # Cost on the hot path
+///
+/// One `i64` max against a stack local per frame. No allocation, no registry
+/// lookup, no label — the gauge handle is resolved once and written on the
+/// existing `DRAIN_REPORT_EVERY` path beside `publish_fold_depth`, never per
+/// frame. This is the `DrainCounters` discipline the module already documents.
+///
+/// Reset to zero after each publish, deliberately: a sticky maximum reads
+/// alarming forever after one stall, which is how a signal stops being read.
+pub const RING_DWELL_MAX_MS_GAUGE: &str = "tv_dhan_feed_ring_dwell_max_ms";
+
 /// Gauge: rows appended to the ILP buffer but not yet flushed to QuestDB.
 /// A buffer is a staging area, not storage — a rising value means rows are
 /// accumulating in the process rather than landing in the database.
@@ -3038,16 +3213,45 @@ fn flush_and_record(
     ingest: &mut LiveIngest,
     feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
 ) -> u64 {
-    // OFFLOADED: the flush is a bounded-queue hand-off with no network in it,
-    // so there is nothing to move off-worker and — more importantly — nothing
-    // to report health from. `rows` here means rows HANDED OFF, and health is
-    // defined three paragraphs up as rows FLUSHED. Recording on hand-off would
-    // forge liveness for exactly as long as the database was unreachable: the
-    // queue accepts batches, the sink fails every write, and the one signal an
-    // operator checks reads green. The writer thread records instead, from the
-    // rows that actually landed — see `LiveIngest::spawn_offload_writer`.
+    // OFFLOADED: health is NOT recorded here. `rows` on this path means rows
+    // HANDED OFF, and health is defined three paragraphs up as rows FLUSHED.
+    // Recording on hand-off would forge liveness for exactly as long as the
+    // database was unreachable: the queue accepts batches, the sink fails
+    // every write, and the one signal an operator checks reads green. The
+    // writer thread records instead, from the rows that actually landed —
+    // see `LiveIngest::spawn_offload_writer`.
+    //
+    // CORRECTED 2026-08-26 — the sentence that opened this comment used to
+    // read "the flush is a bounded-queue hand-off with no network in it, so
+    // there is nothing to move off-worker", and it returned `ingest.flush()`
+    // BARE on the strength of that. It was half true and the half it missed
+    // is the one with the network in it: `LiveIngest::flush` flushes the
+    // inline-depth sink FIRST and unconditionally (see its own body, which
+    // says so and explains why it sits above the early return), and
+    // `DepthIngest::flush` is a blocking ILP-over-HTTP round trip bounded by
+    // the conf-pinned `request_timeout=5000`.
+    //
+    // So the offload — landed precisely to get blocking HTTP off this task —
+    // left a blocking HTTP call on this task, on the ONLY path production
+    // takes. Production enables both halves: `spawn_offload_writer` at boot
+    // and `with_inline_depth` on the same builder chain, so
+    // `writer_is_offloaded()` is true and `inline_depth` is `Some` on every
+    // real run, and this early return was reached every flush.
+    //
+    // The consequence is the mechanism `blocking_flush`'s own docs describe:
+    // a stalled QuestDB pins a tokio worker for up to 5 s, the WS read loops
+    // sharing that worker stop pumping pongs, the drain stops draining, and
+    // the ring fills. It is not merely slow — it is a tick-loss and
+    // disconnect path, which is the whole reason the helper exists.
+    //
+    // Wrapped UNCONDITIONALLY rather than gated on "is there depth pending":
+    // a gate needs a second accessor that must be kept in step with what
+    // `LiveIngest::flush` actually does, and the last time these two pieces
+    // of knowledge were kept in separate places is what produced this bug.
+    // The cost of being wrong the cheap way is one worker swap at ~5 flushes
+    // per second; the cost of being wrong the other way is this comment.
     if ingest.writer_is_offloaded() {
-        return ingest.flush();
+        return blocking_flush(|| ingest.flush());
     }
     let rows = blocking_flush(|| ingest.flush());
     feed_health.record_ticks(
@@ -3251,6 +3455,12 @@ async fn run_frame_drain(
                 // difference instead of corrupting the sample.
                 let queued_nanos =
                     i64::try_from(frame.received_at.elapsed().as_nanos()).unwrap_or(i64::MAX);
+                // Publish what was already being computed. Until 2026-08-26
+                // this value was derived on EVERY frame — ~5,000 times a
+                // second — used once to back-date `received_at_nanos`, and
+                // then dropped, so the one number that says how far behind our
+                // own drain is existed for a microsecond and reached nothing.
+                record_ring_dwell(queued_nanos);
                 let received_at_nanos = chrono::Utc::now()
                     .timestamp_nanos_opt()
                     .unwrap_or(0)
@@ -3259,6 +3469,12 @@ async fn run_frame_drain(
                 // wall-clock instant is used so a frame's arrival and its
                 // silence-accounting can never disagree.
                 let recv_millis = u64::try_from(received_at_nanos / 1_000_000).unwrap_or(0);
+                // The same instant as an `i64`, for the per-connection
+                // delivery stamp. Derived from `received_at_nanos` rather than
+                // taken fresh so a socket's stamp and its silence-accounting
+                // can never disagree by a scheduling delay — the same reason
+                // `recv_millis` above exists.
+                let recv_millis_i64 = received_at_nanos / 1_000_000;
 
                 // Routed BY ENDPOINT, never by guesswork. Depth frames carry a
                 // 12-byte header and can stack several packets in one message;
@@ -3272,6 +3488,17 @@ async fn run_frame_drain(
                         );
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
+                        // Stamp the SOCKET as delivering, gated on the frame
+                        // having actually produced something.
+                        //
+                        // Gated, not unconditional: a socket returning frames
+                        // that all fail to parse is not delivering market
+                        // data, and stamping on arrival would report it
+                        // healthy — the precise false-OK this detector exists
+                        // to remove. `folded > 0` is the honest bar.
+                        if outcome.folded > 0 {
+                            record_connection_tick(frame.connection_index, recv_millis_i64);
+                        }
                     }
                     DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
                         // PERSISTED since 2026-08-15 (operator: depth-20 and
@@ -3307,6 +3534,19 @@ async fn run_frame_drain(
                                     depth, &frame, received_at_nanos, kind, c,
                                 );
                                 depth_rows = depth_rows.saturating_add(outcome.rows);
+                                // Depth sockets get the same delivery stamp as
+                                // the main feed. Without this every depth
+                                // connection reads "never ticked" and is
+                                // excluded from the worst-age gauge — which
+                                // would leave ten of the sixteen sockets with
+                                // no deaf-socket coverage at all, while the
+                                // gauge looked healthy for that very reason.
+                                if outcome.rows > 0 {
+                                    record_connection_tick(
+                                        frame.connection_index,
+                                        recv_millis_i64,
+                                    );
+                                }
                                 depth_refused = depth_refused.saturating_add(outcome.refused);
                             }
                             None => {
@@ -3549,6 +3789,47 @@ async fn run_frame_drain(
                     ),
                     drain_started.elapsed().as_secs(),
                 ));
+                // The PER-SOCKET half of the same question, published on the
+                // same tick and for the same reason.
+                //
+                // The lane gauge above cannot see one deaf socket among
+                // sixteen: with fifteen delivering, the lane's last tick is
+                // always a second old however dead the sixteenth is. This one
+                // reports the WORST socket, so a single deaf connection moves
+                // it while the lane gauge stays flat — and that difference IS
+                // the diagnosis.
+                //
+                // -1 for "no connection has ticked yet", which is a real state
+                // (pre-open, or a lane that just started) and must not render
+                // as 0. Zero would read as "every socket ticked this instant",
+                // the most reassuring value available, at the moment we know
+                // least.
+                metrics::gauge!(WORST_CONN_TICK_AGE_GAUGE).set(
+                    worst_connection_tick_age_secs(
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .map_or(-1.0, |secs| f64::from(u32::try_from(secs).unwrap_or(u32::MAX))),
+                );
+                // Ring OCCUPANCY, the companion to the dwell gauge above.
+                //
+                // Published here rather than in `publish_fold_depth` because
+                // the budgets live on the drain's own frame, not on the
+                // ingest, and threading them through that function's signature
+                // would touch four call sites to move two atomic loads.
+                //
+                // Per-pool detail is published unselected alongside the
+                // worst-of-two: labels are free on `/metrics` and cost a
+                // CloudWatch dimension each, so the pair that answers "is the
+                // ring filling?" ships and the pair that answers "which one?"
+                // stays local, where whoever is triaging is already looking.
+                let main_pct =
+                    budget_fill_pct(main_feed_budget.resident(), main_feed_budget.cap());
+                let depth_pct = budget_fill_pct(depth_budget.resident(), depth_budget.cap());
+                metrics::gauge!(RING_RESIDENT_PCT_GAUGE).set(main_pct.max(depth_pct));
+                metrics::gauge!("tv_dhan_feed_ring_resident_pct_by_pool", "pool" => "main_feed")
+                    .set(main_pct);
+                metrics::gauge!("tv_dhan_feed_ring_resident_pct_by_pool", "pool" => "depth")
+                    .set(depth_pct);
                 // Gauges publish unconditionally — a dashboard reading zero
                 // outside market hours is correct, and gating the gauge would
                 // make "no data" and "nothing wrong" indistinguishable.
@@ -4631,6 +4912,144 @@ impl WsLagHandles {
     }
 }
 
+/// Per-connection last-tick instant, in epoch MILLISECONDS. `0` = never ticked.
+///
+/// # The failure this exists for
+///
+/// A socket that keeps answering pings but stops delivering data never trips
+/// the idle watchdog — the watchdog governs SILENCE on the wire, and a socket
+/// sending pongs is not silent. It also never reconnects, so the whole
+/// reconnect family (`tv_dhan_ws_reconnect_total`, `_dial_failed_total`,
+/// `_subscribe_failed_total`) stays flat: alarming those, the obvious fix,
+/// cannot catch this case BY CONSTRUCTION, because the defining property of a
+/// deaf socket is that nothing about it is retrying.
+///
+/// The lane-level `LAST_TICK_AGE_GAUGE` cannot see it either. With fifteen
+/// sockets delivering normally the lane's last tick is always a second old,
+/// however dead the sixteenth is.
+///
+/// # Why ONE gauge and not sixteen
+///
+/// Per-connection series would be sixteen names' worth of cost (~$4.80/mo by
+/// the 2026-08-14 noise-lock figure) to answer a yes/no question. Publishing
+/// the WORST age across connections answers it for one series (~$0.30/mo) with
+/// identical detection power: if socket 7 goes deaf, the max climbs while the
+/// lane gauge stays at one second. Per-connection attribution is still on
+/// `/metrics` for whoever is triaging, which is the moment attribution is
+/// actually wanted — and by then a human is already looking.
+///
+/// # Never-ticked slots are EXCLUDED, deliberately
+///
+/// A slot that has never ticked reads `0` and is skipped rather than treated
+/// as infinitely stale. Two reasons: an unused slot would peg this gauge at
+/// "broken" forever, and a legitimately quiet subscription (a depth-200 socket
+/// on one illiquid contract) is not a fault. The never-ticked case has its own
+/// signal already — `tv_dhan_feed_instruments_never_ticked` plus RISK-GAP-03 —
+/// so it is covered, not dropped.
+static PER_CONN_LAST_TICK_MILLIS: [std::sync::atomic::AtomicI64;
+    MAX_TOTAL_DHAN_CONNECTIONS as usize] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; MAX_TOTAL_DHAN_CONNECTIONS as usize];
+
+/// Stamps that a connection delivered a tick. One relaxed store per FRAME.
+///
+/// Per frame, not per tick: a frame stacks packets, and the question this
+/// answers ("is this socket delivering at all?") is answered identically by
+/// either. The cheaper one wins on a path that runs ~5,000 times a second.
+///
+/// An out-of-range index is dropped rather than panicking or wrapping. The
+/// planner cannot produce one — the array is sized from the same constant the
+/// pool is — and writing to the wrong slot would report the wrong socket
+/// healthy, which is worse than not writing.
+pub fn record_connection_tick(connection_index: u8, recv_millis: i64) {
+    if let Some(slot) = PER_CONN_LAST_TICK_MILLIS.get(connection_index as usize) {
+        slot.store(recv_millis, Ordering::Relaxed);
+    }
+}
+
+/// Age in seconds of the STALEST connection that has ever ticked.
+///
+/// `None` when no connection has ticked yet — which is a real state (pre-open,
+/// or a lane that has just started) and must NOT render as zero. Zero would
+/// mean "every socket ticked this instant", the most reassuring reading
+/// available, at the moment we know least.
+///
+/// Pure, so the boundary cases are testable without a clock.
+#[must_use]
+pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
+    let mut worst: Option<u64> = None;
+    for slot in &PER_CONN_LAST_TICK_MILLIS {
+        let last = slot.load(Ordering::Relaxed);
+        if last == 0 {
+            continue; // never ticked — see the type's docs
+        }
+        // saturating: a clock stepped backwards must read as 0 age, never wrap
+        // into a gigantic one at the moment the log is hardest to read.
+        let age = u64::try_from(now_millis.saturating_sub(last).max(0) / 1_000).unwrap_or(u64::MAX);
+        worst = Some(worst.map_or(age, |w| w.max(age)));
+    }
+    worst
+}
+
+/// Gauge: how stale the WORST-performing live connection is, in seconds.
+///
+/// `-1` when no connection has ticked yet, so "unknown" is distinguishable
+/// from "all fresh" on the chart. A gauge that renders both as 0 is the
+/// false-OK shape this repo has retired repeatedly.
+pub const WORST_CONN_TICK_AGE_GAUGE: &str = "tv_dhan_ws_worst_conn_tick_age_secs";
+
+/// Gauge: how FULL the ring byte budget is, as a percentage, worst of the two
+/// pools.
+///
+/// # The half of the ring we were not publishing
+///
+/// The ring is bounded twice — by frame COUNT (65,536) and by BYTES
+/// (`RingByteBudget`). `tv_dhan_feed_ring_max_bytes` has been EMF-selected
+/// since 2026-08-15, so the CAPACITY reaches CloudWatch and the OCCUPANCY does
+/// not: we ship the denominator and withhold the numerator.
+/// `RingByteBudget::resident()` existed the whole time with call sites only in
+/// its own unit tests — the fifth instance in this lane of code that exists,
+/// is tested, and is never invoked.
+///
+/// # Percent, and worst-of-two
+///
+/// A percentage rather than raw bytes because the two budgets are sized
+/// differently (main-feed and depth split 3:1), so raw bytes are not
+/// comparable and a single raw gauge would be dominated by whichever pool is
+/// larger regardless of which is in trouble.
+///
+/// Worst-of-two rather than one gauge per pool for the reason the deaf-socket
+/// gauge is worst-of-sixteen: two dimensions cost twice one to answer a
+/// question one answers, and per-pool detail stays on `/metrics` where whoever
+/// is triaging will already be looking.
+///
+/// # It pairs with the dwell gauge, and the pair is the diagnosis
+///
+/// Dwell says how far behind the drain is in TIME; this says how full the ring
+/// is in BYTES. Both climbing is a drain that cannot keep up. Dwell flat while
+/// this climbs is large frames rather than a slow drain — a different problem
+/// with a different fix. Neither number says that alone.
+pub const RING_RESIDENT_PCT_GAUGE: &str = "tv_dhan_feed_ring_resident_pct";
+
+/// Fill percentage of one budget, `0.0..=100.0`.
+///
+/// A zero-capacity budget reads 0.0 rather than dividing — that combination is
+/// unreachable in production (both caps are derived from a non-zero host
+/// figure) but a NaN reaching a gauge is silently unchartable, and "the chart
+/// went blank" is a worse failure than "the chart read zero".
+#[must_use]
+pub fn budget_fill_pct(resident: usize, cap: usize) -> f64 {
+    if cap == 0 {
+        return 0.0;
+    }
+    // `u32::try_from` then `f64::from`, lossless by construction — the house
+    // pattern, and the same reason `take_ring_dwell_max_ms` uses it. Ring
+    // budgets are gigabyte-scale at most, so the u32 ceiling of ~4.29e9 is
+    // never approached; saturating there would read as full, which is the
+    // safe direction for a saturation gauge.
+    let r = f64::from(u32::try_from(resident).unwrap_or(u32::MAX));
+    let c = f64::from(u32::try_from(cap).unwrap_or(u32::MAX));
+    (r / c * 100.0).min(100.0)
+}
 static WS_LAG_HANDLES: OnceLock<WsLagHandles> = OnceLock::new();
 
 fn ws_lag_handles() -> &'static WsLagHandles {
@@ -4776,6 +5195,12 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(PENDING_ROWS_GAUGE).set(pending);
     metrics::gauge!(SEALS_DROPPED_GAUGE).set(dropped);
     metrics::gauge!(SEQ_REFUSED_GAUGE).set(refused);
+    // Ring dwell rides the SAME periodic publish rather than a timer of its
+    // own. A second timer would be a second `select!` arm on the drain loop,
+    // and the whole point of this measurement is that the drain loop is not
+    // being starved — a signal that adds a new way to starve it would be
+    // measuring a problem it helped cause.
+    metrics::gauge!(RING_DWELL_MAX_MS_GAUGE).set(take_ring_dwell_max_ms());
 }
 
 /// The WebSocket base URL for one MARKET-DATA endpoint type.
@@ -6651,6 +7076,19 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
     // Deliberately routed through `publish_alive_connections` rather than
     // pushing 0 directly: one function owns the health push, so there is no
     // second path to drift.
+    //
+    // Installed BEFORE that call, so the arming push below is the FIRST thing
+    // to reach the registry. Ordering matters: install after it and the very
+    // first transition — the one that arms the row — is silently dropped, and
+    // the row keeps its boot-time `false` until the next socket event. On a
+    // lane that dials once and stays up, "the next socket event" is the 17:30
+    // shutdown.
+    if !install_feed_health(Arc::clone(&params.feed_health)) {
+        // Already installed. `FEED_STACK_SPAWNED` makes a second spawn
+        // impossible in production, so this can only be a repeat call under
+        // test; the first registry stays authoritative either way.
+        tracing::debug!("Dhan lane feed-health registry was already installed — keeping the first");
+    }
     publish_alive_connections(ALIVE_CONNECTIONS.load(Ordering::SeqCst));
 
     // Installed BEFORE the bring-up task is spawned, so neither the silence
@@ -7580,8 +8018,34 @@ pub fn spawn_daily_crossverify(
                         noise_p50_paise = c.noise_p50_paise,
                         noise_p95_paise = c.noise_p95_paise,
                         noise_max_paise = c.noise_max_paise,
+                        // The match RATE, computed rather than left as an
+                        // exercise. Both inputs were already on this line,
+                        // so anyone could multiply by four and subtract —
+                        // and nobody did, for two sessions, while the run
+                        // sat at 0.09% of its intended coverage. A number
+                        // that needs arithmetic before it means anything is
+                        // a number that gets skipped.
+                        price_fields_compared = c.minutes_compared.saturating_mul(4),
+                        price_fields_agreed = c
+                            .minutes_compared
+                            .saturating_mul(4)
+                            .saturating_sub(c.cells_diverged),
+                        // Volume — reported for the first time today. A
+                        // capture percentage, never a pass/fail: see the
+                        // volume block on `DayComparison`.
+                        volume_cells = c.volume_cells,
+                        volume_exact = c.volume_exact,
+                        volume_capture_p50_pct = c.volume_capture_p50_pct,
+                        volume_capture_p05_pct = c.volume_capture_p05_pct,
+                        volume_capture_min_pct = c.volume_capture_min_pct,
                         findings = c.findings.len(),
                         rest_failures = report.rest_failures,
+                        // Added 2026-08-26. `rest_failures` alone reported
+                        // 814-of-864 and 815-of-865 on consecutive sessions
+                        // and gave nobody a way to act on it: the reason was
+                        // discarded at the fetch site. This field names the
+                        // dominant cause on the same line as the verdict.
+                        rest_failure_reasons = %report.rest_failure_breakdown.summary(),
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
                         degraded = report.degraded,
@@ -9824,6 +10288,11 @@ mod tests {
             noise_p50_paise: 88,
             noise_p95_paise: 99,
             noise_max_paise: 111,
+            volume_cells: 122,
+            volume_exact: 133,
+            volume_capture_p50_pct: 94,
+            volume_capture_p05_pct: 61,
+            volume_capture_min_pct: 12,
         };
 
         let row = xverify_daily_row(&c, 5);
@@ -11724,40 +12193,58 @@ mod tests {
         // adding a further flush site without the helper fails here rather
         // than in prod.
         //
-        // 2026-08-25 — one exception now exists, and it is the opposite of the
-        // defect this test was written for. When the writer has been SPLIT
-        // (`LiveIngest::spawn_offload_writer`), `ingest.flush()` performs no
-        // network I/O at all: it hands the ILP buffer to a bounded queue that
-        // a dedicated OS thread drains. Wrapping THAT in `block_in_place`
-        // would ask the runtime to spin up a replacement worker for a
-        // `try_send`, which is pure cost for no benefit.
+        // 2026-08-25 — an exception was carved for the offloaded early return,
+        // on the reasoning that when the writer has been SPLIT
+        // (`LiveIngest::spawn_offload_writer`) `ingest.flush()` performs no
+        // network I/O: it hands the ILP buffer to a bounded queue that a
+        // dedicated OS thread drains, so wrapping THAT in `block_in_place`
+        // would spin up a replacement worker for a `try_send`.
         //
-        // So the exception is counted EXPLICITLY rather than by loosening the
-        // equality. `bare == wrapped` would have been the tempting edit and it
-        // is the wrong one: it stops noticing a genuinely bare blocking flush,
-        // which is the entire point of the test. Instead the offloaded form is
-        // recognised by its own literal, and anything that is neither wrapped
-        // nor that literal still fails.
+        // 2026-08-26 — THE EXCEPTION IS WITHDRAWN, because the reasoning was
+        // wrong about what `LiveIngest::flush` does. It flushes the
+        // inline-depth sink FIRST and unconditionally, above its own
+        // `pending_rows == 0` early return, and `DepthIngest::flush` IS a
+        // blocking ILP-over-HTTP round trip (`request_timeout=5000`). So the
+        // carve-out did not exempt a queue hand-off — it exempted a 5-second
+        // blocking HTTP call, on the ONLY path production takes, inside the
+        // very test written to stop exactly that.
+        //
+        // This is worth more than the fix: the test DID hold the line it was
+        // built to hold, and was then walked around by an exception written in
+        // good faith from an incomplete reading of the callee. A guard is only
+        // as strong as the claim its exception rests on, and this one rested
+        // on a claim nobody re-derived from `LiveIngest::flush`.
+        //
+        // The invariant is therefore back to its original, unexceptional form:
+        // EVERY production `ingest.flush()` is wrapped. `offloaded` is still
+        // counted — pinned at ZERO — rather than deleted, so re-introducing
+        // the bare early return fails here by name instead of quietly
+        // rebalancing the equality.
         let bare = production_half.matches("ingest.flush()").count();
         let wrapped = production_half
             .matches("blocking_flush(|| ingest.flush())")
             .count();
         let offloaded = production_half.matches("return ingest.flush();").count();
         assert_eq!(
-            offloaded, 1,
-            "expected exactly ONE non-blocking flush — the early return inside \
-             `flush_and_record` taken when the writer has been offloaded. Found \
-             {offloaded}: either the offload branch was deleted (the flush is \
-             back on the drain) or a second site started bypassing the helper"
+            offloaded, 0,
+            "found {offloaded} BARE offloaded flush(es). `LiveIngest::flush` \
+             flushes the inline-depth sink unconditionally and that is a \
+             blocking ILP-over-HTTP call — a bare `return ingest.flush();` puts \
+             it straight back on the async drain task, which is a tick-loss and \
+             disconnect path, not merely a slow one"
+        );
+        assert!(
+            production_half.contains("return blocking_flush(|| ingest.flush());"),
+            "the offloaded early return must still EXIST and must be wrapped — \
+             if it is gone entirely the writer split was deleted and the full \
+             flush is back on the drain"
         );
         assert_eq!(
             bare,
             wrapped + offloaded,
-            "every production ingest.flush() must be either wrapped in \
-             blocking_flush (the synchronous fallback) or the offloaded early \
-             return; found {bare} call(s), {wrapped} wrapped and {offloaded} \
-             offloaded — the difference is a blocking HTTP call sitting on the \
-             async drain task"
+            "every production ingest.flush() must be wrapped in blocking_flush; \
+             found {bare} call(s), {wrapped} wrapped and {offloaded} bare — the \
+             difference is a blocking HTTP call sitting on the async drain task"
         );
 
         // The offload must be WIRED, not merely available. Seven of the nine
@@ -11814,7 +12301,6 @@ mod tests {
              flush returns rows HANDED OFF, and recording those as feed health \
              forges liveness for exactly as long as the database is unreachable"
         );
-
         // 2026-08-18: the drain's three flush sites now route through
         // `flush_and_record`, which pairs the flush with the feed-health
         // report, so exactly ONE wrapped `ingest.flush()` remains — inside
@@ -11827,12 +12313,22 @@ mod tests {
         // separately below. Loosening `wrapped` alone would have been the
         // wrong edit — it would stop noticing a bare flush entirely — which is
         // why the equality above is kept and this pair replaces the count.
+        //
+        // 2026-08-26: TWO, not one. `flush_and_record` has two arms — the
+        // offloaded early return and the synchronous fallback — and BOTH now
+        // wrap, because the callee flushes the inline-depth sink over the
+        // network on either path. Both wrapped calls are still inside the one
+        // helper, so the choke-point property this assertion actually protects
+        // is unchanged; only the arm count moved. Kept as an exact equality
+        // rather than `>= 1` for the same reason it was exact before: a `>=`
+        // would stop noticing the helper being inlined back into the drain.
         assert_eq!(
-            wrapped, 1,
-            "expected exactly ONE wrapped ingest.flush() — the single one \
-             inside `flush_and_record`. Found {wrapped}: either a flush site \
-             bypassed the helper, or the helper was inlined back into the \
-             drain (which re-opens the four-sites-to-keep-in-sync problem)"
+            wrapped, 2,
+            "expected exactly TWO wrapped ingest.flush() calls — the offloaded \
+             early return and the synchronous fallback, both inside \
+             `flush_and_record`. Found {wrapped}: either a flush site bypassed \
+             the helper, or the helper was inlined back into the drain (which \
+             re-opens the four-sites-to-keep-in-sync problem)"
         );
         let recorded_sites = production_half
             .matches("flush_and_record(&mut ingest, &feed_health)")
@@ -12310,8 +12806,31 @@ mod tests {
         let src = include_str!("dhan_feed_stack.rs");
         let marker = "cross-verification finished — this is the honest";
         let idx = src.find(marker).expect("the cross-verify emit must exist");
-        // Look back over the emit's own argument list only.
-        let start = idx.saturating_sub(2_000);
+        // CORRECTED 2026-08-26. This walked back a FIXED 2,000 bytes, and on
+        // the day four more fields were added to the emit it failed — not
+        // because a field was missing, but because the list outgrew the
+        // window. It failed CLOSED, blocking a correct change, which is the
+        // better of the two directions; the shape is wrong either way.
+        //
+        // This is the FIFTH fixed-window guard found in this branch, all
+        // written by me. A byte count is a guess about how long code will
+        // stay; the macro opening is a real boundary and cannot drift.
+        //
+        // The openings are assembled from FRAGMENTS, not written whole. A
+        // source-scanning guard in another crate reads this file for `error!`
+        // sites and cannot tell a literal in a test array from a real emit —
+        // it failed on exactly that, and the failure was 100% correct given
+        // what it could see. Same technique the failure-reason pin uses one
+        // module over, for the same reason: this file is read by scanners.
+        let start = [
+            concat!("info", "!("),
+            concat!("error", "!("),
+            concat!("warn", "!("),
+        ]
+        .iter()
+        .filter_map(|m| src[..idx].rfind(m))
+        .max()
+        .expect("the emit must sit inside a tracing macro");
         let emit = &src[start..idx];
 
         assert!(
@@ -13950,6 +14469,97 @@ mod inline_depth_tests {
         assert!(
             ingest.inline_depth.is_some(),
             "the sink must survive the flush for the next packet"
+        );
+    }
+
+    /// `LiveIngest::flush` flushes the inline-depth sink EVEN WHEN the tick
+    /// writer has been offloaded — which is the fact a source-scan exception
+    /// got wrong on 2026-08-25 and left a blocking HTTP call on the drain.
+    ///
+    /// The exception in `flush_and_record` read the offloaded path as "a
+    /// bounded-queue hand-off with no network in it" and returned
+    /// `ingest.flush()` bare on that basis. It was reasoning about the TICK
+    /// writer, which is true of it, and never re-derived what the callee also
+    /// does: the depth sink is flushed first, unconditionally, above the
+    /// `pending_rows == 0` early return, and `DepthIngest::flush` is a real
+    /// blocking ILP-over-HTTP round trip (`request_timeout=5000`).
+    ///
+    /// This is written as a BEHAVIOURAL test on purpose. The invariant is also
+    /// pinned by a source scan a few hundred lines up, but a source scan
+    /// asserts the shape of the code, and the defect here was in a CLAIM about
+    /// the code's behaviour — the exact thing a text match cannot check. If
+    /// someone ever "optimises" `LiveIngest::flush` by moving the inline-depth
+    /// flush below the early return, every source scan still passes and this
+    /// test is the only thing that notices.
+    ///
+    /// `DepthWriter::for_test` has no sender, so its flush discards and errors
+    /// — which is precisely the signal we want: `dropped_rows` rising is proof
+    /// the flush was ATTEMPTED, and nothing else in this path moves it.
+    #[test]
+    fn the_offloaded_path_still_flushes_the_inline_depth_sink() {
+        let mut sink = DepthIngest::for_test();
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 100.5,
+            ask_price: 100.75,
+        }; 5];
+        let appended = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            1_700_000_000_000_000_000,
+            0,
+            0,
+            counters(),
+        );
+        assert_eq!(appended, 10, "fixture must actually buffer depth rows");
+        assert_eq!(
+            sink.dropped_rows(),
+            0,
+            "nothing may have been discarded before the flush, or the \
+             assertion below proves nothing"
+        );
+
+        let mut ingest =
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8).with_inline_depth(sink);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(health)
+            .expect("offload writer must spawn");
+        assert!(
+            ingest.writer_is_offloaded(),
+            "this test is only meaningful on the OFFLOADED path — the one \
+             production takes and the one the withdrawn exception exempted"
+        );
+
+        // ZERO tick rows pending, so `LiveIngest::flush` returns 0 by its own
+        // early return. The depth sink must still have been flushed.
+        assert_eq!(ingest.flush(), 0, "no tick rows to cover");
+        let depth = ingest
+            .inline_depth
+            .as_ref()
+            .expect("the sink must survive the flush");
+        assert_eq!(
+            depth.dropped_rows(),
+            10,
+            "the inline-depth flush must run on the OFFLOADED path too. Zero \
+             here means `LiveIngest::flush` skipped the depth sink, and the \
+             `flush_and_record` fast path would then be free of network I/O — \
+             which is what the 2026-08-25 exception assumed and what left a \
+             5-second blocking HTTP call on the async drain task"
+        );
+        assert_eq!(
+            depth.pending_rows(),
+            0,
+            "a discarded buffer must not still read as pending"
         );
     }
 }
