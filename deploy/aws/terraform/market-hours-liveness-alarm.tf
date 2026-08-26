@@ -398,6 +398,23 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 6 alarms.
         aws_cloudwatch_metric_alarm.tick_spill_replay_failing.alarm_name,
         aws_cloudwatch_metric_alarm.ticks_spilling.alarm_name,
+        # 2026-08-26: dhan_worst_socket_deaf JOINS the gate — OPERATOR-APPROVED
+        # ("Yes, phone me", 2026-08-26).
+        #
+        # It is notBreaching, so unlike dhan_live_lane_down and
+        # dhan_no_ticks_flowing it does not NEED the gate to avoid a
+        # missing-data page. It needs the gate for the OTHER reason, and the
+        # reason is daily rather than occasional: after the 15:30 close every
+        # socket legitimately stops delivering, so the worst-connection age
+        # climbs past its 600 s threshold within ten minutes and this alarm
+        # would fire on a market that is simply shut — every single trading
+        # day, at ~15:40. That is the fastest possible way to train an operator
+        # to ignore an alarm, which is exactly what this file's own notes on
+        # the two alarms above warn about.
+        #
+        # Authorization and the binding constraints are the dated §2.3i row in
+        # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 7 alarms.
+        aws_cloudwatch_metric_alarm.dhan_worst_socket_deaf.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).

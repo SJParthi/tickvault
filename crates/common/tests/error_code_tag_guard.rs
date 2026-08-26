@@ -282,7 +282,14 @@ fn scan_corpus_exists_and_is_substantial() {
 /// Groww feed and the two-broker comparators that went with it. The budget
 /// follows the corpus down because a ratchet allowed to sit above the truth is
 /// a ceiling somebody padded once, and it stops ratcheting the moment it does.
-const UNCODED_ERROR_BUDGET: usize = 83;
+///
+/// 83 -> 82 (2026-08-26). ONE site coded, and it is the one that mattered
+/// most: the `TrySendError::Full` arm in `ws_frame_spill.rs` — the WAL spill
+/// channel filling — had no `error!` at all, so the durable floor could be
+/// breached with nothing but a counter nobody was reading to say so. It now
+/// carries `WS-SPILL-02`. The budget comes down with it, in the same change,
+/// per the rule the line above states.
+const UNCODED_ERROR_BUDGET: usize = 82;
 
 /// Sites where an `error!` carries no code and that is CORRECT.
 ///

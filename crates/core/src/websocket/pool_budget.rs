@@ -230,6 +230,65 @@ impl DhanEndpointType {
         }
     }
 
+    /// Does this endpoint need a CLIENT-originated keepalive ping?
+    ///
+    /// # The measurement (prod, 2026-08-26, market open)
+    ///
+    /// `tv_dhan_ws_control_frames_total{kind="ping"}`:
+    ///
+    /// | endpoint | server pings received |
+    /// |---|---|
+    /// | `main_feed` | 3,460 |
+    /// | `depth_20` | 12,110 |
+    /// | **`depth_200`** | **series absent entirely — ZERO** |
+    ///
+    /// The counter is created lazily on first ping, so an absent series means
+    /// depth-200 received **no control frame at all** in a whole session.
+    /// `docs/dhan-ref/full-market-depth.md:107` claims *"Server pings every 10
+    /// seconds — same ping-pong mechanism as Live Market Feed."* **That claim
+    /// is false for this endpoint.**
+    ///
+    /// # Why it matters, and why the fix is a ping rather than a bigger timeout
+    ///
+    /// `IdleWatchdog`'s own header states its purpose: *"this timer is not
+    /// merely 'is the server quiet?' — it is also, and mostly, **'have WE
+    /// stopped draining?'**"*. That works because Dhan pings, our library
+    /// auto-pongs **only while the read loop polls**, and the arriving traffic
+    /// therefore proves we are draining.
+    ///
+    /// With no server ping there is nothing to pong, so on depth-200 the only
+    /// activity is market data — and the watchdog silently degrades from
+    /// measuring OUR health to measuring whether an ILLIQUID OPTION HAPPENS TO
+    /// BE TRADING. The five depth-200 instruments are FINNIFTY / MIDCPNIFTY /
+    /// NIFTY options, which legitimately go 27+ seconds without a book update.
+    ///
+    /// Measured consequence, same session: `main_feed` and `order_update` took
+    /// **0** disconnects while `depth_200` took **265**, every one of them
+    /// self-inflicted at `idle_secs: 27`. Three of the five sockets cycled 19
+    /// times each and then stopped dead at **09:14:45** — nothing was fixed at
+    /// 09:15; the market opened.
+    ///
+    /// A client ping restores the intended semantics exactly: we ping, Dhan
+    /// pongs, and the pong arrives **only if the socket is alive AND our read
+    /// loop is draining** — which is the question the watchdog was built to
+    /// ask. Merely raising the timeout would silence the symptom while leaving
+    /// the watchdog measuring liquidity.
+    ///
+    /// Deliberately NOT applied to the endpoints Dhan already pings: their
+    /// 2026-08-19 repair works, proven by main_feed going from 2,150
+    /// disconnects/day to 0, and adding redundant traffic to a working path
+    /// buys nothing.
+    #[must_use]
+    pub const fn needs_client_keepalive_ping(self) -> bool {
+        match self {
+            // Measured: zero server pings, ever.
+            Self::Depth200 => true,
+            // Measured: Dhan pings these, and the 2026-08-19 fix already turns
+            // that ping into a watchdog reset.
+            Self::MainFeed | Self::Depth20 | Self::OrderUpdate => false,
+        }
+    }
+
     /// Max instruments a single connection of this type may subscribe.
     #[must_use]
     pub const fn max_instruments_per_connection(self) -> u32 {

@@ -142,3 +142,66 @@ fn test_sp5_1_drops_dimension_wired_in_spill() {
          that cause only, which is harder to notice than losing both."
     );
 }
+
+/// SP5.2 — the `connected` dimension, wired 2026-08-26.
+///
+/// This is the pin the module doc above promised: *"They MUST be re-pinned in
+/// the PR that wires them — otherwise the revived feed ships with strictly less
+/// health coverage than the retired one had."*
+///
+/// # What was broken
+///
+/// `FeedHealthRegistry::set_connected` had ZERO production call sites — every
+/// reference in the workspace sat inside a `#[cfg(test)]` module. The field
+/// initialises `false` and `feed_health::classify` tests `if !i.connected`
+/// BEFORE the tick-age branch, so `/api/feeds/health` answered
+/// `Down, "enabled but disconnected — reconnecting"` unconditionally.
+///
+/// Captured on prod at one instant, 2026-08-26: the same JSON object reported
+/// `verdict=down, connected=false` alongside `ticks_total=17,265,688` and
+/// `last_tick_age=1s`, while `/health` said `15 connections` and
+/// `tv_dhan_feed_stack_up` read 1. `/board`, `/dashboard` and `/feeds` all
+/// render that row.
+#[test]
+fn test_sp5_2_connected_dimension_wired_in_the_lane() {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("src/dhan_feed_stack.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+    assert!(
+        src.contains("feed_health.set_connected("),
+        "SP5.2 regression: the Dhan lane no longer reports socket connectivity \
+         to the feed-health registry, so /api/feeds/health reverts to reporting \
+         a working feed as DOWN on every trading day."
+    );
+
+    // Exactly ONE push site. The whole reason `publish_alive_connections`
+    // exists is that its own doc calls it "one function owns the health push,
+    // so there is no second path to drift" — a second site would let the two
+    // disagree, which is how a status row starts lying without anyone noticing.
+    assert_eq!(
+        src.matches("feed_health.set_connected(").count(),
+        1,
+        "the connected push must have exactly ONE site (inside \
+         publish_alive_connections, which is both edges of \
+         AliveConnectionGuard). A second site can drift from the first."
+    );
+
+    // The registry must be installed BEFORE the arming push. Install after it
+    // and the first transition — the one that arms the row — is dropped, and
+    // on a lane that dials once and stays up the next socket event is the
+    // 17:30 shutdown.
+    let install = src
+        .find("install_feed_health(Arc::clone(&params.feed_health))")
+        .expect("the lane must install the feed-health registry at spawn");
+    let arming = src
+        .find("publish_alive_connections(ALIVE_CONNECTIONS.load(Ordering::SeqCst))")
+        .expect("the lane must arm the row at spawn");
+    assert!(
+        install < arming,
+        "the feed-health registry must be installed BEFORE the arming \
+         publish_alive_connections call, or the arming transition is silently \
+         dropped and the row keeps its boot-time `false`."
+    );
+}

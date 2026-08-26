@@ -196,3 +196,63 @@ refuted by its own investigation and reported as refuted.
   is the only ground truth for that class.
 - The lag figures are one session on one day. They are a measurement, not a
   guarantee of future sessions.
+
+---
+
+## 9. Status as of 2026-08-26 13:40 IST — what has been applied, and one correction
+
+Section 7 opens "Nothing applied." That was true when written and is no longer.
+Recorded here as an addendum rather than by editing the rows above, so the
+report stays readable as the record of what was known at the time.
+
+### Applied
+
+| Rec | Status | Where |
+|---|---|---|
+| 1 — move the depth flush off the frame drain | **DONE** | `f3d069a1`. Finding 1's second half was the load-bearing one: the OFFLOADED path returned `ingest.flush()` bare, and `LiveIngest::flush` flushes the inline-depth sink unconditionally. The guard that should have caught it carried an exception written from an incomplete reading of the callee. |
+| 2 — publish `queued_nanos` | **DONE, as a GAUGE not a histogram** | `baf32508`. `tv_dhan_feed_ring_dwell_max_ms`, max-per-window with reset-on-read, EMF-selected and charted. A histogram was rejected on cost — see the correction below. `resident()` remains unpublished. |
+
+### ⚠ Correction to recommendation 3
+
+Rec 3 reads: *"EMF-select `tv_dhan_ws_lag_ms` (16 fixed connection series) …
+Cardinality already authorized. small."* **Both halves are wrong**, and the
+recommendation is withdrawn in that form.
+
+- **It is not 16 series.** `tv_dhan_ws_lag_ms` is a *histogram*, not a gauge. It
+  ships ~12 bucket series per dimension plus sum and count, so 16 connections is
+  roughly 220 series — an order of magnitude above what the 2026-08-14
+  noise-lock authorization priced at $4.80/mo. Shipping it on the strength of
+  that authorization would have spent ~14× a quoted number silently.
+- **It is not an oversight but a stated policy.**
+  `deploy/aws/EMF-METRIC-SELECTOR-NOTES.md` excludes latency histograms
+  explicitly — *"they answer 'how much', not 'what broke'"*. Calling it a gap
+  was a misreading of a deliberate decision.
+
+The finding underneath rec 3 — *no CloudWatch signal distinguishes "Dhan was
+slow" from "we were slow"* — was real, and the ring-dwell gauge answers the
+half that matters, which is also the only half we can act on. Dhan's delivery
+lag is theirs; our backlog is ours.
+
+### Still open, unchanged
+
+Findings 3 (out-of-order writes into closed partitions) and 4 (the deaf socket
+that keeps ponging; the un-pageable reconnect family) stand, as do recs 4, 5
+and 6. Finding 3 additionally needs the operator ruling rec 4 names — it is a
+question about what a timestamp *means*, not one an executor should answer.
+
+### One measurement that changes the disk picture
+
+Measured on the box at 13:05 IST, after the 200→300 GB grow: **153 MB/s of 500
+provisioned, 1,265 IOPS of 6,000, `%util` 91%, disk 96 GB of 300 (32%)**. The
+volume is neither throughput- nor IOPS-bound, so **the EBS raise authorized on
+2026-08-25 would buy nothing** and is still not taken.
+
+Attribution, same measurement: `tickvault` writes **1.1 MB/s**; QuestDB writes
+**79 MB/s and reads 70 MB/s**. The ~129:1 gap is entirely storage-side, and the
+read side exceeding the write side is the signature of partition rewrites
+rather than of ingest. `market_depth` is **62 GB** against `ticks` at **9.3 GB**.
+
+**PARTITION BY HOUR → DAY, floated earlier as the fix, is the wrong direction.**
+Today 34.9% of ticks land 1 min–1 h behind and 1.6% land 1 h–1 day behind; a DAY
+partition makes each out-of-order merge rewrite more data, not less. No
+migration on that reasoning.

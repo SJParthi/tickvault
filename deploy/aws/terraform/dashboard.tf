@@ -487,6 +487,106 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
       {
         type   = "metric"
+        x      = 16
+        y      = 64
+        width  = 8
+        height = 6
+        properties = {
+          # The only ring signal that rises BEFORE the loss, not after it.
+          #
+          # Every other ring metric on this dashboard is a post-mortem count:
+          # ring_full_total and frame_refused_total move once frames have
+          # already been turned away. This is how long a frame WAITED before
+          # the drain reached it, so it climbs while there is still headroom
+          # left — which is the only window in which an operator can act.
+          #
+          # MAXIMUM, never Average. A mean hides the stall that matters: one
+          # eight-second dwell inside a window of microsecond dwells averages
+          # to approximately zero, and it is precisely that one frame that
+          # says the drain stopped draining.
+          #
+          # Deliberately UNALARMED for now. The value has never been observed,
+          # because until 2026-08-26 it was computed ~5,000 times a second and
+          # thrown away; picking a threshold before there is a baseline invents
+          # a number and then teaches the operator to ignore the alarm built on
+          # it. Chart first, threshold when the chart has something to read.
+          title  = "How far behind the drain is (worst frame wait, ms)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_ring_dwell_max_ms", { label = "worst ring wait", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 70
+        width  = 8
+        height = 6
+        properties = {
+          # A socket that keeps answering pings but stops delivering data.
+          #
+          # This failure defeats every other mechanism by construction. The
+          # idle watchdog governs SILENCE, and a ponging socket is not silent.
+          # The reconnect counters stay flat, because the defining property of
+          # a deaf socket is that nothing about it is retrying. And the
+          # LANE-level tick age reads about a second throughout, because
+          # fifteen of the sixteen sockets are fine.
+          #
+          # Read it AGAINST the lane tick age, not alone: both low is healthy,
+          # this one climbing while the lane stays flat is exactly one deaf
+          # socket, and both climbing is the whole feed. That difference is the
+          # diagnosis, which is why the two belong on the same screen.
+          #
+          # -1 means no connection has ticked yet — pre-open, or a lane that
+          # has just started. Deliberately not 0, which would read as "every
+          # socket ticked this instant" at the moment we know least.
+          title  = "Deaf socket check: worst connection tick age (s), -1 = none yet"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_ws_worst_conn_tick_age_secs", { label = "worst socket", stat = "Maximum" }],
+            [local.dash_namespace, "tv_dhan_feed_last_tick_age_secs", { label = "whole lane (for contrast)", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 70
+        width  = 8
+        height = 6
+        properties = {
+          # The other half of the ring. Read this WITH the dwell chart, never
+          # alone — the pair is the diagnosis and neither number gives it:
+          #
+          #   both flat            -> healthy
+          #   both climbing        -> the drain cannot keep up
+          #   dwell flat, this up  -> large frames, not a slow drain
+          #   dwell up, this flat  -> the drain is slow on small frames
+          #
+          # Until 2026-08-26 CloudWatch had tv_dhan_feed_ring_max_bytes (the
+          # CAPACITY) and nothing for the occupancy — the denominator without
+          # the numerator. `RingByteBudget::resident()` existed the whole time
+          # with call sites only in its own unit tests.
+          #
+          # Percent rather than bytes because the two pools are sized 3:1, so
+          # raw bytes are not comparable and the larger pool would dominate the
+          # chart regardless of which one is in trouble.
+          title  = "Ring fill (% of byte budget, worst pool)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_ring_resident_pct", { label = "worst pool", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
         x      = 8
         y      = 64
         width  = 8

@@ -2543,3 +2543,1070 @@ gone" would send an operator to diagnose a healthy thread.
 **14e** (no new EMF metric name may ship — `user-data.sh.tftpl` at zero free
 bytes) is honoured: all three new counters are local-exporter only. The loss
 path they sit on already pages through `tv_ticks_dropped_total`.
+
+---
+
+## Item 25 — three dead loss-signals on the durable floor (2026-08-26)
+
+- [x] **25a — `init_metrics` moved above STAGE-C so cached counter handles are real**
+  - Files: `crates/app/src/main.rs`
+  - Tests: `crates/app/tests/metrics_recorder_install_order_guard.rs` (5)
+- [x] **25b — the channel-FULL drop arm carries `code = WS-SPILL-02`**
+  - Files: `crates/storage/src/ws_frame_spill.rs`
+  - Tests: `crates/storage/tests/durable_floor_signal_guard.rs` (2 of 7)
+- [x] **25c — depth spill ceiling derived from the volume, not a literal**
+  - Files: `crates/storage/src/depth_persistence.rs`
+  - Tests: `crates/storage/tests/durable_floor_signal_guard.rs` (5 of 7)
+
+### Design
+
+The frame WAL is the durable floor, and the design believes it has four
+independent detectors on it. Live measurement on prod 2026-08-26 found **one**
+working, by accident.
+
+| # | Signal | State found | Cause |
+|---|---|---|---|
+| 1 | `tv_ws_frame_spill_drop_critical` → `durable-floor-breach` leg | **dead** | handle cached pre-recorder |
+| 2 | `tv_ticks_lost_total` → dedicated alarm | **dead** | same |
+| 3 | `error!` on channel-FULL → `{ $.code = "WS-SPILL-02" }` | **never matched** | no `code` field on that arm |
+| 4 | `tv_dhan_ws_wal_dropped_total` | alive | a *different* module keeps its own mirror |
+
+**25a.** `metrics::counter!` resolved before a recorder is installed returns
+`Counter { inner: None }`; `increment` is `if let Some(..)`, so it is a no-op
+forever. `SpillDropCounters::new` **caches** those handles (deliberately — the
+drop path must not allocate) and ran inside `WsFrameSpill::new` at `main.rs:913`,
+35 lines above `init_metrics` at `:948`. Verified live: both series absent from
+`/metrics` entirely while neighbours registered post-install rendered at 0.
+
+This is the SECOND occurrence in this file — the 2026-07-14 PR-C3 note records
+the same loss for `tv_ws_frame_wal_replay_total`, repaired by moving the
+*increment*. That fixes one instance and leaves the ordering hazard, which is
+why it recurred. Moving the *install* retires the class.
+
+**25b.** The `Disconnected` arm has always carried the code; the `Full` arm has
+not. FULL is the arm production reaches — it is what a writer stalled behind a
+saturated disk produces — so the un-pageable arm was the likely one.
+
+**25c.** `DEPTH_SPILL_MAX_BYTES` is a literal whose own doc cites a volume "86%
+full … ~28 GB free". Measured 2026-08-26: **300 GB, 255 GB free**. The premise
+expired and the number could not follow it.
+
+| tier | ceiling | sized by | rows/s | outage covered |
+|---|---|---|---|---|
+| tick | ~9.4 GB | volume ÷ 32 | 2,706 | **~5.2 h** |
+| depth | 512 MiB | a literal | 51,000 | **~75 s** |
+
+19× the volume, 250× less coverage. The tick tier became host-derived on
+2026-08-21 for exactly this reason; depth was not moved with it. Same fraction,
+same `OnceLock`, floor retained so it can never shrink.
+
+### Edge Cases
+
+- Unmeasurable volume → falls back to the 512 MiB floor with a coded warn, never
+  silently (mirrors the tick tier).
+- Small volume → `.max(DEPTH_SPILL_MAX_BYTES)` guarantees the derived ceiling is
+  never *below* what the literal already allowed.
+- `OnceLock` → the `df` probe runs at most once, on the cold failure path, so the
+  enforced number and the number a log line quotes can never disagree.
+- Comment-stripping in the ordering guard: the fix ships with prose naming both
+  symbols; a scanner that matched comments would pass a genuinely broken file.
+  Pinned by a self-test.
+
+### Failure Modes
+
+- 25a moves `init_metrics` ahead of the fail-closed WAL halt. Metrics init does
+  not depend on the WAL, and a boot that halts having installed a recorder is
+  strictly more observable than one that halts without.
+- 25c raises a ceiling on a shared volume. Bounded at 1/32, leaving 96.8% for
+  QuestDB and the frame WAL — the same share the tick tier already takes, and the
+  original "a rescue must not become the incident" reasoning is preserved.
+
+### Test Plan
+
+12 new tests, all green. **Bite-proven by reverting each fix:**
+
+| Revert | Result |
+|---|---|
+| `code =` removed from the Full arm | **2 FAILED** (`channel_full_drop_carries…`, `both_drop_arms_are_coded…`) |
+| `init_metrics` moved back below STAGE-C | **3 FAILED**; the 2 scanner self-tests correctly stayed green |
+
+Scoped suites (`testing-scope.md`): `tickvault-app` **1,797 passed / 0 failed**,
+`tickvault-storage` **0 failed**. `cargo fmt --check` clean. Clippy runs in CI
+(not installed on this toolchain).
+
+### Rollback
+
+Three independent, self-contained reverts; no schema, config, terraform or wire
+change. Reverting 25c restores the 512 MiB literal exactly.
+
+### Observability
+
+No new metric name and no new EMF selector entry — honouring Item 14e
+(`user-data.sh.tftpl` at zero free bytes). This item makes **existing** signals
+work rather than adding more: two counters that never emitted now emit, and one
+`error!` becomes matchable by the filter that was already deployed for it.
+
+### Honest envelope
+
+Fixes DETECTION, not loss. The 75-second depth cliff becomes ~23 minutes on
+today's volume; it does not become infinite, and past the ceiling depth rows are
+still dropped — counted and paged, as before. Nothing here addresses the disk
+saturation (~94:1 amplification) that makes a stall likely in the first place.
+
+---
+
+## Item 26 — depth-200 disconnects itself ~265×/session (2026-08-26)
+
+- [x] **26 — client-originated keepalive ping on the one endpoint Dhan never pings**
+  - Files: `crates/core/src/websocket/pool_budget.rs`, `connection.rs`, `pool_supervisor.rs`
+  - Tests: `crates/core/tests/depth200_client_keepalive_guard.rs` (8)
+
+### Design
+
+Measured, prod, market open, 2026-08-26:
+
+| endpoint | connects | disconnects |
+|---|---|---|
+| main_feed (×5) | 5 | **0** |
+| order_update | 1 | **0** |
+| depth_20 (×5) | 15 | 10 (2 Dhan RST clusters) |
+| **depth_200 (×5)** | 265 | **265 — all self-inflicted, `idle_secs: 27`** |
+
+`tv_dhan_ws_control_frames_total{kind="ping"}`: main_feed **3,460**, depth_20
+**12,110**, depth_200 — **series absent entirely**. The counter is created
+lazily on first ping, so an absent series means depth-200 received **no control
+frame at all** in a whole session. `docs/dhan-ref/full-market-depth.md:107`
+claims it pings every 10 s. That claim is false for this endpoint.
+
+`IdleWatchdog`'s header states its purpose: *"this timer is not merely 'is the
+server quiet?' — it is also, and mostly, **'have WE stopped draining?'**"*. It
+can only mean that because Dhan pings, our library auto-pongs **only while the
+read loop polls**, and arriving traffic therefore proves we are draining. With
+no server ping there is nothing to pong, so on depth-200 the only activity is
+market data — and the watchdog silently degrades into **a liquidity detector**.
+Its five instruments are FINNIFTY / MIDCPNIFTY / NIFTY options, which
+legitimately go 27+ s without a book update. Three of the five cycled 19 times
+each and then stopped dead at **09:14:45**; nothing was fixed at 09:15, the
+market opened.
+
+The fix restores the intended semantics rather than muting the symptom: we send
+a Ping every 10 s, Dhan pongs, and **the pong arrives only if the socket is
+alive AND our read loop is draining** — exactly the question the watchdog was
+built to ask. Merely widening the timeout would leave it measuring liquidity.
+
+The receiving half already existed: the 2026-08-19 repair routes
+`Message::Pong` → `SocketEvent::KeepAlive` → `ConnEvent::KeepAliveReceived` →
+`record_activity`. This change only supplies something to receive.
+
+### Edge Cases
+
+- Sited on the **existing 1 s idle ticker**, not a new timer: a second
+  `select!` arm would be a second way to hold this task away from `recv`, and
+  catching a reader that stopped polling is the watchdog's entire job.
+- `last_client_ping` seeded to **now**, so a freshly-dialled socket does not
+  ping while its subscribe is still in flight.
+- Monotonic `Instant`, never wall time — an NTP step must not conjure or
+  suppress a keepalive.
+- Const-asserted: ≥2 pings fit inside the 27 s idle window (one lost ping or
+  pong cannot expire a healthy socket), 2 intervals fit inside Dhan's
+  documented 40 s client-silence close, and the interval is never below the
+  tick that drives it.
+
+### Failure Modes
+
+- **Dhan does not answer pings on this endpoint** → nothing changes; the
+  watchdog keeps governing at 27 s exactly as today. `let _ =` at the call site
+  makes that explicit: escalating a failed keepalive would turn "no pong here"
+  into a disconnect, which is worse than the behaviour being fixed.
+- **Someone resets the watchdog on SEND instead of on the pong** → the watchdog
+  is silently disabled (we would always look active because we always ping).
+  Pinned by a bite-proven test.
+
+### Test Plan
+
+8 tests, all green. **Bite-proven**: adding `record_activity` at the send site
+fails `the_watchdog_reset_stays_on_the_received_pong_not_on_the_send` and
+nothing else — the guard catches precisely the dangerous edit.
+
+`cargo test -p tickvault-core` → **0 failed** (lib alone: 2,343 passed).
+
+### Rollback
+
+Single revert. The trait method is required rather than defaulted deliberately
+— a default returning `Ok(())` would let a transport claim keepalive support it
+does not have, and that failure would look exactly like a healthy socket.
+
+### Observability
+
+`tv_dhan_ws_client_keepalive_ping_total{endpoint,outcome}` — local exporter
+only, **no EMF selector entry** (`user-data.sh.tftpl` at zero free bytes,
+Item 14e). It exists so the fix can be VERIFIED on the box, not so it can page.
+
+### Honest envelope
+
+**Whether Dhan answers pings on depth-200 is UNVERIFIED** — we have never let a
+socket run past 27 s to find out, and no vendor doc covers it. The change is
+fail-safe in both directions, but it must NOT be claimed to work until measured.
+The verification is two live readings on the next session: `…client_keepalive_ping_total{outcome="sent"}`
+climbing, and `tv_dhan_ws_control_frames_total{kind="pong",endpoint="depth_200"}`
+**coming into existence for the first time**. If the second series stays absent,
+Dhan does not pong here and the next lever is the watchdog threshold.
+
+This also removes the need to answer that question defensively: a 10 s client
+ping means we are never silent, so Dhan's 40 s client-silence close cannot be
+reached regardless of whether it would have applied.
+
+---
+
+## Item 27 — a stale last-trade time fabricates candles on closed days (2026-08-26)
+
+- [x] **27a — stale-trading-day gate: candle-only refusal, row kept**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `fold_counters.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/trading/tests/stale_trading_day_gate_guard.rs` (6)
+- [x] **27b — delete the provably-unreachable duplicate timestamp-band check**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`
+
+### Design
+
+Dhan sends the **last trade time**. A contract that last traded days ago is
+snapshotted NOW carrying a timestamp from THEN. Measured across all 20.5M rows
+of one live session: mean `received_at - ts` **~5 hours**, max **34 days**.
+
+The candle-window gate tested `exchange_timestamp % 86_400` — seconds of day
+only, with no notion of WHICH day — against `[09:15:00, 15:40:00)`. A stale
+trade time of *yesterday 15:39:41* is 56,381 s, **inside** that window, so it
+passed as "in session" and opened a bucket dated on a day that had closed.
+
+Verified live, 2026-08-26:
+
+| Evidence | Value |
+|---|---|
+| `candles_1m` bars on past dates | **8,898** |
+| Distinct instruments | **8,898** |
+| Oldest | `2026-07-23T09:39` |
+| QuestDB volume created | **08:59:50 the same morning** |
+
+A database that was empty at 08:59:50 cannot contain July history. Those bars
+were written that day.
+
+Worse than the fabricated rows: with a bucket already open on the stale date,
+today's real 09:15 tick takes the CONTINUE path rather than the OPEN path, so
+**the day-open arm never fires** — across all 24 timeframes.
+
+The watermark is the right reference and needs no clock threaded in: it advances
+only on price-sane, band-checked ticks, and the advance is `>` so a stale tick
+can never move it. Ordered ABOVE the seconds-of-day gate on the same reasoning
+the timestamp band was hoisted above the price gate — a tick bad in both ways is
+attributed to the more actionable cause.
+
+**27b:** a second, byte-identical timestamp-band check stood ~30 lines below the
+first and was provably unreachable (the first returns on the same condition) — a
+merge artifact from the two 2026-08-25 hardening fixes. Deleted: dead code that
+reads as a live safety check invites reasoning about a guard that never runs.
+
+### Edge Cases
+
+- **Same-day earlier ticks still fold.** Only a whole-DAY regression is refused.
+  Intraday out-of-order arrival is normal (different instruments trade at
+  different times) and must not be swept up. Pinned by a negative test.
+- **First tick after boot is never refused.** Watermark starts at 0, so nothing
+  can be older — the same cold-start trap the band check's own comment records
+  having been written and caught once already.
+- Integer division on IST epoch seconds gives the IST day directly;
+  `exchange_timestamp` is already IST, so no offset arithmetic (`data-integrity.md`:
+  "NEVER ADD +5:30 TO ts").
+
+### Failure Modes
+
+- If the watermark could regress, the gate would disarm itself. It cannot (`>`),
+  and that is pinned by its own test rather than assumed.
+- A stale tick from an instrument whose slot does not yet exist is refused before
+  `slot_index`, so a stale-only instrument cannot burn one of the 25,000 slots.
+
+### Test Plan
+
+6 behavioural tests. **Bite-proven**: deleting the gate fails exactly the 4
+tests that assert it, while the 2 negative controls (same-day-earlier,
+first-tick) stay green — proving they are not vacuously asserting "everything is
+refused".
+
+`cargo test -p tickvault-trading --lib` → **1,633 passed / 0 failed**. fmt and
+banned-pattern scan clean.
+
+The exhaustive `ConsumeStats` destructure in
+`test_every_refusal_field_makes_folded_false` refused to compile until the new
+field was wired into `folded()` — the mechanical guard working exactly as its
+own doc says it should.
+
+### Rollback
+
+Single revert of each item; 27a and 27b are independent.
+
+### Observability
+
+`tv_aggregator_tick_refused_total{reason="stale_trading_day"}` — a new label on
+an EXISTING series, so no new metric name and no EMF selector entry (Item 14e:
+`user-data.sh.tftpl` at zero free bytes). The neighbouring doc comment saying the
+label carries "THREE distinct values" was corrected to FOUR in the same change.
+
+### Honest envelope
+
+This stops NEW fabricated bars. It does **not** remove the 8,898 already in
+`candles_1m` — deleting rows is an operator decision, and they are trivially
+identifiable (`ts < today`). It also does not change what `ticks.ts` means: the
+row still carries the true trade time, which is correct and is what
+`data-integrity.md` requires.
+
+**Residual, stated rather than discovered:** the gate is watermark-relative, so
+the window before the session's first in-session tick has no reference to
+compare against. In practice pre-open ticks are already refused by the
+seconds-of-day gate, so the exposure is narrow — but it is not zero, and closing
+it fully would require threading the wall-clock date into `consume_tick`, which
+changes two public signatures and every call site.
+
+---
+
+## Item 28 — 825,783 ticks a session discarded with no row at all (2026-08-26)
+
+- [x] **28 — `exchange_timestamp == 0` is the vendor's sentinel, not corruption**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `fold_counters.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/trading/tests/stale_trading_day_gate_guard.rs` (+3, now 9)
+
+### Design
+
+Measured live: `tv_dhan_feed_ingest_refused_total{reason="timestamp"}` =
+**825,783** in one session — **4.0% of every tick decoded** — still climbing
+when read. The drain classes a timestamp refusal as a HARD refusal, returning
+before `append_tick_with_seq`, so every one was discarded **with no row at
+all**. Not a missing candle: no record the instrument was even seen.
+
+The 2026-08-20 fix had already made this exact call correctly for the PRICE
+sentinel, and its reasoning applies verbatim: *"discarding the ROW loses the
+ability to tell 'did not trade' from 'did not capture', and costs the packet's
+open interest and bid/ask with it."* An instrument that has never traded has no
+last price **and** no last trade time — the two sentinels co-occur — but the
+timestamp check ran first and hard-refused, silently defeating that fix for
+precisely the instruments it was written for.
+
+### The compatibility that makes this safe
+
+Two adversarial regressions (2026-08-09 security review, 2026-08-25 bite test)
+require that a row must **never** be written under a garbage designated
+timestamp. This does not reverse them; it satisfies them **by construction**.
+
+`row_timestamp_ist_nanos` substitutes the receipt time for an out-of-band LTT —
+but only when the caller has one (`(tick.received_at_nanos != 0).then_some(..)`),
+falling back to the raw value otherwise. So the fold keeps the row on exactly
+`ts == 0 && received_at_nanos != 0`: precisely the condition under which the
+writer can stamp it safely. Without that second clause a kept ts=0 row would
+land in a **1970** partition — the same unreachable-partition defect as
+year-2106, from the other end of the number line.
+
+The persistence layer had already anticipated this case. Its own comment calls
+the fallback *"the fallback designated timestamp for a row whose LTT is the
+vendor's never-traded sentinel"* — but the fold refused those rows before they
+could reach it, so that path was unreachable. The two layers now agree.
+
+**Both existing adversarial tests pass UNCHANGED** (their fixtures leave
+`received_at_nanos` at 0, so they exercise the still-hard-refusal arm). Nothing
+was re-blessed to make this land.
+
+### Edge Cases
+
+- Only EXACTLY zero is the sentinel. `0xFFFFFFFF` (~year 2106), `1`, and any
+  other out-of-band value stay hard refusals — pinned by a test that walks all
+  four.
+- The refusal happens BEFORE `slot_index`, so an instrument that only ever sends
+  the sentinel cannot burn one of the 25,000 slots.
+
+### Failure Modes
+
+- If a future caller stops setting `received_at_nanos`, the fold silently
+  reverts to hard-refusing — degraded, not wrong, and in the safe direction.
+- If someone drops the receipt-time clause, `a_zero_timestamp_without_a_receipt_time_is_still_refused_outright`
+  fails.
+
+### Test Plan
+
+3 new tests (9 in the file). `cargo test -p tickvault-trading --lib` →
+**1,633 passed / 0 failed**, including both adversarial regressions untouched.
+fmt + banned-pattern clean.
+
+### Rollback
+
+Single revert; independent of Items 27a/27b.
+
+### Observability
+
+`tv_aggregator_tick_refused_total{reason="untraded_timestamp"}` — a fifth label
+on an EXISTING series, so no new metric name and no EMF entry (Item 14e).
+
+**This is also the measurement that settles the remaining Assumed.** The claim
+that the 825,783 are zeros is inferred, not proven — the refused rows were never
+written, so no query could confirm it. From the next session the split label
+answers it directly: whatever share lands under `untraded_timestamp` is the
+sentinel, and whatever stays under `timestamp` is genuine corruption worth its
+own investigation.
+
+### Honest envelope
+
+Recovers the ROW, not the candle — a zero timestamp can never produce a bar, and
+should not. What comes back is the record that the instrument was seen, plus its
+open interest and bid/ask, and the ability to distinguish "did not trade" from
+"did not capture". If the 825,783 turn out NOT to be zeros, this change is inert
+and the split counter says so on day one.
+
+---
+
+## Item 29 — `/api/feeds/health` reports a working feed as DOWN, every day (2026-08-26)
+
+- [x] **29 — wire `set_connected` from the socket-count choke point**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/app/tests/sp5_dhan_feed_health_wiring_guard.rs` (+1, SP5.2)
+
+### Design
+
+`FeedHealthRegistry::set_connected` had **zero production call sites** — every
+reference in the workspace sat in a test module. The field initialises `false`,
+and `feed_health::classify` tests `if !i.connected` **before** the tick-age
+branch, so the verdict was `Down, "enabled but disconnected — reconnecting"`
+unconditionally.
+
+Captured on prod at one instant, 2026-08-26:
+
+```text
+/health            overall=healthy, websocket={connected, "15 connections"}
+/api/feeds/health  dhan verdict=DOWN connected=false
+                   ticks_total=17,265,688  last_tick_age=1s
+:9091              tv_dhan_ws_alive_connections 15
+                   tv_dhan_feed_stack_up 1
+```
+
+The same JSON object declared the feed down while reporting 17.2 million ticks
+and a one-second-old tick. `/board`, `/dashboard` and `/feeds` all render that
+row, so the operator's at-a-glance surface cried wolf every trading day,
+permanently — the inverse of a false-OK and no less corrosive, because a status
+that is always red is read as decoration.
+
+**This is the THIRD half of one defect**, and the pattern is the finding:
+`set_dhan_lane_running` was fixed 2026-08-14 (*"a status line that cannot vary
+is not a status line"*), `record_ticks` on 2026-08-18 (*"it answered a benign
+Unknown for a corpse"*). Each fix documented the shape and left the next sibling
+in place. `sp5_dhan_feed_health_wiring_guard.rs:42` even named this one and said
+it *"MUST be re-pinned in the PR that wires them"* — this is that PR.
+
+Sited inside `publish_alive_connections` rather than beside
+`set_dhan_lane_running`: that function is **both edges** of
+`AliveConnectionGuard`, so it tracks real socket transitions instead of a coarse
+lane-level flag, and its own doc already claims the single-owner property
+(*"one function owns the health push, so there is no second path to drift"*).
+
+### Edge Cases
+
+- The registry is installed **before** the arming `publish_alive_connections`
+  call. Install after it and the arming transition is silently dropped; on a
+  lane that dials once and stays up, the next socket event is the 17:30
+  shutdown. Ordering is pinned by the test.
+- `OnceLock` mirroring `HEALTH_REPORTER` rather than a new `params` field,
+  because the push site is a free function reached from a `Drop` impl —
+  threading an `Arc` there would need either a guard field or a second push
+  site, and a second site can drift.
+
+### Failure Modes
+
+- A second push site would let the two disagree; the test asserts **exactly
+  one**.
+- Shutdown drives `alive` to 0 and the row correctly goes `false`.
+
+### Test Plan
+
+SP5.2 added to the guard that predicted this gap. **Bite-proven**: removing the
+push fails it and nothing else.
+
+`cargo test -p tickvault-app` → **0 failed** (lib alone 1,404 passed).
+
+**Self-inflicted break, caught and fixed:** the first draft of the fix comment
+contained the literal `#[cfg(test)]`, and 20 source-scan tests split this file
+on that marker to isolate its production half — so my comment truncated their
+view and they failed. Reworded to "a test-only module". The tests were right; a
+comment is part of the file those scans read.
+
+### Rollback
+
+Single revert.
+
+### Observability
+
+No new metric, no new alarm, no EMF entry. It makes an EXISTING operator surface
+tell the truth.
+
+### Honest envelope
+
+Fixes the `connected` dimension only. The sibling `freshness` gap named in the
+same guard doc — a CONNECTED-but-silent feed reading healthy — is separately
+covered by the 30 s silence scan (`RISK-GAP-03`), which has paged since
+2026-08-15. What this does NOT do is make `/health` itself see silence: it
+consults neither tick flow nor the feed registry, so 15 alive sockets receiving
+nothing still reads `healthy` there. The two surfaces had opposite defects and
+only one is fixed here.
+
+---
+
+## Item 30 — the offload left a 5-second blocking HTTP call on the drain
+
+### Design
+
+`flush_and_record` early-returns `ingest.flush()` **bare** when the tick writer
+has been offloaded, on a comment reading *"the flush is a bounded-queue hand-off
+with no network in it, so there is nothing to move off-worker"*.
+
+That is true of the tick writer and false of the callee. `LiveIngest::flush`
+flushes the inline-depth sink FIRST and unconditionally, above its own
+`pending_rows == 0` early return — its body says so and explains why — and
+`DepthIngest::flush` is a blocking ILP-over-HTTP round trip bounded by the
+conf-pinned `request_timeout=5000`.
+
+So the offload, landed on 2026-08-25 precisely to get blocking HTTP off the
+drain task, left blocking HTTP on the drain task, on the **only path production
+takes**: the boot site calls `spawn_offload_writer` and `with_inline_depth` on
+the same builder chain, so both halves are live on every real run and this early
+return was reached on every flush.
+
+**Fix:** wrap it. `return blocking_flush(|| ingest.flush());`
+
+Wrapped unconditionally rather than gated on "is there depth pending": a gate
+needs a second accessor kept in step with what `LiveIngest::flush` actually
+does, and keeping those two pieces of knowledge in separate places is what
+produced this bug. The cost of being wrong the cheap way is one worker swap at
+~5 flushes/sec; the cost of being wrong the other way is a 5-second worker pin.
+
+### Edge cases
+
+- **Current-thread runtime** — `block_in_place` panics there, which is why
+  `blocking_flush` guards on `runtime_flavor()`. This module's drain tests are
+  bare `#[tokio::test]`. Unchanged by this item; the helper already handled it.
+- **Depth buffer empty** — the wrap still happens. Deliberate, see above.
+- **Non-offloaded fallback** — already wrapped; untouched.
+- **Flush failure** — unchanged. `LiveIngest::flush` counts and logs the
+  inline-depth failure and does not propagate it, so the tick flush is never
+  skipped because the depth writer had a bad moment.
+
+### Failure modes
+
+The mechanism is the one `blocking_flush`'s own docs describe, and it is not
+"the flush is slow": a stalled QuestDB pins a tokio worker for up to 5 s; on a
+low-worker host that is a large fraction of the runtime; the WS read loops
+sharing that worker stop pumping pongs and the socket is dropped; the drain
+stops draining and the ring fills. A third-party database stall becomes tick
+loss plus a disconnect.
+
+### Test plan
+
+Two tests, and the split is the point.
+
+1. `test_drain_never_flushes_bare_on_the_async_worker` (source scan) — the
+   `offloaded` count is inverted from 1 to **0**, and a new assertion requires
+   `return blocking_flush(|| ingest.flush());` to still EXIST so that deleting
+   the offload branch entirely also fails. The `wrapped` equality moves 1 → 2:
+   both arms of the one helper now wrap. Bite-proven — restoring the bare
+   return fails it by name.
+2. `the_offloaded_path_still_flushes_the_inline_depth_sink` (behavioural, NEW) —
+   builds an offloaded `LiveIngest` with an inline-depth sink holding 10 rows
+   and zero tick rows, flushes, and asserts the depth sink's `dropped_rows`
+   reached 10. `DepthWriter::for_test` has no sender, so a discard is proof the
+   flush was attempted.
+
+   Bite-proven by moving the inline-depth flush BELOW the `pending_rows == 0`
+   early return: **every source scan still passed and only this test failed.**
+   That is the whole reason it exists — the defect was in a *claim about
+   behaviour*, and a text match cannot check a claim.
+
+### Rollback
+
+Revert the one-line wrap plus the two guard edits. The bare form is what
+shipped before; reverting restores a known (bad) state, not an unknown one.
+
+### Observability
+
+None added, deliberately. There is no metric that distinguishes "the drain is
+blocked in HTTP" from "the drain has nothing to do" — both look like an idle
+task. The existing signals already cover the consequences: ring-full refusals,
+`tv_ticks_dropped_total`, the WAL drop counter revived in Item 25, and the
+depth flush-failure counter. Adding a fourth that fires only in the same
+window would be noise.
+
+### Honest envelope
+
+Removes ONE blocking call from ONE task. It does not make the flush faster, does
+not reduce the ~94:1 write amplification, and does not stop QuestDB stalling —
+it stops a QuestDB stall from also costing ticks and a socket. `flush_depth`
+(the dedicated depth pools) was already wrapped and is unchanged.
+
+**The reusable lesson, recorded because it outlives the fix:** the source-scan
+guard DID hold the line it was built to hold, and was then walked around by an
+exception written in good faith from an incomplete reading of the callee. A
+guard is only as strong as the claim its exception rests on, and this one rested
+on a claim nobody re-derived from `LiveIngest::flush`.
+
+---
+
+## Item 31 — the drain's own backlog was measured 5,000 times a second and thrown away
+
+### Design
+
+`run_frame_drain` derives `queued_nanos` — how long a frame sat in the ring
+before the fold reached it — on EVERY frame, uses it once to back-date
+`received_at_nanos`, and drops it.
+
+That number is the lane's best leading indicator and nothing has ever read it.
+Every other ring signal is a post-mortem count: `tv_dhan_ws_ring_full_total`
+and `tv_dhan_ws_frame_refused_total` move only once frames have already been
+turned away. Dwell rises while there is still headroom.
+
+**Fix:** `record_ring_dwell(queued_nanos)` keeps the maximum in a module
+`AtomicI64`; `publish_fold_depth` drains it to
+`tv_dhan_feed_ring_dwell_max_ms` on the existing periodic path. EMF-selected
+(80 names now, +$0.30/mo, priced in the count ratchet) and charted.
+
+**Rejected alternative — shipping `tv_dhan_ws_lag_ms` instead.** That measures
+the same axis from the vendor's side, and two things rule it out. It is an
+EXPLICIT exclusion in `EMF-METRIC-SELECTOR-NOTES.md` ("latency histograms …
+answer 'how much', not 'what broke'"), and a histogram ships ~12 bucket series
+per dimension — so the per-connection form the 2026-08-14 noise-lock
+authorization priced at $4.80/mo is closer to an order of magnitude more. That
+discrepancy is recorded rather than spent silently. Dhan's delivery lag is also
+not ours to fix; our own backlog is.
+
+### Edge cases
+
+- **Quiet window, no frames** — publishes 0, not the previous window's value.
+  Carrying it forward would make an idle lane look identical to a stalled one.
+- **Zero dwell** (the healthy steady state) — recordable, and must not displace
+  a real sample. Pinned.
+- **Clock steps** — none possible: `frame.received_at.elapsed()` is monotonic.
+- **`i64` overflow** — `try_from(...).unwrap_or(i64::MAX)` was already there.
+
+### Failure modes
+
+Two, and both are invisible in the code's shape, which is why the tests are
+behavioural rather than source scans:
+
+1. **Last-value-wins instead of max.** One 8-second stall followed by three
+   1 ms frames would publish 2 ms — the signal says "fine" at the exact moment
+   the drain has stopped. Bite-proven: `fetch_max` → `store` fails two tests.
+2. **Sticky maximum.** A stall from hours ago keeps the chart red forever, and
+   a permanently-red chart costs more than not publishing. Bite-proven:
+   `swap(0)` → `load` fails two tests.
+
+### Test plan
+
+`crates/app/tests/ring_dwell_gauge_guard.rs`, 6 tests: worst-sample-survives,
+reset-on-read, quiet-window-zero, unit direction (ns→ms, not the reverse — the
+error that would read as a 17-day stall and look plausible because "big number,
+bad situation" is self-consistent), zeros-do-not-poison, and one source check
+that the recorder is wired into the drain and the gauge is actually SET —
+which earns its place because the defect being fixed IS "computed and never
+published", so an arithmetic-only suite would pass on the broken code.
+
+Serialised behind an explicit mutex, not `--test-threads=1`: the latter is a
+property of how the suite is invoked, not one anything can rely on.
+
+### Rollback
+
+Delete the two helper calls and the selector/dashboard entries. The lane
+behaves exactly as before — nothing reads this value.
+
+### Observability
+
+The point of the item. `tv_dhan_feed_ring_dwell_max_ms`, EMF-selected, charted
+as "How far behind the drain is (worst frame wait, ms)", `stat = Maximum`.
+
+**Deliberately UNALARMED.** No threshold is defensible yet: the value has never
+been observed, because it has never been published. Picking a number now
+invents it and then trains the operator to ignore the alarm built on it. Chart
+first; threshold when the chart has a baseline.
+
+### Honest envelope
+
+Publishes a number that already existed. It does not make the drain faster, does
+not enlarge the ring, and does not prevent a stall — it makes one visible before
+it costs ticks instead of after. Cost on the hot path is one uncontended atomic
+`fetch_max` per frame (single writer, `Relaxed`), no allocation and no registry
+lookup; the gauge write is on the existing periodic path, never per frame.
+
+---
+
+## Item 32 — the deaf socket: one connection stops delivering and nothing notices
+
+### Design
+
+A socket that keeps answering pings but stops delivering data is invisible to
+every mechanism the lane has, and each miss is structural rather than an
+oversight:
+
+| Mechanism | Why it cannot see this |
+|---|---|
+| Idle watchdog (27 s) | governs SILENCE on the wire; a ponging socket is not silent |
+| Reconnect family (`reconnect_total`, `dial_failed_total`, `subscribe_failed_total`) | stays flat — the defining property of a deaf socket is that **nothing about it is retrying**. This is why "alarm the reconnect counters", the recommendation on record, cannot work |
+| Lane `tv_dhan_feed_last_tick_age_secs` | reads ~1 s throughout: fifteen of sixteen sockets are fine |
+| `tv_dhan_ws_alive_connections` | counts sockets DIALED, not sockets DELIVERING |
+
+**Fix:** a fixed `[AtomicI64; MAX_TOTAL_DHAN_CONNECTIONS]` of last-delivery
+millis, stamped per frame that actually produced output, published as ONE gauge
+`tv_dhan_ws_worst_conn_tick_age_secs` = the worst age across connections that
+have ever delivered.
+
+**One series, not sixteen.** Per-connection is ~$4.80/mo by the 2026-08-14
+noise-lock figure to answer a yes/no question; the worst-age form answers it
+with identical detection power for ~$0.30/mo. Per-connection attribution stays
+on `/metrics`, which is where a human triaging looks. Charted BESIDE the lane
+gauge, because the difference between them is the diagnosis: both low = healthy,
+this one climbing alone = one deaf socket, both climbing = the whole feed.
+
+### Edge cases
+
+- **Never-ticked slot** — reads `0` and is SKIPPED, not treated as infinitely
+  stale. An unused slot would peg the gauge at "broken" forever, and a
+  legitimately quiet depth-200 subscription on one illiquid contract is not a
+  fault. That case already has `tv_dhan_feed_instruments_never_ticked` +
+  RISK-GAP-03.
+- **No connection has ticked at all** — publishes `-1`, never `0`. Zero would
+  read as "every socket ticked this instant" — the most reassuring value
+  available — at the moment we know least.
+- **Clock steps backwards** (NTP) — `saturating_sub(...).max(0)`, so it reads 0
+  age rather than wrapping into a huge one at the moment logs are hardest to
+  read.
+- **Out-of-range connection index** — dropped. Writing the wrong slot would
+  report the wrong socket healthy, which is worse than not writing.
+- **Frames that arrive but produce nothing** — do NOT stamp. A socket returning
+  unparseable frames is not delivering market data, and stamping on arrival
+  would report it healthy: the exact false-OK this detector removes.
+
+### Failure modes
+
+1. **Min instead of max** — reports the most recent tick anywhere, i.e. perfect
+   health with a socket dead. Bite-proven: `w.max(age)` → `w.min(age)` fails 2
+   tests.
+2. **Depth stamp forgotten** — ten of sixteen sockets read never-ticked, are
+   excluded, and the gauge looks healthy *because* of the exclusion rule that
+   exists to prevent false-OKs. Bite-proven: deleting it fails the wiring test.
+
+### Test plan
+
+`crates/app/tests/deaf_socket_gauge_guard.rs`, 6 tests, all behavioural except
+one wiring scan: one-deaf-among-healthy, all-healthy-reads-zero, recovery
+lets it fall, backwards clock clamps, out-of-range dropped, and both stamp
+sites + the publish are wired. Fixed `NOW_MS`, so nothing depends on the wall
+clock.
+
+### Rollback
+
+Delete the static, the two stamp calls, the publish, the selector entry and the
+widget. Nothing else reads any of them.
+
+### Observability
+
+`tv_dhan_ws_worst_conn_tick_age_secs`, EMF-selected (81 names, +$0.30/mo,
+priced in the count ratchet), charted as "Deaf socket check" against the lane
+gauge for contrast.
+
+**NOT alarmed — and this one is a deliberate deferral, not a missing baseline.**
+A threshold is defensible here (600 s, matching the lane-level no-ticks alarm —
+the same question scoped to one socket). What stops it is money: the maximal
+month already projects above the line where an AWS budget action STOPS the
+trading box. Adding a pager is a spending decision the operator takes knowingly,
+not one an executor slips in. Charted now so the signal exists the moment he
+says yes.
+
+### Honest envelope
+
+Makes a deaf socket VISIBLE; does not detect it automatically, because nothing
+pages on it yet. Detection latency is the 30 s scan cadence plus whatever
+threshold is eventually set. It cannot distinguish "the socket is deaf" from
+"every instrument on this socket genuinely stopped trading" — an operator reads
+it against the lane gauge and the never-ticked count, which is why they share a
+screen. Hot-path cost is one relaxed atomic store per productive frame.
+
+---
+
+## Item 33 — `late_count` counts data loss and had zero production readers
+
+### Design
+
+`ConsumeStats.late_count` is the number of timeframes that DISCARDED a tick as
+too late to place (`ConsumeOutcome::DiscardLate`). A discarded tick means the
+bar it should have contributed to is missing a trade — a wrong bar.
+
+It was computed for all 24 timeframes on every tick and **read by nothing**.
+Every production consumer reads `sealed_count` and `amended_count`, and
+`IngestOutcome::Folded` carries only those two, so the value existed inside one
+function call and died there.
+
+**Fix:** increment `tv_candle_tick_discarded_late_total` at the discard arm,
+through the pre-resolved `fold_counters()` handle.
+
+**Its own metric name, not a `reason` label on
+`tv_aggregator_tick_refused_total`.** That family means "the whole tick was
+refused and NOTHING was folded" — a different and stronger statement. A tick
+counted here DID fold into other timeframes; merging them would make both
+numbers unreadable.
+
+### Edge cases
+
+- **Per (tick, timeframe), not per tick** — one tick can be placeable in the
+  1-day bar and hopeless for the 1-second one. Collapsing to a per-tick number
+  would hide which frames are losing data.
+- **Interaction with Item 27** — the stale-trading-day gate now refuses
+  previous-day ticks BEFORE the timeframe loop, so what reaches this arm is
+  today's ticks that are late for a given frame: a smaller, more interesting
+  population than it would have been last week.
+
+### Failure modes
+
+The counter increments inside the 24-timeframe loop on the per-tick path. A
+bare `metrics::counter!` there costs a sharded-registry lookup 24× per tick —
+the exact defect `fold_counters.rs` was created to remove. Pinned: the test
+asserts the handle is used AND that no bare macro appears in the arm.
+
+### Test plan
+
+`the_late_discard_is_counted_and_not_merely_tallied_into_a_dropped_struct` in
+`stale_trading_day_gate_guard.rs`. Bite-proven — deleting the increment fails
+it and nothing else. `dhat_multi_tf_fold` re-run: still zero allocations.
+
+Two scanner defects were fixed in writing it, both of the kind this session has
+been correcting elsewhere:
+
+1. `split("#[cfg(test)]").next()` truncated ~500 lines ABOVE the arm, because
+   this file carries test-only helpers inside production code. Split at the
+   test MODULE boundary instead.
+2. A fixed byte window missed the increment once a comment was added — the same
+   proximity brittleness rewritten out of two guards earlier today. Replaced
+   with brace matching on the arm's actual block, which is the real boundary.
+
+### Rollback
+
+Delete the increment and the handle. Nothing else reads either.
+
+### Observability
+
+`tv_candle_tick_discarded_late_total` on `/metrics`.
+
+**Deliberately NOT EMF-selected.** Two names were added to the selector today
+(+$0.60/mo) and the maximal month already projects above the AWS budget
+action line. This one is a DATA-QUALITY signal rather than an outage signal —
+it says bars may be incomplete, not that the feed is down — so it is the
+right one to leave on `/metrics` when something has to be. Shipping it is a
+one-line change plus a priced count bump whenever the operator wants it.
+
+### Honest envelope
+
+Makes the loss COUNTABLE, not smaller. It does not recover a discarded tick and
+does not change which ticks are discarded — the amend/discard boundary is
+untouched. Nothing pages on it, so it is only visible to someone already
+looking at `/metrics`.
+
+---
+
+## Item 34 — we shipped the ring's denominator and withheld its numerator
+
+### Design
+
+The frame ring is bounded twice: by frame COUNT (65,536) and by BYTES
+(`RingByteBudget`). `tv_dhan_feed_ring_max_bytes` — the CAPACITY — has been
+EMF-selected since 2026-08-15. The OCCUPANCY was not published at all:
+`RingByteBudget::resident()` existed with call sites only in its own unit
+tests, the fifth instance in this lane of code that exists, is tested, and is
+never invoked.
+
+**Fix:** `tv_dhan_feed_ring_resident_pct` — worst of the two pools —
+published on the same 30 s tick as the dwell and deaf-socket gauges. Per-pool
+detail goes to an UNSELECTED name, so `/metrics` keeps the attribution and
+CloudWatch pays for one series.
+
+**Percent, not bytes.** The two budgets are sized 3:1, so raw bytes are not
+comparable between them and a raw gauge would be dominated by whichever pool
+is larger regardless of which is in trouble.
+
+**It pairs with the dwell gauge, and the pair is the diagnosis:**
+
+| dwell | fill | reading |
+|---|---|---|
+| flat | flat | healthy |
+| up | up | the drain cannot keep up |
+| flat | up | large frames, not a slow drain |
+| up | flat | slow drain on small frames |
+
+Neither number says that alone, which is why they are charted side by side.
+
+### Edge cases
+
+- **Zero capacity** — returns 0.0 rather than dividing. Unreachable in
+  production (both caps derive from a non-zero host figure), but a NaN on a
+  gauge is silently unchartable, and "the chart went blank" is worse than "the
+  chart read zero": blank looks like the app died and sends an operator to
+  diagnose the wrong thing mid-incident.
+- **Over capacity** — clamps to 100. `RingByteBudget` uses a CAS loop
+  specifically so `resident` cannot exceed `cap`, so this should be
+  unreachable; a gauge reading 340% would look like a unit bug and be
+  dismissed at the exact moment the ring is in trouble.
+- **Both pools idle** — reads 0, which is correct and not a stale value.
+
+### Failure modes
+
+**Reporting the average instead of the worst.** With main-feed at 1% and depth
+at 95% the average reads 48% — healthy-looking — while one pool is about to
+refuse frames. Bite-proven: `main_pct.max(depth_pct)` → `(a+b)/2.0` fails the
+wiring test.
+
+### Test plan
+
+`crates/app/tests/ring_fill_gauge_guard.rs`, 5 tests: empty/full/quarter, zero
+capacity is finite and zero, over-capacity clamps, worst-of-two surfaces, and
+the publish reads the LIVE budgets (publishing `cap()` as occupancy would give
+a permanently-100% chart that reads as a crisis and is a bug).
+
+### Rollback
+
+Delete the const, the helper, the three gauge writes, the selector entry and
+the widget.
+
+### Observability
+
+`tv_dhan_feed_ring_resident_pct` EMF-selected (82 names, +$0.30/mo) and charted
+as "Ring fill (% of byte budget, worst pool)" beside the dwell chart.
+`tv_dhan_feed_ring_resident_pct_by_pool{pool}` on `/metrics`, unselected.
+
+**NOT alarmed.** The ring already pages on the after-the-fact case
+(`tv_dhan_ws_ring_full_total`, `tv_dhan_ws_ring_bytes_full_total`), so the loss
+is covered today; this is its leading edge, and a leading-edge threshold needs
+a baseline that does not exist yet.
+
+**THREE names added today (~$0.90/mo) and that is the stopping point.** The
+maximal month already projects above the line where an AWS budget action stops
+the trading box. Everything else found today stays on `/metrics`.
+
+### Honest envelope
+
+Publishes a number that already existed, on a path that already ran. It does
+not enlarge the ring, speed the drain, or prevent a refusal. Sampling is the
+30 s tick, so a sub-30-second fill spike is invisible — the after-the-fact
+counters remain the only signal for that, and they page.
+
+---
+
+## Item 35 — the cross-verification runs 94% blind and cannot say why
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+The 15:41 IST comparator against Dhan's own REST tape is, by this repository's
+own doctrine, the **only ground truth the revived feed has** — the India feed
+carries no sequence number and no snapshot-on-subscribe, so packet loss is
+undetectable at the protocol level and nothing inside our pipeline can prove a
+tick never arrived.
+
+Read from the live box, two consecutive sessions:
+
+| session | targets | `rest_failures` | actually compared | diverged | typical gap |
+|---|---:|---:|---:|---:|---:|
+| 2026-08-24 | 864 | **814** | ~50 | 61 | 35 paise |
+| 2026-08-25 | 865 | **815** | ~50 | 23 | 25 paise |
+
+**94% of the only ground truth fails every day.** Where it does compare, we
+agree with Dhan closely — 25 paise on prices in the thousands. The comparison
+is not failing; it is barely running.
+
+And the reason was **unknowable from the box**. `fetch_rest_side_for_target`
+has always built a precise reason string for every failure mode; its only
+caller matched `Err(_)`, counted `rest_failures += 1`, and dropped it. A count
+without a cause is a symptom that cannot be treated, and it had gone untreated
+for at least two sessions.
+
+Two changes:
+
+1. **Typed failure kinds** (`XverifyFetchFailureKind`, a closed 7-variant set:
+   `no_candles`, `rate_limited`, `http_4xx`, `http_5xx`, `timeout`,
+   `transport`, `other`), tallied per run into a fixed-width
+   `RestFailureBreakdown` and logged on the same line as the verdict, plus a
+   bounded 3-entry sample of real messages. HTTP status is classified from the
+   REAL `StatusCode` via a pure, directly-tested `classify_http_status` — never
+   a substring scan of a rendered message.
+2. **Pacing.** The loop issued ~865 requests back-to-back with no pacing at all
+   against a documented 5-per-second vendor budget, while both sibling REST
+   legs have gone through the shared self-tuning limiter since 2026-07-14. This
+   leg was the odd one out. A new `fetch_rest_side_paced` wrapper acquires the
+   shared limiter and feeds the self-tuner on a real 429.
+
+### Edge cases
+
+- **429 is a client error**, so a naive `is_client_error()` branch first would
+  swallow it into `http_4xx` and hide the one reason that is directly
+  actionable. Order is asserted, and the test states why.
+- **`no_candles` is ambiguous by construction** — a wrong instrument label and
+  a genuinely untraded instrument produce the identical 2xx-with-no-candle
+  response. The count is what separates them: 815 of 865 is not 865 untraded
+  instruments. Documented at the variant rather than papered over.
+- **Empty breakdown** renders `none`, so a clean run stays short.
+- **Zero-count kinds are omitted**, dominant kind first, so one line answers
+  "why" at a glance.
+
+### Failure modes
+
+**Pacing could push the run past its 600 s budget.** At the limiter's 3 rps
+that is ~288 s of pacing floor for 865 targets, inside the budget; the loop
+already breaks on budget with `budget_elapsed = true`, which is honest rather
+than silent. Watched, not assumed.
+
+**The two changes could confound each other** — they do not. The breakdown
+labels the outcome that actually occurred, so if tomorrow reports
+`rate_limited=0` then pacing was never the cause and the dominant label names
+the real one.
+
+### Test plan
+
+5 tests in `dhan_live_crossverify.rs`: distinct stable labels; a real 429
+classifies as `rate_limited` and not as a generic 4xx; the breakdown total
+always equals the failure count; the summary leads with the dominant reason and
+omits zeroes; and the regression pin that the loop tallies the reason, never
+discards it, and goes through the paced wrapper.
+
+**Bite-proven both directions:** reverting the paced call fails the pin;
+deleting the tally line fails the pin.
+
+The pin scans the **production half only** — `include_str!` reads this file
+including its own tests, whose assertion strings contain the banned pattern, so
+the first run failed on itself. The test-module marker is assembled from
+fragments rather than written whole, because spelling it out put a second copy
+in the file and split the source in the wrong place — the second run failed on
+that. Both are recorded at the test: a self-scanning guard fails OPEN, and this
+one would have passed while reading nothing.
+
+### Rollback
+
+Revert to `Err(_) => rest_failures += 1` and drop the wrapper. That restores a
+comparator that reports 94% blindness without a cause.
+
+### Observability
+
+**No new metric name, no new EMF selector entry, no cost.** The breakdown rides
+the existing `cross-verification finished` line as `rest_failure_reasons`, plus
+one `warn!` carrying the reasons and a 3-entry sample. Deliberate: EMF folds
+labels to `{host}` by summing, so a labelled counter would surface only the
+total — which the log already carries — while costing ~$0.30/mo, and the
+maximal month already projects above the line where a budget action stops the
+trading box.
+
+### Honest envelope
+
+This makes the blindness **explainable**, not smaller. Tomorrow's run names the
+dominant cause; fixing that cause is the next change, not this one. Pacing is
+hygiene on a documented budget, **not a claimed cure** — whether rate limiting
+is what blinded the comparator is exactly what the breakdown answers.
+
+Nothing here improves agreement with Dhan. Where the comparison does run we
+already agree to ~25 paise; the problem was never the matching, it was the
+coverage.

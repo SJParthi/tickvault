@@ -820,6 +820,40 @@ async fn async_main() -> Result<()> {
     // is KEPT.
 
     // -----------------------------------------------------------------------
+    // Step 2: Initialize observability (Prometheus metrics exporter)
+    //
+    // MOVED HERE 2026-08-26, ahead of STAGE-C, and the move is the fix — not
+    // a tidy-up. A `metrics::counter!` resolved before the recorder is
+    // installed returns `Counter { inner: None }`, whose `increment` is a
+    // no-op FOREVER; if the caller caches that handle (as `SpillDropCounters`
+    // does, deliberately, to keep its drop path allocation-free) the counter
+    // is dead for the process lifetime. `SpillDropCounters::new` ran inside
+    // `WsFrameSpill::new` in STAGE-C below — 35 lines BEFORE this call — so
+    // `tv_ws_frame_spill_drop_critical` and `tv_ticks_lost_total` never
+    // appeared in `/metrics` at all. Live-verified absent on prod
+    // 2026-08-26 while their neighbours rendered at 0. That silently
+    // disarmed the `tv-<env>-ticks-lost-at-spill-writer` alarm and one leg
+    // of the `durable-floor-breach` composite.
+    //
+    // This is the SECOND occurrence of the identical bug in this file: the
+    // 2026-07-14 PR-C3 note ~120 lines above records the same no-op-recorder
+    // loss for `tv_ws_frame_wal_replay_total`, fixed by moving the INCREMENT.
+    // Moving one increment fixes one instance and leaves the ordering hazard
+    // in place, which is why it recurred. Installing the recorder before the
+    // first boot-flow registration retires the whole class instead.
+    //
+    // Ratchet: crates/app/tests/metrics_recorder_install_order_guard.rs.
+    // -----------------------------------------------------------------------
+    observability::init_metrics(&config.observability)
+        .context("failed to initialize Prometheus metrics")?;
+
+    // Cache parser dispatcher Counter handles AFTER the recorder is
+    // installed. Without this, the first hot-path packet of each kind
+    // would allocate (Principle #1 violation). Must run post-install
+    // because handles created pre-install resolve to a no-op counter.
+    tickvault_core::parser::prewarm_dispatcher_counters();
+
+    // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
     //
     // Every raw WS frame (2 types: LiveFeed, OrderUpdate)
@@ -972,12 +1006,14 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    // Cache parser dispatcher Counter handles AFTER the recorder is
-    // installed. Without this, the first hot-path packet of each kind
-    // would allocate (Principle #1 violation). Must run post-install
-    // because handles created pre-install resolve to a no-op counter.
-    tickvault_core::parser::prewarm_dispatcher_counters();
-
+    // -----------------------------------------------------------------------
+    // Step 2 (continued): post-install metric registrations
+    //
+    // `init_metrics` + `prewarm_dispatcher_counters` moved ABOVE STAGE-C on
+    // 2026-08-26 — see the block there for why. Everything below is
+    // post-install either way; the move only widened that guarantee to cover
+    // STAGE-C, which previously sat on the wrong side of it.
+    // -----------------------------------------------------------------------
     // Seal-writer TRUE-DROP counter (2026-07-09 candle-drop paging PR):
     // same delta-baseline rationale as the two registrations above — the CW
     // agent's prometheus pipeline drops each counter series' FIRST sample
