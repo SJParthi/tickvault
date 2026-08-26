@@ -1635,11 +1635,23 @@ async fn async_main() -> Result<()> {
     });
 
     // =====================================================================
-    // BOOT (single path since PR-C2, 2026-07-13 — the Dhan live-WS lane and
-    // its FAST crash-recovery arm are DELETED per the operator's retirement
-    // directive; Groww is the sole live feed, Dhan is REST-only).
+    // BOOT (single path since PR-C2, 2026-07-13 — the Dhan FAST
+    // crash-recovery arm is DELETED per the operator's retirement directive).
+    //
+    // CORRECTED 2026-08-26. The comment and the boot log below both said
+    // "Groww is the sole live feed, Dhan is REST-only". Both halves are dead:
+    // the operator REVIVED the Dhan live WS on 2026-08-09 (`dhan_enabled =
+    // true` since 2026-08-11) and ordered the ENTIRE Groww feed removed on
+    // 2026-08-21 — `groww_enabled` is not even a config field any more.
+    //
+    // The log line is the part that mattered: it is not a comment, it printed
+    // on EVERY boot into CloudWatch, and it told the operator the opposite of
+    // what the process was doing. That is the class this file already records
+    // 560 lines below, on the ERROR message that advised turning off the live
+    // feed: "actively harmful ... an operator who followed the advice would
+    // have turned off the live feed they had just deliberately enabled".
     // =====================================================================
-    info!("standard boot — shared infra, then per-feed lanes (Groww live; Dhan REST-only)");
+    info!("standard boot — shared infra, then per-feed lanes");
 
     // =======================================================================
     // D2 Stage 2 — HOISTED PROCESS-SHARED INFRA (the single boot path)
