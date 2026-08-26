@@ -5258,7 +5258,12 @@ pub const DEPTH_ATTACH_MIN_WINDOW_SECS: u64 = 30 * 60;
 pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 = 15 * 3_600 + 30 * 60;
 
 /// Current IST second-of-day.
-fn ist_second_of_day_now() -> u32 {
+///
+/// `pub(crate)` since 2026-08-26: the per-minute depth rebalance
+/// (`crate::depth_rebalance`) needs the SAME clock this lane uses. A second
+/// implementation would be one more place for the IST offset to drift, and a
+/// drift there puts every rebalance in the wrong minute.
+pub(crate) fn ist_second_of_day_now() -> u32 {
     let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
     ));
@@ -6291,6 +6296,21 @@ async fn attach_depth_when_available(
                     "late-attach finished: both halves on the wire and the late top-up window \
                      is closed"
                 );
+                // Hand the depth-200 channels to the per-minute rebalance
+                // BEFORE returning, and hand them by MOVE.
+                //
+                // This is the line that makes the at-the-money machinery
+                // live. Until now `depth_commands` was collected here and
+                // dropped on return, which closed every channel the instant
+                // the attach finished — so the tracker, the planner and the
+                // ranking were all correct and none of them could ever reach
+                // a socket.
+                //
+                // Only Depth200 connections go. A depth-200 connection holds
+                // exactly ONE instrument, which is what makes a one-for-one
+                // swap meaningful; depth-20 holds up to 50 and needs its own
+                // shape, which is a separate change.
+                spawn_depth_rebalance(&questdb, &today_date, std::mem::take(&mut depth_commands));
                 return;
             }
         }
@@ -6304,6 +6324,81 @@ async fn attach_depth_when_available(
     }
 }
 
+/// Turns the attach's dialed depth channels into the rebalance's socket list.
+///
+/// Pure, and separate from the spawn, because the FILTER is the load-bearing
+/// part: only `Depth200` connections belong here. A depth-200 connection holds
+/// exactly one instrument, which is what makes a one-for-one swap meaningful.
+/// A depth-20 connection holds up to 50, so the same swap would drop one of
+/// fifty and add another — a valid wire operation and completely the wrong
+/// one, with nothing downstream able to tell.
+///
+/// A connection dialed with anything other than exactly one instrument is
+/// SKIPPED rather than taken with its first: the rebalance's `held` must
+/// mirror the wire, and taking one of several would leave the others
+/// untracked and the socket ordering wrong for every underlying after it.
+#[must_use]
+pub fn depth200_rebalance_sockets(
+    dialed: Vec<(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )>,
+) -> Vec<crate::depth_rebalance::RebalanceSocket> {
+    let mut out = Vec::new();
+    for (endpoint, tx, instruments) in dialed {
+        if endpoint != DhanEndpointType::Depth200 {
+            continue;
+        }
+        let [only] = instruments[..] else {
+            warn!(
+                dialed_with = instruments.len(),
+                "depth rebalance: a depth-200 connection was dialed with something other \
+                 than exactly one instrument, so it is not steerable — a swap names the \
+                 instrument it replaces, and that is only unambiguous at one"
+            );
+            continue;
+        };
+        out.push(crate::depth_rebalance::RebalanceSocket {
+            tx,
+            held: Some(only),
+        });
+    }
+    out
+}
+
+/// Spawns the per-minute depth rebalance for the rest of the session.
+// TEST-EXEMPT: spawn wrapper over depth200_rebalance_sockets + run_depth_rebalance, both tested.
+fn spawn_depth_rebalance(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    dialed: Vec<(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )>,
+) {
+    let sockets = depth200_rebalance_sockets(dialed);
+    if sockets.is_empty() {
+        // Not an error here: a session that dialed no depth-200 connection at
+        // all has nothing to rebalance, and `run_depth_rebalance` would say so
+        // once and exit. Skipping the spawn says the same thing without a
+        // task that exists only to complain.
+        info!("depth rebalance not started: no steerable depth-200 connection was dialed");
+        return;
+    }
+    let questdb = questdb.clone();
+    let date_ist = date_ist.to_owned();
+    let today_ymd = ymd_from_ist_date(&date_ist);
+    let today_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
+    tokio::spawn(crate::depth_rebalance::run_depth_rebalance(
+        questdb,
+        date_ist,
+        today_ymd,
+        today_micros,
+        sockets,
+    ));
+}
 /// How long to wait before the next late-attach attempt, given the IST second.
 ///
 /// Pure so the boundary behaviour is testable without a clock: the whole point
@@ -14356,6 +14451,118 @@ mod late_seed_tests {
         assert!(
             before_refold.matches("return;").count() >= 5,
             "the scan window collapsed — it should span every bring-up refusal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod depth_rebalance_wiring_tests {
+    use super::*;
+
+    fn instrument(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: tickvault_common::types::ExchangeSegment::NseFno,
+        }
+    }
+
+    fn dialed(
+        endpoint: DhanEndpointType,
+        instruments: Vec<SubscribeInstrument>,
+    ) -> (
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // Keep the receiver alive for the life of the test so a closed channel
+        // never masquerades as a filtered one.
+        std::mem::forget(rx);
+        (endpoint, tx, instruments)
+    }
+
+    #[test]
+    fn only_depth_200_connections_are_steerable() {
+        // A depth-20 connection holds up to 50 instruments, so a one-for-one
+        // swap would drop one of fifty and add another — a valid wire
+        // operation and completely the wrong one.
+        let got = depth200_rebalance_sockets(vec![
+            dialed(DhanEndpointType::Depth200, vec![instrument(1)]),
+            dialed(DhanEndpointType::Depth20, vec![instrument(2)]),
+            dialed(DhanEndpointType::MainFeed, vec![instrument(3)]),
+            dialed(DhanEndpointType::OrderUpdate, vec![]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(4)]),
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].held, Some(instrument(1)));
+        assert_eq!(got[1].held, Some(instrument(4)));
+    }
+
+    #[test]
+    fn dial_order_is_preserved_because_the_planner_indexes_by_it() {
+        // plan_swaps assumes NIFTY call, NIFTY put, BANKNIFTY call, BANKNIFTY
+        // put in dial order. Reordering here would swap NIFTY's call onto
+        // BANKNIFTY's socket — a perfectly valid subscription to entirely the
+        // wrong contract.
+        let got = depth200_rebalance_sockets(vec![
+            dialed(DhanEndpointType::Depth200, vec![instrument(10)]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(20)]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(30)]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(40)]),
+        ]);
+        let ids: Vec<u64> = got
+            .iter()
+            .filter_map(|s| s.held.map(|i| i.security_id))
+            .collect();
+        assert_eq!(ids, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn a_connection_dialed_with_more_than_one_instrument_is_skipped_not_truncated() {
+        // Taking the first of several would leave the rest untracked AND shift
+        // every socket index after it, so the planner would steer the wrong
+        // underlying's socket for the whole session.
+        let got = depth200_rebalance_sockets(vec![
+            dialed(
+                DhanEndpointType::Depth200,
+                vec![instrument(1), instrument(2)],
+            ),
+            dialed(DhanEndpointType::Depth200, vec![instrument(3)]),
+        ]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].held, Some(instrument(3)));
+    }
+
+    #[test]
+    fn a_connection_dialed_with_nothing_is_skipped() {
+        let got = depth200_rebalance_sockets(vec![dialed(DhanEndpointType::Depth200, vec![])]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn no_depth_200_connection_yields_no_sockets() {
+        let got = depth200_rebalance_sockets(vec![dialed(
+            DhanEndpointType::Depth20,
+            vec![instrument(1)],
+        )]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn the_attach_hands_its_channels_over_before_returning() {
+        // The whole point of this change. `depth_commands` used to be dropped
+        // on return, closing every channel the instant the attach finished, so
+        // the entire rebalance was unreachable. A source pin, because the only
+        // symptom of losing it is that nothing ever happens.
+        let source = include_str!("dhan_feed_stack.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("spawn_depth_rebalance(")
+                && production.contains("std::mem::take(&mut depth_commands)"),
+            "the attach must MOVE its depth channels into the rebalance; dropping them \
+             closes every channel and the machinery goes silently inert"
         );
     }
 }
