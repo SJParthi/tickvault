@@ -276,6 +276,22 @@ pub const SUBSCRIBE_DISPATCH_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_dispatc
 /// than assumed — the arithmetic above is a bound, this is the measurement.
 pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms";
 
+/// Counter: instruments the guard REFUSED to put on the wire because the
+/// connection would then have carried the same one twice. Labels: `endpoint`,
+/// `site` (`new` | `extend` | `swap`).
+///
+/// This one names an 804. Dhan answers a duplicate subscribe with error code
+/// 804, which `classify_disconnect` files as Fatal: the socket closes and this
+/// supervisor parks it for the session rather than redialling into the same
+/// refusal. So a single repeated instrument in ONE batch does not degrade a
+/// connection, it ends it — and every instrument that connection was carrying
+/// goes dark with it.
+///
+/// A non-zero value is therefore a PRODUCER defect that was caught rather than
+/// suffered: some caller built a set with a repeat in it. The instrument is
+/// named in the log line beside this.
+pub const SUBSCRIBE_DUPLICATE_METRIC: &str = "tv_dhan_ws_subscribe_duplicate_total";
+
 // ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
 // ---------------------------------------------------------------------------
@@ -991,6 +1007,19 @@ pub enum SubscribeGuardRefusal {
         /// Endpoint type asked for.
         endpoint: DhanEndpointType,
     },
+    /// A swap was asked for whose NEW instrument this connection already
+    /// holds.
+    ///
+    /// Fail-closed, and this is the sharpest of the three: applying it would
+    /// send a subscribe for an instrument already on this socket, and Dhan
+    /// answers a duplicate subscribe with an 804 — Fatal, so the connection
+    /// closes and parks for the session. Refusing costs one minute's swap;
+    /// applying costs every instrument the connection was carrying.
+    #[error("{endpoint} was asked to swap in an instrument it already holds")]
+    AlreadySubscribed {
+        /// Endpoint type asked for.
+        endpoint: DhanEndpointType,
+    },
 }
 
 /// The subscription set for ONE connection, and the fact of whether the live
@@ -1010,6 +1039,90 @@ pub struct SubscribeGuard {
     confirmed: bool,
 }
 
+/// Drops instruments that would put the same one on a connection twice, and
+/// says so loudly.
+///
+/// # Why the guard does this at all
+///
+/// Every caller today builds a duplicate-free set, and the guard is not
+/// relying on that. It is the LAST place a set can be inspected before it
+/// reaches the wire, it is shared by all four endpoint types, and the cost of
+/// a duplicate reaching Dhan is not a degraded connection but a dead one:
+/// error 804 is Fatal, so the socket closes, the supervisor parks it for the
+/// session, and every instrument that connection was carrying goes dark.
+///
+/// # Why DROP rather than refuse the whole set
+///
+/// Refusing would leave the connection undialed, which is the same outcome as
+/// the 804 it prevents — no connection, no data. Dropping keeps the other 249
+/// instruments live, and because the guard's own `instruments` records the
+/// drop, the retained set still matches the wire exactly: nothing here can
+/// create the believed-held-ahead-of-wire divergence this module exists to
+/// prevent.
+///
+/// The drop is never silent: each one increments
+/// [`SUBSCRIBE_DUPLICATE_METRIC`] and the first is named in a coded `error!`,
+/// because a non-zero count is a producer defect that was caught rather than
+/// suffered.
+///
+/// # Complexity
+///
+/// O(n) with an O(1)-average set probe per instrument; n is at most 5,000 on
+/// a main-feed connection and is walked once, on the cold path, at dial.
+fn drop_duplicates(
+    endpoint: DhanEndpointType,
+    site: &'static str,
+    already: &[SubscribeInstrument],
+    incoming: Vec<SubscribeInstrument>,
+) -> Vec<SubscribeInstrument> {
+    // Explicit loops rather than an iterator-collect, and pre-sized. This is
+    // the DIAL path, not the drain — it runs when a connection is built and
+    // on a live top-up, never per frame — but the file is hot-path-classed
+    // and an exemption comment is a weaker thing to leave behind than code
+    // that does not need one. Both allocations are bounded by the endpoint
+    // cap (5,000 on the main feed, 50 on depth-20) and happen once.
+    let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+        std::collections::HashSet::with_capacity(already.len().saturating_add(incoming.len()));
+    for i in already {
+        seen.insert((i.security_id, i.segment));
+    }
+    let before = incoming.len();
+    let mut first_dropped: Option<SubscribeInstrument> = None;
+    let mut kept: Vec<SubscribeInstrument> = Vec::with_capacity(before);
+    for i in incoming {
+        if seen.insert((i.security_id, i.segment)) {
+            kept.push(i);
+        } else if first_dropped.is_none() {
+            first_dropped = Some(i);
+        }
+    }
+    let dropped = before.saturating_sub(kept.len());
+    if dropped > 0 {
+        metrics::counter!(
+            SUBSCRIBE_DUPLICATE_METRIC,
+            "endpoint" => endpoint.as_str(),
+            "site" => site,
+        )
+        .increment(dropped as u64);
+        if let Some(example) = first_dropped {
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                site,
+                dropped,
+                security_id = example.security_id,
+                segment = example.segment.as_str(),
+                "a subscription set carried the same instrument more than once — \
+                 dropped before it reached the wire, because Dhan answers a \
+                 duplicate subscribe with an 804 (Fatal) and the connection \
+                 would have parked for the session. The producer built a set \
+                 with a repeat in it."
+            );
+        }
+    }
+    kept
+}
+
 impl SubscribeGuard {
     /// Builds a guard, refusing a set larger than the endpoint's documented
     /// per-connection cap.
@@ -1025,6 +1138,9 @@ impl SubscribeGuard {
         endpoint: DhanEndpointType,
         instruments: Vec<SubscribeInstrument>,
     ) -> Result<Self, SubscribeGuardRefusal> {
+        // Deduped BEFORE the cap check, so a set that only breaches the
+        // cap because of its own repeats is dialed rather than refused.
+        let instruments = drop_duplicates(endpoint, "new", &[], instruments);
         let max = endpoint.max_instruments_per_connection();
         let requested = instruments.len();
         if u64::try_from(requested).unwrap_or(u64::MAX) > u64::from(max) {
@@ -1149,6 +1265,14 @@ impl SubscribeGuard {
         &mut self,
         more: Vec<SubscribeInstrument>,
     ) -> Result<usize, SubscribeGuardRefusal> {
+        if more.is_empty() {
+            return Ok(self.instruments.len());
+        }
+        // Deduped against what this connection ALREADY holds as well as
+        // within the top-up itself. A top-up naming a held instrument is
+        // the most likely shape here: it is what a re-selection produces
+        // when only part of the desired set changed.
+        let more = drop_duplicates(self.endpoint, "extend", &self.instruments, more);
         if more.is_empty() {
             return Ok(self.instruments.len());
         }
@@ -1307,6 +1431,42 @@ impl SubscribeGuard {
         };
         if old == new {
             return Ok(SubscribeSwap::NO_OP);
+        }
+        // The NEW instrument must not already be on this connection, and this
+        // is the sharpest of the guard's three checks.
+        //
+        // `old == new` above catches the no-op. This catches the different
+        // case: `new` is held at some OTHER position, so the swap would
+        // unsubscribe `old` and then subscribe something the socket already
+        // has. Dhan answers that with an 804 — Fatal — and the supervisor
+        // parks the connection for the session, taking every instrument it
+        // carried with it.
+        //
+        // Fail-closed. Refusing costs this minute's swap; the caller retries
+        // next minute, and the set is left exactly as the wire has it.
+        //
+        // Same scan as the one above, same exemption for the same reason.
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+        if self.instruments.iter().any(|held| *held == new) {
+            metrics::counter!(
+                SUBSCRIBE_DUPLICATE_METRIC,
+                "endpoint" => self.endpoint.as_str(),
+                "site" => "swap",
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                held = self.instruments.len(),
+                security_id = new.security_id,
+                segment = new.segment.as_str(),
+                "refusing a swap whose NEW instrument this connection already \
+                 holds — subscribing it twice is an 804, which is Fatal and \
+                 parks the connection for the session"
+            );
+            return Err(SubscribeGuardRefusal::AlreadySubscribed {
+                endpoint: self.endpoint,
+            });
         }
         // Replace in place rather than remove-then-push: position is the only
         // thing that distinguishes one depth-20 slot from another when the
@@ -2918,6 +3078,126 @@ mod tests {
         assert!(!swap.is_no_op());
     }
 
+    // -- the 804 guard: no connection may carry one instrument twice --------
+    //
+    // Dhan answers a duplicate subscribe with error code 804, which
+    // `classify_disconnect` files as Fatal: the socket closes and the
+    // supervisor parks it for the SESSION. So a repeat is not a wasted slot,
+    // it is the loss of every instrument that connection was carrying.
+    //
+    // Every producer today builds a duplicate-free set. These pin that the
+    // guard does not depend on that — it is the last place a set can be
+    // inspected before the wire, and it is shared by all four endpoint types.
+
+    #[test]
+    fn a_set_carrying_the_same_instrument_twice_only_subscribes_it_once() {
+        let mut set = instruments(3);
+        set.push(set[1]);
+        let guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, set).expect("inside the cap");
+        assert_eq!(guard.len(), 3, "the repeat must not reach the wire");
+        let flat: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
+        let mut seen = std::collections::HashSet::new();
+        for i in &flat {
+            assert!(
+                seen.insert((i.security_id, i.segment)),
+                "duplicate {i:?} in a subscribe batch — that is an 804 (Fatal)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_id_in_two_segments_is_two_instruments_not_a_duplicate() {
+        // I-P1-11: `security_id` ALONE is not an identity. Deduping on the id
+        // would silently drop a real contract and leave the connection
+        // carrying fewer instruments than the operator authorized.
+        let set = vec![
+            SubscribeInstrument {
+                security_id: 7,
+                segment: ExchangeSegment::NseFno,
+            },
+            SubscribeInstrument {
+                security_id: 7,
+                segment: ExchangeSegment::BseFno,
+            },
+        ];
+        let guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, set).expect("inside the cap");
+        assert_eq!(guard.len(), 2, "two segments are two instruments");
+    }
+
+    #[test]
+    fn a_top_up_naming_something_already_held_adds_nothing() {
+        // The likeliest live shape: a re-selection where only part of the
+        // desired set changed, so the top-up repeats what is already there.
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(4)).expect("cap");
+        let start = guard.try_extend(instruments(4)).expect("no cap breach");
+        assert_eq!(guard.len(), 4, "nothing new was added");
+        assert_eq!(
+            guard.batches_from(start).flatten().count(),
+            0,
+            "a top-up of pure repeats must put NO subscribe on the wire"
+        );
+    }
+
+    #[test]
+    fn a_top_up_keeps_the_new_half_and_drops_the_repeated_half() {
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(4)).expect("cap");
+        let mut more = instruments(2);
+        more.extend(instruments_from(4, 3));
+        let start = guard.try_extend(more).expect("no cap breach");
+        assert_eq!(guard.len(), 7, "4 held + 3 genuinely new");
+        let sent: Vec<SubscribeInstrument> = guard.batches_from(start).flatten().copied().collect();
+        assert_eq!(sent.len(), 3, "only the new three go on the wire");
+        for i in &sent {
+            assert!(
+                i.security_id >= 4,
+                "a repeated instrument {i:?} reached the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn a_swap_whose_new_instrument_is_already_held_is_refused() {
+        // Distinct from the `old == new` no-op: here `new` sits at a
+        // DIFFERENT position, so the swap would unsubscribe `old` and then
+        // subscribe something the socket already has.
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(3)).expect("cap");
+        let err = guard
+            .try_swap(instruments(3)[0], instruments(3)[2])
+            .expect_err("subscribing a held instrument is an 804");
+        assert!(matches!(
+            err,
+            SubscribeGuardRefusal::AlreadySubscribed { .. }
+        ));
+        assert_eq!(
+            guard.len(),
+            3,
+            "a refused swap must leave the set exactly as the wire has it"
+        );
+        let flat: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
+        assert!(
+            flat.contains(&instruments(3)[0]),
+            "the OLD instrument must still be held — nothing was unsubscribed"
+        );
+    }
+
+    #[test]
+    fn a_swap_onto_itself_is_still_a_no_op_not_a_refusal() {
+        // The common minute: the at-the-money strike has not moved. This must
+        // stay distinguishable from the duplicate refusal above, or every
+        // quiet minute would log an 804 warning.
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth200, instruments(1)).expect("cap");
+        let swap = guard
+            .try_swap(instruments(1)[0], instruments(1)[0])
+            .expect("a no-op swap is legal");
+        assert!(swap.is_no_op());
+    }
+
     /// A depth-200 connection accepts exactly ONE instrument. Subscribing
     /// before unsubscribing asks for two, and Dhan answers an over-limit
     /// subscribe with 804 — Fatal, and retrying re-sends the same over-limit
@@ -3191,6 +3471,23 @@ mod tests {
 
     fn instruments(n: usize) -> Vec<SubscribeInstrument> {
         (0..n)
+            .map(|i| SubscribeInstrument {
+                security_id: SecurityId::try_from(i).unwrap_or(SecurityId::MAX),
+                segment: ExchangeSegment::NseFno,
+            })
+            .collect()
+    }
+
+    /// `n` instruments whose ids start at `start`, for building a top-up that
+    /// is genuinely NEW rather than a repeat of what the connection holds.
+    ///
+    /// `instruments(n)` always starts at 0, so extending a 250-instrument set
+    /// with `instruments(150)` supplies 150 instruments it ALREADY has. On the
+    /// wire that is 150 duplicate subscribes, and Dhan answers a duplicate
+    /// subscribe with an 804 — Fatal. The guard now drops them, so a test
+    /// wanting a real top-up has to ask for one.
+    fn instruments_from(start: usize, n: usize) -> Vec<SubscribeInstrument> {
+        (start..start.saturating_add(n))
             .map(|i| SubscribeInstrument {
                 security_id: SecurityId::try_from(i).unwrap_or(SecurityId::MAX),
                 segment: ExchangeSegment::NseFno,
@@ -5536,7 +5833,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Queued before the loop starts, so the arm is ready as soon as the
         // scripted frames are drained.
-        tx.send(LiveSubscriptionCommand::Extend(instruments(150)))
+        // A top-up of instruments the connection does NOT already hold. Ids
+        // 250..400, so nothing here repeats the initial set — see
+        // `instruments_from`.
+        tx.send(LiveSubscriptionCommand::Extend(instruments_from(250, 150)))
             .await
             .expect("channel open");
         drop(tx);
