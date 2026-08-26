@@ -3610,3 +3610,108 @@ is what blinded the comparator is exactly what the breakdown answers.
 Nothing here improves agreement with Dhan. Where the comparison does run we
 already agree to ~25 paise; the problem was never the matching, it was the
 coverage.
+
+---
+
+## Item 36 — volume was never compared, and the operator asked about volume
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, this morning, verbatim (typos preserved):
+
+> "precisley meanwhiel exactlt at 3.40 pm you need to pull the entiree 850 or
+> 860 spots entikeey rgith dude that too one an donly for one mintue alone
+> especiallu to do the cross verification rigth dude **whetehr our entire
+> system ophlc vlolume is entilrey amtchign for evrythginr ight dude**"
+
+He asked whether OHLC **and volume** match. Checked in source: `PaiseBar::fields()`
+returns exactly four entries — open, high, low, close. **Volume was never compared.**
+It rode along on every finding row as `live_volume` / `rest_volume` and no
+divergence was ever raised on it, so "does our volume agree with the exchange's?"
+had no answer anywhere in the system.
+
+That gap is not academic. A live volume defect measured 2026-08-24 had the
+intraday frames at **~9.2× the day bar**, with 6,088 instruments disagreeing with
+their own minute sums. The one comparison that could have caught it was not
+looking.
+
+**Volume is reported as a CAPTURE PERCENTAGE, not a pass/fail.** Our live feed is
+a conflated ~1/sec sample; the vendor's REST tape is the full record. Under-capture
+is STRUCTURAL and expected, so a strict equality check would flag nearly every cell
+and drown the price signal beside it. Four figures: cells with a usable volume,
+exact matches, the median capture, the 5th percentile, and the worst single cell.
+
+It deliberately does not feed `cells_diverged` or the outcome. A threshold needs a
+baseline and no baseline exists — this measurement is what creates one. Identical
+discipline to the price side, which quantifies its noise rather than asserting a
+limit.
+
+**Also in this item: the match rate is now computed, not left as homework.**
+`minutes_compared` and `cells_diverged` were both already on the verdict line, so
+the rate was always derivable with one multiplication — and nobody did it, for two
+sessions, while the run sat at 0.09% coverage. A number that needs arithmetic
+before it means anything is a number that gets skipped.
+
+### Edge cases
+
+- **The vendor reports zero volume for a minute.** Skipped, not scored 0%. Their
+  volume is the denominator; a zero one means they saw no trades, which says
+  nothing about our capture, and counting it would drag the median toward "we
+  missed everything" when the truth is "there was nothing to miss."
+- **Over-capture (above 100%) is reported, never clamped.** Reading above the
+  vendor's own tape cannot happen honestly — it is the signature of the
+  double-counting defect measured on 2026-08-24. Clamping would erase the only
+  evidence of it.
+- **Integer arithmetic throughout.** A float ratio would be the one place in this
+  module comparing by epsilon, which its own header forbids.
+
+### Failure modes
+
+**A volume gap misread as a price divergence.** Pinned: prices agreeing exactly
+while volume differs 1-vs-9,999 must leave `cells_diverged` at zero and the
+verdict a pass.
+
+**The bad tail hidden by the median.** Caught by a test that FAILED as first
+written. `percentile` here is linear-rank, so at n=20 the 5th percentile lands on
+the second-smallest value and one catastrophic minute never reaches it. That
+failure is what added `volume_capture_min_pct` — p05 describes the distribution,
+the minimum describes the worst thing that actually happened. The price side
+reports `max` for the same reason; volume's bad direction is simply down.
+
+### Test plan
+
+6 tests: volume is compared at all; a volume disagreement never becomes a price
+divergence and never flips the verdict; a vendor-untraded minute is skipped rather
+than scored zero; a perfect capture reads 100 including its tail; the median hides
+one bad cell in twenty and the minimum does not; over-capture survives to the
+report at 920%.
+
+### Rollback
+
+Delete the four fields, the loop block, and the log fields. That restores a
+comparison that checks four of five columns and never says so.
+
+### Observability
+
+**No new metric name, no selector entry, no cost.** Five fields on the existing
+verdict line.
+
+### Honest envelope
+
+This MEASURES volume agreement; it does not enforce it. No threshold is set,
+because none can be honest before a baseline exists — tomorrow's run produces the
+first one. It also cannot separate "we missed trades" from "the vendor's tape
+disagrees with itself", and it inherits the coverage limit of Item 35: measuring
+volume across 295 price-minutes says very little until that number grows.
+
+### Rider — the FIFTH fixed-window guard
+
+`the_cross_verify_verdict_is_logged_as_fields_not_a_debug_dump` scanned a FIXED
+2,000 bytes back from its marker. Adding five fields to the emit made the list
+outgrow the window and the guard failed — not because a field was missing, but
+because the code got longer. It failed CLOSED (blocking a correct change), which
+is the better direction, but the shape is the same one corrected four times
+already in this branch. It now walks back to the enclosing macro opening, which is
+a real boundary and cannot drift. Bite-proven: deleting the field it pins fails it.
