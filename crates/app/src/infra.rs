@@ -843,7 +843,23 @@ pub fn spawn_clock_skew_poller(
                     warn!("clock-skew poll loop exited cleanly — respawning");
                 }
                 Err(err) => {
+                    // CODED, and the guard is why. The first version of this
+                    // arm carried no `code =` field, and
+                    // `uncoded_error_sites_may_only_shrink` failed CI by
+                    // name: an uncoded `error!` reaches the log sink and
+                    // nothing else, because every CloudWatch metric filter
+                    // that pages an operator matches on `$.code`.
+                    //
+                    // BOOT-03 is the right code rather than a convenient
+                    // one: it is what the sibling probe-failure `warn!` in
+                    // `run_clock_skew_loop` uses, it owns the clock-skew
+                    // runbook, and both failures put the operator in the
+                    // same position — `tv_clock_skew_seconds` is no longer
+                    // being refreshed and the alarm on it cannot tell that
+                    // from a steady clock.
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded
+                            .code_str(),
                         ?err,
                         "clock-skew poll loop died — respawning (tv_clock_skew_seconds is \
                          frozen at its last value until it returns, and the alarm on it \
