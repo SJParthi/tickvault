@@ -681,7 +681,7 @@ operator woken by this alarm still has to decide whether to raise the cap or
 narrow the set. The gauge remains unshipped, so there is still no way to watch the
 number CREEP toward the cap — only to be told after it crossed.
 
-#### §2.3d-ii — 2026-08-22 MEASURED: the user-data template has ZERO bytes free
+#### §2.3d-ii — 2026-08-22 MEASURED: the user-data template has ZERO bytes free  ⚠ SUPERSEDED 2026-08-26 (see the note at the end of this section)
 
 §2.3d records the headroom gauge as blocked "33 bytes over the budget", which
 reads like a shortfall specific to that one metric. Measured today, it is not:
@@ -713,6 +713,57 @@ ship one gauge is the wrong trade even with a strong equivalence proof. The
 guard's own prescription — move content to a file `cp`'d in after the Step 5
 repo clone — remains the correct fix, and remains a prod boot-path change that
 needs someone who can watch a real instance boot.
+
+
+> ### ⚠ SUPERSEDED 2026-08-26 — the budget was freed the same week, and two
+> ### later sections in THIS file already say so
+>
+> §2.3d-ii's measurement was correct on 2026-08-22 and was obsolete within
+> three days. **#1815 performed exactly the restructure the paragraph above
+> calls "the correct fix"** — it moved the EMF selector OUT of the boot
+> template and into `deploy/aws/cloudwatch-agent.json`, `cp`'d into place
+> after the Step 5 repo clone. §2.3h (2026-08-25) records that and its
+> before/after byte counts.
+>
+> **Re-measured 2026-08-26**, by running the guard rather than quoting anyone:
+>
+> | | bytes |
+> |---|---|
+> | `user_data_size_guard` reports rendered | **13,869** |
+> | Budget (16,384 AWS limit − 512 required margin) | 15,872 |
+> | **Free** | **2,003** (2,515 to the raw AWS limit) |
+> | `tv_dhan_feed` occurrences left in `user-data.sh.tftpl` | **0** |
+>
+> That 13,869 matches §2.3h's figure to the byte, from an independent run,
+> which is what settles which of the two sections is stale.
+>
+> **So every "blocked by the byte budget" reason in this file is now dead**,
+> and adding an EMF name costs **zero** user-data bytes — `cw_agent_selector_
+> lockstep_guard` now *forbids* a second copy in the boot template. Sections
+> reasoning from the old figure, all superseded on this point: §2.3d (the
+> headroom gauge, "33 bytes over"), §2.3f (`tv_dhan_feed_xverify_runs_total`,
+> "misses by one byte"), and §2.3g (`tv_wal_suspension_probe_failed_total`,
+> "still CloudWatch-invisible — blocked by the same zero-byte budget").
+>
+> **§2.3g is the one that matters.** Its own alarm
+> `tv-<env>-questdb-wal-suspended` reads a GAUGE, and that section states the
+> principle plainly: *"Alarming a gauge whose producer can fail open would be
+> alarming a lie."* The producer-failure counter is what closes that loop, and
+> the file says it cannot ship for a reason that stopped being true on
+> 2026-08-25.
+>
+> **THIS NOTE AUTHORIZES NOTHING.** It records a measurement and retires a
+> dead reason. Shipping any of those three metrics is an operator decision —
+> each is ~$0.30/mo against a ceiling this file documents as having roughly
+> $4.28 of margin at the 90% `STOP_EC2_INSTANCES` line, and §3 governs the
+> protocol. What changes here is only that "we can't, the budget is full" is
+> no longer a true answer.
+>
+> Recorded because §2.3d-ii is written as a MEASUREMENT, which is exactly the
+> kind of claim this file's own §2.3f correction warns carries a date: *"a
+> claim about whether a MECHANISM fired is checkable in one query and must be
+> checked before it is written."* The same applies to a byte count. It was
+> checked, and it moved.
 
 ### §2.3e — 2026-08-22: the pre-open readiness deadline joins family (5)
 
