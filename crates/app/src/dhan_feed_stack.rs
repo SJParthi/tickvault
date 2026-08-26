@@ -12746,9 +12746,25 @@ mod tests {
         );
     }
 
-    /// The pricing quorum holds CONTRACTS. It must never hold DEPTH — depth
-    /// reads the option chain, not spot prices, so waiting for a stock to
-    /// print cannot make its instruments arrive any sooner.
+    /// The pricing quorum holds CONTRACTS. It must never hold DEPTH.
+    ///
+    /// **CORRECTED 2026-08-26.** This said depth "reads the option chain, not
+    /// spot prices". Both halves of that are now false: depth reads the
+    /// CONTRACT ARTIFACT (`load_depth_candidates` -> `read_contract_artifact`,
+    /// with the chain only as an unreachable fallback), and it very much does
+    /// read spot prices — `fetch_spot_prices` is how at-the-money is located
+    /// at all. The test was right; its reason was not, which is worse than no
+    /// reason, because a reader checking whether the coupling still matters
+    /// would have been told to look at the wrong thing.
+    ///
+    /// The REAL reason is a timing one, and it is what makes the operator's
+    /// 09:13 deadline reachable. Depth needs spot prices, which exist from
+    /// 09:00 — pre-open ticks are persisted even though they are not folded
+    /// into candles. The CONTRACT half additionally waits on a pricing quorum
+    /// across ~208 stock underlyings so the at-the-money window is not sized
+    /// against a near-empty price map. Those are different questions with
+    /// different answers at 09:13, so coupling them would make depth wait for
+    /// something it never needed.
     #[test]
     fn outstanding_halves_holds_contracts_while_pending_but_never_depth() {
         assert_eq!(
