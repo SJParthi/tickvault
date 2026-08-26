@@ -256,9 +256,26 @@ proptest! {
     /// This function once printed `atm_window = 25` beside
     /// `stock_options = 0` — a number describing a window applied to nothing,
     /// which reads as a healthy selection to anyone watching the boot line.
-    /// A non-zero window must mean stock options were actually chosen, and a
-    /// zero window must carry a reason that says which of the two failures it
-    /// was.
+    ///
+    /// CORRECTED 2026-08-26. The first version of this property asserted that
+    /// a window of ZERO always means nothing was applied, and demanded a
+    /// reason of "no_room" or "no_ladders". That is what the field's own doc
+    /// said, and both were wrong: `fit_atm_window` returns `Some(0)` when the
+    /// at-the-money strike itself fits and nothing wider does, and the caller
+    /// then subscribes BOTH LEGS of the money for every ladder. A window of 0
+    /// with reason "applied" is a SUCCESS, and the doc has been corrected to
+    /// say so.
+    ///
+    /// The claim is therefore restated in the form that is actually true, and
+    /// it is STRONGER than the original: "applied" must mean stock options
+    /// were taken, at ANY width including zero. The old version left the
+    /// window-0 case entirely unchecked — which is the case hardest to read
+    /// correctly from a boot line, and the one where a false success would go
+    /// unnoticed longest.
+    ///
+    /// The counterexample proptest persisted for this is checked in: one
+    /// stock, three strikes, one future, capacity 3 — room for the future and
+    /// the ATM pair and nothing more.
     #[test]
     fn a_reported_window_is_never_a_window_applied_to_nothing(
         rows in master(),
@@ -266,20 +283,27 @@ proptest! {
         capacity in 0_usize..3000,
     ) {
         let got = select_contract_universe(&rows, &spot, TODAY, capacity);
-        if got.atm_window_used > 0 {
-            prop_assert!(
+        match got.atm_window_reason {
+            "applied" => prop_assert!(
                 got.stock_options > 0,
-                "window {} applied to {} stock options",
+                "reason 'applied' with window {} but {} stock options — a window \
+                 applied to nothing",
                 got.atm_window_used,
                 got.stock_options
-            );
-            prop_assert_eq!(got.atm_window_reason, "applied");
-        } else {
-            prop_assert!(
-                matches!(got.atm_window_reason, "no_room" | "no_ladders"),
-                "a zero window with reason {:?}",
-                got.atm_window_reason
-            );
+            ),
+            "no_room" | "no_ladders" => {
+                prop_assert_eq!(
+                    got.atm_window_used, 0,
+                    "a failure reason must carry a zero width"
+                );
+                prop_assert_eq!(
+                    got.stock_options, 0,
+                    "reason {:?} but {} stock options were taken",
+                    got.atm_window_reason,
+                    got.stock_options
+                );
+            }
+            other => prop_assert!(false, "unknown atm_window_reason {:?}", other),
         }
     }
 

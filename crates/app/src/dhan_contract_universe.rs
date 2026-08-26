@@ -500,11 +500,30 @@ pub struct ContractSelection {
     /// [`STOCK_OPTION_ATM_STRIKES_EACH_SIDE`] means the envelope forced a
     /// shrink — the operator asked for 25 and got this.
     ///
-    /// **0 means no window was applied to anything.** Read it with
-    /// [`Self::atm_window_reason`], which names WHY — a window of 0 from a
-    /// full envelope and a window of 0 from an empty ladder set are different
-    /// failures with different remedies.
+    /// **0 is AMBIGUOUS on its own and must never be read alone.** It carries
+    /// two opposite meanings, separated only by [`Self::atm_window_reason`]:
     ///
+    /// - `0` with `"applied"` — the at-the-money strike itself, BOTH legs, was
+    ///   subscribed for every ladder, and nothing wider fit. This is a
+    ///   SUCCESS: `stock_options` is non-zero.
+    /// - `0` with `"no_room"` or `"no_ladders"` — nothing was subscribed at
+    ///   all. `stock_options` is zero.
+    ///
+    /// CORRECTED 2026-08-26: this said "**0 means no window was applied to
+    /// anything**", which is the second case stated as though it were the
+    /// only one. `fit_atm_window` returns `Some(0)` for the ATM-only fit and
+    /// `None` for the two failures, and the caller's own comment spells the
+    /// distinction out — "window 0 still selects the ATM strike itself, both
+    /// legs, for every stock". So an operator trusting this doc would read a
+    /// successful ATM-only session, with hundreds of pairs subscribed, as a
+    /// total failure. Found by a property test written FROM this doc, which
+    /// is the useful part: the test encoded the doc's claim and the code
+    /// disagreed with it.
+    ///
+    /// The reliable single field to read is `stock_options`. This one
+    /// describes the WIDTH; it never, on its own, says whether anything was
+    ///
+    /// taken.
     /// CORRECTED 2026-08-19: this reported **25 while zero stock options were
     /// selected** whenever the ladder set came back empty. The same run's
     /// boot line then read `stock_options = 0, atm_window = 25` — a number
