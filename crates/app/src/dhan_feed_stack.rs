@@ -3469,6 +3469,12 @@ async fn run_frame_drain(
                 // wall-clock instant is used so a frame's arrival and its
                 // silence-accounting can never disagree.
                 let recv_millis = u64::try_from(received_at_nanos / 1_000_000).unwrap_or(0);
+                // The same instant as an `i64`, for the per-connection
+                // delivery stamp. Derived from `received_at_nanos` rather than
+                // taken fresh so a socket's stamp and its silence-accounting
+                // can never disagree by a scheduling delay — the same reason
+                // `recv_millis` above exists.
+                let recv_millis_i64 = received_at_nanos / 1_000_000;
 
                 // Routed BY ENDPOINT, never by guesswork. Depth frames carry a
                 // 12-byte header and can stack several packets in one message;
@@ -3482,6 +3488,17 @@ async fn run_frame_drain(
                         );
                         folded = folded.saturating_add(outcome.folded);
                         unparseable = unparseable.saturating_add(outcome.unparseable);
+                        // Stamp the SOCKET as delivering, gated on the frame
+                        // having actually produced something.
+                        //
+                        // Gated, not unconditional: a socket returning frames
+                        // that all fail to parse is not delivering market
+                        // data, and stamping on arrival would report it
+                        // healthy — the precise false-OK this detector exists
+                        // to remove. `folded > 0` is the honest bar.
+                        if outcome.folded > 0 {
+                            record_connection_tick(frame.connection_index, recv_millis_i64);
+                        }
                     }
                     DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
                         // PERSISTED since 2026-08-15 (operator: depth-20 and
@@ -3517,6 +3534,19 @@ async fn run_frame_drain(
                                     depth, &frame, received_at_nanos, kind, c,
                                 );
                                 depth_rows = depth_rows.saturating_add(outcome.rows);
+                                // Depth sockets get the same delivery stamp as
+                                // the main feed. Without this every depth
+                                // connection reads "never ticked" and is
+                                // excluded from the worst-age gauge — which
+                                // would leave ten of the sixteen sockets with
+                                // no deaf-socket coverage at all, while the
+                                // gauge looked healthy for that very reason.
+                                if outcome.rows > 0 {
+                                    record_connection_tick(
+                                        frame.connection_index,
+                                        recv_millis_i64,
+                                    );
+                                }
                                 depth_refused = depth_refused.saturating_add(outcome.refused);
                             }
                             None => {
@@ -3759,6 +3789,27 @@ async fn run_frame_drain(
                     ),
                     drain_started.elapsed().as_secs(),
                 ));
+                // The PER-SOCKET half of the same question, published on the
+                // same tick and for the same reason.
+                //
+                // The lane gauge above cannot see one deaf socket among
+                // sixteen: with fifteen delivering, the lane's last tick is
+                // always a second old however dead the sixteenth is. This one
+                // reports the WORST socket, so a single deaf connection moves
+                // it while the lane gauge stays flat — and that difference IS
+                // the diagnosis.
+                //
+                // -1 for "no connection has ticked yet", which is a real state
+                // (pre-open, or a lane that just started) and must not render
+                // as 0. Zero would read as "every socket ticked this instant",
+                // the most reassuring value available, at the moment we know
+                // least.
+                metrics::gauge!(WORST_CONN_TICK_AGE_GAUGE).set(
+                    worst_connection_tick_age_secs(
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .map_or(-1.0, |secs| f64::from(u32::try_from(secs).unwrap_or(u32::MAX))),
+                );
                 // Gauges publish unconditionally — a dashboard reading zero
                 // outside market hours is correct, and gating the gauge would
                 // make "no data" and "nothing wrong" indistinguishable.
@@ -4841,6 +4892,90 @@ impl WsLagHandles {
     }
 }
 
+/// Per-connection last-tick instant, in epoch MILLISECONDS. `0` = never ticked.
+///
+/// # The failure this exists for
+///
+/// A socket that keeps answering pings but stops delivering data never trips
+/// the idle watchdog — the watchdog governs SILENCE on the wire, and a socket
+/// sending pongs is not silent. It also never reconnects, so the whole
+/// reconnect family (`tv_dhan_ws_reconnect_total`, `_dial_failed_total`,
+/// `_subscribe_failed_total`) stays flat: alarming those, the obvious fix,
+/// cannot catch this case BY CONSTRUCTION, because the defining property of a
+/// deaf socket is that nothing about it is retrying.
+///
+/// The lane-level `LAST_TICK_AGE_GAUGE` cannot see it either. With fifteen
+/// sockets delivering normally the lane's last tick is always a second old,
+/// however dead the sixteenth is.
+///
+/// # Why ONE gauge and not sixteen
+///
+/// Per-connection series would be sixteen names' worth of cost (~$4.80/mo by
+/// the 2026-08-14 noise-lock figure) to answer a yes/no question. Publishing
+/// the WORST age across connections answers it for one series (~$0.30/mo) with
+/// identical detection power: if socket 7 goes deaf, the max climbs while the
+/// lane gauge stays at one second. Per-connection attribution is still on
+/// `/metrics` for whoever is triaging, which is the moment attribution is
+/// actually wanted — and by then a human is already looking.
+///
+/// # Never-ticked slots are EXCLUDED, deliberately
+///
+/// A slot that has never ticked reads `0` and is skipped rather than treated
+/// as infinitely stale. Two reasons: an unused slot would peg this gauge at
+/// "broken" forever, and a legitimately quiet subscription (a depth-200 socket
+/// on one illiquid contract) is not a fault. The never-ticked case has its own
+/// signal already — `tv_dhan_feed_instruments_never_ticked` plus RISK-GAP-03 —
+/// so it is covered, not dropped.
+static PER_CONN_LAST_TICK_MILLIS: [std::sync::atomic::AtomicI64;
+    MAX_TOTAL_DHAN_CONNECTIONS as usize] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; MAX_TOTAL_DHAN_CONNECTIONS as usize];
+
+/// Stamps that a connection delivered a tick. One relaxed store per FRAME.
+///
+/// Per frame, not per tick: a frame stacks packets, and the question this
+/// answers ("is this socket delivering at all?") is answered identically by
+/// either. The cheaper one wins on a path that runs ~5,000 times a second.
+///
+/// An out-of-range index is dropped rather than panicking or wrapping. The
+/// planner cannot produce one — the array is sized from the same constant the
+/// pool is — and writing to the wrong slot would report the wrong socket
+/// healthy, which is worse than not writing.
+pub fn record_connection_tick(connection_index: u8, recv_millis: i64) {
+    if let Some(slot) = PER_CONN_LAST_TICK_MILLIS.get(connection_index as usize) {
+        slot.store(recv_millis, Ordering::Relaxed);
+    }
+}
+
+/// Age in seconds of the STALEST connection that has ever ticked.
+///
+/// `None` when no connection has ticked yet — which is a real state (pre-open,
+/// or a lane that has just started) and must NOT render as zero. Zero would
+/// mean "every socket ticked this instant", the most reassuring reading
+/// available, at the moment we know least.
+///
+/// Pure, so the boundary cases are testable without a clock.
+#[must_use]
+pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
+    let mut worst: Option<u64> = None;
+    for slot in &PER_CONN_LAST_TICK_MILLIS {
+        let last = slot.load(Ordering::Relaxed);
+        if last == 0 {
+            continue; // never ticked — see the type's docs
+        }
+        // saturating: a clock stepped backwards must read as 0 age, never wrap
+        // into a gigantic one at the moment the log is hardest to read.
+        let age = u64::try_from(now_millis.saturating_sub(last).max(0) / 1_000).unwrap_or(u64::MAX);
+        worst = Some(worst.map_or(age, |w| w.max(age)));
+    }
+    worst
+}
+
+/// Gauge: how stale the WORST-performing live connection is, in seconds.
+///
+/// `-1` when no connection has ticked yet, so "unknown" is distinguishable
+/// from "all fresh" on the chart. A gauge that renders both as 0 is the
+/// false-OK shape this repo has retired repeatedly.
+pub const WORST_CONN_TICK_AGE_GAUGE: &str = "tv_dhan_ws_worst_conn_tick_age_secs";
 static WS_LAG_HANDLES: OnceLock<WsLagHandles> = OnceLock::new();
 
 fn ws_lag_handles() -> &'static WsLagHandles {

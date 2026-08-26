@@ -521,6 +521,40 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
       {
         type   = "metric"
+        x      = 0
+        y      = 70
+        width  = 8
+        height = 6
+        properties = {
+          # A socket that keeps answering pings but stops delivering data.
+          #
+          # This failure defeats every other mechanism by construction. The
+          # idle watchdog governs SILENCE, and a ponging socket is not silent.
+          # The reconnect counters stay flat, because the defining property of
+          # a deaf socket is that nothing about it is retrying. And the
+          # LANE-level tick age reads about a second throughout, because
+          # fifteen of the sixteen sockets are fine.
+          #
+          # Read it AGAINST the lane tick age, not alone: both low is healthy,
+          # this one climbing while the lane stays flat is exactly one deaf
+          # socket, and both climbing is the whole feed. That difference is the
+          # diagnosis, which is why the two belong on the same screen.
+          #
+          # -1 means no connection has ticked yet — pre-open, or a lane that
+          # has just started. Deliberately not 0, which would read as "every
+          # socket ticked this instant" at the moment we know least.
+          title  = "Deaf socket check: worst connection tick age (s), -1 = none yet"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_ws_worst_conn_tick_age_secs", { label = "worst socket", stat = "Maximum" }],
+            [local.dash_namespace, "tv_dhan_feed_last_tick_age_secs", { label = "whole lane (for contrast)", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
         x      = 8
         y      = 64
         width  = 8

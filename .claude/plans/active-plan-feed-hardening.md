@@ -3235,3 +3235,96 @@ not enlarge the ring, and does not prevent a stall — it makes one visible befo
 it costs ticks instead of after. Cost on the hot path is one uncontended atomic
 `fetch_max` per frame (single writer, `Relaxed`), no allocation and no registry
 lookup; the gauge write is on the existing periodic path, never per frame.
+
+---
+
+## Item 32 — the deaf socket: one connection stops delivering and nothing notices
+
+### Design
+
+A socket that keeps answering pings but stops delivering data is invisible to
+every mechanism the lane has, and each miss is structural rather than an
+oversight:
+
+| Mechanism | Why it cannot see this |
+|---|---|
+| Idle watchdog (27 s) | governs SILENCE on the wire; a ponging socket is not silent |
+| Reconnect family (`reconnect_total`, `dial_failed_total`, `subscribe_failed_total`) | stays flat — the defining property of a deaf socket is that **nothing about it is retrying**. This is why "alarm the reconnect counters", the recommendation on record, cannot work |
+| Lane `tv_dhan_feed_last_tick_age_secs` | reads ~1 s throughout: fifteen of sixteen sockets are fine |
+| `tv_dhan_ws_alive_connections` | counts sockets DIALED, not sockets DELIVERING |
+
+**Fix:** a fixed `[AtomicI64; MAX_TOTAL_DHAN_CONNECTIONS]` of last-delivery
+millis, stamped per frame that actually produced output, published as ONE gauge
+`tv_dhan_ws_worst_conn_tick_age_secs` = the worst age across connections that
+have ever delivered.
+
+**One series, not sixteen.** Per-connection is ~$4.80/mo by the 2026-08-14
+noise-lock figure to answer a yes/no question; the worst-age form answers it
+with identical detection power for ~$0.30/mo. Per-connection attribution stays
+on `/metrics`, which is where a human triaging looks. Charted BESIDE the lane
+gauge, because the difference between them is the diagnosis: both low = healthy,
+this one climbing alone = one deaf socket, both climbing = the whole feed.
+
+### Edge cases
+
+- **Never-ticked slot** — reads `0` and is SKIPPED, not treated as infinitely
+  stale. An unused slot would peg the gauge at "broken" forever, and a
+  legitimately quiet depth-200 subscription on one illiquid contract is not a
+  fault. That case already has `tv_dhan_feed_instruments_never_ticked` +
+  RISK-GAP-03.
+- **No connection has ticked at all** — publishes `-1`, never `0`. Zero would
+  read as "every socket ticked this instant" — the most reassuring value
+  available — at the moment we know least.
+- **Clock steps backwards** (NTP) — `saturating_sub(...).max(0)`, so it reads 0
+  age rather than wrapping into a huge one at the moment logs are hardest to
+  read.
+- **Out-of-range connection index** — dropped. Writing the wrong slot would
+  report the wrong socket healthy, which is worse than not writing.
+- **Frames that arrive but produce nothing** — do NOT stamp. A socket returning
+  unparseable frames is not delivering market data, and stamping on arrival
+  would report it healthy: the exact false-OK this detector removes.
+
+### Failure modes
+
+1. **Min instead of max** — reports the most recent tick anywhere, i.e. perfect
+   health with a socket dead. Bite-proven: `w.max(age)` → `w.min(age)` fails 2
+   tests.
+2. **Depth stamp forgotten** — ten of sixteen sockets read never-ticked, are
+   excluded, and the gauge looks healthy *because* of the exclusion rule that
+   exists to prevent false-OKs. Bite-proven: deleting it fails the wiring test.
+
+### Test plan
+
+`crates/app/tests/deaf_socket_gauge_guard.rs`, 6 tests, all behavioural except
+one wiring scan: one-deaf-among-healthy, all-healthy-reads-zero, recovery
+lets it fall, backwards clock clamps, out-of-range dropped, and both stamp
+sites + the publish are wired. Fixed `NOW_MS`, so nothing depends on the wall
+clock.
+
+### Rollback
+
+Delete the static, the two stamp calls, the publish, the selector entry and the
+widget. Nothing else reads any of them.
+
+### Observability
+
+`tv_dhan_ws_worst_conn_tick_age_secs`, EMF-selected (81 names, +$0.30/mo,
+priced in the count ratchet), charted as "Deaf socket check" against the lane
+gauge for contrast.
+
+**NOT alarmed — and this one is a deliberate deferral, not a missing baseline.**
+A threshold is defensible here (600 s, matching the lane-level no-ticks alarm —
+the same question scoped to one socket). What stops it is money: the maximal
+month already projects above the line where an AWS budget action STOPS the
+trading box. Adding a pager is a spending decision the operator takes knowingly,
+not one an executor slips in. Charted now so the signal exists the moment he
+says yes.
+
+### Honest envelope
+
+Makes a deaf socket VISIBLE; does not detect it automatically, because nothing
+pages on it yet. Detection latency is the 30 s scan cadence plus whatever
+threshold is eventually set. It cannot distinguish "the socket is deaf" from
+"every instrument on this socket genuinely stopped trading" — an operator reads
+it against the lane gauge and the never-ticked count, which is why they share a
+screen. Hot-path cost is one relaxed atomic store per productive frame.
