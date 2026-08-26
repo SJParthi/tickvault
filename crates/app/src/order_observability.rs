@@ -22,18 +22,45 @@
 //! pattern); the daily OnEod heartbeat + counters-vs-rows reconcile
 //! (OMS-GAP-02 on mismatch) make silence detectable (audit Rule 11).
 //!
-//! HONEST ENVELOPE (2026-07-14 hostile review, C1): this whole subsystem
-//! is code-ready and fully wired at BOTH trading-pipeline spawn sites, but
-//! it is DORMANT while `feeds.dhan_enabled = false` (today's prod default)
-//! — both spawn sites are Dhan-lane-gated, so on a dhan-off boot the
-//! consumer, the ensure-DDL, the OnEod heartbeat, and the reconcile never
-//! run (and nothing false-pages — nothing runs). The heartbeat/reconcile
-//! contract holds whenever the Dhan lane / live trading runs (dhan-ON,
-//! in-session, strategy-config-present boots). Additionally the OnEod
-//! heartbeat + reconcile fire at most ONCE PER PROCESS (the market-close
-//! signal is a one-shot sleep; a multi-day dev process gets no day-2
-//! heartbeat and the day tallies are since-process-start — prod's daily
-//! 16:30 IST box stop makes once-per-process = once-per-day there).
+//! HONEST ENVELOPE (2026-07-14 hostile review, C1; REASON CORRECTED
+//! 2026-08-26): this whole subsystem is code-ready and fully wired, and it
+//! is DORMANT — but NOT for the reason this paragraph gave until today.
+//!
+//! It used to read "DORMANT while `feeds.dhan_enabled = false` (today's prod
+//! default)". That premise is dead: `config/base.toml` has carried
+//! `dhan_enabled = true` since the 2026-08-11 operator flip. Applied
+//! literally, the old rule now yields the OPPOSITE of the truth — a reader
+//! would conclude this subsystem went live when the flag flipped.
+//!
+//! That inversion is the dangerous direction here, because three lines above
+//! this one the module promises that the OnEod heartbeat and the
+//! counters-vs-rows reconcile "make silence detectable (audit Rule 11)".
+//! Believing the subsystem runs turns its silence into "no order-side
+//! mismatches today" — a false-OK on the very mechanism documented as the
+//! Rule-11 defence.
+//!
+//! THE REAL REASON, measured 2026-08-26: `run_order_side_consumer` is
+//! spawned from exactly one place, `trading_pipeline.rs`, and
+//! `spawn_trading_pipeline` has ZERO production call sites — every
+//! occurrence outside its own definition is cfg-test-gated. So the
+//! consumer, the ensure-DDL, the OnEod heartbeat and the reconcile never
+//! run on ANY boot, dhan-on or dhan-off, and nothing false-pages because
+//! nothing runs at all.
+//!
+//! Unlike the config flag it replaces, that reason is MECHANICALLY PINNED
+//! and cannot rot the same way: `crates/app/tests/order_side_wiring_guard.rs`
+//! counts `spawn_trading_pipeline` occurrences in production source, and the
+//! health handler reports the row as `pipeline | retired` for the same
+//! reason. When a production spawn site is added, that guard is what will
+//! fail — which is the moment this paragraph must be rewritten again.
+//!
+//! The heartbeat/reconcile contract holds whenever the trading pipeline
+//! actually runs (a production spawn site, in-session, strategy config
+//! present). Additionally the OnEod heartbeat + reconcile fire at most ONCE
+//! PER PROCESS (the market-close signal is a one-shot sleep; a multi-day dev
+//! process gets no day-2 heartbeat and the day tallies are
+//! since-process-start — prod's daily box stop makes once-per-process =
+//! once-per-day there).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
