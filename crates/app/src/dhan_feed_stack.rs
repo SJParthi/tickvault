@@ -8018,6 +8018,26 @@ pub fn spawn_daily_crossverify(
                         noise_p50_paise = c.noise_p50_paise,
                         noise_p95_paise = c.noise_p95_paise,
                         noise_max_paise = c.noise_max_paise,
+                        // The match RATE, computed rather than left as an
+                        // exercise. Both inputs were already on this line,
+                        // so anyone could multiply by four and subtract —
+                        // and nobody did, for two sessions, while the run
+                        // sat at 0.09% of its intended coverage. A number
+                        // that needs arithmetic before it means anything is
+                        // a number that gets skipped.
+                        price_fields_compared = c.minutes_compared.saturating_mul(4),
+                        price_fields_agreed = c
+                            .minutes_compared
+                            .saturating_mul(4)
+                            .saturating_sub(c.cells_diverged),
+                        // Volume — reported for the first time today. A
+                        // capture percentage, never a pass/fail: see the
+                        // volume block on `DayComparison`.
+                        volume_cells = c.volume_cells,
+                        volume_exact = c.volume_exact,
+                        volume_capture_p50_pct = c.volume_capture_p50_pct,
+                        volume_capture_p05_pct = c.volume_capture_p05_pct,
+                        volume_capture_min_pct = c.volume_capture_min_pct,
                         findings = c.findings.len(),
                         rest_failures = report.rest_failures,
                         // Added 2026-08-26. `rest_failures` alone reported
@@ -10268,6 +10288,11 @@ mod tests {
             noise_p50_paise: 88,
             noise_p95_paise: 99,
             noise_max_paise: 111,
+            volume_cells: 122,
+            volume_exact: 133,
+            volume_capture_p50_pct: 94,
+            volume_capture_p05_pct: 61,
+            volume_capture_min_pct: 12,
         };
 
         let row = xverify_daily_row(&c, 5);
@@ -12781,8 +12806,20 @@ mod tests {
         let src = include_str!("dhan_feed_stack.rs");
         let marker = "cross-verification finished — this is the honest";
         let idx = src.find(marker).expect("the cross-verify emit must exist");
-        // Look back over the emit's own argument list only.
-        let start = idx.saturating_sub(2_000);
+        // CORRECTED 2026-08-26. This walked back a FIXED 2,000 bytes, and on
+        // the day four more fields were added to the emit it failed — not
+        // because a field was missing, but because the list outgrew the
+        // window. It failed CLOSED, blocking a correct change, which is the
+        // better of the two directions; the shape is wrong either way.
+        //
+        // This is the FIFTH fixed-window guard found in this branch, all
+        // written by me. A byte count is a guess about how long code will
+        // stay; the macro opening is a real boundary and cannot drift.
+        let start = ["info!(", "error!(", "warn!("]
+            .iter()
+            .filter_map(|m| src[..idx].rfind(m))
+            .max()
+            .expect("the emit must sit inside a tracing macro");
         let emit = &src[start..idx];
 
         assert!(

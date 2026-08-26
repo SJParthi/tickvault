@@ -541,6 +541,42 @@ pub struct DayComparison {
     pub noise_p50_paise: i64,
     pub noise_p95_paise: i64,
     pub noise_max_paise: i64,
+
+    // ---- volume, added 2026-08-26 ----------------------------------
+    //
+    // Until today the comparison checked open/high/low/close and NOTHING
+    // else. Volume rode along on every finding row and was never once
+    // compared, so "does our volume agree with the exchange's?" had no
+    // answer anywhere in the system — while a live volume defect measured
+    // on 2026-08-24 had the intraday frames at ~9.2x the day bar with 6,088
+    // instruments disagreeing with their own minute sums.
+    //
+    // Volume is reported as a CAPTURE PERCENTAGE (ours as a share of
+    // theirs), not as a pass/fail. That is the honest shape for this pair:
+    // our live feed is a conflated ~1/sec sample and theirs is the full
+    // tape, so under-capture is STRUCTURAL and expected. A strict equality
+    // check would flag nearly every cell and drown the price signal it sits
+    // beside.
+    //
+    // It deliberately does NOT feed `cells_diverged` or the outcome. A
+    // threshold needs a baseline, and no baseline exists yet — this is the
+    // measurement that creates one. Same discipline the price side already
+    // applies by quantifying its noise instead of asserting a limit.
+    /// Cells where both sides carried a usable volume (theirs > 0).
+    pub volume_cells: i64,
+    /// Of those, how many matched to the unit.
+    pub volume_exact: i64,
+    /// Our volume as a percentage of theirs — median, and the 5th
+    /// percentile (the bad tail). 100 means we saw everything they did.
+    pub volume_capture_p50_pct: i64,
+    pub volume_capture_p05_pct: i64,
+    /// Worst SINGLE cell. Added after a test caught the gap: `percentile`
+    /// here is linear-rank, so at n=20 the 5th percentile lands on the
+    /// second-smallest value and one catastrophic minute is invisible to
+    /// it. p05 describes the distribution; this describes the worst thing
+    /// that actually happened. The price side reports `max` for exactly
+    /// the same reason — volume's bad direction is simply down.
+    pub volume_capture_min_pct: i64,
 }
 
 impl DayComparison {
@@ -624,6 +660,9 @@ pub fn compare_day(
     let mut diffs: Vec<i64> = Vec::new();
     let mut minutes_compared: i64 = 0;
     let mut cells_diverged: i64 = 0;
+    let mut volume_cells: i64 = 0;
+    let mut volume_exact: i64 = 0;
+    let mut volume_capture: Vec<i64> = Vec::new();
     let mut missing_live: i64 = 0;
     let mut missing_rest: i64 = 0;
     let mut tail_unsealed: i64 = 0;
@@ -661,6 +700,32 @@ pub fn compare_day(
                             diff_paise: diff,
                         });
                     }
+                }
+
+                // Volume — MEASURED, never a verdict. See the volume block
+                // on `DayComparison` for why this is a capture percentage
+                // and not a pass/fail.
+                //
+                // Their volume is the denominator, so a zero or negative one
+                // is skipped rather than divided by: a minute the vendor
+                // reports as untraded says nothing about our capture, and
+                // counting it as 0% would drag the median toward a number
+                // that means "no trades happened", not "we missed them".
+                if r.bar.volume > 0 {
+                    volume_cells = volume_cells.saturating_add(1);
+                    if l.bar.volume == r.bar.volume {
+                        volume_exact = volume_exact.saturating_add(1);
+                    }
+                    // Integer arithmetic throughout — a float ratio here
+                    // would be the one place in this module that compares
+                    // by epsilon, which its own header forbids.
+                    let pct = l
+                        .bar
+                        .volume
+                        .saturating_mul(100)
+                        .checked_div(r.bar.volume)
+                        .unwrap_or(0);
+                    volume_capture.push(pct);
                 }
             }
             (None, Some(r)) => {
@@ -711,6 +776,10 @@ pub fn compare_day(
     }
 
     diffs.sort_unstable();
+    volume_capture.sort_unstable();
+    let volume_capture_p50_pct = percentile(&volume_capture, 0.50);
+    let volume_capture_p05_pct = percentile(&volume_capture, 0.05);
+    let volume_capture_min_pct = volume_capture.first().copied().unwrap_or(0);
     let noise_p50_paise = percentile(&diffs, 0.50);
     let noise_p95_paise = percentile(&diffs, 0.95);
     let noise_max_paise = diffs.last().copied().unwrap_or(0);
@@ -782,6 +851,11 @@ pub fn compare_day(
         noise_p50_paise,
         noise_p95_paise,
         noise_max_paise,
+        volume_cells,
+        volume_exact,
+        volume_capture_p50_pct,
+        volume_capture_p05_pct,
+        volume_capture_min_pct,
     }
 }
 
@@ -2783,6 +2857,163 @@ mod tests {
             "the loop must go through the PACED wrapper: ~865 unpaced requests \
              against a 5-per-second vendor budget is the shape both sibling \
              REST legs were fixed out of on 2026-07-14"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // VOLUME — added 2026-08-26
+    //
+    // Until today this comparison checked open/high/low/close and nothing
+    // else. Volume rode along on every finding row and was never once
+    // compared, so "does our volume agree with the exchange's?" had no
+    // answer anywhere in the system.
+    // -----------------------------------------------------------------
+
+    /// Builds on the existing `bar` helper rather than calling the
+    /// constructor again, so this file gains no second fallible-unwrap site.
+    fn bar_vol(o: f64, h: f64, l: f64, c: f64, v: i64) -> PaiseBar {
+        let mut b = bar(o, h, l, c);
+        b.volume = v;
+        b
+    }
+
+    #[test]
+    fn volume_is_compared_at_all() {
+        // The whole point. Before today this assertion was unwritable:
+        // there was no field to read.
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 700))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.volume_cells, 1, "the cell must be counted");
+        assert_eq!(cmp.volume_exact, 0, "700 is not 1000");
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 70,
+            "we saw 700 of their 1000 — that is 70% capture, and saying so \
+             is the entire deliverable"
+        );
+    }
+
+    #[test]
+    fn a_volume_disagreement_never_becomes_a_price_divergence() {
+        // The trap this design exists to avoid. Our feed is a conflated
+        // ~1/sec sample and theirs is the full tape, so under-capture is
+        // STRUCTURAL. Folding it into `cells_diverged` would flag nearly
+        // every cell and drown the price signal beside it.
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 9_999))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(
+            cmp.cells_diverged, 0,
+            "prices agree exactly — a volume gap must not be reported as a \
+             price divergence"
+        );
+        assert!(
+            cmp.outcome.is_pass(),
+            "and it must not flip the verdict: a threshold needs a baseline, \
+             and this measurement is what creates one"
+        );
+        assert_eq!(cmp.volume_capture_p50_pct, 0, "1 of 9,999 rounds to 0%");
+    }
+
+    #[test]
+    fn a_minute_the_vendor_reports_as_untraded_is_skipped_not_scored_zero() {
+        // Their volume is the denominator. A zero one says the vendor saw no
+        // trades that minute — which says NOTHING about our capture. Scoring
+        // it 0% would drag the median toward "we missed everything" when the
+        // truth is "there was nothing to miss".
+        let live = vec![
+            side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
+            side(2, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
+        ];
+        let rest = vec![
+            side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
+            side(2, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(
+            cmp.volume_cells, 1,
+            "only the traded minute counts toward the profile"
+        );
+        assert_eq!(cmp.volume_exact, 1);
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 100,
+            "a clean capture must read 100, not be dragged down by a minute \
+             nobody traded in"
+        );
+    }
+
+    #[test]
+    fn capturing_everything_reads_as_one_hundred_percent() {
+        let live: Vec<SideBar> = (0..10)
+            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 250)))
+            .collect();
+        let rest = live.clone();
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.volume_cells, 10);
+        assert_eq!(cmp.volume_exact, 10);
+        assert_eq!(cmp.volume_capture_p50_pct, 100);
+        assert_eq!(
+            cmp.volume_capture_p05_pct, 100,
+            "the bad tail of a perfect run is still perfect"
+        );
+    }
+
+    #[test]
+    fn the_fifth_percentile_surfaces_the_bad_tail_the_median_hides() {
+        // Nine good minutes and one terrible one. The median says everything
+        // is fine; only the tail says an instrument had a hole in it. That
+        // asymmetry is why both are reported.
+        let mut live: Vec<SideBar> = (0..19)
+            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)))
+            .collect();
+        live.push(side(1, OPEN + 19 * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 20)));
+        let rest: Vec<SideBar> = (0..20)
+            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)))
+            .collect();
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.volume_cells, 20);
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 100,
+            "the median is blind to one bad minute in twenty"
+        );
+        // And so is the 5th percentile, at this sample size. `percentile` is
+        // linear-rank: at n=20 it lands on the SECOND-smallest value, so one
+        // catastrophic minute never reaches it. This test was written
+        // asserting 2 here, failed, and that failure is what added
+        // `volume_capture_min_pct` — the statistic that does surface it.
+        assert_eq!(
+            cmp.volume_capture_p05_pct, 100,
+            "p05 describes the distribution, and at n=20 one bad cell is not \
+             the distribution"
+        );
+        assert_eq!(
+            cmp.volume_capture_min_pct, 2,
+            "the MINIMUM is what surfaces one bad minute — 20 of 1,000 is 2%, \
+             and without this field that hole was invisible in every reported \
+             number"
+        );
+    }
+
+    #[test]
+    fn over_capture_is_reported_rather_than_clamped() {
+        // Reading ABOVE 100% is not noise to be tidied away — it means our
+        // volume exceeds the vendor's own tape for that minute, which cannot
+        // happen honestly. It is the signature of the double-counting defect
+        // measured on 2026-08-24 (intraday frames at ~9.2x the day bar), and
+        // clamping it to 100 would erase the only evidence of it.
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 9_200))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(
+            cmp.volume_capture_p50_pct, 920,
+            "920% must survive to the report — a clamp here would hide a \
+             real, already-measured defect"
         );
     }
 }
