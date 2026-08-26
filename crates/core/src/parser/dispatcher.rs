@@ -295,6 +295,18 @@ pub fn dispatch_depth_packet<'b>(
 pub fn main_feed_packet_len(bytes: &[u8]) -> Option<usize> {
     let code = *bytes.first()?;
     let size = match code {
+        // Code 1 and code 2 are the SAME 16-byte ticker packet, and
+        // `dispatch_frame` accepts them in ONE arm. Code 1 was missing from
+        // this table until 2026-08-26, so a frame whose first packet was an
+        // INDEX ticker walked no further: the drain counted `unparseable`,
+        // abandoned the WHOLE remaining frame, and `stacked_disconnect_reason`
+        // returned `None` -- putting an 804 back out of reach behind exactly
+        // the shape the walk was built to see through. Latent rather than
+        // live only because IDX_I subscribes in Quote mode today; the
+        // 2026-08-21 scope-lock names `Ticker` as the next value to try if
+        // Dhan refuses Quote for indices, which is one config line away from
+        // discarding every index frame.
+        RESPONSE_CODE_INDEX_TICKER => TICKER_PACKET_SIZE,
         RESPONSE_CODE_TICKER => TICKER_PACKET_SIZE,
         RESPONSE_CODE_QUOTE => QUOTE_PACKET_SIZE,
         RESPONSE_CODE_OI => OI_PACKET_SIZE,
@@ -1045,6 +1057,7 @@ mod stacked_disconnect_tests {
     #[test]
     fn every_documented_main_feed_code_has_a_length() {
         for code in [
+            RESPONSE_CODE_INDEX_TICKER,
             RESPONSE_CODE_TICKER,
             RESPONSE_CODE_QUOTE,
             RESPONSE_CODE_OI,
@@ -1060,5 +1073,62 @@ mod stacked_disconnect_tests {
         }
         assert_eq!(main_feed_packet_len(&[99]), None);
         assert_eq!(main_feed_packet_len(&[]), None);
+    }
+
+    /// The enumeration above is a readable smoke test and CANNOT be the
+    /// guard: it is a hand-written list, and a hand-written list is exactly
+    /// how `RESPONSE_CODE_INDEX_TICKER` (code 1) went missing from
+    /// `main_feed_packet_len` while `dispatch_frame` accepted it — the list in
+    /// the test omitted the same code the table omitted, so it agreed with the
+    /// bug. This sweeps the WHOLE byte space and derives the expectation from
+    /// `dispatch_frame` itself, so the two can never disagree again no matter
+    /// which codes are added or removed.
+    ///
+    /// The contract, in one line: a code the dispatcher will DECODE must have
+    /// a length the walk can STEP by. Anything else strands the rest of the
+    /// frame — the drain abandons it, and a stacked disconnect inside it is
+    /// never seen.
+    #[test]
+    fn every_code_the_dispatcher_accepts_has_a_walkable_length() {
+        // Long enough for the widest packet (FULL, 162 B) so a dispatchable
+        // code can never be misread as "unknown" merely for being truncated.
+        let mut buf = [0u8; 256];
+        for code in 0u8..=255 {
+            buf[0] = code;
+            let dispatchable = !matches!(
+                dispatch_frame(&buf, 0),
+                Err(ParseError::UnknownResponseCode(_))
+            );
+            let walkable = main_feed_packet_len(&buf).is_some();
+            assert_eq!(
+                dispatchable, walkable,
+                "code {code}: dispatch_frame accepts it = {dispatchable}, but \
+                 main_feed_packet_len knows a length = {walkable}. These must \
+                 agree — a decodable packet with no length stops the walk and \
+                 abandons the rest of the frame; a length for a code nothing \
+                 decodes steps the walk over bytes no parser has validated."
+            );
+        }
+    }
+
+    /// The bite: code 1 specifically, because that is the one that was wrong,
+    /// and because it is one config line from being live. The 2026-08-21
+    /// scope-lock names `Ticker` as the next `IDX_I_FEED_MODE` value to try if
+    /// Dhan refuses Quote for indices — at which point every one of ~119 index
+    /// frames would arrive as code 1.
+    #[test]
+    fn an_index_ticker_leading_a_frame_does_not_hide_a_stacked_disconnect() {
+        let mut frame = packet(RESPONSE_CODE_INDEX_TICKER);
+        frame.extend_from_slice(&disc(804));
+        assert_eq!(
+            stacked_disconnect_reason(&frame, 70_000),
+            Some(804),
+            "an 804 behind an index ticker must still be seen — 804 is Fatal \
+             and retrying it can earn an 805 account block"
+        );
+        assert_eq!(
+            main_feed_packet_len(&[RESPONSE_CODE_INDEX_TICKER]),
+            Some(TICKER_PACKET_SIZE)
+        );
     }
 }

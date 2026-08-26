@@ -2130,6 +2130,7 @@ impl LiveIngest {
 pub struct DrainCounters {
     folded: metrics::Counter,
     non_tick: metrics::Counter,
+    main_feed_disconnects: metrics::Counter,
     unparseable: metrics::Counter,
     seq_unrepresentable: metrics::Counter,
     aggregator_refused: metrics::Counter,
@@ -2204,6 +2205,7 @@ pub fn counters() -> &'static DrainCounters {
     COUNTERS.get_or_init(|| DrainCounters {
         folded: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "folded"),
         non_tick: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "non_tick"),
+        main_feed_disconnects: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "disconnect"),
         unparseable: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "unparseable"),
         seq_unrepresentable: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "seq_unrepresentable"),
         aggregator_refused: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "aggregator_refused"),
@@ -3941,6 +3943,40 @@ pub fn drain_main_feed_frame(
                     IngestOutcome::WriteFailed => c.write_failed.increment(1),
                 }
             }
+            // A disconnect the drain DECODED. It is split out of the untyped
+            // `non_tick` bucket above because of a divergence found on
+            // 2026-08-26: `classify_frame` requires the WHOLE frame to walk
+            // cleanly before it will act on a stacked disconnect (deliberate --
+            // it stops a 16-byte frame whose first byte happens to be 50 from
+            // parking a healthy socket on a reason read out of random data),
+            // while THIS walk stops AT the bad packet, having already decoded
+            // everything before it. So `[disconnect 804][unknown code]`
+            // reaches here as a real, parsed 804 that the classifier called
+            // `Data`.
+            //
+            // That asymmetry is not resolved here -- relaxing the classifier
+            // would trade away a documented fail-safe -- but the reason no
+            // longer vanishes. 804 means the subscribe set exceeds the
+            // per-connection cap and is ruled Fatal precisely because retrying
+            // re-sends the identical over-limit set forever and can earn an
+            // 805 account block, so "the reason reached no log and no metric"
+            // was the part that made it unfixable from outside.
+            //
+            // Not throttled: a disconnect packet ends the socket, so this is
+            // bounded by reconnects, not by frame rate.
+            Ok(ParsedFrame::Disconnect(reason)) => {
+                c.main_feed_disconnects.increment(1);
+                out.disconnects = out.disconnects.saturating_add(1);
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "drain_decoded_disconnect",
+                    reason = ?reason,
+                    "the main feed decoded a DISCONNECT packet inside a frame — \
+                     if this reason is not also on a socket-close line, the \
+                     classifier could not act on it and the reconnect ladder is \
+                     treating a possibly-fatal reason as transient"
+                );
+            }
             // Non-tick frames are real protocol traffic, not errors: OI and
             // previous-close arrive as their own packets, market-status and
             // disconnect are control. Counted so the traffic mix is visible,
@@ -3975,6 +4011,10 @@ pub fn drain_main_feed_frame(
 pub struct FrameOutcome {
     /// Packets in this frame that became a buffered row.
     pub folded: u64,
+    /// DISCONNECT packets this frame carried and the drain decoded. Split
+    /// out of the untyped non-tick count on 2026-08-26 so a reason the
+    /// classifier could not act on is still visible — see the drain arm.
+    pub disconnects: u64,
     /// Packets refused by the parser or by an unknown response code.
     pub unparseable: u64,
     /// Depth rows appended from the 5 levels carried INLINE in Full-mode tick
@@ -11361,10 +11401,17 @@ mod tests {
         // middle of the next packet and fabricates ticks from misaligned
         // bytes, so it is pinned per code rather than trusted to the
         // vendor-supplied length field in the header.
+        // Code 1 (INDEX ticker) shares the 16-byte ticker layout and is
+        // accepted by `dispatch_frame`; it was absent from BOTH this list and
+        // the table until 2026-08-26, so the test agreed with the bug. The
+        // exhaustive sweep in `parser::dispatcher`'s own tests is the real
+        // guard now — this stays as the readable smoke check.
+        assert_eq!(main_feed_packet_len(&[1]), Some(TICKER_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[2]), Some(TICKER_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[4]), Some(QUOTE_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[5]), Some(OI_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[6]), Some(PREVIOUS_CLOSE_PACKET_SIZE));
+        assert!(main_feed_packet_len(&[7]).is_some());
         assert_eq!(main_feed_packet_len(&[8]), Some(FULL_QUOTE_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[50]), Some(DISCONNECT_PACKET_SIZE));
         // Unknown code and empty input: `None`, so the walker stops rather

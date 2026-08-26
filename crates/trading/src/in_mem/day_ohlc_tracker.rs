@@ -44,6 +44,7 @@
 //! invariant must hold for future scope extension.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use papaya::HashMap as PapayaHashMap;
 use parking_lot::Mutex;
@@ -75,6 +76,20 @@ pub struct DayOhlc {
     /// does not use volume, our trading decisions do not reference volume.
     armed: bool,
 }
+
+/// How far the exchange-supplied day open may sit from the same packet's last
+/// traded price before it is refused as CORRUPT.
+///
+/// This is a corruption bound, not a market bound — see the refusal site in
+/// [`DayOhlc::update_tick_with_exchange_open`] for why 100x is impossible for
+/// a real instrument on an exchange whose circuit limits cap a day's move at
+/// +/-20%.
+pub const DAY_OPEN_CORRUPTION_BAND: f64 = 100.0;
+
+/// How many exchange day-opens have been refused this process, for the
+/// power-of-two log throttle. Separate from the metric because
+/// `metrics::Counter` does not expose its value.
+static REFUSED_DAY_OPEN_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl DayOhlc {
     /// Sentinel `disarmed` state — all fields meaningless until first tick.
@@ -204,13 +219,64 @@ impl DayOhlc {
     /// ingest gate above exists for. Either one leaves the first-tick open
     /// exactly as it was — never overwritten with zero.
     pub fn update_tick_with_exchange_open(&mut self, last_price: f64, exchange_day_open: f64) {
+        // Whether THIS packet's price passed the ingest gate, decided BEFORE
+        // the mutation so the answer is about this tick and not about history.
+        //
+        // 2026-08-26: this used to be `if !self.armed { return; }`, whose
+        // comment ("an instrument whose LTP was refused has no armed state to
+        // attach an open to") is true only of the FIRST tick. For every tick
+        // after arming, `armed` is already true, so a packet whose LTP was
+        // refused as corrupt still had its `day_open` adopted — and adopting
+        // one field of a packet whose other field is proven garbage is exactly
+        // the trust this gate exists to withhold. The parsers are PROVEN to
+        // emit NaN LTP (`quote.rs:382` asserts it on a real packet shape), so
+        // the corrupt-packet case is not hypothetical.
+        let price_accepted = last_price.is_finite() && last_price > 0.0;
         self.update_tick(last_price);
-        // Only after the tick gate has run: an instrument whose LTP was
-        // refused has no armed state to attach an open to.
-        if !self.armed {
+        if !price_accepted || !self.armed {
             return;
         }
         if !exchange_day_open.is_finite() || exchange_day_open <= 0.0 {
+            return;
+        }
+        // A CORRUPTION band, not a market band. The adopted open WIDENS the
+        // range (see the invariant note above), and that widening is
+        // irreversible until the IST-midnight reset — so a single bad packet
+        // permanently distorts the day's high or low for that instrument.
+        //
+        // 100x against the same packet's own last traded price is chosen to be
+        // impossible for a real instrument rather than tuned to a market: NSE
+        // circuit limits cap a day's move at +/-20%, so a legitimate
+        // open-to-last ratio lives inside [0.8, 1.25] and this band leaves ~80x
+        // of headroom on both sides. What it does reject is the shape that
+        // actually appears in corrupt f32 payloads — `3.4e38` (f32::MAX) and
+        // the subnormal `1e-38` class, both of which are finite and positive
+        // and so pass every check above.
+        let ratio_ceiling = last_price * DAY_OPEN_CORRUPTION_BAND;
+        let ratio_floor = last_price / DAY_OPEN_CORRUPTION_BAND;
+        if exchange_day_open > ratio_ceiling || exchange_day_open < ratio_floor {
+            metrics::counter!("tv_day_ohlc_exchange_open_refused_total").increment(1);
+            // Logged, not only counted: a counter that reaches no operator
+            // surface measures the loss and then discards the measurement.
+            // Throttled to powers of two so a corrupt-payload storm cannot
+            // flood the sink -- the house pattern, and the reason this is a
+            // `warn!` rather than an unconditional line on a per-tick path.
+            let n = REFUSED_DAY_OPEN_SEEN
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    exchange_day_open,
+                    last_price,
+                    band = DAY_OPEN_CORRUPTION_BAND,
+                    occurrences = n,
+                    "exchange day open REFUSED as corrupt -- it sits outside a \
+                     {DAY_OPEN_CORRUPTION_BAND}x band around this packet's own last \
+                     traded price, so adopting it would have widened the day range \
+                     irreversibly until the IST-midnight reset. The previous open is \
+                     kept."
+                );
+            }
             return;
         }
         self.day_open = exchange_day_open;
@@ -455,6 +521,76 @@ pub fn ist_seconds_of_day() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// BITE (2026-08-26): a packet whose LTP is refused must not have its
+    /// `day_open` trusted either.
+    ///
+    /// The old guard was `if !self.armed { return; }`, which is only about the
+    /// FIRST tick. Once armed, a NaN-LTP packet — a shape the Dhan parsers are
+    /// PROVEN to emit — still had its `day_open` adopted, and because the
+    /// adopted open WIDENS high/low, one such packet distorted the day's range
+    /// irreversibly until the IST-midnight reset.
+    #[test]
+    fn a_refused_price_does_not_let_its_day_open_through() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(100.0, 100.0);
+        assert_eq!(d.day_open, 100.0);
+        assert_eq!(d.day_high, 100.0);
+        assert_eq!(d.day_low, 100.0);
+
+        // NaN LTP with a finite, positive, plausible-looking open.
+        d.update_tick_with_exchange_open(f64::NAN, 101.0);
+        assert_eq!(d.day_open, 100.0, "the corrupt packet's open is refused");
+        assert_eq!(d.day_high, 100.0);
+        assert_eq!(d.day_low, 100.0);
+
+        // Zero and negative LTP are the quieter variants of the same class.
+        d.update_tick_with_exchange_open(0.0, 101.0);
+        d.update_tick_with_exchange_open(-5.0, 101.0);
+        assert_eq!(d.day_open, 100.0);
+    }
+
+    /// BITE: the corruption band. `f32::MAX` and the subnormal class are both
+    /// finite and positive, so every earlier check passes them; only a band
+    /// against the packet's own price rejects them.
+    #[test]
+    fn an_absurd_day_open_is_refused_rather_than_widening_the_range() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(100.0, 100.0);
+
+        d.update_tick_with_exchange_open(100.0, 3.4e38);
+        assert_eq!(d.day_high, 100.0, "f32::MAX must not become the day high");
+        assert_eq!(d.day_open, 100.0);
+
+        d.update_tick_with_exchange_open(100.0, 1e-38);
+        assert_eq!(d.day_low, 100.0, "a subnormal must not become the day low");
+        assert_eq!(d.day_open, 100.0);
+
+        d.update_tick_with_exchange_open(100.0, 5e-324);
+        assert_eq!(d.day_low, 100.0);
+    }
+
+    /// The band must never reject a REAL move. NSE circuit limits cap a day at
+    /// +/-20%, so this sweeps well past anything the exchange permits and
+    /// asserts every one of them is still adopted.
+    #[test]
+    fn every_move_an_exchange_can_actually_produce_is_still_adopted() {
+        for (price, open) in [
+            (100.0, 80.0),       // -20%, the circuit floor
+            (100.0, 125.0),      // +25%, past the ceiling
+            (100.0, 10.0),       // 10x, impossible on NSE
+            (100.0, 1000.0),     // 10x the other way
+            (0.05, 0.5),         // a penny option, 10x
+            (99_000.0, 9_900.0), // an index-scale price, 10x
+        ] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(price, open);
+            assert_eq!(
+                d.day_open, open,
+                "price {price} with open {open} is inside every real market's range"
+            );
+        }
+    }
 
     /// The exchange's own open replaces the first-tick open.
     ///

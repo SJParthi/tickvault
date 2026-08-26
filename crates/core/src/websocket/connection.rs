@@ -54,7 +54,7 @@
 //! # Complexity
 //! | Path | Cost | Note |
 //! |---|---|---|
-//! | [`classify_frame`] | O(1), zero alloc | length check + two fixed-offset byte reads |
+//! | [`classify_frame`] | O(1) on the exact-length path; **O(packets per frame)** on the stacked walk, zero alloc either way | An exact-length frame is a length check plus two fixed-offset byte reads. A main-feed frame of any OTHER length walks packet boundaries looking for a stacked disconnect (`stacked_disconnect_reason`), bounded by `MAX_PACKETS_PER_FRAME` (70,000). Corrected 2026-08-26: this row still claimed the pre-2026-08-25 cost, which is the stale-complexity-claim class this repo has recorded five times. |
 //! | [`DhanFeedSocketImpl::recv`] steady state | O(1), zero alloc *of ours* | `Bytes` move; tungstenite owns the decode buffer |
 //! | [`build_feed_url`] | O(n) in url length, allocates | cold path, once per dial |
 //! | [`build_subscribe_payload`] | O(n) in batch, allocates | cold path, ~50 messages per connect |
