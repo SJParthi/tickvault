@@ -21,7 +21,7 @@ use proptest::prelude::*;
 use std::collections::BTreeSet;
 
 use tickvault_app::dhan_feed_stack::{
-    build_feed_stack_plan, dedup_subscribe_set, distinct_fold_slots,
+    FeedStackPlanError, build_feed_stack_plan, dedup_subscribe_set, distinct_fold_slots,
 };
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_budget::DhanEndpointType;
@@ -338,7 +338,19 @@ proptest! {
         let mut pool = PoolSupervisor::new();
         let outcome = build_feed_stack_plan(&mut pool, std::time::Instant::now(), &[], &d20, &[]);
         if unique > ceiling {
-            prop_assert!(outcome.is_err(), "{unique} instruments accepted past {ceiling}");
+            // The SPECIFIC refusal, not merely "some error".
+            //
+            // Past the ceiling the shard width also exceeds Dhan's
+            // per-connection cap, so `SubscribeGuard` would refuse too and a
+            // bare `is_err()` cannot tell the two apart. They are not
+            // interchangeable: the planner's refusal is the one that names the
+            // endpoint, the count and the authorised bound, and that names the
+            // scope-lock file the operator has to edit. A run that fell through
+            // to the guard's refusal would be correct and unreadable.
+            prop_assert!(
+                matches!(outcome, Err(FeedStackPlanError::PoolTooSmall { .. })),
+                "{unique} past {ceiling} refused by the wrong layer: {outcome:?}"
+            );
             return Ok(());
         }
         let plan = outcome.map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
