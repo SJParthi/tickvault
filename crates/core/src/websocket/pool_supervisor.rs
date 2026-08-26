@@ -979,6 +979,18 @@ pub enum SubscribeGuardRefusal {
         /// Documented per-connection cap.
         max: u32,
     },
+    /// A swap was asked for against an instrument this connection does not
+    /// hold.
+    ///
+    /// Fail-closed rather than fall back to an append: applying it would
+    /// subscribe the NEW instrument while unsubscribing something that was
+    /// never there, so the retained set would claim an instrument the socket
+    /// does not have and every later reconnect would replay it.
+    #[error("{endpoint} was asked to swap an instrument it does not hold")]
+    NotSubscribed {
+        /// Endpoint type asked for.
+        endpoint: DhanEndpointType,
+    },
 }
 
 /// The subscription set for ONE connection, and the fact of whether the live
@@ -1200,6 +1212,142 @@ impl SubscribeGuard {
     /// retained verbatim for replay on the next connect.
     pub fn mark_lost(&mut self) {
         self.confirmed = false;
+    }
+
+    /// Replaces one live instrument with another on a socket that is already
+    /// up, returning what to send on the wire.
+    ///
+    /// # Why this exists (2026-08-26)
+    ///
+    /// The operator's depth-200 rule is that the four sockets carry the
+    /// AT-THE-MONEY call and put of NIFTY and BANKNIFTY, re-picked every
+    /// minute. An at-the-money strike chosen at 09:10 is not at-the-money at
+    /// 14:00, so a set fixed at attach time silently drifts away from the
+    /// thing it was chosen to be — and drifts SILENTLY, because a
+    /// subscription to a now-far-from-the-money strike is perfectly healthy
+    /// and returns real data all day.
+    ///
+    /// Until now the guard could only GROW ([`SubscribeGuard::try_extend`])
+    /// or be replayed whole. Neither expresses a swap:
+    ///
+    /// - Re-dialing the connection drops depth for the reconnect and is the
+    ///   churn this design exists to avoid — one socket redialled **322
+    ///   times in a single session** on 2026-08-26 before the ranking fix.
+    /// - `try_extend` alone leaves the OLD instrument subscribed. The socket
+    ///   would then hold both, the retained set would claim both, and every
+    ///   later reconnect would replay a set that grows once per ATM change
+    ///   until it hits the per-connection cap.
+    ///
+    /// # What the caller must do with the result
+    ///
+    /// Send [`SubscribeSwap::unsubscribe`] FIRST, then
+    /// [`SubscribeSwap::subscribe`]. Order matters on a depth-200 socket,
+    /// which accepts exactly one instrument: subscribing before unsubscribing
+    /// asks for two, and Dhan answers an over-limit subscribe with **804**,
+    /// which is Fatal — retrying re-sends the identical over-limit set
+    /// forever and can earn an 805 account block.
+    ///
+    /// # Why the retained set is updated even though the wire has not moved
+    ///
+    /// The guard is the REPLAY source for a reconnect. If the swap were
+    /// recorded only after the socket confirmed, a disconnect in between
+    /// would replay the OLD instrument and the sockets would quietly revert
+    /// to a strike nobody chose. Recording it here means a reconnect replays
+    /// the CURRENT intent, and the cost of the socket never receiving the
+    /// swap is one stale minute — recoverable, and visible, because the next
+    /// minute's evaluation asks again.
+    ///
+    /// # Errors
+    ///
+    /// [`SubscribeGuardRefusal::NotSubscribed`] when `old` is not in the set.
+    /// Fail-closed and the guard is left untouched: a swap against an
+    /// instrument this connection never held would otherwise ADD `new`
+    /// while unsubscribing something that was never there, which is
+    /// `try_extend` wearing a swap's name.
+    ///
+    /// A swap of an instrument for ITSELF is a legal no-op — it returns empty
+    /// wire work rather than an error, because the caller asking "make this
+    /// socket carry X" when it already carries X is a correct question with a
+    /// correct answer of "nothing to do". That is the ordinary case every
+    /// minute the market does not move a strike.
+    ///
+    /// # Complexity
+    ///
+    /// O(n) in the instruments held by THIS connection — a linear scan for
+    /// `old`. On a depth-200 connection n is 1 and on depth-20 it is at most
+    /// 50, so this is O(1) in every use it was written for. It is NOT O(1) on
+    /// a 5,000-instrument main-feed connection, and is flagged rather than
+    /// relabelled: swapping on the main feed is not a use this was built for.
+    pub fn try_swap(
+        &mut self,
+        old: SubscribeInstrument,
+        new: SubscribeInstrument,
+    ) -> Result<SubscribeSwap, SubscribeGuardRefusal> {
+        // A linear scan, and it is NOT relabelled as O(1) — the doc above
+        // flags it as O(n) in the instruments held by THIS connection. What
+        // makes it acceptable is what n actually is at the only call sites
+        // this was written for: 1 on a depth-200 connection and at most 50 on
+        // depth-20, once a minute, on the cold path. An index would cost a
+        // second structure that must stay in lockstep with the Vec across
+        // every swap, extend and reconnect replay — and a structure that can
+        // drift is a larger risk than a scan of fifty elements.
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+        let Some(at) = self.instruments.iter().position(|held| *held == old) else {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                held = self.instruments.len(),
+                "refusing a swap whose OLD instrument this connection does not \
+                 hold — applying it would subscribe the new one while \
+                 unsubscribing something that was never there"
+            );
+            return Err(SubscribeGuardRefusal::NotSubscribed {
+                endpoint: self.endpoint,
+            });
+        };
+        if old == new {
+            return Ok(SubscribeSwap::NO_OP);
+        }
+        // Replace in place rather than remove-then-push: position is the only
+        // thing that distinguishes one depth-20 slot from another when the
+        // caller reasons about the set, and a swap should not reorder the rest.
+        if let Some(slot) = self.instruments.get_mut(at) {
+            *slot = new;
+        }
+        Ok(SubscribeSwap {
+            unsubscribe: Some(old),
+            subscribe: Some(new),
+        })
+    }
+}
+
+/// The wire work one [`SubscribeGuard::try_swap`] implies.
+///
+/// Both fields are `Option` for the same reason: the no-op swap (an
+/// instrument replaced by itself) must be expressible as "send nothing"
+/// rather than as an error or as an empty `Vec` the caller might loop over
+/// and mistake for work. That case is the COMMON one — every minute the
+/// at-the-money strike has not moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeSwap {
+    /// Send this FIRST. See [`SubscribeGuard::try_swap`] for why the order is
+    /// not a preference.
+    pub unsubscribe: Option<SubscribeInstrument>,
+    /// Send this SECOND, and only after the unsubscribe has gone out.
+    pub subscribe: Option<SubscribeInstrument>,
+}
+
+impl SubscribeSwap {
+    /// Nothing to send — the socket already carries what was asked for.
+    pub const NO_OP: Self = Self {
+        unsubscribe: None,
+        subscribe: None,
+    };
+
+    /// `true` when this swap implies no wire traffic at all.
+    #[must_use]
+    pub const fn is_no_op(&self) -> bool {
+        self.unsubscribe.is_none() && self.subscribe.is_none()
     }
 }
 
@@ -2573,6 +2721,145 @@ mod tests {
             security_id: id,
             segment: ExchangeSegment::NseFno,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // try_swap — the primitive the per-minute at-the-money re-selection
+    // needs (2026-08-26). Without it the only ways to change what a live
+    // socket carries are "grow it" or "re-dial it", and neither is a swap.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_swap_reports_the_unsubscribe_first_and_the_subscribe_second() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let swap = g.try_swap(si(1), si(2)).expect("holds the old one");
+        assert_eq!(swap.unsubscribe, Some(si(1)));
+        assert_eq!(swap.subscribe, Some(si(2)));
+        assert!(!swap.is_no_op());
+    }
+
+    /// A depth-200 connection accepts exactly ONE instrument. Subscribing
+    /// before unsubscribing asks for two, and Dhan answers an over-limit
+    /// subscribe with 804 — Fatal, and retrying re-sends the same over-limit
+    /// set forever. The ORDER is the safety property, so it is pinned by the
+    /// field names rather than left to a comment.
+    #[test]
+    fn the_swap_never_leaves_a_depth_200_connection_holding_two_instruments() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let _ = g.try_swap(si(1), si(2)).expect("holds the old one");
+        assert_eq!(g.len(), 1, "a swap must not grow the set");
+    }
+
+    /// The retained set is the REPLAY source. If a swap were recorded only
+    /// after the socket confirmed, a disconnect in between would replay the
+    /// OLD strike and the sockets would quietly revert to one nobody chose.
+    #[test]
+    fn a_reconnect_after_a_swap_replays_the_new_instrument_not_the_old() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let _ = g.try_swap(si(1), si(2)).expect("holds the old one");
+        g.mark_lost();
+        let replayed: Vec<_> = g.batches().flatten().copied().collect();
+        assert_eq!(
+            replayed,
+            vec![si(2)],
+            "the reconnect replayed the OLD strike"
+        );
+    }
+
+    /// The COMMON case, every minute the market has not moved a strike.
+    /// Expressed as "send nothing" rather than as an error, because the
+    /// caller asking "make this socket carry X" when it already carries X is
+    /// a correct question.
+    #[test]
+    fn swapping_an_instrument_for_itself_is_a_silent_no_op() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let swap = g.try_swap(si(1), si(1)).expect("holds it");
+        assert!(
+            swap.is_no_op(),
+            "an unchanged strike must cost no wire traffic"
+        );
+        assert_eq!(swap.unsubscribe, None);
+        assert_eq!(swap.subscribe, None);
+        assert_eq!(g.len(), 1);
+    }
+
+    /// Fail-closed. Falling back to an append here would subscribe the new
+    /// instrument while unsubscribing one that was never there — `try_extend`
+    /// wearing a swap's name, and the retained set would then claim something
+    /// the socket does not hold.
+    #[test]
+    fn a_swap_against_an_instrument_the_connection_never_held_is_refused() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let refusal = g.try_swap(si(99), si(2)).expect_err("does not hold 99");
+        assert!(matches!(
+            refusal,
+            SubscribeGuardRefusal::NotSubscribed { .. }
+        ));
+        assert_eq!(g.len(), 1, "a refused swap must not half-apply");
+        let held: Vec<_> = g.batches().flatten().copied().collect();
+        assert_eq!(held, vec![si(1)], "the refused swap mutated the set");
+    }
+
+    /// `security_id` ALONE is not unique — the only unique key is
+    /// `(security_id, exchange_segment)` per I-P1-11. A swap that matched on
+    /// the id alone would unsubscribe the wrong instrument whenever two
+    /// segments share a number, which they do: id 13 is NIFTY in `IDX_I` and
+    /// an unrelated cash stock in `NSE_EQ`.
+    #[test]
+    fn a_swap_matches_on_the_composite_key_not_the_bare_security_id() {
+        let idx = SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::IdxI,
+        };
+        let eq = SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::NseEquity,
+        };
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![idx]).expect("one instrument");
+        let refusal = g
+            .try_swap(eq, si(2))
+            .expect_err("same id, different segment, is a different instrument");
+        assert!(matches!(
+            refusal,
+            SubscribeGuardRefusal::NotSubscribed { .. }
+        ));
+    }
+
+    /// Position is what distinguishes one depth-20 slot from another when a
+    /// caller reasons about the set. A swap replaces in place; it must not
+    /// reorder the instruments around it.
+    #[test]
+    fn a_swap_replaces_in_place_and_leaves_the_rest_in_order() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth20, (0..5).map(si).collect())
+            .expect("under cap");
+        let _ = g.try_swap(si(2), si(42)).expect("holds it");
+        let held: Vec<_> = g.batches().flatten().map(|i| i.security_id).collect();
+        assert_eq!(held, vec![0, 1, 42, 3, 4]);
+    }
+
+    /// A whole session of at-the-money changes must not grow the set. This is
+    /// the failure `try_extend` alone would have produced: one instrument
+    /// added per change until the connection hits its cap and Dhan answers
+    /// 804.
+    #[test]
+    fn four_hundred_swaps_leave_the_set_exactly_one_instrument_long() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(0)])
+            .expect("one instrument");
+        for step in 0..400u64 {
+            let swap = g
+                .try_swap(si(step), si(step + 1))
+                .expect("holds the old one");
+            assert!(!swap.is_no_op());
+        }
+        assert_eq!(g.len(), 1, "the set grew across a session of swaps");
+        let held: Vec<_> = g.batches().flatten().copied().collect();
+        assert_eq!(held, vec![si(400)]);
     }
 
     /// The whole point: reach the slots stranded on a live connection.
