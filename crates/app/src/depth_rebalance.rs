@@ -155,6 +155,66 @@ fn strike_paise(strike: f64) -> Option<i64> {
     Some(paise as i64)
 }
 
+/// The nearest expiry an underlying has in the slice, or `None` when it has
+/// none.
+///
+/// Ties are impossible — an expiry is a date — so `min` is total here.
+#[must_use]
+fn nearest_expiry_for(candidates: &[DepthCandidate], underlying: &str) -> Option<i64> {
+    candidates
+        .iter()
+        .filter(|c| c.underlying == underlying && c.expiry_micros > 0)
+        .map(|c| c.expiry_micros)
+        .min()
+}
+
+/// Whether a candidate belongs to its underlying's nearest expiry.
+///
+/// # Why every depth grouping must ask this
+///
+/// Operator, 2026-08-26: *"always current expiry alone only ... especially for
+/// depth 20 and depth 200"*. The reason is not preference. The candidate slice
+/// carries EVERY expiry from today forward — this week's, next month's, the
+/// quarterly — because `depth_candidates_from_master` drops only what has
+/// already expired.
+///
+/// Group that slice by `(underlying, strike)` and the same strike from two
+/// different expiries lands in one bucket, so whichever row arrives last wins.
+/// The socket then subscribes a far-month contract that barely quotes, at a
+/// strike chosen from this month's spot — a well-formed subscription to an
+/// almost-empty book, and nothing downstream can tell it from a real one.
+///
+/// So the expiry filter is not a refinement of the at-the-money search. It is
+/// what makes the search meaningful at all.
+///
+/// # NEAREST, not "monthly" — and this distinction must not be tidied away
+///
+/// Operator, same day: *"for nifty always weekly current expiry and remaining
+/// entirely only monthly, so current month expiry"*. Both are true, and ONE
+/// rule delivers both:
+///
+/// | Underlying | Expiries NSE lists | Nearest is |
+/// |---|---|---|
+/// | NIFTY | weekly + monthly | this week's |
+/// | BANKNIFTY, stocks | monthly only | this month's |
+///
+/// Taking the nearest gives the weekly for NIFTY and the monthly for
+/// everything else without the code ever having to know which is which. A
+/// future reader who "corrects" this into a month-matching filter would
+/// silently push NIFTY onto a contract up to four weeks out — the exact
+/// far-expiry subscription this function exists to prevent, arrived at by
+/// making the rule look more explicit.
+#[must_use]
+fn is_nearest_expiry(candidate: &DepthCandidate, nearest: Option<i64>) -> bool {
+    match nearest {
+        Some(expiry) => candidate.expiry_micros == expiry,
+        // An underlying whose rows all carry a missing expiry. Nothing to
+        // compare against, so nothing is refused on that basis — the id and
+        // strike guards still apply.
+        None => true,
+    }
+}
+
 /// Groups a candidate slice into per-underlying chain views.
 ///
 /// # What is dropped, and why each is dropped rather than guessed
@@ -176,14 +236,30 @@ fn strike_paise(strike: f64) -> Option<i64> {
 /// # Complexity
 ///
 /// O(candidates) to bucket, then O(k log k) per underlying to order strikes —
-/// cold path, once a minute, over the few hundred rows of an index chain.
+///
+/// # Current expiry only
+///
+/// Rows outside each underlying's NEAREST expiry are dropped before grouping.
+/// See [`is_nearest_expiry`] — without it, one strike from two expiries shares
+/// a bucket and the later row wins.
 #[must_use]
 pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<OwnedChainMinute> {
     // (underlying, strike_paise) -> (ce, pe, spot)
     let mut by_strike: HashMap<(&str, i64), (Option<i64>, Option<i64>, f64)> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
+    // CURRENT EXPIRY ONLY, per underlying. Resolved once rather than per row:
+    // the slice carries every expiry from today forward, and grouping by
+    // (underlying, strike) without this puts two expiries' contracts in one
+    // bucket. See `is_nearest_expiry`.
+    let mut nearest: HashMap<&str, Option<i64>> = HashMap::new();
     for c in candidates {
         if !c.is_index_option {
+            continue;
+        }
+        let expiry = *nearest
+            .entry(&c.underlying)
+            .or_insert_with(|| nearest_expiry_for(candidates, &c.underlying));
+        if !is_nearest_expiry(c, expiry) {
             continue;
         }
         let Some(paise) = strike_paise(c.strike) else {
@@ -255,8 +331,16 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
 pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<StrikePair> {
     let mut pairs: HashMap<i64, (Option<i64>, Option<i64>)> = HashMap::new();
     let mut spot = f64::NAN;
+    // CURRENT EXPIRY ONLY. Without this the same strike from two expiries
+    // shares one map slot and the later row wins — so the socket can land on
+    // a far-month contract at a strike chosen from this month's spot. See
+    // `is_nearest_expiry`.
+    let nearest = nearest_expiry_for(candidates, underlying);
     for c in candidates {
         if c.underlying != underlying {
+            continue;
+        }
+        if !is_nearest_expiry(c, nearest) {
             continue;
         }
         let Some(paise) = strike_paise(c.strike) else {
@@ -1959,5 +2043,174 @@ mod fifth_socket_tests {
             production.contains("TopMoverSocket::seeded(held,"),
             "the rebalance loop must seed the top-mover tracker from what the socket holds"
         );
+    }
+}
+
+#[cfg(test)]
+mod current_expiry_tests {
+    use super::*;
+
+    const THIS_WEEK: i64 = 1_900_000_000_000_000;
+    const NEXT_WEEK: i64 = 1_900_604_800_000_000;
+    const NEXT_MONTH: i64 = 1_902_592_000_000_000;
+
+    fn at(
+        underlying: &str,
+        expiry: i64,
+        strike: f64,
+        leg: &str,
+        id: i64,
+        index: bool,
+    ) -> DepthCandidate {
+        DepthCandidate {
+            underlying: underlying.to_owned(),
+            contract_security_id: id,
+            expiry_micros: expiry,
+            strike,
+            spot: 24_500.0,
+            leg: leg.to_owned(),
+            is_index_option: index,
+        }
+    }
+
+    /// The collision the operator caught, reproduced exactly.
+    ///
+    /// Both expiries list a 24500 strike. Keyed on (underlying, strike) alone
+    /// they share one map slot, and the row that happens to arrive last wins.
+    #[test]
+    fn a_far_expiry_never_wins_a_strike_from_the_near_one() {
+        let c = vec![
+            at("NIFTY", THIS_WEEK, 24_500.0, "CE", 101, true),
+            at("NIFTY", THIS_WEEK, 24_500.0, "PE", 102, true),
+            // Same strike, next week. Listed AFTER, so without the filter it
+            // overwrites — and nothing downstream could tell.
+            at("NIFTY", NEXT_WEEK, 24_500.0, "CE", 901, true),
+            at("NIFTY", NEXT_WEEK, 24_500.0, "PE", 902, true),
+        ];
+        let got = chain_minutes_from_candidates(&c);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pairs.len(), 1);
+        assert_eq!(
+            got[0].pairs[0].ce_security_id, 101,
+            "the near expiry's contract must win"
+        );
+        assert_eq!(got[0].pairs[0].pe_security_id, 102);
+    }
+
+    #[test]
+    fn the_at_the_money_pair_comes_from_the_near_expiry_too() {
+        let c = vec![
+            at("RELIANCE", THIS_WEEK, 24_500.0, "CE", 101, false),
+            at("RELIANCE", THIS_WEEK, 24_500.0, "PE", 102, false),
+            at("RELIANCE", NEXT_MONTH, 24_500.0, "CE", 901, false),
+            at("RELIANCE", NEXT_MONTH, 24_500.0, "PE", 902, false),
+        ];
+        let got = atm_pair_for(&c, "RELIANCE").expect("a pair");
+        assert_eq!(got.ce_security_id, 101);
+        assert_eq!(got.pe_security_id, 102);
+    }
+
+    #[test]
+    fn a_far_expiry_strike_nearer_to_spot_still_loses() {
+        // The nastiest shape: the far expiry lists a strike CLOSER to spot.
+        // A filter applied after the at-the-money search would pick it.
+        let c = vec![
+            at("NIFTY", THIS_WEEK, 24_400.0, "CE", 101, true),
+            at("NIFTY", THIS_WEEK, 24_400.0, "PE", 102, true),
+            at("NIFTY", NEXT_WEEK, 24_500.0, "CE", 901, true),
+            at("NIFTY", NEXT_WEEK, 24_500.0, "PE", 902, true),
+        ];
+        let got = atm_pair_for(&c, "NIFTY").expect("a pair");
+        assert_eq!(
+            got.ce_security_id, 101,
+            "spot is 24500 and the far expiry has the exact strike — it must \
+             STILL lose, because expiry is filtered before the search, not after"
+        );
+    }
+
+    #[test]
+    fn nifty_takes_its_weekly_while_banknifty_takes_its_monthly() {
+        // ONE rule, both answers. NIFTY lists weeklies so its nearest is this
+        // week's; BANKNIFTY lists monthlies only so its nearest is this
+        // month's. Neither needs the code to know which is which.
+        let c = vec![
+            at("NIFTY", THIS_WEEK, 24_500.0, "CE", 101, true),
+            at("NIFTY", THIS_WEEK, 24_500.0, "PE", 102, true),
+            at("NIFTY", NEXT_WEEK, 24_500.0, "CE", 111, true),
+            at("NIFTY", NEXT_WEEK, 24_500.0, "PE", 112, true),
+            at("NIFTY", NEXT_MONTH, 24_500.0, "CE", 121, true),
+            at("NIFTY", NEXT_MONTH, 24_500.0, "PE", 122, true),
+            at("BANKNIFTY", THIS_WEEK, 24_500.0, "CE", 201, true),
+            at("BANKNIFTY", THIS_WEEK, 24_500.0, "PE", 202, true),
+            at("BANKNIFTY", NEXT_MONTH, 24_500.0, "CE", 211, true),
+            at("BANKNIFTY", NEXT_MONTH, 24_500.0, "PE", 212, true),
+        ];
+        let got = chain_minutes_from_candidates(&c);
+        let nifty = got.iter().find(|m| m.underlying == "NIFTY").expect("nifty");
+        let bank = got
+            .iter()
+            .find(|m| m.underlying == "BANKNIFTY")
+            .expect("banknifty");
+        assert_eq!(nifty.pairs[0].ce_security_id, 101);
+        assert_eq!(bank.pairs[0].ce_security_id, 201);
+    }
+
+    #[test]
+    fn each_underlying_gets_its_own_nearest_not_the_slices() {
+        // BANKNIFTY's nearest is later than NIFTY's. A single slice-wide
+        // minimum would drop BANKNIFTY entirely.
+        let c = vec![
+            at("NIFTY", THIS_WEEK, 24_500.0, "CE", 101, true),
+            at("NIFTY", THIS_WEEK, 24_500.0, "PE", 102, true),
+            at("BANKNIFTY", NEXT_MONTH, 54_000.0, "CE", 201, true),
+            at("BANKNIFTY", NEXT_MONTH, 54_000.0, "PE", 202, true),
+        ];
+        let got = chain_minutes_from_candidates(&c);
+        assert_eq!(got.len(), 2, "both underlyings must survive: {got:?}");
+    }
+
+    #[test]
+    fn the_whole_near_expiry_ladder_survives_not_just_one_strike() {
+        let mut c = Vec::new();
+        for k in 0..5_i64 {
+            #[expect(clippy::cast_precision_loss, reason = "k is tiny")]
+            let strike = 24_400.0 + (k as f64) * 50.0;
+            c.push(at("NIFTY", THIS_WEEK, strike, "CE", 100 + k * 2, true));
+            c.push(at("NIFTY", THIS_WEEK, strike, "PE", 101 + k * 2, true));
+            c.push(at("NIFTY", NEXT_WEEK, strike, "CE", 900 + k * 2, true));
+            c.push(at("NIFTY", NEXT_WEEK, strike, "PE", 901 + k * 2, true));
+        }
+        let got = chain_minutes_from_candidates(&c);
+        assert_eq!(got[0].pairs.len(), 5, "every near-expiry strike survives");
+        for pair in &got[0].pairs {
+            assert!(
+                pair.ce_security_id < 900,
+                "a far-expiry id leaked into the ladder: {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_with_no_expiry_at_all_are_not_refused_on_that_basis() {
+        // Nothing to compare against. The id and strike guards still apply;
+        // refusing here would drop a whole underlying over a missing field.
+        let c = vec![
+            at("NIFTY", 0, 24_500.0, "CE", 101, true),
+            at("NIFTY", 0, 24_500.0, "PE", 102, true),
+        ];
+        let got = chain_minutes_from_candidates(&c);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pairs[0].ce_security_id, 101);
+    }
+
+    #[test]
+    fn the_nearest_expiry_lookup_ignores_other_underlyings() {
+        let c = vec![
+            at("NIFTY", NEXT_MONTH, 24_500.0, "CE", 101, true),
+            at("BANKNIFTY", THIS_WEEK, 54_000.0, "CE", 201, true),
+        ];
+        assert_eq!(nearest_expiry_for(&c, "NIFTY"), Some(NEXT_MONTH));
+        assert_eq!(nearest_expiry_for(&c, "BANKNIFTY"), Some(THIS_WEEK));
+        assert_eq!(nearest_expiry_for(&c, "MISSING"), None);
     }
 }
