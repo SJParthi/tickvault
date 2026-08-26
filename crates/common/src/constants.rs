@@ -3330,6 +3330,26 @@ pub const BOOT_ESCALATION_ERROR_AT_SECS: u64 = 30;
 /// merging trading days in QuestDB.
 pub const CLOCK_SKEW_HALT_THRESHOLD_SECS: f64 = 2.0;
 
+/// How often the running app RE-SAMPLES wall-clock skew after boot.
+///
+/// WHY THIS EXISTS (2026-08-26). The boot gate above samples skew exactly
+/// once, and `tv_clock_skew_seconds` is a gauge on an exporter configured
+/// with NO idle timeout — so the boot reading is re-rendered on every
+/// scrape for the whole session. CloudWatch therefore received a
+/// datapoint all day and `tv-<env>-clock-skew-high` sat green on a value
+/// taken at 08:30, blind to any drift that developed afterwards. That is
+/// the SAME false-green the 2026-07-16 audit found (the probe then had
+/// zero production callers at all) — wiring the boot gate moved it from
+/// "green because no data" to "green because stale data", which is more
+/// convincing and therefore worse.
+///
+/// 30s is not arbitrary: the alarm is `period = 60` over 2 evaluation
+/// periods, so publishing twice per period guarantees every window it
+/// evaluates carries a FRESH sample rather than a re-rendered old one.
+/// It also matches the house cadence for the other cold-path sweeps
+/// (`scan_silence`, the token-health gauge).
+pub const CLOCK_SKEW_POLL_INTERVAL_SECS: u64 = 30;
+
 // ---------------------------------------------------------------------------
 // Phase 0 Item 11 — Dual-Gate Market-Hours (operator-locked 2026-05-13)
 // ---------------------------------------------------------------------------
@@ -3650,6 +3670,19 @@ mod boot_constants_tests {
         const { assert!(BOOT_ESCALATION_INFO_AT_SECS < BOOT_ESCALATION_WARN_AT_SECS) };
         const { assert!(BOOT_ESCALATION_WARN_AT_SECS < BOOT_ESCALATION_ERROR_AT_SECS) };
         const { assert!(BOOT_ESCALATION_ERROR_AT_SECS < BOOT_DEADLINE_SECS) };
+    }
+
+    #[test]
+    fn test_clock_skew_poll_interval_beats_the_alarm_period() {
+        // The alarm on tv_clock_skew_seconds evaluates 60-second periods.
+        // A poll interval at or above that leaves periods carrying only a
+        // re-rendered stale gauge, which is the false-green this constant
+        // exists to end. Twice per period is the requirement; assert the
+        // property, not the number, so a future retune cannot pass by
+        // editing the literal in two places.
+        const ALARM_PERIOD_SECS: u64 = 60;
+        const { assert!(CLOCK_SKEW_POLL_INTERVAL_SECS * 2 <= ALARM_PERIOD_SECS) };
+        const { assert!(CLOCK_SKEW_POLL_INTERVAL_SECS > 0) };
     }
 
     #[test]

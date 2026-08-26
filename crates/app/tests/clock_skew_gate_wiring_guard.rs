@@ -36,6 +36,39 @@ fn test_clock_skew_gate_is_wired_into_main() {
     );
 }
 
+/// 2026-08-26 — the boot gate alone is NOT enough, and the 2026-07-16 fix
+/// recorded in this file's header only got half of it.
+///
+/// `probe_clock_skew` sets a `metrics` gauge, and the Prometheus exporter is
+/// built with no idle timeout, so a gauge re-renders its last value on every
+/// scrape for as long as the process lives. With the boot gate as the only
+/// caller, `tv_clock_skew_seconds` carried the 08:30 reading all session:
+/// `tv-<env>-clock-skew-high` and the dashboard panel both read it, both saw a
+/// dense healthy series, and both were blind to drift that developed after
+/// boot. The 2026-07-16 audit moved this from "green because nothing
+/// publishes" to "green because the publish never changes" — more convincing,
+/// and therefore worse.
+///
+/// This pins the periodic re-sample. If the poller wiring silently dies, the
+/// alarm goes back to reading a pre-market number all day.
+#[test]
+fn test_clock_skew_poller_is_wired_into_main() {
+    let src = main_rs_source();
+    assert!(
+        src.contains("spawn_clock_skew_poller("),
+        "main.rs must spawn the clock-skew poller after the BOOT-03 gate — \
+         without it tv_clock_skew_seconds freezes at its boot value and the \
+         alarm on it reads a pre-market number for the whole session."
+    );
+    assert!(
+        src.contains("CLOCK_SKEW_POLL_INTERVAL_SECS"),
+        "the poller must be driven by CLOCK_SKEW_POLL_INTERVAL_SECS, whose own \
+         ratchet keeps it at or under half the alarm's 60s evaluation period. \
+         A hardcoded interval here can drift past that period and silently \
+         return the alarm to evaluating stale samples."
+    );
+}
+
 #[test]
 fn test_clock_skew_gate_halts_on_breach() {
     // The ThresholdExceeded arm must HALT boot the same way BOOT-01/BOOT-02 do
