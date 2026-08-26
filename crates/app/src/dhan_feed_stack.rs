@@ -8272,7 +8272,7 @@ fn persist_xverify_report(
     // shape that grows.
     const PERSIST_BATCH_ROWS: usize = 20_000;
     let mut batch_errors = 0_usize;
-    let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
+    let flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
         if w.pending() >= PERSIST_BATCH_ROWS && w.flush().is_err() {
             // One batch lost, named, and the run continues. Before this the
             // same failure took the whole day with it.
