@@ -1559,13 +1559,32 @@ async fn async_main() -> Result<()> {
     // retirement directive 2026-07-13; websocket-connection-scope-lock.md
     // "2026-07-13 Amendment" §B). Every boot flows through ONE path:
     // shared prefix → build_shared_infra → WAL settlement → REST stack
-    // (unconditional) → READY → run_process_runloop. `dhan_enabled=true` is
-    // an ILLEGAL post-retirement config (logged loudly + ignored at the
-    // REST-stack spawn below — dhan_enabled=false is the prod reality).
-    // The OFF-feed-isolation guarantee is now BY CONSTRUCTION: no Dhan auth
-    // beyond the REST stack's own, no instrument fetch, no Dhan WebSocket
-    // (except the stack's functional-dormant order-update WS) exists on any
-    // path.
+    // (unconditional) → READY → run_process_runloop.
+    //
+    // CORRECTED 2026-08-26. This block used to end:
+    //
+    //   "`dhan_enabled=true` is an ILLEGAL post-retirement config (logged
+    //    loudly + ignored at the REST-stack spawn below — dhan_enabled=false
+    //    is the prod reality). The OFF-feed-isolation guarantee is now BY
+    //    CONSTRUCTION: no Dhan auth beyond the REST stack's own, no
+    //    instrument fetch, no Dhan WebSocket ... exists on any path."
+    //
+    // Every clause was false. `config/base.toml` carries `dhan_enabled = true`
+    // (the 2026-08-11 operator flip), `feed_stack_gate` READS that flag rather
+    // than ignoring it, and the lane it gates dials up to 16 Dhan WebSockets.
+    // So this said the shipped production config is illegal, and that no Dhan
+    // WebSocket can exist, in a boot path whose whole job is to bring them up.
+    //
+    // The same correction was already made 640 lines below, at the
+    // `feed_stack_gate` call site, and its note diagnoses this precisely:
+    // "the message survived the revival because nothing tied it to the flag
+    // it described." That is true of this block too — it was updated there
+    // and missed here, which is the partial re-bless that makes a file look
+    // reviewed. `crates/common/tests/dhan_enabled_premise_guard.rs` now ties
+    // both to the real value in base.toml.
+    //
+    // What IS still true and is the point of this block: there is no Dhan
+    // fast/slow boot to choose between, so this is a LOGGING dispatcher only.
     // =======================================================================
     if !config.feeds.dhan_enabled {
         warn!(

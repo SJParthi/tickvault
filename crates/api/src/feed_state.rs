@@ -74,8 +74,9 @@ pub struct FeedRuntimeState {
     /// operator directive 2026-07-13) — captured BEFORE the feed-state
     /// overlay is applied (round-2 review MEDIUM, 2026-07-13). Distinct
     /// from the mutable `dhan` runtime atomic: with the Dhan live WS lane
-    /// retired by config (`dhan_enabled = false` in base + production),
-    /// the runtime cold-start supervisor refuses a lane start — so the
+    /// retired by config at the time (REVIVED 2026-08-09; base.toml now carries
+    /// dhan_enabled = true) — the runtime cold-start supervisor refuses a
+    /// lane start regardless, so the
     /// `/api/feeds` handler must refuse a Dhan ENABLE at the API layer too
     /// (409), instead of flipping a flag that can never take effect (a
     /// Rule-11 false-OK: /feeds would show ON while nothing can start).

@@ -9183,9 +9183,12 @@ mod tests {
     // -- the gate -----------------------------------------------------------
 
     #[test]
-    fn test_feed_stack_gate_is_shut_by_the_shipped_config() {
-        // `dhan_enabled = false` in BOTH config/base.toml and
-        // config/production.toml since the 2026-07-13 retirement.
+    fn test_feed_stack_gate_is_shut_when_the_config_flag_is_off() {
+        // NOTE (2026-08-26): base.toml now carries dhan_enabled = TRUE; this
+        // test passes `false` explicitly to exercise the gate arm, and does
+        // not describe the shipped config. Was written when both files said
+        // `dhan_enabled = false`, which was true from the 2026-07-13
+        // retirement until the 2026-08-11 flip.
         assert_eq!(
             feed_stack_gate(false, Some(DHAN_LIVE_FEED_ENV_ON)),
             FeedStackGate::DisabledByConfig
