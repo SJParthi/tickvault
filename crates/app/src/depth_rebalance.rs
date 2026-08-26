@@ -685,7 +685,11 @@ pub async fn fetch_movers(
         .timeout(std::time::Duration::from_secs(MOVERS_QUERY_TIMEOUT_SECS))
         .build()
     else {
-        tracing::error!("depth rebalance: HTTP client build failed — no movers this minute");
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+            "depth rebalance: HTTP client build failed, so the fifth socket has no ranking \
+             to follow this minute. It keeps whatever it holds."
+        );
         return Vec::new();
     };
     let sql = build_movers_query(today_ist_micros);
