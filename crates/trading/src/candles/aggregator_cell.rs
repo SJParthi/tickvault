@@ -662,6 +662,13 @@ impl AggregatorCell {
                     && bucket_start == last.bucket_start_ist_secs
                 {
                     fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
+                    // SEAL SITE 5 of 5 — and the one that proves the guard
+                    // earns its keep. I wrote this change believing there
+                    // were four emission points; the source scan found this
+                    // fifth `AmendedLate` arm on its first run. Same reason
+                    // as site 4: the late tick moved `close`, so the
+                    // percentages beside it must be recomputed.
+                    self.last_sealed[ord].stamp_seal_percentages();
                     return ConsumeOutcome::AmendedLate {
                         amended_state: self.last_sealed[ord],
                     };
@@ -797,7 +804,7 @@ impl AggregatorCell {
         // risk of a later bucket claiming it.
         if bucket_start > open_start {
             self.armed_for_day_open[ord] = false;
-            let sealed_state = std::mem::replace(
+            let mut sealed_state = std::mem::replace(
                 &mut self.slots[ord],
                 open_bucket(
                     tick,
@@ -812,6 +819,10 @@ impl AggregatorCell {
                     cumulative_volume,
                 ),
             );
+            // SEAL SITE 1 of 5 (see `stamp_seal_percentages`). Stamped
+            // BEFORE `last_sealed` is written, so the late-refold path below
+            // amends an already-stamped bar rather than a blank one.
+            sealed_state.stamp_seal_percentages();
             self.last_sealed[ord] = sealed_state;
             return ConsumeOutcome::Sealed { sealed_state };
         }
@@ -821,6 +832,11 @@ impl AggregatorCell {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
                 fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
+                // SEAL SITE 4 of 5, and one of the two a careless fix misses: the
+                // late tick just moved `close`, so a percentage stamped at
+                // the original seal is now stale for the row that actually
+                // gets persisted. Re-stamp from the amended close.
+                self.last_sealed[ord].stamp_seal_percentages();
                 return ConsumeOutcome::AmendedLate {
                     amended_state: self.last_sealed[ord],
                 };
@@ -857,10 +873,10 @@ impl AggregatorCell {
         if self.slots[ord].is_uninitialised() {
             return None;
         }
-        Some(std::mem::replace(
-            &mut self.slots[ord],
-            LiveCandleState::empty(),
-        ))
+        let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
+        // SEAL SITE 2 of 5 (see `stamp_seal_percentages`).
+        sealed.stamp_seal_percentages();
+        Some(sealed)
     }
 
     /// Watermark-aware INTRADAY catch-up seal: seals the open bucket ONLY
@@ -897,7 +913,10 @@ impl AggregatorCell {
         {
             return None;
         }
-        let sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
+        let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
+        // SEAL SITE 3 of 5 (see `stamp_seal_percentages`). Stamped before
+        // `last_sealed` so a subsequent late refold amends a stamped bar.
+        sealed.stamp_seal_percentages();
         self.last_sealed[ord] = sealed;
         Some(sealed)
     }
@@ -3067,5 +3086,231 @@ mod open_bucket_ordering_tests {
             delta.is_empty(),
             "an inverted pair must never produce a widening"
         );
+    }
+    // ------------------------------------------------------------------
+    // Item 25 (2026-08-26): the percentage columns are stamped at EVERY
+    // emission site.
+    //
+    // Before this, all three shipped as `0.0` on every candle ever written:
+    // 17,409,304 bars across six frames on the live box, none with a value.
+    // The plumbing and the columns were both fine — only the arithmetic was
+    // missing, which is why nothing ever failed.
+    // ------------------------------------------------------------------
+
+    /// A tick carrying the exchange's own day open and previous close.
+    fn tick_with_baselines(ts: u32, price: f32, cum_volume: u32) -> ParsedTick {
+        ParsedTick {
+            day_open: 24_341.95,
+            day_close: 24_334.55,
+            ..tick_at(ts, price, cum_volume)
+        }
+    }
+
+    #[test]
+    fn seal_site_1_an_intraday_crossing_carries_the_percentages() {
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN, 24_341.95, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 60, 24_273.15, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        let ConsumeOutcome::Sealed { sealed_state } = out else {
+            panic!("expected a seal, got {out:?}");
+        };
+        assert!(
+            sealed_state.open_gap_pct != 0.0,
+            "the overnight gap was not stamped at the intraday seal"
+        );
+        assert!(
+            (sealed_state.open_gap_pct - 0.030_41).abs() < 0.000_5,
+            "gap pct was {}",
+            sealed_state.open_gap_pct
+        );
+    }
+
+    #[test]
+    fn seal_site_2_force_seal_carries_the_percentages() {
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN, 24_341.95, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 30, 24_273.15, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        let sealed = cell.force_seal(TfIndex::M1).expect("bucket drained");
+        assert!(
+            (sealed.open_pct - -0.282_63).abs() < 0.000_5,
+            "force_seal pre-open pct was {}",
+            sealed.open_pct
+        );
+        assert!(
+            (sealed.open_gap_pct - 0.030_41).abs() < 0.000_5,
+            "force_seal gap pct was {}",
+            sealed.open_gap_pct
+        );
+    }
+
+    #[test]
+    fn seal_site_3_catch_up_seal_carries_the_percentages() {
+        // This is the site that seals ILLIQUID instruments on time — the very
+        // instruments whose percentages an operator is most likely to be
+        // reading, because nothing else about them is moving.
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 5, 24_273.15, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let sealed = cell
+            .catch_up_seal(TfIndex::M1, OPEN + 60)
+            .expect("bucket end reached");
+        assert!(
+            (sealed.open_pct - -0.282_63).abs() < 0.000_5,
+            "catch_up_seal pre-open pct was {}",
+            sealed.open_pct
+        );
+    }
+
+    #[test]
+    fn seal_site_4_a_late_tick_that_moves_the_close_restamps_the_percentages() {
+        // The site a careless fix misses. The bar was already sealed and
+        // already stamped; a late tick then moves `close`, and the amended
+        // state is what gets persisted. A percentage left over from the
+        // original seal would sit in the same row as a close it does not
+        // describe.
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN, 24_341.95, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 60, 24_341.95, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        let ConsumeOutcome::Sealed { sealed_state } = out else {
+            panic!("expected a seal, got {out:?}");
+        };
+        let pct_at_seal = sealed_state.open_pct;
+
+        // A late tick for the FIRST bucket, later within it than its close,
+        // so it genuinely rewrites the close.
+        let late = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 30, 24_273.15, 21),
+            20,
+            FeedStrategy::DEFAULT,
+            21,
+        );
+        let ConsumeOutcome::AmendedLate { amended_state } = late else {
+            panic!("expected a late amend, got {late:?}");
+        };
+        assert!(
+            (amended_state.close - 24_273.15).abs() < 0.01,
+            "the late tick did not move the close: {}",
+            amended_state.close
+        );
+        assert!(
+            (amended_state.open_pct - pct_at_seal).abs() > 0.000_1,
+            "the amended bar kept the percentage from before the amend \
+             ({pct_at_seal}) — the row would persist a percentage that does \
+             not describe its own close"
+        );
+        assert!(
+            (amended_state.open_pct - -0.282_63).abs() < 0.000_5,
+            "amended pre-open pct was {}",
+            amended_state.open_pct
+        );
+    }
+
+    /// The durable half. Four emission sites exist today; a fifth added next
+    /// month would silently ship zeros again, and every existing test would
+    /// still pass — exactly how the original defect survived from the Wave-5
+    /// seal-column work until 2026-08-26.
+    ///
+    /// This counts the sites in this file's own source and requires each to
+    /// stamp. It cannot prove a future site stamps CORRECTLY, but it makes
+    /// adding one without thinking about it fail the build.
+    #[test]
+    fn every_seal_emission_site_stamps_the_percentages() {
+        // Scan the PRODUCTION half only. This test's own assertion messages
+        // name the symbol, and counting those would make the guard pass or
+        // fail on how it is worded rather than on what the code does.
+        let whole = include_str!("aggregator_cell.rs");
+        let prod = whole
+            .split_once("\n#[cfg(test)]")
+            .map_or(whole, |(before, _)| before);
+        assert!(
+            prod.len() < whole.len(),
+            "the test-module split marker was not found — the guard would be \
+             scanning its own source and is no longer trustworthy"
+        );
+
+        let stamps = prod.matches(".stamp_seal_percentages()").count();
+        assert_eq!(
+            stamps, 5,
+            "expected exactly 5 stamp calls (one per emission site), found \
+             {stamps}. If you ADDED an emission path, stamp it and raise this \
+             number. If you REMOVED one, lower it. Do not delete this assertion."
+        );
+
+        let markers = prod.matches("SEAL SITE").count();
+        assert_eq!(
+            markers, 5,
+            "each stamp call must carry its `SEAL SITE n of 5` marker so the \
+             next reader can find all of them from any one of them"
+        );
+
+        // Every emission of a bar-carrying outcome must have a stamp close
+        // above it. Crude by choice: a precise check would need a parser, and
+        // a parser is a thing that can itself be wrong in a way nobody
+        // notices for months — which is exactly how this defect survived.
+        for outcome in ["ConsumeOutcome::Sealed {", "ConsumeOutcome::AmendedLate {"] {
+            let mut from = 0usize;
+            let mut emissions = 0usize;
+            while let Some(rel) = prod[from..].find(outcome) {
+                let at = from + rel;
+                let window = &prod[at.saturating_sub(700)..at];
+                if window.contains("return ") || window.contains("= ") {
+                    assert!(
+                        window.contains(".stamp_seal_percentages()"),
+                        "an emission of `{outcome}` at byte {at} has no stamp \
+                         within the preceding 700 bytes — that bar would ship \
+                         three zeros"
+                    );
+                    emissions += 1;
+                }
+                from = at + outcome.len();
+            }
+            assert!(
+                emissions >= 1,
+                "found no emission of `{outcome}` in the production half — the \
+                 guard is scanning the wrong text"
+            );
+        }
     }
 }
