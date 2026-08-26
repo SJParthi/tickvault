@@ -1566,9 +1566,11 @@ impl LiveIngest {
         // old trade time, carrying live open interest and bid/ask. Discarding
         // it would lose the ability to tell "did not trade today" from "did
         // not capture", which is the same false-OK the 2026-08-20 fix removed.
-        let candle_only_refusal =
-            (stats.out_of_session || stats.untraded_sentinel || stats.stale_trading_day)
-                && !hard_refusal;
+        let candle_only_refusal = (stats.out_of_session
+            || stats.untraded_sentinel
+            || stats.stale_trading_day
+            || stats.untraded_timestamp)
+            && !hard_refusal;
 
         if hard_refusal {
             let reason = if stats.refused_price {

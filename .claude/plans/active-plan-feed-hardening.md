@@ -2864,3 +2864,96 @@ compare against. In practice pre-open ticks are already refused by the
 seconds-of-day gate, so the exposure is narrow — but it is not zero, and closing
 it fully would require threading the wall-clock date into `consume_tick`, which
 changes two public signatures and every call site.
+
+---
+
+## Item 28 — 825,783 ticks a session discarded with no row at all (2026-08-26)
+
+- [x] **28 — `exchange_timestamp == 0` is the vendor's sentinel, not corruption**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `fold_counters.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/trading/tests/stale_trading_day_gate_guard.rs` (+3, now 9)
+
+### Design
+
+Measured live: `tv_dhan_feed_ingest_refused_total{reason="timestamp"}` =
+**825,783** in one session — **4.0% of every tick decoded** — still climbing
+when read. The drain classes a timestamp refusal as a HARD refusal, returning
+before `append_tick_with_seq`, so every one was discarded **with no row at
+all**. Not a missing candle: no record the instrument was even seen.
+
+The 2026-08-20 fix had already made this exact call correctly for the PRICE
+sentinel, and its reasoning applies verbatim: *"discarding the ROW loses the
+ability to tell 'did not trade' from 'did not capture', and costs the packet's
+open interest and bid/ask with it."* An instrument that has never traded has no
+last price **and** no last trade time — the two sentinels co-occur — but the
+timestamp check ran first and hard-refused, silently defeating that fix for
+precisely the instruments it was written for.
+
+### The compatibility that makes this safe
+
+Two adversarial regressions (2026-08-09 security review, 2026-08-25 bite test)
+require that a row must **never** be written under a garbage designated
+timestamp. This does not reverse them; it satisfies them **by construction**.
+
+`row_timestamp_ist_nanos` substitutes the receipt time for an out-of-band LTT —
+but only when the caller has one (`(tick.received_at_nanos != 0).then_some(..)`),
+falling back to the raw value otherwise. So the fold keeps the row on exactly
+`ts == 0 && received_at_nanos != 0`: precisely the condition under which the
+writer can stamp it safely. Without that second clause a kept ts=0 row would
+land in a **1970** partition — the same unreachable-partition defect as
+year-2106, from the other end of the number line.
+
+The persistence layer had already anticipated this case. Its own comment calls
+the fallback *"the fallback designated timestamp for a row whose LTT is the
+vendor's never-traded sentinel"* — but the fold refused those rows before they
+could reach it, so that path was unreachable. The two layers now agree.
+
+**Both existing adversarial tests pass UNCHANGED** (their fixtures leave
+`received_at_nanos` at 0, so they exercise the still-hard-refusal arm). Nothing
+was re-blessed to make this land.
+
+### Edge Cases
+
+- Only EXACTLY zero is the sentinel. `0xFFFFFFFF` (~year 2106), `1`, and any
+  other out-of-band value stay hard refusals — pinned by a test that walks all
+  four.
+- The refusal happens BEFORE `slot_index`, so an instrument that only ever sends
+  the sentinel cannot burn one of the 25,000 slots.
+
+### Failure Modes
+
+- If a future caller stops setting `received_at_nanos`, the fold silently
+  reverts to hard-refusing — degraded, not wrong, and in the safe direction.
+- If someone drops the receipt-time clause, `a_zero_timestamp_without_a_receipt_time_is_still_refused_outright`
+  fails.
+
+### Test Plan
+
+3 new tests (9 in the file). `cargo test -p tickvault-trading --lib` →
+**1,633 passed / 0 failed**, including both adversarial regressions untouched.
+fmt + banned-pattern clean.
+
+### Rollback
+
+Single revert; independent of Items 27a/27b.
+
+### Observability
+
+`tv_aggregator_tick_refused_total{reason="untraded_timestamp"}` — a fifth label
+on an EXISTING series, so no new metric name and no EMF entry (Item 14e).
+
+**This is also the measurement that settles the remaining Assumed.** The claim
+that the 825,783 are zeros is inferred, not proven — the refused rows were never
+written, so no query could confirm it. From the next session the split label
+answers it directly: whatever share lands under `untraded_timestamp` is the
+sentinel, and whatever stays under `timestamp` is genuine corruption worth its
+own investigation.
+
+### Honest envelope
+
+Recovers the ROW, not the candle — a zero timestamp can never produce a bar, and
+should not. What comes back is the record that the instrument was seen, plus its
+open interest and bid/ask, and the ability to distinguish "did not trade" from
+"did not capture". If the 825,783 turn out NOT to be zeros, this change is inert
+and the split counter says so on day one.

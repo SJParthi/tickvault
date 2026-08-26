@@ -232,3 +232,102 @@ fn the_first_tick_of_a_process_is_not_refused() {
     );
     assert!(s.folded());
 }
+
+// ---------------------------------------------------------------------------
+// The vendor's "no last trade time" sentinel (2026-08-26)
+// ---------------------------------------------------------------------------
+//
+// Measured on prod: `tv_dhan_feed_ingest_refused_total{reason="timestamp"}` =
+// 825,783 in one session — 4.0% of every tick decoded — and the drain treats a
+// timestamp refusal as a HARD refusal, so all of them were discarded with NO
+// ROW AT ALL. Not a missing candle: no record the instrument was even seen.
+//
+// The 2026-08-20 fix had already made this call correctly for the PRICE
+// sentinel. An instrument that has never traded has no last price AND no last
+// trade time, so the two co-occur — but the timestamp check ran first and hard-
+// refused, silently defeating that fix for exactly the instruments it was for.
+
+fn tick_with_receipt(ts: u32, ltp: f32, received_at_nanos: i64) -> ParsedTick {
+    ParsedTick {
+        security_id: 4242,
+        exchange_segment_code: 2,
+        exchange_timestamp: ts,
+        last_traded_price: ltp,
+        received_at_nanos,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_zero_timestamp_with_a_receipt_time_keeps_its_row() {
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+
+    let s = agg.consume_tick(
+        Feed::Dhan,
+        &tick_with_receipt(0, 0.0, 1_787_000_000_000_000_000),
+        None,
+        |_, _, _, _, _| panic!("a zero timestamp must never seal a bucket"),
+    );
+
+    assert!(
+        s.untraded_timestamp,
+        "ts == 0 is the vendor's 'no last trade time' sentinel, not corruption"
+    );
+    assert!(
+        !s.refused_timestamp && !s.refused_price && !s.slot_exhausted,
+        "it must NOT be a hard refusal — the drain drops the row on those, and \
+         that is how 825,783 ticks a session were being discarded outright"
+    );
+    assert!(!s.folded(), "no candle may be folded from a zero timestamp");
+}
+
+#[test]
+fn a_zero_timestamp_without_a_receipt_time_is_still_refused_outright() {
+    // The guard that keeps this compatible with the 2026-08-09 / 2026-08-25
+    // adversarial regressions instead of reversing them.
+    //
+    // `row_timestamp_ist_nanos` substitutes the receipt time for an
+    // out-of-band LTT, but ONLY when the caller has one. With no receipt time
+    // it falls back to the raw value, so a kept ts=0 row would land in a 1970
+    // partition that retention and archival — both keyed on the trading day —
+    // can never reach. That is the same unreachable-partition defect as
+    // year-2106, approached from the other end of the number line.
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+
+    let s = agg.consume_tick(
+        Feed::Dhan,
+        &tick_with_receipt(0, 0.0, 0),
+        None,
+        |_, _, _, _, _| panic!("must never seal"),
+    );
+
+    assert!(
+        s.refused_timestamp,
+        "with NO receipt time the writer cannot stamp the row safely, so the \
+         fold must refuse it outright"
+    );
+    assert!(!s.untraded_timestamp);
+}
+
+#[test]
+fn genuinely_corrupt_timestamps_stay_hard_refusals_even_with_a_receipt_time() {
+    // Only EXACTLY zero is the sentinel. 0xFFFFFFFF is ~year 2106 and a
+    // below-floor non-zero value is corruption; both must keep costing the row,
+    // because writing them puts a row under a garbage designated timestamp.
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+
+    for poison in [u32::MAX, 1, 1_599_999_999, 2_524_608_001] {
+        let s = agg.consume_tick(
+            Feed::Dhan,
+            &tick_with_receipt(poison, 100.0, 1_787_000_000_000_000_000),
+            None,
+            |_, _, _, _, _| panic!("must never seal"),
+        );
+        assert!(
+            s.refused_timestamp,
+            "ts {poison} is corruption, not the never-traded sentinel, and must \
+             stay a hard refusal"
+        );
+        assert!(!s.untraded_timestamp, "ts {poison} is not the sentinel");
+    }
+}
