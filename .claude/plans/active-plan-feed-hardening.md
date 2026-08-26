@@ -2652,3 +2652,106 @@ Fixes DETECTION, not loss. The 75-second depth cliff becomes ~23 minutes on
 today's volume; it does not become infinite, and past the ceiling depth rows are
 still dropped — counted and paged, as before. Nothing here addresses the disk
 saturation (~94:1 amplification) that makes a stall likely in the first place.
+
+---
+
+## Item 26 — depth-200 disconnects itself ~265×/session (2026-08-26)
+
+- [x] **26 — client-originated keepalive ping on the one endpoint Dhan never pings**
+  - Files: `crates/core/src/websocket/pool_budget.rs`, `connection.rs`, `pool_supervisor.rs`
+  - Tests: `crates/core/tests/depth200_client_keepalive_guard.rs` (8)
+
+### Design
+
+Measured, prod, market open, 2026-08-26:
+
+| endpoint | connects | disconnects |
+|---|---|---|
+| main_feed (×5) | 5 | **0** |
+| order_update | 1 | **0** |
+| depth_20 (×5) | 15 | 10 (2 Dhan RST clusters) |
+| **depth_200 (×5)** | 265 | **265 — all self-inflicted, `idle_secs: 27`** |
+
+`tv_dhan_ws_control_frames_total{kind="ping"}`: main_feed **3,460**, depth_20
+**12,110**, depth_200 — **series absent entirely**. The counter is created
+lazily on first ping, so an absent series means depth-200 received **no control
+frame at all** in a whole session. `docs/dhan-ref/full-market-depth.md:107`
+claims it pings every 10 s. That claim is false for this endpoint.
+
+`IdleWatchdog`'s header states its purpose: *"this timer is not merely 'is the
+server quiet?' — it is also, and mostly, **'have WE stopped draining?'**"*. It
+can only mean that because Dhan pings, our library auto-pongs **only while the
+read loop polls**, and arriving traffic therefore proves we are draining. With
+no server ping there is nothing to pong, so on depth-200 the only activity is
+market data — and the watchdog silently degrades into **a liquidity detector**.
+Its five instruments are FINNIFTY / MIDCPNIFTY / NIFTY options, which
+legitimately go 27+ s without a book update. Three of the five cycled 19 times
+each and then stopped dead at **09:14:45**; nothing was fixed at 09:15, the
+market opened.
+
+The fix restores the intended semantics rather than muting the symptom: we send
+a Ping every 10 s, Dhan pongs, and **the pong arrives only if the socket is
+alive AND our read loop is draining** — exactly the question the watchdog was
+built to ask. Merely widening the timeout would leave it measuring liquidity.
+
+The receiving half already existed: the 2026-08-19 repair routes
+`Message::Pong` → `SocketEvent::KeepAlive` → `ConnEvent::KeepAliveReceived` →
+`record_activity`. This change only supplies something to receive.
+
+### Edge Cases
+
+- Sited on the **existing 1 s idle ticker**, not a new timer: a second
+  `select!` arm would be a second way to hold this task away from `recv`, and
+  catching a reader that stopped polling is the watchdog's entire job.
+- `last_client_ping` seeded to **now**, so a freshly-dialled socket does not
+  ping while its subscribe is still in flight.
+- Monotonic `Instant`, never wall time — an NTP step must not conjure or
+  suppress a keepalive.
+- Const-asserted: ≥2 pings fit inside the 27 s idle window (one lost ping or
+  pong cannot expire a healthy socket), 2 intervals fit inside Dhan's
+  documented 40 s client-silence close, and the interval is never below the
+  tick that drives it.
+
+### Failure Modes
+
+- **Dhan does not answer pings on this endpoint** → nothing changes; the
+  watchdog keeps governing at 27 s exactly as today. `let _ =` at the call site
+  makes that explicit: escalating a failed keepalive would turn "no pong here"
+  into a disconnect, which is worse than the behaviour being fixed.
+- **Someone resets the watchdog on SEND instead of on the pong** → the watchdog
+  is silently disabled (we would always look active because we always ping).
+  Pinned by a bite-proven test.
+
+### Test Plan
+
+8 tests, all green. **Bite-proven**: adding `record_activity` at the send site
+fails `the_watchdog_reset_stays_on_the_received_pong_not_on_the_send` and
+nothing else — the guard catches precisely the dangerous edit.
+
+`cargo test -p tickvault-core` → **0 failed** (lib alone: 2,343 passed).
+
+### Rollback
+
+Single revert. The trait method is required rather than defaulted deliberately
+— a default returning `Ok(())` would let a transport claim keepalive support it
+does not have, and that failure would look exactly like a healthy socket.
+
+### Observability
+
+`tv_dhan_ws_client_keepalive_ping_total{endpoint,outcome}` — local exporter
+only, **no EMF selector entry** (`user-data.sh.tftpl` at zero free bytes,
+Item 14e). It exists so the fix can be VERIFIED on the box, not so it can page.
+
+### Honest envelope
+
+**Whether Dhan answers pings on depth-200 is UNVERIFIED** — we have never let a
+socket run past 27 s to find out, and no vendor doc covers it. The change is
+fail-safe in both directions, but it must NOT be claimed to work until measured.
+The verification is two live readings on the next session: `…client_keepalive_ping_total{outcome="sent"}`
+climbing, and `tv_dhan_ws_control_frames_total{kind="pong",endpoint="depth_200"}`
+**coming into existence for the first time**. If the second series stays absent,
+Dhan does not pong here and the next lever is the watchdog threshold.
+
+This also removes the need to answer that question defensively: a 10 s client
+ping means we are never silent, so Dhan's 40 s client-silence close cannot be
+reached regardless of whether it would have applied.
