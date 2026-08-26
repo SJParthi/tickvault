@@ -283,6 +283,78 @@ pub fn select_live_universe(
 // the writer never produces, finds nothing, falls back, and the result is
 // indistinguishable from "the master resolved nothing usable".
 
+/// Fraction of the authorized envelope that must remain free before the
+/// headroom warning fires, expressed as a divisor: `capacity / 10` = 10%.
+///
+/// Chosen against the measured shape, not picked round. The 2026-08-22 live
+/// reading was 22,996 of 25,000 — **8% free** — and index option chains are
+/// deliberately UNCAPPED, having been observed at 2,037 contracts for three
+/// underlyings. One volatile expiry closes a gap that size.
+pub const UNIVERSE_HEADROOM_WARN_DIVISOR: usize = 10;
+
+/// Warns while there is still time to act on a universe approaching the
+/// subscription ceiling.
+///
+/// # Why this exists at all
+///
+/// Overflow is not graceful here and must not be made graceful: `plan_pool`
+/// refuses the WHOLE pool rather than truncating it, so crossing the ceiling
+/// costs the entire session's feed rather than its excess. That fail-closed
+/// shape is correct — silently subscribing a subset would be a false-OK about
+/// coverage — but it means the only safe place to notice the problem is
+/// BEFORE it happens, and until now nothing did. The size gauge shows today's
+/// number; nothing said how close today's number was to the edge.
+///
+/// # Why the constant is read here
+///
+/// `MAX_DAILY_UNIVERSE_SIZE` had ZERO production readers. Its own doc records
+/// that the function which once enforced it was deleted on 2026-07-13, and
+/// that the live lane subsequently ran at 4,565 SIDs against a stated cap of
+/// 1,200 with nothing halting — a documented limit that enforced nothing, so
+/// anyone reading it believed a check existed where none did. It is read here
+/// as a cross-check on the capacity the caller passed: if the two ever
+/// disagree, the constant is stale and says so, instead of sitting in the
+/// tree looking authoritative.
+///
+/// Pure apart from the log/metric side effects. O(1).
+fn report_universe_headroom(instruments: usize, capacity: usize) {
+    let headroom = capacity.saturating_sub(instruments);
+    let warn_below = capacity / UNIVERSE_HEADROOM_WARN_DIVISOR;
+
+    if capacity != tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE {
+        // Not an error — the caller's capacity is the REAL bound (it comes
+        // from the endpoint's subscription capacity) and is allowed to differ.
+        // What is not allowed is for the documented constant to drift out of
+        // step with it unnoticed, which is how it became decorative.
+        tracing::warn!(
+            capacity,
+            documented_max = tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE,
+            "the live subscription capacity and MAX_DAILY_UNIVERSE_SIZE disagree — the \
+             capacity in force is the one logged here; the constant is documentation and \
+             is now stale. Bring them back into lockstep or the constant misleads the \
+             next reader."
+        );
+    }
+
+    if headroom < warn_below {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "universe_headroom_low",
+            instruments,
+            capacity,
+            headroom,
+            warn_below,
+            "live universe is within {headroom} instruments of the {capacity} ceiling. \
+             Crossing it does NOT drop the excess — the whole subscription is refused \
+             and the session runs with no feed at all. Index option chains are uncapped \
+             by design, so one volatile expiry can close a gap this size. Act before the \
+             next session: raise the ceiling or narrow the spot universe."
+        );
+    } else {
+        tracing::info!(instruments, capacity, headroom, "live universe headroom");
+    }
+}
+
 /// Why a daily artifact could not be turned into a master list.
 ///
 /// Two variants rather than one because they mean different things and want
@@ -418,10 +490,14 @@ pub fn resolve_live_universe(
     // than 2026-08-21), and it is pinned by
     // `ntm_wins_when_both_narrowing_flags_are_on` so it cannot be reversed by
     // someone tidying the two branches into a different order.
+    let mut ntm_used = false;
     if cfg.spot_universe_ntm_only {
         let ntm_path = crate::dhan_universe::ntm_spot_artifact_path(date_ist);
         match read_master_artifact(&ntm_path) {
-            Ok(m) => master = Some(m),
+            Ok(m) => {
+                master = Some(m);
+                ntm_used = true;
+            }
             Err(failure) => {
                 metrics::counter!(
                     MASTER_SOURCING_FALLBACK_COUNTER,
@@ -466,6 +542,29 @@ pub fn resolve_live_universe(
         }
     }
     let narrowed = master.is_some();
+    // WHICH narrowing actually produced the master, for the log label.
+    //
+    // The label used to be a two-arm ternary — `narrowed ? "fno_underlyings"
+    // : "full_master"` — with NO NTM arm, even though NTM is tried FIRST and
+    // wins when both flags are on. So an NTM universe was reported as
+    // `fno_underlyings`, naming a narrowing that had not run.
+    //
+    // MEASURED 2026-08-25: the box logged `spot_universe: "fno_underlyings",
+    // instruments: 865` while the artifact line the same session read
+    // `ntm_constituents: 746, nse_indices: 119` — 746 + 119 = exactly the 865
+    // subscribed. NTM was working perfectly and the label said otherwise.
+    //
+    // That cost a real false finding: an audit read the label, concluded the
+    // operator's NTM requirement was NOT being met, and was about to report a
+    // gap that did not exist. A label is not decoration — it is what the next
+    // reader trusts instead of re-deriving the answer.
+    let spot_universe_label = if !narrowed {
+        "full_master"
+    } else if ntm_used {
+        "ntm"
+    } else {
+        "fno_underlyings"
+    };
 
     let master = match master {
         Some(m) => m,
@@ -502,14 +601,11 @@ pub fn resolve_live_universe(
             #[allow(clippy::cast_precision_loss)]
             // APPROVED: bounded by the capacity envelope, far below 2^53.
             metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(selection.instruments.len() as f64);
+            report_universe_headroom(selection.instruments.len(), capacity);
             tracing::info!(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
-                spot_universe = if narrowed {
-                    "fno_underlyings"
-                } else {
-                    "full_master"
-                },
+                spot_universe = spot_universe_label,
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
@@ -523,11 +619,7 @@ pub fn resolve_live_universe(
             tracing::error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 master_entries = master.len(),
-                spot_universe = if narrowed {
-                    "fno_underlyings"
-                } else {
-                    "full_master"
-                },
+                spot_universe = spot_universe_label,
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
@@ -751,6 +843,76 @@ pub async fn await_mapping_artifact(
 
 #[cfg(test)]
 mod tests {
+
+    /// The three spot-universe sources must produce THREE distinct labels.
+    ///
+    /// MEASURED 2026-08-25: the box logged `spot_universe: "fno_underlyings",
+    /// instruments: 865` while the same session's artifact line read
+    /// `ntm_constituents: 746, nse_indices: 119` — which is exactly 865. NTM
+    /// was working and the label named a narrowing that had not run, because
+    /// the label was a two-arm ternary with no NTM case.
+    ///
+    /// Source-scanned rather than called: the label is computed inside
+    /// `resolve_live_universe`, which needs an artifact on disk. What must not
+    /// regress is the SHAPE — a two-arm ternary cannot describe three sources,
+    /// and that is checkable without a filesystem.
+    #[test]
+    fn the_spot_universe_label_has_an_arm_for_every_source() {
+        let full = include_str!("dhan_live_universe.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        for label in ["\"ntm\"", "\"fno_underlyings\"", "\"full_master\""] {
+            assert!(
+                src.contains(label),
+                "the label {label} must exist — three sources need three names"
+            );
+        }
+        assert!(
+            src.contains("let spot_universe_label ="),
+            "the label must be computed once and reused, not re-derived per log site"
+        );
+        assert_eq!(
+            src.matches("spot_universe = spot_universe_label").count(),
+            2,
+            "both the success and the fallback log line must use the SAME computed label — \
+             two independently-written ternaries are how the NTM arm went missing"
+        );
+        // The exact shape that was wrong: a `narrowed` ternary choosing
+        // between only fno_underlyings and full_master.
+        assert!(
+            !src.contains("spot_universe = if narrowed {"),
+            "the two-arm ternary must not come back — it cannot name the NTM source"
+        );
+    }
+
+    /// NTM winning must SET the flag the label reads, or the label silently
+    /// falls back to naming the F&O narrowing again.
+    #[test]
+    fn the_ntm_success_path_records_that_ntm_was_used() {
+        let full = include_str!("dhan_live_universe.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let src = full.split(test_marker).next().unwrap_or(full);
+
+        let ntm_branch = src
+            .find("if cfg.spot_universe_ntm_only {")
+            .expect("the NTM branch must exist");
+        let fno_branch = src
+            .find("if master.is_none() && cfg.spot_universe_fno_underlyings_only {")
+            .expect("the F&O branch must exist");
+        assert!(
+            ntm_branch < fno_branch,
+            "NTM is tried FIRST — that ordering IS the 2026-08-22-over-2026-08-21 precedence"
+        );
+        assert!(
+            src[ntm_branch..fno_branch].contains("ntm_used = true"),
+            "the NTM success arm must record that it won, or the label names the wrong source"
+        );
+        assert!(
+            !src[fno_branch..].contains("ntm_used = true"),
+            "only the NTM arm may set it"
+        );
+    }
     /// Precedence is expressed by ORDER — the NTM branch runs first and the
     /// F&O branch is guarded by `master.is_none()`. That is a real decision
     /// (operator 2026-08-22 supersedes 2026-08-21) sitting in a form that a
@@ -762,6 +924,53 @@ mod tests {
     /// artifacts from disk. This asserts the exact property that matters and
     /// that the exemption otherwise leaves unchecked: with both flags on, the
     /// F&O read cannot run once NTM has produced a set.
+    /// `MAX_DAILY_UNIVERSE_SIZE` had zero production readers. This is now a
+    /// reader, and this test is what stops it becoming decorative again.
+    ///
+    /// The number itself is the one the scope lock derives: 5 main-feed
+    /// connections x 5,000 instruments each. If the capacity ever stops
+    /// matching that derivation the constant is lying about the bound, which
+    /// is exactly the state the audit found it in.
+    #[test]
+    fn the_documented_universe_ceiling_is_actually_read_and_matches_its_derivation() {
+        use tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE;
+
+        assert_eq!(
+            MAX_DAILY_UNIVERSE_SIZE, 25_000,
+            "the ceiling is 5 connections x 5,000 instruments — the main-feed subscription \
+             capacity, not a round number"
+        );
+
+        // The warn band must leave real room to act. A 1% band on 25,000 is
+        // 250 instruments — less than one index option chain, i.e. a warning
+        // that arrives after the decision is already made.
+        let warn_below = MAX_DAILY_UNIVERSE_SIZE / UNIVERSE_HEADROOM_WARN_DIVISOR;
+        assert!(
+            warn_below >= 2_000,
+            "the headroom warning must fire while at least one full index option chain \
+             still fits (2,037 contracts observed for three underlyings); {warn_below} \
+             would arrive too late to act on"
+        );
+
+        // The measured 2026-08-22 reading — 22,996 of 25,000 — must be inside
+        // the warn band. If it is not, this warning would have stayed silent
+        // through the exact state that prompted it.
+        assert!(
+            MAX_DAILY_UNIVERSE_SIZE - 22_996 < warn_below,
+            "the live 2026-08-22 universe (22,996 of 25,000) must trip the headroom \
+             warning; a band that misses it is decoration"
+        );
+
+        // And the function must actually be called on the success path —
+        // publishing headroom only when something already broke is the
+        // fallback-only-tripwire shape this file rejected for the size gauge.
+        let src = include_str!("dhan_live_universe.rs");
+        assert!(
+            src.contains("report_universe_headroom(selection.instruments.len(), capacity)"),
+            "the headroom report must run on the MASTER-SOURCED success path, not only \
+             on a failure branch"
+        );
+    }
     #[test]
     fn ntm_wins_when_both_narrowing_flags_are_on() {
         let src = include_str!("dhan_live_universe.rs");

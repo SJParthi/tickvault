@@ -772,3 +772,332 @@ instead of the log field (the gauge does not reach CloudWatch); makes the
 filter `breaching` on missing data (pages every night and weekend); adds the
 EMF name without the byte-budget restructure §2.3d-ii describes; or reports the
 deadline as met on the strength of a dial rather than a completed attach.
+
+### §2.3f — 2026-08-25: the cross-verify verdict gets its page, and the watchmen get watched
+
+**The verbatim operator authorization (2026-08-25, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Fix wbrytjonf dude oaku"
+
+Given in DIRECT response to a message whose "Still open, not done" list named exactly
+these items and stated that the first needed his go: *"**No new alarm exists.** Fix 3
+made one *writable*; creating it needs your dated quote per §3 of the noise lock"* and
+*"**The start-watchdog Lambda has no `Errors` alarm** — the only Lambda in the tree
+without one, and it's the component that starts the box and pages about it. Small and
+self-contained if you want it."* This section is the dated record the rule-file-first
+law requires, written BEFORE the terraform.
+
+#### ⚠ First, a correction to the message that earned this quote
+
+The claim that the start-watchdog is **the only** Lambda without an `Errors` alarm is
+**FALSE**, and it understated the gap by six times. Counted in source the same day:
+13 `aws_lambda_function` resources, **7** with an `Errors` alarm, **6 without**:
+
+| Unalarmed Lambda | What it does when it works | What its silence costs |
+|---|---|---|
+| `start_watchdog` | starts the box at 08:30 IST, retries, verifies the 17:30 stop | a failed start pages nobody; the trading day is simply missing |
+| `hard_stop_guard` | force-stops the box outside its window / over budget | a failed stop bills silently; a spuriously-failing one is invisible |
+| `boot_heartbeat_gate` | arms and disarms the boot alarm around the window | a stuck gate leaves the boot alarm armed all night or disarmed all morning |
+| `deploy_watchdog` | detects a box booted on a stale binary | the 2026-07-09 stale-binary class returns unannounced |
+| `tv_daily_budget_digest` | the daily spend digest | the digest just stops arriving |
+| `questdb_console_proxy` | serves the console (its FRONT half **is** alarmed) | half a surface watched, half not |
+
+The pattern is this file's own recurring one: **a set nobody enumerated.** The seven
+that are alarmed were each added by the PR that created them; the six that are not were
+each created by a PR that did not think to. Nothing was ever decided about them.
+
+#### What this section authorizes
+
+**(a) The cross-verification verdict becomes a page.** Family (5) gains a ninth and
+tenth signal: `tv-<env>-errcode-ws-gap-03-xverify-vacuous` and
+`tv-<env>-errcode-ws-gap-03-xverify-failed`. The 15:41 live-vs-official comparison is
+the only ground truth the revived Dhan feed has, and both of its failure verdicts —
+compared ZERO minutes, or could not run at all — reach nothing today.
+
+They are **log-filter** alarms, not metric alarms, and that is deliberate:
+`tv_dhan_feed_xverify_runs_total` is 31 bytes and needs 32 with its separating pipe
+against 31 free in the user-data budget (§2.3d-ii) — so the EMF route misses **by one
+byte**, while the log-filter lane costs no user-data byte at all.
+
+Each pattern carries **three** conditions, not the usual two:
+
+```
+{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_vacuous" }
+{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_failed"  }
+```
+
+**Two entries rather than one `||` pattern, deliberately.** The first draft matched
+both verdicts in a single `($.source = "a" || $.source = "b")` filter, and
+`terraform plan` accepted it — which means nothing: the provider treats `pattern` as
+an opaque string, so filter-pattern SYNTAX is parsed only by the real
+PutMetricFilter call at APPLY time. A malformed pattern would pass every PR check
+and break the post-merge apply lane. Two single-condition entries use only the shape
+already proven live by `ws-gap-03-universe-collapse`, cost one extra dime, and name
+the two verdicts separately — which is better triage anyway, since they have
+different causes and different next steps.
+
+`WS-GAP-03` has ~50 emit sites in `dhan_feed_stack.rs` — every dial failure, reconnect
+and pool event — so a bare code filter would page on ordinary connection churn. That is
+the RISK-GAP-03 noise trap with fifty times the surface, and it is the same mistake
+§2.3d-i records being approved and then caught. The `source` field, added by PR #1808
+specifically so this alarm could exist, appears on exactly these two emits.
+
+`ok_recovery = false`: the comparison runs **once per session**, so an auto-OK an hour
+later means the datapoint aged out, never that the next run compared anything.
+
+**(b) All six unalarmed Lambdas get an `Errors` alarm**, on the house shape — `Sum >= 1`
+over 300s, `notBreaching`, and `ok_actions = []` (their auto-OK is an aged-out datapoint,
+never a fix — the round-14 precedent).
+
+**(c) A ratchet, which is the durable half.** Six alarms fix today's list; they do not
+stop the seventh Lambda from arriving unwatched next month, which is exactly how these
+six accumulated. `every_lambda_has_an_errors_alarm_or_a_declared_exemption` reads every
+`aws_lambda_function` in the terraform directory and requires each to have an `Errors`
+alarm targeting it, or to be declared exempt with a reason. A new Lambda now fails the
+build until someone decides.
+
+#### Honest cost
+
+8 new alarms at ~$0.10/mo = **~$0.80/mo**. Measured against the live account the same
+day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** with the
+90% `STOP_EC2_INSTANCES` action line at **$117**. No new EMF name, no user-data byte.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make the feed work.** The cross-verify alarm reports that the comparison
+  produced no verdict. A non-zero `compared` remains the only evidence this repository
+  can offer that ticks arrive, and no alarm produces one.
+- **It does not fix the AZ pin.** The message that earned this quote also listed
+  automatic AZ failover, and that one is NOT taken here: remediation means flipping
+  termination protection, snapshotting a 200 GB root, TERMINATING the production
+  instance, re-applying, and restoring. That is a destructive, hard-to-reverse operation
+  on the live trading box, and "fix everything" is not the explicit go-ahead a terminate
+  needs. Detection is already correct and already pages (`classify_start_failure` names
+  the remedy). Automating the remediation needs its own dated quote that says so in as
+  many words.
+- **An `Errors` alarm catches a Lambda that THROWS.** A Lambda that returns success
+  having done nothing useful is invisible to it, because a dropped schedule produces
+  no error at all. **CORRECTED 2026-08-25 (same day, by an adversarial re-read):** an
+  earlier draft of this row claimed `start_watchdog` has "its own not-invoked alarm".
+  It does NOT. A tree-wide scan for `metric_name = "Invocations"` returns exactly TWO
+  alarms — on `dhan-token-minter` and `market-hours-liveness-gate` — and
+  `start-watchdog-lambda.tf` declares one alarm only. So the component that STARTS the
+  trading box every morning is blind to the 2026-07-02 repo-wide scheduler-drop class,
+  and this row asserted the opposite while pointing at it as reassurance. Adding that
+  alarm is a real follow-up; claiming it already existed was exactly the false-OK this
+  file exists to stop.
+
+#### What a PR that violates §2.3f looks like (REJECT)
+
+- Filters either cross-verify alarm on `WS-GAP-03` alone, or drops the `source` condition
+  (pages on every reconnect — the trap this section exists to avoid).
+- Sets `ok_recovery = true` on it (a once-per-session emitter cannot recover by aging).
+- Adds an `aws_lambda_function` without an `Errors` alarm or a declared exemption.
+- Gives any of the eight `ok_actions` (a green "recovered" page for an aged-out
+  datapoint is the Rule-11 false-OK the round-14 note records).
+- Ships the EMF name for `tv_dhan_feed_xverify_runs_total` without the byte-budget
+  restructure §2.3d-ii describes — it is over by one byte, and shaving an unrelated
+  comment to make room is what that guard's own message forbids.
+- Automates an instance TERMINATE for AZ failover under cover of this quote.
+
+### §2.3g — 2026-08-25: the disk went to 20 KB free and 15 tables suspended, and neither gauge had an alarm
+
+**The verbatim operator demand (2026-08-25, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see menawhoel alogn with these ensure to achieve O(1) irrepsetcive of any woerts case sistauitons or errros or scenarios it can ve any stuaitons dudew which is db memory ram app forntend backend ir tut ca be antthing dude see which is forntend bakcend db app memory ram db aws isnatcnes ebs iops imbs disk rpessure ram wal disk spill ring ufefr dlq or etc etc"
+
+> "See this process shod lbe entitled fully comprehsoisnvely automated no manual intervention or human inputs or human monitoring shod lobe expected"
+
+The quote names **disk pressure, WAL and disk spill** by hand and rules out
+human monitoring. This dated row is the rule-file edit §3 requires before any
+new page, recorded BEFORE the terraform.
+
+#### The evidence, read from the live account rather than inferred
+
+`get-metric-statistics`, namespace `Tickvault/Prod`, 2026-08-25:
+
+| IST | `tv_spill_dir_free_bytes` (Min) | `tv_questdb_wal_suspended_tables` (Max) |
+|---|---:|---:|
+| 08:30 | **38.8 GB** | 0 |
+| 09:30 | **14.5 GB** | 0 |
+| 10:30 | **20,480 bytes** | 3 |
+| 11:30 | 20,480 bytes | **15** |
+| 12:30 | 20,480 bytes | 11 |
+| 13:30 | 58.6 GB | 0 |
+
+24 GB vanished in the first hour, the volume sat at **twenty kilobytes free**
+for three hours, and fifteen tables suspended themselves. A WAL-suspended
+QuestDB table keeps ACKing ILP writes while silently not applying them, so
+every writer reported success throughout.
+
+**Neither metric has an alarm.** Verified live:
+`describe-alarms --query 'MetricAlarms[?MetricName==...]'` returns EMPTY for
+both. Both are EMF-selected and both reached CloudWatch on schedule — the data
+was there, in the operator's own account, the whole time, and nothing was
+watching it. The hour of warning between 38.8 GB and 14.5 GB went to nobody.
+
+#### ⚠ A claim from the same audit that live data REFUTED
+
+The audit reported that `tv-prod-disk-fill-rate-high` "cannot fire inside a
+session" because its 6-hour period × 2 evaluations needs 12 hours of data on a
+box that runs ~9. **That is FALSE**, and it is recorded here because acting on
+it would have damaged a working alarm. `describe-alarms` returns:
+
+> `Threshold Crossed: 1 out of the last 2 datapoints [1.4588218265938622 (25/08/26 12:22:00)] was not greater than the threshold (4.0)`
+
+It evaluates, it produces datapoints, it can fire. Its periods are wall-clock
+aligned, not "12 hours of samples" — a 9-hour session spans two aligned 6-hour
+buckets and both carry samples.
+
+**What the same reading DOES show is worse than the claim it refutes.** On the
+day the volume hit 100% for three hours, this alarm measured **1.46 points per
+day against a threshold of 4** — arithmetically correct and completely useless.
+The 24-hour drift stays low *because* overnight archival drops partitions; the
+failure is INTRADAY, and a daily-trend alarm cannot see an intraday fill by
+construction. Its 6-hour window is the right window for the trend it measures
+and must not be "fixed"; what was missing is an intraday signal, which is
+exactly what the free-bytes gauge is.
+
+#### What this authorizes — family (5) gains an ELEVENTH and TWELFTH signal
+
+| Alarm | Metric | Fires when | Why this shape |
+|---|---|---|---|
+| `tv-<env>-spill-dir-free-low` | `tv_spill_dir_free_bytes` | `Minimum <= 20 GiB` | 20 GiB is ~1 hour of headroom at the MEASURED 24 GB/h open burn, and the archiver's own high-water trigger sits at 75% used — this fires while remediation is still possible, not after |
+| `tv-<env>-questdb-wal-suspended` | `tv_questdb_wal_suspended_tables` | `Maximum >= 1` | The ONE detector for the one failure where every tick counter reports success and the rows are not there. Threshold 1, not 3: a single suspended table is already silent loss for that table |
+
+Both `treat_missing_data = notBreaching` and ungated: the box is stopped
+overnight, so no-data is the normal off-hours state, and each reports a DEFECT
+rather than silence. The dark-lane case is already owned by
+`dhan-no-ticks-flowing` (§2.3b-i). Neither takes `ok_actions` — a gauge falling
+back is an aged-out datapoint or a recovery the operator performed, never proof
+the space came back (the round-14 precedent).
+
+**Cost:** 2 alarms ≈ **$0.20/mo**, no new EMF name and no user-data byte —
+which matters, because the user-data template renders at exactly its
+15,872-byte budget with **zero** free (§2.3d-ii), so an EMF-route alarm is
+currently impossible.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on free bytes does not create free bytes. The volume filled because a
+session's ingest exceeds what 300 GB holds with a 2-day archival floor, and
+that arithmetic is untouched here. This converts a three-hour full disk that
+reached the operator only when he asked why a table was empty into a page an
+hour before it happens — that is the entire claim.
+
+It also does not fix the probe that FEEDS the WAL gauge. Until 2026-08-25 a
+QuestDB schema drift that changed the `suspended` cell's TYPE made
+`parse_wal_tables_response` skip every row and return `Ok(vec![])`, which set
+the gauge to a confident **0**. Alarming a gauge whose producer can fail open
+would be alarming a lie; the probe now returns `AllRowsSkipped` instead, so the
+alarm has something honest to read. `tv_wal_suspension_probe_failed_total` is
+still NOT EMF-selected and so is still CloudWatch-invisible — blocked by the
+same zero-byte budget, recorded rather than papered over.
+
+#### What a PR that violates §2.3g looks like (REJECT)
+
+- Changes `disk_fill_rate_high`'s 6-hour period on the strength of the refuted
+  "cannot fire" claim.
+- Gives either alarm `ok_actions` (a green "recovered" for an aged-out
+  datapoint is the Rule-11 false recovery).
+- Makes either `breaching` on missing data (pages every night and weekend).
+- Alarms the WAL gauge while leaving the probe able to fail open.
+- Adds a per-INSTRUMENT dimension to either (the §2.3 cardinality rule stands).
+
+### §2.3h — 2026-08-25: the byte budget that blocked three counters was already freed, and one of them guards an alarm shipped hours earlier
+
+**The verbatim operator authorization (2026-08-25, typed directly in-session):**
+
+> "Yes go ahead fix and resolve everything"
+
+Given in DIRECT response to a message that named exactly this work, its cost, and
+the correction that unblocked it: *"the follow-up is now genuinely available, and
+it's small: EMF-select the four counters — the three that make your per-minute
+high/low recovery visible (firing 2,632 times a session today, currently with no
+way to alarm if it stops) and `tv_wal_suspension_probe_failed_total`."* This
+dated row is recorded BEFORE the terraform and the selector edit, per the
+rule-file-first law.
+
+#### ⚠ First, the correction that makes this possible — I said this was blocked, four times
+
+§2.3d-ii records the user-data template rendering at **exactly 15,872 of 15,872
+bytes, zero free**, and names that as the reason `tv_wal_suspension_probe_failed_total`
+could not be EMF-selected. §2.3g repeats it. I repeated it again in three separate
+session check-ins, each time citing the one before rather than re-measuring.
+
+**It stopped being true on 2026-08-25**, when #1815 performed the exact
+restructure the guard's own message prescribes — moving the EMF selector OUT of
+the boot template and into `deploy/aws/cloudwatch-agent.json`, `cp`'d into place
+after the Step 5 repo clone. Measured across commits:
+
+| commit | rendered user-data |
+|---|---:|
+| `18aebcfb1~1` (before #1815) | **15,841** — 31 bytes free |
+| `18aebcfb1` (#1815) | **13,869** |
+| `cacea254d` (#1817) | 13,869 |
+
+So ~2,000 bytes were freed, and better than that: `cw_agent_selector_lockstep_guard`
+now **forbids** a second copy in the boot template, so adding an EMF name costs
+**zero** user-data bytes rather than 33. The blocker is not merely relieved, it is
+structurally gone.
+
+**The reusable lesson is the one this file keeps re-learning:** a measurement
+carries a date, and a measurement quoted from a quote is not a measurement. The
+byte figure was correct when first taken and stale within three days, and it was
+propagated by citation four times without anyone re-running the one command that
+settles it.
+
+#### What this authorizes
+
+| Metric | Why | Alarm? |
+|---|---|---|
+| `tv_wal_suspension_probe_failed_total` | The §2.3g `questdb-wal-suspended` alarm reads a GAUGE whose producer can fail. Before #1816 that producer could fail OPEN — return a confident 0 while tables were suspended. #1816 made it fail loud, but the counter that says so reached nothing. Without this, an alarm shipped hours earlier can be silently blind. | **YES** — `>= 1` |
+| `tv_candle_session_high_recovered_total` | The operator asked about per-minute high/low specifically. This is the count of minute-highs widened to the exchange's own running day high — prints we never received a tick for. 2,632 today. | no — see below |
+| `tv_candle_session_low_recovered_total` | Same, for lows. 247 today. | no |
+
+#### Deliberately NOT shipped, and why the omission is the judgment
+
+**`tv_candle_day_high_adopted_total` and `day_low_adopted_total` are LEFT OUT.**
+They fire on the first bucket of a session only — today they read **0 and 3**
+against the session counters' 2,632 and 247. They are a subset signal of the same
+mechanism at ~1% of the resolution, and each EMF name is ~$0.30/mo. Shipping five
+names to carry three names' worth of signal is the "paid for and unwatched" shape
+§2.3b was written to end.
+
+**The two session counters are shipped as METRICS but deliberately NOT ALARMED.**
+An alarm on "recovery stopped" would fire on a quiet market: a flat session
+legitimately sets no new day highs, so zero recoveries is a NORMAL reading, not a
+broken fold. That is precisely the noise trap this file records repeatedly — a
+pager that cries on an ordinary day teaches the operator to ignore it. They are
+charted so the mechanism is observable, and the thing that would actually indicate
+breakage (the fold refusing input) is already covered by
+`tv_indicator_tick_rejected_total`.
+
+#### Honest cost
+
+3 EMF names ≈ **$0.90/mo**, 1 alarm ≈ **$0.10/mo** ⇒ **~$1.00/mo**, zero
+user-data bytes.
+
+**Against the budget, stated rather than absorbed:** §2.3c put a maximal month at
+**$118.28** against a 90% `STOP_EC2_INSTANCES` line of **$117.00** at the live
+`limit_amount` of $130 — already **$1.28 over**, and this takes it to ~$2.28 over.
+The live account is nowhere near it (MTD **$48.87**, forecast **$61.51**, measured
+2026-08-25), so no stop is imminent — but the maximal-month arithmetic crosses the
+automatic action line and that gap widens with every addition. The levers remain
+the already-approved Quote 10 EIP release (−$3.60/mo, execution bundled with an
+instance recreate) or an operator decision on `limit_amount`, which Quote 18
+forbids raising above 125 and which cannot be set to 125 because 90% of that is
+$112.50, below the bill. Neither is taken here.
+
+#### What a PR that violates §2.3h looks like (REJECT)
+
+- Alarms `tv_candle_session_high_recovered_total` or `session_low_recovered_total`
+  (fires on a quiet market — the noise trap named above).
+- Re-adds a second copy of the EMF selector to `user-data.sh.tftpl` (the guard
+  forbids it, and it is what consumed the 2,000 bytes in the first place).
+- Cites the "15,872 with zero free" figure without re-measuring it.
+- Adds an EMF name whose producer does not exist (`emf_selector_producer_guard`).
+- Gives the probe-failed alarm `ok_actions` — a counter aging out of its window is
+  not a repair.

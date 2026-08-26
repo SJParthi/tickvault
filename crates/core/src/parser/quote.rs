@@ -20,6 +20,7 @@ use super::types::{PacketHeader, ParseError};
 /// # Performance
 /// O(1) — eleven `from_le_bytes` reads.
 #[inline]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by QUOTE_PACKET_SIZE check
 pub fn parse_quote_packet(
     raw: &[u8],
@@ -65,6 +66,7 @@ pub fn parse_quote_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;

@@ -190,13 +190,22 @@ fn tv_names(hay: &str) -> Vec<String> {
 }
 
 /// Names carried by the CloudWatch agent's EMF `metric_selectors` regex.
+///
+/// Reads `deploy/aws/cloudwatch-agent.json` — the file the box actually loads.
+/// Until 2026-08-25 this content was ALSO embedded in
+/// `deploy/aws/terraform/user-data.sh.tftpl`, and this guard read that copy.
+/// The duplicate was ~1.6 KB and it pinned the user-data template at exactly
+/// its 15,872-byte budget with zero bytes free, so it was removed: the
+/// template now writes a minimal host-only fallback and copies this file into
+/// place after the Step 5 clone. `cw_agent_selector_lockstep_guard.rs` pins
+/// that the copy still happens.
 fn emf_selected(root: &Path) -> BTreeSet<String> {
-    let path = root.join("deploy/aws/terraform/user-data.sh.tftpl");
+    let path = root.join("deploy/aws/cloudwatch-agent.json");
     let content =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
     let at = content
         .find("\"metric_selectors\"")
-        .expect("user-data carries a metric_selectors key");
+        .expect("the deployed CloudWatch agent config carries a metric_selectors key");
     let tail = &content[at..];
     let end = tail.find(']').expect("metric_selectors list is closed");
     tv_names(&tail[..end]).into_iter().collect()

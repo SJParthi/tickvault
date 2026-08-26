@@ -583,6 +583,203 @@ still in `EXECUTION_FAILURE`, every ceiling number above is arithmetic about a
 switch that does not throw, and this remains the single most important open
 item on this whole surface.
 
+
+**Quote 19 (2026-08-25, EBS grow 200 → 300 GB after a disk-full production halt — preserve EXACTLY, typos included):**
+> "go ahead with your eocmmendation dude see clelary ntoe i never evr want ot face rpessure flushign espielclay entilrey rleated to db questdb evryhtign i shoduld alwyas achieve O(1) dude okay?"
+
+Given in DIRECT response to a message recommending **200 → 300 GB, +$9.12/mo**,
+presented alongside the measured evidence below and the explicit statement that
+growing gp3 is a one-way door. This is the fresh dated quote §7 Mechanical
+Rule 3 requires before any EBS size change.
+
+**The incident this answers (MEASURED live, 2026-08-25, not estimated).** The
+200 GB root volume filled during the session. QuestDB's O3 merge failed with
+`CairoException: [28] No space left [size=70243632]` at **11:29 IST**, naming
+`table=ticks~33` and `table=market_depth~34`, and **fourteen tables
+WAL-SUSPENDED themselves**: `ticks`, `market_depth`, and every candle frame
+from `candles_1s` to `candles_1d`.
+
+| Table | sequencerTxn (accepted) | writerTxn (stored) | Behind |
+|---|---:|---:|---:|
+| `market_depth` | 244,651 | 214,743 | **29,908** |
+| `candles_1s` | 272,941 | 267,868 | 5,073 |
+| `candles_1m` | 272,415 | 267,260 | 5,155 |
+| `ticks` | 142,410 | 137,899 | 4,511 |
+| `order_audit` | 10 | 4 | 6 |
+| `order_update_events` | 10 | 4 | 6 |
+| `ws_event_audit` | 3,372 | 3,372 | 0 (healthy) |
+
+**Why this was invisible, and it is the important half.** A WAL-suspended
+QuestDB table **keeps accepting and ACKing ILP writes** while silently not
+applying them. Every writer therefore reported success: the operator's manual
+super order incremented `tv_order_update_events_rows_total{feed="dhan"}` and
+`tv_order_audit_rows_total{event="placed"}` to 6 each, no persist-error counter
+existed at all, and both tables were EMPTY. The operator found it by asking why
+his order was not in any table — not by a page.
+
+> **⚠ CORRECTED 2026-08-25 — the sentence that stood here was FALSE, and it is
+> the exact class this file's own O(1) table warns about.** It read:
+> *"`WAL-SUSPEND-01` exists for exactly this and did not fire; that gap is
+> tracked separately from this quote."* Checked against the live log rather
+> than repeated, the code **DID** fire, promptly, and it **DID** page:
+>
+> | evidence | value |
+> |---|---|
+> | coded `ERROR` events, 2026-08-25 | **70**, naming each suspended table (`ticks`, `candles_3m`, `candles_15s`, …) with `error_message: "bulk update failed and will be rolled back"` |
+> | first fire | **11:23 IST** — the volume reached 100% at ~11:11, so ~12 minutes |
+> | CloudWatch alarm | `tv-prod-errcode-wal-suspend-01`, `ActionsEnabled: True` |
+> | alarm transitions that day | OK→ALARM **11:24 IST**, →OK 12:05, OK→ALARM **12:37**, →OK 13:02 |
+>
+> So detection worked and the operator was paged twice. What actually failed
+> was the DISK, and separately the operator's own read of the situation — he
+> found the empty tables by asking, which is true, but not because nothing had
+> told him.
+>
+> **This row cost real work.** A later session read the false sentence, carried
+> it into a live risk assessment as *"the alarm for it did not fire"*, and
+> ranked "make WAL-suspension page you" as the next thing to build — work that
+> was already done and shipped on 2026-07-10 (W2 PR#6). That is the same
+> failure the `day_ohlc_tracker` row records on 2026-08-12: a stale row does
+> not merely fail to warn, it **manufactures false findings**, and the cost is
+> paid by whoever trusts it next.
+>
+> The durable lesson is narrow and worth stating: this file records what an
+> incident FELT like from the operator's side, and that is legitimate — but a
+> claim about whether a MECHANISM fired is checkable in one query
+> (`aws logs filter-log-events --filter-pattern '"WAL-SUSPEND-01"'`) and must
+> be checked before it is written, not inferred from the fact that nobody
+> noticed the page.
+
+**By 11:51 IST the box became UNMANAGEABLE.** `ssm send-command` began failing
+in **0.001 s** with empty stdout and stderr — the agent cannot allocate the
+scratch space needed to launch a shell. No remediation that requires the box
+(deleting WAL segments, `RESUME WAL`) can run until the volume grows, which is
+why the AWS-side `modify-volume` + reboot is the recovery path.
+
+**Why more disk is the correct fix and not merely the easy one.** All three
+provisioned dimensions were measured against CloudWatch peaks (22–24 Aug):
+
+| Dimension | Provisioned | Measured peak | Used |
+|---|---:|---:|---:|
+| IOPS | 6,000 | 1,168 | **19%** |
+| Throughput | 500 MiB/s | 107 MB/s | **21%** |
+| **Size** | **200 GB** | **200 GB** | **100%** |
+
+Only SIZE is exhausted. **The Quote 17 IOPS/throughput raise is therefore NOT
+reverted to fund this**, despite the tempting 19%/21% headroom: `VolumeQueueLength`
+peaked at **8.5** during the 09:24–09:34 IST open burst, which is the opposite
+signal, and a 5-minute metric bucket cannot show a ten-second burst. Trading
+provisioned I/O for size on an unexplained queue depth would be guessing.
+
+**Why the retention design did not save it.** The archival chain is exactly the
+shape the operator describes — current day hot, everything older verified into
+S3 and dropped — and it RAN: `pressure_archive_enabled = true` starts an episode
+at 75% used and shrinks the hot window to `pressure_hot_days = 2`. Two days is a
+hard floor (today and yesterday are still being written, so the archiver's
+verify cannot close the count→drop race on them). It archived everything it was
+permitted to, the volume was still full, and it raised `STORAGE-GAP-05` and
+STOPPED rather than dropping anything unverified. That is correct behaviour, and
+it means **two days of data no longer fit in 200 GB** — a fact no retention
+setting can change.
+
+**What 300 GB buys, arithmetically.** Live usage is ~157 GB QuestDB + ~35 GB
+frame WAL. At 300 GB the QuestDB working set sits at **~52%**, comfortably below
+the 75% pressure trigger, which is what the operator's "never face pressure
+flushing" requirement actually demands. (The 35 GB WAL figure is itself a defect
+already fixed in PR #1804 — the ACTIVE segment set had neither an age nor a byte
+bound — so the real post-deploy headroom is larger still.)
+
+**⚠ Honest cost, including the part that does not fit.** gp3 storage is
+$0.0912/GB-month, so +100 GB = **+$9.12/mo → ~₹920 incl GST**. Derived from
+MEASURED daily cost rather than the planning envelope: the highest full weekday
+on the current configuration is **$4.06** (Aug 21) and a weekend day is ~$2.48,
+so a maximal month is 22 × 4.06 + 8 × 2.48 = **$109.16**, going to **$118.28**
+with this grow. That is **under the Quote 18 hard cap of $125** — the constraint
+the operator actually stated.
+
+It is **NOT** under the budget's automatic action line. `limit_amount` is $130
+and `STOP_EC2_INSTANCES` fires at 90% = **$117.00**, so a maximal month now
+projects **$1.28 above the line that switches the trading box off**. This is the
+precise trap Quote 18 documented and it is recorded here rather than absorbed:
+the live budget today reads actual **$48.87** / forecast **$61.51**, so August
+itself is nowhere near it, but a full month on this configuration is. Two levers
+close it, both needing their own decision — releasing the Elastic IP (already
+approved in principle by Quote 10, −$3.60/mo, execution bundled with an instance
+recreate) or aligning `limit_amount` with the $125 cap, which cannot be done as
+written because 90% of 125 is $112.50, BELOW the projected bill.
+
+**⚠ RE-TESTED LIVE 2026-08-25 and STILL BLOCKED, for the fourth time:**
+`budgets:DescribeBudgetActionsForBudget` returns `AccessDeniedException` for
+`user/claude-code-agent`. Whether the two `STOP_EC2_INSTANCES` actions recorded
+in `EXECUTION_FAILURE` on 2026-07-31 still fail is **Unknown**. That cuts both
+ways and neither way is comfortable: if they are broken the $117 line above is
+arithmetic about a switch that does not throw, and if they are fixed the box
+gets stopped mid-month. A broken safety net is never a reason to cross a
+threshold.
+
+> ### ⚠ CORRECTED 2026-08-25 — "the kill switch may not fire AT ALL" was OVERSTATED, in four places
+>
+> Quotes 13, 17, 18 and 19 each carry a FLAGGED, UNRESOLVED note whose substance
+> is: *both `STOP_EC2_INSTANCES` budget actions were last seen in
+> `EXECUTION_FAILURE`, the read is `AccessDenied`, so **"whether the kill switch
+> works AT ALL is Unknown"** and every ceiling number above is "arithmetic about a
+> switch that does not throw."*
+>
+> The premise is true. **The conclusion is not, and the gap between them is a
+> whole second kill-switch that nobody was counting.**
+>
+> | | AWS-native budget action | `tv_hard_stop_guard` (ours) |
+> |---|---|---|
+> | Owner | AWS Budgets | this repository, `hard_stop_guard.rs` |
+> | Cadence | on budget threshold | **hourly**, `cron(0 * * * ? *)` |
+> | Reads spend from | AWS Budgets internals | Cost Explorer, `ce:GetCostAndUsage` |
+> | On breach | `STOP_EC2_INSTANCES` | stops the box, **disables the morning auto-start**, and pages |
+> | Permission | the `budget_action` role | `ec2:StopInstances` scoped by the `tv-<env>-app` Name tag |
+> | Verifiable from here | **no** — `AccessDenied` | **yes** — 34 ported tests, `classify` → `breach_stop` |
+>
+> So the honest statement is **"the AWS-NATIVE action is unverifiable"**, never
+> "the kill switch may not fire". A ceiling is not arithmetic about nothing:
+> `hard_stop_guard` enforces it hourly, in code that ships with this repo, and it
+> never consults the native action.
+>
+> **This row cost real work, which is why it is corrected rather than quietly
+> narrowed.** On 2026-08-25 an executor reported it to the operator as *"arguably
+> the most serious open item in the whole repo"* — reasoning from these four
+> sections rather than from `hard_stop_guard.rs`, which is thirty lines of
+> reading away. That is precisely the failure the O(1) table's own
+> `day_ohlc_tracker` note records on 2026-08-12: **a stale row does not merely
+> fail to warn, it manufactures false findings**, and the cost is paid by
+> whoever trusts it next.
+>
+> **THE GAP THAT WAS REAL, and that all four sections missed while watching the
+> native action:** nothing checked that OUR switch still *runs*. Its `Errors`
+> alarm is structurally blind to a dropped EventBridge schedule — no invocation
+> means no error — so a silently disabled rule reads as a permanently healthy
+> Lambda. That is the 2026-07-02 repo-wide scheduler-drop class, and it applied
+> to the budget kill-switch and to the Lambda that starts the trading box each
+> morning, simultaneously. **FIXED the same day:** six `*-not-invoked` alarms
+> (6-hour window for the two hourly guards, 24-hour for the four weekday ones),
+> plus `cloudwatch_app_alarms_wiring.rs::
+> every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption`, which
+> fails the build if a future scheduled Lambda arrives without one. That guard
+> found four of the six itself, on its first run.
+>
+> **Still Unknown, and still worth an operator's IAM edit:** whether the two
+> native actions have recovered. It is now a nice-to-know rather than a hole in
+> the safety net, and the read needs one action added to a policy — not new
+> credentials (`sts get-caller-identity`, `budgets describe-budget` and
+> `ce get-cost-and-usage` all succeed for the same identity).
+
+**One-way door.** gp3 grows online in one command and can **NEVER** shrink;
+`modify-volume` refuses a smaller size and a 300 GB snapshot cannot restore into
+anything smaller. Reversing this needs a terminate-and-recreate. `variables.tf`
+validation permits 10–200 GB, so the ceiling moves to 300 in the same change.
+
+**What Quote 19 does NOT authorize:** any instance-type change; any AZ re-pin;
+any schedule change; any IOPS or throughput change in either direction; raising
+`limit_amount`; live order fire; or any edit to the §28 frozen area. The
+operator's "never face pressure flushing / always O(1)" framing is the REASON
+for this grow, not a grant to make other changes in its name.
 ---
 
 > **[ARCHIVED 2026-07-20]** §1 The rule (retired subscription contract) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).

@@ -81,8 +81,23 @@ pub const DEPTH_20_MAX_STRIKES_EACH_SIDE: usize = 50;
 /// the WHOLE pool rather than truncating — so the fix for an under-fill would
 /// have turned into a total depth outage on the day the chain widened.
 ///
-/// Returns 0 when there are no eligible underlyings; the caller selects
-/// nothing, which is the correct answer to "depth on what?".
+/// Returns 0 for no eligible underlyings AND for a window too narrow to hold
+/// one strike either side. The two are NOT the same at the call site, and the
+/// difference was undocumented until 2026-08-25: with no underlyings the
+/// caller selects nothing, but with a collapsed window it computes
+/// `keep = each_side * 2 + 1` = 1 and still takes the ATM strike itself, both
+/// legs, per underlying. That is the RIGHT behaviour -- the single most
+/// informative strike is better than none -- but at 126 or more eligible
+/// underlyings it sums past `DEPTH_20_MAX_INSTRUMENTS`. What keeps that safe
+/// is NOT this function: it is the last-resort envelope guard in
+/// `select_depth_universe`, which truncates the nearest-ATM-first ordering and
+/// COUNTS the drop in `depth_20_dropped_for_capacity`. Unreachable today only
+/// because `contract_segment_for_underlying` admits four NSE names, so the
+/// bound is enforced by an unrelated match rather than by the sizing.
+///
+/// The superseded sentence read: "the caller selects nothing, which is the
+/// correct answer to depth on what?" -- true for the zero-underlying case and
+/// false for the collapsed-window one.
 #[must_use]
 pub fn depth_20_strikes_each_side(underlyings: usize) -> usize {
     if underlyings == 0 {
@@ -1125,11 +1140,6 @@ mod tests {
         );
     }
 
-    /// The chain parser defaults a missing `contract_security_id` to 0, and the
-    /// field is "added v2.5" upstream. A zero means the vendor did not tell us
-    /// the id — subscribing it sends a well-formed request for a nonexistent
-    /// instrument and receives silence that reads exactly like a quiet book.
-    #[test]
     /// The finding this closes: `contract_segment_for_underlying` maps only
     /// the six INDEX underlyings, so every one of the ~20,000 stock-option
     /// candidates was counted as `refused_unknown_underlying`. Five figures of
@@ -1185,6 +1195,19 @@ mod tests {
         );
     }
 
+    /// The chain parser defaults a missing `contract_security_id` to 0, and the
+    /// field is "added v2.5" upstream. A zero means the vendor did not tell us
+    /// the id — subscribing it sends a well-formed request for a nonexistent
+    /// instrument and receives silence that reads exactly like a quiet book.
+    ///
+    /// This doc comment and the `#[test]` below it were STRANDED ~55 lines
+    /// above, separated from this function by a later test that was inserted
+    /// between them. The attribute therefore landed on that other test as a
+    /// duplicate, and this function was left with none — so it compiled as
+    /// dead code and has never run. `cargo` said so on every build
+    /// ("duplicated attribute", "function is never used"); nothing failed,
+    /// because a test that does not run cannot fail.
+    #[test]
     fn test_select_depth_universe_refuses_and_counts_zero_contract_ids() {
         let rows = vec![
             candidate("NIFTY", 0, 100.0, "CE"),

@@ -35,7 +35,7 @@ pub const GST_MULT: f64 = 1.18;
 /// block in budget.tf + aws-budget.md. KEEP IN SYNC with budget.tf
 /// limit_amount + budget-guards.tf BUDGET_KILL_USD — the digest reads
 /// BUDGET_USD, the native Budget Action + killswitch fire at limit_amount.
-pub const BUDGET_USD: f64 = 130.0;
+pub const BUDGET_USD: f64 = 150.0;
 
 /// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";

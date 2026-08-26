@@ -52,6 +52,51 @@ pub const SPILL_DISK_HEALTH_POLL_INTERVAL_SECS: u64 = 60;
 /// sweep exists to eliminate.
 pub const SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
+/// Fraction of the measured filesystem the warning aims to reserve, expressed
+/// as a divisor: `total / 10` = 10%.
+///
+/// 10% is not a new number — it is the number the constant above was CHOSEN
+/// for, in its own words: *"10 GiB restores a genuinely actionable margin
+/// (~10% of the 100 GB volume)"*. What was missing is that the volume moved
+/// and the byte count did not.
+pub const SPILL_DISK_FREE_TARGET_DIVISOR: u64 = 10;
+
+/// The free-space threshold to warn at, for a filesystem of `total_bytes`.
+///
+/// # Why this is derived and not a constant any more
+///
+/// The fixed 10 GiB above was justified as "~10% of the 100 GB volume". The
+/// live root volume is **300 GB** since 2026-08-25 (Quote 19), so the same
+/// number is 3.3% — and at the fill rate measured during that day's disk-full
+/// outage it buys well under an hour, for a problem whose remediation takes
+/// longer than that. The intent was a proportion; only the arithmetic was
+/// frozen.
+///
+/// The old doc argued AGAINST a percentage on the grounds that "the spill
+/// directory and the data volume can be sized independently". That objection
+/// does not apply to what is actually measured here: `probe_disk_free_bytes`
+/// reports `total_bytes` for the filesystem the spill directory ITSELF lives
+/// on, so a fraction of that total is the same volume, not a proxy for it.
+///
+/// # The floor is what makes this safe in both directions
+///
+/// `max(FLOOR, total/10)` can only ever move the threshold UP relative to
+/// today. A small dev disk keeps the 10 GiB it has now rather than collapsing
+/// to a threshold that would fire after the disk is already unusable; the
+/// 300 GB production volume gets 30 GiB, which is the margin the constant
+/// always claimed to provide.
+///
+/// Pure and O(1). Pinned by `derived_threshold_scales_with_the_volume`.
+#[must_use]
+pub const fn spill_disk_free_critical_threshold(total_bytes: u64) -> u64 {
+    let proportional = total_bytes / SPILL_DISK_FREE_TARGET_DIVISOR;
+    if proportional > SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD {
+        proportional
+    } else {
+        SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+    }
+}
+
 /// Outcome of one health check, exposed for unit testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskHealthOutcome {
@@ -144,8 +189,10 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
         info!(
             path = %spill_dir.display(),
             interval_secs = SPILL_DISK_HEALTH_POLL_INTERVAL_SECS,
-            critical_threshold_bytes = SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD,
-            "spill disk-health watcher started"
+            critical_threshold_floor_bytes = SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD,
+            critical_threshold_divisor = SPILL_DISK_FREE_TARGET_DIVISOR,
+            "spill disk-health watcher started — the effective threshold is \
+             max(floor, total/divisor), resolved against the volume on every probe"
         );
 
         // Ensure the dir exists so `df` doesn't fail the probe.
@@ -169,12 +216,18 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                 } => {
                     m_free.set(free_bytes as f64);
                     m_total.set(total_bytes as f64);
-                    if free_bytes < SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD {
+                    // Derived per-probe, never cached: the volume can grow
+                    // online (gp3 `modify-volume` is a one-command operation
+                    // and was used on 2026-08-25), and a threshold resolved
+                    // once at startup would keep warning against the size the
+                    // box booted with.
+                    let threshold_bytes = spill_disk_free_critical_threshold(total_bytes);
+                    if free_bytes < threshold_bytes {
                         error!(
                             path = %spill_dir.display(),
                             free_bytes,
                             total_bytes,
-                            threshold = SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD,
+                            threshold = threshold_bytes,
                             "CRITICAL: spill dir free space below threshold — \
                              tick spill is at risk if QuestDB stays down"
                         );
@@ -272,6 +325,61 @@ mod tests {
         // 1 GiB minimum so the alert has meaningful runway. If a future
         // edit lowers this to a few MB, alerts fire too late.
         assert!(SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD >= 1024 * 1024 * 1024);
+    }
+
+    /// The 2026-08-25 finding: the fixed 10 GiB was sized as "~10% of the
+    /// 100 GB volume" and the volume became 300 GB, so the alert had shrunk
+    /// to 3.3% without anyone changing it.
+    ///
+    /// Bite-proof in BOTH directions — a derived threshold that silently
+    /// went DOWN on a small disk would be worse than the constant it
+    /// replaced, so the floor is asserted as hard as the scaling is.
+    #[test]
+    fn derived_threshold_scales_with_the_volume() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const GB: u64 = 1_000_000_000;
+
+        // The live production volume (300 GB gp3, verified 2026-08-25).
+        // 10% of it is 30 GB, comfortably above the 10 GiB floor, so the
+        // derived value must win.
+        assert_eq!(spill_disk_free_critical_threshold(300 * GB), 30 * GB);
+
+        // The 100 GB volume the constant was originally justified against:
+        // 10 GB proportional vs a 10 GiB floor — the FLOOR wins, because a
+        // GiB is larger than a GB. That is the intended direction (never
+        // weaker than today), and it is the case a naive `total/10` would
+        // have quietly loosened.
+        assert_eq!(
+            spill_disk_free_critical_threshold(100 * GB),
+            SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+        );
+
+        // A small dev disk keeps the floor rather than collapsing to a
+        // threshold that fires after the disk is already unusable.
+        assert_eq!(
+            spill_disk_free_critical_threshold(20 * GIB),
+            SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+        );
+
+        // Degenerate inputs cannot produce a threshold of zero, which would
+        // mean "warn when the disk is completely full" — i.e. never warn in
+        // time. `probe_disk_free_bytes` should never report 0, but a parse
+        // that returned it must not disarm the alarm.
+        assert_eq!(
+            spill_disk_free_critical_threshold(0),
+            SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+        );
+
+        // Monotonic: a bigger volume never earns a smaller warning margin.
+        let mut prev = 0_u64;
+        for gb in [50_u64, 100, 200, 300, 500, 1000] {
+            let t = spill_disk_free_critical_threshold(gb * GB);
+            assert!(
+                t >= prev,
+                "threshold must never shrink as the volume grows ({gb} GB gave {t}, previous {prev})"
+            );
+            prev = t;
+        }
     }
 
     #[test]

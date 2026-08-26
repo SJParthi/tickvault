@@ -2208,3 +2208,50 @@ rules:
       QuestDB recovers). Escalate so the operator reads the stage field
       and the tv_order_update_events_* counters per the runbook instead
       of any auto-action.
+
+  # ORDER-EVT-02 = an order-update frame PARSED but decoded HOLLOW: order_no,
+  # status and security_id all empty on a well-formed frame. OrderUpdate
+  # carries #[serde(default)] on every field, so a key-name mismatch — a Dhan
+  # schema change, an undocumented message shape, a super-order leg frame —
+  # yields a struct of defaults and NO parse error. Escalate, and there is no
+  # auto-action that could ever be right here: nothing is broken on our side
+  # to restart, and the fix is a SCHEMA decision that must be made by reading
+  # the raw frame the emit carries in its `excerpt` field. Guessing at Dhan's
+  # field names from one message would be worse than the silence it replaced.
+  # Found live 2026-08-25 on the operator's manual super order.
+  - name: order-evt-02-decoded-hollow-escalate
+    match:
+      code: ORDER-EVT-02
+    action: escalate
+    runbook_path: docs/error-runbooks/order-update-events-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      ORDER-EVT-02 = the frame decoded to an empty struct, so order data is
+      being silently discarded while every counter reads healthy. Escalate
+      so the operator reads the redacted raw excerpt and compares its key
+      set against OrderUpdate and the Dhan reference — the repair is a
+      schema change, never an auto-action, and several excerpts should be
+      collected before the struct is touched.
+
+  # TICK-SPILL-01 = a rescued tick-spill file was permanently refused by
+  # QuestDB (a 4xx that is not 408/429) and moved to quarantine so the rest of
+  # the backlog can drain. Escalate, and no auto-action is appropriate: the
+  # file is ALREADY set aside and the queue is ALREADY moving, so there is
+  # nothing to restart; what remains is a salvage judgement — which lines
+  # survived the tear and are worth re-posting — and that is the operator's.
+  # Found live 2026-08-25, when one torn line kept a 512 MB file holding
+  # 1,662,318 intact ticks from ever being attempted.
+  - name: tick-spill-01-file-quarantined-escalate
+    match:
+      code: TICK-SPILL-01
+    action: escalate
+    runbook_path: docs/error-runbooks/tick-spill-replay-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      TICK-SPILL-01 = rescued ticks are on disk, permanently unreplayable as
+      written, and set aside so the backlog drains. Escalate so the operator
+      salvages the well-formed lines per the runbook (safe to repeat — the
+      ticks dedup key carries capture_seq). No auto-action: the blocking
+      condition is already resolved by the quarantine itself.

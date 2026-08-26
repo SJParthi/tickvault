@@ -465,7 +465,10 @@ fn scan_emits() -> Vec<Emit> {
 
 /// Names in the deployed EMF `metric_selectors` allowlist.
 fn shipped_names() -> BTreeSet<String> {
-    let ud = repo_root().join("deploy/aws/terraform/user-data.sh.tftpl");
+    // The deployed agent config. Was embedded in user-data.sh.tftpl until
+    // 2026-08-25; that ~1.6 KB duplicate is gone and the template copies this
+    // file into place after the Step 5 clone.
+    let ud = repo_root().join("deploy/aws/cloudwatch-agent.json");
     let src = fs::read_to_string(&ud).expect("user-data template must be readable");
     src.lines()
         .filter(|l| l.contains("metric_selectors"))
@@ -494,7 +497,7 @@ fn every_loss_counter_is_shipped_logged_or_allowlisted() {
          A counter that measures data loss and reaches nobody is worse than no \
          counter: the loss is measured, the measurement is discarded, and the \
          dashboard stays green. Fix by ONE of:\n\
-         (a) add the name to metric_selectors in BOTH user-data.sh.tftpl and \
+         (a) add the name to metric_selectors in deploy/aws/cloudwatch-agent.json and \
          cloudwatch-agent.json, bump the count ratchet, and add a dated COST \
          NOTE (~$0.30/mo each — the budget kill-ceiling STOPS the box at 90%, \
          so this is a real decision, not a formality);\n\

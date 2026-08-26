@@ -232,6 +232,17 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "OMS-GAP-04",
     "OMS-GAP-05",
     "ORDER-EVT-01",
+    // ORDER-EVT-02 is log-sink-only because the Dhan noise lock says so, not
+    // because a hollow decode is unimportant — it means order data is being
+    // silently discarded, which on its face is exactly what should wake
+    // someone. `dhan-rest-only-noise-lock-2026-07-14.md` §1 fixes the Dhan
+    // Telegram family at four items and §3 makes any new Dhan-scoped page a
+    // REJECT without a fresh dated operator quote, so an alarm here is not
+    // this change's to make. Its sibling ORDER-EVT-01 sits in this list for
+    // the same reason. The operator surface is the coded log line, whose
+    // `excerpt` field carries the raw frame — that excerpt, not the page, is
+    // what makes the next occurrence fixable.
+    "ORDER-EVT-02",
     "ORDER-PNL-01",
     "ORDER-READY-01",
     "ORPHAN-POSITION-01",
@@ -256,6 +267,16 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "RISK-GAP-02",
     "SELFTEST-02",
     "SPOT1M-02",
+    // TICK-SPILL-01 is log-sink-only, and unlike most entries here that is
+    // a comfortable call rather than a constrained one. By the time it fires
+    // the file is already quarantined and the backlog is already draining —
+    // the condition it reports is one the system has just handled, not one
+    // waiting on a human. What needs a human is the salvage, which is not
+    // urgent: the rows are on disk and the dedup key makes the re-post
+    // repeatable whenever the operator gets to it. The urgent half of this
+    // story — the flush that failed in the first place — already pages via
+    // HOT-PATH-02 and the dhan_ticks_dropped alarm.
+    "TICK-SPILL-01",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",

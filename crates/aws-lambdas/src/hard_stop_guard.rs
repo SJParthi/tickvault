@@ -52,7 +52,7 @@ use tracing::{error, info, warn};
 /// stale fallback was a flagged follow-up while it was harmless; raising the
 /// ceiling made it a defect, so it is fixed here in the same change rather than
 /// left as a note.
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 130.0;
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 150.0;
 /// Legacy parity default for the change-only ping-state SSM param
 /// (NOT under the banned groww/* namespace).
 pub const DEFAULT_PING_STATE_PARAM: &str = "/tickvault/prod/budget-guard/ping-state";
