@@ -44,10 +44,11 @@ use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_supervisor::{LiveSubscriptionCommand, SubscribeInstrument};
 
 use crate::depth200_atm::{
-    ChainMinute, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair, TopMoverPick,
-    TopMoverSocket, plan_swaps,
+    ChainMinute, Depth200AtmConfig, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair,
+    TopMoverPick, TopMoverSocket, plan_swaps,
 };
 use crate::dhan_depth_universe::{DepthCandidate, contract_segment_for_underlying};
+use crate::dhan_feed_stack::ist_second_of_day_now;
 use crate::movers::StockMove;
 
 /// The segment a STOCK option trades in.
@@ -658,6 +659,162 @@ pub fn apply_decision(sockets: &mut [RebalanceSocket], decision: &RebalanceDecis
         }
     }
     sent
+}
+
+/// How long a movers query may take before it is abandoned for the minute.
+///
+/// Deliberately shorter than the minute it runs in. A query that outlived its
+/// own minute would return a ranking for a minute that has already passed,
+/// and the socket would chase the market one step behind all session — which
+/// looks exactly like working correctly.
+const MOVERS_QUERY_TIMEOUT_SECS: u64 = 10;
+
+/// Runs the movers query, returning an empty ranking on every failure.
+///
+/// Empty rather than an error, because the caller's response is identical
+/// either way: leave the fifth socket where it is. Each failure is logged with
+/// its reason so "the market is flat" and "the query died" are still
+/// distinguishable to a reader, just not to the control flow.
+// TEST-EXEMPT: HTTP composition of build_movers_query + parse_movers_dataset, both tested.
+pub async fn fetch_movers(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    today_ist_micros: i64,
+) -> Vec<MoverRow> {
+    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(MOVERS_QUERY_TIMEOUT_SECS))
+        .build()
+    else {
+        tracing::error!("depth rebalance: HTTP client build failed — no movers this minute");
+        return Vec::new();
+    };
+    let sql = build_movers_query(today_ist_micros);
+    let body = match client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(?err, "depth rebalance: movers response unreadable");
+                return Vec::new();
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "depth rebalance: movers query non-2xx");
+            return Vec::new();
+        }
+        Err(err) => {
+            tracing::warn!(?err, "depth rebalance: movers query failed");
+            return Vec::new();
+        }
+    };
+    match parse_movers_dataset(&body) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(err, "depth rebalance: movers response unparseable");
+            Vec::new()
+        }
+    }
+}
+
+/// Seconds to sleep to land [`REBALANCE_OFFSET_SECS`] past the next minute.
+///
+/// Pure so the boundary behaviour is testable without a clock — the whole
+/// question is what happens at :00, at exactly the offset, and one second
+/// after it, and an inline arithmetic expression inside a `sleep` cannot be
+/// asserted at all.
+///
+/// Never returns zero. A zero sleep at the exact offset second would spin the
+/// loop through the same minute repeatedly, firing a query every iteration
+/// until the second rolled over — the sort of busy loop that shows up as
+/// inexplicable database load.
+#[must_use]
+pub const fn secs_until_next_rebalance(second_of_minute: u64) -> u64 {
+    let target = REBALANCE_OFFSET_SECS;
+    if second_of_minute < target {
+        target - second_of_minute
+    } else {
+        // Past this minute's slot: wait for the next one.
+        60 - second_of_minute + target
+    }
+}
+
+/// The per-minute rebalance: the thing that makes every engine above live.
+///
+/// # Why the sockets are owned, not borrowed
+///
+/// It runs for the session and outlives the attach that dialed the
+/// connections. Holding the channels is also what keeps them OPEN: a
+/// `Sender` dropped at the end of the attach closes the channel, which is
+/// exactly why the machinery was inert rather than merely idle.
+///
+/// # Why it refuses to start with no sockets
+///
+/// A rebalance over zero connections runs two queries a minute for a whole
+/// session to decide swaps that can never be sent. Refusing loudly at the
+/// start is the difference between a visible gap and a silent one.
+// TEST-EXEMPT: async loop over secs_until_next_rebalance + load_depth_candidates + fetch_movers + plan_minute + apply_decision, each separately tested.
+pub async fn run_depth_rebalance(
+    questdb: tickvault_common::config::QuestDbConfig,
+    date_ist: String,
+    today_ymd: u32,
+    today_ist_micros: i64,
+    mut sockets: Vec<RebalanceSocket>,
+) {
+    if sockets.is_empty() {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+            "depth rebalance refused to start: no depth-200 connections were handed to it, so \
+             every at-the-money strike stays wherever it was dialed for the whole session"
+        );
+        return;
+    }
+    pre_register_rebalance_counters();
+    let mut tracker = Depth200AtmTracker::new(Depth200AtmConfig::default());
+    let mut top_mover = TopMoverSocket::default();
+    tracing::info!(
+        sockets = sockets.len(),
+        offset_secs = REBALANCE_OFFSET_SECS,
+        "depth rebalance started: the at-the-money strikes now follow spot through the session"
+    );
+
+    loop {
+        let second = u64::from(ist_second_of_day_now() % 60);
+        tokio::time::sleep(std::time::Duration::from_secs(secs_until_next_rebalance(
+            second,
+        )))
+        .await;
+
+        let candidates =
+            crate::dhan_depth_universe::load_depth_candidates(&questdb, &date_ist, today_ymd).await;
+        let movers = fetch_movers(&questdb, today_ist_micros).await;
+
+        // What the four index sockets are believed to hold, in dial order.
+        // Read from the sockets rather than tracked separately: two records of
+        // the same fact drift, and a drift here produces swaps the guard
+        // refuses forever.
+        let held: Vec<SubscribeInstrument> = sockets.iter().filter_map(|s| s.held).collect();
+
+        let decision = plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers);
+        if decision.is_quiet() {
+            // The overwhelmingly common minute. No log line: ~375 of these a
+            // session would bury the ones that matter.
+            continue;
+        }
+        let sent = apply_decision(&mut sockets, &decision);
+        tracing::info!(
+            sent,
+            atm_swaps = decision.atm_swaps.len(),
+            top_mover_swap = decision.top_mover_swap.is_some(),
+            top_mover_first = decision.top_mover_first.is_some(),
+            candidates = candidates.len(),
+            movers = movers.len(),
+            "depth rebalance moved sockets"
+        );
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1625,5 +1782,60 @@ mod apply_tests {
         assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_full"));
         assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_closed"));
         pre_register_rebalance_counters();
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn before_the_slot_it_waits_only_the_remaining_seconds() {
+        assert_eq!(secs_until_next_rebalance(0), REBALANCE_OFFSET_SECS);
+        assert_eq!(secs_until_next_rebalance(1), REBALANCE_OFFSET_SECS - 1);
+        assert_eq!(secs_until_next_rebalance(REBALANCE_OFFSET_SECS - 1), 1);
+    }
+
+    #[test]
+    fn at_the_slot_it_waits_a_whole_minute_rather_than_spinning() {
+        // A zero sleep at the exact offset second would fire a query every
+        // loop iteration until the second rolled over — a busy loop that
+        // surfaces as inexplicable database load, not as an error.
+        assert_eq!(secs_until_next_rebalance(REBALANCE_OFFSET_SECS), 60);
+    }
+
+    #[test]
+    fn it_never_sleeps_for_zero_at_any_second_of_the_minute() {
+        for second in 0..60 {
+            let wait = secs_until_next_rebalance(second);
+            assert!(wait > 0, "second {second} would spin");
+            assert!(wait <= 60, "second {second} would skip a minute: {wait}");
+        }
+    }
+
+    #[test]
+    fn every_second_lands_on_the_offset() {
+        // The property that actually matters: whatever second we start at,
+        // waking up puts us at the offset past a minute boundary — never at
+        // :00, where the candle has sealed but the writer has not flushed.
+        for second in 0..60 {
+            let landed = (second + secs_until_next_rebalance(second)) % 60;
+            assert_eq!(landed, REBALANCE_OFFSET_SECS, "from second {second}");
+        }
+    }
+
+    #[test]
+    fn late_in_the_minute_it_waits_into_the_next_one() {
+        assert_eq!(secs_until_next_rebalance(59), 1 + REBALANCE_OFFSET_SECS);
+        assert_eq!(secs_until_next_rebalance(30), 30 + REBALANCE_OFFSET_SECS);
+    }
+
+    #[test]
+    fn the_movers_timeout_cannot_outlive_its_own_minute() {
+        // A query that outlived its minute would return a ranking for a minute
+        // that has already passed, and the socket would chase the market one
+        // step behind all session — which looks exactly like working.
+        assert!(MOVERS_QUERY_TIMEOUT_SECS < 60);
+        assert!(MOVERS_QUERY_TIMEOUT_SECS > 0);
     }
 }
