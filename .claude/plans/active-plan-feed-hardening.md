@@ -3328,3 +3328,82 @@ threshold is eventually set. It cannot distinguish "the socket is deaf" from
 "every instrument on this socket genuinely stopped trading" — an operator reads
 it against the lane gauge and the never-ticked count, which is why they share a
 screen. Hot-path cost is one relaxed atomic store per productive frame.
+
+---
+
+## Item 33 — `late_count` counts data loss and had zero production readers
+
+### Design
+
+`ConsumeStats.late_count` is the number of timeframes that DISCARDED a tick as
+too late to place (`ConsumeOutcome::DiscardLate`). A discarded tick means the
+bar it should have contributed to is missing a trade — a wrong bar.
+
+It was computed for all 24 timeframes on every tick and **read by nothing**.
+Every production consumer reads `sealed_count` and `amended_count`, and
+`IngestOutcome::Folded` carries only those two, so the value existed inside one
+function call and died there.
+
+**Fix:** increment `tv_candle_tick_discarded_late_total` at the discard arm,
+through the pre-resolved `fold_counters()` handle.
+
+**Its own metric name, not a `reason` label on
+`tv_aggregator_tick_refused_total`.** That family means "the whole tick was
+refused and NOTHING was folded" — a different and stronger statement. A tick
+counted here DID fold into other timeframes; merging them would make both
+numbers unreadable.
+
+### Edge cases
+
+- **Per (tick, timeframe), not per tick** — one tick can be placeable in the
+  1-day bar and hopeless for the 1-second one. Collapsing to a per-tick number
+  would hide which frames are losing data.
+- **Interaction with Item 27** — the stale-trading-day gate now refuses
+  previous-day ticks BEFORE the timeframe loop, so what reaches this arm is
+  today's ticks that are late for a given frame: a smaller, more interesting
+  population than it would have been last week.
+
+### Failure modes
+
+The counter increments inside the 24-timeframe loop on the per-tick path. A
+bare `metrics::counter!` there costs a sharded-registry lookup 24× per tick —
+the exact defect `fold_counters.rs` was created to remove. Pinned: the test
+asserts the handle is used AND that no bare macro appears in the arm.
+
+### Test plan
+
+`the_late_discard_is_counted_and_not_merely_tallied_into_a_dropped_struct` in
+`stale_trading_day_gate_guard.rs`. Bite-proven — deleting the increment fails
+it and nothing else. `dhat_multi_tf_fold` re-run: still zero allocations.
+
+Two scanner defects were fixed in writing it, both of the kind this session has
+been correcting elsewhere:
+
+1. `split("#[cfg(test)]").next()` truncated ~500 lines ABOVE the arm, because
+   this file carries test-only helpers inside production code. Split at the
+   test MODULE boundary instead.
+2. A fixed byte window missed the increment once a comment was added — the same
+   proximity brittleness rewritten out of two guards earlier today. Replaced
+   with brace matching on the arm's actual block, which is the real boundary.
+
+### Rollback
+
+Delete the increment and the handle. Nothing else reads either.
+
+### Observability
+
+`tv_candle_tick_discarded_late_total` on `/metrics`.
+
+**Deliberately NOT EMF-selected.** Two names were added to the selector today
+(+$0.60/mo) and the maximal month already projects above the AWS budget
+action line. This one is a DATA-QUALITY signal rather than an outage signal —
+it says bars may be incomplete, not that the feed is down — so it is the
+right one to leave on `/metrics` when something has to be. Shipping it is a
+one-line change plus a priced count bump whenever the operator wants it.
+
+### Honest envelope
+
+Makes the loss COUNTABLE, not smaller. It does not recover a discarded tick and
+does not change which ticks are discarded — the amend/discard boundary is
+untouched. Nothing pages on it, so it is only visible to someone already
+looking at `/metrics`.

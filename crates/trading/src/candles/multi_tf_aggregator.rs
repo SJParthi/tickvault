@@ -859,6 +859,22 @@ impl MultiTfAggregator {
                 }
                 ConsumeOutcome::DiscardLate => {
                     stats.late_count = stats.late_count.saturating_add(1);
+                    // A tick discarded here is DATA LOSS for this timeframe:
+                    // the bar it should have contributed to is now missing a
+                    // trade. `late_count` has carried that fact since the
+                    // aggregator was written and had ZERO production readers
+                    // until 2026-08-26 — every consumer reads `sealed_count`
+                    // and `amended_count`, and `IngestOutcome::Folded` carries
+                    // only those two, so the drop was computed on every tick
+                    // and reached nothing.
+                    //
+                    // Pre-resolved handle, per this module's whole reason for
+                    // existing: this arm sits inside the 24-timeframe loop on
+                    // the per-tick path, which is the one place a bare
+                    // `counter!` macro must never appear.
+                    crate::candles::fold_counters::fold_counters()
+                        .tick_discarded_late
+                        .increment(1);
                 }
             }
         }

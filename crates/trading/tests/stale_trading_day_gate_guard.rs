@@ -331,3 +331,97 @@ fn genuinely_corrupt_timestamps_stay_hard_refusals_even_with_a_receipt_time() {
         assert!(!s.untraded_timestamp, "ts {poison} is not the sentinel");
     }
 }
+
+/// `late_count` had ZERO production readers, and it counts DATA LOSS.
+///
+/// Every consumer of `ConsumeStats` reads `sealed_count` and `amended_count`;
+/// `IngestOutcome::Folded` carries only those two. So `late_count` — the
+/// number of timeframes that DISCARDED this tick as unplaceable — was computed
+/// on every tick, for all 24 timeframes, and reached nothing. A bar missing a
+/// trade is a wrong bar, and nothing moved.
+///
+/// This is a source assertion because the alternative is worse, not because it
+/// is stronger: `metrics::Counter` offers no readback without installing a
+/// process-global recorder, and installing one inside a unit test makes every
+/// other test in the binary race on it. The BEHAVIOUR that `DiscardLate`
+/// increments `late_count` is already covered by the aggregator's own tests;
+/// what is unproven without this is that the value escapes the function.
+#[test]
+fn the_late_discard_is_counted_and_not_merely_tallied_into_a_dropped_struct() {
+    let src = include_str!("../src/candles/multi_tf_aggregator.rs");
+    // Split at the test MODULE boundary, not at the first `#[cfg(test)]`.
+    //
+    // This file carries test-only HELPERS inside production code — the first
+    // marker sits ~500 lines ABOVE the arm this test is about — so the usual
+    // `split("#[cfg(test)]").next()` idiom silently hands back the wrong half
+    // and the test fails on correct code. A scanner that looks in the wrong
+    // place is worse than no scanner: it teaches whoever hits it to delete the
+    // assertion rather than to read it.
+    let production = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src);
+
+    let arm = production
+        .find("ConsumeOutcome::DiscardLate =>")
+        .expect("the late-discard arm must exist");
+    // The arm's ACTUAL block, by brace matching — not a fixed byte window.
+    //
+    // A byte window is a proximity assertion, and proximity is not the
+    // invariant: adding a comment inside the arm fails it, while moving the
+    // increment OUT of the arm to a line just inside the window passes it.
+    // Brittle where it blocks correct edits and permissive where it matters.
+    // Two guards in this repo were rewritten on 2026-08-26 for exactly that,
+    // so this one is written the right way round to begin with.
+    let body = {
+        let open = arm
+            + production[arm..]
+                .find('{')
+                .expect("the arm must have a block");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, ch) in production[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &production[open..=end]
+    };
+    assert!(
+        body.contains("tick_discarded_late"),
+        "the DiscardLate arm must increment a counter. Without it the drop is \
+         tallied into a struct field that no production caller reads, which is \
+         indistinguishable from not counting it at all"
+    );
+
+    // Pre-resolved handle, never the bare macro: this arm sits INSIDE the
+    // 24-timeframe loop on the per-tick path, and `fold_counters.rs` exists
+    // precisely because a `counter!` macro there costs a sharded-registry
+    // lookup 24 times per tick.
+    assert!(
+        body.contains("fold_counters()"),
+        "the increment must go through the pre-resolved handle set; a bare \
+         `metrics::counter!` on the 24-times-per-tick path is the defect \
+         fold_counters.rs was created to remove"
+    );
+    assert!(
+        !body.contains("metrics::counter!"),
+        "no bare counter macro inside the per-timeframe loop"
+    );
+
+    // And the handle must actually exist with a distinct metric name — not be
+    // folded into the tick_refused family, which means something stronger and
+    // different: "the whole tick was refused and nothing was folded". A tick
+    // counted here DID fold into other timeframes.
+    let counters_src = include_str!("../src/candles/fold_counters.rs");
+    assert!(
+        counters_src.contains("tv_candle_tick_discarded_late_total"),
+        "the late discard needs its own metric name, not a `reason` label on \
+         tv_aggregator_tick_refused_total — those mean different things"
+    );
+}
