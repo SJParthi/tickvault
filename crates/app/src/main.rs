@@ -905,6 +905,36 @@ async fn async_main() -> Result<()> {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Step 2: Initialize observability (Prometheus metrics exporter)
+    // -----------------------------------------------------------------------
+    observability::init_metrics(&config.observability)
+        .context("failed to initialize Prometheus metrics")?;
+
+    // MOVED HERE 2026-08-26, and the move is the whole fix.
+    //
+    // This block used to sit ~35 lines ABOVE `init_metrics`, which meant
+    // `SpillDropCounters::new()` resolved its handles against the NO-OP
+    // recorder. `metrics::counter!` with no recorder installed returns a
+    // no-op handle, and this one is CACHED in the struct for the process
+    // lifetime — so the pre-registration was lost AND every later
+    // `increment(1)` on a real frame drop went nowhere. `tv_ticks_lost_total`
+    // and `tv_ws_frame_spill_drop_critical` were therefore absent from
+    // /metrics on the live box (verified 2026-08-26: zero matching lines out
+    // of 756), which makes `tv-<env>-ticks-lost-spill` — the alarm on
+    // UNRECOVERABLE tick loss — incapable of ever firing.
+    //
+    // This exact hazard is documented twice within 40 lines of here: the
+    // STAGE-C.2b comment above ("they hit the no-op recorder and were
+    // silently lost") and `prewarm_dispatcher_counters` below ("Must run
+    // post-install because handles created pre-install resolve to a no-op
+    // counter"). It was fixed for those two and missed here.
+    //
+    // Nothing between the old and new position touched `_ws_frame_spill` —
+    // its only consumer is the stack wiring far below — and the fail-closed
+    // halt is strictly better here: it now happens with the exporter UP, so
+    // the boot-halt is observable rather than silent.
     // PR-C2 (2026-07-13): with the Dhan live WS retired there is no frame
     // APPEND site left in this process (the dhan_rest_stack order-update WS
     // deliberately runs wal_spill=None while dormant — C1 dormancy honesty),
@@ -941,12 +971,6 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     };
-
-    // -----------------------------------------------------------------------
-    // Step 2: Initialize observability (Prometheus metrics exporter)
-    // -----------------------------------------------------------------------
-    observability::init_metrics(&config.observability)
-        .context("failed to initialize Prometheus metrics")?;
 
     // Cache parser dispatcher Counter handles AFTER the recorder is
     // installed. Without this, the first hot-path packet of each kind
