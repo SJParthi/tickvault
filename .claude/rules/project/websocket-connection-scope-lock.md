@@ -1031,6 +1031,82 @@ wire and is being discarded in favour of a derived one.
   instrument.
 
 
+
+### 2026-08-26 (SECOND) — DEPTH-200 IS NIFTY + BANKNIFTY ATM, AND IT MUST TRACK ATM ALL SESSION
+
+**The verbatim operator demand (2026-08-26, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "see meanwhile clealry ntoe for evry one minute alwyas espeiclaly for dpeth 200 esppeiclaly as of now nifty atm ce atm pe always for every one minute resusbcribe dude okay even for bancknfity atm ce atm pe also dude okay are you doign this dude as of now or nto dude okay"
+
+**The authorization (same session, in direct response to the three open items
+being listed back to him):**
+
+> "fix and resolve evryhtign dude okay?"
+
+#### What was actually happening — measured, not inferred
+
+The five depth-200 sockets on 2026-08-26 carried:
+
+| Slot | Contract | Rows in the 09:20 minute |
+|---|---|---|
+| 1 | NIFTY Sep-26 24150 CE | 100,800 |
+| 2 | FINNIFTY Sep-26 26250 CE | **800** |
+| 3 | FINNIFTY Sep-26 26250 PE | **800** |
+| 4 | MIDCPNIFTY Sep-26 15000 CE | 100,000 |
+| 5 | MIDCPNIFTY Sep-26 15000 PE | 100,800 |
+
+**BANKNIFTY got ZERO sockets**, and NIFTY got one lone leg. Two of the five
+went to FINNIFTY strikes delivering ~125x less than the others.
+
+**The cause is `atm_distance`**, which returns `|strike - spot|` — a RAW
+ABSOLUTE price distance — and `select_depth_universe` sorts one `pair_pool`
+mixing every underlying by that number. Absolute rupee distance is not
+comparable across underlyings with different price levels and strike
+spacings: a FINNIFTY strike 50 points from a ~26,200 spot outranks a
+BANKNIFTY strike 100 points from a ~57,500 spot, though the BANKNIFTY strike
+is nearer in every sense that matters and vastly more liquid.
+
+That mis-ranking also caused a second, separate fault: connections 12 and 13
+redialled **112 and 210 times** (against 19 each for the other three) because
+the 50-second idle-silence watchdog reads a sparse deep book as a dead socket.
+Putting liquid ATM contracts in those slots removes the churn as a side
+effect — one fix, two faults.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Priority | **NIFTY first, then BANKNIFTY.** Their ATM CE/PE pairs claim four of the five sockets before any other underlying is considered |
+| Ranking within an underlying | nearest-ATM, unchanged |
+| Ranking ACROSS underlyings | **normalised**, never raw rupees — absolute distance is not comparable between a 24,000 index and a 57,000 one |
+| 5th socket | unchanged: the next-nearest lone leg, with `depth_200_lone_leg` still reporting it |
+| Budget | UNCHANGED — 5 instruments, 5 sockets. This changes WHICH five, never how many |
+| ATM tracking | the selected strike must follow spot through the session, not freeze at the boot-time value |
+
+#### What this reverses, stated rather than quietly applied
+
+`dhan_feed_stack` skips re-selection once `depth_done`, on the recorded
+grounds that "re-running two QuestDB queries a minute for a set that is
+already subscribed buys nothing". That was true of a set chosen by identity
+and false of a set chosen by ATM: an ATM contract picked at 09:10 is not ATM
+at 14:00 if the index moved, so the boot-time choice decays all session. The
+operator's instruction is that it must track.
+
+**Edge-triggered, NOT unconditional.** "Re-subscribe every minute" taken
+literally is ~375 re-subscribes per socket per session, on the very feed whose
+reconnect churn this same change is fixing. The re-subscribe fires only when
+the resolved ATM strike actually CHANGES, which yields the operator's outcome
+at a fraction of the cost. A no-op minute must cost no socket action.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks depth-200 candidates across underlyings by raw `|strike - spot|`.
+- Lets any underlying outside NIFTY/BANKNIFTY take a socket while a NIFTY or
+  BANKNIFTY ATM pair is available.
+- Changes the socket or instrument budget (5 remains 5).
+- Re-subscribes unconditionally every minute rather than on an ATM change.
+- Hardcodes contract security-ids — they expire; the chain leg is the source.
 ### 2026-08-26 — THE OPEN RULE RE-AFFIRMED, AND WHAT WAS ACTUALLY MISSING
 
 **The verbatim operator demand (2026-08-26, typed directly in-session — preserve

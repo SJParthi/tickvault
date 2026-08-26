@@ -369,6 +369,57 @@ fn atm_distance(candidate: &DepthCandidate) -> f64 {
     (candidate.strike - candidate.spot).abs()
 }
 
+/// Underlyings that claim depth-200 sockets before any other, in this order.
+///
+/// OPERATOR-LOCKED 2026-08-26 (`websocket-connection-scope-lock.md`,
+/// "DEPTH-200 IS NIFTY + BANKNIFTY ATM"): *"for evry one minute alwyas
+/// espeiclaly for dpeth 200 … nifty atm ce atm pe always … even for
+/// bancknfity atm ce atm pe also"*.
+///
+/// Four of the five sockets are these two underlyings' ATM CE/PE pairs. The
+/// list is ORDERED — index 0 outranks index 1 — so NIFTY takes its pair
+/// first if only one pair fits.
+pub const DEPTH_200_PRIORITY_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
+
+/// Rank of a candidate's underlying in [`DEPTH_200_PRIORITY_UNDERLYINGS`],
+/// or `usize::MAX` for everything else.
+///
+/// Compared BEFORE distance, so a NIFTY pair outranks a nearer FINNIFTY pair
+/// however the rupee arithmetic falls out.
+fn depth_200_priority_rank(underlying: &str) -> usize {
+    DEPTH_200_PRIORITY_UNDERLYINGS
+        .iter()
+        .position(|u| u.eq_ignore_ascii_case(underlying))
+        .unwrap_or(usize::MAX)
+}
+
+/// Distance from at-the-money as a FRACTION of spot, for ranking ACROSS
+/// underlyings.
+///
+/// WHY NOT RAW RUPEES — 2026-08-26, live. `atm_distance` returns
+/// `|strike - spot|`, and `select_depth_universe` sorted one pool mixing every
+/// underlying by it. Absolute rupee distance is not comparable between a
+/// ~24,000 index and a ~57,000 one with different strike spacings: a FINNIFTY
+/// strike 50 points from spot outranked a BANKNIFTY strike 100 points from a
+/// spot more than twice as large, though the BANKNIFTY strike is nearer in
+/// every sense that matters and far more liquid.
+///
+/// The result on the box that day: FINNIFTY and MIDCPNIFTY took four of the
+/// five 200-level sockets, NIFTY took one lone leg, and **BANKNIFTY took
+/// none**. Two of those sockets carried FINNIFTY strikes delivering ~125x
+/// fewer rows than the others, which then tripped the 50-second idle-silence
+/// watchdog into 322 redials between them.
+///
+/// Normalising by spot makes the comparison dimensionless and therefore
+/// meaningful across underlyings. `atm_distance` is UNCHANGED and still ranks
+/// WITHIN an underlying, where raw rupees are already comparable.
+fn atm_distance_fraction(candidate: &DepthCandidate) -> f64 {
+    let raw = atm_distance(candidate);
+    if !raw.is_finite() || !candidate.spot.is_finite() || candidate.spot <= 0.0 {
+        return f64::MAX;
+    }
+    raw / candidate.spot
+}
 /// Choose the depth-20 and depth-200 sets from one chain snapshot.
 ///
 /// Pure, so every refusal rule is testable without a database or a socket.
@@ -438,7 +489,12 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     // Whole CE/PE pairs for depth-200, ranked across every underlying, so the
     // 2 pairs go to the 2 most at-the-money books rather than to whichever
     // underlying happens to sort first.
-    let mut pair_pool: Vec<(f64, SubscribeInstrument, SubscribeInstrument)> = Vec::new();
+    // (priority_rank, atm_fraction, CE, PE). Priority is compared FIRST so a
+    // NIFTY/BANKNIFTY pair outranks a nearer pair from any other underlying
+    // (operator lock 2026-08-26); the fraction is normalised by spot so the
+    // cross-underlying comparison is dimensionless. See the ranking helpers.
+    let mut pair_pool: Vec<(String, usize, f64, SubscribeInstrument, SubscribeInstrument)> =
+        Vec::new();
 
     for underlying in &underlyings {
         let mut rows: Vec<(&DepthCandidate, ExchangeSegment)> = usable
@@ -525,7 +581,9 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             let pe = legs.iter().find(|(c, _)| c.leg.eq_ignore_ascii_case("PE"));
             if let (Some((ce_c, ce_seg)), Some((pe_c, pe_seg))) = (ce, pe) {
                 pair_pool.push((
-                    atm_distance(ce_c),
+                    ce_c.underlying.trim().to_ascii_uppercase(),
+                    depth_200_priority_rank(&ce_c.underlying),
+                    atm_distance_fraction(ce_c),
                     SubscribeInstrument {
                         security_id: ce_c.contract_security_id as SecurityId,
                         segment: *ce_seg,
@@ -545,9 +603,56 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     // most informative ones. Only once no WHOLE pair fits in the remaining
     // budget does a lone leg get taken — so the lone leg is always the LAST
     // socket, never a pair displaced by a half.
-    pair_pool.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // ORDER: one ATM pair from EACH priority underlying before any underlying
+    // takes a second pair.
+    //
+    // Operator lock 2026-08-26: "nifty atm ce atm pe always … even for
+    // bancknfity atm ce atm pe also". That is ONE pair each, not two pairs
+    // from whichever index ranks first — sorting on (priority, distance)
+    // alone gives NIFTY both its ATM and its next strike and leaves BANKNIFTY
+    // a lone leg, which is the same shape of miss as the raw-rupee bug, one
+    // level up.
+    //
+    // So the primary key is the pair's RANK WITHIN ITS OWN UNDERLYING: every
+    // underlying's nearest pair competes in round 0, every underlying's
+    // second pair in round 1, and so on. Priority breaks ties inside a round
+    // (NIFTY before BANKNIFTY before the rest), and the spot-normalised
+    // distance breaks ties inside that.
+    //
+    // Result on a normal chain: NIFTY ATM pair, BANKNIFTY ATM pair, then the
+    // odd socket to the next round's leader.
+    {
+        let mut by_underlying: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // Nearest-first within each underlying, so the round index below is
+        // assigned in ATM order rather than chain order.
+        pair_pool.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.total_cmp(&b.2)));
+        let mut ranked: Vec<(usize, usize, f64, SubscribeInstrument, SubscribeInstrument)> =
+            Vec::with_capacity(pair_pool.len());
+        for (underlying, priority, frac, ce, pe) in pair_pool.drain(..) {
+            let round = by_underlying.entry(underlying).or_insert(0);
+            ranked.push((*round, priority, frac, ce, pe));
+            *round += 1;
+        }
+        // A priority underlying exhausts its strikes BEFORE any other
+        // underlying takes a socket. Without this first key, NIFTY's SECOND
+        // pair sorts behind FINNIFTY's first (both are "round 0" for their own
+        // underlying), and the odd 5th socket lands on the sparse contract
+        // whose idle-silence redials this change exists to stop.
+        ranked.sort_by(|a, b| {
+            (a.1 == usize::MAX)
+                .cmp(&(b.1 == usize::MAX))
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.total_cmp(&b.2))
+        });
+        pair_pool = ranked
+            .into_iter()
+            .map(|(_, p, f, ce, pe)| (String::new(), p, f, ce, pe))
+            .collect();
+    }
     let mut remaining_pairs = pair_pool.into_iter();
-    for (_, ce, pe) in remaining_pairs.by_ref() {
+    for (_, _, _, ce, pe) in remaining_pairs.by_ref() {
         // `+ 2` because a pair costs two sockets; a pair that would overflow
         // the budget is skipped, and the loop falls through to the lone-leg
         // step below rather than truncating the pair here.
@@ -1046,6 +1151,124 @@ pub async fn load_depth_universe(
 
 #[cfg(test)]
 mod tests {
+
+    /// Build a candidate with an explicit spot, so cross-underlying ranking
+    /// can be exercised at realistic index price levels.
+    fn candidate_at(
+        underlying: &str,
+        sid: i64,
+        strike: f64,
+        leg: &str,
+        spot: f64,
+    ) -> DepthCandidate {
+        let mut c = candidate(underlying, sid, strike, leg);
+        c.spot = spot;
+        c
+    }
+
+    /// THE OPERATOR'S RULE (lock 2026-08-26), reproduced from the live box.
+    ///
+    /// These are the real spots and strikes on 2026-08-26. Under the old raw
+    /// `|strike - spot|` sort, FINNIFTY's 50-point gap beat BANKNIFTY's
+    /// 100-point gap even though BANKNIFTY's spot is more than twice as large
+    /// — and the box really did end up with FINNIFTY and MIDCPNIFTY holding
+    /// four of the five 200-level sockets while BANKNIFTY held NONE.
+    #[test]
+    fn depth_200_gives_its_sockets_to_nifty_and_banknifty_not_the_nearest_rupee_gap() {
+        let candidates = vec![
+            // FINNIFTY: 50 points from spot — the SMALLEST raw gap here.
+            candidate_at("FINNIFTY", 63097, 26_250.0, "CE", 26_200.0),
+            candidate_at("FINNIFTY", 63100, 26_250.0, "PE", 26_200.0),
+            // MIDCPNIFTY: 60 points.
+            candidate_at("MIDCPNIFTY", 72982, 15_000.0, "CE", 14_940.0),
+            candidate_at("MIDCPNIFTY", 72983, 15_000.0, "PE", 14_940.0),
+            // BANKNIFTY: 100 points, but on a 57,500 spot — nearer in
+            // fractional terms than either of the above.
+            candidate_at("BANKNIFTY", 90001, 57_500.0, "CE", 57_400.0),
+            candidate_at("BANKNIFTY", 90002, 57_500.0, "PE", 57_400.0),
+            // NIFTY: 40 points on a 24,340 spot.
+            candidate_at("NIFTY", 46991, 24_300.0, "CE", 24_310.0),
+            candidate_at("NIFTY", 46992, 24_300.0, "PE", 24_310.0),
+            // NIFTY one strike out — the realistic shape, and the natural
+            // occupant of the odd 5th socket.
+            candidate_at("NIFTY", 46993, 24_350.0, "CE", 24_310.0),
+            candidate_at("NIFTY", 46994, 24_350.0, "PE", 24_310.0),
+        ];
+
+        let sel = select_depth_universe(&candidates);
+        let ids: Vec<i64> = sel
+            .depth_200
+            .iter()
+            .map(|i| i64::try_from(i.security_id).expect("test sid fits i64"))
+            .collect();
+
+        assert!(
+            ids.contains(&46991) && ids.contains(&46992),
+            "NIFTY ATM CE and PE must both hold sockets, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&90001) && ids.contains(&90002),
+            "BANKNIFTY ATM CE and PE must both hold sockets — it held NONE on \
+             2026-08-26, which is the defect this pins. Got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&63097) && !ids.contains(&63100),
+            "FINNIFTY must NOT take a socket while a NIFTY or BANKNIFTY leg is \
+             available on a smaller raw rupee gap; those two slots redialled 322 \
+             times on 2026-08-26. Got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&72982) && !ids.contains(&72983),
+            "MIDCPNIFTY must not take a socket either. Got {ids:?}"
+        );
+        assert_eq!(ids.len(), 5, "all five sockets must be filled, got {ids:?}");
+        assert!(
+            sel.depth_200_lone_leg,
+            "the odd 5th socket is a lone leg and must SAY so"
+        );
+    }
+
+    /// NIFTY outranks BANKNIFTY when only one pair can fit, because the
+    /// priority list is ORDERED and index 0 wins.
+    #[test]
+    fn nifty_takes_the_last_pair_before_banknifty() {
+        assert_eq!(depth_200_priority_rank("NIFTY"), 0);
+        assert_eq!(depth_200_priority_rank("BANKNIFTY"), 1);
+        assert_eq!(depth_200_priority_rank("banknifty"), 1, "case-insensitive");
+        assert_eq!(depth_200_priority_rank("FINNIFTY"), usize::MAX);
+        assert_eq!(depth_200_priority_rank("MIDCPNIFTY"), usize::MAX);
+    }
+
+    /// The normalised distance must make a far-in-rupees strike on a large
+    /// index rank NEARER than a close-in-rupees strike on a small one — that
+    /// inversion is the whole point, and raw rupees get it backwards.
+    #[test]
+    fn the_normalised_distance_compares_across_price_levels() {
+        let banknifty = candidate_at("BANKNIFTY", 1, 57_500.0, "CE", 57_400.0); // 100 pts
+        let finnifty = candidate_at("FINNIFTY", 2, 26_250.0, "CE", 26_200.0); // 50 pts
+
+        assert!(
+            atm_distance(&banknifty) > atm_distance(&finnifty),
+            "raw rupees rank BANKNIFTY as further — this is the trap"
+        );
+        assert!(
+            atm_distance_fraction(&banknifty) < atm_distance_fraction(&finnifty),
+            "normalised by spot, BANKNIFTY is NEARER: {} vs {}",
+            atm_distance_fraction(&banknifty),
+            atm_distance_fraction(&finnifty)
+        );
+    }
+
+    /// An unusable spot cannot rank first. `f64::MAX` sorts last, so a
+    /// candidate with a zero or non-finite spot is refused rather than
+    /// silently promoted to the front of the pool.
+    #[test]
+    fn an_unusable_spot_sorts_last_in_the_normalised_ranking() {
+        let zero_spot = candidate_at("NIFTY", 3, 24_300.0, "CE", 0.0);
+        let nan_spot = candidate_at("NIFTY", 4, 24_300.0, "CE", f64::NAN);
+        assert_eq!(atm_distance_fraction(&zero_spot), f64::MAX);
+        assert_eq!(atm_distance_fraction(&nan_spot), f64::MAX);
+    }
     use super::*;
 
     fn candidate(underlying: &str, sid: i64, strike: f64, leg: &str) -> DepthCandidate {
