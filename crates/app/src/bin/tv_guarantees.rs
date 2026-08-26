@@ -51,7 +51,7 @@
 #![allow(clippy::expect_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// How much a row can be promised.
@@ -389,6 +389,36 @@ fn count_substring_scoped(root: &Path, needles: &[&str], production_only: bool) 
     acc
 }
 
+/// Every crate root on disk: `lib.rs`, `main.rs`, and each `src/bin/*.rs`.
+///
+/// Discovered rather than listed, for the same reason
+/// `main_lint_blanket_guard` now discovers them: a hardcoded path is a
+/// guarantee about one file wearing the language of a guarantee about all
+/// of them.
+fn crate_roots_on_disk() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(crates) = std::fs::read_dir("crates") else {
+        return out;
+    };
+    for c in crates.flatten() {
+        let src = c.path().join("src");
+        for name in ["lib.rs", "main.rs"] {
+            let p = src.join(name);
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+        if let Ok(bins) = std::fs::read_dir(src.join("bin")) {
+            for b in bins.flatten() {
+                if b.path().extension().is_some_and(|e| e == "rs") {
+                    out.push(b.path());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
 /// Distinct `[section]` headers in `config/base.toml`.
 ///
 /// The count of surfaces an operator can retune WITHOUT a rebuild -- which is
@@ -1879,6 +1909,26 @@ fn main() {
         true,
     );
 
+    // Every crate root must have DECIDED about silent panics -- `deny`, or
+    // `allow` with a written reason. Silence is the failure: the compiler
+    // resolves it to "permitted" and nobody is told. Counted here and
+    // enforced by `main_lint_blanket_guard`, which until 2026-08-26 checked
+    // exactly one hardcoded path while twenty-five other roots drifted.
+    let roots = crate_roots_on_disk();
+    let crate_roots = roots.len();
+    let silent_roots = roots
+        .iter()
+        .filter(|p| {
+            let Ok(src) = std::fs::read_to_string(p) else {
+                return false;
+            };
+            let decided = |lint: &str| {
+                src.contains(&format!("deny({lint})")) || src.contains(&format!("allow({lint})"))
+            };
+            !(decided("clippy::unwrap_used") && decided("clippy::expect_used"))
+        })
+        .count();
+
     let permutations = vec![
         Row::new(
             "Inputs the author did not choose",
@@ -1959,6 +2009,16 @@ fn main() {
             },
             format!("{panic_macros} sites"),
             "each compiler-guaranteed or test-only and named with its reason in that guard's allowlist; a NEW one fails the build",
+        ),
+        Row::new(
+            "Crate roots that chose about silent panics",
+            if silent_roots == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{crate_roots} roots"),
+            "deny, or allow with a written reason -- SILENCE fails the build, because the compiler reads it as permission",
         ),
         Row::new(
             "Combinations nobody has thought of",
