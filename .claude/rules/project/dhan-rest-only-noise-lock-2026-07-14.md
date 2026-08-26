@@ -1101,3 +1101,72 @@ $112.50, below the bill. Neither is taken here.
 - Adds an EMF name whose producer does not exist (`emf_selector_producer_guard`).
 - Gives the probe-failed alarm `ok_actions` — a counter aging out of its window is
   not a repair.
+
+### §2.3i — 2026-08-26: the deaf socket gets its page
+
+**The verbatim operator authorization (2026-08-26, answering a presented
+choice):**
+
+> "Yes, phone me"
+
+Given in DIRECT response to a question that named the alarm, its threshold,
+its price, and the reason it had NOT been added unilaterally: *"Adding the
+phone call costs about 10 cents a month, and I did NOT add it on my own
+because your worst-case month already lands just above the line where AWS
+automatically switches the trading box OFF."* This dated row is the rule-file
+edit §3 demands before any new Dhan-scoped page, recorded BEFORE the
+terraform.
+
+**The failure it covers, and why nothing else can.** A socket that keeps
+answering pings but stops delivering data defeats every existing mechanism,
+each for a structural reason rather than an oversight:
+
+| Mechanism | Why it is blind to this |
+|---|---|
+| Idle watchdog (27 s) | governs SILENCE on the wire; a ponging socket is not silent |
+| Reconnect family | stays flat — the defining property of a deaf socket is that **nothing about it is retrying**. This is why "alarm the reconnect counters", the recommendation on record, cannot work |
+| `dhan-no-ticks-flowing` (§2.3b) | reads the LANE. With fifteen of sixteen sockets delivering, the lane's last tick is always ~1 s old |
+| `tv_dhan_ws_alive_connections` | counts sockets DIALED, not DELIVERING |
+
+**Family (5) therefore gains a THIRTEENTH signal:**
+`tv-<env>-dhan-worst-socket-deaf` on `tv_dhan_ws_worst_conn_tick_age_secs`,
+`Maximum >= 600` over one 300 s period.
+
+**The threshold is not invented.** `dhan-no-ticks-flowing` pages at 300 s × 2
+periods = ten minutes of lane silence. This is the same question scoped to one
+socket, so it takes the same ten minutes — expressed as one 600 s crossing
+rather than two 300 s ones, because this gauge is a per-socket age that only
+climbs.
+
+**`notBreaching`, and that differs from its two siblings deliberately.**
+`dhan_live_lane_down` and `dhan_no_ticks_flowing` are `breaching` because a
+DEAD APP publishes nothing and that absence must page. Those two already cover
+that case; a third alarm firing on the same absence buys nothing and triples
+the noise of one outage. This one answers a narrower question that only has
+meaning while the lane is alive: *of the sockets that ARE running, is one of
+them deaf?*
+
+**⚠ It joins the market-hours gate in the SAME change, and that is not
+optional.** Without it this pages **every single trading day at ~15:40**:
+after the 15:30 close every socket legitimately stops delivering, the gauge
+crosses 600 within ten minutes, and the alarm fires on a market that is simply
+shut. The gate now arms **7** alarms. Landing the alarm without the gate
+membership re-creates the exact noise trap §2.3a records.
+
+**Cost:** 1 alarm ≈ **$0.10/mo**, no new EMF name — the gauge was selected the
+same day (82 names, ~$0.30/mo, priced in the count ratchet).
+
+**⚠ What this does NOT do (Rule 11).** It reports that a socket has gone
+quiet; it cannot distinguish "the socket is deaf" from "every instrument on
+that socket genuinely stopped trading". The alarm text says so and points at
+the lane gauge and the never-ticked count for that comparison. It also does
+not prevent a socket going deaf, and detection latency is the 30 s publish
+cadence plus the 600 s threshold.
+
+**What a PR that violates §2.3i looks like (REJECT):** lands the alarm without
+the gate membership (the daily 15:40 false page); flips it to `breaching`
+(duplicates the two absence alarms and pages three times for one outage);
+adds a per-CONNECTION dimension (the §2.3 cardinality rule stands — sixteen
+dimensions ≈ $4.80/mo to answer a yes/no question one series answers);
+or lowers the threshold below the lane alarm's ten minutes without a measured
+baseline.
