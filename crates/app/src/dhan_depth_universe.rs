@@ -1754,6 +1754,87 @@ mod tests {
         }
     }
 
+    /// What this selector costs at the authorised scale.
+    ///
+    /// MEASUREMENT, not a gate. `#[ignore]`d so a wall-clock number never
+    /// becomes a flaky CI failure — the house pattern from
+    /// `catch_up_seal_all_sweep_cost_at_the_authorized_ceiling`.
+    ///
+    /// # The number, and the two optimisations it refuted
+    ///
+    /// 44,000 rows across 220 underlyings, release-less debug build in an
+    /// x86 dev container, minimum of five runs:
+    ///
+    /// | version | cost |
+    /// |---|---|
+    /// | before the per-underlying consensus spot | **7.4 ms** |
+    /// | with it (shipped) | **32.3 ms** |
+    /// | normalise once into a `Vec<String>`, carry the spot | **46.1 ms** |
+    /// | borrow the raw `&str` as the map key, zero allocations | **29.7 ms** |
+    ///
+    /// The consensus fix (defect 10) cost 4.4x, which is worth knowing and
+    /// was invisible until timed. Both attempts to win it back FAILED:
+    ///
+    /// - Normalising once up front and carrying the resolved spot on the
+    ///   `usable` tuple made it **43% SLOWER**. Forty-four thousand retained
+    ///   `String`s cost more than twice as many short-lived ones the
+    ///   allocator immediately reuses, and widening the tuple added copy cost
+    ///   through two further `Vec` builds.
+    /// - Borrowing the raw name as the key removes all 88,000 allocations and
+    ///   buys **8%** — which also refutes the diagnosis behind the first
+    ///   attempt. The cost is not the strings. It is two hash lookups per row
+    ///   into a nested map. Eight percent does not pay for the behaviour
+    ///   change it carries (two rows of one underlying written with different
+    ///   casing would get separate consensus prices).
+    ///
+    /// So the shipped version stands, and the honest framing is that ~32 ms
+    /// once a minute is a **0.05% duty cycle** on the rebalance task. Recorded
+    /// rather than optimised, because a measured cost with a stated shape is
+    /// the thing this repository's own complexity table exists to hold — and
+    /// because I nearly recorded "fixed, 4.4x faster" off a single sample of
+    /// an optimisation that was in fact slower.
+    ///
+    /// NOT measured on the prod r8g.xlarge (Graviton4), and not measured in
+    /// release mode; both would be faster.
+    #[test]
+    #[ignore = "wall-clock measurement, run on demand"]
+    fn select_depth_universe_cost_at_the_authorized_ceiling() {
+        // 220 F&O underlyings, 100 strikes each, both legs = 44,000 rows.
+        let mut rows: Vec<DepthCandidate> = Vec::with_capacity(44_000);
+        for u in 0..220 {
+            let name = format!("STK{u:03}");
+            let spot = 1_000.0 + f64::from(u);
+            for k in 0..100 {
+                let strike = spot + f64::from(k - 50) * 10.0;
+                for (leg, off) in [("CE", 0), ("PE", 1)] {
+                    rows.push(DepthCandidate {
+                        underlying: name.clone(),
+                        contract_security_id: i64::from(u) * 1_000 + i64::from(k) * 2 + off + 1,
+                        expiry_micros: 1_900_000_000_000_000,
+                        strike,
+                        spot,
+                        leg: leg.to_owned(),
+                        is_index_option: false,
+                    });
+                }
+            }
+        }
+        // Five runs, reporting the MINIMUM. A single sample in a shared
+        // container is noise, and the minimum is the closest thing to the
+        // cost without interference.
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let got = select_depth_universe(&rows);
+            best = best.min(start.elapsed());
+            assert_eq!(got.refused_stock_option, rows.len());
+        }
+        println!(
+            "MEASURED select_depth_universe: {} rows, 220 underlyings -> {best:?} (min of 5)",
+            rows.len(),
+        );
+    }
+
     /// A chain legitimately carries weeklies AND monthlies. Depth on a far
     /// month is bandwidth spent on an illiquid book, so only the nearest expiry
     /// is subscribed.
