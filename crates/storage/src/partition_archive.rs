@@ -1703,8 +1703,20 @@ impl PartitionArchiver {
         let body = read_body_capped(response).await?;
         let value: serde_json::Value =
             serde_json::from_str(&body).context("wal_tables() probe body is not JSON")?;
-        let rows = parse_wal_tables_response(&value)
+        let (rows, skipped) = parse_wal_tables_response(&value)
             .map_err(|f| anyhow::anyhow!("wal_tables() probe parse failed: {}", f.as_str()))?;
+        // Fail CLOSED on a partial view. This set decides which tables the
+        // archiver must leave alone; a row that failed to parse is a table
+        // whose suspension state is UNKNOWN, and treating unknown as
+        // not-suspended would let the archiver detach partitions from a table
+        // that is silently not applying rows. Refusing the run is recoverable;
+        // archiving a suspended table is not.
+        if skipped > 0 {
+            anyhow::bail!(
+                "wal_tables() probe skipped {skipped} unparseable row(s) -- the \
+                 suspended-table set is incomplete, refusing to archive on it"
+            );
+        }
         Ok(rows
             .into_iter()
             .filter(|r| r.suspended)

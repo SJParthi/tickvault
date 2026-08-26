@@ -187,7 +187,9 @@ impl WalProbeFailure {
 /// for the mandatory columns) are skipped defensively so one bad row
 /// cannot blind the probe to the remaining tables — but ALL of them being
 /// skipped is drift, not an empty answer, and is reported as such.
-pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalProbeFailure> {
+pub fn parse_wal_tables_response(
+    body: &Value,
+) -> Result<(Vec<WalTableRow>, usize), WalProbeFailure> {
     let columns = body
         .get("columns")
         .and_then(Value::as_array)
@@ -210,7 +212,7 @@ pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalPr
     // An absent/empty dataset is a legitimate "no WAL tables" answer.
     let rows = match body.get("dataset").and_then(Value::as_array) {
         Some(rows) => rows,
-        None => return Ok(Vec::new()),
+        None => return Ok((Vec::new(), 0)),
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -253,7 +255,18 @@ pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalPr
     if out.is_empty() && !rows.is_empty() {
         return Err(WalProbeFailure::AllRowsSkipped);
     }
-    Ok(out)
+    // SOME rows skipped is not the same answer as none skipped, and until
+    // 2026-08-26 the difference was invisible. `observe` derives its FALLING
+    // edge from ABSENCE -- a latched table missing from the row set is read as
+    // "recovered" -- so one row failing to parse made a still-suspended table
+    // emit a false recovery `info!`, clear its latch, and drop out of the
+    // gauge, on the one failure mode where ILP keeps ACKing and every loss
+    // counter reads zero. The defensive per-row skip stays (one bad row must
+    // not blind the probe to the other tables); what changes is that the
+    // caller now KNOWS the observation was partial and refuses to conclude
+    // recovery from it.
+    let skipped = rows.len().saturating_sub(out.len());
+    Ok((out, skipped))
 }
 
 /// What one observation of the current `wal_tables()` rows changed,
@@ -331,6 +344,43 @@ impl WalSuspensionTracker {
         WalSuspensionDelta {
             newly_suspended,
             recovered,
+            currently_suspended: self.suspended.len(),
+        }
+    }
+
+    /// Feed one SUCCESSFUL but possibly PARTIAL probe's rows.
+    ///
+    /// `complete` is false when the parse skipped one or more malformed rows.
+    /// A partial observation may ADD knowledge (a table it did see suspended
+    /// is really suspended, so the rising edge still fires) but must never
+    /// SUBTRACT it: the falling edge is derived from ABSENCE, and a table
+    /// absent because its row failed to parse is not a table that recovered.
+    ///
+    /// Before 2026-08-26 there was only the complete form, so a single
+    /// malformed row for a latched table produced a false "recovered" `info!`,
+    /// cleared the latch, and dropped the table out of
+    /// `tv_questdb_wal_suspended_tables` -- on the one failure mode where ILP
+    /// keeps ACKing, `flush()` returns `Ok`, every loss counter reads zero and
+    /// the rows are simply not there. The alarm this module exists to feed
+    /// would have read green while the table stayed suspended.
+    pub fn observe_with_completeness(
+        &mut self,
+        rows: &[WalTableRow],
+        complete: bool,
+    ) -> WalSuspensionDelta {
+        let delta = self.observe(rows);
+        if complete {
+            return delta;
+        }
+        // Put back every name the partial view could not see. `observe` has
+        // already replaced the latch with what it saw, so the restore is a
+        // union of that with the names it reported as recovered.
+        for name in &delta.recovered {
+            self.suspended.insert(name.clone());
+        }
+        WalSuspensionDelta {
+            newly_suspended: delta.newly_suspended,
+            recovered: Vec::new(),
             currently_suspended: self.suspended.len(),
         }
     }
@@ -494,7 +544,7 @@ impl WalLagTracker {
 /// [`WalProbeFailure::Http`] so the caller's skip-tick semantics are
 /// uniform. Never panics.
 // TEST-EXEMPT: thin I/O shell — the pure parse core (`parse_wal_tables_response`) and the edge machine (`WalSuspensionTracker`) are fully unit-tested; this fn needs a live QuestDB to exercise and is covered by the first live boot (honest live-unverified note in the plan).
-async fn probe_wal_tables(base_url: &str) -> Result<Vec<WalTableRow>, WalProbeFailure> {
+async fn probe_wal_tables(base_url: &str) -> Result<(Vec<WalTableRow>, usize), WalProbeFailure> {
     let client = match crate::http_client::shared_probe_client() {
         Ok(client) => client,
         Err(err) => {
@@ -643,7 +693,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
         loop {
             ticker.tick().await;
             match probe_wal_tables(&base_url).await {
-                Ok(rows) => {
+                Ok((rows, skipped)) => {
                     schema_warned = false;
                     if blind_announced {
                         info!(
@@ -668,7 +718,20 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                         );
                         continue;
                     }
-                    let delta = tracker.observe(&rows);
+                    if skipped > 0 {
+                        // Loud, and NOT a probe failure: the rows that DID
+                        // parse are real and their rising edges must still
+                        // fire. What the count buys is the refusal to read a
+                        // table missing from a partial view as recovered.
+                        warn!(
+                            skipped,
+                            parsed = rows.len(),
+                            "wal_tables() rows failed to parse -- this poll is a \
+                             PARTIAL view, so no table will be reported \
+                             recovered from it"
+                        );
+                    }
+                    let delta = tracker.observe_with_completeness(&rows, skipped == 0);
                     emit_wal_delta(&delta);
                     // The 2026-08-25 gap: a table can stop applying rows
                     // WITHOUT the `suspended` flag ever being set, and that
@@ -938,7 +1001,8 @@ mod tests {
             ],
             "count": 2
         });
-        let rows = parse_wal_tables_response(&body).expect("canonical shape parses");
+        let (rows, skipped) = parse_wal_tables_response(&body).expect("canonical shape parses");
+        assert_eq!(skipped, 0, "a clean body skips nothing");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "ticks");
         assert!(!rows[0].suspended);
@@ -957,7 +1021,7 @@ mod tests {
             "columns": header(&["suspended", "errorMessage", "name", "sequencerTxn"]),
             "dataset": [[true, "boom", "ticks", 7]],
         });
-        let rows = parse_wal_tables_response(&shuffled).expect("shuffled shape parses");
+        let (rows, _skipped) = parse_wal_tables_response(&shuffled).expect("shuffled shape parses");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "ticks");
         assert!(rows[0].suspended);
@@ -1003,7 +1067,7 @@ mod tests {
         }
         // Absent dataset with a valid header = legitimately zero rows.
         let no_dataset = json!({ "columns": header(&["name", "suspended"]) });
-        assert_eq!(parse_wal_tables_response(&no_dataset), Ok(Vec::new()));
+        assert_eq!(parse_wal_tables_response(&no_dataset), Ok((Vec::new(), 0)));
     }
 
     #[test]
@@ -1018,7 +1082,12 @@ mod tests {
                 ["good_table", true],  // valid — must survive
             ],
         });
-        let rows = parse_wal_tables_response(&body).expect("valid rows must survive bad ones");
+        let (rows, skipped) =
+            parse_wal_tables_response(&body).expect("valid rows must survive bad ones");
+        assert!(
+            skipped > 0,
+            "the bad rows must be COUNTED, not silently gone"
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "good_table");
         assert!(rows[0].suspended);
@@ -1057,7 +1126,7 @@ mod tests {
             "columns": header(&["name", "suspended"]),
             "dataset": [],
         });
-        assert_eq!(parse_wal_tables_response(&empty), Ok(Vec::new()));
+        assert_eq!(parse_wal_tables_response(&empty), Ok((Vec::new(), 0)));
     }
 
     #[test]
@@ -1073,7 +1142,8 @@ mod tests {
                 ["market_depth", true],
             ],
         });
-        let rows = parse_wal_tables_response(&mixed).expect("one good row survives");
+        let (rows, skipped) = parse_wal_tables_response(&mixed).expect("one good row survives");
+        assert!(skipped > 0, "the skipped row must be counted");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "market_depth");
         assert!(rows[0].suspended);
@@ -1110,7 +1180,7 @@ mod tests {
             "columns": header(&["name", "suspended", "errorTag", "errorMessage"]),
             "dataset": [["ticks", true, "", ""]],
         });
-        let rows = parse_wal_tables_response(&body).expect("parses");
+        let (rows, _skipped) = parse_wal_tables_response(&body).expect("parses");
         assert_eq!(rows[0].error_tag, None);
         assert_eq!(rows[0].error_message, None);
     }
@@ -1294,6 +1364,71 @@ mod tests {
             assert!(d.recovered.is_empty());
             assert_eq!(d.currently_suspended, 1);
         }
+    }
+
+    /// BITE (2026-08-26): a PARTIAL view must never report a recovery.
+    ///
+    /// The falling edge is derived from ABSENCE, and `parse_wal_tables_response`
+    /// skips a malformed row defensively — so before this fix, one row failing
+    /// to parse made a still-suspended table emit a false "recovered" `info!`,
+    /// clear its latch and drop out of `tv_questdb_wal_suspended_tables`. On
+    /// the one failure mode where ILP keeps ACKing and every loss counter reads
+    /// zero, the alarm would have gone green while the table stayed suspended.
+    #[test]
+    fn a_partial_observation_never_reports_a_recovery() {
+        let mut t = WalSuspensionTracker::new();
+        t.observe(&[row("ticks", true), row("market_depth", true)]);
+        assert_eq!(t.currently_suspended(), 2);
+
+        // `market_depth`'s row failed to parse, so it is simply absent.
+        let d = t.observe_with_completeness(&[row("ticks", true)], false);
+        assert!(
+            d.recovered.is_empty(),
+            "a table absent from a PARTIAL view has not recovered — it was not seen"
+        );
+        assert_eq!(
+            d.currently_suspended, 2,
+            "the gauge must keep counting the table the partial view could not see"
+        );
+        assert_eq!(t.currently_suspended(), 2, "and the latch must survive");
+
+        // The very same absence on a COMPLETE view IS a recovery — the
+        // distinction is the whole point, not a blanket refusal to ever fall.
+        let d = t.observe_with_completeness(&[row("ticks", true)], true);
+        assert_eq!(d.recovered, vec!["market_depth".to_string()]);
+        assert_eq!(d.currently_suspended, 1);
+    }
+
+    /// A partial view may still ADD knowledge: a table it DID see suspended is
+    /// really suspended, so the rising edge fires as normal. Refusing to page
+    /// on a partial poll would trade a false recovery for a missed detection,
+    /// which is the same class of error in the other direction.
+    #[test]
+    fn a_partial_observation_still_fires_the_rising_edge() {
+        let mut t = WalSuspensionTracker::new();
+        let d = t.observe_with_completeness(&[row("ticks", true)], false);
+        assert_eq!(d.newly_suspended.len(), 1);
+        assert_eq!(d.newly_suspended[0].name, "ticks");
+        assert_eq!(d.currently_suspended, 1);
+    }
+
+    /// The count itself: `skipped` must be the number of rows that arrived and
+    /// did not become a `WalTableRow`, because that count is what decides
+    /// whether the poll is treated as complete.
+    #[test]
+    fn the_skipped_count_is_the_rows_that_did_not_parse() {
+        let body = serde_json::json!({
+            "columns": [{"name": "name"}, {"name": "suspended"}],
+            "dataset": [
+                ["ticks", true],
+                ["market_depth", "true"],   // string, not bool — skipped
+                "not-an-array",             // not a row at all — skipped
+                ["candles_1m", false],
+            ],
+        });
+        let (rows, skipped) = parse_wal_tables_response(&body).expect("two rows survive");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(skipped, 2);
     }
 
     #[test]

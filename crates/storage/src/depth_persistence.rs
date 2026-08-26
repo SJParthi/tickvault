@@ -587,6 +587,28 @@ fn temp_depth_spill_dir() -> PathBuf {
 /// the operator a manual re-ingest is safe: the depth DEDUP key carries
 /// `depth_kind` and `capture_seq`, so a partially-applied write plus a
 /// re-send collapses instead of duplicating.
+/// How fast a retryable flush failure must come back before the ONE retry is
+/// allowed.
+///
+/// The depth flush runs inside `block_in_place` on the drain task — the task
+/// that folds ticks — and the sender's `request_timeout` is 5,000 ms. An
+/// unconditional retry therefore makes the worst case TEN seconds of drain
+/// occupancy on the largest table in the database, which is the same
+/// socket-buffer-fills-and-the-vendor-skips-us mechanism the whole
+/// zero-tick-loss requirement is about.
+///
+/// A timed-out request and an `EINTR` both surface as
+/// `questdb::ErrorCode::SocketError`, so the error class cannot separate the
+/// case the retry exists for from the case that must not be retried. The clock
+/// can: an interrupted syscall returns in microseconds, a timeout consumes the
+/// full 5,000 ms. One second sits three orders of magnitude above the first
+/// and five times below the second.
+pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS: u64 = 1_000;
+
+/// [`DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS`] as a `Duration`.
+pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS);
+
 #[must_use]
 fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
     matches!(err.code(), questdb::ErrorCode::SocketError)
@@ -869,15 +891,22 @@ impl DepthWriter {
             );
             anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
         };
+        let started = std::time::Instant::now();
         let first = sender.flush(&mut self.buffer);
+        let first_failure_elapsed = started.elapsed();
         let outcome = match first {
             Ok(()) => Ok(()),
-            Err(err) if flush_failure_is_retryable(&err) => {
-                // ONE retry, only for the transport class. EINTR and a
-                // connection reset leave the buffer intact and the server
-                // holding nothing to reject, so discarding here throws away
-                // rows that a second attempt would have written -- which is
-                // exactly what happened on 2026-08-25 at 13:12:07, when
+            Err(err)
+                if flush_failure_is_retryable(&err)
+                    && first_failure_elapsed < DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                // ONE retry, only for the transport class, and only when the
+                // first attempt failed FAST.
+                //
+                // EINTR and a connection reset leave the buffer intact and the
+                // server holding nothing to reject, so discarding here throws
+                // away rows that a second attempt would have written -- which
+                // is exactly what happened on 2026-08-25 at 13:12:07, when
                 // `io: Interrupted system call (os error 4)` cost 8,810 rows.
                 //
                 // Bounded at one deliberately. This runs on the flush path, so
@@ -886,6 +915,17 @@ impl DepthWriter {
                 // upstream instead -- the same loss wearing a different name.
                 // A second failure falls through to the rescue-then-discard
                 // below, unchanged.
+                //
+                // The TIMING condition (added 2026-08-26) is what keeps that
+                // reasoning true. `request_timeout=5000` and an unconditional
+                // retry make the worst case TEN seconds of a flush that runs
+                // inside `block_in_place` on the drain task -- and the drain
+                // task is the tick fold. A timed-out flush maps to the same
+                // `SocketError` class as an EINTR, so without a clock the two
+                // are indistinguishable and the retry doubles the exact stall
+                // it was reasoned to be safe against. An EINTR returns in
+                // microseconds; a timeout consumes the full budget. The window
+                // separates them with three orders of magnitude to spare.
                 metrics::counter!(
                     "tv_depth_flush_retries_total",
                     "feed" => self.feed.as_str(),
@@ -893,7 +933,18 @@ impl DepthWriter {
                 .increment(1);
                 sender.flush(&mut self.buffer)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                if flush_failure_is_retryable(&err) {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_depth_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
         };
         match outcome {
             Ok(()) => {
@@ -967,6 +1018,32 @@ pub fn depth_segment_label(code: u8) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The retry window must be far above an interrupted syscall and far below
+    /// the sender's own request timeout — that gap is the whole reason a clock
+    /// can separate two failures the error class cannot.
+    #[test]
+    fn the_retry_window_sits_between_an_eintr_and_the_request_timeout() {
+        // Source-scanned rather than built from a config fixture: the number
+        // the window is reasoned against is the LITERAL in `depth_ilp_http_conf`,
+        // and a change to it must invalidate this test.
+        let src = include_str!("depth_persistence.rs");
+        assert!(
+            src.contains("request_timeout=5000"),
+            "the retry window is reasoned against a 5,000 ms request timeout; if that \
+             literal moved, re-derive the window instead of re-blessing this test"
+        );
+        assert!(
+            DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS < 5_000,
+            "a window at or above the request timeout would allow the retry after a \
+             timeout, doubling a 5s stall on the drain task to 10s"
+        );
+        assert!(
+            DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS >= 100,
+            "a window this tight would refuse the EINTR retry the 2026-08-25 8,810-row \
+             loss is the evidence for"
+        );
+    }
     use super::*;
 
     // ---- flush-failure classification (2026-08-25) ----------------------
