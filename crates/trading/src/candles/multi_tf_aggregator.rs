@@ -510,17 +510,15 @@ impl MultiTfAggregator {
         // is now attributed to `timestamp` rather than `price`, which is the
         // more actionable of the two — a bad price costs one candle, a bad
         // timestamp poisons a partition.
-        if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-            || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
-        {
-            crate::candles::fold_counters::fold_counters()
-                .tick_refused_timestamp
-                .increment(1);
-            return ConsumeStats {
-                refused_timestamp: true,
-                ..ConsumeStats::default()
-            };
-        }
+        //
+        // DE-DUPLICATED 2026-08-26: this band check was present TWICE, back to
+        // back and byte-identical, left by a merge resolution. The second copy
+        // was unreachable — the first returns — so behaviour was correct, but
+        // every ACCEPTED tick paid two dead comparisons, and a reader deleting
+        // "the duplicate" could as easily have deleted the live one. The two
+        // comment blocks are kept because they explain different halves of the
+        // same decision: the ordering rationale, and the counter-registry
+        // resolution.
         // TIMESTAMP BAND — moved ABOVE the untraded-sentinel return on
         // 2026-08-25, and that reordering is the whole fix.
         //
