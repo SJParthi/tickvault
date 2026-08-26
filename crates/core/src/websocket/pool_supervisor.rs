@@ -1447,7 +1447,7 @@ impl SubscribeGuard {
         //
         // Same scan as the one above, same exemption for the same reason.
         // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
-        if self.instruments.iter().any(|held| *held == new) {
+        if self.instruments.contains(&new) {
             metrics::counter!(
                 SUBSCRIBE_DUPLICATE_METRIC,
                 "endpoint" => self.endpoint.as_str(),

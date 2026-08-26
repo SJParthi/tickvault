@@ -207,8 +207,7 @@ pub fn build_depth20_layout(candidates: &[DepthCandidate], movers: &[MoverRow]) 
     let mut seen: std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> =
         std::collections::HashSet::new();
     for underlying in DEPTH_20_INDEX_UNDERLYINGS {
-        let mut instruments =
-            index_window(candidates, underlying, DEPTH_20_INDEX_STRIKES_EACH_SIDE);
+        let instruments = index_window(candidates, underlying, DEPTH_20_INDEX_STRIKES_EACH_SIDE);
         if instruments.is_empty() {
             out.index_underlyings_unresolved.push(underlying.to_owned());
         }
