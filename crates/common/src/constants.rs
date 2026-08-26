@@ -3343,11 +3343,21 @@ pub const CLOCK_SKEW_HALT_THRESHOLD_SECS: f64 = 2.0;
 /// "green because no data" to "green because stale data", which is more
 /// convincing and therefore worse.
 ///
-/// 30s is not arbitrary: the alarm is `period = 60` over 2 evaluation
-/// periods, so publishing twice per period guarantees every window it
-/// evaluates carries a FRESH sample rather than a re-rendered old one.
+/// 30s is not arbitrary, and the reason is about STALENESS rather than
+/// datapoint count. The CloudWatch agent collects on its own 60s cadence
+/// (`metrics_collection_interval` in `deploy/aws/cloudwatch-agent.json`),
+/// so CloudWatch gets one datapoint per alarm period whatever we do here —
+/// what we control is how OLD the value the agent reads happens to be.
+/// Polling at half the agent's interval bounds that at 30s. Polling at 60s
+/// would leave it free to align badly and hand over a nearly-minute-old
+/// reading; the pre-fix behaviour handed over a NINE-HOUR-old one.
 /// It also matches the house cadence for the other cold-path sweeps
 /// (`scan_silence`, the token-health gauge).
+///
+/// The `const` assert below pins the relationship to the ALARM period
+/// rather than the agent's, deliberately: the alarm period is the contract
+/// this constant exists to satisfy, and both are 60s today, so one assert
+/// covers both without pretending to enforce a file it cannot read.
 pub const CLOCK_SKEW_POLL_INTERVAL_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------

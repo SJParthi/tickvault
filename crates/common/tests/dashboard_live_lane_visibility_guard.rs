@@ -246,10 +246,17 @@ fn nothing_is_charted_that_can_never_publish() {
     let selected = emf_selected_names(&read(USER_DATA));
     let dashboard = read(DASHBOARD);
 
+    // SCOPE WIDENED 2026-08-26 — was three prefixes: `tv_dhan_`, `tv_tick`,
+    // `tv_ws_`. Same defect as the sibling check above, in the direction this
+    // test's own comment calls "the more dangerous one": a phantom widget on
+    // `tv_cadence_*`, `tv_chain_*`, `tv_partition_*`, `tv_ilp_*`, `tv_boot_*`
+    // or any other prefix rendered "no data" and NOTHING would have said so.
+    //
+    // Any `tv_`-prefixed string on the dashboard is in scope now. The filter
+    // reads string literals, and the dashboard's comments never quote a metric
+    // name, so a prose mention cannot produce a false positive.
     let mut phantom: Vec<String> = Vec::new();
-    for name in dashboard.split('"').filter(|s| {
-        s.starts_with("tv_dhan_") || s.starts_with("tv_tick") || s.starts_with("tv_ws_")
-    }) {
+    for name in dashboard.split('"').filter(|s| s.starts_with("tv_")) {
         // Derived metrics-log-filter series (order-side) are published by a
         // log metric filter rather than the EMF path, so they legitimately
         // never appear in the selector list.
