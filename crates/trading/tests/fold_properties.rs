@@ -67,6 +67,26 @@ fn price() -> impl Strategy<Value = f32> {
     ]
 }
 
+/// Open interest, INCLUDING the absent sentinel at a real rate.
+///
+/// **Added 2026-08-26 after this suite caught a defect essentially by luck.**
+/// The OI properties are entirely about `0` — the ABSENT sentinel a
+/// Ticker-mode packet carries — and the generator drew OI from `0..5_000`,
+/// so the sentinel appeared about once in five thousand ticks. CI hit it;
+/// 60,000 local cases did not. A property whose subject the generator almost
+/// never produces is a coin flip, not a test.
+///
+/// The weighting mirrors `price()` above, which already names the shapes that
+/// matter instead of trusting a uniform range to find them.
+fn open_interest() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        // The absent sentinel: EVERY Ticker-mode packet carries it, and every
+        // equity carries it always. Common in the feed, so common here.
+        3 => Just(0u32),
+        7 => (1u32..5_000),
+    ]
+}
+
 /// A scenario's ticks, sharing ONE day-open.
 ///
 /// `day_open` is a per-DAY constant for an instrument, not a per-tick value,
@@ -81,7 +101,7 @@ fn price() -> impl Strategy<Value = f32> {
 fn ticks() -> impl Strategy<Value = Vec<ParsedTick>> {
     (
         prop_oneof![3 => (0.05f32..90_000.0), 1 => Just(0.0f32)],
-        prop::collection::vec((price(), 0u32..59, 0u32..100_000, 0u32..5_000), 1..24),
+        prop::collection::vec((price(), 0u32..59, 0u32..100_000, open_interest()), 1..24),
     )
         .prop_map(|(day_open, raw)| {
             raw.into_iter()
