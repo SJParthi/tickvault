@@ -973,8 +973,8 @@ jobs:
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
               "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
-              "READY_OK=no; for i in $(seq 1 60); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
-              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 300s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
+              "READY_OK=no; for i in $(seq 1 150); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
+              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
               "echo TICKVAULT-UP",
               "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo timeout 180 dnf install -y amazon-cloudwatch-agent || sudo timeout 180 yum install -y amazon-cloudwatch-agent || (curl -fsSL --max-time 120 https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
               "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
@@ -1023,7 +1023,7 @@ jobs:
           # ~12.6 min), so 240 polls ≈ 25 min REAL. Sizing: every on-box stage
           # is now explicitly bounded (same-date deploy-hang fix — dnf ≤180s,
           # curl ≤120s, git fetch ≤120s, s3 cp ≤300s each, compose up ≤600s,
-          # smoke ≤40s, no-block restart + 300s readiness poll, CW agent ≤~300s), and the
+          # smoke ≤40s, no-block restart + 750s readiness poll, CW agent ≤~300s), and the
           # sizing case is a POST-NUKE FIRST deploy that must also dnf-install
           # docker + pull the QuestDB image inside `compose up` — realistic
           # wall-clock ~8-12 min, so 25 min real gives ~2x headroom while any
