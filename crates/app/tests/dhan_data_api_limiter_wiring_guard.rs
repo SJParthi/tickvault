@@ -196,6 +196,33 @@ fn ratchet_retry_shaping_is_wired_into_the_ladder_and_run_loop() {
     );
 }
 
+/// The THIRD choke point, added 2026-08-26.
+///
+/// The 15:31 daily cross-verification fires up to one request per target at
+/// the SAME `/v2/charts/intraday` endpoint the spot-1m leg uses — 865 on
+/// 2026-08-26 — and did it in an unpaced sequential loop while this guard
+/// pinned two choke points and called the job done. A guard that enumerates
+/// callers is only as good as its enumeration.
+#[test]
+fn ratchet_crossverify_rest_leg_routes_through_shared_limiter() {
+    let src = read_app_src("src/dhan_live_crossverify.rs");
+    let body = fn_body(&src, "pub async fn fetch_rest_side_for_target(");
+    assert!(
+        body.contains("shared_dhan_data_api_limiter()") && body.contains(".acquire()"),
+        "fetch_rest_side_for_target must acquire a permit from the SAME \
+         shared Dhan Data-API limiter — it is the choke point every \
+         cross-verification request passes through, and there is no unpaced \
+         variant of it"
+    );
+    assert!(
+        body.contains("StatusCode::TOO_MANY_REQUESTS") && body.contains("record_429()"),
+        "a real 429 on this leg must feed the shared self-tuner from the REAL \
+         StatusCode (never a substring scan): a limiter that cannot see this \
+         leg's throttling cannot step down for it, and the collateral lands on \
+         the per-minute legs"
+    );
+}
+
 #[test]
 fn ratchet_limiter_module_is_the_single_pacing_authority() {
     let src = read_app_src("src/dhan_data_api_limiter.rs");

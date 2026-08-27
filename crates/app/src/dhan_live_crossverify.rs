@@ -1298,6 +1298,11 @@ pub fn classify_rest_failure(err: &str) -> &'static str {
         "no_candles"
     } else if err.starts_with("rest fetch timed out") || err.starts_with("rest body timed out") {
         "timed_out"
+    } else if err.starts_with("rest fetch rate limited") {
+        // Its own bucket, not `http_4xx`: being throttled is a statement
+        // about OUR request rate, and every other 4xx is a statement about
+        // the request itself. Reading them as one number hides which.
+        "rate_limited"
     } else if let Some(rest) = err.strip_prefix("rest fetch http ") {
         // Status class only — 5xx is theirs, 4xx is usually ours, and the
         // exact code is in the status text this collapses.
@@ -1659,6 +1664,37 @@ pub fn classify_http_status(status: reqwest::StatusCode) -> XverifyFetchFailureK
 /// is built by the SHARED [`crate::dhan_intraday_parse::intraday_request_body`]
 /// so the day-granular window convention matches the spot-1m leg exactly.
 ///
+/// # Pacing (added 2026-08-26)
+///
+/// This awaits the SHARED `dhan_data_api_limiter` before every request, and
+/// feeds a real `429` back into its self-tuner.
+///
+/// **It did not, and that was a hole in the pacing contract.** The limiter's
+/// own header calls itself the single authority over "every per-minute Dhan
+/// Data-API REST fire" and enumerates two choke points — the spot-1m leg and
+/// the option-chain leg. This leg hits the SAME `/v2/charts/intraday`
+/// endpoint, with the same token, up to once per target — 865 requests on
+/// 2026-08-26 — in a tight sequential loop with no pacing of any kind. The
+/// module's own run-budget comment even derives its 600s from "the Dhan Data
+/// API budget is 5 requests/sec", then never enforced it.
+///
+/// Two consequences, and the second is the one that matters most. Our own
+/// requests could exceed the vendor budget and come back throttled — 815 of
+/// 865 failed that day, with the reason discarded. And because the 429s never
+/// reached `record_429`, the self-tuner could not SEE the pressure this leg
+/// created, so it could not step down for it: the collateral damage landed on
+/// the per-minute legs, which the operator's 2026-08-11 directive keeps
+/// explicitly running.
+///
+/// Pacing is affordable here: 865 targets at the limiter's 2-4 rps is
+/// ~216-433s, inside the 600s run budget, and the budget already degrades the
+/// verdict honestly rather than pretending un-fetched targets were clean.
+///
+/// Unlike the other two legs this keeps `acquire` and `record_429` INSIDE the
+/// fetch fn rather than in a paced wrapper: there is exactly one call site and
+/// no unpaced variant, so putting them here means no future caller can be
+/// added that bypasses them.
+///
 /// # Errors
 /// Transport failure, non-2xx, or timeout. The token is never logged.
 pub async fn fetch_rest_side_for_target(
@@ -1680,6 +1716,9 @@ pub async fn fetch_rest_side_for_target(
         trading_date,
         next_day,
     );
+    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
+        .acquire()
+        .await;
     let fut = client
         .post(intraday_url)
         .header("access-token", jwt)
@@ -1696,14 +1735,15 @@ pub async fn fetch_rest_side_for_target(
         })?;
     let status = resp.status();
     if !status.is_success() {
-        // Classified from the REAL StatusCode, never a substring scan of the
-        // rendered message — the discipline the spot-1m leg records for
-        // feeding its self-tuner, and the reason `rate_limited` here can be
-        // trusted as an answer rather than a guess.
-        return Err(XverifyFetchFailure::new(
-            classify_http_status(status),
-            format!("rest fetch http {status}"),
-        ));
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Fed from the REAL StatusCode, never a substring scan of the
+            // rendered status — the same rule the other two legs follow.
+            // Enough of these inside the tuner's rolling window steps the
+            // shared limiter down to its 2 rps floor.
+            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
+            return Err("rest fetch rate limited".to_string());
+        }
+        return Err(format!("rest fetch http {status}"));
     }
     let text = tokio::time::timeout(timeout, resp.text())
         .await
@@ -2092,7 +2132,7 @@ mod tests {
             ("rest returned no candles", "no_candles"),
             ("rest fetch timed out", "timed_out"),
             ("rest body timed out", "timed_out"),
-            ("rest fetch http 429 Too Many Requests", "http_4xx"),
+            ("rest fetch rate limited", "rate_limited"),
             ("rest fetch http 401 Unauthorized", "http_4xx"),
             ("rest fetch http 503 Service Unavailable", "http_5xx"),
             ("rest fetch transport: connection closed", "transport"),
@@ -2119,6 +2159,48 @@ mod tests {
         assert_ne!(
             classify_rest_failure("rest returned no candles"),
             classify_rest_failure("rest fetch http 500 Internal Server Error"),
+        );
+        // Throttling is a statement about OUR request rate; every other 4xx
+        // is about the request itself. One bucket would hide which.
+        assert_ne!(
+            classify_rest_failure("rest fetch rate limited"),
+            classify_rest_failure("rest fetch http 401 Unauthorized"),
+        );
+    }
+
+    /// This leg fires up to one request per target — 865 on 2026-08-26 — at
+    /// the SAME `/v2/charts/intraday` endpoint the per-minute legs use, and it
+    /// did so with no pacing at all while the shared limiter called itself the
+    /// single authority over every Dhan Data-API fire.
+    ///
+    /// The 429 half matters as much as the acquire: without `record_429` the
+    /// self-tuner cannot SEE the pressure this leg creates, so it cannot step
+    /// down for it, and the collateral lands on the per-minute legs the
+    /// operator's 2026-08-11 directive keeps explicitly running.
+    #[test]
+    fn the_rest_leg_is_paced_by_the_shared_data_api_limiter() {
+        let src = include_str!("dhan_live_crossverify.rs");
+        let start = src
+            .find("pub async fn fetch_rest_side_for_target(")
+            .expect("the fetch fn must exist");
+        let end = start
+            + 1
+            + src[start + 1..]
+                .find("\n}\n")
+                .expect("the fetch fn must end at column 0");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("shared_dhan_data_api_limiter()") && body.contains(".acquire()"),
+            "every request must take a permit from the SHARED limiter — an \
+             unpaced sequential loop over every target is what the limiter \
+             exists to prevent"
+        );
+        assert!(
+            body.contains("StatusCode::TOO_MANY_REQUESTS") && body.contains("record_429()"),
+            "a real 429 must reach the self-tuner from the StatusCode, never a \
+             substring scan — a limiter that cannot see this leg's throttling \
+             cannot step down for it"
         );
     }
 

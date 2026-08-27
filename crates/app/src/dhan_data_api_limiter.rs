@@ -20,6 +20,24 @@
 //! leg's 1-unique-per-3s per-underlying gap stays LAYERED ON TOP,
 //! unchanged.
 //!
+//! **THIRD choke point added 2026-08-26:
+//! `dhan_live_crossverify::fetch_rest_side_for_target`.** This header
+//! claimed to cover "every per-minute Dhan Data-API REST fire" and named
+//! two, and that was true of the per-minute legs — but the 15:31 daily
+//! cross-verification hits the SAME `/v2/charts/intraday` endpoint with
+//! the same token, once per target, in a tight sequential loop: 865
+//! requests on 2026-08-26, entirely unpaced. Its own run-budget comment
+//! derives 600s from "the Dhan Data API budget is 5 requests/sec" and
+//! then never enforced it.
+//!
+//! The 429 half is the part that hurt beyond that leg: because its
+//! throttling never reached [`DhanDataApiLimiter::record_429`], the
+//! self-tuner could not SEE the pressure and so could not step down for
+//! it — the collateral landed on the per-minute legs the operator's
+//! 2026-08-11 directive keeps explicitly running. A limiter blind to one
+//! of its own endpoint's callers is not the single authority this header
+//! says it is.
+//!
 //! ## HONESTY — what this limiter does and does NOT do
 //! 2026-07-14 live session: the spot-1m leg was 0/980 (0%) with ~244
 //! wasted 429s — the ladder re-fired ~20 req/min against all-empty
