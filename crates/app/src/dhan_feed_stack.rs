@@ -8515,47 +8515,62 @@ fn persist_xverify_report(
     };
 
     let mut cell_errors = 0_usize;
+    // CHUNKED 2026-08-26. This loop appended all findings and flushed ONCE.
+    // On 2026-08-26 that was 764,003 rows -> a 207,965,278-byte buffer against
+    // the server's 104,857,600 cap, the flush was refused, and the
+    // poisoned-buffer defence discarded every row. The feed's only
+    // ground-truth record has no row for that day. It is scale-driven, not a
+    // blip: 201,353 findings on 2026-08-25 became 764,003 the next session.
+    //
+    // `flush_if_large` bounds the buffer by BYTES rather than by row count, so
+    // a wider row cannot silently re-approach the cap. A chunk that fails is
+    // discarded and counted here — the run is still marked degraded below, so
+    // a partial write is never rounded up to success.
+    let mut chunk_flush_errors = 0_usize;
     for finding in &c.findings {
         if writer.append_cell(finding).is_err() {
             cell_errors += 1;
         }
-        flush_if_full(&mut writer, &mut batch_errors);
-    }
-
-    // The vendor's own tape, stored BEFORE any judgement is applied to it.
-    // Until 2026-08-26 these rows were compared in memory and dropped, so the
-    // only surviving trace of what the exchange actually said was the subset
-    // that happened to DISAGREE.
-    let mut tape_errors = 0_usize;
-    for row in &report.rest_tape {
-        if writer.append_rest_tape(row).is_err() {
-            tape_errors += 1;
+        if writer.flush_if_large().is_err() {
+            chunk_flush_errors += 1;
         }
-        flush_if_full(&mut writer, &mut batch_errors);
     }
 
+    // The daily row now meets a nearly-empty buffer. That matters more than it
+    // looks: it is appended AFTER the cells, so under the old single-flush
+    // shape an oversized cell buffer destroyed the one row recording that a
+    // comparison happened at all — the detail and the evidence of its loss
+    // went in the same refusal.
     let daily = xverify_daily_row(c, tolerance_paise);
     let daily_err = writer.append_daily(&daily).err();
 
     match writer.flush() {
         Ok(()) => {
-            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
-                .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
-            if cell_errors > 0 || daily_err.is_some() || tape_errors > 0 || batch_errors > 0 {
+            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(c.findings.len() as u64 + 1);
+            if cell_errors > 0 || chunk_flush_errors > 0 || daily_err.is_some() {
                 // Partial writes are reported, never rounded up to success:
                 // an audit table that silently drops rows is worse than one
                 // that is honestly incomplete.
+                //
+                // `chunk_flush_errors` joined this condition with the
+                // 2026-08-26 chunking, and it is the reason chunking is safe
+                // to do at all. Draining in pieces converts "no rows today"
+                // into "most rows today", which is an IMPROVEMENT only while
+                // the shortfall is visible — a silently-short audit table
+                // reads as a complete one. Each failed chunk discards its own
+                // buffer, so the rows lost are bounded by the flush threshold
+                // rather than by the run.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "xverify_persist_partial",
                     cell_errors,
-                    tape_errors,
-                    batch_errors,
+                    chunk_flush_errors,
                     daily_failed = daily_err.is_some(),
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),
                     "Dhan live-feed cross-verification persisted with gaps — some findings \
-                     could not be appended, so the audit tables are incomplete for today"
+                     could not be appended or a chunk flush was refused, so the audit \
+                     tables are incomplete for today"
                 );
             }
         }
@@ -10754,6 +10769,68 @@ mod tests {
         assert!(
             src.contains("pub questdb: tickvault_common::config::QuestDbConfig"),
             "CrossverifyDeps must carry the ILP write config"
+        );
+    }
+
+    /// The 2026-08-26 loss, pinned at the call site.
+    ///
+    /// That session's 764,003 findings built a 207,965,278-byte ILP buffer
+    /// against the server's 104,857,600 cap; the single flush was refused and
+    /// the poisoned-buffer defence discarded every row, so the feed's only
+    /// ground truth has no record for the day.
+    ///
+    /// Two halves, and BOTH are load-bearing. The chunked flush stops the
+    /// buffer growing without bound — but it also converts "no rows today"
+    /// into "most rows today", which is an improvement only while the
+    /// shortfall is visible. A caller that chunked and then ignored the
+    /// failures would ship a silently-short audit table, which reads as a
+    /// complete one and is strictly worse than the honest total loss it
+    /// replaced.
+    #[test]
+    fn the_xverify_persist_drains_in_chunks_and_reports_what_it_lost() {
+        let src = include_str!("dhan_feed_stack.rs");
+
+        let body_start = src
+            .find("fn persist_xverify_report(")
+            .expect("the persister must exist");
+        // Bound the slice to the FUNCTION, not to end-of-file. This test's own
+        // string literals below contain every marker it looks for, so an
+        // unbounded slice would match itself and pass while production code had
+        // lost the call entirely — a guard that reads its own source is the
+        // purest form of the false-OK this file keeps finding.
+        let body_end = body_start
+            + 1
+            + src[body_start + 1..]
+                .find("\n}\n")
+                .expect("the persister must end at column 0");
+        let body = &src[body_start..body_end];
+        assert!(
+            !body.contains("fn the_xverify_persist_drains"),
+            "the scanned slice has swallowed this test — it would then match its \
+             own assertions and pass vacuously"
+        );
+
+        assert!(
+            body.contains("writer.flush_if_large()"),
+            "the append loop must drain in chunks. Appending every finding and \
+             flushing once is what built a 207,965,278-byte buffer on \
+             2026-08-26 and lost all 764,003 rows to a refused flush"
+        );
+
+        let counted = body
+            .find("chunk_flush_errors += 1")
+            .expect("a refused chunk must be counted, not swallowed");
+        let reported = body
+            .find("chunk_flush_errors > 0")
+            .expect("the count must reach the degraded-run condition");
+        let logged = body
+            .find("chunk_flush_errors,")
+            .expect("the count must be a field on the partial-write error line");
+        assert!(
+            counted < reported && reported < logged,
+            "the chunk-failure count must be incremented, then gate the \
+             partial-write verdict, then be logged — a count that never \
+             reaches the verdict makes a short audit table look complete"
         );
     }
 

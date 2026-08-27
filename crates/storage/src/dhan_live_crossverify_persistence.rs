@@ -651,6 +651,13 @@ impl DhanLiveXverifyAuditWriter {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 
+    /// Test-only byte length of the ILP buffer — the quantity the 2026-08-26
+    /// loss was measured in (207,965,278 against a 104,857,600 cap).
+    #[cfg(test)]
+    fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Appends one cell finding row. Symbols BEFORE columns (the ILP
     /// tags-before-fields rule).
     ///
@@ -783,6 +790,63 @@ impl DhanLiveXverifyAuditWriter {
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
+    }
+
+    /// Flush threshold for the streaming append path.
+    ///
+    /// # The live loss this exists to stop (MEASURED 2026-08-26, not modelled)
+    ///
+    /// `persist_xverify_report` appended EVERY finding and then flushed once.
+    /// On 2026-08-26 that was 764,003 rows, and the single flush was refused:
+    ///
+    /// ```text
+    /// Could not flush buffer: Buffer size of 207965278 exceeds maximum
+    /// configured allowed size of 104857600 bytes.
+    /// ```
+    ///
+    /// The poisoned-buffer defence then discarded all 764,003 — so the revived
+    /// feed's ONE ground-truth record has no row for that day, and
+    /// `WS-GAP-03 source=xverify_failed` fired saying exactly that.
+    ///
+    /// It is not a one-off. The comparison ran fine on 2026-08-25 at 201,353
+    /// findings; the universe grew and the count went 3.8x in a single day, so
+    /// every session from here produces a buffer over the cap.
+    ///
+    /// **The cruellest part was the daily SUMMARY row.** It is appended after
+    /// the cells and flushed with them, so an oversized cell buffer destroys
+    /// the one row that records a comparison happened at all — losing the
+    /// detail AND the evidence of the loss in the same refusal. Chunking fixes
+    /// that as a side effect: the cells drain in pieces, and the summary meets
+    /// a nearly-empty buffer.
+    ///
+    /// 32 MiB against the 100 MiB server cap is ~3x headroom, so a row growing
+    /// wider does not silently re-approach the limit; at the measured ~272
+    /// bytes/row that is ~123,000 rows per flush, about 6 flushes for a
+    /// 2026-08-26-sized session.
+    pub const FLUSH_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
+
+    /// Flush ONLY if the buffer has grown past [`Self::FLUSH_THRESHOLD_BYTES`].
+    ///
+    /// Called per-append by streaming producers so the buffer is bounded by
+    /// the threshold rather than by the total row count. Cheap when it does
+    /// nothing: one `len()` compare.
+    ///
+    /// On failure the poisoned-buffer defence still applies — that chunk is
+    /// discarded and the error returned — but the buffer is then EMPTY, so a
+    /// caller that keeps going loses one chunk instead of the whole run. That
+    /// is a deliberate change in failure shape: all-or-nothing gave "no rows
+    /// today", which is at least honest; chunked gives "most rows today",
+    /// which is better ONLY IF the shortfall is reported. The caller must
+    /// count these and mark the run degraded — never round a partial write up
+    /// to success.
+    ///
+    /// # Errors
+    /// Propagates [`Self::flush`], including its discard.
+    pub fn flush_if_large(&mut self) -> Result<()> {
+        if self.buffer.len() < Self::FLUSH_THRESHOLD_BYTES {
+            return Ok(());
+        }
+        self.flush()
     }
 
     /// Flushes buffered rows over ILP-HTTP (per-flush server ACK). On ANY
@@ -1203,6 +1267,83 @@ mod tests {
         assert!(line.contains("noise_max_paise=60"));
         assert!(line.contains("tolerance_paise=0"));
         assert!(line.contains("tail_unsealed=2"));
+    }
+
+    /// The 2026-08-26 loss, as a test.
+    ///
+    /// That session produced 764,003 findings, the single flush built a
+    /// 207,965,278-byte buffer against the server's 104,857,600 cap, and the
+    /// poisoned-buffer defence discarded every row — the revived feed's only
+    /// ground truth had no record for the day.
+    ///
+    /// `for_test()` has no sender, so a flush that is genuinely REACHED must
+    /// fail — and that failure is what makes this test meaningful rather than
+    /// decorative. It appends until the buffer is over the threshold, then
+    /// asserts `flush_if_large` actually TRIED to send (Err, buffer emptied by
+    /// the poisoned-buffer defence). Under the old shape the buffer just kept
+    /// growing, so no call at any size could have produced that.
+    ///
+    /// The small-run half matters too: below the threshold the call must be a
+    /// no-op, because on the live path reaching a flush per row would turn one
+    /// round trip into hundreds of thousands.
+    #[test]
+    fn the_buffer_is_bounded_by_bytes_not_by_row_count() {
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        // Well under the threshold: nothing should be offered for flush.
+        for _ in 0..50 {
+            w.append_cell(&sample_cell()).expect("append");
+        }
+        assert!(
+            w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES,
+            "a small run must not trigger a flush"
+        );
+        assert!(
+            w.flush_if_large().is_ok(),
+            "below the threshold this is a no-op even with no sender — it must \
+             not be reached, because reaching it would try to send"
+        );
+        assert_eq!(w.pending(), 50, "a no-op flush must not clear pending");
+
+        // Now cross it for real. The append loop is bounded by BYTES, exactly
+        // as the production caller is, so this cannot silently spin if the row
+        // width changes.
+        while w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES {
+            w.append_cell(&sample_cell()).expect("append");
+        }
+        let rows_at_threshold = w.pending();
+        assert!(
+            w.flush_if_large().is_err(),
+            "past the threshold the flush must be REACHED — with no sender that \
+             surfaces as Err. An Ok here would mean the threshold is never \
+             acted on and the buffer grows without bound, which is the \
+             2026-08-26 defect"
+        );
+        assert_eq!(
+            w.pending(),
+            0,
+            "a reached flush that fails must discard its chunk (poisoned-buffer \
+             defence), leaving the buffer empty for the next chunk — not \
+             carrying {rows_at_threshold} poisoned rows forward into it"
+        );
+    }
+
+    /// The threshold has to leave real headroom under the server cap, or the
+    /// fix re-creates the bug the first time a row gets wider.
+    #[test]
+    fn the_flush_threshold_leaves_headroom_under_the_server_cap() {
+        // The cap named verbatim in the 2026-08-26 failure.
+        const OBSERVED_SERVER_CAP_BYTES: usize = 104_857_600;
+        assert!(
+            DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES * 3 <= OBSERVED_SERVER_CAP_BYTES,
+            "the flush threshold must sit at least 3x under the server's \
+             configured max buffer, so a wider row cannot silently re-approach \
+             the limit that discarded 764,003 rows on 2026-08-26"
+        );
+        assert!(
+            DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES > 1024 * 1024,
+            "too small a threshold turns one flush into thousands of round \
+             trips on the daily comparator"
+        );
     }
 
     #[test]
