@@ -218,6 +218,51 @@ pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 /// puzzling verdict.
 pub const LIVE_ROW_LIMIT: usize = LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES;
 
+/// Ceiling on the live-read query's size ON THE WIRE, checked before it is
+/// sent.
+///
+/// **Added 2026-08-26 with the target-scoping filter, because that filter is
+/// what created the risk.** The query used to be a fixed ~250 bytes; it now
+/// carries an `IN` list that grows with the target count, and it travels as a
+/// URL QUERY PARAMETER on a GET — so it lands in the server's request-header
+/// buffer, not a body. Past that buffer QuestDB rejects the request, and the
+/// symptom is an opaque HTTP error that reads like an outage rather than like
+/// a query we built too large.
+///
+/// Budgeted against the WIRE size, not the raw string, because they differ by
+/// ~25% here and only one of them is what the server measures: every
+/// separator `,` percent-encodes to `%2C`, every space to `%20`. A first
+/// version of this budget was written against `sql.len()` and read as
+/// comfortable while the encoded form sat 4 KB higher.
+///
+/// **The exact server limit is UNVERIFIED from here** — no QuestDB is
+/// reachable from the dev container — so this is set at 75% of the smallest
+/// default this project has run with (32 KiB) rather than tuned to a number
+/// nobody measured. Measured renderings, 7-digit Dhan ids:
+///
+/// ```text
+///   865 targets (today)          ~8,957 B wire   37% of budget
+/// 2,000 targets (design ceiling) ~20,307 B wire   83% of budget
+/// ```
+///
+/// The ceiling case is tight on purpose: [`LIVE_COVERED_INSTRUMENTS`] is
+/// already the point past which the doc says the answer is a paginated read
+/// rather than a bigger number, and this budget reaches the same conclusion
+/// independently instead of quietly allowing one more doubling.
+pub const LIVE_SQL_WIRE_BUDGET_BYTES: usize = 24 * 1024;
+
+/// Upper bound on how many bytes `sql` becomes as a URL query parameter.
+///
+/// Not an encoder: every byte that is not alphanumeric is ASSUMED to expand to
+/// a 3-byte `%XX` escape. That over-counts slightly (`_`, `-`, `.` and `~` are
+/// unreserved and pass through), which is the correct direction for a budget —
+/// it can refuse a query that would have fitted, and can never wave through
+/// one that would not. Pure, O(n) over a cold-path string.
+#[must_use]
+pub fn url_query_wire_len(sql: &str) -> usize {
+    sql.len() + 2 * sql.chars().filter(|c| !c.is_ascii_alphanumeric()).count()
+}
+
 // ---------------------------------------------------------------------------
 // Config — DEFAULT OFF
 // ---------------------------------------------------------------------------
@@ -523,11 +568,10 @@ pub fn live_candles_select_sql(day_start_ist_nanos: i64, target_ids: &[i64]) -> 
         let mut ids: Vec<i64> = target_ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
-        let list = ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+        // No space after the comma: this goes out as a URL QUERY PARAMETER,
+        // where `, ` encodes to `%2C%20` (6 bytes) and `,` to `%2C` (3). At
+        // the design ceiling that is 6 KB of pure separator.
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         format!("AND security_id IN ({list})")
     };
     format!(
@@ -1592,6 +1636,22 @@ pub async fn read_live_side(
 ) -> Result<(Vec<SideBar>, bool, usize), String> {
     let target_ids: Vec<i64> = targets.iter().map(|t| t.security_id).collect();
     let sql = live_candles_select_sql(day_start_ist_nanos, &target_ids);
+    // Fail CLOSED on an oversized query rather than sending it. Over the
+    // server's header buffer this comes back as an opaque HTTP error that
+    // reads like an outage; refusing here names the real cause and the real
+    // fix, which the LIVE_ROW_LIMIT doc already anticipates (paginate or read
+    // per-instrument, not a bigger number).
+    let wire = url_query_wire_len(&sql);
+    if wire > LIVE_SQL_WIRE_BUDGET_BYTES {
+        return Err(format!(
+            "live read query is ~{wire} bytes on the wire for {} targets, over the \
+             {LIVE_SQL_WIRE_BUDGET_BYTES}-byte budget — it travels as a URL query \
+             parameter and would land in QuestDB's request-header buffer, where the \
+             rejection reads like an outage. The target set has outgrown a \
+             single-request read; paginate it rather than raising this",
+            targets.len()
+        ));
+    }
     let fut = client
         .get(questdb_exec_url)
         .query(&[("query", sql.as_str())])
@@ -2231,7 +2291,7 @@ mod tests {
     fn the_live_read_is_scoped_to_the_rest_targets() {
         let sql = live_candles_select_sql(DAY_START_NANOS, &[51, 13, 25, 13]);
         assert!(
-            sql.contains("AND security_id IN (13, 25, 51)"),
+            sql.contains("AND security_id IN (13,25,51)"),
             "the read must be narrowed to the targets, sorted and deduped so the \
              query text is deterministic: {sql}"
         );
@@ -2239,6 +2299,83 @@ mod tests {
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("ORDER BY ts ASC"));
         assert!(sql.contains(&format!("LIMIT {}", LIVE_ROW_LIMIT + 1)));
+    }
+
+    /// The scoping filter made the query grow with the target count, and it
+    /// travels as a URL QUERY PARAMETER on a GET — so it lands in QuestDB's
+    /// request-header buffer. This pins that the DESIGN CEILING still fits,
+    /// not merely that today's 865 do: a budget verified only against today's
+    /// number is a budget nobody checked.
+    #[test]
+    fn the_live_read_sql_fits_its_transport_budget_at_the_design_ceiling() {
+        // Dhan security ids are 7 digits at the top of the observed range.
+        let ids: Vec<i64> = (0..LIVE_COVERED_INSTRUMENTS as i64)
+            .map(|i| 1_000_000 + i)
+            .collect();
+        let sql = live_candles_select_sql(DAY_START_NANOS, &ids);
+        let wire = url_query_wire_len(&sql);
+        assert!(
+            wire <= LIVE_SQL_WIRE_BUDGET_BYTES,
+            "at the {}-target design ceiling the query is ~{} bytes on the wire, \
+             over the {}-byte budget — the read would be refused by the server \
+             with an error that reads like an outage",
+            LIVE_COVERED_INSTRUMENTS,
+            wire,
+            LIVE_SQL_WIRE_BUDGET_BYTES
+        );
+        // And the separator must stay bare INSIDE THE ID LIST: `, ` encodes to
+        // `%2C%20`, which is 6 KB of pure separator at this size. The SELECT
+        // column list above it legitimately uses `, ` and is a fixed ~40 bytes,
+        // so the check is scoped to the clause that scales.
+        let in_clause = sql
+            .split_once("security_id IN (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| list)
+            .expect("the scoped query must carry an IN list");
+        assert!(
+            !in_clause.contains(", "),
+            "a space after the comma doubles the encoded separator cost across \
+             {} ids",
+            LIVE_COVERED_INSTRUMENTS
+        );
+    }
+
+    /// Today's real set, so the margin is a number somebody has seen rather
+    /// than an assumption. If this ever gets close, the guard above fires
+    /// before the server does.
+    #[test]
+    fn todays_target_count_leaves_real_headroom_in_the_query_budget() {
+        let ids: Vec<i64> = (0..865_i64).map(|i| 1_000_000 + i).collect();
+        let sql = live_candles_select_sql(DAY_START_NANOS, &ids);
+        let wire = url_query_wire_len(&sql);
+        assert!(
+            wire * 2 < LIVE_SQL_WIRE_BUDGET_BYTES,
+            "865 targets are ~{} bytes on the wire; the budget is {} — under half \
+             is the headroom this design assumes, and losing it means the target \
+             set grew past what one request can carry",
+            wire,
+            LIVE_SQL_WIRE_BUDGET_BYTES
+        );
+    }
+
+    /// The wire estimate must be an UPPER bound, or the budget it feeds waves
+    /// through queries the server will refuse.
+    #[test]
+    fn the_wire_estimate_never_under_counts_the_encoded_form() {
+        // Alphanumerics pass through untouched.
+        assert_eq!(url_query_wire_len("abc123"), 6);
+        // Everything else is assumed to become a 3-byte escape.
+        assert_eq!(url_query_wire_len(" "), 3);
+        assert_eq!(url_query_wire_len(","), 3);
+        assert_eq!(url_query_wire_len("a,b"), 1 + 3 + 1);
+        assert_eq!(url_query_wire_len(""), 0);
+        // And it must never be SMALLER than the raw length.
+        for probe in ["SELECT * FROM t", "1,2,3", "feed = 'dhan'"] {
+            assert!(
+                url_query_wire_len(probe) >= probe.len(),
+                "the estimate under-counted {probe:?}"
+            );
+        }
     }
 
     /// With no targets there is no REST side at all, so a universe-wide read
