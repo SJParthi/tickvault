@@ -3126,6 +3126,19 @@ async fn build_shared_infra(
                 source = sample.source,
                 "BOOT-03: clock-skew gate passed"
             );
+            // The gate above samples ONCE. `tv_clock_skew_seconds` is a gauge
+            // on an exporter with no idle timeout, so without this poller the
+            // 08:30 reading is re-rendered on every scrape and
+            // `tv-<env>-clock-skew-high` spends the whole session green on a
+            // pre-market number. Re-sample every 30s so the alarm and the
+            // dashboard panel track LIVE drift. See
+            // infra::spawn_clock_skew_poller for the full reasoning.
+            infra::spawn_clock_skew_poller(
+                config.questdb.clone(),
+                std::time::Duration::from_secs(
+                    tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+                ),
+            );
         }
         Err(infra::ClockSkewError::ThresholdExceeded {
             skew_secs,

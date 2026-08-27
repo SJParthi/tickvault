@@ -51,7 +51,7 @@
 #![allow(clippy::expect_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// How much a row can be promised.
@@ -296,6 +296,146 @@ fn error_code_liveness(root: &Path) -> (usize, usize, usize) {
 ///
 /// Walks with `std::fs` rather than shelling out to a search tool, so the
 /// report has no dependency on which binaries the host happens to carry.
+/// Counts LINES anywhere in the Rust sources containing any needle.
+///
+/// Deliberately substring-matching rather than line-start, unlike
+/// [`count_in_rust_sources`]: the things this is used for (`#[cfg(target_os`,
+/// a capped-map constant) appear mid-line as often as they start one, and a
+/// line-start scan would report a confident zero for a real occurrence --
+/// which is the false-OK this binary exists to refuse.
+fn count_substring_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
+    count_substring_scoped(root, needles, false)
+}
+
+/// As [`count_substring_in_rust_sources`], but `production_only` stops
+/// counting at each file's `mod tests`.
+///
+/// # Why this exists, and its honest limit
+///
+/// The first version of the "OS-conditional code" row reported **5 lines**
+/// and read as a common-runtime break. It was neither:
+///
+/// * **Two were this file counting itself.** The scanner's own needle literal
+///   is a line of Rust containing the needle. A report about false numbers
+///   producing one by self-reference is the sharpest possible version of the
+///   mistake, so the report's own path is excluded by name.
+/// * **The rest were `#[cfg(test)]` assertions** about macOS DNS resolving
+///   invalid hostnames differently from Linux. Production has no OS branch at
+///   all, which is the thing the row exists to check.
+///
+/// The cutoff is `mod tests`, which assumes this repo's convention of putting
+/// the test module last in a file. That is an APPROXIMATION: a `#[cfg(test)]`
+/// block placed above other code would be counted as production, and a
+/// production item below `mod tests` would be missed. Both are the safe
+/// direction for the first and the unsafe one for the second, so it is stated
+/// rather than presented as exact.
+fn count_substring_scoped(root: &Path, needles: &[&str], production_only: bool) -> usize {
+    fn walk(dir: &Path, needles: &[&str], production_only: bool, acc: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                // A "production only" count must not walk the test trees.
+                // Until 2026-08-26 it did, and the panic-macro row read TEN
+                // while `production_panic_macro_guard` -- measuring the same
+                // property over `crates/*/src` -- read two. Two measurements
+                // of one thing that disagree is the failure this file's own
+                // doc comments warn about, arriving inside the row added to
+                // stop it. `tests.rs` is excluded by NAME for the same
+                // reason: a test module living in `src/` is still a test.
+                if production_only
+                    && path
+                        .file_name()
+                        .is_some_and(|n| n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, needles, production_only, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                if production_only && path.file_name().is_some_and(|n| n == "tests.rs") {
+                    continue;
+                }
+                // This binary's own source names every needle it scans for.
+                // Counting itself would inflate every row it appears in.
+                if path.file_name().is_some_and(|n| n == "tv_guarantees.rs") {
+                    continue;
+                }
+                for line in text.lines() {
+                    let t = line.trim_start();
+                    if production_only && t.starts_with("mod tests") {
+                        break;
+                    }
+                    // A commented-out occurrence is prose, not code. Counting
+                    // it would let a deleted mechanism keep its number.
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    if needles.iter().any(|n| line.contains(n)) {
+                        *acc += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(root, needles, production_only, &mut acc);
+    acc
+}
+
+/// Every crate root on disk: `lib.rs`, `main.rs`, and each `src/bin/*.rs`.
+///
+/// Discovered rather than listed, for the same reason
+/// `main_lint_blanket_guard` now discovers them: a hardcoded path is a
+/// guarantee about one file wearing the language of a guarantee about all
+/// of them.
+fn crate_roots_on_disk() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(crates) = std::fs::read_dir("crates") else {
+        return out;
+    };
+    for c in crates.flatten() {
+        let src = c.path().join("src");
+        for name in ["lib.rs", "main.rs"] {
+            let p = src.join(name);
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+        if let Ok(bins) = std::fs::read_dir(src.join("bin")) {
+            for b in bins.flatten() {
+                if b.path().extension().is_some_and(|e| e == "rs") {
+                    out.push(b.path());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+/// Distinct `[section]` headers in `config/base.toml`.
+///
+/// The count of surfaces an operator can retune WITHOUT a rebuild -- which is
+/// the only honest reading of "dynamic" for a compiled binary. It is a
+/// breadth measure, not a quality one: it says how much is reachable from
+/// config, never whether the right things are.
+fn config_sections(root: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(root.join("config/base.toml")) else {
+        return 0;
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('[') && l.ends_with(']') && !l.starts_with("[["))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 fn count_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
     fn walk(dir: &Path, needles: &[&str], acc: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -377,6 +517,67 @@ fn distinct_tv_names(root: &Path) -> usize {
     walk(root, &mut acc);
     acc.len()
 }
+/// Distinct metric names that count a REFUSAL rather than a success.
+///
+/// The fail-closed paths in this workspace all share a shape: refuse the
+/// input, increment a counter, log once. The counter is the load-bearing
+/// half -- a refusal nobody counts is indistinguishable from a success,
+/// which is the false-OK class the charter forbids. Counting the DISTINCT
+/// names says how many independent refusal paths report themselves; it says
+/// nothing about whether each one is alarmed (section 6 answers that).
+///
+/// Word-matched on the metric name, so `tv_tick_gap_tracker_refused_total`
+/// counts and `tv_ticks_total` does not. A refusal counter named without one
+/// of these words is invisible here -- the count is a floor, not a census.
+fn distinct_refusal_counters(root: &Path) -> usize {
+    const WORDS: [&str; 6] = [
+        "refused",
+        "rejected",
+        "dropped",
+        "skipped",
+        "exhausted",
+        "unconsumed",
+    ];
+    fn walk(dir: &Path, acc: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let mut rest = line;
+                    while let Some(at) = rest.find("\"tv_") {
+                        rest = &rest[at + 1..];
+                        if let Some(close) = rest.find('"') {
+                            let name = &rest[..close];
+                            if WORDS.iter().any(|w| name.contains(w)) {
+                                acc.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeSet::new();
+    walk(root, &mut acc);
+    acc.len()
+}
+
 /// Count lines CONTAINING any needle, anywhere in the line.
 ///
 /// Sibling to [`count_in_rust_sources`], which anchors at the start of the
@@ -1476,19 +1677,18 @@ fn main() {
     // Shipped vs taken, MEASURED both ends. The first draft hardcoded
     // "76 of 371" -- a document number in a binary whose entire premise is
     // that documents cannot stay true. The gap is a deliberate cost
-    // decision (all 371 would cost ~$111/mo against a budget whose
-    // automatic action switches the trading box off), so both numbers are
-    // shown rather than the flattering one.
-    let selector =
-        std::fs::read_to_string("deploy/aws/terraform/user-data.sh.tftpl").unwrap_or_default();
-    let shipped = selector
-        .split("\"metric_selectors\"")
-        .nth(1)
-        .map(|tail| {
-            let end = tail.find(']').unwrap_or(0);
-            tail[..end].matches("tv_").count()
-        })
-        .unwrap_or(0);
+    // decision (shipping every one would cost ~$111/mo against a budget
+    // whose automatic action switches the trading box off), so both numbers
+    // are shown rather than the flattering one.
+    //
+    // The selector is read from `deploy/aws/cloudwatch-agent.json` and NOT
+    // from the boot template. It lived in the template until the template
+    // hit its byte ceiling and the selector was moved out; a reader still
+    // pointed at the old path returns ZERO shipped, which renders a healthy
+    // system as shipping nothing. This report caught that on itself, which
+    // is the only reason the wrong path did not survive into the page.
+    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
+    let shipped = shipped_names.len();
     let emitted = distinct_tv_names(Path::new("crates"));
 
     let (total_codes, live_codes, alarmed_codes) = error_code_liveness(Path::new("."));
@@ -1496,7 +1696,6 @@ fn main() {
     // A metric in the CloudWatch selector is SHIPPED — it costs money every
     // session whether or not anything reads it. A name that appears in no
     // alarm and no dashboard widget is being paid for and watched by nobody.
-    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
     let in_terraform = metric_names_in_terraform();
     let unwatched: Vec<&String> = shipped_names
         .iter()
@@ -1593,6 +1792,241 @@ fn main() {
     ];
 
     // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // 7. The operator's four words, measured rather than asserted
+    //
+    // `z-plus-defense-doctrine.md` sets a four-word test — common runtime,
+    // dynamic, scalable, incremental — and until now this report answered
+    // none of it. The four have been repeated across sessions as a
+    // requirement, and a requirement that nothing measures is a wish.
+    //
+    // Every row here is deliberately narrow. "Scalable" cannot be proven by
+    // a grep; what a grep CAN prove is that the structures which grow per
+    // instrument have a declared ceiling rather than growing until the host
+    // dies, which is the specific failure this repo has recorded five times.
+    // ---------------------------------------------------------------
+    let os_conditional = count_substring_scoped(Path::new("crates"), &["#[cfg(target_os"], true);
+    let compose_files = files
+        .iter()
+        .filter(|f| f.ends_with("docker-compose.yml"))
+        .count();
+    let tunable = config_sections(Path::new("."));
+    let capped = count_substring_in_rust_sources(
+        Path::new("crates"),
+        &[
+            "MAX_TRACKED_",
+            "MAX_INDICATOR_INSTRUMENTS",
+            "MAX_SPOT_BAR_SLOTS",
+            "AGGREGATOR_MAX_SLOTS",
+            "MAX_DAILY_UNIVERSE_SIZE",
+        ],
+    );
+    let host_derived = count_substring_in_rust_sources(Path::new("crates"), &["MemTotal"]);
+
+    let runtime = vec![
+        Row::new(
+            "Same container set, dev and prod",
+            if compose_files == 1 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{compose_files} compose"),
+            "one file describes both; a second would be two runtimes wearing one name",
+        ),
+        Row::new(
+            "OS-conditional code under crates/",
+            if os_conditional == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{os_conditional} lines"),
+            "PRODUCTION only — test-module OS branches are excluded; a Mac branch and a Linux branch in the runtime are two runtimes",
+        ),
+        Row::new(
+            "Retunable without a rebuild",
+            Verdict::Bounded,
+            format!("{tunable} sections"),
+            "config surfaces an operator can change and restart into; breadth, not quality",
+        ),
+        Row::new(
+            "Sizing derived from the host it runs on",
+            if host_derived > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{host_derived} refs"),
+            "RAM budget reads min(MemTotal, cgroup) -- not a constant pinned to one machine",
+        ),
+        Row::new(
+            "Per-entity growth has a declared ceiling",
+            Verdict::Bounded,
+            format!("{capped} refs"),
+            "fail-closed caps on the maps that grow per instrument; a ceiling, never O(1) space",
+        ),
+        Row::new(
+            "Incremental delivery",
+            Verdict::Bounded,
+            "operator",
+            "one PR at a time, each independently revertible -- a process fact, not a measured one",
+        ),
+    ];
+
+    // ---------------------------------------------------------------
+    // 8. Extreme permutations, combinations, and out-of-box cases
+    //
+    // The operator's standing ask is that every combination of exception,
+    // error, condition and out-of-box scenario be covered. No grep can
+    // prove that -- the set is infinite, and a report claiming otherwise
+    // would be the exact false-OK this file exists to end.
+    //
+    // What CAN be measured is which MACHINES exist for generating cases a
+    // human would not think of, and every row here is one of those
+    // machines rather than a claim about the cases themselves. A property
+    // test invents its own inputs; a chaos suite invents its own failures;
+    // a loom model invents its own interleavings; a fuzzer invents its own
+    // bytes. Counting them says how many directions the search runs in --
+    // never that the search finished.
+    // ---------------------------------------------------------------
+    let proptest_blocks = count_substring_in_rust_sources(Path::new("crates"), &["proptest!"]);
+    let loom_models = count_substring_in_rust_sources(Path::new("crates"), &["loom::"]);
+    let chaos_suites = files.iter().filter(|f| f.contains("chaos_")).count();
+    let fuzz_targets = files
+        .iter()
+        .filter(|f| f.contains("fuzz/fuzz_targets/"))
+        .count();
+    let guard_files = files.iter().filter(|f| f.ends_with("_guard.rs")).count();
+    let saturating = count_substring_in_rust_sources(
+        Path::new("crates"),
+        &["saturating_", "checked_", "wrapping_"],
+    );
+    let refusal_counters = distinct_refusal_counters(Path::new("crates"));
+    let panic_macros = count_substring_scoped(
+        Path::new("crates"),
+        &["unreachable!(", "panic!(", "todo!(", "unimplemented!("],
+        true,
+    );
+
+    // Every crate root must have DECIDED about silent panics -- `deny`, or
+    // `allow` with a written reason. Silence is the failure: the compiler
+    // resolves it to "permitted" and nobody is told. Counted here and
+    // enforced by `main_lint_blanket_guard`, which until 2026-08-26 checked
+    // exactly one hardcoded path while twenty-five other roots drifted.
+    let roots = crate_roots_on_disk();
+    let crate_roots = roots.len();
+    let silent_roots = roots
+        .iter()
+        .filter(|p| {
+            let Ok(src) = std::fs::read_to_string(p) else {
+                return false;
+            };
+            let decided = |lint: &str| {
+                src.contains(&format!("deny({lint})")) || src.contains(&format!("allow({lint})"))
+            };
+            !(decided("clippy::unwrap_used") && decided("clippy::expect_used"))
+        })
+        .count();
+
+    let permutations = vec![
+        Row::new(
+            "Inputs the author did not choose",
+            if proptest_blocks > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{proptest_blocks} generators"),
+            "property tests invent their own values; each run explores cases nobody wrote down",
+        ),
+        Row::new(
+            "Thread interleavings enumerated",
+            if loom_models > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{loom_models} refs"),
+            "loom walks every ordering of a small concurrent region -- exhaustive there, silent everywhere else",
+        ),
+        Row::new(
+            "Failure injection suites",
+            if chaos_suites > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{chaos_suites} files"),
+            "chaos tests break the dependency on purpose; the envelope they cover is the envelope claimed",
+        ),
+        Row::new(
+            "Byte-level hostile inputs",
+            if fuzz_targets > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{fuzz_targets} targets"),
+            "the parser is fed garbage until it crashes or the hour is up -- weekly, never per-PR",
+        ),
+        Row::new(
+            "Invariants that fail the build",
+            if guard_files > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{guard_files} guards"),
+            "a rule nothing enforces is a wish; each of these turns one wish into a red build",
+        ),
+        Row::new(
+            "Arithmetic that cannot wrap",
+            if saturating > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{saturating} sites"),
+            "saturating/checked at the counters and clocks; release also builds with overflow-checks on",
+        ),
+        Row::new(
+            "Refusals that are counted, never silent",
+            if refusal_counters > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{refusal_counters} counters"),
+            "every fail-closed path increments something -- a refusal nobody counts reads as success",
+        ),
+        Row::new(
+            "Panic macros left in production paths",
+            if Path::new("crates/common/tests/production_panic_macro_guard.rs").exists() {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{panic_macros} sites"),
+            "each compiler-guaranteed or test-only and named with its reason in that guard's allowlist; a NEW one fails the build",
+        ),
+        Row::new(
+            "Crate roots that chose about silent panics",
+            if silent_roots == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{crate_roots} roots"),
+            "deny, or allow with a written reason -- SILENCE fails the build, because the compiler reads it as permission",
+        ),
+        Row::new(
+            "Combinations nobody has thought of",
+            Verdict::Impossible,
+            "unbounded",
+            "the set is infinite; these machines widen the search, they never finish it",
+        ),
+    ];
     // Report
     // ---------------------------------------------------------------
     let sections: Vec<(&str, &[Row])> = vec![
@@ -1604,6 +2038,14 @@ fn main() {
         (
             "6. Data — stored, deduped, searchable, watched",
             &observability[..],
+        ),
+        (
+            "7. Common runtime, dynamic, scalable, incremental",
+            &runtime[..],
+        ),
+        (
+            "8. Extreme permutations, combinations, out-of-box",
+            &permutations[..],
         ),
     ];
 
@@ -1635,6 +2077,20 @@ fn main() {
             &observability
         )
     );
+    print!(
+        "{}",
+        render(
+            "7. COMMON RUNTIME, DYNAMIC, SCALABLE, INCREMENTAL",
+            &runtime
+        )
+    );
+    print!(
+        "{}",
+        render(
+            "8. EXTREME PERMUTATIONS, COMBINATIONS, OUT-OF-BOX",
+            &permutations
+        )
+    );
 
     let all: Vec<Row> = lang
         .into_iter()
@@ -1643,6 +2099,8 @@ fn main() {
         .chain(testing)
         .chain(pinning)
         .chain(observability)
+        .chain(runtime)
+        .chain(permutations)
         .collect();
     let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
     let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();

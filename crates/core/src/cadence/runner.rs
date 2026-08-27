@@ -2064,6 +2064,36 @@ fn handle_completion<C, D>(
     let dry_run = deps.dry_run;
     let now_wall = clock.ist_ms_of_day();
     let lane_feed = completion.lane;
+
+    // OUT-OF-BOX GUARD (2026-08-26). Every `Feed` arm below this point is
+    // written for a REST cadence lane, and `CycleState` carries a `LaneRun`
+    // for Dhan alone -- so a completion naming any other feed has no lane to
+    // land in. Until now each of those arms was `unreachable!()`, and under
+    // the release profile's `panic = "abort"` that takes the WHOLE trading
+    // process down for a case the type system does not forbid:
+    // `Completion.lane` is a plain `Feed`, so "structurally unreachable" was
+    // caller convention wearing a compiler's clothes. One mis-routed
+    // completion -- from a future feed gaining a cadence lane, a test helper,
+    // or a refactor that widens `Feed` -- would have aborted the session.
+    //
+    // Refused here instead: counted, logged with a code, and dropped. The
+    // cost of the out-of-box case is now ONE completion rather than the
+    // trading day. The arms further down are `return` rather than a
+    // best-guess lane, so even with this guard deleted the failure stays a
+    // dropped completion instead of a wrong one.
+    if !matches!(lane_feed, Feed::Dhan) {
+        metrics::counter!(
+            "tv_cadence_completion_refused_total",
+            "lane" => lane_feed.as_str()
+        )
+        .increment(1);
+        error!(
+            code = ErrorCode::Cadence03SchedulerDegraded.code_str(),
+            lane = lane_feed.as_str(),
+            "cadence completion arrived for a feed that has no cadence lane — dropped"
+        );
+        return;
+    }
     let leg_label = match &completion.kind {
         CompletionKind::Chain { .. } => "chain",
         CompletionKind::Spot { .. } => "spot",
@@ -2093,11 +2123,12 @@ fn handle_completion<C, D>(
     {
         let lane: &mut LaneRun = match lane_feed {
             Feed::Dhan => &mut cycle.dhan,
-            // TrueData (feed #4) is a live-tick feed, never a REST cadence
-            // lane — the cadence scheduler only ever drives Dhan/Groww
-            // lanes (CycleState has no TrueData LaneRun), so this arm is
-            // structurally unreachable regardless of truedata_enabled.
-            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
+            // No cadence lane exists for any other feed, and the guard at
+            // the top of this function already refused and counted such a
+            // completion. This arm is defence in depth: dropping the
+            // completion, never guessing the Dhan lane and never aborting
+            // the process.
+            Feed::Truedata => return,
         };
         lane.inflight = lane.inflight.saturating_sub(1);
         if lane.resolved {
@@ -2205,8 +2236,9 @@ fn handle_completion<C, D>(
                         // transport-class fetch_failed.
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
-                            // TrueData is a live-tick feed, never a cadence lane.
-                            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
+                            // No cadence lane for this feed; the top-of-function guard already
+                            // refused and counted it. Dropped, never a panic.
+                            Feed::Truedata => return,
                         };
                         if terminal
                             && !matches!(
@@ -2269,10 +2301,9 @@ fn handle_completion<C, D>(
                             // fallback-shape cycle dirty.
                             match lane_feed {
                                 Feed::Dhan => cycle.dhan_spot_dirty = true,
-                                // TrueData is a live-tick feed, never a cadence lane.
-                                Feed::Truedata => {
-                                    unreachable!("cadence has no TrueData lane")
-                                }
+                                // No cadence lane for this feed; the top-of-function guard already
+                                // refused and counted it. Dropped, never a panic.
+                                Feed::Truedata => return,
                             }
                         }
                         // The retry is APPENDED at the next free
@@ -2377,8 +2408,9 @@ fn handle_completion<C, D>(
                         // chain arm above.
                         let terminal = match lane_feed {
                             Feed::Dhan => !retry_scheduled,
-                            // TrueData is a live-tick feed, never a cadence lane.
-                            Feed::Truedata => unreachable!("cadence has no TrueData lane"),
+                            // No cadence lane for this feed; the top-of-function guard already
+                            // refused and counted it. Dropped, never a panic.
+                            Feed::Truedata => return,
                         };
                         let cell_missing = match target.chain_underlying() {
                             Some(u) => lane.asm.spot(u).is_none(),
@@ -2415,8 +2447,12 @@ fn handle_completion<C, D>(
 fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
     let lane = match feed {
         Feed::Dhan => &cycle.dhan,
-        // TrueData is a live-tick feed, never a cadence lane.
-        Feed::Truedata => unreachable!("cadence has no TrueData lane"),
+        // No cadence lane exists for this feed, so it has no outstanding
+        // work of its own -- which is precisely what "exhausted" means
+        // here. `true` is therefore the correct answer and not a fallback:
+        // it lets the shared fallback rungs proceed rather than waiting
+        // forever on a lane that will never report.
+        Feed::Truedata => return true,
     };
     if lane.inflight > 0 {
         return false;
@@ -2426,7 +2462,7 @@ fn lane_own_path_exhausted(feed: Feed, cycle: &CycleState) -> bool {
             action,
             CycleAction::DhanChain { .. } | CycleAction::DhanSpot { .. }
         ),
-        // TrueData is a live-tick feed, never a cadence lane.
+        // Same reasoning: no lane means no events of its own to find.
         Feed::Truedata => false,
     })
 }

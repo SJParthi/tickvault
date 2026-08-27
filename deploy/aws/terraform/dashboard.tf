@@ -752,6 +752,112 @@ resource "aws_cloudwatch_dashboard" "operator" {
           ]
           period = 300
         }
+      },
+
+      # ----- Row 13: the ten that Row 12 left behind -----
+      # (2026-08-26.) Row 12 above charted 7 of the 17 metrics that 2026-08-22
+      # found shipped-but-unwatched. Re-measuring the EMF allowlist against
+      # this file and every alarm today: 82 names ship, 40 are alarmed, 32 of
+      # the rest are charted here, and TEN were neither. This row takes nine of
+      # them.
+      #
+      # Two of the ten matter more than the rest, because a rule file already
+      # says they are here. `dhan-rest-only-noise-lock` 2.3h records the two
+      # candle-recovery counters as "shipped as METRICS but deliberately NOT
+      # ALARMED ... They are charted so the mechanism is observable". They were
+      # not charted. The metrics were paid for and visible nowhere, while the
+      # document said otherwise -- which is worse than an ordinary gap, because
+      # anyone checking the claim by reading would have found it satisfied.
+      #
+      # `tv_dhan_ws_lag_excluded_total` stays off for the reason already
+      # recorded: it qualifies a lag histogram that is NOT EMF-shipped, so a
+      # line here would show a correction with nothing to correct.
+      #
+      # `tv_dhan_feed_depth_total` stays off too, and its recorded reason is
+      # now sharper than "a one-widget follow-up".
+      # EMF folds its labels by summing, and its arms are `rows` (the success
+      # path, large) plus `refused` / `dropped` / `shed_inline` /
+      # `shed_dedicated` / `disconnects` / `length_mismatch` / `truncated` (the
+      # failures, expected zero). A folded line is therefore dominated by
+      # successes and could not show a failure spike at all. Charting it would
+      # close the count while creating exactly the false comfort this row
+      # exists to remove, so it stays uncharted with the reason recorded rather
+      # than charted to make a number reach zero. Splitting it needs
+      # per-outcome metric names, which is its own change.
+      #
+      # Both of this file's own checks were run per metric before charting:
+      #   1. a producer exists in crates/*/src  (grep-verified 2026-08-26,
+      #      exactly one file per name)
+      #   2. the name is in the EMF allowlist   (that is how they were found)
+      {
+        type   = "text"
+        x      = 0
+        y      = 84
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "## The last ten — eight charted here, two deliberately left off\nNone of these raises an alarm, by design. The left panel should sit **flat at zero**: each line is a quiet fallback, a refusal, or a measurement thrown away. The right two panels are **not** faults — they are work the system does that had no way of reaching you at all."
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 86
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Quiet fallbacks and refusals — every line should sit flat at zero"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_cadence_late_response_total", { label = "broker answer arrived after its minute", stat = "Sum" }],
+            [local.dash_namespace, "tv_cadence_spot_fallback_total", { label = "spot price taken from the chain instead", stat = "Sum" }],
+            [local.dash_namespace, "tv_chain_mark_refused_total", { label = "option mark refused", stat = "Sum" }],
+            [local.dash_namespace, "tv_mid_session_profile_rest_degraded_total", { label = "mid-session identity check degraded", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 86
+        width  = 6
+        height = 6
+        properties = {
+          # NOT under the flat-at-zero heading, deliberately. A quiet market
+          # legitimately sets no new day highs, so zero is a NORMAL reading
+          # here and a rising line is the fold working, not failing. That is
+          # also why 2.3h refused to alarm them: a pager that cries on an
+          # ordinary day teaches the operator to ignore it.
+          title  = "Candle highs and lows corrected from the exchange's own running day figures"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_candle_session_high_recovered_total", { label = "minute highs widened", stat = "Sum" }],
+            [local.dash_namespace, "tv_candle_session_low_recovered_total", { label = "minute lows widened", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 18
+        y      = 86
+        width  = 6
+        height = 6
+        properties = {
+          # Gauges, so Maximum rather than Sum: summing a headroom reading
+          # across a period reports a number that was never true at any instant.
+          title  = "Resource headroom"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_open_fds", { label = "open file descriptors", stat = "Maximum" }],
+            [local.dash_namespace, "tv_subsystem_memory_estimated_bytes", { label = "estimated memory by subsystem (bytes)", stat = "Maximum" }]
+          ]
+          period = 300
+        }
       }
     ]
   })

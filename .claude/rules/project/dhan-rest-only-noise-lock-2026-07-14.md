@@ -939,6 +939,45 @@ day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** wit
   alarm is a real follow-up; claiming it already existed was exactly the false-OK this
   file exists to stop.
 
+  > **⚠ RE-CORRECTED 2026-08-26 — the correction above went stale within HOURS of
+  > being written, and it is now the thing manufacturing a false finding.**
+  >
+  > `start-watchdog-lambda.tf:345` declares
+  > `aws_cloudwatch_metric_alarm.start_watchdog_not_invoked` —
+  > `tv-<env>-start-watchdog-not-invoked`, `Invocations < 1` over 6 hours,
+  > `treat_missing_data = breaching` — and its own `alarm_description` names the
+  > 2026-07-02 scheduler-drop class verbatim. It landed in `cacea254d`
+  > (2026-08-25 19:16:55Z, PR #1817), whose title is literally *"the kill-switch
+  > nobody checked was still running — and a claim in four rule sections was
+  > overstated"*. So the follow-up this bullet calls for was DONE the same day, by
+  > the same change, and this bullet was never updated.
+  >
+  > The tree-wide scan now returns **NINE** occurrences across **SEVEN** files,
+  > producing **EIGHT** distinct not-invoked alarms: boot-heartbeat-gate,
+  > daily-budget-digest, deploy-watchdog, dhan-token-minter, hard-stop-guard,
+  > market-hours-gate, market-open-readiness, start-watchdog.
+  >
+  > **The cost is the same one this bullet was written to warn about, one level
+  > up.** A reader trusting it today concludes the component that starts the
+  > trading box is blind, and goes to build an alarm that already exists —
+  > exactly the wasted work the `day_ohlc_tracker` row (2026-08-12) and the
+  > `WAL-SUSPEND-01` row (2026-08-25) each record. **A correction is a claim
+  > like any other, and it goes stale like any other.** The durable lesson is
+  > not "check harder" — it is that an alarm-existence claim is one `grep`
+  > (`grep -rn 'metric_name *= *"Invocations"' deploy/aws/terraform/`), so it
+  > must be re-run at the moment of writing rather than carried forward, in a
+  > correction just as much as in the sentence it corrects.
+  >
+  > **And it was checkable without even grepping.** The same PR added
+  > `cloudwatch_app_alarms_wiring.rs::
+  > every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption`,
+  > which FAILS THE BUILD if any scheduled Lambda lacks a not-invoked alarm and
+  > has no declared exemption. It has been GREEN ever since. So this bullet did
+  > not merely go stale against the terraform — it contradicted a passing test
+  > in the same repository, on the same day, added by the same commit. When a
+  > prose claim and a green ratchet disagree, the ratchet is the one that
+  > cannot be wrong by inattention.
+
 #### What a PR that violates §2.3f looks like (REJECT)
 
 - Filters either cross-verify alarm on `WS-GAP-03` alone, or drops the `source` condition
@@ -1125,6 +1164,41 @@ pager that cries on an ordinary day teaches the operator to ignore it. They are
 charted so the mechanism is observable, and the thing that would actually indicate
 breakage (the fold refusing input) is already covered by
 `tv_indicator_tick_rejected_total`.
+
+> ### ⚠ CORRECTED 2026-08-26 — "They are charted" was FALSE
+>
+> The two counters were shipped to CloudWatch and charted **nowhere**.
+> `grep tv_candle_session_high_recovered_total deploy/aws/terraform/dashboard.tf`
+> returned **0**; the names appeared only in the EMF selector. So they were paid
+> for (~$0.60/mo), alarmed by nothing *by design*, and visible on no surface at
+> all — the "measured but unwatched" class §2.3b was written to end, sitting
+> inside the very section that reports closing it.
+>
+> This is worse than an ordinary gap, and the reason is worth stating: anyone
+> auditing the claim **by reading** would have found it satisfied. A wrong
+> sentence in this file does not merely fail to warn — it certifies. That is the
+> same cost the `day_ohlc_tracker` row records on 2026-08-12 and the
+> `WAL-SUSPEND-01` row records on 2026-08-25, arriving a third time.
+>
+> **FIXED the same day.** Both counters are charted in `dashboard.tf` Row 13,
+> deliberately NOT under that row's "every line should sit flat at zero"
+> heading — a quiet market legitimately sets no new day highs, so zero here is
+> normal and a rising line is the fold working. The paragraph's reasoning about
+> not alarming them stands unchanged and is re-verified; only the claim that
+> they were charted was false.
+>
+> **The durable half is not the widget.** The same sweep found **ten** shipped
+> metrics that were on no dashboard and in no alarm, and the guard meant to
+> prevent exactly this — `dashboard_live_lane_visibility_guard.rs` — could not
+> have caught any of them: it filtered to `tv_dhan_*`, so it held for one prefix
+> and drifted silently for the other eight. Its scope is now **every** selected
+> name, bite-proven against a metric that could not have failed the old version.
+> Eight of the ten are charted; the two left off are recorded there with reasons,
+> one of them sharpened (`tv_dhan_feed_depth_total` folds its success and failure
+> arms into a single summed line, so a plain chart could not show a failure spike
+> at all — charting it would close the entry while creating the false comfort the
+> entry exists to prevent).
+
 
 #### Honest cost
 

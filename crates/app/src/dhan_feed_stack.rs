@@ -8335,6 +8335,15 @@ pub fn spawn_daily_crossverify(
                         minutes_compared = c.minutes_compared,
                         cells_diverged = c.cells_diverged,
                         missing_live = c.missing_live,
+                        // The split that makes `missing_live` actionable.
+                        // At 31.2% of fetched minutes on 2026-08-25 the
+                        // single figure could mean a catastrophe or a
+                        // non-event; these two say which. See
+                        // `DayComparison::missing_live_traded` — and note
+                        // the pair is uninformative for IDX_I, which has no
+                        // volume at all.
+                        missing_live_traded = c.missing_live_traded,
+                        missing_live_zero_volume = c.missing_live_zero_volume,
                         missing_rest = c.missing_rest,
                         tail_unsealed = c.tail_unsealed,
                         out_of_session = c.out_of_session,
@@ -8630,6 +8639,8 @@ fn xverify_daily_row(
         minutes_compared: c.minutes_compared,
         cells_diverged: c.cells_diverged,
         missing_live: c.missing_live,
+        missing_live_traded: c.missing_live_traded,
+        missing_live_zero_volume: c.missing_live_zero_volume,
         missing_rest: c.missing_rest,
         tail_unsealed: c.tail_unsealed,
         out_of_session: c.out_of_session,
@@ -10697,6 +10708,8 @@ mod tests {
             minutes_compared: 22,
             cells_diverged: 33,
             missing_live: 44,
+            missing_live_traded: 40,
+            missing_live_zero_volume: 4,
             missing_rest: 55,
             tail_unsealed: 66,
             out_of_session: 77,

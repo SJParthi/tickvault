@@ -270,14 +270,37 @@ impl SealRing {
         if self.inner.len() >= self.capacity {
             // Drop-OLDEST per L-C1 (NOT drop-newest — preserve recent
             // seals near the failure root cause).
-            let oldest = self.inner.pop_front().unwrap_or_else(|| {
-                panic!(
-                    "ring at capacity {} but pop_front returned None — invariant violated",
-                    self.capacity
-                )
-            });
-            self.inner.push_back(seal);
-            BufferOutcome::DroppedOldest(oldest)
+            //
+            // The empty arm was `panic!("invariant violated")` until
+            // 2026-08-26.
+            //
+            // HONESTY, because the first draft of this comment claimed more
+            // than was true and a test caught it: that panic was NOT
+            // reachable. `with_capacity` already clamps a zero capacity to
+            // 1 — an earlier session found the same hazard and closed it at
+            // the constructor — and `new()` uses the SEAL_BUFFER_CAPACITY
+            // const. So this is defence in depth, not a live-bug fix, and
+            // must not be described as one.
+            //
+            // It is still worth making: the clamp is CALLER-side and this
+            // arm is CALLEE-side, so a future constructor that skips the
+            // clamp would reintroduce a process ABORT (release builds set
+            // `panic = "abort"`) on the seal-ABSORPTION path — the tier
+            // that exists to survive a QuestDB outage. A crash there fires
+            // at precisely the worst moment.
+            //
+            // With no older seal to evict, the ARRIVING seal is itself the
+            // overflow: hand it back as the dropped entry so the caller
+            // routes it to the next tier (spill → DLQ) exactly as an
+            // evicted one. Nothing lost, nothing unbounded, and a ring
+            // constructed without the clamp degrades to pass-through.
+            match self.inner.pop_front() {
+                Some(oldest) => {
+                    self.inner.push_back(seal);
+                    BufferOutcome::DroppedOldest(oldest)
+                }
+                None => BufferOutcome::DroppedOldest(seal),
+            }
         } else {
             self.inner.push_back(seal);
             BufferOutcome::Buffered
@@ -443,6 +466,36 @@ mod tests {
         assert_eq!(ring.pop_oldest(), Some(s2));
         assert_eq!(ring.pop_oldest(), Some(s3));
         assert_eq!(ring.pop_oldest(), None);
+    }
+
+    /// A zero capacity must not be able to abort the process — and the
+    /// thing that guarantees it is the CONSTRUCTOR clamp, not the eviction
+    /// arm.
+    ///
+    /// Worth pinning because the first draft of this test asserted a
+    /// pass-through and FAILED: `with_capacity(0)` clamps to 1, so the ring
+    /// is degenerate-but-sound and the first push simply buffers. The
+    /// commit comment had claimed a live hazard on the strength of reading
+    /// the eviction arm alone. The clamp is the defence; the callee-side
+    /// arm is defence in depth behind it, and this test states which is
+    /// which so a future reader does not repeat the mistake.
+    #[test]
+    fn test_seal_ring_zero_capacity_is_clamped_not_panicking() {
+        let mut ring = SealRing::with_capacity(0);
+        assert_eq!(ring.capacity(), 1, "zero must be clamped at construction");
+
+        let s1 = mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
+        let s2 = mk_seal(13, 0, TfIndex::M1, 1_716_000_960, 101.0);
+
+        // First push fits the clamped slot.
+        assert_eq!(ring.try_buffer(s1), BufferOutcome::Buffered);
+        assert_eq!(ring.len(), 1);
+
+        // Second evicts the first to the next absorbing tier — degenerate,
+        // sound, and above all not a panic on the absorption path.
+        assert_eq!(ring.try_buffer(s2), BufferOutcome::DroppedOldest(s1));
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.pop_oldest(), Some(s2));
     }
 
     #[test]

@@ -629,6 +629,45 @@ pub struct DayComparison {
     pub minutes_compared: i64,
     pub cells_diverged: i64,
     pub missing_live: i64,
+    /// The `missing_live` minutes where Dhan's own bar carried a NON-ZERO
+    /// volume — the exchange recorded trades in that minute and we hold no
+    /// candle for it.
+    ///
+    /// # Why this is split out (2026-08-26)
+    ///
+    /// `missing_live` is the closest proxy this system has for packet loss,
+    /// and on 2026-08-25 it read **5,783 of 18,510** minutes — 31.2% — for
+    /// the 50 instruments the run managed to fetch. That number is alarming
+    /// and, as a single figure, unanswerable: it conflates two situations
+    /// that mean opposite things.
+    ///
+    /// * Dhan's bar has volume > 0 → the instrument TRADED that minute and
+    ///   we have nothing. That is a genuine gap in our capture.
+    /// * Dhan's bar has volume == 0 → nothing traded. Our fold correctly
+    ///   emits nothing for a bucket no tick opened (`live_candle_state.rs`
+    ///   makes an unopened bucket a sentinel), so this is not loss at all.
+    ///
+    /// Reporting them as one number is why "31.2% missing" could be read
+    /// either as a catastrophe or as a non-event, with no way to tell.
+    ///
+    /// # What this split does NOT decide
+    ///
+    /// It is a MEASUREMENT, not a verdict. The `outcome` logic is unchanged:
+    /// `missing_live` in total still counts as a real divergence, because
+    /// narrowing that to the traded half would be a behaviour change resting
+    /// on an assumption about vendor tape-filling that nothing here has
+    /// verified.
+    ///
+    /// **It says nothing at all for `IDX_I`.** An index has no volume by
+    /// construction, so every index bar lands in the zero bucket regardless
+    /// of whether the index was being computed. For index instruments this
+    /// pair carries no information and must not be read as one.
+    pub missing_live_traded: i64,
+    /// The `missing_live` minutes where Dhan's bar carried ZERO volume.
+    ///
+    /// See [`DayComparison::missing_live_traded`] for what this does and does
+    /// not mean — in particular that it is uninformative for `IDX_I`.
+    pub missing_live_zero_volume: i64,
     pub missing_rest: i64,
     pub tail_unsealed: i64,
     pub out_of_session: i64,
@@ -788,6 +827,8 @@ pub fn compare_day_in_scope(
     let mut volume_exact: i64 = 0;
     let mut volume_capture: Vec<i64> = Vec::new();
     let mut missing_live: i64 = 0;
+    let mut missing_live_traded: i64 = 0;
+    let mut missing_live_zero_volume: i64 = 0;
     let mut missing_rest: i64 = 0;
     let mut tail_unsealed: i64 = 0;
 
@@ -861,6 +902,15 @@ pub fn compare_day_in_scope(
                     DhanLiveXverifyCellKind::TailUnsealed
                 } else {
                     missing_live = missing_live.saturating_add(1);
+                    // Split the one number that could not be acted on. See
+                    // `DayComparison::missing_live_traded` for why, and for
+                    // the IDX_I caveat that makes this pair meaningless on
+                    // an index.
+                    if r.bar.volume > 0 {
+                        missing_live_traded = missing_live_traded.saturating_add(1);
+                    } else {
+                        missing_live_zero_volume = missing_live_zero_volume.saturating_add(1);
+                    }
                     DhanLiveXverifyCellKind::MissingLive
                 };
                 findings.push(DhanLiveXverifyCellFinding {
@@ -969,6 +1019,8 @@ pub fn compare_day_in_scope(
         minutes_compared,
         cells_diverged,
         missing_live,
+        missing_live_traded,
+        missing_live_zero_volume,
         missing_rest,
         tail_unsealed,
         out_of_session,
@@ -998,6 +1050,8 @@ pub fn daily_row(
         minutes_compared: cmp.minutes_compared,
         cells_diverged: cmp.cells_diverged,
         missing_live: cmp.missing_live,
+        missing_live_traded: cmp.missing_live_traded,
+        missing_live_zero_volume: cmp.missing_live_zero_volume,
         missing_rest: cmp.missing_rest,
         tail_unsealed: cmp.tail_unsealed,
         out_of_session: cmp.out_of_session,
@@ -2355,6 +2409,65 @@ mod tests {
         let cmp = compare_day(&[], &rest, DAY_START_NANOS, RUN_TS, 0, false);
         assert_eq!(cmp.tail_unsealed, 0);
         assert_eq!(cmp.missing_live, 1);
+    }
+
+    /// The split that makes `missing_live` actionable (2026-08-26).
+    ///
+    /// On 2026-08-25 the run reported 5,783 missing minutes out of 18,510 —
+    /// 31.2% — as ONE number, which could be read as a catastrophe or as a
+    /// non-event with no way to choose. These two counters separate the case
+    /// where the exchange recorded trades and we hold nothing (a real gap)
+    /// from the case where nothing traded at all (not a loss).
+    ///
+    /// The invariant asserted here is the one that keeps the split honest:
+    /// the two halves must SUM to the whole. A future edit that adds a third
+    /// classification without updating the total would otherwise report three
+    /// numbers that quietly disagree — the exact failure this module's own
+    /// `error_code_liveness` doc warns about.
+    #[test]
+    fn compare_day_splits_missing_live_by_whether_the_minute_actually_traded() {
+        // Two REST minutes we have no candle for: one with volume, one without.
+        let traded = PaiseBar::from_rupees(100.0, 101.0, 99.0, 100.5, 250).expect("finite");
+        let untraded = PaiseBar::from_rupees(100.0, 100.0, 100.0, 100.0, 0).expect("finite");
+        let rest = vec![side(13, OPEN, traded), side(13, OPEN + 60, untraded)];
+
+        let cmp = compare_day(&[], &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.missing_live, 2, "both minutes are missing from live");
+        assert_eq!(
+            cmp.missing_live_traded, 1,
+            "the minute Dhan recorded trades in is a REAL gap in our capture"
+        );
+        assert_eq!(
+            cmp.missing_live_zero_volume, 1,
+            "a minute nothing traded in is not loss — our fold correctly emits \
+             nothing for a bucket no tick opened"
+        );
+        assert_eq!(
+            cmp.missing_live_traded + cmp.missing_live_zero_volume,
+            cmp.missing_live,
+            "the split must SUM to the total, or the report shows three numbers \
+             that disagree with each other"
+        );
+    }
+
+    /// A tail minute is excused BEFORE the split, so it must reach neither half.
+    ///
+    /// Without this the amnesty would leak: an unsealed 15:29 bar would be
+    /// counted as a real gap by `missing_live_traded` while the total that
+    /// excused it stayed at zero — a split that contradicts its own parent.
+    #[test]
+    fn compare_day_tail_amnesty_reaches_neither_half_of_the_split() {
+        let traded = PaiseBar::from_rupees(100.0, 101.0, 99.0, 100.5, 250).expect("finite");
+        // 15:29 — inside the tail amnesty window.
+        let rest = vec![side(13, SESSION_CLOSE_SECS_OF_DAY_IST - 60, traded)];
+
+        let cmp = compare_day(&[], &rest, DAY_START_NANOS, RUN_TS, 0, false);
+
+        assert_eq!(cmp.tail_unsealed, 1);
+        assert_eq!(cmp.missing_live, 0);
+        assert_eq!(cmp.missing_live_traded, 0);
+        assert_eq!(cmp.missing_live_zero_volume, 0);
     }
 
     #[test]
