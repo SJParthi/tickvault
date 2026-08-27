@@ -552,7 +552,7 @@ jobs:
         # FAIL -> "DLT deploy FAILED" Telegram, on EVERY push. Two distinct
         # cases, two behaviours:
         #
-        #   A. The box SHOULD be up now (08:30-16:30 IST Mon-Fri, OR this run is
+        #   A. The box SHOULD be up now (08:30-17:30 IST Mon-Fri, OR this run is
         #      a manual/after-close workflow_dispatch). If it's stopped, the
         #      08:30 EventBridge start silently failed (see scripts/aws-autopilot.sh
         #      EventBridge diagnostic). SELF-HEAL: start it here + wait for the
@@ -579,12 +579,15 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -uo pipefail
-          # Up-window = 08:30-16:30 IST Mon-Fri (the EventBridge schedule window;
-          # narrowed back from 08:00-17:00 on 2026-06-05 per operator).
+          # Up-window = 08:30-17:30 IST Mon-Fri (the EventBridge schedule window;
+          # widened 16:30 -> 17:30 on 2026-08-08 per operator Quote 14, recorded in
+          # daily-universe-scope-expansion-2026-05-27.md. That quote moved FOUR
+          # coupled sites in lockstep; this workflow was a FIFTH nobody listed,
+          # and it kept the old 16:30 until 2026-08-27).
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
           UP_WINDOW=no
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then UP_WINDOW=yes; fi
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1730 ]; then UP_WINDOW=yes; fi
           # A manual run or the after-close cron dispatch (workflow_dispatch)
           # always intends the box up — self-start regardless of clock.
           SHOULD_BE_UP=no
@@ -614,7 +617,7 @@ jobs:
 
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
-            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. The 08:45 IST pre-market cron will redeploy this commit once the box is up."
+            echo "::notice::Box is intentionally stopped (outside 08:30-17:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. The 08:45 IST pre-market cron will redeploy this commit once the box is up."
             # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
             # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
             # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
@@ -625,7 +628,7 @@ jobs:
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
           # Record that THIS run started a stopped box, so the final auto-stop
-          # step below can stop it again if we are now OUTSIDE the 08:30-16:30
+          # step below can stop it again if we are now OUTSIDE the 08:30-17:30
           # IST Mon-Fri up-window (e.g. an after-close workflow_dispatch deploy).
           # Without this, an out-of-window deploy would leave the box billing all
           # night until the next hourly hard-stop guard catches it.
@@ -970,8 +973,8 @@ jobs:
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
               "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
-              "READY_OK=no; for i in $(seq 1 60); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
-              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 300s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
+              "READY_OK=no; for i in $(seq 1 150); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
+              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
               "echo TICKVAULT-UP",
               "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo timeout 180 dnf install -y amazon-cloudwatch-agent || sudo timeout 180 yum install -y amazon-cloudwatch-agent || (curl -fsSL --max-time 120 https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
               "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
@@ -1020,7 +1023,7 @@ jobs:
           # ~12.6 min), so 240 polls ≈ 25 min REAL. Sizing: every on-box stage
           # is now explicitly bounded (same-date deploy-hang fix — dnf ≤180s,
           # curl ≤120s, git fetch ≤120s, s3 cp ≤300s each, compose up ≤600s,
-          # smoke ≤40s, no-block restart + 300s readiness poll, CW agent ≤~300s), and the
+          # smoke ≤40s, no-block restart + 750s readiness poll, CW agent ≤~300s), and the
           # sizing case is a POST-NUKE FIRST deploy that must also dnf-install
           # docker + pull the QuestDB image inside `compose up` — realistic
           # wall-clock ~8-12 min, so 25 min real gives ~2x headroom while any
@@ -1453,7 +1456,7 @@ jobs:
         # COST-HARDENING 2026-06-30 (never-cross): when an after-close /
         # workflow_dispatch deploy self-started a STOPPED box (the step above set
         # DEPLOY_STARTED_STOPPED_BOX=yes), leave it running ONLY if we are inside
-        # the 08:30-16:30 IST Mon-Fri up-window. If we are OUTSIDE the window, the
+        # the 08:30-17:30 IST Mon-Fri up-window. If we are OUTSIDE the window, the
         # box would otherwise bill all night until the hourly hard-stop guard
         # catches it — so stop it here, immediately, at the end of the deploy.
         # always() so it runs whether the deploy passed or failed. We NEVER stop a
@@ -1466,8 +1469,8 @@ jobs:
           set -uo pipefail
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then
-            echo "Inside 08:30-16:30 IST Mon-Fri window — leaving the box running."
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1730 ]; then
+            echo "Inside 08:30-17:30 IST Mon-Fri window — leaving the box running."
             exit 0
           fi
           echo "Outside the up-window (dow=$DOW time=$HHMM) and THIS run started the box — stopping it to avoid an out-of-window bill."
