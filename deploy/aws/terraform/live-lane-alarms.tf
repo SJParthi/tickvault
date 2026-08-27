@@ -779,5 +779,71 @@ resource "aws_cloudwatch_metric_alarm" "depth_steering_stalled" {
   alarm_actions   = local.app_alarm_actions
   # Steering resuming is a real, self-explanatory recovery — the sockets
   # re-aim on the next minute and the age falls back to near zero.
+
+# 14. ONE SOCKET WENT DEAF (2026-08-26) — operator-approved
+# ---------------------------------------------------------------------------
+# A socket that keeps answering pings but stops delivering data is invisible to
+# every other mechanism, and each miss is STRUCTURAL rather than an oversight:
+#
+#   * the idle watchdog governs SILENCE, and a ponging socket is not silent;
+#   * the reconnect family stays flat — the defining property of a deaf socket
+#     is that nothing about it is retrying, which is why "alarm the reconnect
+#     counters", the recommendation on record, cannot catch it;
+#   * alarm 11 above (dhan_no_ticks_flowing) reads the LANE. With fifteen of
+#     sixteen sockets delivering, the lane's last tick is always ~1 s old
+#     however dead the sixteenth is;
+#   * tv_dhan_ws_alive_connections counts sockets DIALED, not DELIVERING.
+#
+# The gauge reports the WORST connection that has ever delivered, so a single
+# deaf socket moves it while alarm 11 stays flat — and that DIFFERENCE is the
+# diagnosis.
+#
+# THRESHOLD 600, NOT INVENTED: alarm 11 pages at 300 s × 2 periods = ten
+# minutes of lane silence. This is the same question scoped to one socket, so
+# it uses the same ten minutes, expressed as one 600 s crossing rather than two
+# 300 s ones because this gauge is a per-socket age that only climbs.
+#
+# notBreaching, NOT breaching, and that differs from alarms 11 and 13 on
+# purpose. Those flip to breaching because a DEAD APP publishes nothing and
+# absence must page. That case is already covered by them — adding a third
+# alarm that pages on the same absence buys nothing and triples the noise of
+# one outage. This one answers a narrower question that only has meaning while
+# the lane is alive: "of the sockets that ARE running, is one of them deaf?"
+#
+# GATED ANYWAY. Without the gate this pages every single trading day at ~15:40:
+# after the 15:30 close every socket legitimately stops delivering, the gauge
+# climbs past 600 within ten minutes, and the alarm fires on a market that is
+# simply shut. That is the fastest way to train an operator to ignore it.
+resource "aws_cloudwatch_metric_alarm" "dhan_worst_socket_deaf" {
+  alarm_name        = "tv-${var.environment}-dhan-worst-socket-deaf"
+  alarm_description = "ONE Dhan socket has delivered nothing for ~10 minutes DURING MARKET HOURS while the lane as a whole looks healthy. This is the deaf-socket case: a connection that keeps answering pings but stops sending data never trips the idle watchdog (it is not silent), never reconnects (nothing is retrying), and does not move the lane-level tick-age gauge (the other fifteen sockets are fine). Read this AGAINST tv_dhan_feed_last_tick_age_secs on the live-lane dashboard row: this one climbing ALONE is a single deaf socket; both climbing is the whole feed and alarm 11 will have fired too. Triage: (1) tv_dhan_ws_worst_conn_tick_age_secs_by_pool and the per-connection detail on /metrics name WHICH socket. (2) tv_dhan_ws_alive_connections - is it still dialed. (3) tv_dhan_feed_instruments_never_ticked - a subscribe that silently did not take looks the same from here. (4) journalctl -u tickvault for WS-GAP-03 and the subscribe batches. A value of -1 means no connection has ticked yet and is NOT a fault."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 600
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_ws_worst_conn_tick_age_secs"
+  namespace           = local.app_namespace
+  period              = 300
+  # Maximum, never Average: a window holding one fresh scrape and four stale
+  # ones is still a window in which that socket was silent, and averaging would
+  # let a single late frame erase four minutes of nothing.
+  statistic = "Maximum"
+  # `{host}` — the metric is unlabelled and the EMF processor declares exactly
+  # one dimension set. Per-socket attribution lives on /metrics deliberately:
+  # sixteen CloudWatch dimensions would cost ~$4.80/mo to answer a yes/no
+  # question this one series answers.
+  dimensions = local.app_dimensions
+
+  # A stopped box publishes nothing, and that is health rather than a deaf
+  # socket. Absence-must-page is alarms 11 and 13's job, not this one's.
+  treat_missing_data = "notBreaching"
+
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri. WITHOUT THIS LINE THIS ALARM PAGES EVERY EVENING
+  # AT ~15:40, when every socket legitimately stops delivering.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  # A socket resuming IS a real, self-explanatory recovery — unlike the loss
+  # counters, where a delta returning to zero never means the data came back.
   ok_actions = local.app_alarm_ok
 }

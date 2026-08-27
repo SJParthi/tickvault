@@ -8372,12 +8372,12 @@ pub fn spawn_daily_crossverify(
                         volume_capture_min_pct = c.volume_capture_min_pct,
                         findings = c.findings.len(),
                         rest_failures = report.rest_failures,
-                        // WHY they failed, not just how many. Read
-                        // `no_candles` first: an instrument that did not trade
-                        // is normal, and counting it beside timeouts under one
-                        // word called "failures" is what made 815 of 865 look
-                        // like an outage with nothing in the log to check.
-                        rest_failure_kinds = report.rest_failure_kinds.as_str(),
+                        // Added 2026-08-26. `rest_failures` alone reported
+                        // 814-of-864 and 815-of-865 on consecutive sessions
+                        // and gave nobody a way to act on it: the reason was
+                        // discarded at the fetch site. This field names the
+                        // dominant cause on the same line as the verdict.
+                        rest_failure_reasons = %report.rest_failure_breakdown.summary(),
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
                         // Reported beside `degraded`, never folded into it: a
@@ -8522,8 +8522,22 @@ fn persist_xverify_report(
     // shape that grows.
     const PERSIST_BATCH_ROWS: usize = 20_000;
     let mut batch_errors = 0_usize;
+    //
+    // MERGED 2026-08-27: two sessions fixed this independently, one bounding
+    // ROWS and one bounding BYTES, and the bounds are not interchangeable.
+    // Rows give a predictable batch size; BYTES is the quantity that actually
+    // breached the ceiling, and it is the one that survives a row shape
+    // getting wider — which the batch-size note directly above names as the
+    // thing it is buying headroom against. Keeping only the row bound would
+    // have re-created that assumption one layer down.
     let flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
-        if w.pending() >= PERSIST_BATCH_ROWS && w.flush().is_err() {
+        let failed = if w.pending() >= PERSIST_BATCH_ROWS {
+            w.flush().is_err()
+        } else {
+            // Byte-bounded: a no-op below the threshold, one `len()` compare.
+            w.flush_if_large().is_err()
+        };
+        if failed {
             // One batch lost, named, and the run continues. Before this the
             // same failure took the whole day with it.
             *errs += 1;
@@ -8531,25 +8545,23 @@ fn persist_xverify_report(
     };
 
     let mut cell_errors = 0_usize;
-    // CHUNKED 2026-08-26. This loop appended all findings and flushed ONCE.
-    // On 2026-08-26 that was 764,003 rows -> a 207,965,278-byte buffer against
-    // the server's 104,857,600 cap, the flush was refused, and the
-    // poisoned-buffer defence discarded every row. The feed's only
-    // ground-truth record has no row for that day. It is scale-driven, not a
-    // blip: 201,353 findings on 2026-08-25 became 764,003 the next session.
-    //
-    // `flush_if_large` bounds the buffer by BYTES rather than by row count, so
-    // a wider row cannot silently re-approach the cap. A chunk that fails is
-    // discarded and counted here — the run is still marked degraded below, so
-    // a partial write is never rounded up to success.
-    let mut chunk_flush_errors = 0_usize;
     for finding in &c.findings {
         if writer.append_cell(finding).is_err() {
             cell_errors += 1;
         }
-        if writer.flush_if_large().is_err() {
-            chunk_flush_errors += 1;
+        flush_if_full(&mut writer, &mut batch_errors);
+    }
+
+    // The vendor's own tape, stored BEFORE any judgement is applied to it.
+    // Until 2026-08-26 these rows were compared in memory and dropped, so the
+    // only surviving trace of what the exchange actually said was the subset
+    // that happened to DISAGREE.
+    let mut tape_errors = 0_usize;
+    for row in &report.rest_tape {
+        if writer.append_rest_tape(row).is_err() {
+            tape_errors += 1;
         }
+        flush_if_full(&mut writer, &mut batch_errors);
     }
 
     // The daily row now meets a nearly-empty buffer. That matters more than it
@@ -8562,8 +8574,9 @@ fn persist_xverify_report(
 
     match writer.flush() {
         Ok(()) => {
-            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(c.findings.len() as u64 + 1);
-            if cell_errors > 0 || chunk_flush_errors > 0 || daily_err.is_some() {
+            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
+                .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
+            if cell_errors > 0 || daily_err.is_some() || tape_errors > 0 || batch_errors > 0 {
                 // Partial writes are reported, never rounded up to success:
                 // an audit table that silently drops rows is worse than one
                 // that is honestly incomplete.
@@ -8580,7 +8593,8 @@ fn persist_xverify_report(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "xverify_persist_partial",
                     cell_errors,
-                    chunk_flush_errors,
+                    tape_errors,
+                    batch_errors,
                     daily_failed = daily_err.is_some(),
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),
@@ -10831,24 +10845,37 @@ mod tests {
         );
 
         assert!(
-            body.contains("writer.flush_if_large()"),
-            "the append loop must drain in chunks. Appending every finding and \
+            body.contains("flush_if_full(&mut writer, &mut batch_errors)"),
+            "the append loop must drain in batches. Appending every finding and \
              flushing once is what built a 207,965,278-byte buffer on \
              2026-08-26 and lost all 764,003 rows to a refused flush"
         );
+        // BOTH bounds, not either. Rows give a predictable batch size; BYTES
+        // is the quantity that actually breached, and the only one that
+        // survives a row shape getting wider.
+        assert!(
+            body.contains("w.pending() >= PERSIST_BATCH_ROWS"),
+            "the row bound must survive"
+        );
+        assert!(
+            body.contains("w.flush_if_large()"),
+            "the BYTE bound must survive: a row bound alone re-creates the \
+             'the rows can never get wider' assumption one layer down, which \
+             is what the batch-size note itself warns about"
+        );
 
         let counted = body
-            .find("chunk_flush_errors += 1")
-            .expect("a refused chunk must be counted, not swallowed");
+            .find("*errs += 1")
+            .expect("a refused batch must be counted, not swallowed");
         let reported = body
-            .find("chunk_flush_errors > 0")
+            .find("batch_errors > 0")
             .expect("the count must reach the degraded-run condition");
         let logged = body
-            .find("chunk_flush_errors,")
+            .find("batch_errors,")
             .expect("the count must be a field on the partial-write error line");
         assert!(
             counted < reported && reported < logged,
-            "the chunk-failure count must be incremented, then gate the \
+            "the batch-failure count must be incremented, then gate the \
              partial-write verdict, then be logged — a count that never \
              reaches the verdict makes a short audit table look complete"
         );

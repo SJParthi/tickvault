@@ -2300,6 +2300,17 @@ pub trait DhanFeedSocket: Send {
         let _ = batch;
         async { Err(SocketFailure) }
     }
+    /// Send ONE client-originated keepalive Ping.
+    ///
+    /// Required, not defaulted, deliberately: a default that quietly returned
+    /// `Ok(())` would let a transport claim keepalive support it does not have,
+    /// and the failure would look exactly like a healthy socket. The compiler
+    /// asking every implementor is the point.
+    ///
+    /// Driven ONLY for endpoints where
+    /// [`DhanEndpointType::needs_client_keepalive_ping`] is true. The watchdog
+    /// reset stays on the RECEIVED pong, never on this send.
+    fn send_ping(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
     /// Await the next socket event. This is the call that keeps the automatic
     /// pong flowing — nothing may be done between two of these but
     /// [`FrameSink::accept`].
@@ -5172,6 +5183,7 @@ mod tests {
         /// the reverse order asks for two instruments and earns a Fatal 804,
         /// so the ORDER is the property under test, not the counts.
         wire_calls: Vec<&'static str>,
+        pings: usize,
     }
 
     struct FakeSocket {
@@ -5210,6 +5222,18 @@ mod tests {
                     Err(_) => true,
                 };
                 if ok { Ok(()) } else { Err(SocketFailure) }
+            }
+        }
+
+        fn send_ping(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                if let Ok(mut s) = state.lock() {
+                    s.pings += 1;
+                }
+                Ok(())
             }
         }
 
@@ -5716,6 +5740,15 @@ mod tests {
                     std::future::pending::<()>().await;
                     unreachable!()
                 }
+            }
+            /// This fake exists to HANG a swap, not to exercise keepalive.
+            /// Answering immediately keeps it that way: a pending ping here
+            /// would stall the supervisor for a reason the test is not about,
+            /// and the resulting failure would point at the wrong thing.
+            fn send_ping(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                async { Ok(()) }
             }
             fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send {
                 let state = std::sync::Arc::clone(&self.state);

@@ -1269,6 +1269,85 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
             .await
     }
 
+    /// Send ONE client-originated keepalive Ping.
+    ///
+    /// Only reached for endpoints where [`DhanEndpointType::needs_client_keepalive_ping`]
+    /// is true — see that method for the measurement showing depth-200 receives
+    /// zero server pings, and why that quietly turned the idle watchdog into a
+    /// liquidity detector.
+    ///
+    /// # What this deliberately does NOT do
+    ///
+    /// It does **not** touch the idle watchdog. The reset stays where it has
+    /// been since 2026-08-19: on the **Pong we receive back**, through the
+    /// existing `Message::Pong` -> `SocketEvent::KeepAlive` ->
+    /// `ConnEvent::KeepAliveReceived` -> `record_activity` chain.
+    ///
+    /// That distinction is the whole safety of this change. Resetting on SEND
+    /// would defeat the watchdog outright — we would always look "active"
+    /// because we always ping, and a reader that had stopped draining would
+    /// never be caught. Resetting on the RECEIVED pong preserves the original
+    /// semantics exactly: a pong can only arrive if the socket is alive **and**
+    /// our read loop is polling it.
+    ///
+    /// # Failure is not fatal
+    ///
+    /// A failed send is counted and logged, never escalated. If Dhan does not
+    /// answer pings on this endpoint the watchdog simply keeps firing at 27s
+    /// exactly as it does today — this change can make that path better, never
+    /// worse.
+    async fn send_ping(&mut self) -> Result<(), SocketFailure> {
+        let endpoint = self.params.endpoint;
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(SocketFailure);
+        };
+
+        // `from_static(&[])` — an empty ping payload that provably allocates
+        // nothing (it points at a static empty slice).
+        //
+        // The obvious empty-vector spelling was written here first and the
+        // banned-pattern scanner rejected it, correctly: this module is
+        // hot-path scoped, and a keepalive that allocates on a socket carrying
+        // 51,000 rows/s is exactly the small invisible cost Principle #1 exists
+        // to stop. Dhan needs no payload — the frame itself is the probe.
+        let send = stream.send(Message::Ping(bytes::Bytes::from_static(&[])));
+        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
+            Ok(Ok(())) => {
+                metrics::counter!(
+                    CLIENT_KEEPALIVE_PING_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "outcome" => "sent",
+                )
+                .increment(1);
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                metrics::counter!(
+                    CLIENT_KEEPALIVE_PING_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "outcome" => "send_failed",
+                )
+                .increment(1);
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    reason = %err,
+                    "client keepalive ping could not be sent — the idle watchdog still \
+                     governs this socket, so this degrades to the pre-2026-08-26 behaviour"
+                );
+                Err(SocketFailure)
+            }
+            Err(_elapsed) => {
+                metrics::counter!(
+                    CLIENT_KEEPALIVE_PING_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "outcome" => "timeout",
+                )
+                .increment(1);
+                Err(SocketFailure)
+            }
+        }
+    }
+
     async fn recv(&mut self) -> SocketEvent {
         let endpoint = self.params.endpoint;
         let Some(stream) = self.stream.as_mut() else {

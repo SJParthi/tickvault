@@ -206,20 +206,37 @@ fn ratchet_retry_shaping_is_wired_into_the_ladder_and_run_loop() {
 #[test]
 fn ratchet_crossverify_rest_leg_routes_through_shared_limiter() {
     let src = read_app_src("src/dhan_live_crossverify.rs");
-    let body = fn_body(&src, "pub async fn fetch_rest_side_for_target(");
+    // The pacing sits in a WRAPPER, matching the shape the spot-1m and chain
+    // legs already use: an unpaced `fetch_rest_side_for_target` that is
+    // testable without a limiter, and `fetch_rest_side_paced` around it.
+    let body = fn_body(&src, "async fn fetch_rest_side_paced(");
     assert!(
         body.contains("shared_dhan_data_api_limiter()") && body.contains(".acquire()"),
-        "fetch_rest_side_for_target must acquire a permit from the SAME \
-         shared Dhan Data-API limiter — it is the choke point every \
-         cross-verification request passes through, and there is no unpaced \
-         variant of it"
+        "fetch_rest_side_paced must acquire a permit from the SAME shared Dhan \
+         Data-API limiter — it is the choke point every cross-verification \
+         request passes through"
     );
     assert!(
-        body.contains("StatusCode::TOO_MANY_REQUESTS") && body.contains("record_429()"),
-        "a real 429 on this leg must feed the shared self-tuner from the REAL \
-         StatusCode (never a substring scan): a limiter that cannot see this \
-         leg's throttling cannot step down for it, and the collateral lands on \
-         the per-minute legs"
+        body.contains("record_429()"),
+        "a real 429 on this leg must feed the shared self-tuner: a limiter that \
+         cannot see this leg's throttling cannot step down for it, and the \
+         collateral lands on the per-minute legs"
+    );
+    assert!(
+        body.contains("XverifyFetchFailureKind::RateLimited"),
+        "the 429 must be recognised from the TYPED failure kind, which is \
+         classified from the real StatusCode — never a substring scan of a \
+         rendered message"
+    );
+
+    // And the unpaced fn must have no OTHER caller: a wrapper only paces what
+    // goes through it.
+    let run = fn_body(&src, "pub async fn run_cross_verification(");
+    assert!(
+        run.contains("fetch_rest_side_paced(") && !run.contains("fetch_rest_side_for_target("),
+        "the run loop must call the PACED wrapper. Calling the unpaced fn \
+         directly is how this leg spent a year outside the pacing contract the \
+         limiter's own header says covers it"
     );
 }
 

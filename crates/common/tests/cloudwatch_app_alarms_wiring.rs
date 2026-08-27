@@ -835,6 +835,97 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // First-bucket-only -- 0 and 3 today against the session counters' 2,632
     // and 247. Same mechanism at ~1% of the resolution; two more paid series
     // for no added signal.
+    //
+    // 2026-08-26, PLUS 1: tv_dhan_feed_ring_dwell_max_ms (~$0.30/mo).
+    //
+    // The longest a frame sat in the ring before the drain folded it, per
+    // reporting window. Priced deliberately, per the rule this assertion
+    // states, and it earns the byte on the inclusion rule rather than on
+    // interest: it is a SATURATION signal on the one resource whose exhaustion
+    // is the lane's loss mechanism -- a drain that falls behind fills the ring,
+    // and a full ring refuses frames.
+    //
+    // It was ALREADY being computed, ~5,000 times a second, and thrown away:
+    // `run_frame_drain` derived it solely to back-date `received_at_nanos`.
+    // Every other ring signal is an AFTER-the-fact count (`ring_full_total`,
+    // `frame_refused_total`) -- they fire once the loss has happened. This is
+    // the only one that rises BEFORE it.
+    //
+    // Chosen over shipping tv_dhan_ws_lag_ms, which measures the same axis from
+    // the vendor's side. Two reasons, both stated so the choice is checkable:
+    // that histogram is an EXPLICIT exclusion in EMF-METRIC-SELECTOR-NOTES.md
+    // ("latency histograms ... answer 'how much', not 'what broke'"), and a
+    // histogram ships ~12 bucket series per dimension -- so the per-connection
+    // form the 2026-08-14 noise-lock authorization priced at $4.80/mo would in
+    // fact be closer to an order of magnitude more. That discrepancy is
+    // recorded rather than spent.
+    //
+    // NOT alarmed. There is no threshold anyone can defend yet: the value has
+    // never been observed, because it has never been published. Alarming an
+    // unmeasured signal picks a number out of the air and then trains an
+    // operator to ignore it. Charted first; a threshold when there is a
+    // baseline to set it from.
+    //
+    // 2026-08-26, PLUS 1 MORE: tv_dhan_ws_worst_conn_tick_age_secs (~$0.30/mo).
+    //
+    // The age of the STALEST connection that has ever delivered. It exists for
+    // one failure with no other evidence: a socket that keeps answering pings
+    // but stops delivering data.
+    //
+    // That failure defeats every mechanism already in place, by construction:
+    // the idle watchdog governs SILENCE and a ponging socket is not silent; the
+    // reconnect family stays flat because the defining property of a deaf
+    // socket is that nothing about it is retrying (which is why "alarm the
+    // reconnect counters", the recommended fix, cannot catch it); and the
+    // LANE-level tick-age gauge reads ~1 s throughout, because fifteen of the
+    // sixteen sockets are fine.
+    //
+    // ONE series, not sixteen. Per-connection would be ~$4.80/mo by the
+    // 2026-08-14 noise-lock figure to answer a yes/no question; publishing the
+    // WORST age answers it with identical detection power for one name. A
+    // single deaf socket moves this while the lane gauge stays flat, and that
+    // DIFFERENCE is the diagnosis. Per-connection attribution stays on
+    // /metrics, which is where a human triaging looks anyway.
+    //
+    // NOT alarmed, and this one is a deliberate deferral rather than a missing
+    // baseline: a threshold here is defensible (600 s, matching the lane-level
+    // no-ticks alarm, same question scoped to one socket), but the maximal
+    // month already projects above the line where an AWS budget action STOPS
+    // the trading box. Adding a pager is a spending decision the operator
+    // should take knowingly, not one an executor slips in. Charted now so the
+    // signal exists the moment he says yes.
+    //
+    // 2026-08-26, PLUS 1 FINAL: tv_dhan_feed_ring_resident_pct (~$0.30/mo).
+    //
+    // How FULL the ring byte budget is, worst of the two pools. This one is
+    // not a new signal so much as the missing half of an existing one:
+    // tv_dhan_feed_ring_max_bytes -- the CAPACITY -- has been selected since
+    // 2026-08-15, so CloudWatch has had the denominator and not the numerator.
+    // `RingByteBudget::resident()` existed the whole time with call sites only
+    // in its own unit tests.
+    //
+    // A PERCENTAGE, because the two budgets are sized 3:1 and raw bytes are
+    // not comparable between them -- a raw gauge would be dominated by
+    // whichever pool is larger regardless of which is in trouble. Worst-of-two
+    // rather than one name per pool, for the same reason the deaf-socket gauge
+    // is worst-of-sixteen; per-pool detail is published under its own
+    // UNSELECTED name and stays on /metrics.
+    //
+    // It pairs with tv_dhan_feed_ring_dwell_max_ms and the PAIR is the
+    // diagnosis: both climbing is a drain that cannot keep up, dwell flat
+    // while this climbs is large frames rather than a slow drain -- a
+    // different problem with a different fix. Neither says that alone.
+    //
+    // NOT alarmed, same reasoning as the two above: the ring already has
+    // after-the-fact alarms on tv_dhan_ws_ring_full_total and
+    // tv_dhan_ws_ring_bytes_full_total, so the loss case pages today. This is
+    // the leading edge of it, and a leading-edge threshold needs a baseline
+    // that does not exist yet.
+    //
+    // THREE names added today (~$0.90/mo) and that is the stopping point. The
+    // maximal month already projects above the line where an AWS budget action
+    // stops the trading box; further names are a spending decision the
+    // operator takes knowingly. Everything else found today stays on /metrics.
     // 2026-08-26, PLUS 1: tv_questdb_wal_apply_lag_max. The WAL layer shipped
     // a SUSPENSION gauge and no LAG gauge, so the only QuestDB backpressure
     // signal reaching CloudWatch was binary — stuck or not. A table can be
@@ -858,8 +949,8 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // diagnostic-only name.
     assert_eq!(
         names.len(),
-        81,
-        "Z+ L2 VERIFY ratchet: expected exactly 81 names in the MAIN EMF \
+        84,
+        "Z+ L2 VERIFY ratchet: expected exactly 84 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \
@@ -1501,7 +1592,8 @@ fn test_app_alarms_count_is_seven() {
     // reported to a counter nobody reads leaves the gauge simply not updating,
     // which on notBreaching reads as health. An alarm whose input can silently
     // stop is not an alarm. Cost: +1 alarm (~+$0.10/mo) + 1 EMF name below.
-    // 9 (was 8) since 2026-08-26: added `tv_questdb_wal_apply_lag_max`
+    // 9 (was 8) since 2026-08-26, alongside questdb-wal-probe-failed above
+    // — both landed the same day from different sessions: added `tv_questdb_wal_apply_lag_max`
     // (tv-<env>-questdb-wal-apply-lag). The operator found a live incident by
     // ASKING, not by being paged in time: market_depth ran 48,454 transactions
     // behind for ~95 minutes with `suspended = FALSE`, so rows were ACKed and

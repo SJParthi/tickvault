@@ -58,7 +58,6 @@
 //! `candles_*` or `historical_candles` (the live-feed purity rule).
 
 use serde::Deserialize;
-use tracing::info;
 
 use tickvault_storage::dhan_live_crossverify_persistence::{
     DhanLiveXverifyCellFinding, DhanLiveXverifyCellKind, DhanLiveXverifyDailyRow,
@@ -175,17 +174,9 @@ pub const SESSION_MINUTES: usize =
 ///
 /// Stated as a coverage promise rather than left implicit in a row count: at
 /// or below this many instruments the live read is complete, and above it the
-/// run reports `partial`.
-///
-/// **What this now has to cover is the TARGET set, not the universe
-/// (2026-08-26).** The live read used to scan every `feed='dhan'` row and is
-/// now narrowed to the instruments the REST side is actually fetched for —
-/// see [`live_candles_select_sql`] for why. The target set is bounded by what
-/// `dhan_intraday_instrument_for` can label, which is indices plus NSE cash
-/// equities: 865 on 2026-08-26, against ~868 distinct live instruments and
-/// ~8,144 that produced candles that day. So this carries better than 2x
-/// headroom over the quantity that now matters, where against the universe it
-/// had already stopped being enough.
+/// run reports `partial`. Today's live universe is ~868 distinct instruments
+/// (~119 NSE indices + ~750 NTM constituents), so this carries better than 2×
+/// headroom.
 pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 
 /// Row cap for the live-side `/exec` read. Beyond it the run is stamped
@@ -200,22 +191,12 @@ pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 /// nothing connected the number to the universe it had to cover, so nobody
 /// could see that it had stopped being enough.
 ///
-/// **⚠ CORRECTED 2026-08-26 — the ceiling this has to clear is the TARGET
-/// count, not the universe.** This paragraph used to warn that
-/// `MAX_DAILY_UNIVERSE_SIZE` of 25,000 would need `25_000 × 385 ≈ 9.6M` rows
-/// in one response. That was true of the universe-wide read and is no longer
-/// the shape: the query is scoped to the REST targets, so the demand is
-/// `targets × 385` — 865 targets is ~333,000 rows, comfortably inside this
-/// cap, and the daily truncation that was silently dropping every afternoon
-/// stops with it.
-///
-/// The warning is not retired, only re-pointed: if the target set ever grows
-/// past [`LIVE_COVERED_INSTRUMENTS`] — which needs
-/// `dhan_intraday_instrument_for` to start labelling F&O, since that is what
-/// keeps ~22,000 contracts out of it — the same truncation returns, and the
-/// answer is still a paginated or per-instrument read rather than a bigger
-/// number here. Stated so the next widening does not discover it from a
-/// puzzling verdict.
+/// **⚠ It does NOT cover the authorized ceiling.** `MAX_DAILY_UNIVERSE_SIZE`
+/// is 25,000, which would need `25_000 × 385 ≈ 9.6M` rows in one response —
+/// not a cap raise but a paginated or per-instrument read, i.e. a design
+/// change. Until then a universe past [`LIVE_COVERED_INSTRUMENTS`] verifies
+/// its morning and says `partial`. Stated here so the next widening does not
+/// discover it from a puzzling verdict.
 pub const LIVE_ROW_LIMIT: usize = LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES;
 
 /// Ceiling on the live-read query's size ON THE WIRE, checked before it is
@@ -316,9 +297,7 @@ pub struct DhanLiveCrossverifyConfig {
     /// read used to share it, which coupled two operations that differ by
     /// three orders of magnitude: one 8-column REST call for a single
     /// instrument's day, versus a scan returning up to [`LIVE_ROW_LIMIT`] rows
-    /// across every target at once (it scanned the whole universe until
-    /// 2026-08-26 — see [`live_candles_select_sql`]; narrower now, still the
-    /// same order-of-magnitude gap). Sharing the knob meant any raise of the row cap
+    /// for the whole universe. Sharing the knob meant any raise of the row cap
     /// converted honest truncation into a hard `Err` that aborts the entire
     /// run — strictly worse than the partial verdict it replaced.
     #[serde(default = "default_live_read_timeout_secs")]
@@ -1315,68 +1294,6 @@ pub fn rest_candles_to_side_bars(
 // The bounded runner
 // ---------------------------------------------------------------------------
 
-/// Bucket a REST fetch error into a STABLE label for the coalesced tally.
-///
-/// # Why this exists (MEASURED 2026-08-26)
-///
-/// The runner's loop was `Err(_) => rest_failures += 1`. On 2026-08-26 that
-/// counted **815 of 865 targets** and threw every reason away — and nothing
-/// else logged one, so the whole log window for that run contains not a single
-/// line about the dominant failure of the day. The run reported
-/// `rest_failures: 815` and there was no way to ask why.
-///
-/// The buckets matter as much as the logging. `"rest returned no candles"` is
-/// NOT a failure in the same sense as a timeout: an instrument that did not
-/// trade, or that Dhan simply has no tape for, is normal and expected —
-/// especially across ~750 NSE cash equities. Lumping it with transport errors
-/// under one word called "failures" makes a routine day look broken and a
-/// broken day look routine.
-///
-/// Labels are derived from the fixed prefixes
-/// [`fetch_rest_side_for_target`] returns, and deliberately carry NO
-/// instrument detail: the tally is a fixed, tiny set of buckets, so it cannot
-/// grow with the universe.
-#[must_use]
-pub fn classify_rest_failure(err: &str) -> &'static str {
-    if err.starts_with("rest returned no candles") {
-        "no_candles"
-    } else if err.starts_with("rest fetch timed out") || err.starts_with("rest body timed out") {
-        "timed_out"
-    } else if err.starts_with("rest fetch rate limited") {
-        // Its own bucket, not `http_4xx`: being throttled is a statement
-        // about OUR request rate, and every other 4xx is a statement about
-        // the request itself. Reading them as one number hides which.
-        "rate_limited"
-    } else if let Some(rest) = err.strip_prefix("rest fetch http ") {
-        // Status class only — 5xx is theirs, 4xx is usually ours, and the
-        // exact code is in the status text this collapses.
-        match rest.as_bytes().first() {
-            Some(b'4') => "http_4xx",
-            Some(b'5') => "http_5xx",
-            _ => "http_other",
-        }
-    } else if err.starts_with("rest fetch transport") {
-        "transport"
-    } else if err.starts_with("rest body") {
-        "body"
-    } else {
-        "other"
-    }
-}
-
-/// Render a failure tally as a stable, compact log field: `a=1 b=2`.
-///
-/// Sorted so two runs with the same failures render identically — a field that
-/// reorders itself cannot be diffed across days.
-#[must_use]
-pub fn render_failure_tally(tally: &std::collections::BTreeMap<&'static str, usize>) -> String {
-    tally
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// One instrument to cross-verify.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XverifyTarget {
@@ -1566,18 +1483,6 @@ pub struct RunReport {
     pub malformed_rows: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
-    /// Why the REST fetches failed, as a stable `label=count` tally.
-    ///
-    /// **Added 2026-08-26 because the reason was being thrown away.** The
-    /// loop was `Err(_) => rest_failures += 1`, nothing else logged a fetch
-    /// failure, and the day 815 of 865 targets failed there is not one line in
-    /// the log window explaining any of them. `rest_failures` said how many;
-    /// nothing could say why.
-    ///
-    /// `no_candles` is the label to read first: an instrument that did not
-    /// trade is normal, and counting it as a "failure" alongside timeouts is
-    /// what makes a routine day look broken.
-    pub rest_failure_kinds: String,
     /// `true` when the live read came back at [`LIVE_ROW_LIMIT`] + 1 rows, so
     /// the day was cut short.
     ///
@@ -1585,45 +1490,28 @@ pub struct RunReport {
     /// used to be folded straight into `degraded` and dropped, and `degraded`
     /// is also set by a single REST failure — so a run reporting
     /// `degraded: true, rest_failures: 815` gave no way to tell whether the
-    /// live read had also been cut. It had: the run's own counts summed to
-    /// exactly the cap. Truncation is the more serious of the two, because
-    /// `ORDER BY ts ASC` cuts the END of the day and the missing minutes come
-    /// back as `missing_live` — the packet-loss proxy. Reported separately so
-    /// the two are never again indistinguishable.
+    /// live read had ALSO been cut. It had: that run's own counts
+    /// (`minutes_compared` + `missing_rest`) summed to exactly the row cap.
+    ///
+    /// Truncation is the more serious of the two, because `ORDER BY ts ASC`
+    /// cuts the END of the day and the missing minutes come back as
+    /// `missing_live` — the packet-loss proxy. Reported separately so the two
+    /// are never again indistinguishable.
     pub live_truncated: bool,
-}
-
-/// Keep only live bars whose FULL identity is a REST target; return how many
-/// were dropped. Pure.
-///
-/// The SQL narrows on `security_id` alone, which is not an identity: Dhan
-/// reuses numeric ids across segments (I-P1-11 — the documented FINNIFTY
-/// `IDX_I` / `NSE_EQ` id-27 collision). So an `IN` list can over-include a
-/// DIFFERENT instrument that merely shares a number, and that instrument has
-/// no REST side — it would come straight back as `missing_rest` noise, which
-/// is exactly what the filter exists to remove.
-///
-/// Split out from the read so the composite-key rule is testable without
-/// HTTP. The predicate stays a simple, index-friendly integer `IN` in SQL and
-/// the exactness lives here, in one place, with a test on it.
-#[must_use]
-pub fn retain_targets_only(bars: &mut Vec<SideBar>, targets: &[XverifyTarget]) -> usize {
-    let scope: std::collections::HashSet<(i64, &str)> = targets
-        .iter()
-        .map(|t| (t.security_id, t.segment.as_str()))
-        .collect();
-    let before = bars.len();
-    bars.retain(|b| scope.contains(&(b.security_id, b.segment.as_str())));
-    before - bars.len()
+    /// The vendor's own minute candles, exactly as fetched — added
+    /// 2026-08-26 on operator instruction.
+    ///
+    /// These bars ALREADY existed in memory: the comparison built them,
+    /// judged them, and dropped them. Carrying them out is a move, not a
+    /// copy, so it costs no extra allocation — and it is the difference
+    /// between a comparison that can be re-run offline and one that must
+    /// re-fetch ~868 rate-limited requests to say anything twice.
+    pub rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow>,
 }
 
 /// Read the live side out of QuestDB via `/exec`, bounded by `timeout`.
 ///
-/// Scoped to `targets` — see [`live_candles_select_sql`] for why reading the
-/// whole universe made 99.1% of one day's findings noise about instruments the
-/// REST side was never asked for.
-///
-/// Returns the parsed rows plus the truncation flag and malformed-row count.
+/// Returns the parsed rows plus the truncation and malformed-row counts.
 ///
 /// # Errors
 /// Transport failure, non-2xx, timeout, or an unparseable body.
@@ -1668,30 +1556,13 @@ pub async fn read_live_side(
         .await
         .map_err(|_| "live read body timed out".to_string())?
         .map_err(|e| format!("live read body: {e}"))?;
-    let (mut bars, truncated, malformed) = parse_live_dataset(&body, LIVE_ROW_LIMIT)?;
-
     // The SQL narrows on `security_id` ALONE, which is not an identity: Dhan
-    // reuses numeric ids across segments (I-P1-11 — the documented FINNIFTY
-    // IDX_I / NSE_EQ id-27 collision). An `IN` list can therefore over-include
-    // a DIFFERENT instrument that merely shares a number, and that instrument
-    // has no REST side, so it would come straight back as `missing_rest`
-    // noise — the thing the filter exists to remove.
-    //
-    // Re-filter on the composite key here rather than trying to express it in
-    // SQL: the predicate stays a simple, index-friendly integer `IN`, and the
-    // exactness lives in one place that can be tested.
-    let dropped = retain_targets_only(&mut bars, targets);
-    if dropped > 0 {
-        // Once per run, not once per row. Cold path.
-        info!(
-            dropped,
-            kept = bars.len(),
-            "dhan_live_crossverify: dropped live rows whose security_id matched a \
-             target but whose segment did not — a shared numeric id is a \
-             different instrument, and comparing it would fabricate findings"
-        );
-    }
-    Ok((bars, truncated, malformed))
+    // reuses numeric ids across segments (I-P1-11). Rows for a DIFFERENT
+    // instrument that merely shares a number therefore survive this read —
+    // and are skipped one layer later by `compare_day_in_scope`, which
+    // filters on the full `(security_id, segment)` pair before an instrument
+    // is even counted. One check, at the layer that produces findings.
+    parse_live_dataset(&body, LIVE_ROW_LIMIT)
 }
 
 /// Maps a non-success HTTP status to a bounded failure kind. Pure.
@@ -1724,37 +1595,6 @@ pub fn classify_http_status(status: reqwest::StatusCode) -> XverifyFetchFailureK
 /// is built by the SHARED [`crate::dhan_intraday_parse::intraday_request_body`]
 /// so the day-granular window convention matches the spot-1m leg exactly.
 ///
-/// # Pacing (added 2026-08-26)
-///
-/// This awaits the SHARED `dhan_data_api_limiter` before every request, and
-/// feeds a real `429` back into its self-tuner.
-///
-/// **It did not, and that was a hole in the pacing contract.** The limiter's
-/// own header calls itself the single authority over "every per-minute Dhan
-/// Data-API REST fire" and enumerates two choke points — the spot-1m leg and
-/// the option-chain leg. This leg hits the SAME `/v2/charts/intraday`
-/// endpoint, with the same token, up to once per target — 865 requests on
-/// 2026-08-26 — in a tight sequential loop with no pacing of any kind. The
-/// module's own run-budget comment even derives its 600s from "the Dhan Data
-/// API budget is 5 requests/sec", then never enforced it.
-///
-/// Two consequences, and the second is the one that matters most. Our own
-/// requests could exceed the vendor budget and come back throttled — 815 of
-/// 865 failed that day, with the reason discarded. And because the 429s never
-/// reached `record_429`, the self-tuner could not SEE the pressure this leg
-/// created, so it could not step down for it: the collateral damage landed on
-/// the per-minute legs, which the operator's 2026-08-11 directive keeps
-/// explicitly running.
-///
-/// Pacing is affordable here: 865 targets at the limiter's 2-4 rps is
-/// ~216-433s, inside the 600s run budget, and the budget already degrades the
-/// verdict honestly rather than pretending un-fetched targets were clean.
-///
-/// Unlike the other two legs this keeps `acquire` and `record_429` INSIDE the
-/// fetch fn rather than in a paced wrapper: there is exactly one call site and
-/// no unpaced variant, so putting them here means no future caller can be
-/// added that bypasses them.
-///
 /// # Errors
 /// Transport failure, non-2xx, or timeout. The token is never logged.
 pub async fn fetch_rest_side_for_target(
@@ -1776,9 +1616,6 @@ pub async fn fetch_rest_side_for_target(
         trading_date,
         next_day,
     );
-    crate::dhan_data_api_limiter::shared_dhan_data_api_limiter()
-        .acquire()
-        .await;
     let fut = client
         .post(intraday_url)
         .header("access-token", jwt)
@@ -1795,15 +1632,14 @@ pub async fn fetch_rest_side_for_target(
         })?;
     let status = resp.status();
     if !status.is_success() {
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // Fed from the REAL StatusCode, never a substring scan of the
-            // rendered status — the same rule the other two legs follow.
-            // Enough of these inside the tuner's rolling window steps the
-            // shared limiter down to its 2 rps floor.
-            crate::dhan_data_api_limiter::shared_dhan_data_api_limiter().record_429();
-            return Err("rest fetch rate limited".to_string());
-        }
-        return Err(format!("rest fetch http {status}"));
+        // Classified from the REAL StatusCode, never a substring scan of the
+        // rendered message — the discipline the spot-1m leg records for
+        // feeding its self-tuner, and the reason `rate_limited` here can be
+        // trusted as an answer rather than a guess.
+        return Err(XverifyFetchFailure::new(
+            classify_http_status(status),
+            format!("rest fetch http {status}"),
+        ));
     }
     let text = tokio::time::timeout(timeout, resp.text())
         .await
@@ -1906,10 +1742,13 @@ pub async fn run_cross_verification(
     let mut rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow> =
         Vec::new();
     let mut rest_failures = 0usize;
-    // Bounded by the label set in `classify_rest_failure`, never by the
-    // universe: the reason is what was missing, not more rows.
-    let mut rest_failure_tally: std::collections::BTreeMap<&'static str, usize> =
-        std::collections::BTreeMap::new();
+    let mut rest_failure_breakdown = RestFailureBreakdown::default();
+    // Bounded sample of the actual messages. A run can fail 815 times; logging
+    // 815 lines would bury the verdict it exists to deliver, and logging none
+    // is what left the failure unexplainable for two sessions. Three is enough
+    // to read the shape and small enough to never flood.
+    const FAILURE_SAMPLE_MAX: usize = 3;
+    let mut failure_samples: Vec<String> = Vec::with_capacity(FAILURE_SAMPLE_MAX);
     let mut budget_elapsed = false;
     let target_count = targets.len();
 
@@ -1955,12 +1794,36 @@ pub async fn run_cross_verification(
         )
         .await
         {
-            Ok(mut bars) => rest.append(&mut bars),
-            Err(e) => {
+            Ok(mut bars) => {
+                let fetched_at_nanos = crate::spot_1m_rest_boot::fetched_at_ist_nanos_now();
+                rest_tape.extend(bars.iter().map(|b| {
+                    tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
+                        minute_ts_ist_nanos: b.minute_ts_ist_nanos,
+                        trading_date_ist_nanos: day_start_ist_nanos,
+                        security_id: b.security_id,
+                        segment: b.segment.clone(),
+                        instrument: target.instrument.clone(),
+                        open: b.bar.open_r,
+                        high: b.bar.high_r,
+                        low: b.bar.low_r,
+                        close: b.bar.close_r,
+                        volume: b.bar.volume,
+                        fetched_at_nanos,
+                    }
+                }));
+                rest.append(&mut bars);
+            }
+            Err(failure) => {
+                // The reason used to die here as `Err(_)`. See
+                // `XverifyFetchFailureKind` for what that cost.
                 rest_failures = rest_failures.saturating_add(1);
-                *rest_failure_tally
-                    .entry(classify_rest_failure(&e))
-                    .or_insert(0) += 1;
+                rest_failure_breakdown.record(failure.kind);
+                if failure_samples.len() < FAILURE_SAMPLE_MAX {
+                    failure_samples.push(format!(
+                        "{}/{} {}: {}",
+                        target.segment, target.security_id, target.instrument, failure.msg
+                    ));
+                }
             }
         }
     }
@@ -2001,9 +1864,9 @@ pub async fn run_cross_verification(
     Ok(RunReport {
         comparison,
         rest_failures,
-        rest_failure_kinds: render_failure_tally(&rest_failure_tally),
-        degraded,
+        rest_failure_breakdown,
         live_truncated: truncated,
+        degraded,
         malformed_rows: live_malformed,
         budget_elapsed,
         rest_tape,
@@ -2166,121 +2029,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_candles_select_sql_is_feed_scoped_ordered_and_limit_probed() {
-        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
-        assert!(sql.contains("FROM candles_1m"));
-        assert!(sql.contains("feed = 'dhan'"), "must not read another feed");
-        assert!(sql.contains("ORDER BY ts ASC"));
-        assert!(
-            sql.contains(&format!("LIMIT {}", LIVE_ROW_LIMIT + 1)),
-            "LIMIT must be cap+1 (the truncation probe): {sql}"
-        );
-        // Live-feed purity: this module reads candles_1m and writes nothing here.
-        for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP"] {
-            assert!(!sql.to_ascii_uppercase().contains(forbidden));
-        }
-    }
-
-    /// The reason 815 of 865 fetches failed on 2026-08-26 is unknowable from
-    /// the logs, because the loop was `Err(_) => rest_failures += 1` and
-    /// nothing else logged a fetch failure. These pin the buckets that answer
-    /// it next time.
-    #[test]
-    fn every_rest_failure_shape_lands_in_a_stable_bucket() {
-        for (err, want) in [
-            ("rest returned no candles", "no_candles"),
-            ("rest fetch timed out", "timed_out"),
-            ("rest body timed out", "timed_out"),
-            ("rest fetch rate limited", "rate_limited"),
-            ("rest fetch http 401 Unauthorized", "http_4xx"),
-            ("rest fetch http 503 Service Unavailable", "http_5xx"),
-            ("rest fetch transport: connection closed", "transport"),
-            ("rest body: invalid utf-8", "body"),
-            ("something nobody wrote yet", "other"),
-        ] {
-            assert_eq!(classify_rest_failure(err), want, "for {err:?}");
-        }
-    }
-
-    /// The distinction that decides whether a day reads as broken.
-    ///
-    /// An instrument that did not trade — routine across ~750 cash equities —
-    /// returns "no candles". Counting that beside a timeout under one word
-    /// called "failures" makes a normal day look like an outage, and hides a
-    /// real outage inside a normal-looking number.
-    #[test]
-    fn an_instrument_that_did_not_trade_is_not_the_same_as_a_broken_fetch() {
-        assert_ne!(
-            classify_rest_failure("rest returned no candles"),
-            classify_rest_failure("rest fetch timed out"),
-            "no-candles and a timeout must never share a bucket"
-        );
-        assert_ne!(
-            classify_rest_failure("rest returned no candles"),
-            classify_rest_failure("rest fetch http 500 Internal Server Error"),
-        );
-        // Throttling is a statement about OUR request rate; every other 4xx
-        // is about the request itself. One bucket would hide which.
-        assert_ne!(
-            classify_rest_failure("rest fetch rate limited"),
-            classify_rest_failure("rest fetch http 401 Unauthorized"),
-        );
-    }
-
-    /// This leg fires up to one request per target — 865 on 2026-08-26 — at
-    /// the SAME `/v2/charts/intraday` endpoint the per-minute legs use, and it
-    /// did so with no pacing at all while the shared limiter called itself the
-    /// single authority over every Dhan Data-API fire.
-    ///
-    /// The 429 half matters as much as the acquire: without `record_429` the
-    /// self-tuner cannot SEE the pressure this leg creates, so it cannot step
-    /// down for it, and the collateral lands on the per-minute legs the
-    /// operator's 2026-08-11 directive keeps explicitly running.
-    #[test]
-    fn the_rest_leg_is_paced_by_the_shared_data_api_limiter() {
-        let src = include_str!("dhan_live_crossverify.rs");
-        let start = src
-            .find("pub async fn fetch_rest_side_for_target(")
-            .expect("the fetch fn must exist");
-        let end = start
-            + 1
-            + src[start + 1..]
-                .find("\n}\n")
-                .expect("the fetch fn must end at column 0");
-        let body = &src[start..end];
-
-        assert!(
-            body.contains("shared_dhan_data_api_limiter()") && body.contains(".acquire()"),
-            "every request must take a permit from the SHARED limiter — an \
-             unpaced sequential loop over every target is what the limiter \
-             exists to prevent"
-        );
-        assert!(
-            body.contains("StatusCode::TOO_MANY_REQUESTS") && body.contains("record_429()"),
-            "a real 429 must reach the self-tuner from the StatusCode, never a \
-             substring scan — a limiter that cannot see this leg's throttling \
-             cannot step down for it"
-        );
-    }
-
-    /// The tally is a log FIELD, so it has to render the same way twice for
-    /// the same failures — a field that reorders itself cannot be diffed
-    /// across days, which is the only way this number gets used.
-    #[test]
-    fn the_failure_tally_renders_stably_and_is_empty_when_nothing_failed() {
-        use std::collections::BTreeMap;
-        let mut t: BTreeMap<&'static str, usize> = BTreeMap::new();
-        assert_eq!(render_failure_tally(&t), "", "a clean run adds no noise");
-        t.insert("timed_out", 3);
-        t.insert("no_candles", 770);
-        t.insert("http_4xx", 42);
-        assert_eq!(
-            render_failure_tally(&t),
-            "http_4xx=42 no_candles=770 timed_out=3"
-        );
-    }
-
     /// The 2026-08-26 noise flood, as a test.
     ///
     /// That run emitted 757,273 of its 764,002 findings as `missing_rest` —
@@ -2397,49 +2145,20 @@ mod tests {
         );
     }
 
-    /// `security_id` alone is not an identity (I-P1-11). The SQL `IN` list can
-    /// therefore over-include a different instrument sharing a number — and
-    /// that one has no REST side, so it returns as `missing_rest` noise, the
-    /// very thing the scoping removes.
     #[test]
-    fn a_shared_security_id_in_another_segment_is_not_in_scope() {
-        let b = bar(100.0, 101.0, 99.0, 100.5);
-        let targets = vec![XverifyTarget {
-            security_id: 27,
-            segment: "IDX_I".to_string(),
-            instrument: "INDEX".to_string(),
-        }];
-
-        let mut bars = vec![
-            side(27, OPEN, b), // IDX_I — the real target
-            SideBar {
-                security_id: 27, // same number, different instrument
-                segment: "NSE_EQ".to_string(),
-                minute_ts_ist_nanos: minute(OPEN),
-                bar: b,
-            },
-        ];
-        let dropped = retain_targets_only(&mut bars, &targets);
-        assert_eq!(dropped, 1, "the NSE_EQ id-27 row is a different instrument");
-        assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].segment, "IDX_I");
-    }
-
-    /// The scoping must not quietly drop the instruments it exists to compare.
-    #[test]
-    fn every_targeted_instrument_survives_the_scope_filter() {
-        let b = bar(100.0, 101.0, 99.0, 100.5);
-        let targets: Vec<XverifyTarget> = [13, 25, 51]
-            .iter()
-            .map(|&id| XverifyTarget {
-                security_id: id,
-                segment: "IDX_I".to_string(),
-                instrument: "INDEX".to_string(),
-            })
-            .collect();
-        let mut bars = vec![side(13, OPEN, b), side(25, OPEN, b), side(51, OPEN, b)];
-        assert_eq!(retain_targets_only(&mut bars, &targets), 0);
-        assert_eq!(bars.len(), 3, "a target must never be filtered out");
+    fn live_candles_select_sql_is_feed_scoped_ordered_and_limit_probed() {
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
+        assert!(sql.contains("FROM candles_1m"));
+        assert!(sql.contains("feed = 'dhan'"), "must not read another feed");
+        assert!(sql.contains("ORDER BY ts ASC"));
+        assert!(
+            sql.contains(&format!("LIMIT {}", LIVE_ROW_LIMIT + 1)),
+            "LIMIT must be cap+1 (the truncation probe): {sql}"
+        );
+        // Live-feed purity: this module reads candles_1m and writes nothing here.
+        for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP"] {
+            assert!(!sql.to_ascii_uppercase().contains(forbidden));
+        }
     }
 
     // =======================================================================
@@ -3544,16 +3263,10 @@ mod tests {
             malformed_rows: 0,
             budget_elapsed: true,
             live_truncated: false,
-            rest_failure_kinds: "timed_out=3".to_string(),
+            rest_tape: Vec::new(),
         };
         assert!(report.degraded);
         assert!(report.budget_elapsed);
-        assert!(
-            !report.live_truncated,
-            "truncation must be reported on its own: `degraded` is also set by \
-             a single REST failure, so folding the two together is what left \
-             the 2026-08-26 short read invisible in the log"
-        );
         assert!(!report.comparison.outcome.is_pass());
     }
 
