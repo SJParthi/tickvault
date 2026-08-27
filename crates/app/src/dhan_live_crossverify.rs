@@ -58,6 +58,7 @@
 //! `candles_*` or `historical_candles` (the live-feed purity rule).
 
 use serde::Deserialize;
+use tracing::info;
 
 use tickvault_storage::dhan_live_crossverify_persistence::{
     DhanLiveXverifyCellFinding, DhanLiveXverifyCellKind, DhanLiveXverifyDailyRow,
@@ -174,9 +175,17 @@ pub const SESSION_MINUTES: usize =
 ///
 /// Stated as a coverage promise rather than left implicit in a row count: at
 /// or below this many instruments the live read is complete, and above it the
-/// run reports `partial`. Today's live universe is ~868 distinct instruments
-/// (~119 NSE indices + ~750 NTM constituents), so this carries better than 2×
-/// headroom.
+/// run reports `partial`.
+///
+/// **What this now has to cover is the TARGET set, not the universe
+/// (2026-08-26).** The live read used to scan every `feed='dhan'` row and is
+/// now narrowed to the instruments the REST side is actually fetched for —
+/// see [`live_candles_select_sql`] for why. The target set is bounded by what
+/// `dhan_intraday_instrument_for` can label, which is indices plus NSE cash
+/// equities: 865 on 2026-08-26, against ~868 distinct live instruments and
+/// ~8,144 that produced candles that day. So this carries better than 2x
+/// headroom over the quantity that now matters, where against the universe it
+/// had already stopped being enough.
 pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 
 /// Row cap for the live-side `/exec` read. Beyond it the run is stamped
@@ -191,12 +200,22 @@ pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 /// nothing connected the number to the universe it had to cover, so nobody
 /// could see that it had stopped being enough.
 ///
-/// **⚠ It does NOT cover the authorized ceiling.** `MAX_DAILY_UNIVERSE_SIZE`
-/// is 25,000, which would need `25_000 × 385 ≈ 9.6M` rows in one response —
-/// not a cap raise but a paginated or per-instrument read, i.e. a design
-/// change. Until then a universe past [`LIVE_COVERED_INSTRUMENTS`] verifies
-/// its morning and says `partial`. Stated here so the next widening does not
-/// discover it from a puzzling verdict.
+/// **⚠ CORRECTED 2026-08-26 — the ceiling this has to clear is the TARGET
+/// count, not the universe.** This paragraph used to warn that
+/// `MAX_DAILY_UNIVERSE_SIZE` of 25,000 would need `25_000 × 385 ≈ 9.6M` rows
+/// in one response. That was true of the universe-wide read and is no longer
+/// the shape: the query is scoped to the REST targets, so the demand is
+/// `targets × 385` — 865 targets is ~333,000 rows, comfortably inside this
+/// cap, and the daily truncation that was silently dropping every afternoon
+/// stops with it.
+///
+/// The warning is not retired, only re-pointed: if the target set ever grows
+/// past [`LIVE_COVERED_INSTRUMENTS`] — which needs
+/// `dhan_intraday_instrument_for` to start labelling F&O, since that is what
+/// keeps ~22,000 contracts out of it — the same truncation returns, and the
+/// answer is still a paginated or per-instrument read rather than a bigger
+/// number here. Stated so the next widening does not discover it from a
+/// puzzling verdict.
 pub const LIVE_ROW_LIMIT: usize = LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES;
 
 // ---------------------------------------------------------------------------
@@ -252,7 +271,9 @@ pub struct DhanLiveCrossverifyConfig {
     /// read used to share it, which coupled two operations that differ by
     /// three orders of magnitude: one 8-column REST call for a single
     /// instrument's day, versus a scan returning up to [`LIVE_ROW_LIMIT`] rows
-    /// for the whole universe. Sharing the knob meant any raise of the row cap
+    /// across every target at once (it scanned the whole universe until
+    /// 2026-08-26 — see [`live_candles_select_sql`]; narrower now, still the
+    /// same order-of-magnitude gap). Sharing the knob meant any raise of the row cap
     /// converted honest truncation into a hard `Err` that aborts the entire
     /// run — strictly worse than the partial verdict it replaced.
     #[serde(default = "default_live_read_timeout_secs")]
@@ -431,15 +452,89 @@ pub fn day_bounds_micros(day_start_ist_nanos: i64) -> (i64, i64) {
 ///   complete rather than a false `partial`.
 ///
 /// Pure. Pinned by the digit-magnitude tests below.
+///
+/// # Why the id filter exists (MEASURED 2026-08-26, not modelled)
+///
+/// This read used to be UNIVERSE-WIDE while the REST side is fetched only for
+/// `targets`. `compare_day` emits `missing_rest` for any key the live side has
+/// and the REST side does not — so every instrument outside the target set
+/// produced one finding per minute it traded, purely for being out of scope.
+///
+/// On 2026-08-26 that was **757,273 of 764,002 findings — 99.1%**:
+///
+/// ```text
+/// targets: 865   instruments: 8144   minutes_compared: 12727
+/// cells_diverged: 946   missing_live: 5783   missing_rest: 757273
+/// ```
+///
+/// The excluded majority is F&O by design: `dhan_intraday_instrument_for`
+/// returns `None` for `NSE_FNO` rather than guess between FUTIDX/OPTIDX/
+/// FUTSTK/OPTSTK, so ~22,000 contracts are never targets — yet every one of
+/// them that traded appeared here and was written up as a finding.
+///
+/// Those rows carry NO information. `missing_rest` is explicitly not counted
+/// as divergence, and `missing_live` — the packet-loss proxy this subsystem
+/// exists for — is structurally impossible without REST data. An instrument we
+/// never asked about can produce neither signal, so including it can only
+/// add noise; at ~272 bytes/row it was ~206 MB/day of it, into a volume that
+/// filled to 100% and WAL-suspended fifteen tables the day before.
+///
+/// Scoping the read to the targets also retires the truncation that was
+/// silently limiting coverage: 865 targets x 385 minutes is ~333,000 rows
+/// against a 770,000 cap, where the universe-wide read hit the cap and — being
+/// `ORDER BY ts ASC` — dropped every afternoon.
+///
+/// **That the read came back exactly full is arithmetic, not inference.**
+/// Every in-session live key is either compared or `missing_rest`, so the run's
+/// own published counts recover the row count it read:
+///
+/// ```text
+/// minutes_compared 12,727 + missing_rest 757,273 = 770,000
+///                                  LIVE_ROW_LIMIT = 770,000
+/// ```
+///
+/// To the row. Strictly that means truncated OR a day holding exactly the cap,
+/// which is the distinction the `LIMIT cap + 1` probe exists to make — and the
+/// run summary does not publish `truncated`, so it could not be read off the
+/// log. That field is added alongside this change for exactly that reason.
+///
+/// Why it matters more than the noise: `ORDER BY ts ASC` cuts the END of the
+/// day, and a live minute truncated away is indistinguishable from one never
+/// captured — it returns as `missing_live`, which IS counted as divergence and
+/// is the packet-loss proxy this subsystem exists for. On 2026-08-26 that
+/// effect was small only because 815 of 865 REST fetches failed, so there was
+/// barely any REST tail left to go unmatched. On a day when the REST side
+/// works, a truncated afternoon reads as tick loss.
+///
+/// An EMPTY target list matches nothing rather than falling back to the
+/// universe. With no targets there is no REST side, so a universe-wide read
+/// would make every live row a finding: the 2026-08-26 failure at its maximum.
+/// The honest verdict for that state is no data, and the caller reaches it.
 #[must_use]
-pub fn live_candles_select_sql(day_start_ist_nanos: i64) -> String {
+pub fn live_candles_select_sql(day_start_ist_nanos: i64, target_ids: &[i64]) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
     let probe_limit = LIVE_ROW_LIMIT.saturating_add(1);
+    // `i64` renders as digits only, so this cannot carry an injection: there
+    // is no path from an operator string into the predicate.
+    let scope = if target_ids.is_empty() {
+        // Deliberately unsatisfiable — see the doc comment.
+        "AND 1 = 0".to_string()
+    } else {
+        let mut ids: Vec<i64> = target_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let list = ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("AND security_id IN ({list})")
+    };
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, security_id, segment, open, high, \
          low, close, volume \
          FROM candles_1m \
-         WHERE feed = 'dhan' AND ts >= {start} AND ts < {end} \
+         WHERE feed = 'dhan' AND ts >= {start} AND ts < {end} {scope} \
          ORDER BY ts ASC LIMIT {probe_limit}"
     )
 }
@@ -1001,11 +1096,52 @@ pub struct RunReport {
     pub malformed_rows: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
+    /// `true` when the live read came back at [`LIVE_ROW_LIMIT`] + 1 rows, so
+    /// the day was cut short.
+    ///
+    /// **Added 2026-08-26 because its absence hid the diagnosis.** Truncation
+    /// used to be folded straight into `degraded` and dropped, and `degraded`
+    /// is also set by a single REST failure — so a run reporting
+    /// `degraded: true, rest_failures: 815` gave no way to tell whether the
+    /// live read had also been cut. It had: the run's own counts summed to
+    /// exactly the cap. Truncation is the more serious of the two, because
+    /// `ORDER BY ts ASC` cuts the END of the day and the missing minutes come
+    /// back as `missing_live` — the packet-loss proxy. Reported separately so
+    /// the two are never again indistinguishable.
+    pub live_truncated: bool,
+}
+
+/// Keep only live bars whose FULL identity is a REST target; return how many
+/// were dropped. Pure.
+///
+/// The SQL narrows on `security_id` alone, which is not an identity: Dhan
+/// reuses numeric ids across segments (I-P1-11 — the documented FINNIFTY
+/// `IDX_I` / `NSE_EQ` id-27 collision). So an `IN` list can over-include a
+/// DIFFERENT instrument that merely shares a number, and that instrument has
+/// no REST side — it would come straight back as `missing_rest` noise, which
+/// is exactly what the filter exists to remove.
+///
+/// Split out from the read so the composite-key rule is testable without
+/// HTTP. The predicate stays a simple, index-friendly integer `IN` in SQL and
+/// the exactness lives here, in one place, with a test on it.
+#[must_use]
+pub fn retain_targets_only(bars: &mut Vec<SideBar>, targets: &[XverifyTarget]) -> usize {
+    let scope: std::collections::HashSet<(i64, &str)> = targets
+        .iter()
+        .map(|t| (t.security_id, t.segment.as_str()))
+        .collect();
+    let before = bars.len();
+    bars.retain(|b| scope.contains(&(b.security_id, b.segment.as_str())));
+    before - bars.len()
 }
 
 /// Read the live side out of QuestDB via `/exec`, bounded by `timeout`.
 ///
-/// Returns the parsed rows plus the truncation and malformed-row counts.
+/// Scoped to `targets` — see [`live_candles_select_sql`] for why reading the
+/// whole universe made 99.1% of one day's findings noise about instruments the
+/// REST side was never asked for.
+///
+/// Returns the parsed rows plus the truncation flag and malformed-row count.
 ///
 /// # Errors
 /// Transport failure, non-2xx, timeout, or an unparseable body.
@@ -1014,8 +1150,10 @@ pub async fn read_live_side(
     questdb_exec_url: &str,
     day_start_ist_nanos: i64,
     timeout: std::time::Duration,
+    targets: &[XverifyTarget],
 ) -> Result<(Vec<SideBar>, bool, usize), String> {
-    let sql = live_candles_select_sql(day_start_ist_nanos);
+    let target_ids: Vec<i64> = targets.iter().map(|t| t.security_id).collect();
+    let sql = live_candles_select_sql(day_start_ist_nanos, &target_ids);
     let fut = client
         .get(questdb_exec_url)
         .query(&[("query", sql.as_str())])
@@ -1032,7 +1170,30 @@ pub async fn read_live_side(
         .await
         .map_err(|_| "live read body timed out".to_string())?
         .map_err(|e| format!("live read body: {e}"))?;
-    parse_live_dataset(&body, LIVE_ROW_LIMIT)
+    let (mut bars, truncated, malformed) = parse_live_dataset(&body, LIVE_ROW_LIMIT)?;
+
+    // The SQL narrows on `security_id` ALONE, which is not an identity: Dhan
+    // reuses numeric ids across segments (I-P1-11 — the documented FINNIFTY
+    // IDX_I / NSE_EQ id-27 collision). An `IN` list can therefore over-include
+    // a DIFFERENT instrument that merely shares a number, and that instrument
+    // has no REST side, so it would come straight back as `missing_rest`
+    // noise — the thing the filter exists to remove.
+    //
+    // Re-filter on the composite key here rather than trying to express it in
+    // SQL: the predicate stays a simple, index-friendly integer `IN`, and the
+    // exactness lives in one place that can be tested.
+    let dropped = retain_targets_only(&mut bars, targets);
+    if dropped > 0 {
+        // Once per run, not once per row. Cold path.
+        info!(
+            dropped,
+            kept = bars.len(),
+            "dhan_live_crossverify: dropped live rows whose security_id matched a \
+             target but whose segment did not — a shared numeric id is a \
+             different instrument, and comparing it would fabricate findings"
+        );
+    }
+    Ok((bars, truncated, malformed))
 }
 
 /// Fetch ONE target's official 1-minute tape from Dhan, bounded by `timeout`.
@@ -1125,6 +1286,7 @@ pub async fn run_cross_verification(
         questdb_exec_url,
         day_start_ist_nanos,
         std::time::Duration::from_secs(cfg.live_read_timeout_secs),
+        targets,
     )
     .await?;
 
@@ -1168,6 +1330,7 @@ pub async fn run_cross_verification(
         comparison,
         rest_failures,
         degraded,
+        live_truncated: truncated,
         malformed_rows: live_malformed,
         budget_elapsed,
     })
@@ -1240,7 +1403,7 @@ mod tests {
 
         // And the same guard on the rendered SQL, so a hand-edited format!
         // string cannot regress past the helper.
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         assert!(sql.contains(&format!("ts >= {start}")));
         assert!(sql.contains(&format!("ts < {end}")));
         assert!(
@@ -1291,7 +1454,7 @@ mod tests {
     /// projection) would join on keys 1000× too small and compare nothing.
     #[test]
     fn live_candles_select_sql_rescales_projected_key_to_nanoseconds() {
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         assert!(
             sql.contains("(ts / 1) * 1000 AS ts_nanos"),
             "projection must re-scale micros back to nanos: {sql}"
@@ -1300,7 +1463,7 @@ mod tests {
 
     #[test]
     fn live_candles_select_sql_is_feed_scoped_ordered_and_limit_probed() {
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         assert!(sql.contains("FROM candles_1m"));
         assert!(sql.contains("feed = 'dhan'"), "must not read another feed");
         assert!(sql.contains("ORDER BY ts ASC"));
@@ -1312,6 +1475,90 @@ mod tests {
         for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP"] {
             assert!(!sql.to_ascii_uppercase().contains(forbidden));
         }
+    }
+
+    /// The 2026-08-26 noise flood, as a test.
+    ///
+    /// That run emitted 757,273 of its 764,002 findings as `missing_rest` —
+    /// 99.1% — because the live read was universe-wide while the REST side is
+    /// fetched only for `targets`. Every instrument outside the target set
+    /// produced one finding per minute it traded, for being out of scope.
+    #[test]
+    fn the_live_read_is_scoped_to_the_rest_targets() {
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[51, 13, 25, 13]);
+        assert!(
+            sql.contains("AND security_id IN (13, 25, 51)"),
+            "the read must be narrowed to the targets, sorted and deduped so the \
+             query text is deterministic: {sql}"
+        );
+        // The rest of the contract must survive the added clause.
+        assert!(sql.contains("feed = 'dhan'"));
+        assert!(sql.contains("ORDER BY ts ASC"));
+        assert!(sql.contains(&format!("LIMIT {}", LIVE_ROW_LIMIT + 1)));
+    }
+
+    /// With no targets there is no REST side at all, so a universe-wide read
+    /// would make EVERY live row a finding — the 2026-08-26 failure at its
+    /// maximum. Matching nothing is the honest shape; the verdict then reads
+    /// as no data.
+    #[test]
+    fn an_empty_target_list_reads_nothing_rather_than_the_universe() {
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[]);
+        assert!(
+            sql.contains("AND 1 = 0"),
+            "an empty target set must be unsatisfiable, never an unfiltered \
+             universe read: {sql}"
+        );
+        assert!(
+            !sql.contains("security_id IN ()"),
+            "an empty IN list is a SQL syntax error, which would degrade the \
+             run for the wrong reason: {sql}"
+        );
+    }
+
+    /// `security_id` alone is not an identity (I-P1-11). The SQL `IN` list can
+    /// therefore over-include a different instrument sharing a number — and
+    /// that one has no REST side, so it returns as `missing_rest` noise, the
+    /// very thing the scoping removes.
+    #[test]
+    fn a_shared_security_id_in_another_segment_is_not_in_scope() {
+        let b = bar(100.0, 101.0, 99.0, 100.5);
+        let targets = vec![XverifyTarget {
+            security_id: 27,
+            segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+        }];
+
+        let mut bars = vec![
+            side(27, OPEN, b), // IDX_I — the real target
+            SideBar {
+                security_id: 27, // same number, different instrument
+                segment: "NSE_EQ".to_string(),
+                minute_ts_ist_nanos: minute(OPEN),
+                bar: b,
+            },
+        ];
+        let dropped = retain_targets_only(&mut bars, &targets);
+        assert_eq!(dropped, 1, "the NSE_EQ id-27 row is a different instrument");
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].segment, "IDX_I");
+    }
+
+    /// The scoping must not quietly drop the instruments it exists to compare.
+    #[test]
+    fn every_targeted_instrument_survives_the_scope_filter() {
+        let b = bar(100.0, 101.0, 99.0, 100.5);
+        let targets: Vec<XverifyTarget> = [13, 25, 51]
+            .iter()
+            .map(|&id| XverifyTarget {
+                security_id: id,
+                segment: "IDX_I".to_string(),
+                instrument: "INDEX".to_string(),
+            })
+            .collect();
+        let mut bars = vec![side(13, OPEN, b), side(25, OPEN, b), side(51, OPEN, b)];
+        assert_eq!(retain_targets_only(&mut bars, &targets), 0);
+        assert_eq!(bars.len(), 3, "a target must never be filtered out");
     }
 
     // =======================================================================
@@ -2323,7 +2570,7 @@ mod tests {
     fn test_read_live_side_uses_the_microsecond_window_query() {
         // The runner must go through `live_candles_select_sql`, not a
         // hand-rolled query — that helper is where the #1474 fix lives.
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         let (start, _) = day_bounds_micros(DAY_START_NANOS);
         assert!(sql.contains(&start.to_string()));
         assert!(!sql.contains(&DAY_START_NANOS.to_string()));
@@ -2355,9 +2602,16 @@ mod tests {
             degraded: true,
             malformed_rows: 0,
             budget_elapsed: true,
+            live_truncated: false,
         };
         assert!(report.degraded);
         assert!(report.budget_elapsed);
+        assert!(
+            !report.live_truncated,
+            "truncation must be reported on its own: `degraded` is also set by \
+             a single REST failure, so folding the two together is what left \
+             the 2026-08-26 short read invisible in the log"
+        );
         assert!(!report.comparison.outcome.is_pass());
     }
 }

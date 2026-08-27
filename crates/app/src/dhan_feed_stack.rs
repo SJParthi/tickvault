@@ -7907,6 +7907,13 @@ pub fn spawn_daily_crossverify(
                         rest_failures = report.rest_failures,
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
+                        // Reported beside `degraded`, never folded into it: a
+                        // single REST failure also sets `degraded`, so the two
+                        // together were indistinguishable — which is why the
+                        // 2026-08-26 short live read left no trace in this
+                        // line even though the run's own counts summed to the
+                        // cap exactly.
+                        live_truncated = report.live_truncated,
                         degraded = report.degraded,
                         vacuous = c.is_vacuous(),
                         "Dhan live-feed cross-verification finished — this is the honest \
