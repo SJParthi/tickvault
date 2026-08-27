@@ -7905,6 +7905,12 @@ pub fn spawn_daily_crossverify(
                         noise_max_paise = c.noise_max_paise,
                         findings = c.findings.len(),
                         rest_failures = report.rest_failures,
+                        // WHY they failed, not just how many. Read
+                        // `no_candles` first: an instrument that did not trade
+                        // is normal, and counting it beside timeouts under one
+                        // word called "failures" is what made 815 of 865 look
+                        // like an outage with nothing in the log to check.
+                        rest_failure_kinds = report.rest_failure_kinds.as_str(),
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
                         // Reported beside `degraded`, never folded into it: a
