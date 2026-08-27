@@ -1205,28 +1205,52 @@ fn fold_in_bucket(
     // arrived last rather than the one that traded last. `>=` is deliberate:
     // many packets share one LTT second, and within a second last-write-wins
     // is the pre-existing, correct behaviour.
-    if tick.exchange_timestamp >= state.close_ts_ist_secs {
+    // Captured BEFORE the close guard mutates `close_ts_ist_secs`, so the OI
+    // rule below reads "is this the newest packet we have seen" rather than a
+    // value that depends on statement order two lines up.
+    let tick_is_newest = tick.exchange_timestamp >= state.close_ts_ist_secs;
+    if tick_is_newest {
         state.close = price;
         state.close_ts_ist_secs = tick.exchange_timestamp;
-        // MERGE 2026-08-25: the order guard above and the non-zero guard here
-        // fix DIFFERENT halves of the same field, and OI needs BOTH.
-        //
-        // The order guard answers "is this packet newer?". It cannot answer
-        // "does this packet carry an OI reading at all". `0` is the ABSENT
-        // sentinel — a Ticker-mode packet has no OI field and an equity never
-        // has one — so a NEWER blank packet passes the order guard and would
-        // still erase a real OI that an earlier tick in the SAME bucket had
-        // established. Order alone does not make a blank field into news.
-        //
-        // Last NON-ZERO wins, exactly like `prev_day_close` / `session_open`
-        // below, which carry the same reasoning for the same reason.
-        if tick.open_interest != 0 {
+    }
+    // MERGE 2026-08-25: the order guard above and the non-zero guard here fix
+    // DIFFERENT halves of the same field, and OI needs BOTH.
+    //
+    // The order guard answers "is this packet newer?". It cannot answer "does
+    // this packet carry an OI reading at all". `0` is the ABSENT sentinel — a
+    // Ticker-mode packet has no OI field and an equity never has one — so a
+    // NEWER blank packet passes the order guard and would still erase a real
+    // OI that an earlier tick in the SAME bucket had established. Order alone
+    // does not make a blank field into news.
+    //
+    // UN-NESTED 2026-08-26. The merge put this INSIDE the order guard, which
+    // silently gave OI a third rule nobody wrote down: "last non-zero wins,
+    // among packets that happened to arrive in timestamp order". Arrival order
+    // is arbitrary — this feed carries no sequence number, which is the stated
+    // premise of the whole permutation suite — so an out-of-order packet
+    // carrying a REAL reading was dropped entirely and the bar kept a 0.
+    //
+    // Reproduced exactly, not inferred: a blank packet at t+20 arriving first,
+    // then a real OI of 5,000 at t+3, left the bar at `oi = 0` — a reading we
+    // held and threw away. `fold_properties::
+    // a_blank_open_interest_never_erases_a_real_one` caught it in CI; it is
+    // rare only because that generator draws OI from `0..5_000`, so the
+    // absent sentinel appears about once in five thousand ticks. 60,000 local
+    // cases did not hit it. Rarity in a generator is not rarity in a feed:
+    // every Ticker-mode packet carries `open_interest = 0`.
+    //
+    // Last NON-ZERO wins, by EXCHANGE TIMESTAMP — plus "anything beats
+    // nothing", which is what the un-nesting adds.
+    if tick.open_interest != 0 {
+        // `state.oi == 0` first: with no reading at all, an older real one is
+        // strictly better than none.
+        if state.oi == 0 || tick_is_newest {
             state.oi = i64::from(tick.open_interest);
-        } else if state.oi != 0 {
-            crate::candles::fold_counters::fold_counters()
-                .oi_zero_ignored
-                .increment(1);
         }
+    } else if state.oi != 0 {
+        crate::candles::fold_counters::fold_counters()
+            .oi_zero_ignored
+            .increment(1);
     }
     // Exchange cumulative volume only ever rises, so a bucket's traded volume
     // is monotone too. `saturating_sub` bounded the ARITHMETIC against
@@ -1365,6 +1389,77 @@ mod tests {
             1_500,
         );
         assert_eq!(cell.snapshot(TfIndex::M1).volume, 1_400);
+    }
+
+    #[test]
+    /// The half the 2026-08-25 merge lost by nesting OI inside the close
+    /// order guard, reproduced from the input CI actually found.
+    ///
+    /// A blank packet at the LATER timestamp arrives first; the real reading
+    /// at the earlier timestamp arrives second. Under the nested rule the
+    /// order guard rejected the whole packet and the bar kept `oi = 0` — a
+    /// reading we held and discarded. Arrival order is arbitrary on a feed
+    /// with no sequence number, which is the premise the permutation suite is
+    /// built on, so this is an ordinary shape and not an exotic one.
+    #[test]
+    fn a_reordered_packet_still_delivers_its_open_interest() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::default();
+
+        // Later timestamp, BLANK oi, arrives FIRST — a Ticker-mode packet.
+        let mut blank_later = tick_at(OPEN + 20, 100.0, 10);
+        blank_later.open_interest = 0;
+        cell.consume_tick(TfIndex::M1, &blank_later, 0, strategy, 10);
+        assert_eq!(cell.snapshot(TfIndex::M1).oi, 0, "nothing known yet");
+
+        // Earlier timestamp, REAL oi, arrives SECOND — a Quote packet that
+        // overtook it on the wire.
+        let mut real_earlier = tick_at(OPEN + 3, 101.0, 20);
+        real_earlier.open_interest = 5_000;
+        cell.consume_tick(TfIndex::M1, &real_earlier, 0, strategy, 20);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).oi,
+            5_000,
+            "an out-of-order packet's REAL open interest must still land when \
+             the bar holds none — anything beats nothing, and dropping it \
+             loses a reading we actually received"
+        );
+
+        // And it must not move `close` backwards while doing so: the two
+        // guards are separate again, which is the entire point.
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).close_ts_ist_secs,
+            OPEN + 20,
+            "un-nesting OI must not weaken the close order guard"
+        );
+        assert!(
+            (cell.snapshot(TfIndex::M1).close - 100.0).abs() < f64::EPSILON,
+            "close still belongs to the latest timestamp"
+        );
+    }
+
+    /// Once a reading exists, an OLDER real one must not replace it — the
+    /// other direction of the same rule, and the reason the fix is not simply
+    /// "always take a non-zero OI".
+    #[test]
+    fn an_older_open_interest_never_replaces_a_newer_one() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::default();
+
+        let mut newer = tick_at(OPEN + 30, 100.0, 10);
+        newer.open_interest = 6_000;
+        cell.consume_tick(TfIndex::M1, &newer, 0, strategy, 10);
+
+        let mut older = tick_at(OPEN + 5, 99.0, 20);
+        older.open_interest = 4_000;
+        cell.consume_tick(TfIndex::M1, &older, 0, strategy, 20);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).oi,
+            6_000,
+            "the newer reading must win; `anything beats nothing` applies only \
+             when the bar has nothing"
+        );
     }
 
     #[test]
