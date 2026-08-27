@@ -939,6 +939,45 @@ day: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130** wit
   alarm is a real follow-up; claiming it already existed was exactly the false-OK this
   file exists to stop.
 
+  > **⚠ RE-CORRECTED 2026-08-26 — the correction above went stale within HOURS of
+  > being written, and it is now the thing manufacturing a false finding.**
+  >
+  > `start-watchdog-lambda.tf:345` declares
+  > `aws_cloudwatch_metric_alarm.start_watchdog_not_invoked` —
+  > `tv-<env>-start-watchdog-not-invoked`, `Invocations < 1` over 6 hours,
+  > `treat_missing_data = breaching` — and its own `alarm_description` names the
+  > 2026-07-02 scheduler-drop class verbatim. It landed in `cacea254d`
+  > (2026-08-25 19:16:55Z, PR #1817), whose title is literally *"the kill-switch
+  > nobody checked was still running — and a claim in four rule sections was
+  > overstated"*. So the follow-up this bullet calls for was DONE the same day, by
+  > the same change, and this bullet was never updated.
+  >
+  > The tree-wide scan now returns **NINE** occurrences across **SEVEN** files,
+  > producing **EIGHT** distinct not-invoked alarms: boot-heartbeat-gate,
+  > daily-budget-digest, deploy-watchdog, dhan-token-minter, hard-stop-guard,
+  > market-hours-gate, market-open-readiness, start-watchdog.
+  >
+  > **The cost is the same one this bullet was written to warn about, one level
+  > up.** A reader trusting it today concludes the component that starts the
+  > trading box is blind, and goes to build an alarm that already exists —
+  > exactly the wasted work the `day_ohlc_tracker` row (2026-08-12) and the
+  > `WAL-SUSPEND-01` row (2026-08-25) each record. **A correction is a claim
+  > like any other, and it goes stale like any other.** The durable lesson is
+  > not "check harder" — it is that an alarm-existence claim is one `grep`
+  > (`grep -rn 'metric_name *= *"Invocations"' deploy/aws/terraform/`), so it
+  > must be re-run at the moment of writing rather than carried forward, in a
+  > correction just as much as in the sentence it corrects.
+  >
+  > **And it was checkable without even grepping.** The same PR added
+  > `cloudwatch_app_alarms_wiring.rs::
+  > every_scheduled_lambda_has_a_did_it_run_alarm_or_a_declared_exemption`,
+  > which FAILS THE BUILD if any scheduled Lambda lacks a not-invoked alarm and
+  > has no declared exemption. It has been GREEN ever since. So this bullet did
+  > not merely go stale against the terraform — it contradicted a passing test
+  > in the same repository, on the same day, added by the same commit. When a
+  > prose claim and a green ratchet disagree, the ratchet is the one that
+  > cannot be wrong by inattention.
+
 #### What a PR that violates §2.3f looks like (REJECT)
 
 - Filters either cross-verify alarm on `WS-GAP-03` alone, or drops the `source` condition
@@ -1126,6 +1165,41 @@ charted so the mechanism is observable, and the thing that would actually indica
 breakage (the fold refusing input) is already covered by
 `tv_indicator_tick_rejected_total`.
 
+> ### ⚠ CORRECTED 2026-08-26 — "They are charted" was FALSE
+>
+> The two counters were shipped to CloudWatch and charted **nowhere**.
+> `grep tv_candle_session_high_recovered_total deploy/aws/terraform/dashboard.tf`
+> returned **0**; the names appeared only in the EMF selector. So they were paid
+> for (~$0.60/mo), alarmed by nothing *by design*, and visible on no surface at
+> all — the "measured but unwatched" class §2.3b was written to end, sitting
+> inside the very section that reports closing it.
+>
+> This is worse than an ordinary gap, and the reason is worth stating: anyone
+> auditing the claim **by reading** would have found it satisfied. A wrong
+> sentence in this file does not merely fail to warn — it certifies. That is the
+> same cost the `day_ohlc_tracker` row records on 2026-08-12 and the
+> `WAL-SUSPEND-01` row records on 2026-08-25, arriving a third time.
+>
+> **FIXED the same day.** Both counters are charted in `dashboard.tf` Row 13,
+> deliberately NOT under that row's "every line should sit flat at zero"
+> heading — a quiet market legitimately sets no new day highs, so zero here is
+> normal and a rising line is the fold working. The paragraph's reasoning about
+> not alarming them stands unchanged and is re-verified; only the claim that
+> they were charted was false.
+>
+> **The durable half is not the widget.** The same sweep found **ten** shipped
+> metrics that were on no dashboard and in no alarm, and the guard meant to
+> prevent exactly this — `dashboard_live_lane_visibility_guard.rs` — could not
+> have caught any of them: it filtered to `tv_dhan_*`, so it held for one prefix
+> and drifted silently for the other eight. Its scope is now **every** selected
+> name, bite-proven against a metric that could not have failed the old version.
+> Eight of the ten are charted; the two left off are recorded there with reasons,
+> one of them sharpened (`tv_dhan_feed_depth_total` folds its success and failure
+> arms into a single summed line, so a plain chart could not show a failure spike
+> at all — charting it would close the entry while creating the false comfort the
+> entry exists to prevent).
+
+
 #### Honest cost
 
 3 EMF names ≈ **$0.90/mo**, 1 alarm ≈ **$0.10/mo** ⇒ **~$1.00/mo**, zero
@@ -1152,3 +1226,72 @@ $112.50, below the bill. Neither is taken here.
 - Adds an EMF name whose producer does not exist (`emf_selector_producer_guard`).
 - Gives the probe-failed alarm `ok_actions` — a counter aging out of its window is
   not a repair.
+
+### §2.3i — 2026-08-26: the deaf socket gets its page
+
+**The verbatim operator authorization (2026-08-26, answering a presented
+choice):**
+
+> "Yes, phone me"
+
+Given in DIRECT response to a question that named the alarm, its threshold,
+its price, and the reason it had NOT been added unilaterally: *"Adding the
+phone call costs about 10 cents a month, and I did NOT add it on my own
+because your worst-case month already lands just above the line where AWS
+automatically switches the trading box OFF."* This dated row is the rule-file
+edit §3 demands before any new Dhan-scoped page, recorded BEFORE the
+terraform.
+
+**The failure it covers, and why nothing else can.** A socket that keeps
+answering pings but stops delivering data defeats every existing mechanism,
+each for a structural reason rather than an oversight:
+
+| Mechanism | Why it is blind to this |
+|---|---|
+| Idle watchdog (27 s) | governs SILENCE on the wire; a ponging socket is not silent |
+| Reconnect family | stays flat — the defining property of a deaf socket is that **nothing about it is retrying**. This is why "alarm the reconnect counters", the recommendation on record, cannot work |
+| `dhan-no-ticks-flowing` (§2.3b) | reads the LANE. With fifteen of sixteen sockets delivering, the lane's last tick is always ~1 s old |
+| `tv_dhan_ws_alive_connections` | counts sockets DIALED, not DELIVERING |
+
+**Family (5) therefore gains a THIRTEENTH signal:**
+`tv-<env>-dhan-worst-socket-deaf` on `tv_dhan_ws_worst_conn_tick_age_secs`,
+`Maximum >= 600` over one 300 s period.
+
+**The threshold is not invented.** `dhan-no-ticks-flowing` pages at 300 s × 2
+periods = ten minutes of lane silence. This is the same question scoped to one
+socket, so it takes the same ten minutes — expressed as one 600 s crossing
+rather than two 300 s ones, because this gauge is a per-socket age that only
+climbs.
+
+**`notBreaching`, and that differs from its two siblings deliberately.**
+`dhan_live_lane_down` and `dhan_no_ticks_flowing` are `breaching` because a
+DEAD APP publishes nothing and that absence must page. Those two already cover
+that case; a third alarm firing on the same absence buys nothing and triples
+the noise of one outage. This one answers a narrower question that only has
+meaning while the lane is alive: *of the sockets that ARE running, is one of
+them deaf?*
+
+**⚠ It joins the market-hours gate in the SAME change, and that is not
+optional.** Without it this pages **every single trading day at ~15:40**:
+after the 15:30 close every socket legitimately stops delivering, the gauge
+crosses 600 within ten minutes, and the alarm fires on a market that is simply
+shut. The gate now arms **7** alarms. Landing the alarm without the gate
+membership re-creates the exact noise trap §2.3a records.
+
+**Cost:** 1 alarm ≈ **$0.10/mo**, no new EMF name — the gauge was selected the
+same day (82 names, ~$0.30/mo, priced in the count ratchet).
+
+**⚠ What this does NOT do (Rule 11).** It reports that a socket has gone
+quiet; it cannot distinguish "the socket is deaf" from "every instrument on
+that socket genuinely stopped trading". The alarm text says so and points at
+the lane gauge and the never-ticked count for that comparison. It also does
+not prevent a socket going deaf, and detection latency is the 30 s publish
+cadence plus the 600 s threshold.
+
+**What a PR that violates §2.3i looks like (REJECT):** lands the alarm without
+the gate membership (the daily 15:40 false page); flips it to `breaching`
+(duplicates the two absence alarms and pages three times for one outage);
+adds a per-CONNECTION dimension (the §2.3 cardinality rule stands — sixteen
+dimensions ≈ $4.80/mo to answer a yes/no question one series answers);
+or lowers the threshold below the lane alarm's ten minutes without a measured
+baseline.

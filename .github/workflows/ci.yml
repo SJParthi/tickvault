@@ -223,9 +223,30 @@ jobs:
         #
         # `--all-targets` is STILL deliberately omitted, and that is a real
         # remaining gap, not an oversight: test code legitimately uses
-        # `eprintln!` (calibration output), the workspace does not currently
-        # build clean in that mode, and its true warning count is UNMEASURED.
-        # Arming it is separate work with its own measurement — do not
+        # `eprintln!` (calibration output) and the workspace does not
+        # currently build clean in that mode.
+        #
+        # MEASURED 2026-08-26 (this comment said "its true warning count is
+        # UNMEASURED" until now, and an unmeasured gap is indistinguishable
+        # from a hidden defect, which is why it was worth an hour):
+        # `cargo clippy --workspace --all-targets --no-deps` reports
+        # **167 warnings + 19 errors = 186 findings**. Dominated by
+        # cosmetics: 72 inconsistent_digit_grouping (date literals such as
+        # `2026_08_28`), 32 doc_overindented_list_items, 24
+        # assertions_on_constants.
+        #
+        # The verdict that matters: **every one of the 186 is inside
+        # `#[cfg(test)]`. Zero are production-scoped.** Each error location
+        # was classified individually, not sampled. The seven
+        # `await_holding_lock` hits look alarming and are not — they are the
+        # `env_guard()` test-serialization mutex in
+        # `crates/api/src/handlers/debug.rs`, all past that file's line-377
+        # `#[cfg(test)]`.
+        #
+        # So this gap masks NO production defect. Closing it is cosmetic
+        # churn across many files, which is precisely why it stays separate
+        # work — but it is now separate KNOWN work rather than an open
+        # unknown. Arming it still means fixing all 186 first; do not
         # bundle it in by adding the flag here.
         #
         # Ratcheted by `crates/common/tests/rust_only_guard.rs::

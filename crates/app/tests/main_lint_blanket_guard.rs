@@ -73,35 +73,152 @@ const EXPECT_ATTR: &str = "#![cfg_attr(not(test), deny(clippy::expect_used))]";
 const PRINT_DBG_ATTR: &str =
     "#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]";
 
-/// The `main` binary crate root MUST carry the three restriction-lint
-/// deny attributes that `lib.rs` carries, so production boot-sequence code
-/// in `main.rs` is linted for the same silent-panic / stray-print class.
+/// Every crate root in the workspace: `lib.rs`, `main.rs`, and each
+/// `src/bin/*.rs`.
+///
+/// Discovered, never listed. A hardcoded list is how this guard spent a
+/// year covering ONE file: it pinned `crates/app/src/main.rs` by name while
+/// twenty-five other roots — nine lambda binaries, three CLI tools, seven
+/// libraries and a second `main.rs` — went unchecked. The rule was never
+/// app-specific; its SCOPE was. Exactly the shape found in
+/// `dashboard_live_lane_visibility_guard` a day earlier, which held for one
+/// metric prefix and drifted silently for the other eight.
+fn crate_roots() -> Vec<String> {
+    let root = workspace_root();
+    let mut out = Vec::new();
+    let Ok(crates) = fs::read_dir(root.join("crates")) else {
+        return out;
+    };
+    for c in crates.flatten() {
+        let src = c.path().join("src");
+        for name in ["lib.rs", "main.rs"] {
+            if src.join(name).is_file() {
+                out.push(format!(
+                    "crates/{}/src/{name}",
+                    c.file_name().to_string_lossy()
+                ));
+            }
+        }
+        if let Ok(bins) = fs::read_dir(src.join("bin")) {
+            for b in bins.flatten() {
+                if b.path().extension().is_some_and(|e| e == "rs") {
+                    out.push(format!(
+                        "crates/{}/src/bin/{}",
+                        c.file_name().to_string_lossy(),
+                        b.file_name().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// EVERY crate root must make an EXPLICIT decision about silent panics.
+///
+/// `deny` is the default posture. `allow` with an `// APPROVED:` reason is
+/// legitimate for a diagnostic CLI whose whole job is to fall over loudly
+/// on a broken workspace — `tv_doctor`, `tv_guarantees` and `smoke_test`
+/// all carry one, and that is a decision on the record.
+///
+/// What fails is SILENCE. A root that says nothing has not chosen the
+/// permissive posture; it has failed to choose at all, and the compiler
+/// resolves that to "allowed" without anyone noticing. On 2026-08-26 one
+/// root was in exactly that state — `crates/tickvault-logs-mcp/src/main.rs`,
+/// which this guard could not see because it was looking at one hardcoded
+/// path. It held zero unwraps, so nothing was broken; what was missing was
+/// the thing that would have said so if a future edit added one.
+#[test]
+fn every_crate_root_decides_about_silent_panics() {
+    let mut silent = Vec::new();
+
+    for rel in crate_roots() {
+        let src = strip_line_comments(&read(&rel));
+        for lint in ["clippy::unwrap_used", "clippy::expect_used"] {
+            let denied = src.contains(&format!("deny({lint})"));
+            let allowed = src.contains(&format!("allow({lint})"));
+            if !denied && !allowed {
+                silent.push(format!("{rel}: says nothing about {lint}"));
+            }
+        }
+    }
+
+    assert!(
+        silent.is_empty(),
+        "a crate root that says nothing about unwrap/expect has not chosen the permissive \
+         posture — it has failed to choose, and the compiler reads silence as permission.\n\
+         Add the deny blanket, or `#![allow(...)]` with an `// APPROVED: <reason>` comment \
+         so the decision is on the record.\n\n{}",
+        silent.join("\n")
+    );
+}
+
+/// The DEFAULT posture is deny, and the crates carrying production code
+/// must keep it. A diagnostic CLI may opt out with a reason; a library or a
+/// service binary may not.
+#[test]
+fn production_crate_roots_keep_the_deny_blanket() {
+    // Every root that is NOT a hand-run diagnostic tool.
+    let exempt = ["tv_doctor.rs", "tv_guarantees.rs", "smoke_test.rs"];
+    let mut weakened = Vec::new();
+
+    for rel in crate_roots() {
+        if exempt.iter().any(|e| rel.ends_with(e)) {
+            continue;
+        }
+        let src = strip_line_comments(&read(&rel));
+        for needle in [UNWRAP_ATTR, EXPECT_ATTR] {
+            if !src.contains(needle) {
+                weakened.push(format!("{rel}: missing `{needle}`"));
+            }
+        }
+    }
+
+    assert!(
+        weakened.is_empty(),
+        "these roots carry production code and must deny silent panics. A release build \
+         sets `panic = \"abort\"`, so an `unwrap` on a None is not an error — it ends the \
+         trading session.\n\n{}",
+        weakened.join("\n")
+    );
+}
+
+/// `crates/app` specifically: `main.rs` and `lib.rs` stay in lockstep on
+/// all THREE attributes including the print/dbg blanket.
+///
+/// The original 2026-07-17 pin, kept verbatim in substance: the boot
+/// sequence lives directly in `main.rs`, so a stray `println!` there is an
+/// operator-facing surface that bypasses the structured log sink entirely.
 #[test]
 fn test_main_rs_carries_lib_restriction_lint_blanket() {
-    let main_rs = strip_line_comments(&read("crates/app/src/main.rs"));
-
-    for needle in [UNWRAP_ATTR, EXPECT_ATTR, PRINT_DBG_ATTR] {
-        assert!(
-            main_rs.contains(needle),
-            "crates/app/src/main.rs MUST carry the restriction-lint attribute `{needle}` \
-             (the same deny blanket as lib.rs) — production code in the bin crate root \
-             must be linted for unwrap/expect/print/dbg. See main_lint_blanket_guard.rs."
-        );
+    for rel in ["crates/app/src/main.rs", "crates/app/src/lib.rs"] {
+        let src = strip_line_comments(&read(rel));
+        for needle in [UNWRAP_ATTR, EXPECT_ATTR, PRINT_DBG_ATTR] {
+            assert!(
+                src.contains(needle),
+                "{rel} MUST carry the restriction-lint attribute `{needle}` — the two app \
+                 crate roots stay in lockstep. See main_lint_blanket_guard.rs."
+            );
+        }
     }
 }
 
-/// The blanket must be REAL in `lib.rs` too (so the two roots stay in
-/// lockstep — a future PR that weakens lib.rs would otherwise silently
-/// diverge the two crate roots).
 #[test]
-fn test_lib_rs_still_carries_the_same_blanket() {
-    let lib_rs = strip_line_comments(&read("crates/app/src/lib.rs"));
-
-    for needle in [UNWRAP_ATTR, EXPECT_ATTR, PRINT_DBG_ATTR] {
-        assert!(
-            lib_rs.contains(needle),
-            "crates/app/src/lib.rs MUST keep the restriction-lint attribute `{needle}` — \
-             main.rs mirrors it; the two crate roots stay in lockstep."
-        );
-    }
+fn guard_self_test_discovers_more_than_one_root() {
+    let roots = crate_roots();
+    assert!(
+        roots.len() > 20,
+        "discovery is the point of this guard: it found only {} root(s), which means the \
+         walk broke and every assertion below it passes vacuously",
+        roots.len()
+    );
+    assert!(roots.iter().any(|r| r == "crates/app/src/main.rs"));
+    assert!(roots.iter().any(|r| r.contains("aws-lambdas/src/bin/")));
+    assert!(
+        roots
+            .iter()
+            .any(|r| r == "crates/tickvault-logs-mcp/src/main.rs"),
+        "the root this guard could not see until 2026-08-26 must be in the set"
+    );
 }

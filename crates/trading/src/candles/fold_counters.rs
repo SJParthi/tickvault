@@ -58,13 +58,38 @@ pub(crate) struct FoldCounters {
     pub(crate) cumulative_regression: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
-    /// `tick_refused` carries a `reason` label with THREE distinct values.
-    /// One field per value, because collapsing them would merge three
+    /// `tick_refused` carries a `reason` label with FIVE distinct values.
+    /// One field per value, because collapsing them would merge five
     /// independent refusal causes into one series and make the counter
     /// useless for telling a bad price from a bad timestamp.
+    ///
+    /// (THREE until 2026-08-26, when `stale_trading_day` and
+    /// `untraded_timestamp` were added. The count is stated here because it is
+    /// exactly the kind of number that silently goes stale — this file's own
+    /// neighbours have been corrected for that before.)
     pub(crate) tick_refused_price: metrics::Counter,
     pub(crate) tick_refused_timestamp: metrics::Counter,
     pub(crate) tick_refused_untraded_sentinel: metrics::Counter,
+    /// Ticks whose IST DATE was older than the newest date seen — a stale
+    /// last-trade time. Candle-only refusal; the row is still written.
+    pub(crate) tick_refused_stale_trading_day: metrics::Counter,
+    /// Per-TIMEFRAME discards: a tick that arrived too late to be placed in
+    /// that timeframe's bucket and was dropped.
+    ///
+    /// Counted per (tick, timeframe) pair, NOT per tick — one tick can be
+    /// placeable in the 1-day bar and hopeless for the 1-second one, and
+    /// collapsing that to a per-tick number would hide exactly which frames
+    /// are losing data.
+    ///
+    /// Deliberately its own name rather than a `reason` on
+    /// `tv_aggregator_tick_refused_total`: that family means "the whole tick
+    /// was refused and nothing was folded", which is a different and more
+    /// serious statement. A tick counted here DID fold into other timeframes.
+    pub(crate) tick_discarded_late: metrics::Counter,
+
+    /// Ticks whose `exchange_timestamp` was EXACTLY 0 — the vendor's "no last
+    /// trade time" sentinel. Candle-only refusal; the row is still written.
+    pub(crate) tick_untraded_timestamp: metrics::Counter,
 }
 
 impl FoldCounters {
@@ -106,6 +131,15 @@ impl FoldCounters {
             tick_refused_untraded_sentinel: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
                 "reason" => "untraded_sentinel"
+            ),
+            tick_refused_stale_trading_day: metrics::counter!(
+                "tv_aggregator_tick_refused_total",
+                "reason" => "stale_trading_day"
+            ),
+            tick_discarded_late: metrics::counter!("tv_candle_tick_discarded_late_total"),
+            tick_untraded_timestamp: metrics::counter!(
+                "tv_aggregator_tick_refused_total",
+                "reason" => "untraded_timestamp"
             ),
         }
     }

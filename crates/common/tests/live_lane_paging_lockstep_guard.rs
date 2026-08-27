@@ -2,8 +2,10 @@
 //!
 //! # Why this file exists separately from the visibility guard
 //!
-//! `dashboard_live_lane_visibility_guard` proves every published lane metric is
-//! *shown*. Showing is not telling. A dashboard is a pull surface: it reports
+//! `dashboard_live_lane_visibility_guard` proves every published metric is
+//! *shown* (its scope widened from lane-only to ALL selected names on
+//! 2026-08-26; the FILE keeps its lane name so this cross-reference and its
+//! git history stay intact). Showing is not telling. A dashboard is a pull surface: it reports
 //! only to someone who has already decided to look, which by definition is not
 //! the person asleep at 02:00 when the durable floor stops holding.
 //!

@@ -124,6 +124,22 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // normally near-empty — a large day IS the signal.
     "dhan_live_crossverify_cell_audit",
     "dhan_live_crossverify_daily",
+    // The vendor's own 1-minute tape, captured verbatim by the same 15:41
+    // sweep that produces the two rows above (2026-08-26, Item 38). It is
+    // the ONLY copy of what Dhan actually answered: without it a divergence
+    // verdict can be read but never re-checked by hand, because the REST
+    // side was judged and then discarded.
+    //
+    // DAY-partitioned and swept exactly like its two siblings, but it is NOT
+    // near-empty like them: the cell table is bounded by divergences, this
+    // one is bounded by INSTRUMENTS. One rotation third (~290 of ~865 spots)
+    // x 375 session minutes ~= 108K rows/day at full success, ~30 MB/day at
+    // the measured ~272 B/row, so ~2.7 GB across the 90-day hot window. At
+    // today's measured 50-successful-fetches ceiling it is ~19K rows/day.
+    // Stated as a number rather than "trivial" because it is the largest
+    // per-day writer in this list and the volume is what the retention sweep
+    // exists to bound.
+    "dhan_rest_1m_tape",
     // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the

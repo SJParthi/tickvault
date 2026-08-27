@@ -487,6 +487,106 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
       {
         type   = "metric"
+        x      = 16
+        y      = 64
+        width  = 8
+        height = 6
+        properties = {
+          # The only ring signal that rises BEFORE the loss, not after it.
+          #
+          # Every other ring metric on this dashboard is a post-mortem count:
+          # ring_full_total and frame_refused_total move once frames have
+          # already been turned away. This is how long a frame WAITED before
+          # the drain reached it, so it climbs while there is still headroom
+          # left — which is the only window in which an operator can act.
+          #
+          # MAXIMUM, never Average. A mean hides the stall that matters: one
+          # eight-second dwell inside a window of microsecond dwells averages
+          # to approximately zero, and it is precisely that one frame that
+          # says the drain stopped draining.
+          #
+          # Deliberately UNALARMED for now. The value has never been observed,
+          # because until 2026-08-26 it was computed ~5,000 times a second and
+          # thrown away; picking a threshold before there is a baseline invents
+          # a number and then teaches the operator to ignore the alarm built on
+          # it. Chart first, threshold when the chart has something to read.
+          title  = "How far behind the drain is (worst frame wait, ms)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_ring_dwell_max_ms", { label = "worst ring wait", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 70
+        width  = 8
+        height = 6
+        properties = {
+          # A socket that keeps answering pings but stops delivering data.
+          #
+          # This failure defeats every other mechanism by construction. The
+          # idle watchdog governs SILENCE, and a ponging socket is not silent.
+          # The reconnect counters stay flat, because the defining property of
+          # a deaf socket is that nothing about it is retrying. And the
+          # LANE-level tick age reads about a second throughout, because
+          # fifteen of the sixteen sockets are fine.
+          #
+          # Read it AGAINST the lane tick age, not alone: both low is healthy,
+          # this one climbing while the lane stays flat is exactly one deaf
+          # socket, and both climbing is the whole feed. That difference is the
+          # diagnosis, which is why the two belong on the same screen.
+          #
+          # -1 means no connection has ticked yet — pre-open, or a lane that
+          # has just started. Deliberately not 0, which would read as "every
+          # socket ticked this instant" at the moment we know least.
+          title  = "Deaf socket check: worst connection tick age (s), -1 = none yet"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_ws_worst_conn_tick_age_secs", { label = "worst socket", stat = "Maximum" }],
+            [local.dash_namespace, "tv_dhan_feed_last_tick_age_secs", { label = "whole lane (for contrast)", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 70
+        width  = 8
+        height = 6
+        properties = {
+          # The other half of the ring. Read this WITH the dwell chart, never
+          # alone — the pair is the diagnosis and neither number gives it:
+          #
+          #   both flat            -> healthy
+          #   both climbing        -> the drain cannot keep up
+          #   dwell flat, this up  -> large frames, not a slow drain
+          #   dwell up, this flat  -> the drain is slow on small frames
+          #
+          # Until 2026-08-26 CloudWatch had tv_dhan_feed_ring_max_bytes (the
+          # CAPACITY) and nothing for the occupancy — the denominator without
+          # the numerator. `RingByteBudget::resident()` existed the whole time
+          # with call sites only in its own unit tests.
+          #
+          # Percent rather than bytes because the two pools are sized 3:1, so
+          # raw bytes are not comparable and the larger pool would dominate the
+          # chart regardless of which one is in trouble.
+          title  = "Ring fill (% of byte budget, worst pool)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_dhan_feed_ring_resident_pct", { label = "worst pool", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
         x      = 8
         y      = 64
         width  = 8
@@ -649,6 +749,112 @@ resource "aws_cloudwatch_dashboard" "operator" {
             [local.dash_namespace, "tv_wal_replay_corrupted_segments_total", { label = "corrupted segments on replay", stat = "Sum" }],
             [local.dash_namespace, "tv_partition_archive_failed_total", { label = "archive to S3 failed", stat = "Sum" }],
             [local.dash_namespace, "tv_boot_deadline_exceeded_total", { label = "boot step ran out of time", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+
+      # ----- Row 13: the ten that Row 12 left behind -----
+      # (2026-08-26.) Row 12 above charted 7 of the 17 metrics that 2026-08-22
+      # found shipped-but-unwatched. Re-measuring the EMF allowlist against
+      # this file and every alarm today: 82 names ship, 40 are alarmed, 32 of
+      # the rest are charted here, and TEN were neither. This row takes nine of
+      # them.
+      #
+      # Two of the ten matter more than the rest, because a rule file already
+      # says they are here. `dhan-rest-only-noise-lock` 2.3h records the two
+      # candle-recovery counters as "shipped as METRICS but deliberately NOT
+      # ALARMED ... They are charted so the mechanism is observable". They were
+      # not charted. The metrics were paid for and visible nowhere, while the
+      # document said otherwise -- which is worse than an ordinary gap, because
+      # anyone checking the claim by reading would have found it satisfied.
+      #
+      # `tv_dhan_ws_lag_excluded_total` stays off for the reason already
+      # recorded: it qualifies a lag histogram that is NOT EMF-shipped, so a
+      # line here would show a correction with nothing to correct.
+      #
+      # `tv_dhan_feed_depth_total` stays off too, and its recorded reason is
+      # now sharper than "a one-widget follow-up".
+      # EMF folds its labels by summing, and its arms are `rows` (the success
+      # path, large) plus `refused` / `dropped` / `shed_inline` /
+      # `shed_dedicated` / `disconnects` / `length_mismatch` / `truncated` (the
+      # failures, expected zero). A folded line is therefore dominated by
+      # successes and could not show a failure spike at all. Charting it would
+      # close the count while creating exactly the false comfort this row
+      # exists to remove, so it stays uncharted with the reason recorded rather
+      # than charted to make a number reach zero. Splitting it needs
+      # per-outcome metric names, which is its own change.
+      #
+      # Both of this file's own checks were run per metric before charting:
+      #   1. a producer exists in crates/*/src  (grep-verified 2026-08-26,
+      #      exactly one file per name)
+      #   2. the name is in the EMF allowlist   (that is how they were found)
+      {
+        type   = "text"
+        x      = 0
+        y      = 84
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "## The last ten — eight charted here, two deliberately left off\nNone of these raises an alarm, by design. The left panel should sit **flat at zero**: each line is a quiet fallback, a refusal, or a measurement thrown away. The right two panels are **not** faults — they are work the system does that had no way of reaching you at all."
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 86
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Quiet fallbacks and refusals — every line should sit flat at zero"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_cadence_late_response_total", { label = "broker answer arrived after its minute", stat = "Sum" }],
+            [local.dash_namespace, "tv_cadence_spot_fallback_total", { label = "spot price taken from the chain instead", stat = "Sum" }],
+            [local.dash_namespace, "tv_chain_mark_refused_total", { label = "option mark refused", stat = "Sum" }],
+            [local.dash_namespace, "tv_mid_session_profile_rest_degraded_total", { label = "mid-session identity check degraded", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 86
+        width  = 6
+        height = 6
+        properties = {
+          # NOT under the flat-at-zero heading, deliberately. A quiet market
+          # legitimately sets no new day highs, so zero is a NORMAL reading
+          # here and a rising line is the fold working, not failing. That is
+          # also why 2.3h refused to alarm them: a pager that cries on an
+          # ordinary day teaches the operator to ignore it.
+          title  = "Candle highs and lows corrected from the exchange's own running day figures"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_candle_session_high_recovered_total", { label = "minute highs widened", stat = "Sum" }],
+            [local.dash_namespace, "tv_candle_session_low_recovered_total", { label = "minute lows widened", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 18
+        y      = 86
+        width  = 6
+        height = 6
+        properties = {
+          # Gauges, so Maximum rather than Sum: summing a headroom reading
+          # across a period reports a number that was never true at any instant.
+          title  = "Resource headroom"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_open_fds", { label = "open file descriptors", stat = "Maximum" }],
+            [local.dash_namespace, "tv_subsystem_memory_estimated_bytes", { label = "estimated memory by subsystem (bytes)", stat = "Maximum" }]
           ]
           period = 300
         }
