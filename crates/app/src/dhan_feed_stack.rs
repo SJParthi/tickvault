@@ -8372,12 +8372,12 @@ pub fn spawn_daily_crossverify(
                         volume_capture_min_pct = c.volume_capture_min_pct,
                         findings = c.findings.len(),
                         rest_failures = report.rest_failures,
-                        // Added 2026-08-26. `rest_failures` alone reported
-                        // 814-of-864 and 815-of-865 on consecutive sessions
-                        // and gave nobody a way to act on it: the reason was
-                        // discarded at the fetch site. This field names the
-                        // dominant cause on the same line as the verdict.
-                        rest_failure_reasons = %report.rest_failure_breakdown.summary(),
+                        // WHY they failed, not just how many. Read
+                        // `no_candles` first: an instrument that did not trade
+                        // is normal, and counting it beside timeouts under one
+                        // word called "failures" is what made 815 of 865 look
+                        // like an outage with nothing in the log to check.
+                        rest_failure_kinds = report.rest_failure_kinds.as_str(),
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
                         // Reported beside `degraded`, never folded into it: a

@@ -1271,6 +1271,63 @@ pub fn rest_candles_to_side_bars(
 // The bounded runner
 // ---------------------------------------------------------------------------
 
+/// Bucket a REST fetch error into a STABLE label for the coalesced tally.
+///
+/// # Why this exists (MEASURED 2026-08-26)
+///
+/// The runner's loop was `Err(_) => rest_failures += 1`. On 2026-08-26 that
+/// counted **815 of 865 targets** and threw every reason away — and nothing
+/// else logged one, so the whole log window for that run contains not a single
+/// line about the dominant failure of the day. The run reported
+/// `rest_failures: 815` and there was no way to ask why.
+///
+/// The buckets matter as much as the logging. `"rest returned no candles"` is
+/// NOT a failure in the same sense as a timeout: an instrument that did not
+/// trade, or that Dhan simply has no tape for, is normal and expected —
+/// especially across ~750 NSE cash equities. Lumping it with transport errors
+/// under one word called "failures" makes a routine day look broken and a
+/// broken day look routine.
+///
+/// Labels are derived from the fixed prefixes
+/// [`fetch_rest_side_for_target`] returns, and deliberately carry NO
+/// instrument detail: the tally is a fixed, tiny set of buckets, so it cannot
+/// grow with the universe.
+#[must_use]
+pub fn classify_rest_failure(err: &str) -> &'static str {
+    if err.starts_with("rest returned no candles") {
+        "no_candles"
+    } else if err.starts_with("rest fetch timed out") || err.starts_with("rest body timed out") {
+        "timed_out"
+    } else if let Some(rest) = err.strip_prefix("rest fetch http ") {
+        // Status class only — 5xx is theirs, 4xx is usually ours, and the
+        // exact code is in the status text this collapses.
+        match rest.as_bytes().first() {
+            Some(b'4') => "http_4xx",
+            Some(b'5') => "http_5xx",
+            _ => "http_other",
+        }
+    } else if err.starts_with("rest fetch transport") {
+        "transport"
+    } else if err.starts_with("rest body") {
+        "body"
+    } else {
+        "other"
+    }
+}
+
+/// Render a failure tally as a stable, compact log field: `a=1 b=2`.
+///
+/// Sorted so two runs with the same failures render identically — a field that
+/// reorders itself cannot be diffed across days.
+#[must_use]
+pub fn render_failure_tally(tally: &std::collections::BTreeMap<&'static str, usize>) -> String {
+    tally
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// One instrument to cross-verify.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XverifyTarget {
@@ -1460,6 +1517,18 @@ pub struct RunReport {
     pub malformed_rows: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
+    /// Why the REST fetches failed, as a stable `label=count` tally.
+    ///
+    /// **Added 2026-08-26 because the reason was being thrown away.** The
+    /// loop was `Err(_) => rest_failures += 1`, nothing else logged a fetch
+    /// failure, and the day 815 of 865 targets failed there is not one line in
+    /// the log window explaining any of them. `rest_failures` said how many;
+    /// nothing could say why.
+    ///
+    /// `no_candles` is the label to read first: an instrument that did not
+    /// trade is normal, and counting it as a "failure" alongside timeouts is
+    /// what makes a routine day look broken.
+    pub rest_failure_kinds: String,
     /// `true` when the live read came back at [`LIVE_ROW_LIMIT`] + 1 rows, so
     /// the day was cut short.
     ///
@@ -1737,13 +1806,10 @@ pub async fn run_cross_verification(
     let mut rest_tape: Vec<tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow> =
         Vec::new();
     let mut rest_failures = 0usize;
-    let mut rest_failure_breakdown = RestFailureBreakdown::default();
-    // Bounded sample of the actual messages. A run can fail 815 times; logging
-    // 815 lines would bury the verdict it exists to deliver, and logging none
-    // is what left the failure unexplainable for two sessions. Three is enough
-    // to read the shape and small enough to never flood.
-    const FAILURE_SAMPLE_MAX: usize = 3;
-    let mut failure_samples: Vec<String> = Vec::with_capacity(FAILURE_SAMPLE_MAX);
+    // Bounded by the label set in `classify_rest_failure`, never by the
+    // universe: the reason is what was missing, not more rows.
+    let mut rest_failure_tally: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
     let mut budget_elapsed = false;
     let target_count = targets.len();
 
@@ -1789,36 +1855,12 @@ pub async fn run_cross_verification(
         )
         .await
         {
-            Ok(mut bars) => {
-                let fetched_at_nanos = crate::spot_1m_rest_boot::fetched_at_ist_nanos_now();
-                rest_tape.extend(bars.iter().map(|b| {
-                    tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
-                        minute_ts_ist_nanos: b.minute_ts_ist_nanos,
-                        trading_date_ist_nanos: day_start_ist_nanos,
-                        security_id: b.security_id,
-                        segment: b.segment.clone(),
-                        instrument: target.instrument.clone(),
-                        open: b.bar.open_r,
-                        high: b.bar.high_r,
-                        low: b.bar.low_r,
-                        close: b.bar.close_r,
-                        volume: b.bar.volume,
-                        fetched_at_nanos,
-                    }
-                }));
-                rest.append(&mut bars);
-            }
-            Err(failure) => {
-                // The reason used to die here as `Err(_)`. See
-                // `XverifyFetchFailureKind` for what that cost.
+            Ok(mut bars) => rest.append(&mut bars),
+            Err(e) => {
                 rest_failures = rest_failures.saturating_add(1);
-                rest_failure_breakdown.record(failure.kind);
-                if failure_samples.len() < FAILURE_SAMPLE_MAX {
-                    failure_samples.push(format!(
-                        "{}/{} {}: {}",
-                        target.segment, target.security_id, target.instrument, failure.msg
-                    ));
-                }
+                *rest_failure_tally
+                    .entry(classify_rest_failure(&e))
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -1859,7 +1901,7 @@ pub async fn run_cross_verification(
     Ok(RunReport {
         comparison,
         rest_failures,
-        rest_failure_breakdown,
+        rest_failure_kinds: render_failure_tally(&rest_failure_tally),
         degraded,
         live_truncated: truncated,
         malformed_rows: live_malformed,
@@ -2038,6 +2080,63 @@ mod tests {
         for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP"] {
             assert!(!sql.to_ascii_uppercase().contains(forbidden));
         }
+    }
+
+    /// The reason 815 of 865 fetches failed on 2026-08-26 is unknowable from
+    /// the logs, because the loop was `Err(_) => rest_failures += 1` and
+    /// nothing else logged a fetch failure. These pin the buckets that answer
+    /// it next time.
+    #[test]
+    fn every_rest_failure_shape_lands_in_a_stable_bucket() {
+        for (err, want) in [
+            ("rest returned no candles", "no_candles"),
+            ("rest fetch timed out", "timed_out"),
+            ("rest body timed out", "timed_out"),
+            ("rest fetch http 429 Too Many Requests", "http_4xx"),
+            ("rest fetch http 401 Unauthorized", "http_4xx"),
+            ("rest fetch http 503 Service Unavailable", "http_5xx"),
+            ("rest fetch transport: connection closed", "transport"),
+            ("rest body: invalid utf-8", "body"),
+            ("something nobody wrote yet", "other"),
+        ] {
+            assert_eq!(classify_rest_failure(err), want, "for {err:?}");
+        }
+    }
+
+    /// The distinction that decides whether a day reads as broken.
+    ///
+    /// An instrument that did not trade — routine across ~750 cash equities —
+    /// returns "no candles". Counting that beside a timeout under one word
+    /// called "failures" makes a normal day look like an outage, and hides a
+    /// real outage inside a normal-looking number.
+    #[test]
+    fn an_instrument_that_did_not_trade_is_not_the_same_as_a_broken_fetch() {
+        assert_ne!(
+            classify_rest_failure("rest returned no candles"),
+            classify_rest_failure("rest fetch timed out"),
+            "no-candles and a timeout must never share a bucket"
+        );
+        assert_ne!(
+            classify_rest_failure("rest returned no candles"),
+            classify_rest_failure("rest fetch http 500 Internal Server Error"),
+        );
+    }
+
+    /// The tally is a log FIELD, so it has to render the same way twice for
+    /// the same failures — a field that reorders itself cannot be diffed
+    /// across days, which is the only way this number gets used.
+    #[test]
+    fn the_failure_tally_renders_stably_and_is_empty_when_nothing_failed() {
+        use std::collections::BTreeMap;
+        let mut t: BTreeMap<&'static str, usize> = BTreeMap::new();
+        assert_eq!(render_failure_tally(&t), "", "a clean run adds no noise");
+        t.insert("timed_out", 3);
+        t.insert("no_candles", 770);
+        t.insert("http_4xx", 42);
+        assert_eq!(
+            render_failure_tally(&t),
+            "http_4xx=42 no_candles=770 timed_out=3"
+        );
     }
 
     /// The 2026-08-26 noise flood, as a test.
@@ -3226,6 +3325,7 @@ mod tests {
             malformed_rows: 0,
             budget_elapsed: true,
             live_truncated: false,
+            rest_failure_kinds: "timed_out=3".to_string(),
         };
         assert!(report.degraded);
         assert!(report.budget_elapsed);
