@@ -289,6 +289,19 @@ pub struct DhanLiveXverifyDailyRow {
     /// OHLC cells that differed beyond tolerance.
     pub cells_diverged: i64,
     pub missing_live: i64,
+    /// Of `missing_live`, the minutes whose Dhan bar carried NON-ZERO volume
+    /// — the exchange recorded trades and we hold no candle. A genuine gap.
+    ///
+    /// Split out 2026-08-26 because `missing_live` alone was unanswerable: at
+    /// 31.2% of fetched minutes it could mean a catastrophe or a non-event,
+    /// and one number could not tell them apart. **Uninformative for `IDX_I`**
+    /// — an index has no volume, so every index bar lands in the zero bucket
+    /// regardless.
+    pub missing_live_traded: i64,
+    /// Of `missing_live`, the minutes whose Dhan bar carried ZERO volume —
+    /// nothing traded, and our fold correctly emits nothing for a bucket no
+    /// tick opened. See [`Self::missing_live_traded`] for the IDX_I caveat.
+    pub missing_live_zero_volume: i64,
     pub missing_rest: i64,
     pub tail_unsealed: i64,
     pub out_of_session: i64,
@@ -368,6 +381,8 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             minutes_compared LONG, \
             cells_diverged   LONG, \
             missing_live     LONG, \
+            missing_live_traded LONG, \
+            missing_live_zero_volume LONG, \
             missing_rest     LONG, \
             tail_unsealed    LONG, \
             out_of_session   LONG, \
@@ -450,6 +465,8 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("minutes_compared", "LONG"),
     ("cells_diverged", "LONG"),
     ("missing_live", "LONG"),
+    ("missing_live_traded", "LONG"),
+    ("missing_live_zero_volume", "LONG"),
     ("missing_rest", "LONG"),
     ("tail_unsealed", "LONG"),
     ("out_of_session", "LONG"),
@@ -765,6 +782,10 @@ impl DhanLiveXverifyAuditWriter {
             .context("cells_diverged")?
             .column_i64("missing_live", r.missing_live)
             .context("missing_live")?
+            .column_i64("missing_live_traded", r.missing_live_traded)
+            .context("missing_live_traded")?
+            .column_i64("missing_live_zero_volume", r.missing_live_zero_volume)
+            .context("missing_live_zero_volume")?
             .column_i64("missing_rest", r.missing_rest)
             .context("missing_rest")?
             .column_i64("tail_unsealed", r.tail_unsealed)
@@ -875,6 +896,8 @@ mod tests {
             minutes_compared: 375,
             cells_diverged: 2,
             missing_live: 1,
+            missing_live_traded: 1,
+            missing_live_zero_volume: 0,
             missing_rest: 0,
             tail_unsealed: 2,
             out_of_session: 0,
