@@ -690,7 +690,21 @@ fn writer_loop(
             Ok(r) => r,
             Err(_) => {
                 if let Some(mut w) = current.take() {
-                    drop(w.flush());
+                    // Reported, not discarded. This was `drop(w.flush())`, and
+                    // the buffer it drops is `WAL_WRITER_BUFFER` = 256 KiB --
+                    // roughly 1,300 records that `persisted` has ALREADY
+                    // counted, because `persist_record_resilient` increments on
+                    // a successful `write_all` into the buffer, not on a
+                    // successful flush to the platter.
+                    //
+                    // So the old form did two wrong things at once: it lost the
+                    // records, and it left `persisted_count()` over-reporting by
+                    // exactly the number it lost. The sibling flush thirty lines
+                    // below has always called `report_io_error` -- this arm and
+                    // the rotation arm were the two that did not.
+                    if let Err(err) = w.flush() {
+                        report_io_error("flush_on_close", &err);
+                    }
                 }
                 info!("ws-frame-spill-writer channel closed; exiting");
                 return Ok(());
@@ -724,7 +738,12 @@ fn writer_loop(
 
         if bytes_written >= WAL_SEGMENT_MAX_BYTES {
             if let Some(mut w) = current.take() {
-                drop(w.flush());
+                // Same repair as the close arm above: a failed rotation flush
+                // silently lost the tail of the segment it was closing, while
+                // `persisted` had already counted every record in it.
+                if let Err(err) = w.flush() {
+                    report_io_error("flush_on_rotate", &err);
+                }
             }
             current = open_segment_resilient(wal_dir);
             bytes_written = 0;
@@ -1106,6 +1125,32 @@ pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_t
 /// incremented unconditionally (by zero on a clean boot) so the series exists
 /// before the first real occurrence.
 pub const WAL_REPLAY_RESTORE_FAILED_COUNTER: &str = "tv_wal_replay_restore_failed_total";
+
+/// Neither of the two counters below is EMF-selected, and that is deliberate
+/// rather than an omission: both abandon sites emit a CODED `error!` carrying
+/// `ErrorCode::WsSpill02FrameDropped`, and `ws-spill-02` already has a live
+/// metric-filter alarm in `error-code-alarms.tf`. So the operator is paged the
+/// moment either fires, through a lane that already exists, at zero additional
+/// cost -- while each new EMF name would be ~$0.30/mo against a maximal month
+/// already above the budget's automatic `STOP_EC2_INSTANCES` line. The counters
+/// exist to give the page a MAGNITUDE on `/metrics` and through the debug API,
+/// not to be the thing that reports it.
+///
+/// Segments abandoned mid-file because a record inside them was corrupt.
+///
+/// Distinct from `tv_wal_replay_corrupted_segments_total`, which the caller
+/// increments only when the segment could not be OPENED or READ. This one
+/// covers the case that was previously invisible: the file reads fine, and a
+/// bad record partway through ends the walk, discarding every frame after it.
+pub const WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER: &str = "tv_wal_replay_truncated_segments_total";
+
+/// Bytes abandoned by the above, measured from the corrupt offset to EOF.
+///
+/// Bytes rather than records for the same reason the frame drain counts
+/// abandoned BYTES: the record count of undecodable bytes cannot be known, and
+/// an estimate inside a counter whose purpose is to stop estimates is worse
+/// than no number at all.
+pub const WAL_REPLAY_ABANDONED_BYTES_COUNTER: &str = "tv_wal_replay_abandoned_bytes_total";
 
 // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
@@ -1810,6 +1855,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 
     let mut out = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut i = 0usize;
+    let mut corrupted_at: Option<(&str, usize)> = None;
     // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
     // minimum, then re-check the version-specific minimum after the magic check
     // so a partial v2 tail can never be read as if its frame_seq were payload.
@@ -1851,6 +1897,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
                      build can still recover it."
                 );
             } else {
+                corrupted_at = Some(("magic_mismatch", i));
                 warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
             }
             break;
@@ -1874,6 +1921,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         let ws_type = match WsType::from_u8(ws_byte) {
             Some(t) => t,
             None => {
+                corrupted_at = Some(("unknown_ws_type", i));
                 warn!(segment = ?path, offset = i, ws_byte, "unknown WsType tag; stopping");
                 break;
             }
@@ -1921,6 +1969,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         {
             Some(v) => v,
             None => {
+                corrupted_at = Some(("length_overflow", i));
                 warn!(segment = ?path, offset = i, frame_len, "record length overflow; stopping");
                 break;
             }
@@ -1959,6 +2008,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             crc32_ieee_of(&[&[ws_byte], &len_le[..], &frame])
         };
         if actual != expected {
+            corrupted_at = Some(("crc_mismatch", i));
             warn!(segment = ?path, offset = i, expected, actual, "CRC mismatch; stopping");
             break;
         }
@@ -1969,6 +2019,45 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             received_at_nanos,
         });
         i = record_end;
+    }
+    // CORRUPTION ACCOUNTING -- added 2026-08-28.
+    //
+    // Every abandon site above `break`s out of the walk, and this function then
+    // returned `Ok(out)` regardless. The caller's corruption counter fires only
+    // on `Err`, and `Err` is reachable only from `File::open` and
+    // `read_to_end` -- so a bad record in the MIDDLE of a segment discarded
+    // every frame after it with `tv_wal_replay_corrupted_segments_total`
+    // unmoved, a bare `warn!` carrying no `code` field for any metric filter to
+    // match, and the segment then staged, archived, and never re-read.
+    //
+    // At `WAL_SEGMENT_MAX_BYTES` = 128 MiB that is on the order of 700,000
+    // frames vanishing on one flipped bit, reported nowhere. The identical
+    // hazard one branch away -- an unknown magic at offset 0 -- has always been
+    // counted and coded. This closes the gap between them.
+    //
+    // The two TAIL sites are deliberately NOT counted: a partial trailing
+    // record is what an interrupted writer leaves behind, it abandons nothing
+    // beyond itself, and counting it would page on every unclean shutdown.
+    //
+    // Bytes, not records: the record count of undecodable bytes is unknowable,
+    // and a fabricated number inside a counter that exists to stop fabrication
+    // is worse than no number.
+    if let Some((reason, offset)) = corrupted_at {
+        let abandoned = buf.len().saturating_sub(offset);
+        metrics::counter!(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER).increment(1);
+        metrics::counter!(WAL_REPLAY_ABANDONED_BYTES_COUNTER).increment(abandoned as u64);
+        error!(
+            code = ErrorCode::WsSpill02FrameDropped.code_str(),
+            segment = ?path,
+            reason,
+            offset,
+            abandoned_bytes = abandoned,
+            recovered_frames = out.len(),
+            "WAL segment is corrupt mid-file — the walk stopped here and every \
+             frame after this point is unrecovered. The segment is still moved \
+             to the archive directory, so the bytes survive for manual \
+             inspection, but nothing will read them again automatically."
+        );
     }
     Ok(out)
 }
@@ -2440,6 +2529,94 @@ mod tests {
     /// The assertion that actually bites is the last one: the frames must
     /// still be recoverable. Without the restore loop the deferred leftovers
     /// stay in `replaying/`, `confirm_replayed` archives all three, and this
+
+    /// A corrupt record in the MIDDLE of a segment silently discarded every
+    /// frame after it.
+    ///
+    /// `replay_segment` `break`s at four corruption sites and then returned
+    /// `Ok(out)` regardless, so the caller -- which counts corruption only on
+    /// `Err` -- saw a clean partial read. The segment was then staged,
+    /// archived, and never re-globbed. At a 128 MiB segment that is on the
+    /// order of 700,000 frames gone on one flipped bit, with no counter, no
+    /// coded line, and nothing a metric filter could match.
+    ///
+    /// This writes two real frames, flips a byte inside the SECOND record's
+    /// payload so its CRC fails, and asserts the walk keeps the first frame,
+    /// drops the second, and does not pretend the segment was fully read.
+    #[test]
+    fn a_corrupt_record_mid_segment_is_reported_not_silently_swallowed() {
+        let dir = tmp_dir("replay-mid-corruption");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        spill.append(WsType::LiveFeed, vec![0xAA; 64]);
+        spill.append(WsType::LiveFeed, vec![0xBB; 64]);
+        wait_until_persisted(&spill, 2);
+        drop(spill);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let segments = wal_segments_in(&dir);
+        assert_eq!(
+            segments.len(),
+            1,
+            "fixture must produce exactly one segment"
+        );
+        let path = &segments[0];
+
+        // Sanity: undamaged, both frames read back.
+        let clean = replay_segment(path).expect("undamaged segment must read");
+        assert_eq!(clean.len(), 2, "fixture must contain two readable frames");
+
+        // Flip a byte inside the SECOND payload. Payload bytes are 0xBB and
+        // nothing else in the file is, so this cannot land in a header and
+        // turn the test into a different failure by accident.
+        let mut bytes = std::fs::read(path).unwrap();
+        let victim = bytes
+            .iter()
+            .rposition(|b| *b == 0xBB)
+            .expect("the second payload must be present");
+        bytes[victim] ^= 0xFF;
+        std::fs::write(path, &bytes).unwrap();
+
+        let damaged = replay_segment(path).expect("a corrupt segment still returns Ok");
+        assert_eq!(
+            damaged.len(),
+            1,
+            "the walk must keep every frame BEFORE the corruption and stop there \
+             -- got {} frame(s)",
+            damaged.len()
+        );
+        assert_eq!(
+            &damaged[0].frame[..],
+            &[0xAAu8; 64][..],
+            "the surviving frame must be the first one, intact"
+        );
+
+        // The load-bearing half: the abandonment is reported. Asserted on the
+        // source rather than on a metrics recorder because the counters are
+        // process-global and this suite runs in parallel -- a shared recorder
+        // would make the assertion depend on test ordering, which is exactly
+        // the kind of flake that gets a guard deleted.
+        let source = include_str!("ws_frame_spill.rs");
+        for needle in [
+            "WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER",
+            "WAL_REPLAY_ABANDONED_BYTES_COUNTER",
+            "corrupted_at = Some((\"crc_mismatch\"",
+            "corrupted_at = Some((\"magic_mismatch\"",
+            "corrupted_at = Some((\"unknown_ws_type\"",
+            "corrupted_at = Some((\"length_overflow\"",
+        ] {
+            assert!(
+                source.contains(needle),
+                "mid-segment corruption must stay counted and coded; missing: {needle}"
+            );
+        }
+        assert!(
+            !source.contains("truncated header at tail\");\n            corrupted_at"),
+            "the two TAIL sites must NOT be counted -- a partial trailing record is \
+             what an interrupted writer leaves behind, and counting it would page on \
+             every unclean shutdown"
+        );
+    }
+
     /// recovers NOTHING -- captured to disk, then deleted from the recovery
     /// path with no counter and no error.
     #[test]
