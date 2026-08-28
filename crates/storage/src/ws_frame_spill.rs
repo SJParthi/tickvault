@@ -23,9 +23,24 @@
 // durability floor; overstating that floor is how a gap gets discovered late.
 // Adding a real fsync is a deliberate throughput trade, not a typo fix.
 //
-// Record format on disk:
-//     [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame:len bytes][crc32:u32 LE]
-// CRC32 is computed over ws_type || len || frame.
+// Record format on disk (three versions; replay accepts all three):
+//     v1 [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame][crc32:u32 LE]
+//     v2 [MAGIC:4="TVW2"][ws_type:u8][frame_seq:u64 LE][len:u32 LE][frame][crc32]
+//     v3 [MAGIC:4="TVW3"][ws_type:u8][frame_seq:u64 LE][received_at_nanos:i64 LE]
+//        [len:u32 LE][frame][crc32]
+// CRC32 covers every header byte of that version, in order, then the frame.
+//
+// WHY v3 EXISTS (2026-08-28). The receipt instant is stamped in
+// `FrameSink::accept` BEFORE this append — correctly, and early. It was then
+// discarded here, because the record had nowhere to put it. Replay therefore
+// re-stamped with `now()`, which was harmless while candles bucketed on the
+// EXCHANGE clock and became load-bearing the moment they bucket on receipt:
+// measured on 2026-08-27, 9.1% of a session's ticks replayed 9-20 hours after
+// their true arrival, which under receipt-bucketing would file 34 real minutes
+// into 4 bars stamped outside market hours. v3 carries the receipt so replay
+// restores it instead of inventing one. A v1/v2 record replays with `0`, which
+// the persistence layer already maps to NULL - a missing timestamp, never a
+// false one.
 
 use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
 use std::io::{BufWriter, Read, Write};
@@ -124,6 +139,11 @@ struct WalRecord {
     /// internally at `append` time; a later slice hoists the stamp to the WS
     /// read loop so it equals the per-tick `capture_seq`.
     frame_seq: u64,
+    /// TVW3 (2026-08-28): the frame's TRUE arrival instant as UTC epoch nanos,
+    /// stamped by the caller at receipt. Persisted so replay restores it rather
+    /// than re-stamping `now()`. [`WAL_RECEIPT_UNKNOWN_NANOS`] when the caller
+    /// has none — never a synthesized clock read.
+    received_at_nanos: i64,
     // Zero-tick-loss PR-8a (H1): `Bytes` (Arc-refcounted) so the WS read
     // loop hands ownership to the disk-writer thread with an O(1) refcount
     // bump instead of a per-frame `Vec<u8>` malloc. Derefs to `&[u8]`, so
@@ -149,6 +169,15 @@ pub struct ReplayedFrame {
     /// TICK-SEQ-01: the `frame_seq` read back from the v2 record (replay-stable).
     /// `0` for legacy v1 records that predate the field.
     pub frame_seq: u64,
+    /// TVW3: the frame's ORIGINAL arrival instant (UTC epoch nanos), read back
+    /// from the v3 record. [`WAL_RECEIPT_UNKNOWN_NANOS`] for v1/v2 records that
+    /// predate the field.
+    ///
+    /// A replay consumer MUST prefer this over a fresh clock read. Using `now()`
+    /// is what placed 9.1% of a session's ticks 9-20 hours from their true
+    /// arrival — invisible while candles bucketed on the exchange clock, and
+    /// data-losing once they bucket on receipt.
+    pub received_at_nanos: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,11 +223,21 @@ const SPILL_CHANNEL_CAPACITY: usize = 524_288;
 /// records are always written v2.
 const WAL_MAGIC: [u8; 4] = *b"TVW1";
 const WAL_MAGIC_V2: [u8; 4] = *b"TVW2";
+/// `TVW3` = v3 record: v2 plus an 8-byte LE `received_at_nanos` after
+/// `frame_seq`. NEW records are always written v3.
+const WAL_MAGIC_V3: [u8; 4] = *b"TVW3";
 
 /// Minimum on-disk record size per version, used by the replay loop guard:
 /// v1 = magic(4)+ws_type(1)+len(4)+crc(4) = 13; v2 inserts frame_seq(8) = 21.
 const WAL_MIN_RECORD_V1: usize = 13;
 const WAL_MIN_RECORD_V2: usize = 21;
+/// v3 inserts received_at_nanos(8) after frame_seq: 21 + 8 = 29.
+const WAL_MIN_RECORD_V3: usize = 29;
+
+/// Sentinel written when a caller has no receipt instant to offer, and the
+/// value a v1/v2 record replays with. NEVER a synthesized "now" — see the
+/// module header. `tick_persistence` already maps 0 to NULL.
+pub const WAL_RECEIPT_UNKNOWN_NANOS: i64 = 0;
 
 /// Rotate to a new segment after this many bytes.
 const WAL_SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
@@ -462,9 +501,31 @@ impl WsFrameSpill {
         frame: impl Into<Bytes>,
         frame_seq: u64,
     ) -> AppendOutcome {
+        // No receipt instant offered — record the sentinel, NEVER a clock read
+        // here. Minting one would be indistinguishable on replay from a real
+        // arrival time, which is the exact defect TVW3 exists to close.
+        self.append_with_seq_at(ws_type, frame, frame_seq, WAL_RECEIPT_UNKNOWN_NANOS)
+    }
+
+    /// Like [`WsFrameSpill::append_with_seq`] but also persists the frame's
+    /// TRUE arrival instant (UTC epoch nanos), so boot replay can restore it
+    /// instead of re-stamping `now()`.
+    ///
+    /// The caller stamps `received_at_nanos` at the read instant, BEFORE this
+    /// append. Hot path, O(1), zero-alloc — the extra field is 8 bytes on an
+    /// already-moved struct.
+    // TEST-EXEMPT: same `try_send` path as `append_with_seq`; the receipt round-trip is covered by tvw3_roundtrip_preserves_received_at and tvw1_and_tvw2_records_replay_with_unknown_receipt.
+    pub fn append_with_seq_at(
+        &self,
+        ws_type: WsType,
+        frame: impl Into<Bytes>,
+        frame_seq: u64,
+        received_at_nanos: i64,
+    ) -> AppendOutcome {
         let record = WalRecord {
             ws_type,
             frame_seq,
+            received_at_nanos,
             frame: frame.into(),
         };
         match self.spill_tx.try_send(record) {
@@ -838,16 +899,19 @@ fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL frame > u32::MAX")
     })?;
     let frame_seq = r.frame_seq.to_le_bytes();
-    // CRC covers ws_type || frame_seq || len || frame.
+    let receipt = r.received_at_nanos.to_le_bytes();
+    // CRC covers ws_type || frame_seq || received_at_nanos || len || frame.
     let crc = crc32_ieee_of(&[
         &[r.ws_type.as_u8()],
         &frame_seq[..],
+        &receipt[..],
         &frame_len.to_le_bytes()[..],
         &r.frame,
     ]);
-    w.write_all(&WAL_MAGIC_V2)?;
+    w.write_all(&WAL_MAGIC_V3)?;
     w.write_all(&[r.ws_type.as_u8()])?;
     w.write_all(&frame_seq)?;
+    w.write_all(&receipt)?;
     w.write_all(&frame_len.to_le_bytes())?;
     w.write_all(&r.frame)?;
     w.write_all(&crc.to_le_bytes())?;
@@ -855,8 +919,9 @@ fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
 }
 
 fn record_disk_size(r: &WalRecord) -> u64 {
-    // v2: magic(4) + ws_type(1) + frame_seq(8) + len(4) + frame + crc(4) = 21 + frame
-    WAL_MIN_RECORD_V2 as u64 + r.frame.len() as u64
+    // v3: magic(4) + ws_type(1) + frame_seq(8) + receipt(8) + len(4) + frame
+    //     + crc(4) = 29 + frame
+    WAL_MIN_RECORD_V3 as u64 + r.frame.len() as u64
 }
 
 fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
@@ -1554,15 +1619,20 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
     // so a partial v2 tail can never be read as if its frame_seq were payload.
     while i + WAL_MIN_RECORD_V1 <= buf.len() {
         let magic = &buf[i..i + 4];
+        let is_v3 = magic == WAL_MAGIC_V3;
         let is_v2 = magic == WAL_MAGIC_V2;
         let is_v1 = magic == WAL_MAGIC;
-        if !is_v1 && !is_v2 {
+        if !is_v1 && !is_v2 && !is_v3 {
             warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
             break;
         }
         // Version disambiguation + per-version minimum-size guard (security
-        // review HIGH): a v2 record needs 21 bytes before its variable frame.
-        let min_rec = if is_v2 {
+        // review HIGH): a v2 record needs 21 bytes before its variable frame,
+        // a v3 record 29. Checked BEFORE any header field is read, so a
+        // partial tail can never be reinterpreted as payload.
+        let min_rec = if is_v3 {
+            WAL_MIN_RECORD_V3
+        } else if is_v2 {
             WAL_MIN_RECORD_V2
         } else {
             WAL_MIN_RECORD_V1
@@ -1579,15 +1649,35 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
                 break;
             }
         };
-        // v1: [magic|ws|len|frame|crc]; v2: [magic|ws|frame_seq(8)|len|frame|crc].
-        let (frame_seq, len_off) = if is_v2 {
+        // v1: [magic|ws|len|frame|crc]
+        // v2: [magic|ws|frame_seq(8)|len|frame|crc]
+        // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
+        let (frame_seq, received_at_nanos, len_off) = if is_v3 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
                 Err(_) => break,
             };
-            (u64::from_le_bytes(seq_bytes), i + 13)
+            let recv_bytes: [u8; 8] = match buf[i + 13..i + 21].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            (
+                u64::from_le_bytes(seq_bytes),
+                i64::from_le_bytes(recv_bytes),
+                i + 21,
+            )
+        } else if is_v2 {
+            let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            (
+                u64::from_le_bytes(seq_bytes),
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                i + 13,
+            )
         } else {
-            (0u64, i + 5)
+            (0u64, WAL_RECEIPT_UNKNOWN_NANOS, i + 5)
         };
         let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
             Ok(b) => b,
@@ -1616,9 +1706,20 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             Err(_) => break,
         };
         let expected = u32::from_le_bytes(crc_bytes);
-        // CRC covers the version's exact header bytes: v2 includes frame_seq.
+        // CRC covers the version's exact header bytes, in write order: v2 adds
+        // frame_seq, v3 adds received_at_nanos after it. Using the wrong
+        // version's byte set here would reject every record of that version as
+        // corrupt, so the arms mirror `write_record` exactly.
         let len_le = (frame_len as u32).to_le_bytes();
-        let actual = if is_v2 {
+        let actual = if is_v3 {
+            crc32_ieee_of(&[
+                &[ws_byte],
+                &frame_seq.to_le_bytes()[..],
+                &received_at_nanos.to_le_bytes()[..],
+                &len_le[..],
+                &frame,
+            ])
+        } else if is_v2 {
             crc32_ieee_of(&[
                 &[ws_byte],
                 &frame_seq.to_le_bytes()[..],
@@ -1636,6 +1737,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             ws_type,
             frame,
             frame_seq,
+            received_at_nanos,
         });
         i = record_end;
     }
