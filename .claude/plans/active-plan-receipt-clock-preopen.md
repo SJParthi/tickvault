@@ -168,25 +168,112 @@ needs its own dated authorization under the noise lock.
 
 ## Plan Items
 
-- [ ] **W1** `TVW3` WAL record carries the true receipt time; replay restores it
-  - Files: `crates/storage/src/ws_frame_spill.rs`, `crates/core/src/websocket/pool_supervisor.rs`, `crates/app/src/dhan_feed_stack.rs`
-  - Tests: T1, T2, T3
+- [x] **W1a** `TVW3` WAL record format carries the true receipt time; replay
+      restores it; all three magics accepted; unknown magic is now a CODED
+      error with a counter and an alarm rather than a silent empty replay
+  - Files: `crates/storage/src/ws_frame_spill.rs`,
+    `deploy/aws/terraform/live-lane-alarms.tf`,
+    `crates/common/tests/cloudwatch_app_alarms_wiring.rs`
+  - Tests: T1, T2, T3 — plus 9 new `ws_frame_spill` tests, 3 bite-proven
+  - **Verified 2026-08-28:** `ws_frame_spill` 62 passed / 0 failed
 
-- [ ] **W2** Candles bucket on `received_at`
+- [ ] **W1b** *(REMAINING)* Thread the real receipt through the call chain
+      so `TVW3` actually carries a non-sentinel value
+  - **Honest status: the FORMAT exists and nothing populates it yet.** The
+    receipt is stamped correctly and early in `FrameSink::accept`, and is
+    still dropped at `main.rs:897` where the replayed record is turned back
+    into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
+    callers. Stated plainly because a record format that is present but
+    unpopulated reads, from the outside, exactly like a working one.
+  - Files: `crates/app/src/main.rs` (~:893-897),
+    `crates/app/src/dhan_feed_stack.rs` (`FrameSink::accept`,
+    `refold_wal_frames` ~:6982 which re-stamps `Utc::now()`)
+
+- [ ] **W2** Candles bucket on `received_at`  *(REMAINING — blocked on W1b)*
   - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
   - Tests: T4, T5, T16
+  - **Research complete 2026-08-28. Three findings that shape the design:**
+    1. `ParsedTick.received_at_nanos` EXISTS (`tick_types.rs:28`) and is
+       **UTC**, not IST. The exchange stamp is IST seconds. Bucketing on the
+       raw field without `+ IST_UTC_OFFSET_NANOS` shifts every bucket by
+       5h30m — the single most likely way to get this wrong.
+    2. The bucketing clock is ONE line — `aggregator_cell.rs:651`
+       `tf.bucket_start(tick.exchange_timestamp)` — but **eleven other sites
+       read the same field**, and four of them must move WITH it or they
+       disagree with the bucket they are guarding: the watermark advance
+       (`multi_tf_aggregator.rs:734`), the session gate (`:783`),
+       `close_ts_ist_secs` (`aggregator_cell.rs:1070`), and the
+       `tick_is_newest` close-ordering guard (`:1211`). Moving the bucket
+       clock alone leaves ordering deciding on one clock and bucketing on
+       another.
+    3. Three sites must NOT move: `ws_lag_ms` (it measures exchange-vs-receipt
+       and becomes identically zero), the QuestDB designated `ts`
+       (`data-integrity.md` — never), and the stale-trading-day gate (it is a
+       question about vendor data validity, not about time).
+  - **Design decision:** a single `fold_clock_ist_secs(tick)` helper —
+    receipt converted to IST when plausible, exchange stamp as the fail-soft
+    fallback — used by the bucket, the session gate and the ordering guards
+    together. A tick is never dropped for having an implausible receipt.
 
-- [ ] **W3** Candle session opens 09:00; day-OHLC and cross-verify stay 09:15
-  - Files: `crates/trading/src/candles/tf_index.rs`, `crates/app/src/tf_consistency_boot.rs`
+- [x] **W3** Candle session opens 09:00; day-OHLC and cross-verify stay 09:15
+  - Files: `crates/trading/src/candles/tf_index.rs`,
+    `crates/trading/src/candles/multi_tf_aggregator.rs`,
+    `crates/trading/src/candles/aggregator_cell.rs`,
+    `crates/trading/src/in_mem/spot_bar_store.rs`,
+    `crates/app/src/tf_consistency_boot.rs`,
+    `crates/app/src/market_ram_store_boot.rs`,
+    `crates/app/src/rest_candle_fold.rs`,
+    `crates/app/src/depth_rebalance.rs`,
+    `crates/app/src/dhan_live_crossverify.rs`
   - Tests: T6, T7, T8, T9
+  - **Verified 2026-08-28:** trading lib 1659/0; app lib 1682/0; CI
+    `Test (app)` green across all integration binaries; DHAT + Loom green.
+    Three defects found in the change itself by adversarial sweep and fixed;
+    nine boundary permutations traced and all correct.
 
-- [ ] **W4** Compute the four percentage columns at seal time
-  - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/live_candle_state.rs`, `crates/storage/src/shadow_seal_columns.rs`
-  - Tests: T10, T11, T12
+- [x] **W4** Compute the four percentage columns at seal time
+  - **ALREADY SHIPPED 2026-08-26 — verified in source, not rebuilt.**
+    `LiveCandleState::stamp_seal_percentages` computes
+    `close_pct_from_prev_day`, `open_pct` and `open_gap_pct` at every one of
+    five seal sites; `change_pct` is derived at row extraction. `pct_change`
+    guards four refusal cases (non-finite baseline, non-positive baseline,
+    non-finite value, non-finite quotient). A source-scan ratchet counts the
+    stamp sites so a sixth seal path cannot ship unstamped.
+  - Residual, disclosed rather than fixed: pre-open bars carry
+    `open_pct = 0.0` because `session_open` is the exchange `day_open`, which
+    is 0 until a regular-session trade prints. Semantically correct — there
+    is no baseline yet — but indistinguishable from "flat" on a chart.
 
-- [ ] **W5** Per-minute additive ATM re-fit from 09:16
+- [ ] **W5** Per-minute additive ATM re-fit from 09:16  *(REMAINING)*
   - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/core/src/websocket/pool_supervisor.rs`, `crates/common/src/config.rs`, `config/base.toml`
   - Tests: T13, T14, T15
+  - **Research complete 2026-08-28. What already exists, and what does not:**
+    | Exists | Detail |
+    |---|---|
+    | A retry/top-up loop | `dhan_feed_stack.rs:6146`, 15 s pre-open / 60 s after |
+    | Additive top-up | `top_up_late_contracts:5757` → `try_send(Extend)` |
+    | Unsubscribe on the wire | `connection.rs:1243`, `SwapPlan` at `pool_supervisor.rs:1405` |
+    | **Missing** | **Detail** |
+    | Any re-fit after ~09:30 | `CONTRACT_TOPUP_CUTOFF_IST_SECS = 09:30` (`:5607`) |
+    | Any record of the ATM strike used | no metric, no log field, no artifact column — **drift is invisible** |
+  - **Three constraints the design must respect:**
+    1. The `Extend` path `.await`s the socket write **on the drain task** and
+       is **unbounded** (only `Swap` is capped, by `SWAP_WIRE_BUDGET`). A
+       stalled write blocks the frame drain — i.e. tick loss. Any per-minute
+       path needs a budget of its own.
+    2. Unsubscribe has **zero main-feed callers** (depth only), and
+       `SubscribeGuard`'s instrument set IS the reconnect replay — an
+       unsubscribed instrument silently returns on the next reconnect.
+       Therefore the re-fit is **additive-only**; a swap needs slot release
+       with a full cell reset first, which is its own unit of work.
+    3. **Measured: the re-fit will almost always be a no-op.** Median strike
+       spacing 2.63% of price; average intraday drift 2.20% ≈ **0.8 strikes**
+       against a **25-strike** half-window; worst single underlying 6.0
+       strikes; and for **81 of 210 underlyings (39%)** ±25 already covers the
+       entire ladder. So it must be **delta-driven** — recompute every
+       minute, send only on an actual ATM change — or it is ~375 needless
+       re-subscribes per socket per session on the very feed whose reconnect
+       churn this work is meant to reduce.
 
 ---
 
