@@ -1319,6 +1319,26 @@ impl SubscribeGuard {
     /// This is the number the contract attach needs in order to stop stranding
     /// capacity: without it, room on a partially-filled connection is invisible
     /// and the attach asks only for whole free connections.
+    /// Shrinks the tracked set back to `len`, dropping the tail.
+    ///
+    /// The ONLY sanctioned use is a top-up that stopped part-way on its wire
+    /// budget: the guard must then describe what the socket actually received,
+    /// because the guard's set IS the reconnect replay. A guard naming
+    /// instruments that never reached the wire makes every later reconnect
+    /// replay a subscription the socket never had -- and if that pushes the
+    /// replay over the endpoint cap, Dhan answers 804 and drops the socket.
+    ///
+    /// Growing is not possible here by construction: a `len` at or past the
+    /// current length is a no-op, so this can only ever shrink.
+    ///
+    /// # Complexity
+    /// O(dropped) -- truncation of a `Vec`, no allocation.
+    pub fn truncate_to(&mut self, len: usize) {
+        if len < self.instruments.len() {
+            self.instruments.truncate(len);
+        }
+    }
+
     #[must_use]
     pub fn spare_capacity(&self) -> usize {
         let max =
@@ -1535,6 +1555,40 @@ impl SubscribeSwap {
 /// minute costs zero wire calls and zero stall.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
 pub const SWAP_WIRE_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long a WHOLE live top-up may occupy the drain task.
+///
+/// `SWAP_WIRE_BUDGET` above bounds ONE wire call and its doc opens with "THIS
+/// BOUND IS THE POINT, and without it the swap is dangerous" -- because two
+/// unbounded calls would be twenty seconds of drain occupancy. Every word of
+/// that applies to the top-up with far more force, and the top-up shipped with
+/// no bound at all.
+///
+/// The arithmetic it was missing: `try_extend` admits up to the endpoint's
+/// 5,000-instrument cap, so a connection holding ~850 spot instruments can be
+/// topped up by ~4,150 -- **42 subscribe messages**, each bounded only by the
+/// transport's own 10-second `SUBSCRIBE_SEND_TIMEOUT`. That is a worst case of
+/// **420 seconds** of not polling `recv()`. Dhan closes a silent socket after
+/// [`DHAN_SERVER_CLOSE_AFTER_SILENCE_SECS`] = 40, and the automatic pong is
+/// only emitted while `recv()` is polling -- so **four slow sends already
+/// exceed the close**, and the mechanism that exists to widen coverage takes
+/// the socket down instead.
+///
+/// Five seconds, because a healthy top-up costs ~1.1: 42 messages spaced by
+/// [`SUBSCRIBE_BATCH_INTERVAL`] (25 ms) is 1.05 s of deliberate pacing, and a
+/// few-hundred-byte write on a healthy socket is sub-millisecond. So this is
+/// ~4.5x the real cost and ~8x under the server close. A top-up that cannot
+/// finish inside it is on a sick socket, and the right answer to a sick socket
+/// is the reconnect ladder -- not four hundred more seconds on the drain.
+///
+/// On exhaustion the guard is TRUNCATED to what actually reached the wire, so
+/// it never claims instruments the socket does not hold. That differs from the
+/// send-failure arm, which deliberately leaves the guard wide because a dying
+/// socket is about to replay its whole set anyway. A budget stop is the
+/// opposite case: the socket is alive and staying alive, so the guard must
+/// stay truthful or a later reconnect replays a subscription Dhan rejects.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const TOPUP_WIRE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A change to what a LIVE socket is subscribed to, sent while it is up.
 ///
@@ -2735,16 +2789,83 @@ where
                     let added = more.len();
                     match guard.try_extend(more) {
                         Ok(start) => {
+                            // BOUNDED and PACED. Both were missing, and the
+                            // `SWAP_WIRE_BUDGET` doc two hundred lines up
+                            // already explains why that is dangerous: these
+                            // sends run ON the drain task, the automatic pong
+                            // is only emitted while `recv()` is polling, and
+                            // Dhan closes a silent socket after 40 seconds.
+                            // Unbounded, this loop's worst case is 42 messages
+                            // x the transport's 10-second send timeout = 420
+                            // seconds. The swap path one branch below was given
+                            // a budget for a TWENTY-second exposure; this one
+                            // had twenty times that and no budget.
+                            //
+                            // Pacing is the same 25 ms the initial dispatch
+                            // uses, and for the same reason: 42 messages fired
+                            // back to back is a burst against a broker that
+                            // answers an over-rate subscribe by dropping the
+                            // socket.
+                            // `tokio::time::Instant`, not `std::time::Instant`.
+                            // Both are monotonic, so this is NOT the NTP
+                            // reasoning that governs the watchdog -- it is
+                            // that a bound the test harness cannot advance is
+                            // a bound nothing can prove. Under
+                            // `start_paused` the std clock stands still while
+                            // the runtime's advances, so a std deadline here
+                            // would pass every test and only ever fire in
+                            // production, which is the worst of both.
+                            let deadline = tokio::time::Instant::now() + TOPUP_WIRE_BUDGET;
                             let mut sent = 0usize;
                             let mut failed = false;
+                            let mut budget_exhausted = false;
                             for batch in guard.batches_from(start) {
-                                if socket.send_subscribe(batch).await.is_err() {
-                                    failed = true;
+                                if tokio::time::Instant::now() >= deadline {
+                                    budget_exhausted = true;
                                     break;
                                 }
-                                sent += batch.len();
+                                match tokio::time::timeout(
+                                    SWAP_WIRE_BUDGET,
+                                    socket.send_subscribe(batch),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => sent += batch.len(),
+                                    // A per-message timeout is a SICK SOCKET,
+                                    // not a failed send: treating it as the
+                                    // budget case keeps the guard truthful and
+                                    // lets the reconnect ladder do its job.
+                                    Err(_) => {
+                                        budget_exhausted = true;
+                                        break;
+                                    }
+                                    Ok(Err(_)) => {
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                tokio::time::sleep(SUBSCRIBE_BATCH_INTERVAL).await;
                             }
-                            if failed {
+                            if budget_exhausted {
+                                // Keep the guard honest: it is the reconnect
+                                // replay, so it must name only what the socket
+                                // actually holds.
+                                guard.truncate_to(start + sent);
+                                error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    added,
+                                    sent,
+                                    budget_secs = TOPUP_WIRE_BUDGET.as_secs(),
+                                    "live subscription top-up hit its wire budget and STOPPED - \
+                                     the socket stayed up and is carrying what did reach it. \
+                                     The remainder is not subscribed this session unless a later \
+                                     top-up offers it again."
+                                );
+                                metrics::counter!("tv_dhan_ws_topup_budget_exhausted_total")
+                                    .increment(1);
+                            } else if failed {
                                 // Do NOT mark the guard lost here — the
                                 // supervisor owns that transition and will see
                                 // the disconnect itself. The guard now names
@@ -5184,6 +5305,13 @@ mod tests {
         /// so the ORDER is the property under test, not the counts.
         wire_calls: Vec<&'static str>,
         pings: usize,
+        /// How long each `send_subscribe` takes on the wire.
+        ///
+        /// Exists so a test can reach the top-up's wire budget. Under
+        /// `start_paused = true` tokio auto-advances, so a "slow" socket costs
+        /// no real wall time -- which is the only reason a 40-message top-up
+        /// against a 900 ms socket is testable at all.
+        subscribe_delay: Option<Duration>,
     }
 
     struct FakeSocket {
@@ -5243,14 +5371,20 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
             let state = std::sync::Arc::clone(&self.state);
             async move {
-                let ok = match state.lock() {
+                let (ok, delay) = match state.lock() {
                     Ok(mut s) => {
                         s.subscribes += 1;
                         s.wire_calls.push("subscribe");
-                        s.subscribe_results.pop_front().unwrap_or(true)
+                        (
+                            s.subscribe_results.pop_front().unwrap_or(true),
+                            s.subscribe_delay,
+                        )
                     }
-                    Err(_) => true,
+                    Err(_) => (true, None),
                 };
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
                 if ok { Ok(()) } else { Err(SocketFailure) }
             }
         }
@@ -5897,6 +6031,105 @@ mod tests {
             2,
             "frames still reach the sink — the top-up arm does not eat them"
         );
+    }
+
+    /// The top-up must STOP at its wire budget instead of stalling the reader.
+    ///
+    /// # The defect
+    ///
+    /// These sends run ON the drain task, and the automatic pong is only
+    /// emitted while `recv()` is polling. `try_extend` admits up to the
+    /// endpoint's 5,000 cap, so a top-up can be ~42 messages, each bounded
+    /// only by the transport's 10-second `SUBSCRIBE_SEND_TIMEOUT` -- a worst
+    /// case of 420 seconds of silence against Dhan's 40-second close. Four
+    /// slow sends already exceed it. The mechanism that exists to widen
+    /// coverage was able to take the socket down.
+    ///
+    /// The swap arm one branch below was given `SWAP_WIRE_BUDGET` for a
+    /// TWENTY-second exposure, with a doc opening "THIS BOUND IS THE POINT".
+    /// The top-up had twenty times that exposure and no bound at all.
+    ///
+    /// # What this asserts
+    ///
+    /// A 4,000-instrument top-up is 40 messages. On a 900 ms socket that is
+    /// ~37 seconds unbounded -- past the close. Bounded at 5 seconds it must
+    /// send only a handful and stop. The number is deliberately asserted as a
+    /// RANGE, not a constant: pinning an exact count would break on any
+    /// reasonable retiming and teach the next reader to delete the test.
+    #[tokio::test(start_paused = true)]
+    async fn a_top_up_stops_at_its_wire_budget_instead_of_stalling_the_reader() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa"))]),
+            // Slow but NOT slow enough to trip the per-message timeout, so
+            // what bites is the whole-top-up budget rather than one bad send.
+            subscribe_delay: Some(Duration::from_millis(900)),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Extend(instruments_from(
+            250, 4_000,
+        )))
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let exit = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        let initial = 3; // 250 instruments / 100 per message
+        let topup_sent = s.subscribes - initial;
+        assert!(
+            topup_sent >= 1,
+            "the budget must still permit forward progress -- a top-up that \
+             sends nothing is a permanent hole, not a bound"
+        );
+        assert!(
+            topup_sent < 40,
+            "the top-up must STOP at its budget; it sent {topup_sent} of 40 \
+             messages, which means the bound is not being applied and the \
+             drain can be held past Dhan's 40-second close"
+        );
+        assert_eq!(s.connects, 1, "a bounded top-up must never re-dial");
+    }
+
+    /// A guard may only ever SHRINK, and shrinking is what keeps a
+    /// budget-stopped top-up honest.
+    ///
+    /// The guard's set IS the reconnect replay. If it names instruments the
+    /// socket never received, every later reconnect replays a subscription the
+    /// socket never had — and if that pushes the replay past the endpoint cap,
+    /// Dhan answers 804 and drops the socket. So the budget path truncates and
+    /// the send-FAILURE path deliberately does not: a dying socket is about to
+    /// replay everything anyway.
+    #[test]
+    fn truncate_to_shrinks_the_guard_and_can_never_grow_it() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        assert_eq!(g.len(), 250);
+
+        g.truncate_to(1_000);
+        assert_eq!(g.len(), 250, "a length past the end must be a no-op");
+
+        g.truncate_to(100);
+        assert_eq!(g.len(), 100, "and must otherwise shrink to exactly that");
+
+        g.truncate_to(100);
+        assert_eq!(g.len(), 100, "truncating twice is a no-op");
+
+        g.truncate_to(0);
+        assert!(g.is_empty(), "shrinking to nothing is legal");
     }
 
     /// A connection given NO channel must behave byte-identically to before.
