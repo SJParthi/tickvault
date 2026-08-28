@@ -185,9 +185,48 @@ needs its own dated authorization under the noise lock.
     into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
     callers. Stated plainly because a record format that is present but
     unpopulated reads, from the outside, exactly like a working one.
-  - Files: `crates/app/src/main.rs` (~:893-897),
-    `crates/app/src/dhan_feed_stack.rs` (`FrameSink::accept`,
-    `refold_wal_frames` ~:6982 which re-stamps `Utc::now()`)
+  - Files: `crates/storage/src/ws_frame_spill.rs` (the writer thread),
+    `crates/core/src/websocket/pool_supervisor.rs` (`WalRingSink::accept` —
+    signature only), `crates/app/src/main.rs` (~:893-897),
+    `crates/app/src/dhan_feed_stack.rs` (`refold_wal_frames`, which re-stamps
+    `Utc::now()` on replay)
+
+  - **⚠ THE OBVIOUS IMPLEMENTATION IS FORBIDDEN, and this is the single most
+    important note in this plan.** The natural move — have `WalRingSink::accept`
+    read `Utc::now()` and pass it to `append_with_seq_at` — **breaks a
+    deliberate, tested safety property**. `pool_supervisor.rs` is banned from
+    reading the wall clock at all, enforced by
+    `test_pool_supervisor_source_never_reads_the_wall_clock`, and the ban is
+    load-bearing rather than stylistic: the supervisor's ladder, its token
+    expiry and its backoff are all monotonic **so that an NTP step cannot
+    expire all sixteen sockets at once**. The file's own doc states the ban is
+    blanket on purpose *"so nobody has to re-litigate it per call site"*.
+    `CapturedFrame::received_at` is therefore an `Instant`, not a wall time,
+    and there is no epoch value at that site to write.
+
+  - **The design that satisfies both constraints** — and it is the pattern the
+    supervisor's own doc already prescribes (*"the consumer derives the
+    wall-clock receipt instant by subtracting `elapsed()` from its own clock
+    read"*):
+    1. `WalRingSink::accept` passes the monotonic `Instant` through to the
+       spill channel. It still never reads the wall clock, so the ban and its
+       test are untouched.
+    2. The **WAL writer thread** — which already runs off the hot path and is
+       already permitted a clock — converts at write time:
+       `receipt_nanos = now_wall - instant.elapsed()`.
+    3. `plausible_receipt_nanos` (already shipped) clamps the result, so a
+       clock step between receipt and write degrades to the `0` sentinel
+       rather than to a confident lie.
+    This costs **zero** additional reads on the capture path, keeps the
+    conversion accurate across a clock step landing between receipt and write,
+    and leaves the NTP-safety property exactly as it is.
+
+  - **Rejected alternatives, recorded so they are not re-proposed:** reading
+    the wall clock in `accept` (breaks the ban); anchoring once at boot to a
+    (wall, instant) pair and adding the delta (survives an NTP step but drifts
+    against it, and a long session drifts unboundedly); serialising the raw
+    `Instant` (meaningless across processes, which is the whole point of the
+    replay path).
 
 - [ ] **W2** Candles bucket on `received_at`  *(REMAINING — blocked on W1b)*
   - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
