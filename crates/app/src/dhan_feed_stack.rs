@@ -7413,11 +7413,38 @@ pub fn refold_wal_frames(
                     // session.** The candle grid opens at 09:00, so a
                     // 09:00-09:14 tick folds into a real pre-open bar and this
                     // arm is no longer reached for it. What DOES reach here is
-                    // a tick before 09:00 or at/after 15:40 — the persistence
-                    // window is wider than the candle window at both ends.
-                    // Third stale-reachability comment corrected in this
-                    // change; a reachability claim is one grep of the gate
-                    // constant and must be re-run when written, not carried.
+                    // a tick whose FOLD-CLOCK second falls before 09:00 or at
+                    // or after 15:40.
+                    //
+                    // **RE-CORRECTED 2026-08-28, same day.** The sentence that
+                    // stood here read "the persistence window is wider than
+                    // the candle window at both ends". That is FALSE in both
+                    // halves, and one grep settles it:
+                    //
+                    //     TICK_PERSIST_START_SECS_OF_DAY_IST = 32_400  (09:00)
+                    //     TICK_PERSIST_END_SECS_OF_DAY_IST   = 56_400  (15:40)
+                    //     CANDLE_SESSION_OPEN_SECS_OF_DAY_IST = 32_400 (09:00)
+                    //     MARKET_CLOSE_SECS_OF_DAY_IST        = 56_400 (15:40)
+                    //
+                    // The windows are IDENTICAL, not wider. And the second
+                    // half is wrong in a way the first conceals: there is no
+                    // persistence window GATE on this lane at all --
+                    // `tick_persistence.rs` references neither constant (grep:
+                    // zero hits). A row outside the window is written because
+                    // NOTHING STOPS THE WRITER, not because a wider window
+                    // permits it. The two readings differ the moment someone
+                    // tries to change the persistence window by editing the
+                    // constant, which would do nothing.
+                    //
+                    // Recorded rather than quietly amended because of what it
+                    // is: the sentence being corrected was ITSELF a correction
+                    // of a stale reachability claim, written hours earlier,
+                    // and it closed by saying "a reachability claim is one
+                    // grep of the gate constant and must be re-run when
+                    // written, not carried." It then made a claim about two
+                    // gate constants without running that grep. Stating the
+                    // rule is not the same as following it, and a correction
+                    // carries no more authority than the sentence it replaced.
                     //
                     // Counting it as `lost` would
                     // report real recovered rows as data loss; folding it into
