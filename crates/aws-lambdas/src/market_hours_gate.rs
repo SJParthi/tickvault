@@ -182,12 +182,27 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             );
         }
         OpenDecision::Enable => {
-            cw.enable_alarm_actions()
-                .set_alarm_names(Some(alarm_names.clone()))
-                .send()
-                .await?;
-            // Reset to OK on open so a stale ALARM from a prior window does
-            // not immediately re-fire on the first enabled evaluation.
+            // ORDER IS LOAD-BEARING -- corrected 2026-08-28. See
+            // `alarm_gate.rs` for the full reasoning; in short: AWS runs an
+            // alarm's actions on `SetAlarmState` whenever the new state
+            // differs from the old, so enabling BEFORE resetting paged the
+            // operator every trading morning at 09:20.
+            //
+            // Five of the gated alarms are `treat_missing_data = breaching`
+            // AND carry `ok_actions` -- dhan_live_lane_down,
+            // dhan_no_ticks_flowing, depth_steering_stalled,
+            // market_hours_liveness_missing, app_log_ingestion_silent. The box
+            // stops at 17:30, they enter ALARM overnight with actions
+            // disabled (correct, no page), and the old order then enabled
+            // actions and immediately transitioned them ALARM -> OK, firing
+            // five "recovered" messages for a condition that was the box being
+            // switched off on schedule. Roughly 110 pages a month, all noise,
+            // all at the same minute.
+            //
+            // Resetting while actions are still disabled costs nothing, keeps
+            // every alarm's genuine in-session recovery signal, and also shuts
+            // the mirror-image window in which a stale ALARM briefly had live
+            // actions.
             for name in &alarm_names {
                 cw.set_alarm_state()
                     .alarm_name(name)
@@ -196,6 +211,10 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                     .send()
                     .await?;
             }
+            cw.enable_alarm_actions()
+                .set_alarm_names(Some(alarm_names.clone()))
+                .send()
+                .await?;
             info!(alarms = ?alarm_names, "enabled actions");
         }
     }
@@ -204,6 +223,43 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The gates must RESET to OK before ENABLING actions, never after.
+    ///
+    /// AWS runs an alarm's actions on `SetAlarmState` whenever the new state
+    /// differs from the old one. Enabling first therefore turned the daily
+    /// window open into a page: the box stops at 17:30, the five gated alarms
+    /// that are `treat_missing_data = breaching` AND carry `ok_actions` enter
+    /// ALARM overnight (correctly silent, actions disabled), and the 09:20
+    /// reset then fired five "recovered" messages for a condition that was the
+    /// box being switched off on schedule -- roughly 110 pages a month, all
+    /// noise, all at the same minute.
+    ///
+    /// Pinned as a source-order assertion because there is no way to observe
+    /// AWS's action dispatch from a unit test: the bug is entirely in WHICH
+    /// call happens first, and that is exactly what this reads.
+    #[test]
+    fn the_gates_reset_to_ok_before_enabling_actions() {
+        for (label, source) in [
+            ("market_hours_gate", include_str!("market_hours_gate.rs")),
+            ("alarm_gate", include_str!("alarm_gate.rs")),
+        ] {
+            let enable = source
+                .find("enable_alarm_actions()")
+                .unwrap_or_else(|| panic!("{label}: the open path must enable actions"));
+            let reset = source
+                .find("set_alarm_state()")
+                .unwrap_or_else(|| panic!("{label}: the open path must reset to OK"));
+            assert!(
+                reset < enable,
+                "{label}: SetAlarmState(OK) must come BEFORE enable_alarm_actions. \
+                 Enabling first makes the daily window-open transition ALARM -> OK \
+                 with live actions, which pages the operator every trading morning \
+                 for alarms that were never broken -- and leaves a window in which a \
+                 stale ALARM has live actions too"
+            );
+        }
+    }
     use super::*;
 
     #[test]
