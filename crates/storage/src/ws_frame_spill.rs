@@ -1467,18 +1467,43 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
 /// to 1.94 GB, which is the condition that makes an ILP flush fail, which is
 /// what the tick-spill rescue exists for.
 ///
-/// # Why deleting these is safe
+/// # Why deleting these is bounded — and where it is NOT
 ///
 /// A segment is written BEFORE parse and broadcast, as a crash-recovery copy.
 /// On a session that did not crash, the live lane folded those same frames in
-/// real time, so an un-replayed segment from a previous session is redundant —
-/// its frames were already processed. Replay exists for the crash case, and a
-/// crash is recovered from the CURRENT session's tail, never from a segment
-/// days old that the 512 MiB budget could not have reached in any case.
+/// real time, so an un-replayed segment from a previous session is usually
+/// redundant — its frames were already processed.
 ///
-/// The age bound is what makes this provable rather than probable: at any
-/// retention of one full day or more, nothing this pass can delete is
-/// reachable by the next boot's replay budget.
+/// **Usually, not always, and the exception is real.** `WalRingSink::accept`
+/// is WAL-first by design: it appends the frame, and only THEN tries to
+/// reserve ring budget. When that reservation fails it returns
+/// `FrameSinkOutcome::RingFull` and the frame is never folded — it exists in
+/// the ACTIVE WAL and nowhere else. The WAL record carries no flag
+/// distinguishing that frame from one the lane folded a microsecond later, so
+/// this prune cannot tell them apart, and a deletion can therefore be the last
+/// copy of a tick. The count of such sheds is `tv_dhan_ws_ring_full_total`;
+/// when it is zero for a session, everything this pass deletes from that
+/// session really was redundant.
+///
+/// The AGE pass is still bounded, and that bound is what makes it defensible:
+/// at any retention of one full day or more, nothing it deletes was reachable
+/// by the next boot's 512 MiB replay budget in any case — a session writes far
+/// more than that (measured: 244 segments, 31 GB), so the backlog past the
+/// budget is unrecoverable before this prune ever touches it.
+///
+/// The BYTE pass has no such bound. It ignores age and deletes the oldest
+/// survivor to hold the volume under the ceiling, which can take a segment the
+/// next boot would have replayed. That is a disk-pressure event; it is counted
+/// separately as `tv_ws_wal_active_pruned_under_pressure_total` rather than
+/// folded into the routine total, and the condition causing it already pages
+/// through the free-space alarm.
+///
+/// The deeper defect this documents rather than fixes: the 512 MiB per-boot
+/// replay budget against a ~31 GB session means deferred segments can never
+/// drain, so they are guaranteed to reach one of these two passes. Closing
+/// that needs either a larger budget (slower boot) or in-session refold of
+/// shed frames (a design change) — neither is a line edit, and pretending the
+/// prune is harmless was the previous way of not saying so.
 #[must_use]
 pub fn prune_active_segments_at<P: AsRef<Path>>(
     wal_dir: P,
@@ -1671,6 +1696,28 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     if outcome.deleted > 0 || outcome.failed > 0 || outcome.size_deleted > 0 {
         metrics::counter!("tv_ws_wal_active_pruned_total")
             .increment((outcome.deleted + outcome.size_deleted) as u64);
+        // Counted SEPARATELY from the total, because the two passes have
+        // different safety arguments and only one of them is bounded.
+        //
+        // The AGE pass deletes nothing a future boot could have reached: at a
+        // 48-hour retention against a 512 MiB per-boot replay budget, those
+        // segments were already past recovery. The BYTE pass ignores age
+        // entirely -- it deletes the oldest survivor to protect the volume,
+        // and it can therefore delete a segment the next boot would otherwise
+        // have replayed. That is a disk-pressure event, not routine
+        // housekeeping, and it deserves its own number.
+        //
+        // Deliberately NOT EMF-selected: the condition that produces it --
+        // the volume filling -- already pages via `tv-<env>-spill-dir-free-low`
+        // (noise-lock 2.3g), so a second pager for the same cause would be
+        // redundant, and every EMF name costs ~$0.30/mo against a maximal
+        // month already above the budget's automatic stop line. It is
+        // readable on `/metrics` and through the debug API. Stated here so
+        // the omission is a decision on the record rather than an oversight.
+        if outcome.size_deleted > 0 {
+            metrics::counter!("tv_ws_wal_active_pruned_under_pressure_total")
+                .increment(outcome.size_deleted as u64);
+        }
         info!(
             deleted = outcome.deleted,
             size_deleted = outcome.size_deleted,
@@ -1679,9 +1726,14 @@ pub fn prune_active_segments<P: AsRef<Path>>(
             bytes_after = outcome.bytes_after,
             retention_secs,
             max_bytes,
-            "WAL ACTIVE prune pass complete — un-replayed segments past retention. \
-             These are crash-recovery copies of frames the live lane already folded; \
-             the boot replay budget could not have reached them."
+            "WAL ACTIVE prune pass complete — un-replayed segments deleted by age \
+             and, separately, by the byte ceiling. MOST are crash-recovery copies \
+             of frames the live lane folded in real time, and those are redundant. \
+             They are not ALL: a frame shed at the frame ring (tv_dhan_ws_ring_full_total) \
+             reached the WAL and was never folded, and the record does not distinguish \
+             the two — so a deletion here can be the last copy. The age pass is still \
+             bounded (nothing 48h old is reachable by a 512 MiB replay budget); the \
+             byte pass is not, and its count is tv_ws_wal_active_pruned_under_pressure_total."
         );
     }
     outcome
@@ -1928,6 +1980,44 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prune's own words used to assert something it cannot establish.
+    ///
+    /// It said the segments it deletes were crash-recovery copies of frames
+    /// the live lane had supposedly folded already. That is true of every frame the ring
+    /// accepted and FALSE of every frame it shed: `WalRingSink::accept`
+    /// appends to the WAL *before* reserving ring budget, so a `RingFull`
+    /// frame reaches the WAL and is never folded, and nothing in the record
+    /// distinguishes the two afterwards.
+    ///
+    /// A stale reassurance in a log line is worse than no line at all --
+    /// whoever reads it next stops looking. This pins the correction so the
+    /// comfortable sentence cannot come back.
+    #[test]
+    fn the_prune_never_claims_the_frames_it_deletes_were_already_folded() {
+        let source = include_str!("ws_frame_spill.rs");
+        assert!(
+            !source.contains(concat!("frames the live lane ", "already folded")),
+            "the prune's log line is asserting that everything it deletes was \
+             already folded. A frame shed at the ring (FrameSinkOutcome::RingFull) \
+             reached the WAL and was NOT folded, and the record cannot tell them \
+             apart -- so this claim is false for exactly the frames whose loss \
+             matters most"
+        );
+        assert!(
+            source.contains("tv_ws_wal_active_pruned_under_pressure_total"),
+            "the byte-ceiling pass ignores age and can delete a segment the next \
+             boot would have replayed. It must be counted separately from routine \
+             age pruning, or a disk-pressure data deletion is indistinguishable \
+             from housekeeping"
+        );
+        assert!(
+            source.contains("tv_dhan_ws_ring_full_total"),
+            "the doc must name the counter that tells an operator whether this \
+             prune's deletions were redundant -- without it, the honest caveat is \
+             unactionable"
+        );
+    }
     use std::time::Duration;
 
     #[test]
