@@ -14948,7 +14948,6 @@ mod wal_refold_tests {
         LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
     }
 
-    #[test]
     /// The boot replay MUST seed the aggregator watermark before it folds a
     /// single recovered frame.
     ///
