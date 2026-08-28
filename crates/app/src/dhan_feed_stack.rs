@@ -3885,6 +3885,25 @@ async fn run_frame_drain(
                 // arm must not treat that as a reason to end the drain.
             }
             _ = silence_timer.tick() => {
+                // Re-take the WAL receipt anchor (2026-08-28).
+                //
+                // `received_at` is the candle BUCKETING clock, and it is
+                // derived from a monotonic instant against a wall-clock
+                // anchor. `CLOCK_MONOTONIC` and `CLOCK_REALTIME` separate
+                // continuously under NTP SLEW — up to 500 ppm, i.e. ~1.8 s per
+                // hour, ~16 s over a session — so a boot-only anchor would
+                // file bars in the wrong second by a margin that GROWS all
+                // day. That is the error shape hardest to notice and hardest
+                // to reconstruct afterwards.
+                //
+                // This arm and not the 500 ms flush arm: the refresh is a
+                // wall-clock syscall plus one small allocation, and 30 s
+                // already bounds the drift to ~15 ms at the worst permitted
+                // slew — three orders of magnitude inside a 1-second bucket.
+                // Doing it more often would buy nothing measurable and put an
+                // allocation on a hotter arm.
+                tickvault_storage::ws_frame_spill::refresh_receipt_anchor();
+
                 let now_millis = u64::try_from(
                     chrono::Utc::now().timestamp_millis().max(0)
                 ).unwrap_or(0);

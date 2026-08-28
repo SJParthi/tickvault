@@ -419,6 +419,29 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
 // Writer
 // ---------------------------------------------------------------------------
 
+/// The ILP-over-HTTP `request_timeout` in SECONDS, as a number the rest of the
+/// workspace can reason with.
+///
+/// # Why this exists as a constant
+///
+/// The timeout itself lives inside the `format!` string below, and a source-scan
+/// test pins that literal — fine for the conf, useless to anyone who needs the
+/// VALUE. The shutdown budget needs the value: the lane's tail flush can block
+/// for one full `request_timeout` before the offload join even starts, so
+/// `OFFLOAD_SHUTDOWN_GRACE_SECS` plus this number has to fit inside
+/// `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`.
+///
+/// Before 2026-08-28 that relationship was asserted against a hardcoded margin
+/// of 5, which happened to equal this timeout. Correct — and correct by
+/// coincidence: raising the timeout to 10 s would have left the assert passing
+/// while the real shutdown ran over its budget and abandoned the tick tail,
+/// which is precisely the failure that assert exists to prevent, arriving
+/// through the one door it was not watching.
+///
+/// `ilp_request_timeout_matches_the_conf_literal` fails the build if the two
+/// ever disagree.
+pub const ILP_REQUEST_TIMEOUT_SECS: u64 = 5;
+
 /// ILP-over-HTTP conf: per-flush server ACK with `retry_timeout=0` (the caller
 /// owns retry cadence) and a bounded `request_timeout` so a hung flush cannot
 /// wedge the drain.
@@ -677,6 +700,14 @@ pub struct DepthWriter {
     /// Spill directory. Production uses [`DEPTH_SPILL_DIR`]; tests get an
     /// isolated temp dir so they never write into the repo.
     spill_dir: PathBuf,
+    /// Hand-off queue to the depth writer thread when this writer has been
+    /// split by [`DepthWriter::split_for_offload`]. `None` means the
+    /// synchronous arm, which is what every non-lane caller still uses.
+    offload: Option<std::sync::mpsc::SyncSender<DepthFlushBatch>>,
+    /// Consecutive flush spans the producer has RETAINED because the hand-off
+    /// queue was full. Bounded by [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] so
+    /// backpressure cannot silently widen a commit without limit.
+    retained_spans: u32,
 }
 
 /// A unique temp spill directory, so a test writer never touches
@@ -763,6 +794,8 @@ impl DepthWriter {
                     dropped: 0,
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
+                    offload: None,
+                    retained_spans: 0,
                 }
             }
             Err(err) => {
@@ -779,6 +812,8 @@ impl DepthWriter {
                     dropped: 0,
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
+                    offload: None,
+                    retained_spans: 0,
                 }
             }
         }
@@ -802,6 +837,8 @@ impl DepthWriter {
             dropped: 0,
             rescued: 0,
             spill_dir: temp_depth_spill_dir(),
+            offload: None,
+            retained_spans: 0,
         }
     }
 
@@ -1009,6 +1046,141 @@ impl DepthWriter {
         rows
     }
 
+    /// Splits this writer into a PRODUCER half and a network SINK half.
+    ///
+    /// The producer keeps the ILP buffer and the row accounting and stays on
+    /// the drain task; the sink takes the `Sender` and belongs on a thread of
+    /// its own. They are joined by a bounded queue, so the drain can never be
+    /// blocked by the network and can never grow the queue without bound.
+    ///
+    /// See the module section "Off-drain flush for DEPTH" for why this matters
+    /// more here than on the tick path: depth is 24x the tick row volume and
+    /// its synchronous flush ran on the frame drain, so a QuestDB stall became
+    /// upstream tick loss and a socket disconnect.
+    ///
+    /// Consuming `self` and returning a new one is deliberate: it makes the
+    /// split a one-way door at the type level, so no caller can hold a handle
+    /// that still believes it owns the network.
+    #[must_use]
+    // TEST-EXEMPT: the split itself is exercised by every depth offload test
+    // below, each of which calls it to obtain the producer/sink pair.
+    pub fn split_for_offload(
+        mut self,
+    ) -> (
+        Self,
+        DepthWriterSink,
+        std::sync::mpsc::Receiver<DepthFlushBatch>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH);
+        let sink = DepthWriterSink {
+            sender: self.sender.take(),
+            feed: self.feed,
+            spill_dir: self.spill_dir.clone(),
+        };
+        self.offload = Some(tx);
+        (self, sink, rx)
+    }
+
+    /// Closes the hand-off queue, so the writer thread sees the end of the
+    /// stream and can exit.
+    ///
+    /// Shutdown-only. Dropping the sender is what turns the writer's blocking
+    /// `recv` into a clean exit; without it, a caller that joins the thread
+    /// waits forever on a queue nothing will ever close.
+    ///
+    /// Leaves the writer in the UNSPLIT state, so a flush after this point
+    /// takes the synchronous arm and — with the sender long gone to the sink —
+    /// rescues to the depth spill tier rather than silently discarding. That is
+    /// the correct end-of-session behaviour: rows are on disk and named.
+    pub fn close_offload(&mut self) {
+        self.offload = None;
+    }
+
+    /// True once [`Self::split_for_offload`] has run and the queue is open.
+    #[must_use]
+    // TEST-EXEMPT: read by the offload tests below and by the lane's wiring.
+    pub const fn is_offloaded(&self) -> bool {
+        self.offload.is_some()
+    }
+
+    /// Hands the pending buffer to the writer thread without touching the
+    /// network.
+    ///
+    /// Uses `try_send`, never `send`: a blocking send would re-create the exact
+    /// coupling the split exists to remove, one queue further out.
+    fn offload_flush(&mut self) -> DepthOffloadOutcome {
+        let rows = self.pending;
+        // Read the protocol version BEFORE the replace: a fresh buffer must
+        // speak the same protocol the sender negotiated, and borrowing rules
+        // will not let both happen in one expression.
+        let protocol = self.buffer.protocol_version();
+        let batch = DepthFlushBatch {
+            buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+            rows,
+        };
+        let Some(tx) = self.offload.as_ref() else {
+            // Unreachable — `flush` checks. Treated as the gone arm rather than
+            // silently succeeding, because "we sent it" when nothing was sent
+            // is the one report that must never be wrong.
+            self.buffer = batch.buffer;
+            return DepthOffloadOutcome::SinkGone(rows);
+        };
+        match tx.try_send(batch) {
+            Ok(()) => {
+                self.pending = 0;
+                self.retained_spans = 0;
+                metrics::counter!(
+                    "tv_depth_flush_offloaded_total",
+                    "feed" => self.feed.as_str()
+                )
+                .increment(1);
+                DepthOffloadOutcome::Sent(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                // Backpressure, not loss. Put the rows BACK and keep appending
+                // — the next flush retries. This arm is what makes the bounded
+                // queue safe: without it a full queue would either block the
+                // drain (the original defect) or drop rows (a worse one).
+                metrics::counter!(
+                    "tv_depth_flush_queue_full_total",
+                    "feed" => self.feed.as_str()
+                )
+                .increment(1);
+                let held = returned.buffer.as_bytes().len();
+                self.buffer = returned.buffer;
+                self.retained_spans = self.retained_spans.saturating_add(1);
+                // TWO independent cuts. Spans is the primary bound; bytes is
+                // the belt-and-braces one that matters MORE on this path than
+                // on the tick path, because a single depth-200 snapshot is 400
+                // rows and a burst can breach a byte ceiling inside one span.
+                //
+                // `>` and not `>=`: the constant names how many spans may be
+                // RETAINED, so the cut belongs on the span after them.
+                if self.retained_spans > MAX_DEPTH_RETAINED_FLUSH_SPANS
+                    || held >= MAX_DEPTH_PRODUCER_BUFFER_BYTES
+                {
+                    metrics::counter!(
+                        "tv_depth_flush_width_capped_total",
+                        "feed" => self.feed.as_str()
+                    )
+                    .increment(1);
+                    self.retained_spans = 0;
+                    // Rescue rather than keep widening. Durable, counted, and
+                    // re-ingestable — the same tier a failed flush uses.
+                    let dropped = self.discard_pending();
+                    return DepthOffloadOutcome::WidthCapped(dropped);
+                }
+                DepthOffloadOutcome::QueueFull(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                // The writer thread died. Rescue rather than drop, and say so.
+                self.buffer = returned.buffer;
+                let dropped = self.discard_pending();
+                DepthOffloadOutcome::SinkGone(dropped)
+            }
+        }
+    }
+
     /// Flushes buffered rows over ILP-HTTP with a per-flush server ACK.
     ///
     /// On ANY failed flush the pending buffer is DISCARDED: a server-rejected
@@ -1022,6 +1194,35 @@ impl DepthWriter {
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
+        }
+        // OFF-DRAIN ARM. Checked before the sender, because once split there
+        // IS no sender on this half — it went to the sink — and falling
+        // through would rescue every batch of a perfectly healthy lane.
+        //
+        // Returns `Ok(())` on QueueFull as well as on Sent, and that is the
+        // load-bearing decision in this function: a full queue means the rows
+        // are still held and still pending, so reporting `Err` would make the
+        // caller decay feed health and log a failure for backpressure that
+        // lost nothing. WidthCapped and SinkGone DID move rows out of the
+        // buffer (rescued, counted, coded), so they report `Err` exactly as a
+        // failed synchronous flush does.
+        if self.offload.is_some() {
+            return match self.offload_flush() {
+                DepthOffloadOutcome::Sent(_) | DepthOffloadOutcome::QueueFull(_) => Ok(()),
+                DepthOffloadOutcome::WidthCapped(rows) => {
+                    anyhow::bail!(
+                        "market_depth producer held {rows} row(s) past its retention bound \
+                         while the writer thread was behind; they were rescued to the depth \
+                         spill tier — see the preceding coded line"
+                    )
+                }
+                DepthOffloadOutcome::SinkGone(rows) => {
+                    anyhow::bail!(
+                        "market_depth writer thread is gone; {rows} row(s) were rescued to \
+                         the depth spill tier — see the preceding coded line"
+                    )
+                }
+            };
         }
         let Some(sender) = self.sender.as_mut() else {
             let dropped = self.discard_pending();
@@ -1160,10 +1361,288 @@ pub fn depth_segment_label(code: u8) -> Option<&'static str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Off-drain flush for DEPTH (2026-08-28)
+// ---------------------------------------------------------------------------
+//
+// # Why this exists, and why it is the single most consequential change here
+//
+// `TickWriter` was taken off the frame-drain task on 2026-08-25. `DepthWriter`
+// was NOT, and it is the writer that needed it more:
+//
+// | | ticks | depth |
+// |---|---|---|
+// | rows per session (MEASURED 2026-08-24) | 64,349,753 | **1,530,651,649** |
+// | flush off the drain | yes | **no, until this change** |
+//
+// Depth is 24x the tick volume and the largest payload in the process, and its
+// flush ran SYNCHRONOUSLY inside `block_in_place` on the drain task, with a
+// 5,000 ms `request_timeout`, up to ~5 times a second at the modelled rate.
+// `block_in_place` bounds the damage to the RUNTIME -- a replacement worker is
+// spun up so other tasks keep running -- but it does not take the drain out of
+// the flush's critical path, and the drain is the only thing emptying the
+// socket. So a QuestDB hiccup stalled the fold, filled the receive buffer, and
+// Dhan (which skips a slow consumer forward to "the latest available state",
+// with no sequence number for us to detect it) discarded the intermediate
+// ticks at THEIR side. A storage stall became upstream tick loss and a
+// WebSocket disconnect, invisibly, and no amount of provisioned disk
+// throughput removes it because the coupling is structural rather than a
+// matter of speed.
+//
+// This is the same split, applied to the bigger writer. Everything below
+// mirrors `tick_persistence.rs` deliberately, including the bound names, so
+// the two paths cannot drift into different failure semantics.
+
+/// Depth of the hand-off queue between the drain and the depth writer thread.
+///
+/// FOUR, matching the tick path, and for the same reason: the queue is a shock
+/// absorber for a QuestDB hiccup SHORTER than the flush cadence, not a place to
+/// store data. Every batch sitting in it is rows that exist only in this
+/// process's memory, so a deeper queue converts a database stall into a bigger
+/// crash-loss window while making the operator's counters look calmer.
+///
+/// Depth flushes on the ROW threshold far more often than on the 500 ms timer
+/// -- at the modelled ~63,800 rows/s and a 10,000-row threshold that is a flush
+/// roughly every 156 ms -- so four batches absorb ~600 ms of stall here rather
+/// than the ~2 s it absorbs on the tick path. That is the honest figure and it
+/// is deliberately NOT compensated for by a deeper queue: a stall longer than
+/// that SHOULD surface as backpressure, because it is one.
+pub const DEPTH_FLUSH_QUEUE_DEPTH: usize = 4;
+
+/// How much un-handed-off ILP text the depth PRODUCER may hold before it
+/// rescues to the spill tier.
+///
+/// When the queue is full the drain keeps its buffer and keeps appending --
+/// that is the whole point, the rows are neither lost nor reported as lost.
+/// But "keep appending forever" is an unbounded memory path, and this
+/// repository's own complexity table records five uncapped maps found the hard
+/// way. Past this ceiling the producer stops accumulating and rescues, which is
+/// durable, counted, and re-ingestable -- the same tier a failed flush uses.
+///
+/// This is the SECONDARY bound; [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] is the
+/// primary one and cuts far earlier. It exists so that a pathological append
+/// rate cannot reach the questdb-rs wedge inside two spans -- which on THIS
+/// path is a real possibility rather than a theoretical one, because a single
+/// depth-200 snapshot is 400 rows and a burst can add them faster than any
+/// span-based bound can react.
+pub const MAX_DEPTH_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+// Same headroom rule as the tick path: the producer ceiling must sit at or
+// below half the questdb-rs `max_buf_size` wedge, or the rescue arm only fires
+// after every flush is already failing permanently -- making the rescue path
+// unreachable exactly when it is needed.
+const _: () = assert!(
+    MAX_DEPTH_PRODUCER_BUFFER_BYTES * 2 <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES,
+    "the depth producer ceiling must sit at or below half the questdb-rs max_buf_size wedge"
+);
+
+/// How many consecutive flush spans the depth producer may RETAIN before it
+/// stops accumulating and spills.
+///
+/// TWO, matching the tick path. The queue already absorbs
+/// [`DEPTH_FLUSH_QUEUE_DEPTH`] batches before the producer ever sees a full
+/// queue, so the honest absorption is that depth plus this; a cap of one would
+/// spill on the first hiccup.
+///
+/// Commit WIDTH matters less here than it does for ticks -- a depth snapshot is
+/// stamped at capture, so it does not reopen closed partitions the way the 10%
+/// of ticks whose exchange timestamp is over an hour behind arrival do -- but
+/// the bound is kept identical anyway. A writer that batches more aggressively
+/// under pressure is exactly the own-goal the tick change was measured against,
+/// and adopting a looser number here on an unmeasured hunch is how that lesson
+/// gets relearned.
+pub const MAX_DEPTH_RETAINED_FLUSH_SPANS: u32 = 2;
+
+/// One handed-off depth ILP payload, in flight between the drain and the
+/// writer thread.
+///
+/// Deliberately opaque, like its tick counterpart: the drain must not be able
+/// to inspect, re-order, or partially consume a batch, because the only correct
+/// thing to do with one is hand it to the network or rescue the whole thing.
+pub struct DepthFlushBatch {
+    buffer: Buffer,
+    rows: usize,
+}
+
+impl DepthFlushBatch {
+    /// Rows this batch covers.
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the offload tests below.
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// What happened to a depth batch the producer tried to hand off.
+///
+/// Four arms and not a `Result`, because [`DepthOffloadOutcome::QueueFull`] is
+/// NOT a failure and must never be logged or counted as one: the rows are still
+/// held, still pending, and go out on the next flush. Collapsing it into `Err`
+/// is precisely how a backpressure signal becomes a false loss report.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DepthOffloadOutcome {
+    /// Handed to the writer thread. The rows are no longer the drain's.
+    Sent(usize),
+    /// The writer is behind. Rows RETAINED by the producer, nothing lost.
+    QueueFull(usize),
+    /// The writer stayed behind long enough that retaining further would widen
+    /// the commit past [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] or breach
+    /// [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`]. Rows rescued to the spill tier
+    /// rather than accumulated.
+    ///
+    /// Its own arm and not `SinkGone`, because the writer is alive and well --
+    /// reporting "the writer thread is gone" here would send an operator to
+    /// diagnose a thread that is running fine.
+    WidthCapped(usize),
+    /// The writer thread is gone. Rows rescued to the spill tier.
+    SinkGone(usize),
+}
+
+/// The network half of a split [`DepthWriter`] -- owns the ILP `Sender`.
+///
+/// Lives on its own OS thread. It never touches the aggregator, the ring, or
+/// anything the drain owns, which is the entire reason the split exists: a
+/// five-second ILP timeout now blocks a thread whose only job is waiting, not
+/// the thread that must keep emptying the socket.
+pub struct DepthWriterSink {
+    sender: Option<Sender>,
+    feed: Feed,
+    spill_dir: PathBuf,
+}
+
+impl DepthWriterSink {
+    /// Writes one batch. Returns the rows that actually LANDED in QuestDB.
+    ///
+    /// Zero on any failure -- the same contract `DepthWriter::flush` has, and
+    /// for the same reason: the caller reports feed health from this number, so
+    /// a failed write must decay health rather than forge it.
+    ///
+    /// A failure rescues the payload to the depth spill tier through the same
+    /// counters and the same coded error `discard_pending` uses, so an operator
+    /// sees no difference between a synchronous and an offloaded rescue.
+    ///
+    /// The single retry of the synchronous path is deliberately NOT reproduced
+    /// here. That retry exists because the synchronous flush ran on the drain
+    /// and a discarded buffer was the cheaper of two bad options; off the drain
+    /// the rescue tier is strictly better than a retry -- it is durable,
+    /// counted, and re-ingestable, and it cannot stall anything. Keeping the
+    /// retry would have carried a drain-shaped mitigation onto a thread that no
+    /// longer has a drain to protect.
+    pub fn write(&mut self, batch: &mut DepthFlushBatch) -> usize {
+        if batch.rows == 0 {
+            return 0;
+        }
+        let Some(sender) = self.sender.as_mut() else {
+            self.rescue(batch, "no ILP sender (QuestDB unreachable)");
+            return 0;
+        };
+        match sender.flush(&mut batch.buffer) {
+            Ok(()) => {
+                let landed = batch.rows;
+                batch.rows = 0;
+                landed
+            }
+            Err(err) => {
+                let why = format!("{err}");
+                self.rescue(batch, &why);
+                0
+            }
+        }
+    }
+
+    /// Rescues a batch the network refused, exactly as `discard_pending` does.
+    fn rescue(&mut self, batch: &mut DepthFlushBatch, why: &str) {
+        let rows = batch.rows;
+        if rows == 0 {
+            return;
+        }
+        let payload_len = batch.buffer.as_bytes().len();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        match spill_failed_depth_ilp(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            self.feed,
+            now,
+            depth_spill_max_bytes(),
+        ) {
+            Ok(path) => {
+                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
+                    .increment(rows as u64);
+                metrics::counter!("tv_depth_rows_spilled_total", "feed" => self.feed.as_str())
+                    .increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    rescued = rows,
+                    bytes = payload_len,
+                    reason = why,
+                    path = %path.display(),
+                    "offloaded market_depth flush failed — the levels were RESCUED to the \
+                     depth spill file named here, not lost. They are NOT in QuestDB yet. \
+                     Re-ingest is one command and is safe to repeat, because the depth \
+                     dedup key carries depth_kind and capture_seq: \
+                     curl --data-binary @<path> http://<questdb>:9000/write"
+                );
+            }
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::StorageFull {
+                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
+                        .increment(1);
+                } else {
+                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write")
+                        .increment(1);
+                }
+                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
+                    .increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped = rows,
+                    reason = why,
+                    cap_bytes = depth_spill_max_bytes(),
+                    spill_dir = %self.spill_dir.display(),
+                    spill_error = %err,
+                    "offloaded market_depth flush failed AND the depth spill rescue also \
+                     failed — these levels are permanently lost and nothing re-inserts \
+                     them. The raw frames remain in the write-ahead log for manual recovery."
+                );
+            }
+        }
+        batch.buffer.clear();
+        batch.rows = 0;
+    }
+}
 #[cfg(test)]
 mod tests {
 
     /// The retry window must be far above an interrupted syscall and far below
+    /// The named timeout and the conf literal must never drift apart.
+    ///
+    /// [`ILP_REQUEST_TIMEOUT_SECS`] exists so the shutdown budget can reason
+    /// about how long a tail flush may block before the offload join starts. If
+    /// someone raises the conf literal and leaves the constant behind, that
+    /// reasoning silently becomes wrong and the lane's join gets abandoned
+    /// mid-flight again — the exact failure the budget assert was added to
+    /// prevent, arriving through the one door the assert cannot watch.
+    ///
+    /// Source-scanned for the same reason the retry-window test below is: the
+    /// number that matters is the LITERAL, so a change to it must invalidate
+    /// this test rather than be papered over by a fixture.
+    #[test]
+    fn ilp_request_timeout_matches_the_conf_literal() {
+        let src = include_str!("depth_persistence.rs");
+        let expected = format!("request_timeout={}", ILP_REQUEST_TIMEOUT_SECS * 1000);
+        assert!(
+            src.contains(&expected),
+            "ILP_REQUEST_TIMEOUT_SECS ({ILP_REQUEST_TIMEOUT_SECS}s) implies the conf \
+             literal `{expected}`, which is not present. The shutdown budget in main.rs \
+             derives its margin from this constant, so a drift here makes that budget \
+             wrong without failing anything else."
+        );
+    }
+
     /// the sender's own request timeout — that gap is the whole reason a clock
     /// can separate two failures the error class cannot.
     #[test]
@@ -1782,5 +2261,226 @@ mod tests {
         assert_ne!(DEPTH_SIDE_BID, DEPTH_SIDE_ASK);
         assert_eq!(DEPTH_SIDE_BID, "bid");
         assert_eq!(DEPTH_SIDE_ASK, "ask");
+    }
+
+    // ---- off-drain flush (2026-08-28) -----------------------------------
+    //
+    // These pin the SEMANTICS, not the plumbing. The plumbing is a bounded
+    // channel; the semantics are which arms report loss and which do not, and
+    // getting that wrong is how a backpressure signal becomes a false loss
+    // report (or, worse, how a real loss reports as healthy).
+
+    #[test]
+    fn a_split_writer_hands_the_batch_to_the_queue_instead_of_the_network() {
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        assert!(w.is_offloaded(), "the split must open the hand-off queue");
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.pending(), 1);
+
+        w.flush().expect("a healthy hand-off is not a failure");
+
+        assert_eq!(w.pending(), 0, "the rows left the producer");
+        let batch = rx.try_recv().expect("the batch must be on the queue");
+        assert_eq!(batch.rows(), 1, "and it must carry the row count");
+    }
+
+    #[test]
+    fn a_full_queue_retains_the_rows_and_is_never_reported_as_a_failure() {
+        // THE test. A full queue means the writer is behind, not that anything
+        // was lost — the producer keeps its buffer and the next flush retries.
+        // Reporting this as `Err` would decay feed health and log a loss for a
+        // batch that is still entirely in hand, which is the exact false-loss
+        // shape this arm exists to prevent.
+        let (mut w, _sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            w.flush().expect("fills the queue");
+        }
+        // The queue is now full and `_rx` is deliberately not drained.
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.pending(), 1);
+
+        w.flush()
+            .expect("backpressure is not a failure — the rows are still held");
+
+        assert_eq!(
+            w.pending(),
+            1,
+            "the row must still be pending, not silently consumed"
+        );
+    }
+
+    #[test]
+    fn retaining_past_the_span_bound_rescues_rather_than_widening_forever() {
+        // "Keep appending while the writer is behind" is correct exactly twice.
+        // Past that it is an unbounded memory path wearing a backpressure
+        // costume, so the producer cuts to the durable tier and says so.
+        let dir = temp_depth_spill_dir();
+        let (mut w, _sink, _rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            w.flush().expect("fills the queue");
+        }
+        // Every flush from here finds the queue full.
+        let mut last = Ok(());
+        for _ in 0..=MAX_DEPTH_RETAINED_FLUSH_SPANS {
+            w.append_row(&row()).expect("append");
+            last = w.flush();
+        }
+        assert!(
+            last.is_err(),
+            "the span past the retention bound must report that rows left the buffer"
+        );
+        assert_eq!(w.pending(), 0, "and the buffer must be empty afterwards");
+        let spilled: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "the rescue must be DURABLE — a width cap that drops rows is worse \
+             than the accumulation it prevents"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dead_writer_thread_rescues_the_rows_and_reports_it() {
+        let dir = temp_depth_spill_dir();
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        drop(rx); // the writer thread died
+        w.append_row(&row()).expect("append");
+
+        let outcome = w.flush();
+
+        assert!(
+            outcome.is_err(),
+            "a gone writer moved rows out of the buffer — that is a failure, \
+             and reporting Ok here would forge feed health"
+        );
+        assert_eq!(w.pending(), 0);
+        let spilled: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "a dead writer must rescue, not drop — the rows are re-ingestable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_offload_returns_the_writer_to_the_synchronous_arm() {
+        // Shutdown ordering: the queue closes so the writer thread's blocking
+        // recv ends, and any last rows then take the synchronous arm — which,
+        // with the sender long gone to the sink, rescues to disk. Rows on disk
+        // and named is the correct end-of-session outcome; a wedged join is not.
+        let (mut w, _sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        assert!(w.is_offloaded());
+        w.close_offload();
+        assert!(
+            !w.is_offloaded(),
+            "after close the writer must take the synchronous arm"
+        );
+    }
+
+    #[test]
+    fn the_sink_rescues_a_batch_the_network_refused() {
+        // `for_test` has no ILP sender, so the sink's write is the
+        // QuestDB-unreachable arm — the same one a real network failure takes.
+        let dir = temp_depth_spill_dir();
+        let (mut w, mut sink, rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        sink.spill_dir.clone_from(&dir);
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand-off");
+        let mut batch = rx.try_recv().expect("batch");
+
+        let landed = sink.write(&mut batch);
+
+        assert_eq!(
+            landed, 0,
+            "a failed write must report ZERO rows landed — the caller derives \
+             feed health from this number, so it may decay it but never forge it"
+        );
+        assert_eq!(batch.rows(), 0, "and the batch must not be re-writable");
+        let spilled: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "the sink rescues exactly as the producer does"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sink_reports_the_rows_that_actually_landed() {
+        // Zero rows is not a failure and must not touch the spill tier — an
+        // empty flush that wrote a rescue file every 500 ms would fill the
+        // 512 MiB cap with nothing.
+        let dir = temp_depth_spill_dir();
+        let (_w, mut sink, _rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        sink.spill_dir.clone_from(&dir);
+        let mut empty = DepthFlushBatch {
+            buffer: Buffer::new(questdb::ingress::ProtocolVersion::V1),
+            rows: 0,
+        };
+        assert_eq!(sink.write(&mut empty), 0);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) == 0,
+            "an empty batch must never write a rescue file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_split_takes_the_sender_so_the_producer_cannot_touch_the_network() {
+        // The one-way door. If the producer kept a sender, a stray synchronous
+        // flush would put a 5 s blocking round trip back on the drain — the
+        // exact coupling this change removes — and nothing would catch it.
+        let w = DepthWriter::for_test(Feed::Dhan);
+        let had_sender = w.sender.is_some();
+        let (producer, sink, _rx) = w.split_for_offload();
+        assert!(
+            producer.sender.is_none(),
+            "the producer must not retain the ILP sender after the split"
+        );
+        assert_eq!(
+            sink.sender.is_some(),
+            had_sender,
+            "and the sink must hold whatever sender there was"
+        );
+    }
+
+    #[test]
+    fn the_depth_producer_ceiling_leaves_headroom_under_the_questdb_wedge() {
+        // Const-asserted at the definition too; restated as a test so the
+        // reasoning is discoverable from the test list rather than only from a
+        // compile error nobody sees until it fires.
+        assert!(
+            MAX_DEPTH_PRODUCER_BUFFER_BYTES * 2
+                <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES,
+            "past the questdb-rs max_buf_size EVERY flush fails permanently — a wedge, \
+             not a degrade — so the rescue arm must fire well before it"
+        );
+        assert!(
+            MAX_DEPTH_RETAINED_FLUSH_SPANS >= 1,
+            "a retention bound of zero spills on the first hiccup, which converts \
+             ordinary backpressure into disk writes"
+        );
+        assert!(
+            DEPTH_FLUSH_QUEUE_DEPTH >= 1,
+            "a zero-depth queue makes every flush a QueueFull and the split pointless"
+        );
     }
 }

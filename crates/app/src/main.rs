@@ -874,6 +874,36 @@ async fn async_main() -> Result<()> {
     // with the 15:40 conservation audit so the two sites can never drift).
     let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
     let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
+    // CLAIM THE WAL DIRECTORY BEFORE ANYTHING TOUCHES IT (2026-08-28).
+    //
+    // `replay_all` below is not a read — it RENAMES live `*.wal` files into
+    // `replaying/`. Until this claim moved up here, a second process started
+    // against a live one would stage the INCUMBENT's currently-open segment out
+    // from under it (the incumbent keeps writing to the moved inode, its fd is
+    // still valid), and only THEN reach the claim inside `WsFrameSpill::new`
+    // ~115 lines later, be refused, and exit. The refusal worked; it arrived
+    // after the damage, and the incumbent's remaining session frames were left
+    // in a file its own `confirm_replayed` would never cover.
+    //
+    // The guard is MOVED into `WsFrameSpill::new_with_guard` below rather than
+    // re-taken there: a second `lock_wal_dir` from this same process is a
+    // different open file description and the kernel refuses it exactly as it
+    // refuses a foreign one.
+    let ws_wal_guard = match tickvault_storage::ws_frame_spill::lock_wal_dir(&ws_wal_path) {
+        Ok(guard) => guard,
+        Err(err) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                dir = %ws_wal_dir,
+                error = %err,
+                "STAGE-C: another live process already owns this WAL directory — refusing \
+                 to start. Two writers mint capture_seq from independent counters, collide \
+                 inside the ticks DEDUP key, and destroy ticks with no counter to show it."
+            );
+            std::process::exit(1);
+        }
+    };
+
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
@@ -1003,7 +1033,10 @@ async fn async_main() -> Result<()> {
     // deliberately runs wal_spill=None while dormant — C1 dormancy honesty),
     // but the WAL WRITER + fail-closed init are KEPT: the WAL dir remains the
     // replay/archive floor consumed above and by the 15:40 conservation audit.
-    let _ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
+    let _ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new_with_guard(
+        &ws_wal_path,
+        ws_wal_guard,
+    ) {
         Ok(spill) => {
             info!(
                 dir = %ws_wal_dir,
@@ -1072,6 +1105,28 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_orders_rejected_total").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
+
+    // The four live-lane failure counters alarmed on 2026-08-28
+    // (deploy/aws/terraform/live-lane-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md 2.3l). Same first-sample
+    // rationale as every registration above, and these needed it MOST: two of
+    // the four are `metrics::counter!(...).increment(1)` written INLINE at the
+    // failure site, so without this the series is born AT the incident and the
+    // dropped baseline sample IS the incident. All four alarms are
+    // `threshold >= 1, evaluation_periods = 1` on a counter that reads zero on
+    // a healthy lane -- precisely the shape that produces zero datapoints and a
+    // pager that is dead on arrival for the single-episode case, which is the
+    // dominant shape for all four.
+    //
+    // Registered HERE rather than at each emit site because those sites sit
+    // behind runtime gates (the lane, the aggregator, the replay pass); a
+    // counter registered only when its subsystem starts is not dense from boot
+    // on a lane that is off, and this block is the one place provably after the
+    // recorder install and before any scrape.
+    metrics::counter!("tv_dhan_feed_seals_rescued_total").increment(0);
+    metrics::counter!("tv_aggregator_slot_exhausted_total").increment(0);
+    metrics::counter!("tv_tick_spill_replay_quarantined_total").increment(0);
+    metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(0);
 
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder

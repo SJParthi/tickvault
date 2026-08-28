@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -416,27 +416,66 @@ pub struct WsFrameSpill {
 }
 
 impl WsFrameSpill {
-    /// Create a spill writer rooted at `wal_dir`. Spawns the background writer.
+    /// Create a spill writer rooted at `wal_dir`, taking the directory claim
+    /// itself. Spawns the background writer.
+    ///
+    /// Prefer [`WsFrameSpill::new_with_guard`] in any boot path that touches
+    /// the directory BEFORE constructing the spill — see that function for why
+    /// the ordering is not cosmetic.
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full (both construct)
     pub fn new<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Self> {
         let wal_dir = wal_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
             .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
+        let dir_guard = lock_wal_dir(&wal_dir)?;
+        Self::new_with_guard(wal_dir, dir_guard)
+    }
 
-        // ORDER IS LOAD-BEARING, and this is the first thing that happens.
+    /// Create a spill writer for a directory the caller has ALREADY claimed.
+    ///
+    /// # Why this exists — the ordering hole it closes
+    ///
+    /// `new` claims the directory and then seeds the sequence, which is correct
+    /// in isolation. It is NOT sufficient for the real boot path, because
+    /// `main` calls [`replay_all`] on this directory ~115 lines EARLIER, and
+    /// `replay_all` MUTATES: it renames live `*.wal` files into `replaying/`.
+    ///
+    /// So starting a second process while one is live used to stage the
+    /// INCUMBENT's currently-open segment out from under it. The incumbent
+    /// keeps writing to the moved inode — the fd is still valid — and the
+    /// intruder then reaches the claim, is refused, and exits. The refusal
+    /// worked; it just happened after the damage. The incumbent's remaining
+    /// session frames now sit in a file under `replaying/` that its own
+    /// `confirm_replayed` will never cover.
+    ///
+    /// Taking the claim BEFORE the replay makes the refusal arrive before the
+    /// rename, and handing the guard here is what lets the caller keep it: a
+    /// second `lock_wal_dir` from the same process would be a different open
+    /// file description and would be refused by the kernel exactly as a foreign
+    /// process is — so the guard has to be MOVED, not re-taken.
+    // TEST-EXEMPT: covered by the guard-handoff tests below and by every `new` caller, which delegates here.
+    pub fn new_with_guard<P: AsRef<Path>>(
+        wal_dir: P,
+        dir_guard: Option<WalDirGuard>,
+    ) -> anyhow::Result<Self> {
+        let wal_dir = wal_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
+            .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
+
+        // ORDER IS LOAD-BEARING.
         //
-        // 1. CLAIM the directory exclusively, or refuse to start. Two processes
-        //    sharing one WAL directory mint `capture_seq` from two independent
-        //    clock-seeded counters, collide inside the `ticks` DEDUP key, and
-        //    destroy ticks with no counter anywhere to show it. See
-        //    [`lock_wal_dir`] for why this is fail-closed rather than a warning.
+        // 1. The directory is CLAIMED before this function is entered — by the
+        //    caller for the boot path, by `new` for everyone else. Two
+        //    processes sharing one WAL directory mint `capture_seq` from two
+        //    independent clock-seeded counters, collide inside the `ticks`
+        //    DEDUP key, and destroy ticks with no counter anywhere to show it.
+        //    See [`lock_wal_dir`] for why this is fail-closed, not a warning.
         // 2. Only THEN read the on-disk high-water mark and ratchet the counter
-        //    past it. Doing this before the lock would race a live incumbent
+        //    past it. Doing this before the claim would race a live incumbent
         //    that is still appending, and could seed from a value it is about
         //    to exceed.
         // 3. Only THEN spawn the writer thread, so nothing can append at a
         //    sequence below the high-water mark.
-        let dir_guard = lock_wal_dir(&wal_dir)?;
         let disk_high = seed_frame_seq_from_disk(&wal_dir);
         if disk_high > 0 {
             tracing::debug!(
@@ -973,6 +1012,114 @@ pub fn next_frame_seq() -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Frame receipt: derived from a monotonic instant, never read per frame
+// ---------------------------------------------------------------------------
+//
+// The frame's arrival instant is stamped in `FrameSink::accept` as a monotonic
+// `Instant`, deliberately: that file BANS wall-clock reads outright
+// (`test_pool_supervisor_source_never_reads_the_wall_clock`) because its
+// ladders, token expiry and backoff are all monotonic, and an NTP step must be
+// unable to expire all sixteen sockets at once. The ban is right.
+//
+// But the WAL record needs a WALL-CLOCK receipt: replay has to restore when the
+// frame actually arrived, and a monotonic instant means nothing across a
+// process restart. Before 2026-08-28 that tension was resolved by not writing a
+// receipt at all — `append_with_seq` passed `WAL_RECEIPT_UNKNOWN_NANOS` and
+// `append_with_seq_at` had ZERO production callers, so every record on disk
+// carried the sentinel while the format claimed to carry a receipt.
+//
+// Anchoring resolves it: the wall clock is read on a slow timer, in a different
+// crate from the one under the ban, and every per-frame receipt is arithmetic
+// on the monotonic delta. That is strictly better than a per-frame wall-clock
+// read in the property that matters most here — an NTP STEP cannot reorder two
+// frames, because the spacing between them is monotonic by construction.
+/// The receipt anchor: a monotonic instant paired with the UTC-epoch nanos that
+/// were true at that instant.
+///
+/// Two halves in ONE swapped value, deliberately. Split across two atomics a
+/// reader could observe a fresh wall time against a stale monotonic base and
+/// derive a receipt off by a whole refresh interval — a torn read that would be
+/// indistinguishable from a real out-of-order frame.
+#[derive(Debug, Clone, Copy)]
+struct ReceiptAnchor {
+    instant: Instant,
+    nanos: i64,
+}
+
+static RECEIPT_ANCHOR: std::sync::OnceLock<arc_swap::ArcSwap<ReceiptAnchor>> =
+    std::sync::OnceLock::new();
+
+/// Counter: how many times the receipt anchor was re-taken from the wall clock.
+///
+/// Charted rather than alarmed — a steady cadence is the mechanism working. Its
+/// absence during a session is the interesting reading, because it means the
+/// refresh caller stopped and the anchor is aging.
+pub const RECEIPT_ANCHOR_REFRESH_COUNTER: &str = "tv_wal_receipt_anchor_refresh_total";
+
+fn anchor_cell() -> &'static arc_swap::ArcSwap<ReceiptAnchor> {
+    RECEIPT_ANCHOR.get_or_init(|| arc_swap::ArcSwap::from_pointee(take_anchor()))
+}
+
+fn take_anchor() -> ReceiptAnchor {
+    // Order matters and the cost of getting it wrong is a systematic bias:
+    // read the WALL clock first, then the monotonic one, so any scheduling
+    // delay between the two makes the derived receipt slightly EARLY rather
+    // than late. An early receipt files a frame in the bucket it arrived in;
+    // a late one can push it into the next.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0i64, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    ReceiptAnchor {
+        instant: Instant::now(),
+        nanos,
+    }
+}
+
+/// Re-takes the receipt anchor from the wall clock.
+///
+/// # Why this is not optional
+///
+/// `Instant` is `CLOCK_MONOTONIC` and `SystemTime` is `CLOCK_REALTIME`. NTP
+/// does not merely STEP the realtime clock — it SLEWS it, at up to 500 ppm, so
+/// the two clocks separate continuously. A single boot-time anchor therefore
+/// drifts by up to **~1.8 s per hour, ~16 s over a 9-hour session** in the
+/// worst permitted case. Since 2026-08-28 `received_at` is the candle
+/// BUCKETING clock, so an aging anchor does not merely mislabel a timestamp —
+/// it files bars in the wrong second, and the error grows all day, which is the
+/// shape hardest to notice and hardest to reconstruct afterwards.
+///
+/// Re-taking it periodically bounds the drift to one refresh interval's worth
+/// instead of one session's. The spacing BETWEEN frames inside an interval is
+/// still purely monotonic, which is the property that makes the anchor better
+/// than a per-frame wall-clock read: an NTP STEP cannot reorder two frames.
+///
+/// Caller: an off-hot-path timer. This must never be called per frame — it is a
+/// wall-clock syscall and an allocation, and both belong nowhere near the
+/// capture path.
+pub fn refresh_receipt_anchor() {
+    anchor_cell().store(std::sync::Arc::new(take_anchor()));
+    metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER).increment(1);
+}
+
+/// The UTC-epoch-nanos receipt for a monotonic capture instant.
+///
+/// Initialises the anchor on first use, so the first frame of a session anchors
+/// it and reads back its own arrival instant essentially exactly.
+///
+/// Saturating throughout: `Instant` arithmetic panics on a negative interval, and
+/// a panic on the capture path would cost the socket. An instant from BEFORE the
+/// anchor — which a refresh makes genuinely reachable for a frame stamped just
+/// before the swap — yields the anchor time. That is a sub-refresh-interval
+/// flattening of at most a handful of frames, and it is the right trade against
+/// a panic or a negative timestamp.
+#[must_use]
+pub fn receipt_nanos_from(captured_at: Instant) -> i64 {
+    let anchor = anchor_cell().load();
+    let delta = captured_at.saturating_duration_since(anchor.instant);
+    let delta_nanos = i64::try_from(delta.as_nanos()).unwrap_or(i64::MAX);
+    anchor.nanos.saturating_add(delta_nanos)
+}
 /// The exclusive lock file held for the lifetime of the process that owns a
 /// WAL directory.
 ///
@@ -1107,16 +1254,50 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
 
     match lock.try_lock() {
         Ok(()) => Ok(Some(WalDirGuard { _lock: lock, path })),
-        Err(e) => {
+        // CONTENTION — the lock is genuinely held. Fail closed. This is the one
+        // arm the whole mechanism exists for.
+        // O(1) EXEMPT: a match PATTERN on an error variant, not a filesystem call — and the whole function is a one-shot boot-time claim, never on any per-frame path.
+        Err(std::fs::TryLockError::WouldBlock) => {
             metrics::counter!(WAL_DIR_LOCK_REFUSED_COUNTER).increment(1);
             Err(anyhow::anyhow!(
                 "WAL directory {wal_dir:?} is already owned by another live process \
-                 (lock file {path:?}: {e}). REFUSING to start a second writer: two \
+                 (lock file {path:?}). REFUSING to start a second writer: two \
                  processes minting capture_seq from their own clocks silently destroy \
                  ticks through the ticks DEDUP key, with no counter to show it. \
                  Identify the incumbent with `fuser -v` on the lock file and stop it, \
                  or point this process at its own WAL directory."
             ))
+        }
+        // THE FILESYSTEM CANNOT LOCK — not evidence of anything, and fatal if
+        // treated as such (2026-08-28).
+        //
+        // `try_lock` returns `Error(io)` rather than `WouldBlock` when the
+        // filesystem has no working `flock`: NFS without lockd, some FUSE and
+        // overlay mounts. Collapsing that into the contention arm made an
+        // unlockable filesystem indistinguishable from a live incumbent, and
+        // since `main` exits on this error, the result was a PERMANENT BOOT
+        // LOOP on a mount that simply lacks locking — a total outage caused by
+        // the safety mechanism rather than by anything it protects against.
+        //
+        // This is the same over-fail as the create arm above, which was
+        // repaired earlier the same day and left standing here, in the same
+        // function. Both now degrade for the same reason: refusing to run is
+        // only correct when a SECOND WRITER is the actual evidence.
+        Err(e) => {
+            metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                lock_file = ?path,
+                error = %e,
+                "the filesystem refused to lock the WAL directory, so \
+                 one-writer-per-directory is NOT enforced for this process. This is a \
+                 lock-support failure, not a second process — the usual cause is a \
+                 mount without working flock (NFS without lockd, some FUSE or overlay \
+                 mounts). Continuing anyway, because refusing here would boot-loop the \
+                 feed forever on a filesystem that can never satisfy it. While this \
+                 persists, a second process on this directory would not be refused."
+            );
+            Ok(None)
         }
     }
 }
@@ -1149,6 +1330,32 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
 /// records, which predate `frame_seq`. `0` is the correct answer there: it
 /// leaves the wall clock as the seed, exactly as before.
 #[must_use]
+/// How many trailing segments per directory the boot high-water probe reads.
+///
+/// # Why more than one
+///
+/// The probe used to read only `segs.last()`, on the reasoning that the newest
+/// segment holds the maximum. True while the writer is running — and FALSE in
+/// exactly the case the probe exists for. `writer_loop` opens the next segment
+/// file BEFORE writing anything into it, so a crash in that window leaves a
+/// ZERO-BYTE newest segment. The probe then read 0, seeded nothing, and the
+/// restart re-issued `capture_seq` values already in the database, where
+/// QuestDB upserts the collisions away with no counter anywhere to show it.
+/// The same shape follows a torn or garbage first header, which ends the walk
+/// at offset 0.
+///
+/// FOUR, not "all": the cost is bounded and the benefit saturates immediately.
+/// Reading every segment in a long-running directory is an unbounded boot-time
+/// walk over a path that only needs to find one non-empty file, and four covers
+/// an empty newest plus three consecutive torn predecessors — a shape no
+/// observed crash has produced.
+const HIGH_WATER_SEGMENTS_PER_DIR: usize = 4;
+
+/// The greatest `frame_seq` written to any segment under `wal_dir`.
+///
+/// Best-effort and deliberately so — see [`highest_frame_seq_in_segment`]. A
+/// LOWER bound is strictly better than the wall clock alone; refusing to boot
+/// over a torn tail would turn a safety net into an outage.
 pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
     let mut highest = 0u64;
     for dir in [
@@ -1158,10 +1365,18 @@ pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
     ] {
         let mut segs = wal_segments_in(&dir);
         // Lexicographic == chronological: the name is the zero-padded rotation
-        // nanos, so the last is the newest and holds the maximum.
+        // nanos, so the last is the newest.
         segs.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot-time seed, cold path
-        if let Some(newest) = segs.last() {
-            highest = highest.max(highest_frame_seq_in_segment(newest));
+        // Walk BACKWARDS from the newest, and keep walking past an empty or
+        // torn one — see [`HIGH_WATER_SEGMENTS_PER_DIR`]. Stops at the first
+        // segment that yields a sequence, because segments are chronological
+        // and an older one cannot exceed a newer one that has content.
+        for seg in segs.iter().rev().take(HIGH_WATER_SEGMENTS_PER_DIR) {
+            let seen = highest_frame_seq_in_segment(seg);
+            if seen > 0 {
+                highest = highest.max(seen);
+                break;
+            }
         }
     }
     highest
@@ -4591,5 +4806,106 @@ mod tests {
              would reopen the silent capture_seq collision the lock exists to stop"
         );
         drop(held);
+    }
+
+    /// Minimal TVW3 record encoder for the high-water probe tests.
+    ///
+    /// Deliberately hand-rolled rather than routed through `write_record`: the
+    /// probe reads HEADERS off disk, so a test that shares the writer's own
+    /// encoder would pass even if the two disagreed about the layout.
+    fn v3_bytes(ws_type: WsType, frame_seq: u64, receipt: i64, frame: &[u8]) -> Vec<u8> {
+        let frame_len = u32::try_from(frame.len()).expect("test frame");
+        let mut out = Vec::new();
+        out.extend_from_slice(&WAL_MAGIC_V3);
+        out.push(ws_type.as_u8());
+        out.extend_from_slice(&frame_seq.to_le_bytes());
+        out.extend_from_slice(&receipt.to_le_bytes());
+        out.extend_from_slice(&frame_len.to_le_bytes());
+        out.extend_from_slice(frame);
+        let crc = crc32_ieee_of(&[
+            &[ws_type.as_u8()][..],
+            &frame_seq.to_le_bytes()[..],
+            &receipt.to_le_bytes()[..],
+            &frame_len.to_le_bytes()[..],
+            frame,
+        ]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// The empty-newest-segment case, which is the ONE the high-water probe
+    /// exists for and the one it used to fail.
+    ///
+    /// `writer_loop` opens the next segment before writing into it, so a crash
+    /// in that window leaves a zero-byte newest file. Reading only
+    /// `segs.last()` returned 0, seeded nothing, and the restart re-issued
+    /// `capture_seq` values already in the database — where QuestDB upserts the
+    /// collisions away silently, because from this process both appends
+    /// succeeded.
+    #[test]
+    fn an_empty_newest_segment_does_not_hide_the_high_water_mark() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-hfs-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // An older segment carrying a real sequence...
+        let older = dir.join("00000000000000000001.wal");
+        let buf = v3_bytes(WsType::LiveFeed, 987_654_321, 42, b"payload");
+        std::fs::write(&older, &buf).expect("write older");
+
+        // ...and a newer, ZERO-BYTE one, exactly as a crash-after-rotate leaves.
+        std::fs::write(dir.join("00000000000000000002.wal"), b"").expect("write empty");
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            987_654_321,
+            "the probe must walk past an empty newest segment — returning 0 here \
+             re-issues capture_seq values already in the ticks table, and the \
+             collision is upserted away with no counter to report it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same defence against a TORN newest segment: a garbage first header
+    /// ends the walk at offset 0, which is indistinguishable from empty.
+    #[test]
+    fn a_torn_newest_segment_does_not_hide_the_high_water_mark() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-hfs-torn-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let buf = v3_bytes(WsType::LiveFeed, 555_000, 7, b"payload");
+        std::fs::write(dir.join("00000000000000000001.wal"), &buf).expect("write older");
+        // Unknown magic at offset 0 — the walk returns immediately.
+        std::fs::write(dir.join("00000000000000000002.wal"), b"TVW9garbage").expect("write torn");
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            555_000,
+            "a torn newest segment must not read as 'no sequences on disk'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound is real: the probe does not walk an unbounded history.
+    #[test]
+    fn the_high_water_probe_reads_a_bounded_number_of_segments() {
+        assert!(
+            HIGH_WATER_SEGMENTS_PER_DIR >= 2,
+            "one segment is the defect — an empty newest file hides everything behind it"
+        );
+        assert!(
+            HIGH_WATER_SEGMENTS_PER_DIR <= 16,
+            "this runs at boot over three directories; an unbounded walk would turn a \
+             safety net into a slow start"
+        );
     }
 }

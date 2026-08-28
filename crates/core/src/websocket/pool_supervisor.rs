@@ -2037,11 +2037,32 @@ impl FrameSink for WalRingSink {
         // Minted ONCE, here, at the read instant — see `CapturedFrame`.
         let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
+        //
+        // `append_with_seq_at`, never `append_with_seq`: the receipt is the
+        // whole point of the TVW3 record and it is DERIVED from `received_at`
+        // above, not read from a clock here — this file bans wall-clock reads
+        // (`test_pool_supervisor_source_never_reads_the_wall_clock`) and that
+        // ban is right, because an NTP step must not be able to expire all
+        // sixteen sockets at once.
+        //
+        // Before this was wired, `append_with_seq` passed the UNKNOWN sentinel
+        // and `append_with_seq_at` had zero production callers, so every record
+        // on disk carried 0 while the format claimed to carry a receipt — and
+        // replay re-stamped `now()`, which is the moment of REPLAY, not of
+        // arrival. A shape that advertises a guarantee it never delivers is
+        // worse than one that does not advertise it.
+        //
         // `append_with_seq`, never `append`: `append` would mint a SECOND
         // sequence internally and the WAL record would then disagree with the
         // one the consumer stamps.
-        // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
-        if self.spill.append_with_seq(self.ws_type, frame.clone(), seq) == AppendOutcome::Dropped {
+        if self.spill.append_with_seq_at(
+            self.ws_type,
+            // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
+            frame.clone(),
+            seq,
+            tickvault_storage::ws_frame_spill::receipt_nanos_from(received_at),
+        ) == AppendOutcome::Dropped
+        {
             self.wal_dropped.increment(1);
             return FrameSinkOutcome::WalDropped;
         }
@@ -3034,14 +3055,42 @@ where
                                 // that socket still holds its old instrument
                                 // and is still delivering, so tearing it down
                                 // would trade a stale strike for a real gap.
-                                // The socket is EMPTY only when the unsubscribe landed
-                                // and the subscribe did not. A failed unsubscribe
-                                // never sends the subscribe at all, so that socket
-                                // still holds its old instrument and is still
-                                // delivering — tearing it down would trade a stale
-                                // strike for a real gap.
+                                // The socket is EMPTY when the unsubscribe left
+                                // the wire and the subscribe did not follow it.
+                                //
+                                // TWO ways that happens, and the second was
+                                // missed until 2026-08-28:
+                                //
+                                // 1. The unsubscribe was ACKNOWLEDGED and the
+                                //    subscribe then failed. Unambiguous.
+                                // 2. The unsubscribe TIMED OUT. `wire_failed`
+                                //    is set, `unsubscribe_succeeded` is not —
+                                //    but a budget elapsing does not mean the
+                                //    frame was never written. A slow flush that
+                                //    lands afterwards leaves Dhan holding
+                                //    NOTHING on this socket, which is exactly
+                                //    the case this remediation exists for, and
+                                //    the old condition read it as "still
+                                //    holding its old instrument" and did
+                                //    nothing. Worse, the emptied-socket counter
+                                //    then read zero while a socket was empty —
+                                //    a false-OK on the very signal added to
+                                //    make this visible.
+                                //
+                                // Treated as lost, not as safe, because the two
+                                // errors are not symmetric: a redial is
+                                // idempotent and costs a backoff, while an
+                                // empty socket keeps ponging and delivers
+                                // nothing for the rest of the session.
+                                //
+                                // A failed unsubscribe that ANSWERED (`Ok(Err)`)
+                                // is still not lost: the wire returned an
+                                // error, the subscribe was never sent, and that
+                                // socket is still delivering its old strike.
+                                let unsubscribe_may_have_landed = unsubscribe_succeeded
+                                    || (wire_timed_out && swap.unsubscribe.is_some());
                                 let lost_instruments =
-                                    unsubscribe_succeeded && swap.subscribe.is_some();
+                                    unsubscribe_may_have_landed && swap.subscribe.is_some();
                                 // The guard already carries the NEW instrument
                                 // — see `try_swap` for why it is recorded
                                 // before the wire moves. That is what makes
@@ -3051,6 +3100,21 @@ where
                                 // strike that was chosen, not the one it had.
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    // Discriminator for the CloudWatch filter,
+                                    // and a string rather than the
+                                    // `lost_instruments` bool below on purpose:
+                                    // filter PATTERN syntax is validated only
+                                    // by the real PutMetricFilter call at apply
+                                    // time, so a malformed pattern passes every
+                                    // PR check and breaks the post-merge apply
+                                    // lane. This reuses the exact
+                                    // three-condition shape already proven live
+                                    // by the ws-gap-03 filters.
+                                    source = if lost_instruments {
+                                        "swap_emptied_socket"
+                                    } else {
+                                        "swap_wire_failed"
+                                    },
                                     endpoint = supervisor.slot().endpoint.as_str(),
                                     pool_index = supervisor.slot().pool_index,
                                     lost_instruments,
