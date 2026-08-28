@@ -3143,19 +3143,26 @@ where
                                 // breaks the post-merge apply lane. This reuses
                                 // the exact three-condition shape already
                                 // proven live by the ws-gap-03 filters.
+                                // THREE `source` values, not two, and the
+                                // reasoning is kept HERE rather than inside the
+                                // macro on purpose: `loss_counter_visibility_guard`
+                                // requires the counter below to sit near its
+                                // log line, and a comment block inside the
+                                // macro pushes it out of that window. That is
+                                // not a hypothetical — it broke this exact
+                                // counter twice today.
+                                //
+                                // The alarm keys on `swap_emptied_socket` only,
+                                // because that is the case a redial is
+                                // scheduled for. `swap_maybe_emptied` is the
+                                // honest third state: the unsubscribe did not
+                                // answer, so whether the socket is empty is
+                                // UNKNOWN here. Folding it into either of the
+                                // other two would be a claim this code cannot
+                                // make — one direction hides an empty socket,
+                                // the other pages for one that is fine.
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                    // Three values, not two. The alarm keys on
-                                    // `swap_emptied_socket` only, because that
-                                    // is the case a redial is scheduled for.
-                                    // `swap_maybe_emptied` is the honest third
-                                    // state: the unsubscribe did not answer, so
-                                    // whether the socket is empty is UNKNOWN
-                                    // here. Folding it into either of the other
-                                    // two would be a claim this code cannot
-                                    // make -- one direction hides an empty
-                                    // socket, the other pages for a socket that
-                                    // is fine.
                                     source = if lost_instruments {
                                         "swap_emptied_socket"
                                     } else if possibly_emptied {
