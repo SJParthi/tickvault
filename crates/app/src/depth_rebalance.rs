@@ -2413,7 +2413,6 @@ mod schedule_tests {
 
 #[cfg(test)]
 mod fifth_socket_tests {
-    use super::*;
     use crate::depth200_atm::DEPTH_200_TOP_MOVER_SOCKET;
 
     #[test]
