@@ -98,8 +98,8 @@ use tickvault_common::sanitize::capture_rest_error_body;
 
 use crate::partition_manager::{
     DAY_PARTITIONED_TABLES, HOUR_PARTITIONED_TABLES, RETENTION_EXEMPT_TABLES,
-    build_detach_list_sql, is_valid_partition_name, parse_partition_rows,
-    select_partitions_to_detach,
+    build_detach_list_sql, build_detach_list_sql_hours, is_valid_partition_name,
+    parse_partition_rows, select_partitions_to_detach,
 };
 use crate::wal_suspension_watcher::parse_wal_tables_response;
 
@@ -346,6 +346,67 @@ pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u3
         RetentionClass::MarketData | RetentionClass::Standard => MIN_HOT_DAYS,
     };
     effective_hot_days(class_days, floor)
+}
+
+// ---------------------------------------------------------------------------
+// Hour-granular eligibility — the mid-session reclaim
+// ---------------------------------------------------------------------------
+
+/// Tables whose designated `ts` is the ARRIVAL instant, not an exchange stamp.
+///
+/// This list is the whole safety argument for hour-granular archival, so it is
+/// a deliberate allowlist rather than "every HOUR-partitioned table".
+///
+/// `market_depth.ts` is stamped when the frame reached US
+/// (`depth_persistence.rs`, the "`ts` is ARRIVAL time" section) — the 12-byte
+/// depth header carries no timestamp at all, so there is nothing else it could
+/// be. Arrival is monotone, therefore an hour partition stops receiving writes
+/// the moment the wall clock leaves that hour, and a closed hour is genuinely
+/// closed.
+///
+/// **`ticks` is deliberately ABSENT and must stay absent.** Its `ts` is the
+/// exchange LAST-TRADE time (`tick_persistence::row_timestamp_ist_nanos`), so
+/// a quote packet for an illiquid option that last traded at 09:20 is written
+/// at 14:30 INTO the 09:20 partition — measured at ~10% of a session's ticks
+/// arriving more than an hour behind. Archiving `ticks` by the hour would
+/// therefore race live writes into a partition being detached. Day-granular
+/// eligibility is what makes that safe today, and it stays.
+pub(crate) const ARRIVAL_STAMPED_HOUR_TABLES: &[&str] = &["market_depth"];
+
+/// Floor on the hour-granular hot window. Never smaller, whatever config says.
+///
+/// Four hours, not one, and the margin is for WAL REPLAY rather than for the
+/// live path. A replayed frame carries its ORIGINAL receipt (the TVW3 record
+/// field), which is the entire point of that format — so a mid-session restart
+/// re-writes frames into partitions that are already closed. Live arrival is
+/// monotone; replay is not, and replay is the one writer that can move
+/// backwards.
+///
+/// Four hours bounds a restart that replays a backlog of up to four hours.
+/// Beyond that the replay would land in a detached partition — which QuestDB
+/// rejects rather than silently drops, so the failure is loud, but it is still
+/// a failure and the floor exists to keep it out of reach.
+pub(crate) const MIN_HOT_HOURS: u32 = 4;
+
+/// The effective hour-granular hot window for `table`, or `None` when the
+/// table is not eligible for hour-granular archival at all.
+///
+/// `None` is the answer for every table outside
+/// [`ARRIVAL_STAMPED_HOUR_TABLES`] — including `ticks` — and the caller MUST
+/// fall back to the day-granular path rather than inventing an hour window.
+#[must_use]
+pub(crate) fn hot_window_hours(table: &str, configured_hours: u32) -> Option<u32> {
+    if !ARRIVAL_STAMPED_HOUR_TABLES.contains(&table) {
+        return None;
+    }
+    if configured_hours == 0 {
+        // 0 is the OFF switch, not "archive everything". Treating it as a
+        // window would make the cutoff `now()`, which matches the partition
+        // being actively written — the exact hazard MIN_HOT_DAYS_MARKET_DATA's
+        // own comment warns about, one unit down.
+        return None;
+    }
+    Some(configured_hours.max(MIN_HOT_HOURS))
 }
 
 // ---------------------------------------------------------------------------
@@ -1727,7 +1788,15 @@ impl PartitionArchiver {
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
     /// partitions via the SAME primitives the detach path uses.
     async fn list_eligible_partitions(&self, table: &str, hot_days: u32) -> Result<Vec<String>> {
-        let list_sql = build_detach_list_sql(table, hot_days);
+        // Hour-granular where the table allows it, day-granular everywhere
+        // else. `hot_window_hours` returns `None` for every table outside the
+        // arrival-stamped allowlist and for a configured `0`, so the day path
+        // stays the default and the fallback — a table that is not provably
+        // safe for hour archival simply never reaches the hour builder.
+        let list_sql = match hot_window_hours(table, self.cfg.depth_hot_hours) {
+            Some(hours) => build_detach_list_sql_hours(table, hours),
+            None => build_detach_list_sql(table, hot_days),
+        };
         let response = self
             .ddl_client
             .get(&self.exec_url)
@@ -4372,6 +4441,97 @@ mod stub_integration_tests {
                 .expect("objects")
                 .contains_key("tv-test-cold/questdb-partitions/ticks/2026-04-01T09.csv.gz"),
             "the OLDEST partition goes first (monotonic progress)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hour_granular_eligibility_tests {
+    use super::*;
+    use crate::partition_manager::{build_detach_list_sql, build_detach_list_sql_hours};
+
+    /// THE safety property. `ticks` carries the exchange last-trade time, and
+    /// ~10% of a session's ticks arrive more than an hour behind it — into
+    /// partitions that are already closed. Hour-archiving it would race a live
+    /// write against a detach.
+    #[test]
+    fn ticks_can_never_reach_the_hour_path() {
+        for configured in [0, 1, 4, 6, 24, u32::MAX] {
+            assert_eq!(
+                hot_window_hours("ticks", configured),
+                None,
+                "ticks became hour-eligible at configured={configured} — its ts \
+                 is the exchange last-trade time, so a closed hour still \
+                 receives writes"
+            );
+        }
+        assert!(
+            !ARRIVAL_STAMPED_HOUR_TABLES.contains(&"ticks"),
+            "ticks must never join the arrival-stamped allowlist"
+        );
+    }
+
+    #[test]
+    fn only_arrival_stamped_tables_are_listed() {
+        // If this list ever grows, the new entry's `ts` must be the arrival
+        // instant. That is not checkable from here, so the test pins the list
+        // itself: adding a table is a deliberate act with a visible diff.
+        assert_eq!(ARRIVAL_STAMPED_HOUR_TABLES, &["market_depth"]);
+    }
+
+    #[test]
+    fn zero_hours_is_the_off_switch_not_an_empty_window() {
+        // The dangerous reading of 0 is "keep nothing", which makes the cutoff
+        // `now()` and matches the partition being actively written — the exact
+        // hazard MIN_HOT_DAYS_MARKET_DATA's own comment warns about, one unit
+        // down. It must mean OFF instead, falling back to the day path.
+        assert_eq!(hot_window_hours("market_depth", 0), None);
+    }
+
+    #[test]
+    fn a_configured_window_is_clamped_up_to_the_replay_floor() {
+        // Below the floor is where WAL replay bites: a replayed frame carries
+        // its ORIGINAL receipt, so a mid-session restart writes backwards into
+        // closed hours.
+        assert_eq!(hot_window_hours("market_depth", 1), Some(MIN_HOT_HOURS));
+        assert_eq!(hot_window_hours("market_depth", 3), Some(MIN_HOT_HOURS));
+        // At and above the floor the operator's value is honoured verbatim.
+        assert_eq!(hot_window_hours("market_depth", 4), Some(4));
+        assert_eq!(hot_window_hours("market_depth", 6), Some(6));
+        assert!(MIN_HOT_HOURS >= 4, "the replay margin must not shrink");
+    }
+
+    #[test]
+    fn the_hour_query_differs_from_the_day_query_only_in_its_unit() {
+        // A copy-paste that left 'd' in place would silently do nothing at all
+        // — the hour path would behave exactly like the day path it replaced,
+        // and the 78 GB would still not be reclaimed. Cheap to assert, and the
+        // failure is otherwise invisible.
+        let hours = build_detach_list_sql_hours("market_depth", 6);
+        let days = build_detach_list_sql("market_depth", 6);
+
+        assert!(hours.contains("dateadd('h', -6, now())"), "{hours}");
+        assert!(
+            !hours.contains("dateadd('d'"),
+            "hour query still says days: {hours}"
+        );
+        assert_eq!(
+            hours.replace("dateadd('h'", "dateadd('d'"),
+            days,
+            "the two queries must differ ONLY in the unit"
+        );
+    }
+
+    #[test]
+    fn the_table_name_is_quoted_so_the_query_is_well_formed() {
+        // Caught in review: an escaping slip had produced
+        // `table_partitions(.market_depth.)`, which QuestDB rejects. The
+        // detach path treats a failed list query as "no eligible partitions",
+        // so a malformed query reclaims nothing and says nothing.
+        let sql = build_detach_list_sql_hours("market_depth", 6);
+        assert!(
+            sql.contains("table_partitions('market_depth')"),
+            "table name must be single-quoted: {sql}"
         );
     }
 }
