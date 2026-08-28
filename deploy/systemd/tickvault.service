@@ -232,15 +232,16 @@ PrivateTmp=true
 # Graceful shutdown: send SIGTERM, wait, then SIGKILL.
 #
 # MEASURED AND RAISED 2026-08-21 (was 30s, which SIGKILLed the day's tail).
-# The app's shutdown path runs THREE bounded waits SEQUENTIALLY:
+# The app's shutdown path runs FOUR bounded waits SEQUENTIALLY:
 #
-#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = 30   (lane flush, runs first)
-#   SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = 75   (final seal drain, second)
-#   WAL_SPILL_SHUTDOWN_BUDGET_SECS       = 10   (WAL queue drain, third)
-#   worst case                           = 115s
+#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS   = 30   (lane flush, runs first)
+#   SEAL_WRITER_SHUTDOWN_BUDGET_SECS       = 75   (final seal drain, second)
+#   SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS   = 5    (escalation queue, third)
+#   WAL_SPILL_SHUTDOWN_BUDGET_SECS         = 10   (WAL queue drain, fourth)
+#   worst case                             = 120s
 #
-# The first two live in crates/app/src/main.rs; the third lives in
-# crates/storage/src/ws_frame_spill.rs and is reached through
+# Three live in crates/app/src/main.rs; WAL_SPILL_SHUTDOWN_BUDGET_SECS lives
+# in crates/storage/src/ws_frame_spill.rs and is reached through
 # WsFrameSpill::shutdown.
 #
 # At 30s the seal writer could receive at most 10s of its 75s budget, and at
@@ -252,7 +253,7 @@ PrivateTmp=true
 # very tail this exists to save" — the two files had simply drifted, with
 # nothing pinning them together.
 #
-# 140 = the 115s worst case + 25s margin. Raising it is fail-SAFE: it only
+# 145 = the 120s worst case + 25s margin. Raising it is fail-SAFE: it only
 # ever grants more time, never less. The daily 17:30 IST auto-stop is
 # unaffected — a 115s shutdown completes by ~17:31:55, and the stop-verify
 # lambda does not fire until 17:45 IST.
@@ -274,10 +275,23 @@ PrivateTmp=true
 # in its queue, counted by nothing. The drain that closes that hole is a
 # fourth thing competing for this timeout, so the timeout moved with it.
 #
+# 2026-08-28 (same day, third raise): 140 -> 145, because a FOURTH bounded
+# wait joined the path — SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS. Refused seals
+# used to write to disk INLINE on the frame-drain task (a spill mutex plus a
+# write(2), and on spill failure a create_dir_all, an open, a JSON heap
+# allocation and four more syscalls) — on the one thread that empties the
+# socket, which is how ticks are lost UPSTREAM at a vendor that skips slow
+# consumers forward with no sequence number. Moving that to a dedicated
+# thread creates a bounded queue, and a bounded queue that is not drained at
+# exit is the same silent loss the WAL raise above closed. The margin stays
+# 25s rather than narrowing to 20s: the guard permits 20 but calls it the
+# floor, and the teardown after the drain (API + otel shutdown, partition
+# detach) is what spends it.
+#
 # Pinned by crates/app/tests/shutdown_budget_fits_systemd_guard.rs — the
 # relationship, not the number: raising any app budget past this timeout
 # now fails the build.
-TimeoutStopSec=140
+TimeoutStopSec=145
 KillMode=mixed
 KillSignal=SIGTERM
 

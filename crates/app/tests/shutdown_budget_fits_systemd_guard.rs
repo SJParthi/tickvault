@@ -8,7 +8,8 @@
 //! |---|---|---|
 //! | `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` | 20s | first (main.rs:3552) |
 //! | `SEAL_WRITER_SHUTDOWN_BUDGET_SECS` | 75s | second (main.rs:3585) |
-//! | `WAL_SPILL_SHUTDOWN_BUDGET_SECS` | 10s | third (added 2026-08-28) |
+//! | `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` | 5s | third (added 2026-08-28) |
+//! | `WAL_SPILL_SHUTDOWN_BUDGET_SECS` | 10s | fourth (added 2026-08-28) |
 //!
 //! …for a worst case of **95 seconds**, while `deploy/systemd/tickvault.service`
 //! carried `TimeoutStopSec=30`. systemd therefore SIGKILLed the process 65s
@@ -94,6 +95,7 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
     // `WsFrameSpill::shutdown`, so a guard that only ever read main.rs would
     // have been structurally blind to it — the same shape as the unit file
     // being invisible to a compile-time assert.
+    let escalation = const_secs(&main_rs, "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS");
     let wal = const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS");
     let timeout = timeout_stop_secs(&unit);
 
@@ -101,7 +103,7 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
     // SUM. Summing (rather than taking the max) is the whole point: the bug
     // was that the seal writer inherited only the remainder after the lane
     // flush had already spent its budget.
-    let worst_case = lane + seal + wal;
+    let worst_case = lane + seal + escalation + wal;
 
     assert!(
         worst_case < timeout,
@@ -109,7 +111,8 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
          \n\
            DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = {lane}s (runs first)\n\
            SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = {seal}s (runs second)\n\
-           WAL_SPILL_SHUTDOWN_BUDGET_SECS       = {wal}s (runs third)\n\
+           SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS = {escalation}s (runs third)\n\
+           WAL_SPILL_SHUTDOWN_BUDGET_SECS       = {wal}s (runs fourth)\n\
            worst-case app shutdown              = {worst_case}s\n\
            systemd TimeoutStopSec               = {timeout}s\n\
          \n\
@@ -132,6 +135,7 @@ fn stop_timeout_keeps_a_real_margin_not_a_hairline() {
 
     let worst_case = const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS")
         + const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS")
+        + const_secs(&main_rs, "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS")
         + const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS");
     let timeout = timeout_stop_secs(&unit);
     let margin = timeout.saturating_sub(worst_case);
@@ -156,6 +160,7 @@ fn the_stop_timeout_is_documented_as_derived_not_guessed() {
     for needle in [
         "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS",
         "SEAL_WRITER_SHUTDOWN_BUDGET_SECS",
+        "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS",
         "WAL_SPILL_SHUTDOWN_BUDGET_SECS",
     ] {
         assert!(
