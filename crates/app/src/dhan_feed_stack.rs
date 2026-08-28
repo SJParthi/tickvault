@@ -2534,6 +2534,25 @@ pub const TOKEN_MANAGER_WAIT_ATTEMPTS: u64 = 60;
 /// almost nothing, since the loop exits on the first success.
 pub const TOKEN_MANAGER_WAIT_INTERVAL_SECS: u64 = 5;
 
+/// How many times the WAL refold re-checks for the seal writer before
+/// refusing to fold.
+///
+/// Short by design, and the reason is the ordering it protects rather than any
+/// latency budget: this check sits BELOW the token-manager wait above, and the
+/// manager is registered only after an SSM read, a TOTP computation and an
+/// HTTPS round trip. By the time control reaches here, `main` is long past its
+/// seal-writer spawn, so the sender is already installed and the loop exits on
+/// its first look. A long wait would therefore buy nothing real -- if the
+/// sender is missing after two seconds it is missing because the writer failed
+/// to install, not because it is slow, and continuing to sleep only delays the
+/// honest refusal. 20 x 100ms = 2s.
+pub const SEAL_WRITER_WAIT_ATTEMPTS: u64 = 20;
+
+/// Milliseconds between seal-writer re-checks. Milliseconds, not seconds,
+/// because the expected wait is zero: this exists to convert an ordering that
+/// currently holds by accident into one that holds by construction, not to
+/// absorb a real delay.
+pub const SEAL_WRITER_WAIT_INTERVAL_MS: u64 = 100;
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -7902,93 +7921,145 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // `capture_seq`, and the gap detector already knows every instrument, so a
     // recovered tick lands against a seeded slot rather than creating one.
     if !params.wal_replay_live_feed.is_empty() {
-        let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
-        if outcome.lost == 0 {
-            info!(
-                frames = params.wal_replay_live_feed.len(),
-                ticks = outcome.refolded,
-                "recovered live-feed frames from the write-ahead log and folded them — \
-                 ticks captured by a previous session are now in the database"
-            );
-        } else {
-            // Never silently green: a frame we could not re-fold is data we
-            // captured and then failed to save, which is exactly what this
-            // path exists to stop.
+        // ORDERING PIN -- added 2026-08-28.
+        //
+        // Every candle this refold seals goes through the seal closure, which
+        // reads `global_seal_sender()`. When that is `None` the seal is not
+        // buffered anywhere -- the absorption ring lives INSIDE
+        // `SealWriterRunner`, so before the runner exists there is no tier to
+        // absorb into -- and `escalate_refused_seal` records it as lost.
+        //
+        // Today the window is closed transitively rather than deliberately:
+        // this code sits below the token-manager wait above, and the manager
+        // is registered by `dhan_rest_stack` only after an SSM read, a TOTP
+        // computation and an HTTPS round trip, by which time `main` is long
+        // past the seal-writer spawn. That is a race won by a wide margin, not
+        // an ordering -- and it would break silently if either side moved.
+        //
+        // So it is checked. If the sender genuinely is not installed, the
+        // right move is NOT to fold into a void: refusing leaves the segments
+        // unconfirmed in `replaying/`, so the NEXT boot re-stages and re-folds
+        // them. Losing the seals AND archiving their segments -- which is what
+        // an unchecked fold would do -- is the only outcome that is
+        // unrecoverable.
+        let mut seal_writer_ready = false;
+        for attempt in 0..SEAL_WRITER_WAIT_ATTEMPTS {
+            if tickvault_storage::seal_writer_runner::global_seal_sender().is_some() {
+                if attempt > 0 {
+                    info!(
+                        waited_ms = attempt * SEAL_WRITER_WAIT_INTERVAL_MS,
+                        "WAL refold: seal writer registered — proceeding to fold"
+                    );
+                }
+                seal_writer_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                SEAL_WRITER_WAIT_INTERVAL_MS,
+            ))
+            .await;
+        }
+        if !seal_writer_ready {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "refold_no_seal_writer",
                 frames = params.wal_replay_live_feed.len(),
-                ticks = outcome.refolded,
-                lost = outcome.lost,
-                "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
+                waited_ms = SEAL_WRITER_WAIT_ATTEMPTS * SEAL_WRITER_WAIT_INTERVAL_MS,
+                "the seal writer is not installed, so any candle this refold sealed would \
+                 be dropped with nothing to absorb it. REFUSING to fold. The WAL segments \
+                 stay unconfirmed and the next boot will re-stage them — the frames are \
+                 not lost, the recovery is deferred."
+            );
+            report_unfolded_wal_frames(&params.wal_replay_live_feed, "seal_writer_missing");
+        } else {
+            let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
+            if outcome.lost == 0 {
+                info!(
+                    frames = params.wal_replay_live_feed.len(),
+                    ticks = outcome.refolded,
+                    "recovered live-feed frames from the write-ahead log and folded them — \
+                 ticks captured by a previous session are now in the database"
+                );
+            } else {
+                // Never silently green: a frame we could not re-fold is data we
+                // captured and then failed to save, which is exactly what this
+                // path exists to stop.
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    frames = params.wal_replay_live_feed.len(),
+                    ticks = outcome.refolded,
+                    lost = outcome.lost,
+                    "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
                  NOT be folded — the raw frames remain in the WAL archive and can be \
                  recovered manually",
-                outcome.lost
-            );
-        }
+                    outcome.lost
+                );
+            }
 
-        // CRASH-SAFETY CONFIRM — deliberately HERE, not at boot (2026-08-21).
-        //
-        // `confirm_replayed` moves the staged segments out of `replaying/` so
-        // they never re-stage. Its own doc says to call it "ONLY after the
-        // frames returned by `replay_all` have been durably re-captured into
-        // the live pipeline". Boot called it unconditionally, several thousand
-        // lines BEFORE this refold — the only code that makes that sentence
-        // true. Between those two points the segments sat in `archive/`,
-        // where the next boot does not look, while the frames they contained
-        // were still only in memory. A crash in that window lost them for
-        // good, and the archive pruner then deleted the raw bytes on a timer
-        // under a doc-comment asserting they were already persisted.
-        //
-        // Confirming here closes that window. If this process dies before
-        // reaching this line, the segments stay in `replaying/` and the next
-        // boot replays them again — which is idempotent, because every
-        // affected table dedups on its upsert key.
-        //
-        // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
-        // in the database, and the ones we could not are unfoldable rather
-        // than unread — re-replaying them next boot would fail identically
-        // while re-staging forever (the WS-REINJECT-01 growth-storm class).
-        // The `error!` above is what carries those, and it names the count.
-        // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
-        // default) rather than threaded through the params struct: one shared
-        // helper cannot drift out of sync with itself, whereas a second copy
-        // of the path in a struct field can.
-        // FLUSH BEFORE CONFIRMING -- added 2026-08-28.
-        //
-        // The block above says the confirm was moved here because it must run
-        // "ONLY after the frames have been durably re-captured into the live
-        // pipeline". Moving it shrank the window from several thousand lines
-        // to one. It did not CLOSE it: `refold_wal_frames` folds into an
-        // in-memory ILP buffer, and the drain that flushes that buffer is not
-        // spawned until well below this point. So "durably re-captured" still
-        // meant "buffered", and the segments were archived on the strength of
-        // it.
-        //
-        // The failure is the same one the block above describes itself
-        // fixing, one tier down: die before the drain's first flush and those
-        // frames are in `archive/`, where the next boot does not look, while
-        // their rows never reached the database. Silent and permanent.
-        //
-        // Flushing here makes the sentence true rather than nearly true. It
-        // is a boot-path call on a buffer holding at most one replay batch,
-        // so the cost is one ILP round trip before the sockets open -- and a
-        // failed flush is not silent either: `flush` counts it, logs it
-        // coded, and the rescue-to-spill tier below it still applies.
-        //
-        // Wrapped in `blocking_flush` like every other production flush: this
-        // is a boot-path call, but it is still on an async worker, and
-        // `LiveIngest::flush` flushes the inline-depth sink over blocking
-        // ILP-over-HTTP. The bare form was written first and
-        // `test_drain_never_flushes_bare_on_the_async_worker` rejected it --
-        // the guard held a line I walked into, which is what it is for.
-        let flushed = blocking_flush(|| ingest.flush());
-        tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
-        if flushed > 0 {
-            info!(
-                rows = flushed,
-                "flushed the re-folded WAL rows before archiving their segments — \
+            // CRASH-SAFETY CONFIRM — deliberately HERE, not at boot (2026-08-21).
+            //
+            // `confirm_replayed` moves the staged segments out of `replaying/` so
+            // they never re-stage. Its own doc says to call it "ONLY after the
+            // frames returned by `replay_all` have been durably re-captured into
+            // the live pipeline". Boot called it unconditionally, several thousand
+            // lines BEFORE this refold — the only code that makes that sentence
+            // true. Between those two points the segments sat in `archive/`,
+            // where the next boot does not look, while the frames they contained
+            // were still only in memory. A crash in that window lost them for
+            // good, and the archive pruner then deleted the raw bytes on a timer
+            // under a doc-comment asserting they were already persisted.
+            //
+            // Confirming here closes that window. If this process dies before
+            // reaching this line, the segments stay in `replaying/` and the next
+            // boot replays them again — which is idempotent, because every
+            // affected table dedups on its upsert key.
+            //
+            // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
+            // in the database, and the ones we could not are unfoldable rather
+            // than unread — re-replaying them next boot would fail identically
+            // while re-staging forever (the WS-REINJECT-01 growth-storm class).
+            // The `error!` above is what carries those, and it names the count.
+            // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
+            // default) rather than threaded through the params struct: one shared
+            // helper cannot drift out of sync with itself, whereas a second copy
+            // of the path in a struct field can.
+            // FLUSH BEFORE CONFIRMING -- added 2026-08-28.
+            //
+            // The block above says the confirm was moved here because it must run
+            // "ONLY after the frames have been durably re-captured into the live
+            // pipeline". Moving it shrank the window from several thousand lines
+            // to one. It did not CLOSE it: `refold_wal_frames` folds into an
+            // in-memory ILP buffer, and the drain that flushes that buffer is not
+            // spawned until well below this point. So "durably re-captured" still
+            // meant "buffered", and the segments were archived on the strength of
+            // it.
+            //
+            // The failure is the same one the block above describes itself
+            // fixing, one tier down: die before the drain's first flush and those
+            // frames are in `archive/`, where the next boot does not look, while
+            // their rows never reached the database. Silent and permanent.
+            //
+            // Flushing here makes the sentence true rather than nearly true. It
+            // is a boot-path call on a buffer holding at most one replay batch,
+            // so the cost is one ILP round trip before the sockets open -- and a
+            // failed flush is not silent either: `flush` counts it, logs it
+            // coded, and the rescue-to-spill tier below it still applies.
+            //
+            // Wrapped in `blocking_flush` like every other production flush: this
+            // is a boot-path call, but it is still on an async worker, and
+            // `LiveIngest::flush` flushes the inline-depth sink over blocking
+            // ILP-over-HTTP. The bare form was written first and
+            // `test_drain_never_flushes_bare_on_the_async_worker` rejected it --
+            // the guard held a line I walked into, which is what it is for.
+            let flushed = blocking_flush(|| ingest.flush());
+            tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
+            if flushed > 0 {
+                info!(
+                    rows = flushed,
+                    "flushed the re-folded WAL rows before archiving their segments — \
                  the recovered ticks are in the database, not just buffered"
-            );
+                );
+            }
         }
     }
 

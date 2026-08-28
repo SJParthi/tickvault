@@ -180,3 +180,57 @@ fn the_refolded_rows_are_flushed_before_their_segments_are_archived() {
          next boot does not look, by the time the rows reach the database."
     );
 }
+
+/// The refold must not fold into a void when the seal writer is absent.
+///
+/// Boot ordering here holds today only TRANSITIVELY: `run_dhan_feed_stack`
+/// parks in the token-manager wait, which cannot complete until an SSM read, a
+/// TOTP computation and an HTTPS round trip have finished, by which time
+/// `main` is long past `spawn_seal_writer_loop`. That is a race won by a wide
+/// margin, not an ordering — and a race won by a margin is exactly the shape
+/// that breaks silently when either side moves.
+///
+/// What makes the silent version unrecoverable is the pairing: a seal produced
+/// with no sender installed has no absorption tier to fall into (the ring
+/// lives inside `SealWriterRunner`), so it is recorded lost — AND the refold
+/// then confirms the segments, archiving the only copy of the frames that
+/// produced it. Refusing instead leaves the segments in `replaying/`, so the
+/// next boot re-stages them.
+#[test]
+fn the_refold_refuses_to_fold_when_the_seal_writer_is_not_installed() {
+    let source = include_str!("../src/dhan_feed_stack.rs");
+    let refold_at = source
+        .find("let outcome = refold_wal_frames(")
+        .expect("the WAL refold call site must exist");
+    let head = &source[..refold_at];
+    let check_at = head.rfind("global_seal_sender().is_some()").expect(
+        "the refold must check that the seal writer is installed BEFORE it folds — \
+             without it, a boot that reaches the refold early loses every recovered \
+             candle AND archives the frames that produced them",
+    );
+    let refuse_at = head.rfind("seal_writer_missing").expect(
+        "the not-ready branch must report the frames as unfolded, so the segments stay \
+         unconfirmed and the next boot re-stages them",
+    );
+    assert!(
+        check_at < refuse_at,
+        "the readiness check must precede the refusal it guards"
+    );
+    assert!(
+        source.contains(
+            "report_unfolded_wal_frames(&params.wal_replay_live_feed, \"seal_writer_missing\")"
+        ),
+        "the refusal must route through report_unfolded_wal_frames — silently skipping \
+         the refold would leave the operator with no record that recovery was deferred"
+    );
+    // The refusal must not also confirm: confirming archives the segments,
+    // which is the half that makes the loss permanent.
+    let confirm_at = source
+        .find("ws_frame_spill::confirm_replayed")
+        .expect("the confirm call must exist");
+    assert!(
+        refuse_at < confirm_at,
+        "the refusal branch must sit ABOVE the confirm, so a refused refold cannot \
+         archive the segments it declined to read"
+    );
+}
