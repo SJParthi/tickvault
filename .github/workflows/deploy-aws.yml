@@ -1245,11 +1245,52 @@ jobs:
               echo "EOF_DIAG"
             } >> "$GITHUB_ENV"
             echo "ROLLBACK: tickvault is not active after deploy — rolling back"
-            aws ssm send-command \
+            # `reset-failed` BEFORE the restart, and it is the whole reason a
+            # rollback can leave the box dead. The unit sets StartLimitBurst=8
+            # / RestartSec=3, so a binary that exits immediately trips the start
+            # limit within ~24s and systemd then REFUSES every further start
+            # with "Start request repeated too quickly" until the 600s
+            # StartLimitIntervalSec window expires. A bare `systemctl restart`
+            # in that state is a no-op: the good binary is back on disk and
+            # nothing runs it.
+            #
+            # Verified live on 2026-08-28, by hand, during the outage this was
+            # written for: `systemctl start` alone did nothing, and only
+            # `reset-failed` followed by `start` brought the app up.
+            #
+            # `cp` not `mv` for the backup: `mv` CONSUMES it, so a second
+            # rollback in the same session finds no backup and silently does
+            # nothing (the `if [ -f ... ]` simply falls through). Keeping the
+            # file means the recovery path is repeatable.
+            #
+            # The result is now READ instead of fired and forgotten, so a
+            # rollback that failed to restore service says so in the log
+            # rather than reporting the same "exit 1" as one that worked.
+            RB_CMD=$(aws ssm send-command \
               --region "$REGION" \
               --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
+              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ ! -f bin/tickvault.backup ]; then echo ROLLBACK_NO_BACKUP_BINARY; exit 1; fi","cp -f bin/tickvault.backup bin/tickvault","systemctl reset-failed tickvault || true","systemctl start tickvault","for i in $(seq 1 30); do if systemctl is-active --quiet tickvault; then echo ROLLBACK_ACTIVE; exit 0; fi; sleep 2; done","echo ROLLBACK_NOT_ACTIVE; systemctl status tickvault --no-pager -l | head -20; exit 1"]' \
+              --query 'Command.CommandId' --output text 2>/dev/null || echo "")
+            if [ -n "$RB_CMD" ]; then
+              for _ in $(seq 1 24); do
+                sleep 5
+                RB_STATE=$(aws ssm get-command-invocation --region "$REGION" \
+                  --command-id "$RB_CMD" --instance-id "$IID" \
+                  --query 'Status' --output text 2>/dev/null || echo "Pending")
+                case "$RB_STATE" in Success|Failed|Cancelled|TimedOut) break ;; esac
+              done
+              RB_OUT=$(aws ssm get-command-invocation --region "$REGION" \
+                --command-id "$RB_CMD" --instance-id "$IID" \
+                --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
+              if printf '%s' "$RB_OUT" | grep -q ROLLBACK_ACTIVE; then
+                echo "::warning::ROLLBACK SUCCEEDED — the previous binary is running. The deploy still FAILS so the bad build is not recorded as shipped."
+              else
+                echo "::error::ROLLBACK DID NOT RESTORE SERVICE (state=${RB_STATE:-unknown}). The box has NO APP. Output: ${RB_OUT}"
+              fi
+            else
+              echo "::error::ROLLBACK could not be dispatched — the box may have NO APP."
+            fi
             exit 1
           fi
           echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
