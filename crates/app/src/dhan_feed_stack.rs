@@ -7953,7 +7953,43 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // default) rather than threaded through the params struct: one shared
         // helper cannot drift out of sync with itself, whereas a second copy
         // of the path in a struct field can.
+        // FLUSH BEFORE CONFIRMING -- added 2026-08-28.
+        //
+        // The block above says the confirm was moved here because it must run
+        // "ONLY after the frames have been durably re-captured into the live
+        // pipeline". Moving it shrank the window from several thousand lines
+        // to one. It did not CLOSE it: `refold_wal_frames` folds into an
+        // in-memory ILP buffer, and the drain that flushes that buffer is not
+        // spawned until well below this point. So "durably re-captured" still
+        // meant "buffered", and the segments were archived on the strength of
+        // it.
+        //
+        // The failure is the same one the block above describes itself
+        // fixing, one tier down: die before the drain's first flush and those
+        // frames are in `archive/`, where the next boot does not look, while
+        // their rows never reached the database. Silent and permanent.
+        //
+        // Flushing here makes the sentence true rather than nearly true. It
+        // is a boot-path call on a buffer holding at most one replay batch,
+        // so the cost is one ILP round trip before the sockets open -- and a
+        // failed flush is not silent either: `flush` counts it, logs it
+        // coded, and the rescue-to-spill tier below it still applies.
+        //
+        // Wrapped in `blocking_flush` like every other production flush: this
+        // is a boot-path call, but it is still on an async worker, and
+        // `LiveIngest::flush` flushes the inline-depth sink over blocking
+        // ILP-over-HTTP. The bare form was written first and
+        // `test_drain_never_flushes_bare_on_the_async_worker` rejected it --
+        // the guard held a line I walked into, which is what it is for.
+        let flushed = blocking_flush(|| ingest.flush());
         tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
+        if flushed > 0 {
+            info!(
+                rows = flushed,
+                "flushed the re-folded WAL rows before archiving their segments — \
+                 the recovered ticks are in the database, not just buffered"
+            );
+        }
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
@@ -13143,13 +13179,45 @@ mod tests {
         // is unchanged; only the arm count moved. Kept as an exact equality
         // rather than `>= 1` for the same reason it was exact before: a `>=`
         // would stop noticing the helper being inlined back into the drain.
+        //
+        // 2026-08-28: THREE, not two — and the third is deliberately NOT in
+        // the helper. The boot path now flushes the re-folded WAL rows before
+        // `confirm_replayed` archives their segments (see FLUSH BEFORE
+        // CONFIRMING above); that call is on `run_dhan_feed_stack` itself,
+        // before the drain task exists, so routing it through
+        // `flush_and_record` would report feed-health for a lane that has not
+        // opened a socket yet.
+        //
+        // The choke-point property this assertion actually protects is
+        // therefore checked directly below instead of being inferred from the
+        // total: `flush_and_record` must still contain exactly TWO, so the
+        // helper cannot be inlined back into the drain and a drain flush
+        // cannot bypass it — regardless of how many boot-path flushes exist.
         assert_eq!(
-            wrapped, 2,
-            "expected exactly TWO wrapped ingest.flush() calls — the offloaded \
-             early return and the synchronous fallback, both inside \
-             `flush_and_record`. Found {wrapped}: either a flush site bypassed \
-             the helper, or the helper was inlined back into the drain (which \
-             re-opens the four-sites-to-keep-in-sync problem)"
+            wrapped, 3,
+            "expected exactly THREE wrapped ingest.flush() calls — the two \
+             arms of `flush_and_record` plus the boot-path flush that precedes \
+             `confirm_replayed`. Found {wrapped}: a flush site was added or \
+             removed without updating this pin"
+        );
+        // The real invariant, independent of the total above: both DRAIN
+        // flushes live inside the one helper.
+        let helper_start = production_half
+            .find("fn flush_and_record")
+            .expect("flush_and_record must exist");
+        let helper_end = production_half[helper_start..]
+            .find("\nfn ")
+            .map_or(production_half.len(), |off| helper_start + off);
+        let wrapped_in_helper = production_half[helper_start..helper_end]
+            .matches("blocking_flush(|| ingest.flush())")
+            .count();
+        assert_eq!(
+            wrapped_in_helper, 2,
+            "expected exactly TWO wrapped ingest.flush() calls INSIDE \
+             `flush_and_record` — the offloaded early return and the \
+             synchronous fallback. Found {wrapped_in_helper}: either the helper \
+             was inlined back into the drain (which re-opens the \
+             four-sites-to-keep-in-sync problem) or a drain flush bypassed it"
         );
         let recorded_sites = production_half
             .matches("flush_and_record(&mut ingest, &feed_health)")
