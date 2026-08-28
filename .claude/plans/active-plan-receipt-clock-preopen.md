@@ -204,3 +204,54 @@ needs its own dated authorization under the noise lock.
 | 8 | Stock gaps 15% intraday | Re-fit adds ~6 strikes, inside cap and inside slot headroom |
 | 9 | Slot ceiling reached | Re-fit stops adding, counts, logs; existing subscriptions unaffected |
 | 10 | W2 merged without W1 | Blocked by the ordering gate; if forced, scenario 2 regresses to the measured 8.8% loss |
+
+---
+
+## Per-Item Guarantee Matrix
+
+Per `.claude/rules/project/per-wave-guarantee-matrix.md`. Applies to every
+workstream W1–W5 in this plan.
+
+### 15-row "100% everything" matrix
+
+| Demand | Proof artefact for THIS plan | Status |
+|---|---|---|
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` per-crate floors; coverage delta ≥ 0 on the PR | enforced by CI |
+| 100% audit coverage | WAL replay outcome counters + the coded rollback error (W1); `rest_fetch_audit` unchanged | W1 partial |
+| 100% testing coverage | T1–T16 in the Test Plan above; the 22 categories apply to storage/core/trading/app | 6 of 16 written |
+| 100% code checks | banned-pattern, pub-fn-test, pub-fn-wiring, plan-verify, secret-scan, fmt, clippy | green |
+| 100% code performance | DHAT zero-alloc on the fold (T16); the TVW3 append adds 8 bytes on an already-moved struct, no allocation | T16 pending |
+| 100% monitoring | the 7 counters in Observability above | 2 of 7 written |
+| 100% logging | every refusal path carries `code = ErrorCode::…`; the rollback path gains one (W1 defect 2) | in progress |
+| 100% alerting | deliberately NOT bundled — a new pager needs its own dated authorization under the noise lock | stated, not built |
+| 100% security | no secret touches this path; the WAL carries frame bytes only | n/a |
+| 100% security hardening | the receipt is banded like the exchange timestamp (W1 defect 4), so a corrupt value cannot become a designated timestamp | in progress |
+| 100% bugs fixing | adversarial agent pass run BEFORE the code shipped; 2 CRITICAL + 1 MEDIUM found in my own TVW3 work and being fixed | done, fixes in progress |
+| 100% scenarios covering | 10 scenarios in the Scenarios table; rollback added as #11 | in progress |
+| 100% functionalities covering | every new pub fn has a test or a TEST-EXEMPT naming a real test (verified: both named tests now exist and pass) | done for W1 |
+| 100% code review | adversarial pass before impl (done) and after the diff (pending) | half |
+| 100% extreme check | bite-proofs: 3 run on TVW3, each observed to FAIL with the fix reverted, then restored | done for W1 |
+
+### 7-row resilience matrix
+
+| Demand | Honest envelope for THIS plan | Per-item proof |
+|---|---|---|
+| Zero ticks lost | W1 makes replayed ticks land in their ORIGINAL minute instead of the replay minute. Bounded: it cannot recover a frame the WAL never received | T1, T5; bite-proven |
+| WS never disconnects | Untouched. W5 must not send subscribes on the reader task, because the keepalive is only emitted while it polls | T15 |
+| Never slow/locked/hanged | TVW3 adds 8 bytes and no allocation to the append; the extra clock read is on the caller, not this path | T16 (DHAT) |
+| QuestDB never fails | Untouched. The receipt reaches `received_at`, never the dedup key | existing dedup guard |
+| O(1) latency | Append O(1) zero-alloc; replay parse O(bytes), boot only; percentages O(1); the ATM re-fit is O(strikes)/minute OFF the drain — flagged, not claimed O(1) | stated honestly above |
+| Uniqueness + dedup | `received_at` is deliberately NOT in any DEDUP key — it is re-stamped on replay today, which is why it would create duplicate rows. W1 does not change that | `DEDUP_KEY_TICKS` unchanged |
+| Real-time proof | the 7 counters above; the three that can indicate a broken assumption go on the operator dashboard | 2 of 7 written |
+
+### Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: the TVW3
+record round-trips a caller-supplied receipt exactly, rejects a truncated v3
+tail without panicking, detects a receipt-byte flip by CRC, and accounts its own
+on-disk size — each bite-proven by reverting the fix and observing the guard
+fail. v1 and v2 segments still replay, with the sentinel rather than a
+synthesized timestamp. **NOT claimed:** that the receipt reaches the database —
+the two stamping sites are not yet wired, so on the box today every v3 record
+carries the sentinel; that a rollback to a pre-v3 binary is safe (it is not, and
+the fix is in this plan); or that any workstream beyond W1 exists in code.
