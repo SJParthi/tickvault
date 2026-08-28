@@ -87,12 +87,25 @@ use crate::candles::{TF_COUNT, TfIndex};
 /// could not land half-applied: the ring capacity math derives from the same
 /// two constants, so a session move that missed this file would fail the
 /// BUILD rather than silently under-size every per-timeframe ring.
-pub const SESSION_SECS: u32 =
-    ((MARKET_CLOSE_IST_NANOS - MARKET_OPEN_IST_NANOS) / 1_000_000_000) as u32;
+/// 2026-08-28: the RAM ring must span the CANDLE session, which now opens at
+/// 09:00 with the pre-open call auction - not the market open at 09:15. Sized
+/// off `MARKET_OPEN_IST_NANOS` this ring was fifteen minutes short of the
+/// grid feeding it, so the first fifteen pre-open 1m bars of every day would
+/// have been evicted by the day's own later bars: a silent, capacity-shaped
+/// data loss that no counter would have reported.
+pub const CANDLE_SESSION_OPEN_IST_NANOS: i64 = 32_400 * 1_000_000_000;
 
 const _: () = assert!(
-    SESSION_SECS == 23_100,
-    "session length must be 385 minutes (09:15-15:40 IST)"
+    CANDLE_SESSION_OPEN_IST_NANOS < MARKET_OPEN_IST_NANOS,
+    "the candle session must open BEFORE the market, never at or after it"
+);
+
+pub const SESSION_SECS: u32 =
+    ((MARKET_CLOSE_IST_NANOS - CANDLE_SESSION_OPEN_IST_NANOS) / 1_000_000_000) as u32;
+
+const _: () = assert!(
+    SESSION_SECS == 24_000,
+    "session length must be 400 minutes (09:00-15:40 IST): 15 pre-open + 385 regular"
 );
 
 /// One sealed bar resident in RAM — 48 bytes, `Copy`, no heap.
@@ -655,21 +668,25 @@ mod tests {
 
     #[test]
     fn test_bars_per_day_session_math() {
-        // ceil(23_100 / tf_secs), floored at 1 — spot-checked + summed.
+        // ceil(24_000 / tf_secs), floored at 1 — spot-checked + summed.
         // 2026-08-07: session 375 -> 385 min (NSE CAS change 2026-08-03).
-        assert_eq!(bars_per_day(TfIndex::M1), 385);
-        assert_eq!(bars_per_day(TfIndex::M3), 129);
-        assert_eq!(bars_per_day(TfIndex::M5), 77);
-        assert_eq!(bars_per_day(TfIndex::M15), 26);
+        // 2026-08-28: 385 -> 400 min — the candle session now opens at 09:00
+        // with the NSE pre-open call auction, so every ring gained the 15
+        // pre-open minutes it must hold. M1 385 -> 400, M3 129 -> 134,
+        // M5 77 -> 80.
+        assert_eq!(bars_per_day(TfIndex::M1), 400);
+        assert_eq!(bars_per_day(TfIndex::M3), 134);
+        assert_eq!(bars_per_day(TfIndex::M5), 80);
+        assert_eq!(bars_per_day(TfIndex::M15), 27);
         assert_eq!(bars_per_day(TfIndex::D1), 1);
         // 2026-08-10: M2/M30/M60 appended (operator Quote 13's thirteen
-        // frames). ceil(23_100/120)=193, ceil(23_100/1800)=13,
-        // ceil(23_100/3600)=7 → 618 + 213 = 831.
-        assert_eq!(bars_per_day(TfIndex::M2), 193);
-        assert_eq!(bars_per_day(TfIndex::M30), 13);
+        // frames). 2026-08-28 (400-min session): ceil(24_000/120)=200,
+        // ceil(24_000/1800)=14, ceil(24_000/3600)=7 → 642 + 221 = 863.
+        assert_eq!(bars_per_day(TfIndex::M2), 200);
+        assert_eq!(bars_per_day(TfIndex::M30), 14);
         assert_eq!(bars_per_day(TfIndex::M60), 7);
-        assert_eq!(total_bars_per_day_all_tfs(), 831);
-        assert_eq!(SESSION_SECS, 23_100);
+        assert_eq!(total_bars_per_day_all_tfs(), 863);
+        assert_eq!(SESSION_SECS, 24_000);
     }
 
     #[test]
@@ -677,10 +694,13 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 831 × 35 × 8 × 48 = 11_168_640 B ≈ 10.6 MiB
+        // 863 × 35 × 8 × 48 = 11_598_720 B ≈ 11.1 MiB
         // (2026-08-07: 601 -> 618 bars/day with the 385-minute session;
-        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13.)
-        assert_eq!(bytes, 11_168_640);
+        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13;
+        //  2026-08-28: 831 -> 863 with the 09:00 pre-open open — +430 KB
+        //  total, i.e. the whole pre-open capture costs under half a
+        //  megabyte of RAM at the design envelope.)
+        assert_eq!(bytes, 11_598_720);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -726,12 +746,12 @@ mod tests {
 
     #[test]
     fn test_spot_bar_store_wraparound_evicts_oldest() {
-        // spot_days=1 → M15 capacity = 26 bars (385-min session, 2026-08-07);
-        // the 27th append evicts the oldest, and an over-window old bar is
-        // dropped (never displaces).
+        // spot_days=1 → M15 capacity = 27 bars (400-min session, 2026-08-28
+        // — was 26 on the 385-min one); the 28th append evicts the oldest,
+        // and an over-window old bar is dropped (never displaces).
         let store = SpotBarStore::new(1);
         let cap = bars_per_day(TfIndex::M15) as usize;
-        assert_eq!(cap, 26);
+        assert_eq!(cap, 27);
         for i in 0..(cap as u32 + 1) {
             store.append_sealed(key(), TfIndex::M15, bar(OPEN0 + i * 900, f64::from(i)));
         }
@@ -864,9 +884,10 @@ mod tests {
         assert_eq!(stats.bars_resident_per_feed[Feed::Truedata.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Truedata.index()], 1);
-        // Two slots × 1 day × 831 bars × 48 B of pre-allocated capacity
-        // (385-min session; 618 -> 831 on 2026-08-10 with M2/M30/M60).
-        assert_eq!(stats.estimated_bytes, 2 * 831 * 48);
+        // Two slots × 1 day × 863 bars × 48 B of pre-allocated capacity
+        // (400-min session since 2026-08-28; 618 -> 831 on 2026-08-10 with
+        // M2/M30/M60, then 831 -> 863 with the 09:00 pre-open open).
+        assert_eq!(stats.estimated_bytes, 2 * 863 * 48);
     }
 
     #[test]
@@ -876,29 +897,30 @@ mod tests {
         // pinned 16 × 48 B = 768 B/slot of actual heap) and are excluded
         // from the RAM-resident bar total + byte estimate; the session
         // formula stays honest for the future GDF capacity flip.
-        assert_eq!(bars_per_day(TfIndex::S1), 23_100);
-        assert_eq!(bars_per_day(TfIndex::S2), 11_550);
-        assert_eq!(bars_per_day(TfIndex::S15), 1_540);
-        assert_eq!(bars_per_day(TfIndex::S30), 770);
+        assert_eq!(bars_per_day(TfIndex::S1), 24_000);
+        assert_eq!(bars_per_day(TfIndex::S2), 12_000);
+        assert_eq!(bars_per_day(TfIndex::S15), 1_600);
+        assert_eq!(bars_per_day(TfIndex::S30), 800);
         let mut gated_formula_total = 0u32;
         for tf in TfIndex::ALL {
             if tf.is_second_scale() {
                 gated_formula_total += bars_per_day(tf);
             }
         }
-        // 2026-08-07: 75_413 -> 77_422 with the 385-minute session. These are
+        // 2026-08-07: 75_413 -> 77_422 with the 385-minute session;
+        // 2026-08-28: 77_422 -> 80_440 with the 400-minute one. These are
         // the GDF-gated second-scale frames — capacity-1 placeholders today,
         // so the number is the would-be formula cost, not allocated memory.
-        assert_eq!(gated_formula_total, 77_422, "gated formula sum drifted");
+        assert_eq!(gated_formula_total, 80_440, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
         // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13). These
         // three are minute-scale, so unlike the GDF-gated second frames they
         // ARE resident and DO count toward the byte estimate.
-        assert_eq!(total_bars_per_day_all_tfs(), 831);
+        assert_eq!(total_bars_per_day_all_tfs(), 863);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 831 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 863 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");

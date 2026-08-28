@@ -80,9 +80,20 @@ pub const RAM_STORE_STATS_RESPAWN_BACKOFF_SECS: u64 = 5;
 /// row-cap worst case.
 pub const RAM_CHAIN_REHYDRATE_WINDOW_MINUTES: usize = 30;
 
-/// Session windows per day: 13 × 30 min covers [09:15, 15:45) IST — the
-/// 375-minute session plus the legs' boundary-fire margin.
-pub const RAM_CHAIN_REHYDRATE_WINDOW_COUNT: usize = 13;
+/// Session windows per day: 14 × 30 min covers [09:00, 16:00) IST — the
+/// 400-minute candle session plus the legs' boundary-fire margin.
+///
+/// **2026-08-28: 13 -> 14, and it had to move WITH the anchor above.** The
+/// old pair (09:15 + 13 windows) covered [09:15, 15:45). Moving only the
+/// anchor to 09:00 would have covered [09:00, 15:30) — trading one silent
+/// hole at the START of the day for a new one at the END, dropping the
+/// 15:30-15:40 closing-auction window that the 2026-08-03 NSE CAS change
+/// added. Anchor and count are a pair; neither moves alone.
+///
+/// 400 min / 30 = 13.33, so 14 windows are the ceiling, and the 14th runs
+/// past the close into 16:00 — harmless, since a window with no rows reads
+/// nothing.
+pub const RAM_CHAIN_REHYDRATE_WINDOW_COUNT: usize = 14;
 
 /// Ceiling on the spot store's PROJECTED ring capacity, in bytes — the
 /// FALLBACK, used only when the host's memory cannot be read.
@@ -245,8 +256,23 @@ pub const MAX_SPOT_BAR_SLOTS_U32: u32 = MAX_SPOT_BAR_SLOTS as u32;
 /// this alone is precisely the bug being fixed.
 pub const RAM_STORE_SAMPLE_SLOT_COUNT: u32 = 8;
 
-/// NSE session open, IST seconds-of-day (09:15).
-const SESSION_OPEN_SECS_OF_DAY: i64 = 9 * 3600 + 15 * 60;
+/// Candle session open, IST seconds-of-day (09:00).
+///
+/// **2026-08-28: 09:15 -> 09:00, and this one was a SILENT hole rather than a
+/// failing test.** This constant anchors `rehydrate_window_starts`, which is
+/// how a mid-session restart pulls the day's already-sealed bars back out of
+/// `candles_1m` into RAM. When the candle grid moved to 09:00 and this stayed
+/// at 09:15, the rehydrate windows began fifteen minutes AFTER the first bar
+/// of the day — so a restart at, say, 11:00 would have silently rebuilt RAM
+/// without the entire pre-open auction, including the 09:12 equilibrium bar
+/// that the whole change exists to capture. Nothing would have reported it:
+/// the bars are in QuestDB, the rehydrate reports success, and RAM is simply
+/// missing a window nobody asked it for.
+///
+/// Found by an adversarial cross-crate sweep, not by a test — which is the
+/// point worth recording. A constant that is merely NARROWER than the grid
+/// fails no assertion; it just under-reads.
+const SESSION_OPEN_SECS_OF_DAY: i64 = 9 * 3600;
 
 /// IST offset in seconds (UTC + 5:30).
 const IST_UTC_OFFSET_SECS: i64 = 19_800;
@@ -1103,23 +1129,34 @@ mod tests {
         let win = (RAM_CHAIN_REHYDRATE_WINDOW_MINUTES as i64) * MIN;
         // Pre-market boot: nothing to rehydrate.
         assert!(rehydrate_window_starts(day, open - NANOS_PER_SEC).is_empty());
-        // Mid-session (11:00 IST = open + 105 min): windows 09:15..11:00
-        // have opened — 09:15, 09:45, 10:15, 10:45.
+        // Mid-session (10:45 IST = open + 105 min): windows 09:00..10:45
+        // have opened — 09:00, 09:30, 10:00, 10:30.
         let now = open + 105 * MIN;
         let starts = rehydrate_window_starts(day, now);
         assert_eq!(starts.len(), 4);
         assert_eq!(starts[0], open);
         assert_eq!(starts[3], open + 3 * win);
-        // Post-close boot: ALL 13 windows (covering 09:15..15:45) open.
+        // 2026-08-28: the FIRST window must be 09:00, not 09:15 - a restart
+        // that begins reading at 09:15 silently loses the pre-open auction
+        // bars, including the 09:12 equilibrium bar.
+        assert_eq!(starts[0], day + 9 * 3600 * NANOS_PER_SEC);
+        // Post-close boot: ALL 14 windows (covering 09:00..16:00) open.
         let post = day + (15 * 3600 + 50 * 60) * NANOS_PER_SEC;
         let all = rehydrate_window_starts(day, post);
         assert_eq!(all.len(), RAM_CHAIN_REHYDRATE_WINDOW_COUNT);
         assert_eq!(
             *all.last().expect("non-empty"),
-            open + 12 * win,
-            "last window opens 15:15 IST and covers through 15:45"
+            open + 13 * win,
+            "last window opens 15:30 IST and covers through 16:00"
         );
-        // The 13-window grid covers the whole [09:15, 15:30) session.
-        assert!(open + 13 * win >= day + (15 * 3600 + 30 * 60) * NANOS_PER_SEC);
+        // The 14-window grid covers the whole [09:00, 15:40) candle session -
+        // 15:40, not 15:30, since the 2026-08-03 NSE CAS change. A 13-window
+        // grid from 09:00 would stop at 15:30 and drop the closing auction.
+        assert!(open + 14 * win >= day + (15 * 3600 + 40 * 60) * NANOS_PER_SEC);
+        assert!(
+            open + 13 * win < day + (15 * 3600 + 40 * 60) * NANOS_PER_SEC,
+            "13 windows from 09:00 would NOT reach the 15:40 close - this is \
+             the assertion that forces the count to move with the anchor"
+        );
     }
 }

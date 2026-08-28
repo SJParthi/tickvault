@@ -600,11 +600,32 @@ pub fn top_mover_pick(rows: &[MoverRow], candidates: &[DepthCandidate]) -> Optio
 /// ranking than present and unusable.
 #[must_use]
 pub fn build_movers_query(today_ist_micros: i64) -> String {
+    /// 09:15:00 IST as seconds-of-day. Local to this query on purpose: it is
+    /// the MARKET open (when a real ranking becomes meaningful), which since
+    /// 2026-08-28 is deliberately NOT the candle-grid open (09:00).
+    const MARKET_OPEN_SECS_OF_DAY_IST: i64 = 9 * 3600 + 15 * 60;
     let segment = MOVER_UNDERLYING_SEGMENT.as_str();
+    // 2026-08-28: floored at the MARKET open (09:15), not midnight.
+    //
+    // This is a defence of the 09:13 requirement, not a restriction of it.
+    // When the candle grid moved to 09:00, `candles_1m` began holding
+    // pre-open auction bars — so this query, which was reliably EMPTY before
+    // ~09:16 and fell through to the purpose-built tick ranking below,
+    // suddenly returned rows at 09:13 and the fallback became dead code.
+    // Nothing would have failed: the `MOVERS_SOURCE` label would simply have
+    // flipped `ticks` -> `candles` and the ranking would come from thin
+    // auction bars (equities print nothing until ~09:07) instead of the tick
+    // path that was measured against this exact deadline.
+    //
+    // A silent source swap on a stated operator requirement is the false-OK
+    // class. The floor keeps the fallback reachable and the behaviour
+    // identical to what was measured.
+    let market_open_micros =
+        today_ist_micros.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST.saturating_mul(1_000_000));
     format!(
         "SELECT c.security_id, il.symbol_name, c.close_pct_from_prev_day \
          FROM (SELECT security_id, close_pct_from_prev_day FROM candles_1m \
-         WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {today_ist_micros} \
+         WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {market_open_micros} \
          LATEST ON ts PARTITION BY security_id) c \
          JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle \
          WHERE feed = 'dhan' AND exchange_segment = '{segment}') il \
@@ -1682,8 +1703,20 @@ mod tests {
     fn the_movers_query_is_bounded_to_today() {
         // Without this the same LATEST ON returns yesterday's ranking, which
         // is indistinguishable from a real one.
+        //
+        // 2026-08-28: the bound is now today's midnight PLUS the 09:15 market
+        // open (33_300 s = 33_300_000_000 micros), so pre-open auction candles
+        // cannot pre-empt the purpose-built tick ranking that meets the 09:13
+        // deadline. Still bounded to today - that property is what this test
+        // is for and it is asserted below independently of the offset.
         let sql = build_movers_query(1_900_000_000_000_000);
-        assert!(sql.contains("ts >= 1900000000000000"), "{sql}");
+        assert!(sql.contains("ts >= 1900033300000000"), "{sql}");
+        // Bounded-to-today, restated in a form the offset cannot weaken: the
+        // floor must be at or after midnight and strictly inside the same day.
+        assert!(
+            !sql.contains("ts >= 1899"),
+            "floor fell into yesterday: {sql}"
+        );
         assert!(
             sql.contains("LATEST ON ts PARTITION BY security_id"),
             "{sql}"
@@ -2664,8 +2697,23 @@ mod preopen_readiness_tests {
     #[test]
     fn both_rankings_are_bounded_to_today_and_keyed_per_instrument() {
         // An unbounded LATEST ON walks every partition ever written.
-        for sql in [build_movers_query(TODAY), build_preopen_movers_query(TODAY)] {
-            assert!(sql.contains("ts >= 1700000000000000"), "{sql}");
+        //
+        // 2026-08-28: the two rankings now have DIFFERENT floors, and that
+        // asymmetry is the point. The candle ranking floors at the 09:15
+        // market open so pre-open auction bars cannot pre-empt the tick path;
+        // the pre-open tick ranking floors at midnight because it must be
+        // available from the 09:00 capture start. Both are still bounded to
+        // today, which is what this test guards.
+        let floors = [
+            (build_movers_query(TODAY), "ts >= 1700033300000000"),
+            (build_preopen_movers_query(TODAY), "ts >= 1700000000000000"),
+        ];
+        for (sql, floor) in floors {
+            assert!(sql.contains(floor), "{sql}");
+            assert!(
+                !sql.contains("ts >= 1699"),
+                "floor fell into yesterday: {sql}"
+            );
             assert!(
                 sql.contains("LATEST ON ts PARTITION BY security_id"),
                 "{sql}"

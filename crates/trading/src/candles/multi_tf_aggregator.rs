@@ -57,7 +57,7 @@ use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 
 use crate::candles::aggregator_cell::{AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices};
-use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
+use crate::candles::tf_index::{CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST};
 use crate::candles::{BufferOutcome, BufferedSeal, LiveCandleState, SealRing, TfIndex};
 
 /// Hard ceiling on distinct `(feed, security_id, segment)` identities the
@@ -780,7 +780,17 @@ impl MultiTfAggregator {
         // not read `.contains(` as a Vec scan.
         // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
         #[allow(clippy::manual_range_contains)]
-        let out_of_session = secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST
+        // 2026-08-28: the fold window opens at 09:00, not 09:15. The NSE
+        // pre-open call auction (09:00-09:12) is where the day's opening price
+        // is actually discovered, and until this gate moved, every tick of it
+        // was refused here as `out_of_session` - so the equilibrium print that
+        // BECOMES the 09:15 open was never folded into any candle. The comment
+        // above ("a pre-open tick that slipped past this gate would CORRUPT the
+        // 09:15 candle") described the OLD grid, which clamped everything
+        // earlier into the 09:15 bucket; the grid now has real buckets to put
+        // those ticks in, so admitting them forms pre-open candles instead of
+        // corrupting anything.
+        let out_of_session = secs_of_day < CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
             || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
         if out_of_session {
             return ConsumeStats {
@@ -1074,6 +1084,11 @@ mod tests {
     const DAY: u32 = 1_779_321_600;
     /// 09:15:00 IST of [`DAY`].
     const OPEN: u32 = DAY + 33_300;
+    /// 2026-08-28: the CANDLE session opens at 09:00, fifteen minutes before
+    /// the market. Session-gate tests must use THIS, not `OPEN` - a tick at
+    /// 09:14 is now legitimately in-session (it is a pre-open auction tick),
+    /// so asserting it is gated would be asserting the bug this change fixed.
+    const CANDLE_OPEN: u32 = DAY + 32_400;
 
     const SEG_IDX: u8 = 0;
     const SEG_EQ: u8 = 1;
@@ -1713,7 +1728,10 @@ mod tests {
         assert_eq!(count, 0);
         // An instrument that only ever received an OUT-OF-SESSION tick has a
         // slot? No — the gate returns before slot allocation.
-        let pre_open = OPEN - 60;
+        // 2026-08-28: `OPEN - 60` (09:14) is now IN session - it is a
+        // pre-open auction minute and folds into a real 09:14 candle. The
+        // out-of-session case moved one minute earlier than the CANDLE open.
+        let pre_open = CANDLE_OPEN - 60;
         let stats = agg.consume_tick(
             Feed::Dhan,
             &tick(13, SEG_IDX, pre_open, 100.0, 1),
@@ -1971,7 +1989,10 @@ mod tests {
     #[test]
     fn test_multi_tf_aggregator_gates_ticks_outside_the_candle_session() {
         let mut agg = MultiTfAggregator::default();
-        for ts in [OPEN - 1, DAY, DAY + 56_400, DAY + 86_399] {
+        // 2026-08-28: `CANDLE_OPEN - 1` (08:59:59) replaces `OPEN - 1`
+        // (09:14:59) as the last gated second - the fifteen pre-open minutes
+        // between them are now captured, which is the point of the change.
+        for ts in [CANDLE_OPEN - 1, DAY, DAY + 56_400, DAY + 86_399] {
             let stats = agg.consume_tick(
                 Feed::Dhan,
                 &tick(13, SEG_IDX, ts, 100.0, 1),
@@ -1983,10 +2004,11 @@ mod tests {
             assert!(stats.out_of_session, "ts {ts} must be gated");
             assert!(!stats.folded());
         }
-        // The first in-session second IS accepted.
+        // The first in-session second IS accepted - 09:00:00, the first
+        // second of the NSE pre-open call auction.
         let stats = agg.consume_tick(
             Feed::Dhan,
-            &tick(13, SEG_IDX, OPEN, 100.0, 1),
+            &tick(13, SEG_IDX, CANDLE_OPEN, 100.0, 1),
             None,
             |_, _, _, _, _| {},
         );
