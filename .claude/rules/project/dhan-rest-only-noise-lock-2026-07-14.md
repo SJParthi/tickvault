@@ -1393,6 +1393,116 @@ the bill.
 - Bumps the EMF name count without a dated cost note — the ratchet's own
   instruction, and the reason this section exists.
 
+### §2.3k — 2026-08-28: the cross-verification can say "these two records disagree" and page nobody
+
+**The verbatim operator authorization (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude snure to fix and resoleve evryhtyehing entilrey whaevr you have highlighted dude okay?"
+
+Given in DIRECT response to a ranked list in which this item appeared as a CRITICAL row
+reading *"A failed cross-verification pages nobody — the revived feed's only ground truth
+can report mass divergence and nothing alerts. Only 'didn't run' and 'ran on nothing'
+page."* That list is the scope this quote authorizes; it is the same general-go-ahead
+shape `daily-universe-scope-expansion-2026-05-27.md` §28.2 and §28.3 already accept, where
+a broad instruction selects the work the preceding message enumerated. Recorded HERE
+before the terraform, per the rule-file-first law.
+
+Earlier the same session the operator asked what the cross-verification writes and whether
+it notifies — *"where will you save those results ... telegram notification"* — which is
+the question this row answers: it wrote three tables and told nobody when the answer was
+bad.
+
+#### The gap
+
+Three verdicts can end the 15:41 run. Until now only two were reachable by an alarm:
+
+| Verdict | Meaning | Carried a `source` field | Paged |
+|---|---|---|---|
+| `xverify_failed` | the check could not run | yes | yes |
+| `xverify_vacuous` | it ran and compared ZERO minutes | yes | yes |
+| **diverged** | **it ran, it measured, and the two records disagree** | **no** | **no** |
+
+The third is the only one that is an actual finding about the feed. It logged at `info!`
+among forty other fields on the same line. So the single check that exists to say whether
+the revived Dhan feed is trustworthy could answer **"no"** in a form nothing was listening
+for — while the two "we couldn't tell you" outcomes both paged.
+
+#### Family (5) gains a FIFTEENTH signal
+
+`tv-<env>-errcode-ws-gap-03-xverify-diverged`, a **log-filter** alarm on the same
+three-condition shape §2.3f settled on:
+
+```
+{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_diverged" }
+```
+
+Three conditions, not one: `WS-GAP-03` has ~50 emit sites — every dial failure and
+reconnect carries it — so a bare-code filter pages on ordinary connection churn. That is
+the trap §2.3d-i records being approved and then caught, and the `source` field is what
+makes this filter possible at all.
+
+`ok_recovery = false`: the comparison runs ONCE per session, so an auto-OK an hour later
+means the datapoint aged out, never that the next run agreed.
+
+#### ⚠ Why the threshold is HALF, and why that is not a number picked out of the air
+
+A non-zero divergence count is **EXPECTED and is not a defect**.
+`cross-verify-1m-error-codes.md` §1 records that a sampled live stream and the vendor's
+full tape legitimately differ, and says to *"track the trend, not the absolute count"*.
+Paging on any divergence would page every trading day, which this file repeatedly names as
+the fastest way to teach an operator to ignore an alarm.
+
+**No baseline exists for what a normal rate looks like.** So a 1% or 5% threshold would be
+a number invented and then presented as a measurement — the exact class this file's own
+corrections keep retiring. What CAN be asserted with no baseline is narrower and holds at
+any baseline: if **more than half** the compared price fields disagree beyond the
+configured tolerance, the two records are not describing the same market. No sampling-noise
+argument survives that.
+
+So the bar sits where it is *defensible today* rather than where it might be *optimal after
+a month of data*. The `outcome="diverged"` counter added beside it is what will eventually
+supply that data, and tightening the threshold later needs its own dated row.
+
+#### ⚠ Honest cost, and it moves further past the automatic action line
+
+One log-filter alarm ≈ **$0.10/mo**. No new EMF name, no user-data byte.
+
+§2.3j put a maximal month at **~$120.58** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`). This takes it to
+**~$120.68 — about $3.68 above the line that switches the trading box off** in a maximal
+month. The live account is nowhere near it (August MTD $48.87, forecast $61.51, measured
+2026-08-25), so nothing fires today, but the gap widens with every addition and is now the
+largest it has been. The levers are unchanged and neither is taken here: the
+already-approved Quote 10 Elastic IP release (−$3.60/mo, which alone would put the maximal
+month back under the line), or an operator decision on `limit_amount`.
+
+#### ⚠ A stale claim corrected in the same change (Rule 11)
+
+The comment at the vacuous emit site asserted the metric route was *"blocked by ONE BYTE"*,
+because the EMF selector lived in a user-data template rendering 15,841 of a 15,872-byte
+budget. That was true when measured on **2026-08-25** and stopped being true the **same
+day** — #1815 moved the selector into `deploy/aws/cloudwatch-agent.json`. Re-measured
+2026-08-28 by running the guard: the template renders **13,823 bytes, 2,049 free**, and
+`tv_dhan_feed` appears **zero** times in it. The byte blocker is gone; what remains is the
+cost decision above. Recorded because a stale measurement quoted as a live blocker is how
+this repository has manufactured false findings before, and a byte count carries a date
+like any other claim.
+
+#### What a PR that violates §2.3k looks like (REJECT)
+
+- Filters the alarm on `WS-GAP-03` alone, or drops the `source` condition (pages on every
+  reconnect — the trap this shape exists to avoid).
+- Sets `ok_recovery = true` on a once-per-session emitter.
+- Lowers the divergence threshold below half without a MEASURED baseline and its own dated
+  row — an unbaselined tightening is the false page this section refused to ship.
+- Pages on any non-zero `cells_diverged` (fires every trading day).
+- Adds a per-INSTRUMENT dimension (the §2.3 cardinality rule stands).
+- Claims the feed is verified on the strength of this alarm being quiet: a quiet alarm here
+  means "not catastrophically diverged", never "correct". A non-zero `compared` remains the
+  only evidence that the check ran at all.
+
+
 ## COST NOTE 2026-08-28 — the refusal family had never been visible, and it was hiding 2.4% tick loss (+~$0.30/mo)
 
 **Authorization:** operator, 2026-08-28, verbatim: *"Always ensure saving into db

@@ -857,7 +857,41 @@ resource "aws_cloudwatch_dashboard" "operator" {
             # refusal reasons. The per-reason split stays in the
             # AGGREGATOR-DROP-01 log line, which already carries them as
             # separate fields.
-            [local.dash_namespace, "tv_aggregator_tick_refused_total", { label = "ticks the fold refused (all reasons)", stat = "Sum" }]
+            [local.dash_namespace, "tv_aggregator_tick_refused_total", { label = "ticks the fold refused (all reasons)", stat = "Sum" }],
+            # ADDED 2026-08-28, measured on the live box the same day. These
+            # three lines are the biggest numbers in the system that nothing
+            # could see:
+            #
+            #   tv_candle_tick_discarded_late_total  51,227,651
+            #   tv_aggregator_slot_exhausted_total            0
+            #   tv_dhan_feed_abandoned_bytes_total            -
+            #
+            # The first is larger than the session's whole ingested tick count
+            # (20,982,560) because it increments once per TIMEFRAME inside the
+            # 24-TF fold loop -- so it is ~10% of all cell-folds, and every one
+            # is a bar that is missing a trade it should have carried. It had
+            # ZERO production readers until 2026-08-26 and no CloudWatch route
+            # until now.
+            #
+            # Slot exhaustion reads 0 today and that is precisely why it is
+            # here: AGGREGATOR_MAX_SLOTS is 25,000 against an authorized
+            # ~24,600, and the per-minute at-the-money re-fit ADDS instruments
+            # without ever reclaiming a slot. The first non-zero reading means
+            # candles have silently stopped for every new instrument past the
+            # line, and 0 is the only baseline that makes that step visible.
+            #
+            # Abandoned bytes are the undecodable remainder of a frame the
+            # walk gave up on. Refusing to resynchronise on a guess is correct
+            # -- fabricating ticks would be worse -- but the bytes are gone,
+            # and until now nothing counted them anywhere an operator looks.
+            #
+            # None is alarmed: the first two have no baseline for what normal
+            # looks like, and inventing a threshold would be the false page
+            # this dashboard exists to avoid. Charted first, thresholded once
+            # there is data to threshold against.
+            [local.dash_namespace, "tv_candle_tick_discarded_late_total", { label = "candle cells that lost a late tick", stat = "Sum" }],
+            [local.dash_namespace, "tv_aggregator_slot_exhausted_total", { label = "instruments refused a candle slot", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_feed_abandoned_bytes_total", { label = "undecodable frame bytes abandoned", stat = "Sum" }]
           ]
           period = 300
         }

@@ -719,6 +719,32 @@ locals {
       ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
       desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 live-vs-official comparison errored out, so the day's captured candles are UNVERIFIED - never assume they are clean. Distinct from the vacuous alarm: that one ran and found nothing to compare; this one did not complete. The comparison is the only ground truth the DHAN live feed has. Triage: the same log line carries the underlying error verbatim in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
+
+    # ADDED 2026-08-28 (noise-lock section 2.3k). The two entries above both
+    # mean "we could not tell you". This one is the only verdict that is an
+    # actual FINDING about the feed - it ran, it measured, and the two records
+    # disagree - and it was the one with no source field and no alarm, logging
+    # at info! among forty fields. The check that exists to say whether the
+    # revived feed is trustworthy could answer NO in a form nothing watched.
+    #
+    # Threshold is HALF the compared price fields, and that bar is deliberate:
+    # a non-zero divergence count is EXPECTED (a sampled live stream and the
+    # vendor's full tape legitimately differ - cross-verify-1m-error-codes.md
+    # section 1 says track the trend, not the count), so paging on any
+    # divergence pages every trading day. No baseline exists for a NORMAL rate,
+    # so 1% or 5% would be a number invented and called a measurement. More
+    # than half is the one claim that holds at any baseline: the two records
+    # are not describing the same market. The app-side gate carries the
+    # arithmetic; this filter only matches the line it emits.
+    "ws-gap-03-xverify-diverged" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_diverged\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run agreed
+      desc        = "WS-GAP-03 cross-verify MASS DIVERGENCE: the 15:41 live-vs-official comparison ran, measured, and found MORE THAN HALF of the compared price fields disagreeing with Dhan's own record beyond the configured tolerance. That is not sampling noise at any baseline - the captured candles and the vendor tape are not describing the same market, so treat the day's candles as untrustworthy until this is explained. Distinct from the other two xverify alarms: those mean the check could not tell you; this one means it told you and the answer is bad. Triage from the same log line: minutes_compared and price_fields_compared give the denominator, cells_diverged the numerator, and noise_p95_paise / noise_max_paise say whether the disagreement is a small systematic offset (suspect a tolerance or rounding change) or wholesale (suspect the wrong instruments, a segment mismatch, or a clock fault). Cross-check tv_dhan_feed_last_tick_age_secs and the day's refusal counters before concluding the feed is wrong. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
   }
 }
 

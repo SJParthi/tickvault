@@ -2360,6 +2360,10 @@ pub struct DrainCounters {
     xverify_measured: metrics::Counter,
     xverify_vacuous: metrics::Counter,
     xverify_failed: metrics::Counter,
+    /// Runs whose divergence rate was high enough that the two records are not
+    /// describing the same market. See the emit site for why the bar is set
+    /// where it is.
+    xverify_diverged: metrics::Counter,
     xverify_no_token: metrics::Counter,
 }
 
@@ -2424,6 +2428,7 @@ pub fn counters() -> &'static DrainCounters {
         xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
         xverify_vacuous: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "vacuous"),
         xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
+        xverify_diverged: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged"),
         xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
     })
 }
@@ -8576,6 +8581,67 @@ pub fn spawn_daily_crossverify(
                     // the feed, and a table that only records the good days
                     // cannot answer "how often were we blind last month".
                     persist_xverify_report(&deps.questdb, &report, deps.config.tolerance_paise);
+                    // MASS DIVERGENCE -- the verdict that could report a
+                    // broken feed and page nobody.
+                    //
+                    // Until now only `vacuous` ("we measured nothing") and
+                    // `failed` ("we could not run") carried a `source` field,
+                    // so only those two were reachable by an alarm. A run that
+                    // DID measure and found the two records disagreeing
+                    // wholesale logged at `info!` alongside forty other fields
+                    // and reached no operator surface at all. The one check
+                    // that exists to say whether the revived feed is
+                    // trustworthy could answer "no" in a way nothing was
+                    // listening for.
+                    //
+                    // # Why the bar is HALF, and not one cell
+                    //
+                    // A non-zero `cells_diverged` is EXPECTED and is not a
+                    // defect: `cross-verify-1m-error-codes.md` §1 records that
+                    // a sampled live stream and the vendor's full tape
+                    // legitimately differ, and says to "track the trend, not
+                    // the absolute count". Paging on any divergence would page
+                    // every day, and this file already carries the lesson that
+                    // a pager which cries on an ordinary day teaches the
+                    // operator to ignore it.
+                    //
+                    // No baseline exists for what a NORMAL rate looks like, so
+                    // inventing a 1% or 5% threshold would be picking a number
+                    // out of the air and calling it a measurement. What CAN be
+                    // asserted without a baseline is this: if MORE THAN HALF
+                    // the compared price fields disagree beyond the configured
+                    // tolerance, the two records are not describing the same
+                    // market. No sampling-noise argument survives that, at any
+                    // baseline. So the bar sits where it is defensible today
+                    // rather than where it might be optimal after a month of
+                    // data -- and the counter beside it is what will supply
+                    // that data.
+                    //
+                    // Gated on a NON-VACUOUS run: a vacuous one has a zero
+                    // denominator, and its own arm below is already a page.
+                    let price_fields = c.minutes_compared.saturating_mul(4);
+                    if !c.is_vacuous()
+                        && price_fields > 0
+                        && c.cells_diverged.saturating_mul(2) > price_fields
+                    {
+                        counters().xverify_diverged.increment(1);
+                        error!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            source = "xverify_diverged",
+                            instruments = c.instruments,
+                            minutes_compared = c.minutes_compared,
+                            price_fields_compared = price_fields,
+                            cells_diverged = c.cells_diverged,
+                            noise_p95_paise = c.noise_p95_paise,
+                            noise_max_paise = c.noise_max_paise,
+                            "Dhan live-feed cross-verification found MORE THAN HALF of the \
+                             compared price fields disagreeing with Dhan's own record. That is \
+                             not sampling noise at any baseline -- the captured candles and the \
+                             vendor tape are not describing the same market. Treat today's \
+                             candles as untrustworthy until this is explained"
+                        );
+                    }
+
                     if c.is_vacuous() {
                         // A run that compared nothing proves nothing, and the
                         // outcome field alone does not say so loudly enough.
@@ -8597,17 +8663,30 @@ pub fn spawn_daily_crossverify(
                         //
                         // Adding the field is NOT adding a page: nothing
                         // filters on it yet. The alarm itself still needs a
-                        // dated operator quote per that file's §3, and the
-                        // metric route is blocked by ONE BYTE, measured
-                        // 2026-08-25: the EMF selector lives in a user-data
-                        // template whose render is 15,841 of a 15,872-byte
-                        // budget, so 31 bytes are free — and
-                        // `tv_dhan_feed_xverify_runs_total` is 31 characters,
-                        // which with its separating pipe needs 32. So the
-                        // counter is in neither selector copy and never
-                        // reaches CloudWatch, and it cannot be added without
-                        // first removing something or moving the selector out
-                        // of user-data entirely.
+                        // dated operator quote per that file's §3.
+                        //
+                        // ⚠ CORRECTED 2026-08-28. The paragraph that stood
+                        // here said the metric route was "blocked by ONE
+                        // BYTE", because the EMF selector lived in a user-data
+                        // template rendering 15,841 of a 15,872-byte budget.
+                        // That was true when measured on 2026-08-25 and
+                        // stopped being true the SAME DAY: the selector was
+                        // moved out of the template into
+                        // `deploy/aws/cloudwatch-agent.json`, copied in after
+                        // the repo clone. Re-measured 2026-08-28 by running
+                        // the guard rather than quoting anyone — the template
+                        // renders 13,823 bytes, so **2,049 are free**, and
+                        // `tv_dhan_feed` appears ZERO times in it.
+                        //
+                        // So the byte blocker is GONE. What remains is a COST
+                        // decision, not a technical one: an EMF name is
+                        // ~$0.30/mo against a budget whose automatic action
+                        // stops the trading box, and that is the operator's
+                        // call. Recorded this way because a stale measurement
+                        // quoted as a live blocker is exactly how this
+                        // repository has manufactured false findings before —
+                        // and a byte count carries a date like any other
+                        // claim.
                         error!(
                             code = ErrorCode::WsGapConnectionState.code_str(),
                             source = "xverify_vacuous",
@@ -11109,11 +11188,17 @@ mod tests {
     /// `fold_counters::the_two_labelled_extremes_are_separate_handles`
     /// guards on the metric side.
     ///
-    /// This test does NOT claim an alarm exists. None does — the alarm needs
-    /// a dated operator quote per §3 of that file, and the counter route is
-    /// blocked separately (the metric is in neither EMF selector copy). What
-    /// is asserted here is only that the field a future alarm must match on
-    /// is present and unambiguous.
+    /// This test asserts the FIELD, never the alarm. As of 2026-08-28 one of
+    /// the three — `xverify_diverged` — does have a metric-filter alarm, and
+    /// the other two have had theirs since 2026-08-25; but an alarm lives in
+    /// terraform and is pinned by its own wiring guard. Keeping the two
+    /// concerns apart is deliberate: a test that asserted both would go red
+    /// for an infrastructure edit that did not touch this file.
+    ///
+    /// The counter route remains separate and unshipped — the metric is in
+    /// neither EMF selector copy, which is a COST decision (~$0.30/mo per
+    /// name) and no longer a byte-budget one. See the corrected note at the
+    /// vacuous emit site.
     #[test]
     fn the_xverify_error_lines_carry_a_source_an_alarm_can_match_on() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -11121,6 +11206,15 @@ mod tests {
         for (marker, label) in [
             ("counters().xverify_vacuous.increment(1)", "xverify_vacuous"),
             ("counters().xverify_failed.increment(1)", "xverify_failed"),
+            // ADDED 2026-08-28. The gap this closes is the sharpest of the
+            // three: the other two say "we could not measure". This one says
+            // "we measured, and the answer is bad" -- and it was the only
+            // verdict with no `source`, so mass divergence logged at `info!`
+            // among forty fields and reached nobody.
+            (
+                "counters().xverify_diverged.increment(1)",
+                "xverify_diverged",
+            ),
         ] {
             assert!(
                 src.contains(marker),
@@ -11195,12 +11289,14 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "xverify_diverged",
                 "xverify_failed",
                 "xverify_persist_partial",
                 "xverify_vacuous"
             ],
-            "the xverify source labels changed. Two of these are matched by CloudWatch \
-             metric filters (`xverify_vacuous`, `xverify_failed`) and page; \
+            "the xverify source labels changed. THREE of these are matched by CloudWatch \
+             metric filters (`xverify_vacuous`, `xverify_failed`, `xverify_diverged`) and \
+             page; \
              `xverify_persist_partial` deliberately does not, because a partial write \
              still lands the daily verdict row and adding an alarm needs a dated \
              operator quote per dhan-rest-only-noise-lock-2026-07-14.md §3. A new label \

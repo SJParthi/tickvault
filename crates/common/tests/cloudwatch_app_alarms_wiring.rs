@@ -976,11 +976,54 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // (Aug MTD $48.87), but the gap is now the widest it has been. Full
     // reasoning and the two levers: dhan-rest-only-noise-lock-2026-07-14.md
     // section 2.3j.
+    // 2026-08-28 (SECOND, same day): 89 -> 92. Three more loss counters, all
+    // named by a full drop-path trace and all MEASURED on the live box the
+    // same afternoon:
+    //
+    //   tv_candle_tick_discarded_late_total   51,227,651
+    //   tv_aggregator_slot_exhausted_total             0
+    //   tv_dhan_feed_abandoned_bytes_total             -
+    //
+    // The first is LARGER than the session's entire ingested tick count
+    // (20,982,560), because it increments once per TIMEFRAME inside the 24-TF
+    // fold loop -- roughly 10% of all cell-folds, each one a bar missing a
+    // trade it should have carried. Its own emit-site comment records that it
+    // had ZERO production readers until 2026-08-26; it had no CloudWatch route
+    // until now.
+    //
+    // Slot exhaustion reads 0 today, and that is exactly why it ships:
+    // AGGREGATOR_MAX_SLOTS is 25,000 against an authorized ~24,600, and the
+    // per-minute at-the-money re-fit ADDS instruments while nothing ever
+    // reclaims a slot. The first non-zero reading means candles have silently
+    // stopped for every new instrument past the line -- and 0 is the only
+    // baseline that makes that step visible.
+    //
+    // Abandoned bytes are the undecodable remainder of a frame the walk gave
+    // up on. Refusing to resynchronise on a guess is right (fabricating ticks
+    // is worse), but the bytes are gone and nothing counted them where an
+    // operator looks.
+    //
+    // All three are CHARTED and NONE is alarmed. Two have no baseline for what
+    // normal looks like, and inventing a threshold would be the false page
+    // this file keeps retiring. Charted first; thresholded once there is data
+    // to threshold against.
+    //
+    // +$0.90/mo, no user-data byte. Maximal-month projection ~$120.58 ->
+    // ~$121.48 against the automatic STOP_EC2_INSTANCES line at $117.00. The
+    // live account is far below it (Aug MTD $48.87), and the gap is the widest
+    // it has been -- stated rather than absorbed. Levers unchanged: the
+    // already-approved Elastic IP release (-$3.60/mo) alone puts the maximal
+    // month back under the line.
     assert_eq!(
         names.len(),
-        89,
-        "Z+ L2 VERIFY ratchet: expected exactly 89 names in the MAIN EMF \
-         (2026-08-28: 88 -> 89, tv_aggregator_tick_refused_total. The whole \
+        92,
+        "Z+ L2 VERIFY ratchet: expected exactly 92 names in the MAIN EMF \
+         (2026-08-28 SECOND: 89 -> 92, tv_candle_tick_discarded_late_total + \
+         tv_aggregator_slot_exhausted_total + tv_dhan_feed_abandoned_bytes_total \
+         -- see the block above; the late-discard counter alone read 51,227,651 \
+         on the live box, more than the session's whole ingested tick count, \
+         and reached no operator surface at all. \
+         2026-08-28: 88 -> 89, tv_aggregator_tick_refused_total. The whole \
          refusal family had NEVER been EMF-selected, which is why the box \
          could hard-refuse 2,008,916 ticks in the measured 2026-08-27 session \
          -- 2.41% of all 83,446,729 decoded, with NO row written -- and the \
