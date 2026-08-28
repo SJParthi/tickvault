@@ -176,6 +176,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
+        "tv_seal_escalation_lost_total",
+        "double-billed — VERIFIED 2026-08-28: the emit sits in SealEscalationSink::run and is followed IMMEDIATELY by the on_lost callback, which the boot path wires to seal_loss_alarm::record_lost_seal — a throttled AGGREGATOR-DROP-01 error! naming the instrument, segment, timeframe and running total. The loss therefore reaches errors.jsonl and the errcode metric filter on every increment; the log simply lives in the app crate, one callback hop from the counter, which is the one thing this scanner cannot follow. The counter exists only to separate the DEFERRED loss (the caller was told Queued) from the inline one, since record_lost_seal splits by cause and not by path. EMF-shipping it stays available as a ~$0.30/mo decision and would buy a second surface for an event that already pages.",
+    ),
+    (
         "tv_seal_spill_write_errors_total",
         "propagated — both emit sites bail!/Err out of SealSpillWriter and seal_absorption.rs logs the returned error at its append_seal call site (verified 2026-08-12)",
     ),

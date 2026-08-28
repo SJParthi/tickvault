@@ -3158,6 +3158,8 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                     // because a silent fallback is how a fix stops applying
                     // without anyone noticing.
                     tracing::error!(
+                        code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
+                            .code_str(),
                         ?err,
                         "failed to spawn the seal escalation thread — refused seals will write \
                          to disk INLINE on the frame-drain task (pre-offload behaviour); watch \
@@ -4183,7 +4185,10 @@ async fn run_process_runloop(
         }
         if handle.is_finished() {
             if handle.join().is_err() {
-                error!("seal escalation thread panicked during its final drain");
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    "seal escalation thread PANICKED during its final drain — whatever it still held is gone"
+                );
             } else {
                 info!("seal escalation: queue drained on shutdown");
             }
