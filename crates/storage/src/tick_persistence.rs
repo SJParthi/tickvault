@@ -1159,6 +1159,15 @@ fn register_drop_baseline(feed: Feed) {
     // spill episode is rare, so its first increment would otherwise be
     // consumed as the delta baseline and the episode would go unreported.
     metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str()).increment(0);
+    // Same discipline for the persist-error series (2026-08-28). These fire
+    // only on a broken boot, which makes them RARER than a drop episode, not
+    // safer: a first occurrence with no prior sample is consumed as the delta
+    // baseline and publishes nothing, so the alarm is silent through the one
+    // event it exists for. Both `stage` label values are seeded, because a
+    // label set is a separate series.
+    metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_client_build")
+        .increment(0);
+    metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_ddl").increment(0);
 }
 
 impl TickWriter {

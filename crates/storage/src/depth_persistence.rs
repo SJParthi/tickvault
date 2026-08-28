@@ -660,7 +660,7 @@ fn spill_failed_depth_ilp(
     // O(1) EXEMPT: end
 }
 
-/// Publish a zero on the drop series before any row can be written.
+/// Publish a zero on EVERY depth loss series before any row can be written.
 ///
 /// The CloudWatch agent computes a counter's alarm value as the DELTA between
 /// consecutive samples and DROPS the first sample of a series it has never
@@ -669,8 +669,41 @@ fn spill_failed_depth_ilp(
 /// it publishes no datapoint and any alarm on it stays silent through the very
 /// episode it exists to catch. Same discipline as `TickWriter`'s
 /// `register_drop_baseline`.
+///
+/// # Why the SIBLINGS are seeded too (2026-08-28, proven by a live session)
+///
+/// Until today only the `dropped` series was seeded, and the session of
+/// 2026-08-28 showed what that costs. Read from CloudWatch afterwards:
+///
+/// | series | session total |
+/// |---|---|
+/// | `tv_ticks_dropped_total` | 308,818 |
+/// | `tv_ticks_spilled_total` | 308,818 |
+/// | `tv_depth_rows_dropped_total` | 104,540 |
+/// | `tv_depth_rows_spilled_total` | **no series at all** |
+/// | `tv_depth_spill_write_errors_total` | **no series at all** |
+///
+/// The tick side seeds both, so `dropped - spilled = 0` proved every dropped
+/// tick had been RESCUED and nothing was permanently lost. The depth side
+/// seeded one, so the same subtraction was impossible: 104,540 rows that were
+/// either all rescued or all permanently gone, and no way to tell which.
+///
+/// An unseeded counter does not read as "zero". It does not appear, and an
+/// absent series is indistinguishable from a healthy one — which is the exact
+/// false-OK the discriminators were added to prevent. The instrument could not
+/// answer the one question it exists to answer.
+///
+/// `tv_depth_spill_write_errors_total` is seeded on BOTH of its `stage` label
+/// values, because a label set is a separate series: seeding `cap` alone would
+/// leave `write` — the more common failure — silent on its first occurrence.
 fn register_depth_drop_baseline(feed: Feed) {
     metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed.as_str()).increment(0);
+    metrics::counter!("tv_depth_rows_spilled_total", "feed" => feed.as_str()).increment(0);
+    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap").increment(0);
+    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write").increment(0);
+    metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_client_build")
+        .increment(0);
+    metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl").increment(0);
 }
 
 /// Batched `market_depth` ILP writer.
