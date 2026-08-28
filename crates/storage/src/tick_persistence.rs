@@ -879,6 +879,102 @@ fn spill_dir_bytes(dir: &Path) -> u64 {
     // O(1) EXEMPT: end
 }
 
+/// The share of the tick spill ceiling that quarantined files may occupy.
+///
+/// # Why quarantine needs a bound at all
+///
+/// `quarantine_spill_file` promises QUARANTINE, NEVER DELETE, and that promise
+/// is right: on 2026-08-25 a single torn line stranded a file whose other 1,292
+/// lines were recoverable by hand, and a rescue tier that destroys what it
+/// cannot parse is worse than the loss it prevents.
+///
+/// But nothing in this workspace ever removed from `quarantine/`, and since
+/// 2026-08-28 its bytes count toward the spill ceiling. Those two facts
+/// together are a RATCHET: once accumulated quarantine reaches
+/// `tick_spill_max_bytes()`, `spill_failed_ilp` returns `StorageFull` for every
+/// future rescue — for this process AND every subsequent boot — and the only
+/// symptom is a HOT-PATH-02 drop that reads like ordinary backpressure. The
+/// rescue tier would be permanently dead, killed by the tier that exists to
+/// preserve data.
+///
+/// So the promise is kept for a BOUNDED share rather than forever. A quarter,
+/// because the arithmetic has to leave the LIVE rescue path the clear majority
+/// of the budget: quarantine holds files QuestDB has already refused, while the
+/// remaining three quarters hold rows it would still accept. Preferring the
+/// refused ones would trade recoverable-by-hand bytes for rows lost outright.
+pub const QUARANTINE_BUDGET_FRACTION: u64 = 4;
+
+/// Counter: quarantined files deleted to keep the quarantine directory inside
+/// its share of the spill ceiling.
+pub const QUARANTINE_PRUNED_COUNTER: &str = "tv_tick_spill_quarantine_pruned_total";
+
+/// Trims the quarantine directory to its byte budget, OLDEST FIRST.
+///
+/// Boot-time only, and loud: every deletion names the file and the byte count,
+/// because this is the one place in the rescue chain that destroys data on
+/// purpose. Returns the number of files removed.
+///
+/// Oldest-first because a quarantined file's recoverability decays: the operator
+/// who could reconstruct today's torn line from the day's context cannot do that
+/// for a file from three weeks ago, and the newest files are the ones an active
+/// investigation is about.
+///
+/// A directory that cannot be read is not an error here — there may simply be no
+/// quarantine yet, and failing a boot over a missing subdirectory would turn a
+/// housekeeping step into an outage.
+pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64) -> usize {
+    let budget = spill_max_bytes / QUARANTINE_BUDGET_FRACTION;
+    let dir = spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+    // O(1) EXEMPT: begin — boot-time housekeeping over a flat directory, never
+    // on any per-tick or per-frame path.
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+                e.path(),
+            ))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= budget {
+        return 0;
+    }
+    files.sort_by_key(|(mtime, _, _)| *mtime);
+    let mut removed = 0usize;
+    for (_, len, path) in files {
+        if total <= budget {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+            removed += 1;
+            metrics::counter!(QUARANTINE_PRUNED_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                path = %path.display(),
+                bytes = len,
+                budget,
+                "DELETED a quarantined tick spill file to keep the quarantine directory \
+                 inside its share of the spill ceiling. Its recoverable lines are gone. \
+                 This is deliberate and it is the lesser loss: quarantine counts toward \
+                 the spill ceiling, so an unbounded quarantine would return StorageFull \
+                 for every future rescue — permanently disabling the tier that keeps \
+                 live ticks, for this process and every boot after it."
+            );
+        }
+    }
+    // O(1) EXEMPT: end
+    removed
+}
 /// ILP-over-HTTP conf: per-flush server ACK (the 2026-07-05 fire-and-forget
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
@@ -3250,6 +3346,101 @@ mod tests {
             arm_body.contains("tv_ticks_spilled_total"),
             "the recoverable-subset counter must also fire, or the operator \
              cannot tell a rescued loss from a permanent one"
+        );
+    }
+
+    /// The ratchet this closes: quarantine grows, counts toward the ceiling,
+    /// and nothing ever removed from it — so it could permanently disable the
+    /// rescue tier for every future boot.
+    #[test]
+    fn quarantine_is_trimmed_to_its_share_of_the_spill_ceiling() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-prune-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+
+        // Budget = ceiling / 4. With a 400-byte ceiling that is 100 bytes.
+        let ceiling = 400u64;
+        for (i, name) in ["a.ilp", "b.ilp", "c.ilp", "d.ilp"].iter().enumerate() {
+            std::fs::write(q.join(name), vec![b'x'; 60]).expect("write");
+            // Distinct mtimes so "oldest first" is well-defined rather than
+            // filesystem-order luck — a prune that deletes in an arbitrary
+            // order would pass a byte-only assertion while destroying the
+            // newest file, which is the one an investigation is about.
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(q.join(name))
+                .expect("reopen");
+            f.set_modified(t).expect("set mtime");
+        }
+
+        let removed = prune_quarantine(&dir, ceiling);
+
+        assert!(
+            removed >= 3,
+            "240 bytes must be trimmed to 100, got {removed} removed"
+        );
+        assert!(
+            !q.join("a.ilp").exists(),
+            "the OLDEST file must go first — a quarantined file's recoverability decays, \
+             and the newest is the one an active investigation is about"
+        );
+        assert!(
+            q.join("d.ilp").exists(),
+            "the NEWEST quarantined file must survive the trim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quarantine_inside_its_budget_is_never_touched() {
+        // The never-delete promise still holds for everything that fits. A
+        // prune that trimmed unconditionally would destroy recoverable lines
+        // for no reason — on 2026-08-25, 1,292 of 1,293 lines in a quarantined
+        // file were recoverable by hand.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-keep-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+        std::fs::write(q.join("small.ilp"), b"tiny").expect("write");
+
+        assert_eq!(prune_quarantine(&dir, 4096), 0);
+        assert!(q.join("small.ilp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_quarantine_directory_is_not_an_error() {
+        // Boot housekeeping must never fail a boot. Most sessions have no
+        // quarantine at all.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-absent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        assert_eq!(prune_quarantine(&dir, 4096), 0);
+    }
+
+    #[test]
+    fn quarantine_can_never_claim_the_majority_of_the_spill_budget() {
+        // Quarantine holds files QuestDB has ALREADY refused; the rest of the
+        // budget holds rows it would still accept. Letting the refused half
+        // win would trade recoverable-by-hand bytes for rows lost outright.
+        assert!(
+            QUARANTINE_BUDGET_FRACTION >= 2,
+            "a fraction below 2 lets quarantine take at least half the spill ceiling, \
+             starving the LIVE rescue path that keeps rows QuestDB would still accept"
         );
     }
 }

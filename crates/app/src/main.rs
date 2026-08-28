@@ -1857,6 +1857,28 @@ async fn async_main() -> Result<()> {
     // truncates on success. Replay is idempotent because the `ticks` DEDUP key
     // carries `capture_seq`, so a row written twice UPSERTs onto itself — which
     // is what makes a crash between POST and truncate cost nothing.
+    // Trim the quarantine directory BEFORE the drain starts (2026-08-28).
+    //
+    // `quarantine_spill_file` promises quarantine-never-delete, and that
+    // promise is right: a torn line usually leaves the rest of the file
+    // recoverable by hand. But nothing ever removed from `quarantine/`, and its
+    // bytes count toward the spill ceiling — so accumulated quarantine is a
+    // RATCHET that eventually returns StorageFull for every future rescue, on
+    // this boot and every one after it, killing the tier that keeps live ticks.
+    // The promise is therefore kept for a bounded share rather than forever.
+    // Loud: each deletion names the file. See `prune_quarantine`.
+    let quarantine_pruned = tickvault_storage::tick_persistence::prune_quarantine(
+        std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+        tickvault_storage::tick_persistence::tick_spill_max_bytes(),
+    );
+    if quarantine_pruned > 0 {
+        warn!(
+            files = quarantine_pruned,
+            "trimmed the tick quarantine directory to its share of the spill ceiling — \
+             see the preceding coded lines for each file"
+        );
+    }
+
     let _tick_spill_drain_supervisor =
         tickvault_storage::tick_spill_replay::spawn_supervised_tick_spill_replay(
             std::path::PathBuf::from(tickvault_storage::tick_persistence::TICK_SPILL_DIR),

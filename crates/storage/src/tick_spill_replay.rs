@@ -481,6 +481,24 @@ async fn run_replay_loop(dir: PathBuf, url: String) {
                 "tick spill drain round complete"
             );
         }
+        // Trim quarantine on every round, not only at boot (2026-08-28,
+        // round-2 fix). Quarantine is written BY THIS LOOP during the session —
+        // a permanently-refused file is set aside here — so a boot-only trim
+        // lets a heavy-quarantine day ratchet past the ceiling mid-morning and
+        // re-disable the rescue tier until the next boot, which is the exact
+        // failure the trim exists to prevent. Cheap: it reads one flat
+        // directory and returns immediately when the bytes are inside budget.
+        let pruned = crate::tick_persistence::prune_quarantine(
+            &dir,
+            crate::tick_persistence::tick_spill_max_bytes(),
+        );
+        if pruned > 0 {
+            warn!(
+                files = pruned,
+                "trimmed the quarantine directory mid-session — see the preceding coded \
+                 lines for each file"
+            );
+        }
         tokio::time::sleep(std::time::Duration::from_secs(REPLAY_INTERVAL_SECS)).await;
     }
 }
