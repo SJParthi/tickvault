@@ -141,7 +141,13 @@ resource "aws_cloudwatch_metric_alarm" "market_data_persistence_loss" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
   datapoints_to_alarm = 1
   # notBreaching: the box is stopped outside 08:30-17:30 IST weekdays and these
   # counters only move under live traffic, so no-data is the normal overnight

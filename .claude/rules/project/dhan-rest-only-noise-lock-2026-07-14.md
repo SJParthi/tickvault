@@ -2097,3 +2097,92 @@ for a seed. Verified by reverting the fix: 2 tests fail, restored: 4 pass.
   the NEXT session answerable, not this one.
 - Claims the tick path lost data on 2026-08-28. It did not: dropped equals
   spilled, and the WAL drop count is zero.
+
+#### §2.3o-i — 2026-08-28, SAME DAY: two claims in §2.3o above are WRONG, and both were mine
+
+Written hours after §2.3o, from three parallel adversarial investigations that
+were commissioned to check it. Recorded as corrections rather than edits,
+because in both cases the reasoning that produced the wrong claim is the
+reusable part.
+
+**CORRECTION 1 — "the aggregator refusal rate is now roughly three times
+higher" is FALSE. It is not a regression; it is a first reading.**
+
+§2.3o records `tv_aggregator_tick_refused_total` = 5,748,026 (7.0% of ingest)
+and compares it to "2.41% measured yesterday". Those are **two different
+metrics**. The 2.41% figure comes from this file's own COST NOTE of
+2026-08-28, which states in the same breath that
+`list-metrics --metric-name tv_aggregator_tick_refused_total` returned
+`{"Metrics": []}` — the family had NEVER reached CloudWatch — and reports
+2,008,916 as ticks hard-refused **on timestamp**, read from a log line. That
+is one reason of a DIFFERENT counter (`tv_dhan_feed_ingest_refused_total`).
+
+The family was EMF-selected in that same change, so **6.99% is its
+first-ever CloudWatch reading — a baseline, not a jump.** The arithmetic
+agrees: `untraded_timestamp` (825,783, measured 2026-08-26) plus
+`out_of_band_timestamp` (2,008,916, measured 2026-08-27) is already 3.4% of
+the prior session, above 2.41%, and both predate today.
+
+The lesson is specific: **a first measurement is not a trend.** Comparing a
+new series' opening value against a differently-scoped number from a log line
+manufactures a regression out of nothing, and that is what §2.3o did.
+
+**CORRECTION 2 — the feedback loop in §2.3o has a false leg. Spilling does
+NOT meaningfully accelerate the disk fill.**
+
+§2.3o says rows spill to disk "which writes MORE to the same disk — a positive
+feedback loop". Measured: the tick spill for the whole session is
+308,818 rows × ~140 B ≈ **43 MB**, against a 138 GB fill. Three orders of
+magnitude apart. The rescue tier is not the problem; it is the part that
+worked, cheaply.
+
+**Where the 138 GB actually goes** (derived from the DDL row widths and the
+module headers; the depth row count is Assumed at the 2026-08-24 measured
+order):
+
+| Writer | Bytes/session | Share |
+|---|---:|---:|
+| `market_depth` (1.53 e9 rows × 72 B) | ~110 GB | ~80% |
+| 24 candle tables (112 B/row) | ~35–55 GB upper-bounded | — |
+| `ticks` (82.25 M × 144 B) | ~11.8 GB | ~9% |
+| raw frame WAL | bounded ~40 GB active / 50 GB archive | — |
+| tick + depth spill | ~43 MB + capped | ~0.03% |
+
+**Depth is 80% of the burn, one row per level per snapshot.** No complexity
+change and no alarm touches it.
+
+**Three structural findings from the same investigation, none of them fixed:**
+
+1. **The archiver cannot win, by construction.** `retention_class` puts
+   `market_depth` and `ticks` in classes whose floor is ONE DAY, and the SQL is
+   `minTimestamp < dateadd('d', -1, now())` — so today's partitions are
+   unreachable while today is being written. `pressure_config` only ever
+   `min()`s windows DOWN and cannot go below that floor. The maximum a
+   mid-session pressure episode can reclaim is yesterday's data, which the
+   post-market daily leg already dropped. On any day whose predecessor was
+   archived, a pressure episode reclaims **zero**, burns its passes and fires
+   `STORAGE-GAP-05`. The floor is one session; the inflow is one session. The
+   partitions are already `PARTITION BY HOUR`, so an hour-granular floor would
+   turn "never wins" into "runs six times a session".
+2. **There is no backpressure from disk pressure to the subscription set.**
+   `ShedLevel::allows_ticks()` is `const { true }` — no shed level reduces
+   ticks, and nothing reduces the subscribed universe. Both safety nets are
+   FRACTIONAL (`SHED_INLINE_DEPTH_BELOW_FREE = 0.15`, `pressure_high_water_pct
+   = 75`), i.e. 48 GB and 81 GB free on this volume. The session closed at
+   **176 GB free — 55%** — so neither armed, and neither can arm for about
+   another 0.9 of a session. Growing the disk moves both further away in GB at
+   a constant burn rate: **runway measured in sessions is free ÷ 138 GB, and it
+   is 1.3.** A fractional threshold on a growing disk is a threshold that
+   quietly stops meaning anything.
+3. **No per-table byte metric exists anywhere.** A scan for a QuestDB
+   `diskSize`/partition-size gauge returns nothing, so every attribution above
+   is derived rather than observed. Nobody can say from telemetry where the
+   138 GB went.
+
+**What a PR that violates §2.3o-i looks like (REJECT):** compares a metric's
+first CloudWatch reading against a differently-scoped figure and calls the
+difference a regression; describes the tick spill tier as a driver of disk
+growth; raises the volume size as a fix for the burn without also making the
+shed thresholds absolute (a bigger disk makes a fractional net arm later, not
+sooner); or claims the pressure archiver protects a session while its floor
+remains one day.

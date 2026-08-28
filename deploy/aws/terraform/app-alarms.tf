@@ -720,7 +720,14 @@ resource "aws_cloudwatch_metric_alarm" "questdb_wal_probe_failed" {
   alarm_name          = "tv-${var.environment}-questdb-wal-probe-failed"
   alarm_description   = "The QuestDB WAL-suspension PROBE is failing, so tv_questdb_wal_suspended_tables is stale or absent and tv-<env>-questdb-wal-suspended cannot see a suspension. This is a blind-detector alarm, not a data-loss alarm - but the detector it guards is the ONLY thing that can see a suspended table silently ACKing and discarding ILP writes. Triage: grep the app log for WAL-SUSPEND-PROBE and read the failure reason. all_rows_skipped means QuestDB changed the shape of wal_tables() - most likely the `suspended` column now renders as a string rather than a boolean after an upgrade - and parse_wal_tables_response needs its accessor widened; the gauge is NOT to be trusted until it is. Other reasons are transport: check QuestDB is reachable on the health port. Verify by hand meanwhile: SELECT name, suspended FROM wal_tables() WHERE suspended = true."
   comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_wal_suspension_probe_failed_total"
   namespace           = local.app_namespace
   period              = 300
