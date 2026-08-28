@@ -203,19 +203,56 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             // every alarm's genuine in-session recovery signal, and also shuts
             // the mirror-image window in which a stale ALARM briefly had live
             // actions.
+            // THE RESET MUST NOT BE ABLE TO BLOCK THE ENABLE -- 2026-08-28,
+            // same day, correcting the change directly above.
+            //
+            // The first version of this reordering used `?` inside the loop.
+            // That is a strictly WORSE failure mode than the bug it fixed: one
+            // failed `SetAlarmState` returns early, `enable_alarm_actions` never
+            // runs, and EVERY gated alarm stays action-disabled for the entire
+            // trading day. Trading five spurious morning pages for a chance of
+            // total alerting silence is not a trade worth making.
+            //
+            // So a failed reset is COUNTED and LOGGED and the loop continues.
+            // The worst case is now the OLD behaviour for that one alarm -- a
+            // stale ALARM transitioning to OK with actions live, i.e. one
+            // spurious recovery page -- which is exactly the noise this change
+            // set out to remove, and infinitely better than silence.
+            //
+            // `enable_alarm_actions` is therefore unconditional and is the ONLY
+            // call in this arm that may propagate: if the alarms cannot be
+            // armed at all, the invocation must fail loudly so the Lambda's
+            // Errors alarm fires.
+            let mut reset_failures = 0usize;
             for name in &alarm_names {
-                cw.set_alarm_state()
+                if let Err(err) = cw
+                    .set_alarm_state()
                     .alarm_name(name)
                     .state_value(aws_sdk_cloudwatch::types::StateValue::Ok)
                     .state_reason(MARKET_OPEN_STATE_REASON)
                     .send()
-                    .await?;
+                    .await
+                {
+                    reset_failures += 1;
+                    tracing::error!(
+                        alarm = %name,
+                        error = %err,
+                        "could not pre-reset this alarm to OK before arming. Arming \
+                         continues regardless -- the cost is at most one spurious \
+                         recovery page for this alarm, and the alternative is an \
+                         unarmed alarm for the whole session."
+                    );
+                }
             }
             cw.enable_alarm_actions()
                 .set_alarm_names(Some(alarm_names.clone()))
                 .send()
                 .await?;
-            info!(alarms = ?alarm_names, "enabled actions");
+            info!(
+                alarms = ?alarm_names,
+                reset_failures,
+                "enabled actions"
+            );
         }
     }
     Ok(open_result(mode, &decision))
@@ -223,6 +260,43 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A failed pre-reset must never prevent the alarms being ARMED.
+    ///
+    /// The reordering that removed the daily false-recovery flood was first
+    /// written with `?` inside the reset loop. That is a strictly worse failure
+    /// than the one it fixed: one failed `SetAlarmState` returns early,
+    /// `enable_alarm_actions` never runs, and every gated alarm stays
+    /// action-disabled for the whole trading day. Five spurious pages traded
+    /// for a chance of total silence is not a trade worth making.
+    ///
+    /// Source-order and shape assertion, because the failure is entirely about
+    /// which call can abort which -- there is no way to observe it from a unit
+    /// test without an AWS client.
+    #[test]
+    fn a_failed_alarm_reset_cannot_block_arming() {
+        let source = include_str!("market_hours_gate.rs");
+        let enable = source
+            .find("enable_alarm_actions()")
+            .expect("the open path must arm the alarms");
+        let head = &source[..enable];
+        let loop_at = head
+            .rfind("for name in &alarm_names {")
+            .expect("the pre-reset loop must precede arming");
+        let body = &source[loop_at..enable];
+        assert!(
+            !body.contains(".await?;"),
+            "the pre-reset loop propagates with `?`. One failed SetAlarmState then \
+             returns early and enable_alarm_actions NEVER RUNS, leaving every gated \
+             alarm silent for the entire session. A failed reset must be counted and \
+             logged, and arming must proceed regardless"
+        );
+        assert!(
+            body.contains("reset_failures"),
+            "a failed reset must be COUNTED — silently swallowing it would hide that \
+             an alarm may fire one spurious recovery page"
+        );
+    }
 
     /// The gates must RESET to OK before ENABLING actions, never after.
     ///

@@ -4116,12 +4116,34 @@ async fn run_frame_drain(
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
     let tail = flush_and_record(&mut ingest, &feed_health);
+    // DEPTH FLUSHES FIRST -- reordered 2026-08-28.
+    //
+    // `flush_depth` used to sit AFTER `shutdown_offload_writer`, and that
+    // ordering silently dropped the depth tail on exactly the days it matters.
+    // The offload shutdown blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS` (30s)
+    // waiting for the tick writer thread to drain, while main gives this whole
+    // task only `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` (20s) before it logs
+    // "did NOT finish within 20s" and exits. When QuestDB is slow -- which is
+    // when a tail flush is worth anything at all -- the 20s fires first, the
+    // process exits, and the line below never runs.
+    //
+    // Up to `DEPTH_FLUSH_ROW_THRESHOLD` (10,000) buffered depth rows then go
+    // with the process. `discard_pending` never executes, so there is no
+    // spill, no `tv_depth_rows_dropped_total`, and no error line. There is no
+    // `impl Drop` on the writer to catch it either. Silent, and on the 17:30
+    // stop it is every weekday.
+    //
+    // Flushing depth BEFORE the blocking join fixes it without tuning two
+    // constants in two files to agree -- which is the version that rots. The
+    // two ingests are independent (`depth_ingest` is its own `DepthIngest`
+    // with its own buffer and sender), so nothing about the tick offload join
+    // has to happen first.
+    flush_depth(depth_ingest.as_mut());
     // Close the hand-off queue and WAIT. The tail flush above only handed the
     // batch to the writer thread; without this join the process can exit while
     // that batch is still in flight, which would lose precisely the rows the
     // tail flush exists to save. No-op on a lane that was never offloaded.
     ingest.shutdown_offload_writer();
-    flush_depth(depth_ingest.as_mut());
     publish_fold_depth(&ingest);
     let depth_dropped = depth_ingest.as_ref().map_or(0, DepthIngest::dropped_rows);
     warn!(
@@ -9272,6 +9294,43 @@ pub fn now_ist_secs_of_day() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The depth tail must flush BEFORE the blocking offload join.
+    ///
+    /// `shutdown_offload_writer` blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS`
+    /// (30s) while main allows this whole task only
+    /// `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` (20s). With the depth flush
+    /// AFTER the join, a slow QuestDB means the 20s fires first, the process
+    /// exits, and the depth flush never runs -- taking up to
+    /// `DEPTH_FLUSH_ROW_THRESHOLD` buffered rows with it, with no spill, no
+    /// counter, no log, and no `Drop` to catch it.
+    ///
+    /// That is a silent loss on every 17:30 stop where the database is slow,
+    /// which is precisely when the tail flush is worth anything.
+    ///
+    /// Pinned as source order rather than by reconciling the two constants,
+    /// because a fix that depends on two numbers in two files agreeing is the
+    /// version that rots.
+    #[test]
+    fn the_depth_tail_flushes_before_the_blocking_offload_join() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        let join = production_half
+            .rfind("ingest.shutdown_offload_writer();")
+            .expect("the shutdown tail must join the offload writer");
+        let depth = production_half
+            .rfind("flush_depth(depth_ingest.as_mut());")
+            .expect("the shutdown tail must flush depth");
+        assert!(
+            depth < join,
+            "the depth tail flush sits AFTER the offload join, which blocks up to \
+             OFFLOAD_SHUTDOWN_GRACE_SECS while main's budget is shorter -- on a slow \
+             database the process exits first and the buffered depth rows are dropped \
+             with no spill and no counter"
+        );
+    }
     use super::*;
     use tickvault_common::constants::{
         DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE,
