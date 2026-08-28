@@ -1190,6 +1190,12 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(0);
     metrics::counter!("tv_disk_watcher_respawn_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => "live_feed").increment(0);
+    // The seal-spill write-error counter (2026-08-28). Emitted only when the
+    // producer-side durable tier's own append fails, which is the moment the
+    // no-drop policy is leaning hardest on it — and, like the twenty above, it
+    // was dead on arrival for that first episode. Not EMF-selected, for the
+    // same cost reason as the escalation counters below.
+    metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "write").increment(0);
     metrics::counter!(
         tickvault_storage::ilp_overflow::PENDING_DISCARDED_COUNTER,
         "table" => "ticks"
