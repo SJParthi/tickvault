@@ -879,7 +879,14 @@ async fn async_main() -> Result<()> {
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
     // frames reuse the SAME capture sequence as their original live write
     // (replay-stable). v1 records replay with frame_seq=0.
-    let mut ws_wal_replay_live_feed: Vec<(u64, bytes::Bytes)> = Vec::new();
+    // TVW3: the third element is the frame's ORIGINAL arrival instant, read
+    // back from the WAL record. It was persisted on 2026-08-28 precisely so
+    // replay would stop re-deriving it, and until this change NOTHING read it
+    // back -- `ReplayedFrame::received_at_nanos` had zero consumers in the
+    // workspace while its own doc said "a replay consumer MUST prefer this
+    // over a fresh clock read". `WAL_RECEIPT_UNKNOWN_NANOS` for v1/v2 records,
+    // which genuinely predate the field.
+    let mut ws_wal_replay_live_feed: Vec<(u64, i64, bytes::Bytes)> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
@@ -893,8 +900,11 @@ async fn async_main() -> Result<()> {
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
-                            ws_wal_replay_live_feed
-                                .push((rec.frame_seq, bytes::Bytes::from(rec.frame)));
+                            ws_wal_replay_live_feed.push((
+                                rec.frame_seq,
+                                rec.received_at_nanos,
+                                bytes::Bytes::from(rec.frame),
+                            ));
                         }
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
                             ord += 1;
