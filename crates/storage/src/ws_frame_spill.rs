@@ -412,7 +412,7 @@ pub struct WsFrameSpill {
     /// The exclusive claim on the WAL directory, held for as long as this spill
     /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
     /// release it on drop so the next process can start. See [`WalDirGuard`].
-    _dir_guard: WalDirGuard,
+    _dir_guard: Option<WalDirGuard>,
 }
 
 impl WsFrameSpill {
@@ -986,6 +986,12 @@ pub const WAL_DIR_LOCK_FILE: &str = ".wal-owner.lock";
 /// never a loss — the frames the incumbent is capturing are unaffected.
 pub const WAL_DIR_LOCK_REFUSED_COUNTER: &str = "tv_wal_dir_lock_refused_total";
 
+/// Counter: the lock FILE could not be created (an unwritable directory, a full
+/// disk), so one-writer-per-directory is not enforced for this process. Distinct
+/// from [`WAL_DIR_LOCK_REFUSED_COUNTER`] because they mean opposite things: that
+/// one is the guard WORKING, this one is the guard UNAVAILABLE.
+pub const WAL_DIR_LOCK_UNAVAILABLE_COUNTER: &str = "tv_wal_dir_lock_unavailable_total";
+
 /// Counter: the boot re-seed advanced [`WAL_FRAME_SEQ`] past a high-water mark
 /// found on disk. Non-zero means a restart WOULD have re-issued sequence values
 /// already in the database, and did not.
@@ -1044,28 +1050,63 @@ impl WalDirGuard {
 
 /// Take the exclusive claim on `wal_dir`, or refuse.
 ///
+/// # The two failures are NOT the same, and they get opposite treatment
+///
+/// - **CONTENTION** — another live process holds the lock. This is the case the
+///   lock exists for, and it is fail-CLOSED: `Err`. Two processes minting
+///   `capture_seq` from independent clocks destroy ticks through the DEDUP key
+///   with no counter to show it, so one refused boot is the cheap outcome.
+///
+/// - **THE LOCK FILE CANNOT BE CREATED** — an unwritable directory, a full
+///   disk. This returns `Ok(None)`, and the caller proceeds DEGRADED. It is not
+///   evidence of a second process, and killing the lane over a transient
+///   filesystem problem is the worse failure: the writer is deliberately built
+///   to survive an unwritable directory and recover when permission returns
+///   (`test_writer_survives_unwritable_dir_then_recovers` pins exactly that).
+///   Turning that recoverable state into a dead feed would trade a rare silent
+///   loss for a common total outage.
+///
+/// **Honest limit of the degraded arm:** while `Ok(None)` is in force, mutual
+/// exclusion is NOT enforced. It is logged with a coded error and counted, so
+/// the state is visible rather than assumed away — but a second process started
+/// during it would not be refused. That window is bounded by the directory
+/// being unwritable, which the writer is already reporting loudly through
+/// `WS-SPILL-01`.
+///
 /// # Errors
 ///
-/// - the lock file cannot be created — a permissions or disk problem the caller
-///   must not paper over, since an unwritable WAL directory has no durable
-///   floor at all;
-/// - another live process already holds it. The error names the file so an
-///   operator can identify the incumbent with `fuser` or `lsof`.
-pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<WalDirGuard> {
+/// Contention only. A creation failure is `Ok(None)`, never `Err`.
+pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
     let path = wal_dir.join(WAL_DIR_LOCK_FILE);
     // `create(true)` and deliberately NOT `create_new(true)`: the file survives
     // a clean shutdown and carries no state — the kernel lock IS the state — so
     // an existing file is the normal case and is reused.
-    let lock = std::fs::OpenOptions::new() // O(1) EXEMPT: one-shot boot claim, never the per-frame append
+    let lock = match std::fs::OpenOptions::new() // O(1) EXEMPT: one-shot boot claim, never the per-frame append
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(&path)
-        .map_err(|e| anyhow::anyhow!("open WAL lock file {path:?}: {e}"))?;
+    {
+        Ok(f) => f,
+        Err(e) => {
+            metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                lock_file = ?path,
+                error = %e,
+                "could not create the WAL directory lock file, so one-writer-per-directory \
+                 is NOT enforced for this process. Continuing anyway: the usual cause is an \
+                 unwritable directory or a full disk, which the spill writer already survives \
+                 and recovers from, and killing the feed over it would be the worse failure. \
+                 While this persists, a second process on this directory would not be refused."
+            );
+            return Ok(None);
+        }
+    };
 
     match lock.try_lock() {
-        Ok(()) => Ok(WalDirGuard { _lock: lock, path }),
+        Ok(()) => Ok(Some(WalDirGuard { _lock: lock, path })),
         Err(e) => {
             metrics::counter!(WAL_DIR_LOCK_REFUSED_COUNTER).increment(1);
             Err(anyhow::anyhow!(
@@ -4232,7 +4273,9 @@ mod tests {
     #[test]
     fn a_second_claim_on_a_live_wal_directory_is_refused() {
         let dir = tmp_dir("wal-lock-refuse");
-        let first = lock_wal_dir(&dir).expect("first claim must succeed");
+        let first = lock_wal_dir(&dir)
+            .expect("first claim must succeed")
+            .expect("a writable temp dir must yield a guard");
         let second = lock_wal_dir(&dir);
         assert!(
             second.is_err(),
@@ -4260,7 +4303,7 @@ mod tests {
     #[test]
     fn dropping_the_guard_frees_the_wal_directory_for_the_next_process() {
         let dir = tmp_dir("wal-lock-release");
-        let first = lock_wal_dir(&dir).expect("first claim");
+        let first = lock_wal_dir(&dir).expect("first claim").expect("guard");
         drop(first);
         assert!(
             lock_wal_dir(&dir).is_ok(),
@@ -4275,8 +4318,10 @@ mod tests {
     fn two_different_wal_directories_are_independently_claimable() {
         let a = tmp_dir("wal-lock-a");
         let b = tmp_dir("wal-lock-b");
-        let ga = lock_wal_dir(&a).expect("claim a");
-        let gb = lock_wal_dir(&b).expect("claim b must not be blocked by a");
+        let ga = lock_wal_dir(&a).expect("claim a").expect("guard a");
+        let gb = lock_wal_dir(&b)
+            .expect("claim b must not be blocked by a")
+            .expect("guard b");
         assert_ne!(ga.path(), gb.path());
     }
 
@@ -4491,5 +4536,60 @@ mod tests {
              sequence past them (next {next} vs on-disk {far_future}); minting \
              at or below re-issues capture_seq values that are already rows"
         );
+    }
+
+    /// A lock file that cannot be CREATED degrades — it does not kill the lane.
+    ///
+    /// The two failures are not the same and must not be treated the same.
+    /// Contention means a second live process and is fail-closed. A creation
+    /// failure — an unwritable directory, a full disk — is not evidence of a
+    /// second process, and the writer is deliberately built to survive exactly
+    /// that state and recover when it clears
+    /// (`test_writer_survives_unwritable_dir_then_recovers`). Refusing to
+    /// construct would turn a recoverable filesystem problem into a dead feed.
+    ///
+    /// The failure is induced by making the lock PATH a directory, so `open`
+    /// fails with `IsADirectory`. That works as root, which a `chmod 0o555`
+    /// does not — and this is the exact difference that let the regression
+    /// reach CI green locally and red on the runner.
+    #[test]
+    fn a_lock_file_that_cannot_be_created_degrades_instead_of_killing_the_lane() {
+        let dir = tmp_dir("lock-uncreatable");
+        std::fs::create_dir_all(dir.join(WAL_DIR_LOCK_FILE)).expect("occupy the lock path");
+
+        let claimed = lock_wal_dir(&dir).expect("a creation failure must NOT be an Err");
+        assert!(
+            claimed.is_none(),
+            "an uncreatable lock file yields no guard, and says so, rather than \
+             pretending exclusion is in force"
+        );
+
+        // And the whole spill must still construct, because the writer's own
+        // survive-and-recover behaviour is what this protects.
+        let spill = WsFrameSpill::new(&dir).expect(
+            "an uncreatable lock file must not stop the spill from constructing — \
+             the writer survives an unwritable directory by design",
+        );
+        assert_eq!(
+            spill.append(WsType::LiveFeed, vec![1, 2, 3]),
+            AppendOutcome::Spilled,
+            "the channel must still accept frames in the degraded state"
+        );
+        drop(spill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Contention is still fail-CLOSED. The degrade above must not have softened
+    /// the case the lock exists for.
+    #[test]
+    fn contention_is_still_an_error_after_the_degrade_arm_was_added() {
+        let dir = tmp_dir("lock-still-closed");
+        let held = lock_wal_dir(&dir).expect("claim").expect("guard");
+        assert!(
+            lock_wal_dir(&dir).is_err(),
+            "a second live claim must remain an Err — softening this to a degrade \
+             would reopen the silent capture_seq collision the lock exists to stop"
+        );
+        drop(held);
     }
 }
