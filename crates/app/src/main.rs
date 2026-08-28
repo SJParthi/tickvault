@@ -3217,18 +3217,46 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             //
             // Storing both halves keeps the sender alive for exactly the same
             // reason `forget` did, while making shutdown able to reach it.
-            let _ = SEAL_WRITER_CANCEL.set(cancel_tx);
-            let handle = tokio::spawn(async move {
-                run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
-            });
-            if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
-                *slot = Some(handle);
+            //
+            // Gated on the OnceLock, matching the three installs above.
+            //
+            // `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` reads as a discarded
+            // unit; it is a discarded SENDER. `OnceLock::set` returns
+            // `Err(value)` on a second call, so the `let _` DROPPED the only
+            // sender for the `cancel_rx` about to be moved into the spawn — and
+            // a seal-writer loop with no live sender is the one shape that loop
+            // cannot survive (see the `Err` arm of its cancel branch, fixed in
+            // the same change). Unguarded, a second entry here would have:
+            //   * spawned a loop that can never be cancelled,
+            //   * overwritten SEAL_WRITER_HANDLE, so shutdown joins the NEW
+            //     task and burns the whole 75s budget on it,
+            //   * left the FIRST loop — the one actually draining seals — never
+            //     signalled, so its final drain never runs and the day's tail
+            //     dies with the runtime.
+            //
+            // One added call site, the entire session's closing candles. Skip
+            // instead: first installer wins, and the already-running writer
+            // keeps draining.
+            if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {
+                drop(orphan);
+                drop(cancel_rx);
+                tracing::warn!(
+                    "seal writer loop already installed (idempotent skip) — first installer \
+                     wins; this runner will not be spawned"
+                );
+            } else {
+                let handle = tokio::spawn(async move {
+                    run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
+                });
+                if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
+                    *slot = Some(handle);
+                }
+                tracing::info!(
+                    interval_ms = seal_drain_interval().as_millis(),
+                    max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
+                    "seal writer task spawned — Engine B candle sealing enabled"
+                );
             }
-            tracing::info!(
-                interval_ms = seal_drain_interval().as_millis(),
-                max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
-                "seal writer task spawned — Engine B candle sealing enabled"
-            );
         }
         Err(err) => {
             tracing::error!(
