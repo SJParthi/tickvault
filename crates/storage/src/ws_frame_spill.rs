@@ -154,7 +154,25 @@ struct WalRecord {
 /// Result of a hot-path `append()` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
-    /// Frame was queued for durable write. Hot path is done.
+    /// Frame was QUEUED for durable write. Hot path is done.
+    ///
+    /// Read the first word literally: this is a `try_send` onto a bounded
+    /// channel, and a background thread turns the queued record into bytes.
+    /// `Spilled` therefore means "handed off", NOT "on disk", and the two are
+    /// separated by up to `SPILL_CHANNEL_CAPACITY` records plus a 256 KiB
+    /// `BufWriter` — around 100 s of frames at the 5,000 fps envelope.
+    ///
+    /// Everything in that window dies on an abort (`panic = "abort"`, an
+    /// OOM-kill, a SIGKILL past `TimeoutStopSec`) and is counted by NOTHING:
+    /// `persisted_count` counts `write_all`, and `drop_critical` counts only
+    /// the frames `try_send` refused outright. The window is now at least
+    /// OBSERVABLE — `tv_ws_frame_spill_queue_depth` and its session
+    /// high-water are published from the writer batch loop — but observable
+    /// is not the same as closed, and this doc says "queued" so no caller
+    /// mistakes the one for the other.
+    ///
+    /// Nor is a written record fsync'ed; see the module header. The durable
+    /// floor is page-cache-deep, not platter-deep.
     Spilled,
     /// Spill channel was full — frame could not be persisted.
     /// CRITICAL: counted in drop metric; Telegram alert fires.
@@ -763,6 +781,20 @@ fn writer_loop(
     let mut current: Option<BufWriter<File>> = open_segment_resilient(wal_dir);
     let mut bytes_written: u64 = 0;
 
+    // Resolved ONCE, outside the loop, for the same reason the batch-boundary
+    // comment below gives: a handle re-resolved per iteration is how a metric
+    // write becomes a cost.
+    let depth_gauge = metrics::gauge!("tv_ws_frame_spill_queue_depth");
+    let high_water_gauge = metrics::gauge!("tv_ws_frame_spill_queue_high_water");
+    let mut high_water: usize = 0;
+    // Seeded so the series REGISTERS at startup. The CloudWatch agent computes
+    // deltas and drops the first sample of a series it has never seen, so an
+    // always-zero gauge that is never set would be indistinguishable from an
+    // absent one — the exact failure that made a depth loss unknowable on
+    // 2026-08-28.
+    depth_gauge.set(0.0);
+    high_water_gauge.set(0.0);
+
     loop {
         // Block until at least one record arrives. Exit cleanly (and ONLY here)
         // when all senders are dropped — that is the clean-shutdown signal.
@@ -814,6 +846,39 @@ fn writer_loop(
             // Drop the possibly-broken writer; the next record reopens it.
             current = None;
             thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+        }
+
+        // The exposure C1 named, made measurable.
+        //
+        // `AppendOutcome::Spilled` means QUEUED, not written: `append` is a
+        // `try_send` onto a 524,288-slot channel and this thread is what turns
+        // a queued record into bytes. Everything still in the channel at an
+        // abort (`panic = "abort"`, an OOM-kill, a SIGKILL past
+        // `TimeoutStopSec`) is PERMANENTLY LOST — and is counted by nothing,
+        // because `persisted` counts `write_all` and `drop_critical` counts
+        // only the refusals `try_send` rejected outright.
+        //
+        // Until this gauge the depth of that window had never been observed,
+        // so the honest answer to "how many frames could we lose on an abort?"
+        // was Unknown with a ceiling of 524,288 (~100 s at the 5,000 fps
+        // envelope). Now it is a number.
+        //
+        // Published HERE, at the batch boundary, and deliberately not in
+        // `append`: the hot path already learned this lesson once, when
+        // `record_ws_lag` allocated twice per tick (~36 M allocations/hour) on
+        // a path documented as allocation-free. One gauge write per ~257
+        // records costs nothing measurable; one per frame is how that defect
+        // was reintroduced.
+        //
+        // The high-water is the load-bearing half. A gauge sampled every 30 s
+        // by the CloudWatch agent will read ~0 all session and miss the burst
+        // that matters — the whole point is the PEAK during a disk stall, and
+        // a peak that decays between scrapes was never observed at all.
+        let queued = rx.len();
+        depth_gauge.set(queued as f64);
+        if queued > high_water {
+            high_water = queued;
+            high_water_gauge.set(high_water as f64);
         }
 
         if bytes_written >= WAL_SEGMENT_MAX_BYTES {
@@ -5028,5 +5093,89 @@ mod tests {
         let now = Instant::now();
         let r = receipt_nanos_from(now);
         assert!(r > 0, "a receipt must be a real epoch value, got {r}");
+    }
+}
+
+#[cfg(test)]
+mod queue_depth_visibility_tests {
+    /// The writer loop must publish the queue depth AND its session high-water.
+    ///
+    /// Source-scanned rather than behavioural because the loop is a thread with
+    /// no return value and the gauges are process-global; a behavioural test
+    /// would have to install a recorder and race the thread. What can go wrong
+    /// here is a refactor deleting the lines, and a scan catches exactly that.
+    /// The writer loop body, bounded by the next top-level fn.
+    ///
+    /// NOT split on `#[cfg(test)]` like the other guards in this repo: that
+    /// marker appears INSIDE `writer_loop` itself (the `maybe_test_panic`
+    /// hook), so the usual split truncates the production text mid-function
+    /// and the scan silently sees nothing. Caught by these tests failing on
+    /// their first run against code that was already correct.
+    fn writer_loop_src() -> &'static str {
+        let src = include_str!("ws_frame_spill.rs");
+        let from = src.find("fn writer_loop").expect("writer_loop must exist");
+        let len = src[from..]
+            .find("fn open_segment_resilient")
+            .expect("the next top-level fn must still follow writer_loop");
+        &src[from..from + len]
+    }
+
+    #[test]
+    fn the_writer_publishes_its_queue_depth_and_high_water() {
+        let production = writer_loop_src();
+
+        assert!(
+            production.contains("tv_ws_frame_spill_queue_depth"),
+            "the queued-but-unwritten window must be observable — it is the \
+             frames an abort loses, and nothing else counts them"
+        );
+        assert!(
+            production.contains("tv_ws_frame_spill_queue_high_water"),
+            "the PEAK is the load-bearing half: a 30s scrape of a decaying \
+             gauge misses the burst that matters"
+        );
+        assert!(
+            production.contains("let queued = rx.len();"),
+            "depth must be read from the channel itself, not inferred"
+        );
+    }
+
+    /// The gauges must be resolved OUTSIDE the loop and read at the BATCH
+    /// boundary, never per frame.
+    ///
+    /// This is the `record_ws_lag` lesson, which allocated twice per tick —
+    /// ~36M allocations/hour — on a path its own docs called allocation-free.
+    /// Three correct comments did not stop it shipping; a test does.
+    #[test]
+    fn the_depth_gauge_is_not_read_on_the_per_frame_path() {
+        let loop_body = writer_loop_src();
+
+        // The handles are resolved before the `loop {`; the reads happen after
+        // the inner drain. If either moved into the 0..256 drain, the gauge
+        // write would land once per FRAME instead of once per batch.
+        let resolve_at = loop_body
+            .find("metrics::gauge!(\"tv_ws_frame_spill_queue_depth\")")
+            .expect("depth gauge must be resolved in writer_loop");
+        let loop_at = loop_body.find("\n    loop {").expect("the drain loop");
+        assert!(
+            resolve_at < loop_at,
+            "the gauge handle is resolved INSIDE the loop — re-resolving a \
+             handle per iteration is how a metric write becomes a cost"
+        );
+
+        let drain_at = loop_at
+            + loop_body[loop_at..]
+                .find("for _ in 0..256")
+                .expect("the batch drain");
+        let read_at = loop_at
+            + loop_body[loop_at..]
+                .find("let queued = rx.len();")
+                .expect("the depth read");
+        assert!(
+            read_at > drain_at,
+            "the depth is read BEFORE the batch drain — it must sit at the \
+             batch boundary so it costs one write per ~257 records, not one \
+             per frame"
+        );
     }
 }
