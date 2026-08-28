@@ -5331,6 +5331,7 @@ fn drain_depth_frame(
         DepthFeedKind::TwoHundred => DEPTH_KIND_200,
     };
     let mut iter = split_depth_frame(&frame.bytes, kind);
+    let mut packets_walked: u32 = 0;
     // `by_ref` rather than consuming the iterator: `stop_reason()` and
     // `length_field_mismatches()` are read AFTER the walk, and they are the
     // only way to tell a cleanly-consumed frame from a truncated one.
@@ -5478,6 +5479,33 @@ fn drain_depth_frame(
             } else {
                 out.refused = out.refused.saturating_add(1);
                 c.depth_refused.increment(1);
+            }
+
+            // Same bound the main-feed walk has carried since it was written, and
+            // this walk did not (2026-08-28).
+            //
+            // The main-feed walk stops at `MAX_PACKETS_PER_FRAME` because "a frame
+            // claiming more packets than the protocol can produce is malformed or
+            // hostile". Every word of that applies here and the check was simply
+            // absent: the only thing bounding this loop was the frame's own byte
+            // length, which is attacker-influenced in exactly the way a packet
+            // count is.
+            //
+            // It cannot fire on a well-formed frame, which is the point. The
+            // largest depth frame the transport accepts is 512 KiB and the
+            // smallest depth packet is a 12-byte header, so a real frame tops out
+            // near 43,000 packets — comfortably under this cap. A frame that
+            // reaches it is not a busy market.
+            //
+            // Counted as a REFUSAL, not silently: abandoning the tail of a frame
+            // is the same class of loss the `stop_reason` check below reports, and
+            // it must be visible for the same reason.
+            packets_walked = packets_walked.saturating_add(1);
+            if packets_walked >= MAX_PACKETS_PER_FRAME {
+                out.refused = out.refused.saturating_add(1);
+                c.depth_refused.increment(1);
+                c.depth_rows.increment(out.rows);
+                return out;
             }
         }
     }
@@ -11666,6 +11694,71 @@ mod tests {
             received_at: std::time::Instant::now(),
             bytes: bytes::Bytes::from(bytes),
         }
+    }
+
+    /// The depth walk stops at the same packet cap the main-feed walk has.
+    ///
+    /// Until 2026-08-28 the only thing bounding this loop was the frame's own
+    /// byte length — which is attacker-influenced in exactly the way a packet
+    /// count is. The main-feed walk has carried
+    /// `if packets >= MAX_PACKETS_PER_FRAME` since it was written, with the
+    /// comment "a frame claiming more packets than the protocol can produce is
+    /// malformed or hostile"; every word of that applied here and the check was
+    /// simply absent.
+    ///
+    /// Asserted through the PARITY, not a literal: pinning the number here
+    /// would let the two walks drift to different caps, which is the state this
+    /// closes.
+    ///
+    /// HONEST LIMIT: this is a source scan, so it proves the comparison is
+    /// WRITTEN, not that it is reachable. `if false && packets_walked >= ..`
+    /// would still pass — verified, not assumed. Deleting the block fails it,
+    /// which is the regression this actually guards against; a deliberate
+    /// disabling is a code-review problem, not a scanner one.
+    #[test]
+    fn the_depth_walk_carries_the_same_packet_cap_as_the_main_feed_walk() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let from = src
+            .find("\nfn drain_depth_frame")
+            .expect("drain_depth_frame must exist");
+        // `from + 1` so the search does not immediately re-find the `\nfn`
+        // that `from` itself points at — which would slice an empty body and
+        // make this guard pass or fail for the wrong reason.
+        let to = src[from + 1..]
+            .find("\nfn ")
+            .map_or(src.len(), |o| from + 1 + o);
+        let body = &src[from..to];
+        assert!(
+            body.contains("packets_walked >= MAX_PACKETS_PER_FRAME"),
+            "the depth frame walk must stop at the same cap the main-feed walk \
+             uses; without it the loop is bounded only by the frame's own byte \
+             length, which is attacker-influenced"
+        );
+        assert!(
+            body.contains("c.depth_refused.increment(1);"),
+            "hitting the cap abandons the tail of a frame — that is a loss and \
+             must be counted, not silent"
+        );
+    }
+
+    /// A well-formed frame is nowhere near the cap, which is why it is safe.
+    ///
+    /// 512 KiB is the largest depth frame the transport accepts and 12 bytes is
+    /// the smallest depth packet header, so a real frame tops out near 43,000
+    /// packets. A cap that could fire on a busy market would be a bug, not a
+    /// guard.
+    #[test]
+    fn the_depth_packet_cap_cannot_fire_on_a_well_formed_frame() {
+        const SMALLEST_DEPTH_PACKET_BYTES: u32 = 12;
+        let max_real_packets = (tickvault_core::websocket::connection::DEPTH_200_MAX_FRAME_BYTES
+            as u32)
+            / SMALLEST_DEPTH_PACKET_BYTES;
+        assert!(
+            max_real_packets < MAX_PACKETS_PER_FRAME,
+            "the cap ({MAX_PACKETS_PER_FRAME}) must sit above the largest packet \
+             count a real frame can carry ({max_real_packets}), or a busy market \
+             loses its tail"
+        );
     }
 
     #[test]
