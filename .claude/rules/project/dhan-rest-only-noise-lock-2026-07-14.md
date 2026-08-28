@@ -1742,3 +1742,140 @@ does not make it survivable.
 - Makes either `breaching` on missing data (pages every night and weekend).
 - Adds a per-INSTRUMENT dimension to either (the §2.3 cardinality rule stands).
 - Claims the seal writer is now resilient — it is detectable, not respawned.
+
+### §2.3m — 2026-08-28: the socket that carries nothing, and the flush that stalls the drain
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "see aagin why this amrket depth stuck and why the fuck it failed see ebcasue of all tehse issues evenw e will face websocket disocennct wbesocket reocnenct right mtoehrfucekr am i irght how will you provid eme the rela tiem rpoven gauarnteed assured solution mtoehrfucke rokay?"
+
+> "I dont need any hallucination or illusion I just need the working guaranteed assurance solution"
+
+This dated row is written BEFORE the terraform, per the rule-file-first law.
+
+#### The operator is right about the mechanism, and the source says so in its own words
+
+He asserted that the depth stall is what produces the WebSocket disconnects and
+reconnects. Traced end to end, that is exactly what the code does — and
+`dhan_feed_stack.rs` had already written the sentence down:
+
+> "Called bare on this task it pins a tokio worker; on a 2-worker host that is
+> HALF the runtime, and the worker it pins is shared with the WS read loops —
+> which stop pumping pongs and get the socket dropped. Worse, the drain stops
+> draining, so the 65,536-frame ring fills in ~13 s at 5,000 fps and every frame
+> after that is refused."
+
+`tick_persistence.rs` carries the other half:
+
+> "A slow database therefore stalled the fold, filled the receive buffer, and
+> Dhan — which skips a slow consumer forward to 'the latest available state'
+> with no sequence number — discarded the intermediate ticks at THEIR side,
+> invisibly."
+
+**The tick writer was taken off the drain on 2026-08-25. The depth writer was
+not** — verified by source scan: `DepthWriter` had no `offload` field and
+`split_for_offload` returned zero occurrences in that file. And depth is the
+writer that needed it more:
+
+| | ticks | depth |
+|---|---:|---:|
+| rows per session (MEASURED 2026-08-24) | 64,349,753 | **1,530,651,649** |
+| modelled rows/sec | — | **~63,800** |
+| ILP `request_timeout` | 5,000 ms | 5,000 ms |
+| flush on the frame-drain task | no, since 2026-08-25 | **yes, until today** |
+
+So the largest payload in the process ran a synchronous 5-second-timeout flush
+on the tick fold's own task, up to ~5 times a second. That is the coupling, and
+no amount of provisioned disk throughput removes it, because it is structural
+rather than a matter of speed.
+
+#### What was done about it
+
+`DepthWriter::split_for_offload` — the same split, applied to the bigger writer,
+with the same bounds and the same names so the two paths cannot drift into
+different failure semantics: a `DEPTH_FLUSH_QUEUE_DEPTH` of 4, a
+`MAX_DEPTH_RETAINED_FLUSH_SPANS` of 2, a `MAX_DEPTH_PRODUCER_BUFFER_BYTES`
+const-asserted at or below half the questdb-rs wedge, and a `QueueFull` arm that
+reports `Ok` because the rows are still held. Nine tests pin the semantics; the
+one that matters most is that backpressure is never reported as loss.
+
+#### The alarm this section authorizes — family (5) gains a SIXTEENTH signal
+
+`tv-<env>-errcode-ws-gap-02-swap-emptied-socket`. An at-the-money depth swap
+that unsubscribed the old contract and then failed to subscribe the new one
+leaves that socket **carrying nothing** — and it stays transport-healthy: it
+keeps ponging, `tv_dhan_ws_alive_connections` counts it, and
+`dhan-no-ticks-flowing` reads the WHOLE lane, where fifteen other sockets are
+flowing and the last tick is always ~1 s old. Every alarm in family (5) reads
+green through it.
+
+**Scoped by `$.source`, never by the bare code**, and that is the load-bearing
+detail: `WS-GAP-02` is also emitted by the per-minute ATM top-up path, which
+stops at its wire budget without emptying anything and is an ordinary,
+non-paging outcome. A bare-code filter would page on routine top-up exhaustion
+every minute — the RISK-GAP-03 noise trap, on a hotter path. Two conditions plus
+the level, matching the shape §2.3f settled on after finding that filter-pattern
+syntax is validated only by the real `PutMetricFilter` call at apply time.
+
+`ok_recovery = true`, unlike the xverify entries: the same code arm schedules a
+redial and the retained set already names the NEW contract, so a return to OK is
+the remediation working and is worth telling.
+
+**A second, quieter fix in the same arm.** The emptied-socket condition was
+computed as `unsubscribe_succeeded && subscribe.is_some()` — which misses the
+case where the unsubscribe **timed out**. A budget elapsing does not mean the
+frame was never written; a slow flush that lands afterwards leaves Dhan holding
+nothing, which is precisely the case the remediation exists for. Worse, the new
+counter would have read **zero while a socket was empty** — a false-OK on the
+very signal added to make this visible. A timed-out unsubscribe is now treated
+as possibly-landed, because the two errors are not symmetric: a redial is
+idempotent and costs a backoff, while an empty socket delivers nothing for the
+rest of the session.
+
+#### ⚠ Honest cost, and it crosses the automatic action line further
+
+One log-filter alarm on an existing metric-filter lane ≈ **$0.10/mo**. No new
+EMF name, no user-data byte — the two other new safety counters were
+deliberately NOT shipped as EMF names, because their emit sites already carry
+`WS-SPILL-01` and `HOT-PATH-02`, both of which are already filtered and alarmed.
+Three names' worth of coverage for one name's cost.
+
+§2.3k put a maximal month at **~$120.68** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`). This
+takes it to **~$120.78 — about $3.78 above the line that switches the trading
+box off** in a maximal month. The live account is nowhere near it (August MTD
+$48.87, forecast $61.51, measured 2026-08-25), so nothing fires today, but the
+gap widens with every addition. The levers are unchanged and neither is taken
+here: the already-approved Quote 10 Elastic IP release (−$3.60/mo, which alone
+would put the maximal month back under the line), or an operator decision on
+`limit_amount`.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **Taking the depth flush off the drain does not make QuestDB faster.** It
+  removes the drain from the flush's critical path, so a database stall stops
+  becoming upstream tick loss. The stall itself is untouched, and the 24×
+  row volume that causes it is untouched.
+- **The bounded queue is a shock absorber, not storage.** Four batches absorb
+  roughly 600 ms of stall at the modelled depth flush cadence. A longer stall
+  surfaces as backpressure, and past two retained spans the producer rescues to
+  the depth spill tier — durable and re-ingestable, but not in QuestDB.
+- **The alarm reports an emptied socket; it does not prevent one.** Detection
+  latency is the CloudWatch window.
+- **None of this has run against a live market open.** The depth lane has never
+  faced one, and that residual stands from §2.3b.
+
+#### What a PR that violates §2.3m looks like (REJECT)
+
+- Filters the emptied-socket alarm on `WS-GAP-02` alone, or drops the `$.source`
+  condition — it pages on every routine top-up budget exhaustion.
+- Re-couples the depth flush to the frame-drain task, or removes
+  `split_for_offload` from either writer.
+- Makes the depth `QueueFull` arm report a failure — backpressure is not loss,
+  and reporting it as loss decays feed health for rows that are still held.
+- Removes either producer bound (`MAX_DEPTH_RETAINED_FLUSH_SPANS`,
+  `MAX_DEPTH_PRODUCER_BUFFER_BYTES`) — "keep appending while the writer is
+  behind" without a bound is an unbounded memory path in a costume.
+- Uses a blocking `send` on the hand-off queue, which re-creates the exact
+  coupling one queue further out.

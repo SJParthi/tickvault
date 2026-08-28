@@ -81,12 +81,38 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             // It also closes the mirror-image hole: enabling first left a
             // window in which a STALE ALARM had live actions, so the old order
             // could fire a spurious alarm page as well as a spurious recovery.
-            cw.set_alarm_state()
+            // THE RESET MUST NOT BE ABLE TO BLOCK THE ARM (2026-08-28).
+            //
+            // This was `.await?`, and the `?` is the whole defect: a transient
+            // SetAlarmState failure propagated out of the handler and
+            // `enable_alarm_actions` below never ran — leaving the alarm
+            // action-DISABLED for the entire session it was being armed for.
+            // A best-effort tidy-up would have silenced the alarm it exists to
+            // arm, which is strictly worse than the stale-state page the reset
+            // is here to avoid.
+            //
+            // Recorded plainly because this is the SECOND time: the identical
+            // bug was found and fixed in `market_hours_gate.rs` earlier the same
+            // day, and left standing here — the guard that pinned the fix read
+            // `include_str!("market_hours_gate.rs")` and was structurally unable
+            // to see this file. A guard scoped to one of two identical call
+            // sites is a guard that certifies half a fix.
+            if let Err(err) = cw
+                .set_alarm_state()
                 .alarm_name(&alarm_name)
                 .state_value(aws_sdk_cloudwatch::types::StateValue::Ok)
                 .state_reason(BOOT_OPEN_STATE_REASON)
                 .send()
-                .await?;
+                .await
+            {
+                tracing::error!(
+                    alarm = %alarm_name,
+                    error = %err,
+                    "could not reset the alarm to OK before arming it — arming anyway. \
+                     The cost of proceeding is one possible stale page; the cost of \
+                     returning here is an alarm that stays disabled all session."
+                );
+            }
             cw.enable_alarm_actions()
                 .alarm_names(&alarm_name)
                 .send()

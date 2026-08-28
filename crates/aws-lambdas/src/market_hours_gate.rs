@@ -275,27 +275,41 @@ mod tests {
     /// test without an AWS client.
     #[test]
     fn a_failed_alarm_reset_cannot_block_arming() {
-        let source = include_str!("market_hours_gate.rs");
-        let enable = source
-            .find("enable_alarm_actions()")
-            .expect("the open path must arm the alarms");
-        let head = &source[..enable];
-        let loop_at = head
-            .rfind("for name in &alarm_names {")
-            .expect("the pre-reset loop must precede arming");
-        let body = &source[loop_at..enable];
-        assert!(
-            !body.contains(".await?;"),
-            "the pre-reset loop propagates with `?`. One failed SetAlarmState then \
-             returns early and enable_alarm_actions NEVER RUNS, leaving every gated \
-             alarm silent for the entire session. A failed reset must be counted and \
-             logged, and arming must proceed regardless"
-        );
-        assert!(
-            body.contains("reset_failures"),
-            "a failed reset must be COUNTED — silently swallowing it would hide that \
-             an alarm may fire one spurious recovery page"
-        );
+        // BOTH gates, and the scope is the point (2026-08-28).
+        //
+        // This test read only `market_hours_gate.rs` when it was written, and
+        // `alarm_gate.rs` carried the IDENTICAL `.await?` on its reset — so the
+        // fix this test pinned was half a fix, and the test was structurally
+        // unable to say so. A guard scoped to one of two identical call sites
+        // certifies the site it can see and quietly blesses the one it cannot.
+        for (label, source) in [
+            ("market_hours_gate", include_str!("market_hours_gate.rs")),
+            ("alarm_gate", include_str!("alarm_gate.rs")),
+        ] {
+            let enable = source
+                .find("enable_alarm_actions()")
+                .unwrap_or_else(|| panic!("{label}: the open path must arm the alarms"));
+            let reset = source[..enable]
+                .rfind("set_alarm_state()")
+                .unwrap_or_else(|| panic!("{label}: the open path must reset to OK first"));
+            // Everything between the reset call and the arm call. If a `?` sits
+            // in there, one transient SetAlarmState failure returns early and
+            // the arm never happens.
+            let body = &source[reset..enable];
+            assert!(
+                !body.contains(".await?"),
+                "{label}: the pre-arm reset propagates with `?`. One failed \
+                 SetAlarmState then returns early and enable_alarm_actions NEVER RUNS, \
+                 leaving the gated alarm(s) silent for the entire session it was being \
+                 armed for. A failed reset must be logged and arming must proceed"
+            );
+            assert!(
+                body.contains("tracing::error!") || body.contains("reset_failures"),
+                "{label}: a failed reset must be VISIBLE — silently swallowing it hides \
+                 that an alarm may fire one spurious recovery page, and hides that the \
+                 reset is failing at all"
+            );
+        }
     }
 
     /// The gates must RESET to OK before ENABLING actions, never after.
