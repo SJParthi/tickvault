@@ -3117,54 +3117,75 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             // intermediate ticks are discarded at THEIR side, invisibly.
             let mut overflow = runner.overflow();
             let sink = overflow.split_escalation_offload();
-            let _ = SEAL_ESCALATION_STOP.set(sink.stop_flag());
-            match std::thread::Builder::new()
-                .name("tv-seal-escalate".to_string())
-                .spawn(move || {
-                    sink.run(|seal| {
-                        // The paging path lives in this crate, above storage,
-                        // which is why the sink takes a callback rather than
-                        // calling it directly. A seal both disk tiers refuse
-                        // still fires AGGREGATOR-DROP-01 — the page is
-                        // deferred to this thread, never dropped.
-                        let timeframe = tickvault_trading::candles::TfIndex::from_ordinal(
-                            seal.tf_ordinal as usize,
-                        )
-                        .map_or("unknown", |tf| tf.display_name());
-                        tickvault_app::seal_loss_alarm::record_lost_seal(
-                            tickvault_app::seal_loss_alarm::SealLossReason::BothDiskTiersFailed,
-                            seal.security_id,
-                            seal.exchange_segment_code,
-                            timeframe,
-                        );
-                    });
-                }) {
-                Ok(handle) => {
-                    if let Ok(mut slot) = SEAL_ESCALATION_THREAD.lock() {
-                        *slot = Some(handle);
-                    }
-                    tracing::info!(
-                        queue_depth =
-                            tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUE_DEPTH,
-                        "seal escalation thread spawned — refused seals no longer write to disk \
+            // Gated on the OnceLock, matching the two installs above.
+            //
+            // `spawn_seal_writer_loop` has exactly ONE production call site
+            // today, so a second entry is not reachable — but its two
+            // neighbours are both written to survive one, and this was not,
+            // which is the asymmetry an adversarial re-read of this diff
+            // found. Unguarded, a second entry would spawn a SECOND thread,
+            // overwrite the handle, and leave the FIRST one orphaned: its
+            // stop flag unreachable (the OnceLock already holds the first
+            // one), so shutdown would signal a thread it never joins and
+            // join a thread it never signalled. Dropping the sink instead
+            // disconnects the new sender, so the second overflow escalates
+            // inline — the documented lossless fallback.
+            if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {
+                drop(sink);
+                tracing::warn!(
+                    "seal escalation thread already installed (idempotent skip) — this \
+                     overflow will escalate inline; first installer wins"
+                );
+            } else {
+                match std::thread::Builder::new()
+                    .name("tv-seal-escalate".to_string())
+                    .spawn(move || {
+                        sink.run(|seal| {
+                            // The paging path lives in this crate, above storage,
+                            // which is why the sink takes a callback rather than
+                            // calling it directly. A seal both disk tiers refuse
+                            // still fires AGGREGATOR-DROP-01 — the page is
+                            // deferred to this thread, never dropped.
+                            let timeframe = tickvault_trading::candles::TfIndex::from_ordinal(
+                                seal.tf_ordinal as usize,
+                            )
+                            .map_or("unknown", |tf| tf.display_name());
+                            tickvault_app::seal_loss_alarm::record_lost_seal(
+                                tickvault_app::seal_loss_alarm::SealLossReason::BothDiskTiersFailed,
+                                seal.security_id,
+                                seal.exchange_segment_code,
+                                timeframe,
+                            );
+                        });
+                    }) {
+                    Ok(handle) => {
+                        if let Ok(mut slot) = SEAL_ESCALATION_THREAD.lock() {
+                            *slot = Some(handle);
+                        }
+                        tracing::info!(
+                            queue_depth =
+                                tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUE_DEPTH,
+                            "seal escalation thread spawned — refused seals no longer write to disk \
                          on the frame-drain task"
-                    );
-                }
-                Err(err) => {
-                    // The sink (and its receiver) died with the closure, so
-                    // every `try_send` now returns `Disconnected` and falls
-                    // back to the inline cascade. Degraded to the
-                    // pre-2026-08-28 behaviour, never lossy — and loud,
-                    // because a silent fallback is how a fix stops applying
-                    // without anyone noticing.
-                    tracing::error!(
-                        code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
-                            .code_str(),
-                        ?err,
-                        "failed to spawn the seal escalation thread — refused seals will write \
+                        );
+                    }
+                    Err(err) => {
+                        // The sink (and its receiver) died with the closure, so
+                        // every `try_send` now returns `Disconnected` and falls
+                        // back to the inline cascade. Degraded to the
+                        // pre-2026-08-28 behaviour, never lossy — and loud,
+                        // because a silent fallback is how a fix stops applying
+                        // without anyone noticing.
+                        tracing::error!(
+                            code =
+                                tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
+                                    .code_str(),
+                            ?err,
+                            "failed to spawn the seal escalation thread — refused seals will write \
                          to disk INLINE on the frame-drain task (pre-offload behaviour); watch \
                          tv_seal_escalation_inline_fallback_total"
-                    );
+                        );
+                    }
                 }
             }
             if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(overflow) {
