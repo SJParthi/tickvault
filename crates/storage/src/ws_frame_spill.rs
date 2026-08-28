@@ -2851,14 +2851,30 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         // v1: [magic|ws|len|frame|crc]
         // v2: [magic|ws|frame_seq(8)|len|frame|crc]
         // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
+        // Every `try_into` below is on a slice whose bounds the per-version
+        // minimum-size guard above has already validated, so these arms are
+        // structurally unreachable. They still set `corrupted_at` rather than
+        // breaking silently: a bare `break` ends the walk with the segment
+        // reported as fully replayed, and the caller then CONFIRMS and
+        // archives it — so an "impossible" arm that ever fired would discard
+        // every remaining record and say nothing at all. That is exactly the
+        // shape of the crash-recovery replay defect found the same day, and
+        // "unreachable" is a claim about today's bounds checks rather than a
+        // guarantee about tomorrow's.
         let (frame_seq, received_at_nanos, len_off) = if is_v3 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(_) => {
+                    corrupted_at = Some(("slice_seq_v3", i));
+                    break;
+                }
             };
             let recv_bytes: [u8; 8] = match buf[i + 13..i + 21].try_into() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(_) => {
+                    corrupted_at = Some(("slice_received_at", i));
+                    break;
+                }
             };
             (
                 u64::from_le_bytes(seq_bytes),
@@ -2868,7 +2884,10 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         } else if is_v2 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(_) => {
+                    corrupted_at = Some(("slice_seq_v2", i));
+                    break;
+                }
             };
             (
                 u64::from_le_bytes(seq_bytes),
@@ -2880,7 +2899,10 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         };
         let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => {
+                corrupted_at = Some(("slice_len", i));
+                break;
+            }
         };
         let frame_len = u32::from_le_bytes(len_bytes) as usize;
         let frame_off = len_off + 4;
@@ -2903,7 +2925,10 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         let frame = buf[frame_off..frame_off + frame_len].to_vec();
         let crc_bytes: [u8; 4] = match buf[frame_off + frame_len..record_end].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => {
+                corrupted_at = Some(("slice_crc", i));
+                break;
+            }
         };
         let expected = u32::from_le_bytes(crc_bytes);
         // CRC covers the version's exact header bytes, in write order: v2 adds
@@ -3661,6 +3686,69 @@ mod tests {
         );
     }
 
+    /// Every exit from the segment walk is either a counted abandonment or a
+    /// deliberate tail stop — never a silent `break`.
+    ///
+    /// **The defect this pins (2026-08-28).** Five `Err(_) => break` arms sat
+    /// on `try_into` calls whose slices the per-version minimum-size guard has
+    /// already bounds-checked, so all five were structurally unreachable. That
+    /// is precisely why they were dangerous: an unreachable arm attracts no
+    /// scrutiny, and a bare `break` here ends the walk with the segment
+    /// reported as fully replayed. The caller then CONFIRMS and archives it, so
+    /// a single such firing would discard every remaining record in the file
+    /// and produce no counter, no log line and no page.
+    ///
+    /// The same shape as the crash-recovery replay defect found the same day,
+    /// and the reusable half is that "unreachable" is a claim about today's
+    /// bounds checks, not a guarantee about tomorrow's edits.
+    #[test]
+    fn no_walk_exit_is_a_silent_break() {
+        let source = include_str!("ws_frame_spill.rs");
+        let walk = source
+            .split_once("fn replay_segment(path: &Path)")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n// ---"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("replay_segment not found — was it renamed?"));
+
+        // Comment-blind: a doc-comment quoting the old shape must not satisfy
+        // or trip the scan (the house convention).
+        let code: String = walk
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("Err(_) => break,"),
+            "a bare `Err(_) => break` in the segment walk ends the replay with the segment \
+             reported as fully recovered — the caller then archives it, and every record \
+             after that point is lost with nothing counted. Set `corrupted_at` instead, \
+             which is already wired to the counters and the coded error."
+        );
+
+        for needle in [
+            "corrupted_at = Some((\"slice_seq_v3\"",
+            "corrupted_at = Some((\"slice_received_at\"",
+            "corrupted_at = Some((\"slice_seq_v2\"",
+            "corrupted_at = Some((\"slice_len\"",
+            "corrupted_at = Some((\"slice_crc\"",
+        ] {
+            assert!(
+                code.contains(needle),
+                "the structurally-unreachable slice arms must report rather than break; \
+                 missing: {needle}"
+            );
+        }
+
+        // Self-test: the scan can bite. A synthetic body carrying the old
+        // shape must trip it, or the assertion above is decorative.
+        let regressed = "match x { Ok(b) => b, Err(_) => break, }";
+        assert!(
+            regressed.contains("Err(_) => break,"),
+            "self-test: the scan must detect the reintroduced silent break"
+        );
+    }
     /// recovers NOTHING -- captured to disk, then deleted from the recovery
     /// path with no counter and no error.
     #[test]
