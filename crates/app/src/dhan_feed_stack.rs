@@ -8916,6 +8916,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         let mut rounds = 0u32;
         let mut catchup_frames = 0usize;
         let mut catchup_ticks = 0u64;
+        let mut catchup_not_folded = 0u64;
         while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
             let wal_dir = crate::boot_helpers::ws_wal_dir();
             let batch = match tickvault_storage::ws_frame_spill::replay_all(&wal_dir) {
@@ -8935,6 +8936,25 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             if batch.is_empty() {
                 break;
             }
+            // Count what this lane does NOT fold before dropping it.
+            //
+            // The filter below is correct — the re-injection path expects
+            // Dhan's 8-byte-header binary protocol, and handing it an
+            // order-update JSON frame or a TrueData frame would parse one wire
+            // format as another. What was wrong (found 2026-08-28) is that the
+            // discard was SILENT while `confirm_replayed` below archives the
+            // segments those frames came from. So a frame class that the BOOT
+            // path counts loudly, names in a `warn!`, and explains has no
+            // consumer for, was destroyed mid-session with no counter and no
+            // line — the same signal treated two opposite ways depending on
+            // which drain happened to reach it first.
+            //
+            // Counted, not folded: making this lane consume them would be a
+            // scope change, and the raw frames survive in the WAL archive
+            // either way. The counter shares `tv_ws_frame_wal_replay_total`
+            // with the boot path so one series answers "how many of these have
+            // we seen", regardless of which drain saw them.
+            let batch_len = batch.len();
             let staged: Vec<(u64, i64, bytes::Bytes)> = batch
                 .into_iter()
                 .filter(|f| f.ws_type == tickvault_storage::ws_frame_spill::WsType::LiveFeed)
@@ -8946,6 +8966,20 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     )
                 })
                 .collect();
+            let not_folded = batch_len.saturating_sub(staged.len());
+            if not_folded > 0 {
+                catchup_not_folded = catchup_not_folded.saturating_add(not_folded as u64);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "catchup_not_folded")
+                    .increment(not_folded as u64);
+                warn!(
+                    round = rounds,
+                    frames = not_folded,
+                    "WAL catch-up drain: frames this lane does not fold (order-update or \
+                     TrueData) were consumed and archived with their segments — the raw \
+                     frames remain on disk in the WAL archive, but nothing will read them \
+                     again automatically"
+                );
+            }
             if staged.is_empty() {
                 // Nothing this lane folds, but the segments WERE consumed and
                 // staged -- confirm so the loop cannot spin on them forever.
@@ -8985,6 +9019,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 rounds,
                 frames = catchup_frames,
                 ticks = catchup_ticks,
+                not_folded = catchup_not_folded,
                 budget_exhausted = exhausted,
                 "WAL catch-up drain finished — recovered a backlog that a single \
                  512 MiB replay batch could never have reached"
@@ -13649,6 +13684,64 @@ mod tests {
         );
     }
 
+    /// The catch-up drain must never discard a frame class silently.
+    ///
+    /// **The defect this pins (2026-08-28).** The drain filters its batch to
+    /// `WsType::LiveFeed` — correct, because the re-injection path expects
+    /// Dhan's 8-byte-header binary protocol and would parse an order-update
+    /// JSON frame or a TrueData frame as if it were one. What was wrong is
+    /// that the discard was silent while `confirm_replayed` archives the
+    /// segments those frames came from.
+    ///
+    /// The asymmetry is the tell: the BOOT path counts all three classes,
+    /// names them in a `warn!`, and explains that the non-Dhan ones have no
+    /// consumer. The catch-up path treated the identical frames as if they
+    /// had never existed — the same signal handled two opposite ways
+    /// depending on which drain reached it first, which is how a reader
+    /// concludes there is nothing there.
+    #[test]
+    fn the_catchup_drain_counts_what_it_does_not_fold() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain function must exist")
+            .1;
+        // Comment-blind: the doc above quotes the shape, and a scan that its
+        // own explanation satisfies is decorative (the house convention).
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for needle in [
+            "let batch_len = batch.len();",
+            "batch_len.saturating_sub(staged.len())",
+            "\"ws_type\" => \"catchup_not_folded\"",
+            "catchup_not_folded",
+        ] {
+            assert!(
+                code.contains(needle),
+                "the catch-up drain must COUNT the frames it filters out; missing `{needle}`. \
+                 Without it an order-update or TrueData frame is read from disk, dropped, and \
+                 its segment archived as fully replayed — with no counter and no log line."
+            );
+        }
+
+        // The counter is only honest if the log fires with it.
+        assert!(
+            code.contains("frames = not_folded,"),
+            "the discard must reach errors.jsonl as well as a counter — a counter that is not \
+             EMF-selected and not logged reaches nobody at all"
+        );
+
+        // Self-test: the scan can bite.
+        let regressed = ".filter(|f| f.ws_type == WsType::LiveFeed).map(|f| f.frame).collect();";
+        assert!(
+            !regressed.contains("batch_len.saturating_sub(staged.len())"),
+            "self-test: a filter with no accounting must fail the scan"
+        );
+    }
     #[test]
     fn test_ingest_tick_at_yields_a_distinct_sequence_per_packet() {
         // One WebSocket message, two packets for the SAME instrument. If both
