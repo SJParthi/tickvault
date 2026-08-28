@@ -139,11 +139,26 @@ pub async fn set_feed(
         return Err((
             StatusCode::CONFLICT,
             Json(FeedErrorResponse {
-                error: "the Dhan live feed was retired by operator directive 2026-07-13 \
-                     and its lane code was deleted (both brokers are REST-only since the \
-                     2026-07-15 Groww retirement) — enabling it at runtime is permanently refused because \
-                     nothing exists to start; re-introducing the Dhan live WS requires a \
-                     fresh dated operator quote in the scope-lock rule file first"
+                // CORRECTED 2026-08-26. The refusal is right; every reason it
+                // gave was not. It said the lane "was retired ... and its lane
+                // code was deleted", that "both brokers are REST-only", and
+                // that enabling is refused "because nothing exists to start".
+                // The operator REVIVED the lane 2026-08-09 (`dhan_enabled =
+                // true` since 2026-08-11), it dials up to sixteen sockets, and
+                // the second broker was removed 2026-08-21 so there are not
+                // two. This body goes back to a LIVE caller, so it was telling
+                // whoever asked that their running feed does not exist.
+                //
+                // The real reason still refuses, and is narrower:
+                // `set_dhan_lane_running` is how the lane REPORTS its state,
+                // not how anything starts it — the lane comes up from config
+                // at boot, so flipping a runtime flag would change nothing
+                // while making /feeds show ON (the Rule-11 false-OK).
+                error: "the Dhan live feed is started from configuration at \
+                     start-up, not from this switch — this control reports the \
+                     lane's state rather than setting it, so enabling here \
+                     would change nothing while showing ON. To turn the live \
+                     feed on or off, change the configuration and restart"
                     .to_string(),
                 allowed: toggleable_except_dhan_labels(),
             }),
@@ -588,9 +603,21 @@ mod tests {
             panic!("enabling the retired (config-off) dhan lane must be refused");
         };
         assert_eq!(code, StatusCode::CONFLICT);
+        // RE-POINTED 2026-08-26. This required the body to name "2026-07-13"
+        // and "retired" — it PINNED the false reason, which is a large part of
+        // why that wording survived the 2026-08-09 revival: the test was
+        // holding it in place. The refusal itself is unchanged and still
+        // asserted directly above; what the body must now say is why enabling
+        // here does nothing, without telling a caller the lane does not exist.
         assert!(
-            body.error.contains("2026-07-13") && body.error.contains("retired"),
-            "refusal must name the directive date + the retirement: {}",
+            body.error.contains("configuration") && body.error.contains("restart"),
+            "refusal must tell the caller where the live feed IS controlled from: {}",
+            body.error
+        );
+        assert!(
+            !body.error.contains("retired") && !body.error.contains("deleted"),
+            "the lane was revived 2026-08-09 and runs — the refusal must not \
+             tell a caller it does not exist: {}",
             body.error
         );
         assert!(

@@ -27,7 +27,7 @@
 //!    have to be added here deliberately, in the same change, where they are
 //!    visible.
 //!
-//! The five ignored today are all genuinely not gates: two measurement
+//! The seven ignored today are all genuinely not gates: four measurement
 //! harnesses (wall-clock timings, which would flake on a shared CI runner and a
 //! flaky gate is worse than none), a reporting aid, a re-bless helper that
 //! enforces nothing, and a chaos test needing a live Docker stack.
@@ -64,6 +64,17 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     (
         "crates/core/src/pipeline/tick_gap_detector.rs",
         "scan_silence_sweep_cost_at_the_authorized_ceiling",
+    ),
+    // Added 2026-08-26 with the defect-10 cost measurement it belongs to: the
+    // same shape as the two harnesses above -- it times a full
+    // select_depth_universe pass at the authorized 24,600-instrument ceiling
+    // and prints the number. A wall-clock figure on a shared CI runner is a
+    // flake, and a flaky gate teaches people to ignore gates, so it is run
+    // deliberately in release and is never a merge condition. The behaviour it
+    // measures is gated by the ordinary tests in the same file.
+    (
+        "crates/app/src/dhan_depth_universe.rs",
+        "select_depth_universe_cost_at_the_authorized_ceiling",
     ),
     (
         "crates/storage/tests/critical_errcode_alarm_coverage_guard.rs",

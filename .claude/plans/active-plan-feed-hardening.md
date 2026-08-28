@@ -1,6 +1,6 @@
 # Implementation Plan: Feed Hardening — bound the limits, alarm the silence, automate the recovery
 
-**Status:** APPROVED
+**Status:** IN_PROGRESS
 **Date:** 2026-08-10
 **Approved by:** Parthiban (operator) — "approve the plan", 2026-08-10 in-session, given in
 direct response to the 7-item list reproduced verbatim below as Items 1–7.
@@ -4024,3 +4024,203 @@ does **not** improve coverage: the same ~50 instruments still succeed. It does
 not reduce the 815 fetch failures. And it changes what `missing_rest` MEANS —
 historical rows carry the old, inflated definition, so any trend across
 2026-08-26 is a definition change, not a signal.
+
+## Item 25 — the two percentage columns exist on every candle and have never held a value (2026-08-26)
+
+**Operator instruction (2026-08-26, verbatim, typos preserved):**
+
+> "i believe pre open percetage cjmaeh and percnetahe change both of them not
+> needed for ticks dude it is oen and only need for seocnds an dminutes dude
+> okay? see emanwhiel hwow ill you ensure that evn seconds level also will
+> hodl thes eprecise ohlcv and even minute laso ohlcv dude okay? can you lsit
+> i tour dud eoaky?"
+
+He is narrowing an earlier request: the percentage change and the pre-open
+percentage change belong on the **seconds and minutes frames**, not on the raw
+tick table. That is exactly where the columns already are — and that is what
+makes the finding below worth an item rather than a shrug.
+
+### The finding (MEASURED live, not inferred)
+
+`candles_<tf>` has carried `open_pct`, `open_gap_pct`, `change_pct` and
+`close_pct_from_prev_day` since the Wave-5 seal-column work. Read live on the
+production box, 26 Aug 2026, market session only:
+
+| Frame | Bars stored today | With `open_pct` ≠ 0 | With `open_gap_pct` ≠ 0 |
+|---|---:|---:|---:|
+| `candles_1s` | 9,038,254 | **0** | **0** |
+| `candles_5s` | 4,236,485 | **0** | **0** |
+| `candles_15s` | 2,399,970 | **0** | **0** |
+| `candles_1m` | 1,065,763 | **0** | **0** |
+| `candles_3m` | 520,649 | **0** | **0** |
+| `candles_15m` | 148,183 | **0** | **0** |
+
+17.4 million bars, six frames, not one value. The cause is not a plumbing gap
+and not a schema gap — both were verified present:
+
+- **The baselines are live.** `prev_day_close` and `session_open` are
+  refreshed from the exchange fields on every fold in `fold_into_bucket`,
+  last-non-zero-wins. In the minute sampled, all **189,396** ticks carried
+  both.
+- **The write path is intact.** `ShadowSealRow::from_buffered_seal` copies
+  `state.open_pct` / `state.open_gap_pct` / `state.close_pct_from_prev_day`
+  verbatim into the ILP row, and the columns exist in the DDL.
+- **The arithmetic was never written.** `open_bucket` initialises all three to
+  `0.0`, and a workspace scan finds **no other production assignment to any of
+  them**. The doc comments on `LiveCandleState` say "Stamped at seal time";
+  nothing stamps.
+
+This is the false-OK class: a column that exists, is documented, flows through
+the writer, and is always zero reads to a consumer as "this instrument has not
+moved", not as "this was never computed".
+
+### Design
+
+One pure method on `LiveCandleState`, called at every point a bar leaves the
+aggregator:
+
+```
+stamp_seal_percentages():
+    close_pct_from_prev_day = pct(close,        prev_day_close)
+    open_pct                = pct(close,        session_open)
+    open_gap_pct            = pct(session_open, prev_day_close)
+```
+
+where `pct(value, baseline)` returns `0.0` unless `baseline` is finite and
+strictly positive **and** `value` is finite, and returns `0.0` again if the
+quotient is not finite. Zero is the existing "not computable" sentinel for
+these columns and stays so — a bar whose baseline never arrived is
+indistinguishable from one that has not moved, and inventing any other value
+would be worse.
+
+`volume_pct_from_prev_day` and `oi_pct_from_prev_day` are deliberately NOT
+stamped: their columns were dropped from the candle DDL (operator decision
+2026-05-28 — spot instruments have no OI and indices have no volume), so
+computing them would produce fields nothing reads.
+
+**`change_pct` is not a fourth number.** `ShadowSealRow` already sets it equal
+to `close_pct_from_prev_day`; that stays, and this item does not add a
+separate meaning for it.
+
+### The emission sites — all four, and why a helper is not enough
+
+A bar leaves `AggregatorCell` at four points, and the fourth is the one a
+careless fix would miss:
+
+| # | Site | Why it must stamp |
+|---|---|---|
+| 1 | `consume_tick`, intraday bucket crossing (`ConsumeOutcome::Sealed`) | the ordinary path — most bars |
+| 2 | `force_seal` | the IST-midnight / shutdown drain |
+| 3 | `catch_up_seal` | the watermark sweep, which seals illiquid instruments on time |
+| 4 | `consume_tick`, late refold (`ConsumeOutcome::AmendedLate`) | **the bar's `close` CHANGED.** A percentage stamped before the amend is stale for the row that is actually persisted |
+
+Site 4 is the reason this is not a one-line change. A late tick re-writes
+`close` on an already-emitted bar and the amended state is re-persisted; a
+percentage computed at the original seal would then disagree with the `close`
+sitting beside it in the same row.
+
+### Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Pre-open, no exchange baseline yet | `session_open` / `prev_day_close` are `0.0`; both percentages stamp `0.0`. Unchanged from today. |
+| Baseline arrives mid-session (indices — the first several ticks carry no open) | last-non-zero-wins already handles it; every bar sealed after arrival stamps correctly. Bars sealed before it keep `0.0`, honestly. |
+| `close` is a subnormal or non-finite value | the ingest gates upstream already refuse those; the `is_finite` test here is belt-and-braces and returns `0.0`. |
+| Baseline is negative or non-finite | refused — `0.0`. A negative baseline would flip the sign of every percentage silently. |
+| Quotient overflows to infinity | refused — `0.0`. Reachable only from a subnormal baseline that passed the positivity test. |
+| A late refold changes `close` | site 4 re-stamps from the amended `close`. |
+| Day boundary | `force_seal` clears the day-scoped state as it already does; the next day's first bar stamps `0.0` until its baseline arrives. |
+
+### Failure Modes
+
+| If this breaks | Blast radius |
+|---|---|
+| The stamp is wrong | a wrong percentage in a column that is zero today — strictly no worse than the status quo, and visible immediately in any query |
+| A fifth emission site is added later without stamping | that path silently ships zeros again. **This is the real risk**, and it is what the guard test below exists for. |
+| The stamp panics | it cannot: no indexing, no unwrap, no division without a positivity test |
+
+### Test Plan
+
+Unit tests on `LiveCandleState::stamp_seal_percentages` (pure, no I/O):
+
+- a normal bar stamps all three correctly against hand-computed values
+- the live NIFTY numbers from today used as a fixture
+  (open 24,341.95 · prev close 24,334.55 · close 24,273.15 →
+  intraday −0.28%, gap +0.03%)
+- zero / negative / non-finite / subnormal baseline each stamps `0.0`
+- non-finite `close` stamps `0.0`
+- an unchanged price stamps exactly `0.0`, not a rounding artefact
+
+Aggregator tests, one per emission site:
+
+- an intraday crossing seal carries non-zero percentages
+- `force_seal` carries them
+- `catch_up_seal` carries them
+- a late refold that moves `close` re-stamps to match the amended `close`
+
+Guard test (the durable half):
+
+- a source scan asserting every `ConsumeOutcome::Sealed` / `AmendedLate`
+  construction and every `mem::replace` seal in `aggregator_cell.rs` is
+  preceded by a stamp — so a fifth path added next month fails the build
+  instead of shipping zeros
+
+### Rollback
+
+Revert the commit. The columns return to `0.0`, which is the state they have
+been in since they were created — no migration, no schema change, no data to
+undo. Nothing downstream reads them today, so nothing breaks in either
+direction.
+
+### Observability
+
+No new metric, no new alarm, no cost. The evidence is the columns themselves:
+the same live query in the table above returns non-zero on the first session
+after deploy. That query is the acceptance test, and it is cheap enough to
+re-run any day.
+
+### Guarantee matrix
+
+Per `.claude/rules/project/per-wave-guarantee-matrix.md` — the 15-row and
+7-row matrices apply to this item as written there. Rows specific to it:
+zero-alloc (three float divisions on existing struct fields, no allocation, no
+new hot-path branch on the tick path — the stamp runs once per SEAL, not once
+per tick); O(1) (constant work per bar); uniqueness/dedup unchanged (no key
+column touched); recovery unchanged (the seal ring, spill and DLQ carry the
+same struct they always did).
+
+
+### Item 25 — CORRECTION (2026-08-26, same day, operator-caught)
+
+I labelled the two columns the wrong way round in the plan above, the
+artifact, and the chat summary. He caught it verbatim:
+
+> "what eprcenatge change shdou l chekc with rpevd ay close right dude ami i
+> rght dude? but for only for pre open 9.15 am open prcoe comapred with evry
+> minute or seocdn closed rpcoe ddue am i irght dude what the fukis this dude
+> okay? i believe you are wong wiht clauclting theis percnetga change and rpe
+> open eprncetage dud eokay?"
+
+| Column | Question | What I called it | **What it actually is** |
+|---|---|---|---|
+| `close_pct_from_prev_day` | close vs yesterday's close | "the day change" | **percentage change** |
+| `open_pct` | close vs today's 09:15 open | "percentage change" | **pre-open percentage change** |
+| `open_gap_pct` | 09:15 open vs yesterday's close | "pre-open percentage" | the overnight **gap** |
+
+**He is right and the reasoning is his own, stated three times today:** the
+09:15 open IS the pre-open call-auction equilibrium price
+(*"the finalised pre open 9.12 close price as 9.15 am open price"*). So
+"pre-open percentage change" means *how far this bar has moved from the
+pre-open-determined open* — `open_pct`. And "percentage change" unqualified
+means change on the previous close, which is the market convention every
+screen in India uses.
+
+**No arithmetic changes.** All three columns were already being stamped by
+this item, and all three formulas were already correct; only my NAMES for
+them were wrong. What changed is the documentation, the test labels, and —
+importantly — the default the movers ranking must use: **rank by
+`close_pct_from_prev_day`**, the percentage change, not by `open_pct`.
+
+That last consequence is why this correction was worth chasing rather than
+quietly amending: a gainers list ranked on the wrong column produces a
+plausible, completely different list, and nothing about it would look wrong.

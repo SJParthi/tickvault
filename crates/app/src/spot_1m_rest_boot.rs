@@ -109,8 +109,8 @@
 //!
 //! **2026-07-13 update (Phase A, Dhan-live-feed removal):** the old
 //! "a Groww-only session runs NO spot-1m REST fetch" limitation is CLOSED —
-//! with `dhan_enabled = false` (now the locked default; the live WS lane is
-//! retired) the Dhan REST-only stack (`crate::dhan_rest_stack`) spawns this
+//! with the Dhan live WS lane retired at the time (it was REVIVED 2026-08-09;
+//! base.toml now carries dhan_enabled = true) the Dhan REST stack spawns this
 //! scheduler with its OWN TokenManager, mirroring the
 //! spawn_post_market_tasks shape (same params, same config gate, same
 //! spot→chain sequencing channel).

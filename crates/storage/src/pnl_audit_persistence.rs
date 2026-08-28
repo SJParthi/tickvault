@@ -11,12 +11,22 @@
 //!     end-to-end. HONEST ENVELOPE (C1, 2026-07-14 hostile review): the
 //!     emitting consumer + market-close signal are spawned by the trading
 //!     pipeline, whose BOTH spawn sites are Dhan-lane-gated — the whole
-//!     subsystem is code-ready but DORMANT while `feeds.dhan_enabled =
-//!     false` (today's prod default): on a dhan-off boot NO row lands here
-//!     (and nothing false-pages — nothing runs). The "≥1 on_eod row per
-//!     trading day, so silence is detectable" heartbeat contract (audit
-//!     Rule 11) holds whenever the Dhan lane / live trading runs (dhan-ON,
-//!     in-session, strategy-config-present boots).
+//!     pipeline, whose spawn sites are Dhan-lane-gated — the whole
+//!     subsystem is code-ready but DORMANT. REASON CORRECTED 2026-08-26:
+//!     this used to say "DORMANT while `feeds.dhan_enabled = false` (today's
+//!     prod default)", and base.toml has carried `dhan_enabled = true` since
+//!     the 2026-08-11 flip — so the old rule, applied literally, says rows
+//!     land here now. They do not: `spawn_trading_pipeline` has ZERO
+//!     production call sites, so nothing runs on ANY boot. That inversion
+//!     matters because the next bullet is a Rule-11 heartbeat contract —
+//!     believing the subsystem runs turns its silence into "no rows because
+//!     nothing went wrong". The real reason is pinned by
+//!     `crates/app/tests/order_side_wiring_guard.rs`, and the stale-premise
+//!     class by `crates/common/tests/dhan_enabled_premise_guard.rs`.
+//!     The "≥1 on_eod row per trading day, so silence is detectable"
+//!     heartbeat contract (audit Rule 11) holds whenever the trading
+//!     pipeline actually runs (a production spawn site, in-session,
+//!     strategy-config-present boots).
 //!   * `OnFill` / `OnMinute` — enum variants SHIPPED, emits DEFERRED to
 //!     Phase-1 (per-position fill/minute snapshots need the live fill path;
 //!     honest scope — no dormant emit sites exist).

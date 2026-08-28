@@ -115,31 +115,46 @@ pub fn depth_20_strikes_each_side(underlyings: usize) -> usize {
 
 /// Instruments depth-200 subscribes, across all underlyings.
 ///
-/// depth-200 allows ONE instrument per connection and 5 connections, so 5 is
-/// the vendor ceiling AND the budget — an odd number against a market that
-/// trades in CE/PE pairs. Filling it means 2 whole pairs plus one lone leg.
+/// **FOUR since 2026-08-26, by operator instruction** — not the vendor
+/// ceiling of five. Verbatim: *"as fo now dont need to conside the fifth one
+/// dude jsut go aheaf with 4 aloe"*, following his specification of the set
+/// as *"only nifty atm ce atm pr and banknifty atm ce and atm pe"*.
 ///
-/// **This deliberately reverses an earlier decision, so the reversal is
-/// recorded rather than quietly applied.** The constant used to be
-/// `DEPTH_200_MAX_PAIRS = 2`, taking 4 sockets and leaving the 5th empty, on
-/// the stated grounds that a lone leg "cannot answer the spread and fill
-/// questions this data exists for" and would be "analytically unusable".
+/// Four is exactly two CE/PE pairs: NIFTY ATM and BANKNIFTY ATM. The fifth
+/// authorized socket is deliberately left IDLE, which is a real cost stated
+/// plainly rather than quietly absorbed — one of five paid-for 200-level
+/// connections carries nothing.
 ///
-/// That reasoning was half right and overstated the half it got wrong. A
-/// 200-level book on a lone leg genuinely cannot answer CE-vs-PE questions —
-/// synthetic parity, straddle spread, relative skew — because those need both
-/// legs at the same strike simultaneously. But the questions a 200-level book
-/// answers MOST of the time are within-leg: how much size rests at each of 200
-/// levels, where the real liquidity cliff is, what a large order would sweep.
-/// A lone leg answers all of those completely. "Unusable" was the wrong word;
-/// "narrower" was the right one, and the difference decides whether the 5th
-/// socket is worth opening.
+/// **This retires the lone-leg design**, and the reversal is recorded rather
+/// than silently applied. The constant was 5 with the odd socket filled by a
+/// next-nearest lone CE, on the reasoning that a 200-level book on a single
+/// leg still answers every WITHIN-leg question (resting size per level, the
+/// liquidity cliff, what a large order would sweep) even though it cannot
+/// answer CE-vs-PE parity or skew. That reasoning was and remains correct.
+/// What overrides it is the operator's requirement that this feed carry a
+/// SPECIFIC, ATM-tracking set: a lone leg on a third strike is not part of
+/// that set, and filling the socket with one would mean the depth-200 feed
+/// no longer means one thing.
 ///
-/// So the 5th socket is filled with the next-nearest-ATM CE — see
-/// [`DepthSelection::depth_200_lone_leg`], which reports whether a lone leg
-/// was taken so the limitation is visible at the point of USE rather than
-/// only here in a comment.
-pub const DEPTH_200_MAX_SOCKETS: usize = 5;
+/// [`DepthSelection::depth_200_lone_leg`] is RETAINED and must now always be
+/// false; a test pins that, so a future change that re-enables a lone leg
+/// fails rather than quietly re-widening the set.
+pub const DEPTH_200_MAX_SOCKETS: usize = 4;
+
+/// Depth-200 CONNECTIONS the session may open — five, the operator's figure.
+///
+/// Deliberately NOT the same constant as [`DEPTH_200_MAX_SOCKETS`], which is
+/// the budget for at-the-money PAIRS and is even for a reason: a pair costs
+/// two sockets, so an even budget means a whole pair either fits or the budget
+/// is full, and the odd-socket case cannot arise by arithmetic.
+///
+/// Conflating the two would undo that. Raising the pair budget to five lets
+/// the selector reach for a third underlying's pair and stop half-way,
+/// filling the fifth socket with a lone leg — which is precisely the shape the
+/// 2026-08-26 retirement removed. So the fifth connection is budgeted here,
+/// separately, and filled by the day's biggest mover at the dial site rather
+/// than by the pair selector.
+pub const DEPTH_200_TOTAL_SOCKETS: usize = 5;
 
 /// One contract from a chain snapshot, before selection.
 #[derive(Debug, Clone, PartialEq)]
@@ -356,17 +371,142 @@ fn strike_key(strike: f64) -> i64 {
         i64::MAX
     }
 }
-/// Distance from at-the-money. `f64::MAX` for unusable prices so they sort last
-/// and are refused before selection rather than silently ranked first.
-fn atm_distance(candidate: &DepthCandidate) -> f64 {
-    if !candidate.strike.is_finite()
-        || !candidate.spot.is_finite()
-        || candidate.strike <= 0.0
-        || candidate.spot <= 0.0
+/// Distance from at-the-money, against a spot supplied by the CALLER.
+///
+/// `f64::MAX` for an unusable strike or price, so it sorts last and is refused
+/// before selection rather than silently ranked first.
+///
+/// The spot is a PARAMETER rather than read off the candidate, because spot
+/// belongs to the underlying and the chain merely stamps a copy on every row.
+/// The no-parameter version was deleted with the per-row refusal rule it
+/// served. See [`consensus_spot_by_underlying`].
+fn atm_distance_at(candidate: &DepthCandidate, spot: f64) -> f64 {
+    if !candidate.strike.is_finite() || !spot.is_finite() || candidate.strike <= 0.0 || spot <= 0.0
     {
         return f64::MAX;
     }
-    (candidate.strike - candidate.spot).abs()
+    (candidate.strike - spot).abs()
+}
+
+/// Distance from at-the-money as a FRACTION of spot, for ranking ACROSS
+/// underlyings.
+///
+/// WHY NOT RAW RUPEES — 2026-08-26, live. `atm_distance_at` returns
+/// `|strike - spot|`, and `select_depth_universe` sorted one pool mixing every
+/// underlying by it. Absolute rupee distance is not comparable between a
+/// ~24,000 index and a ~57,000 one with different strike spacings: a FINNIFTY
+/// strike 50 points from spot outranked a BANKNIFTY strike 100 points from a
+/// spot more than twice as large, though the BANKNIFTY strike is nearer in
+/// every sense that matters and far more liquid.
+///
+/// The result on the box that day: FINNIFTY and MIDCPNIFTY took four of the
+/// five 200-level sockets, NIFTY took one lone leg, and **BANKNIFTY took
+/// none**. Two of those sockets carried FINNIFTY strikes delivering ~125x
+/// fewer rows than the others, which then tripped the 50-second idle-silence
+/// watchdog into 322 redials between them.
+///
+/// Normalising by spot makes the comparison dimensionless and therefore
+/// meaningful across underlyings. `atm_distance_at` is UNCHANGED and still
+/// ranks WITHIN an underlying, where raw rupees are already comparable.
+fn atm_distance_fraction_at(candidate: &DepthCandidate, spot: f64) -> f64 {
+    let raw = atm_distance_at(candidate, spot);
+    if !raw.is_finite() || !spot.is_finite() || spot <= 0.0 {
+        return f64::MAX;
+    }
+    raw / spot
+}
+
+/// One spot per underlying: the most common usable value its rows carry,
+/// ties to the lower.
+///
+/// # Why a row's own spot is not the right price
+///
+/// Spot is a property of the UNDERLYING, not of a contract row — but the
+/// chain query stamps a copy on every row, and `LATEST ON ts PARTITION BY
+/// underlying_security_id, expiry, strike, leg` takes each strike's own newest
+/// row. A strike the vendor stopped returning at 09:47 therefore keeps 09:47's
+/// `underlying_spot` while the rest of the chain carries this minute's, and a
+/// row whose spot went NULL parses to `NaN`.
+///
+/// Refusing per row makes that a selection defect rather than a data note. A
+/// BANKNIFTY PUT whose single row carried an unusable spot used to be refused
+/// on its own, which left its strike with no whole pair — and the operator's
+/// locked NIFTY/BANKNIFTY-first rule then handed the 200-level socket to
+/// MIDCPNIFTY, silently, on a chain that plainly listed a usable BANKNIFTY
+/// pair. Found by a property test asserting a priority underlying is never
+/// displaced while it can supply a whole pair.
+///
+/// The most common value is order-independent by construction and is the price
+/// the chain as a whole is quoting; stale rows are the ones that dropped out of
+/// the vendor's response, so they are the minority. Grouping is on the bit
+/// pattern, so rows carrying literally the same column value group exactly and
+/// no epsilon has to be invented.
+///
+/// An underlying with NO usable row anywhere is absent from the map, and every
+/// one of its contracts is then refused as before — a missing price is still a
+/// refusal, just not one decided by which row happened to carry it.
+///
+/// # Complexity
+///
+/// O(candidates). Cold path, once per attach.
+fn consensus_spot_by_underlying(
+    candidates: &[DepthCandidate],
+) -> std::collections::HashMap<String, f64> {
+    let mut tally: std::collections::HashMap<String, std::collections::HashMap<u64, (usize, f64)>> =
+        std::collections::HashMap::new();
+    for c in candidates {
+        if !c.spot.is_finite() || c.spot <= 0.0 {
+            continue;
+        }
+        let slot = tally
+            .entry(c.underlying.trim().to_ascii_uppercase())
+            .or_default()
+            .entry(c.spot.to_bits())
+            .or_insert((0, c.spot));
+        slot.0 = slot.0.saturating_add(1);
+    }
+    tally
+        .into_iter()
+        .filter_map(|(underlying, votes)| {
+            let mut best: Option<(usize, f64)> = None;
+            for (count, value) in votes.into_values() {
+                let take = match best {
+                    None => true,
+                    Some((best_count, best_value)) => {
+                        count > best_count || (count == best_count && value < best_value)
+                    }
+                };
+                if take {
+                    best = Some((count, value));
+                }
+            }
+            best.map(|(_, value)| (underlying, value))
+        })
+        .collect()
+}
+
+/// Underlyings that claim depth-200 sockets before any other, in this order.
+///
+/// OPERATOR-LOCKED 2026-08-26 (`websocket-connection-scope-lock.md`,
+/// "DEPTH-200 IS NIFTY + BANKNIFTY ATM"): *"for evry one minute alwyas
+/// espeiclaly for dpeth 200 … nifty atm ce atm pe always … even for
+/// bancknfity atm ce atm pe also"*.
+///
+/// Four of the five sockets are these two underlyings' ATM CE/PE pairs. The
+/// list is ORDERED — index 0 outranks index 1 — so NIFTY takes its pair
+/// first if only one pair fits.
+pub const DEPTH_200_PRIORITY_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
+
+/// Rank of a candidate's underlying in [`DEPTH_200_PRIORITY_UNDERLYINGS`],
+/// or `usize::MAX` for everything else.
+///
+/// Compared BEFORE distance, so a NIFTY pair outranks a nearer FINNIFTY pair
+/// however the rupee arithmetic falls out.
+fn depth_200_priority_rank(underlying: &str) -> usize {
+    DEPTH_200_PRIORITY_UNDERLYINGS
+        .iter()
+        .position(|u| u.eq_ignore_ascii_case(underlying))
+        .unwrap_or(usize::MAX)
 }
 
 /// Choose the depth-20 and depth-200 sets from one chain snapshot.
@@ -384,6 +524,20 @@ fn atm_distance(candidate: &DepthCandidate) -> f64 {
 #[must_use]
 pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     let mut out = DepthSelection::default();
+
+    // ONE spot per underlying, decided before anything is refused.
+    //
+    // A contract is refused for its own bad strike or its own missing id, but
+    // NEVER for a stale copy of a price that belongs to the underlying — see
+    // `consensus_spot_by_underlying` for the socket that was silently lost to
+    // exactly that.
+    let spots = consensus_spot_by_underlying(candidates);
+    let spot_of = |c: &DepthCandidate| -> f64 {
+        spots
+            .get(&c.underlying.trim().to_ascii_uppercase())
+            .copied()
+            .unwrap_or(f64::NAN)
+    };
 
     // ── Refuse first, so nothing unusable can reach the ranking. ──
     let mut usable: Vec<(&DepthCandidate, ExchangeSegment)> = Vec::new();
@@ -410,7 +564,7 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             out.refused_depth_ineligible_segment += 1;
             continue;
         }
-        if atm_distance(c) == f64::MAX {
+        if atm_distance_at(c, spot_of(c)) == f64::MAX {
             out.refused_bad_price += 1;
             continue;
         }
@@ -438,7 +592,12 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     // Whole CE/PE pairs for depth-200, ranked across every underlying, so the
     // 2 pairs go to the 2 most at-the-money books rather than to whichever
     // underlying happens to sort first.
-    let mut pair_pool: Vec<(f64, SubscribeInstrument, SubscribeInstrument)> = Vec::new();
+    // (priority_rank, atm_fraction, CE, PE). Priority is compared FIRST so a
+    // NIFTY/BANKNIFTY pair outranks a nearer pair from any other underlying
+    // (operator lock 2026-08-26); the fraction is normalised by spot so the
+    // cross-underlying comparison is dimensionless. See the ranking helpers.
+    let mut pair_pool: Vec<(String, usize, f64, SubscribeInstrument, SubscribeInstrument)> =
+        Vec::new();
 
     for underlying in &underlyings {
         let mut rows: Vec<(&DepthCandidate, ExchangeSegment)> = usable
@@ -483,7 +642,7 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
                 let d = by_strike
                     .get(&strike_key(*s))
                     .and_then(|legs| legs.first())
-                    .map_or(f64::MAX, |(c, _)| atm_distance(c));
+                    .map_or(f64::MAX, |(c, _)| atm_distance_at(c, spot_of(c)));
                 (d, *s)
             })
             .collect();
@@ -525,7 +684,9 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
             let pe = legs.iter().find(|(c, _)| c.leg.eq_ignore_ascii_case("PE"));
             if let (Some((ce_c, ce_seg)), Some((pe_c, pe_seg))) = (ce, pe) {
                 pair_pool.push((
-                    atm_distance(ce_c),
+                    ce_c.underlying.trim().to_ascii_uppercase(),
+                    depth_200_priority_rank(&ce_c.underlying),
+                    atm_distance_fraction_at(ce_c, spot_of(ce_c)),
                     SubscribeInstrument {
                         security_id: ce_c.contract_security_id as SecurityId,
                         segment: *ce_seg,
@@ -545,19 +706,68 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     // most informative ones. Only once no WHOLE pair fits in the remaining
     // budget does a lone leg get taken — so the lone leg is always the LAST
     // socket, never a pair displaced by a half.
-    pair_pool.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // ORDER: one ATM pair from EACH priority underlying before any underlying
+    // takes a second pair.
+    //
+    // Operator lock 2026-08-26: "nifty atm ce atm pe always … even for
+    // bancknfity atm ce atm pe also". That is ONE pair each, not two pairs
+    // from whichever index ranks first — sorting on (priority, distance)
+    // alone gives NIFTY both its ATM and its next strike and leaves BANKNIFTY
+    // a lone leg, which is the same shape of miss as the raw-rupee bug, one
+    // level up.
+    //
+    // So the primary key is the pair's RANK WITHIN ITS OWN UNDERLYING: every
+    // underlying's nearest pair competes in round 0, every underlying's
+    // second pair in round 1, and so on. Priority breaks ties inside a round
+    // (NIFTY before BANKNIFTY before the rest), and the spot-normalised
+    // distance breaks ties inside that.
+    //
+    // Result on a normal chain: NIFTY ATM pair, BANKNIFTY ATM pair, then the
+    // odd socket to the next round's leader.
+    {
+        let mut by_underlying: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // Nearest-first within each underlying, so the round index below is
+        // assigned in ATM order rather than chain order.
+        pair_pool.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.total_cmp(&b.2)));
+        let mut ranked: Vec<(usize, usize, f64, SubscribeInstrument, SubscribeInstrument)> =
+            Vec::with_capacity(pair_pool.len());
+        for (underlying, priority, frac, ce, pe) in pair_pool.drain(..) {
+            let round = by_underlying.entry(underlying).or_insert(0);
+            ranked.push((*round, priority, frac, ce, pe));
+            *round += 1;
+        }
+        // A priority underlying exhausts its strikes BEFORE any other
+        // underlying takes a socket. Without this first key, NIFTY's SECOND
+        // pair sorts behind FINNIFTY's first (both are "round 0" for their own
+        // underlying), and the odd 5th socket lands on the sparse contract
+        // whose idle-silence redials this change exists to stop.
+        ranked.sort_by(|a, b| {
+            (a.1 == usize::MAX)
+                .cmp(&(b.1 == usize::MAX))
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.total_cmp(&b.2))
+        });
+        pair_pool = ranked
+            .into_iter()
+            .map(|(_, p, f, ce, pe)| (String::new(), p, f, ce, pe))
+            .collect();
+    }
     let mut remaining_pairs = pair_pool.into_iter();
-    for (_, ce, pe) in remaining_pairs.by_ref() {
-        // `+ 2` because a pair costs two sockets; a pair that would overflow
-        // the budget is skipped, and the loop falls through to the lone-leg
-        // step below rather than truncating the pair here.
+    for (_, _, _, ce, pe) in remaining_pairs.by_ref() {
+        // `+ 2` because a pair costs two sockets. The budget is EVEN (4) since
+        // 2026-08-26, so a whole pair always either fits or the budget is
+        // already full — the odd-socket case cannot arise by arithmetic.
+        //
+        // The lone-leg fill that used to live here is RETIRED with the fifth
+        // socket (see DEPTH_200_MAX_SOCKETS). It is not merely unreachable at
+        // today's budget: it must not come back if the budget ever changes
+        // again, because a lone third-strike leg is not part of the set the
+        // operator specified. `depth_200_lone_leg` therefore stays false and a
+        // test pins it, so re-enabling one is a build failure rather than a
+        // quiet re-widening.
         if out.depth_200.len().saturating_add(2) > DEPTH_200_MAX_SOCKETS {
-            // The CE of this rejected pair is the nearest-ATM leg still
-            // unspent, which makes it the best candidate for the odd socket.
-            if out.depth_200.len() < DEPTH_200_MAX_SOCKETS {
-                out.depth_200.push(ce);
-                out.depth_200_lone_leg = true;
-            }
             break;
         }
         out.depth_200.push(ce);
@@ -802,12 +1012,55 @@ pub fn ymd_to_epoch_micros(ymd: u32) -> Option<i64> {
 /// # Errors
 ///
 /// None — every failure degrades to `None` and is logged with its reason.
-// TEST-EXEMPT: async composition of read_contract_artifact + fetch_spot_prices + depth_candidates_from_master + select_depth_universe, each separately tested.
+// TEST-EXEMPT: async composition of load_depth_candidates + select_depth_universe, each separately tested.
 pub async fn load_depth_universe_from_master(
     questdb: &tickvault_common::config::QuestDbConfig,
     date_ist: &str,
     today_ymd: u32,
 ) -> Option<DepthSelection> {
+    let candidates = load_depth_candidates(questdb, date_ist, today_ymd).await;
+    if candidates.is_empty() {
+        return None;
+    }
+    let selection = select_depth_universe(&candidates);
+    if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        source = "contract_artifact",
+        candidates = candidates.len(),
+        depth_20 = selection.depth_20.len(),
+        depth_200 = selection.depth_200.len(),
+        "depth universe resolved from the daily artifact — no wait for the 09:16 chain"
+    );
+    Some(selection)
+}
+
+/// The candidate slice the depth selector consumes, resolved from the daily
+/// contract artifact plus live spot prices.
+///
+/// # Why this is its own function
+///
+/// The per-minute rebalance ([`crate::depth_rebalance`]) needs the SAME slice
+/// the attach selected from. Otherwise the strikes it reasons about could
+/// drift from the strikes actually subscribed, and a socket would move onto a
+/// contract the selector never considered — a well-formed subscription to the
+/// wrong instrument, which nothing downstream could tell apart from the right
+/// one. Extracting it is what makes "one path" a fact rather than a comment.
+///
+/// # Returns an empty slice on every failure
+///
+/// An unreadable artifact, no underlying priced yet, or a master with no
+/// usable options all produce an empty `Vec`, each logged with its reason.
+/// Empty is the honest answer here: the rebalance's response to "we could not
+/// tell" is to keep what it has, which is the same as its response to
+/// "nothing changed", so the two need not be distinguished by this layer.
+// TEST-EXEMPT: async composition of read_contract_artifact + fetch_spot_prices + parse_symbol_map + depth_candidates_from_master, each separately tested.
+pub async fn load_depth_candidates(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    today_ymd: u32,
+) -> Vec<DepthCandidate> {
     let rows = match crate::dhan_contract_universe::read_contract_artifact(date_ist) {
         Ok(r) => r,
         Err(err) => {
@@ -817,7 +1070,7 @@ pub async fn load_depth_universe_from_master(
                 "depth: contract artifact unreadable, falling back to the option chain \
                  (which cannot publish before 09:16 IST)"
             );
-            return None;
+            return Vec::new();
         }
     };
     let prices = crate::dhan_contract_universe::fetch_spot_prices(questdb, {
@@ -838,25 +1091,15 @@ pub async fn load_depth_universe_from_master(
         // Pre-open has not settled yet (or the feed is not delivering). This
         // is the NORMAL state before ~09:08 and must not be an error.
         tracing::debug!("depth: no underlying priced yet — nothing to centre a window on");
-        return None;
+        return Vec::new();
     }
     let candidates = depth_candidates_from_master(&rows, &spot, today_ymd);
-    if candidates.is_empty() {
-        return None;
-    }
-    let selection = select_depth_universe(&candidates);
-    if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
-        return None;
-    }
-    tracing::info!(
-        source = "contract_artifact",
+    tracing::debug!(
         priced_underlyings = spot.len(),
         candidates = candidates.len(),
-        depth_20 = selection.depth_20.len(),
-        depth_200 = selection.depth_200.len(),
-        "depth universe resolved from the daily artifact — no wait for the 09:16 chain"
+        "depth candidates resolved from the daily artifact"
     );
-    Some(selection)
+    candidates
 }
 
 /// Counter: a depth-universe resolution that ended with ZERO sockets.
@@ -1046,6 +1289,134 @@ pub async fn load_depth_universe(
 
 #[cfg(test)]
 mod tests {
+
+    /// Build a candidate with an explicit spot, so cross-underlying ranking
+    /// can be exercised at realistic index price levels.
+    fn candidate_at(
+        underlying: &str,
+        sid: i64,
+        strike: f64,
+        leg: &str,
+        spot: f64,
+    ) -> DepthCandidate {
+        let mut c = candidate(underlying, sid, strike, leg);
+        c.spot = spot;
+        c
+    }
+
+    /// THE OPERATOR'S RULE (lock 2026-08-26), reproduced from the live box.
+    ///
+    /// These are the real spots and strikes on 2026-08-26. Under the old raw
+    /// `|strike - spot|` sort, FINNIFTY's 50-point gap beat BANKNIFTY's
+    /// 100-point gap even though BANKNIFTY's spot is more than twice as large
+    /// — and the box really did end up with FINNIFTY and MIDCPNIFTY holding
+    /// four of the five 200-level sockets while BANKNIFTY held NONE.
+    #[test]
+    fn depth_200_gives_its_sockets_to_nifty_and_banknifty_not_the_nearest_rupee_gap() {
+        let candidates = vec![
+            // FINNIFTY: 50 points from spot — the SMALLEST raw gap here.
+            candidate_at("FINNIFTY", 63097, 26_250.0, "CE", 26_200.0),
+            candidate_at("FINNIFTY", 63100, 26_250.0, "PE", 26_200.0),
+            // MIDCPNIFTY: 60 points.
+            candidate_at("MIDCPNIFTY", 72982, 15_000.0, "CE", 14_940.0),
+            candidate_at("MIDCPNIFTY", 72983, 15_000.0, "PE", 14_940.0),
+            // BANKNIFTY: 100 points, but on a 57,500 spot — nearer in
+            // fractional terms than either of the above.
+            candidate_at("BANKNIFTY", 90001, 57_500.0, "CE", 57_400.0),
+            candidate_at("BANKNIFTY", 90002, 57_500.0, "PE", 57_400.0),
+            // NIFTY: 40 points on a 24,340 spot.
+            candidate_at("NIFTY", 46991, 24_300.0, "CE", 24_310.0),
+            candidate_at("NIFTY", 46992, 24_300.0, "PE", 24_310.0),
+            // NIFTY one strike out — the realistic shape, and the natural
+            // occupant of the odd 5th socket.
+            candidate_at("NIFTY", 46993, 24_350.0, "CE", 24_310.0),
+            candidate_at("NIFTY", 46994, 24_350.0, "PE", 24_310.0),
+        ];
+
+        let sel = select_depth_universe(&candidates);
+        let ids: Vec<i64> = sel
+            .depth_200
+            .iter()
+            .map(|i| i64::try_from(i.security_id).expect("test sid fits i64"))
+            .collect();
+
+        assert!(
+            ids.contains(&46991) && ids.contains(&46992),
+            "NIFTY ATM CE and PE must both hold sockets, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&90001) && ids.contains(&90002),
+            "BANKNIFTY ATM CE and PE must both hold sockets — it held NONE on \
+             2026-08-26, which is the defect this pins. Got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&63097) && !ids.contains(&63100),
+            "FINNIFTY must NOT take a socket while a NIFTY or BANKNIFTY leg is \
+             available on a smaller raw rupee gap; those two slots redialled 322 \
+             times on 2026-08-26. Got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&72982) && !ids.contains(&72983),
+            "MIDCPNIFTY must not take a socket either. Got {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            4,
+            "FOUR sockets since the operator's 2026-08-26 instruction — two whole \
+             pairs, no fifth. Got {ids:?}"
+        );
+        assert!(
+            !sel.depth_200_lone_leg,
+            "the lone leg is RETIRED with the fifth socket; a set that reports one \
+             is no longer the set the operator specified"
+        );
+    }
+
+    /// NIFTY outranks BANKNIFTY when only one pair can fit, because the
+    /// priority list is ORDERED and index 0 wins.
+    #[test]
+    fn nifty_takes_the_last_pair_before_banknifty() {
+        assert_eq!(depth_200_priority_rank("NIFTY"), 0);
+        assert_eq!(depth_200_priority_rank("BANKNIFTY"), 1);
+        assert_eq!(depth_200_priority_rank("banknifty"), 1, "case-insensitive");
+        assert_eq!(depth_200_priority_rank("FINNIFTY"), usize::MAX);
+        assert_eq!(depth_200_priority_rank("MIDCPNIFTY"), usize::MAX);
+    }
+
+    /// The normalised distance must make a far-in-rupees strike on a large
+    /// index rank NEARER than a close-in-rupees strike on a small one — that
+    /// inversion is the whole point, and raw rupees get it backwards.
+    #[test]
+    fn the_normalised_distance_compares_across_price_levels() {
+        let banknifty = candidate_at("BANKNIFTY", 1, 57_500.0, "CE", 57_400.0); // 100 pts
+        let finnifty = candidate_at("FINNIFTY", 2, 26_250.0, "CE", 26_200.0); // 50 pts
+
+        assert!(
+            atm_distance_at(&banknifty, banknifty.spot) > atm_distance_at(&finnifty, finnifty.spot),
+            "raw rupees rank BANKNIFTY as further — this is the trap"
+        );
+        assert!(
+            atm_distance_fraction_at(&banknifty, banknifty.spot)
+                < atm_distance_fraction_at(&finnifty, finnifty.spot),
+            "normalised by spot, BANKNIFTY is NEARER: {} vs {}",
+            atm_distance_fraction_at(&banknifty, banknifty.spot),
+            atm_distance_fraction_at(&finnifty, finnifty.spot)
+        );
+    }
+
+    /// An unusable spot cannot rank first. `f64::MAX` sorts last, so a
+    /// candidate with a zero or non-finite spot is refused rather than
+    /// silently promoted to the front of the pool.
+    #[test]
+    fn an_unusable_spot_sorts_last_in_the_normalised_ranking() {
+        let zero_spot = candidate_at("NIFTY", 3, 24_300.0, "CE", 0.0);
+        let nan_spot = candidate_at("NIFTY", 4, 24_300.0, "CE", f64::NAN);
+        assert_eq!(
+            atm_distance_fraction_at(&zero_spot, zero_spot.spot),
+            f64::MAX
+        );
+        assert_eq!(atm_distance_fraction_at(&nan_spot, nan_spot.spot), f64::MAX);
+    }
     use super::*;
 
     fn candidate(underlying: &str, sid: i64, strike: f64, leg: &str) -> DepthCandidate {
@@ -1249,21 +1620,21 @@ mod tests {
         assert_eq!(
             sel.depth_200.len(),
             DEPTH_200_MAX_SOCKETS,
-            "all five authorized 200-level sockets must be used"
+            "all FOUR authorized 200-level sockets must be used"
         );
-        // Nearest-ATM pairs (spot 100) are (1,2) then (3,4); the 5th socket
-        // takes the CE of the next pair — id 5, not id 6.
+        // Nearest-ATM pairs (spot 100) are (1,2) then (3,4). The third pair
+        // (5,6) does not fit and — since 2026-08-26 — its CE is NOT promoted
+        // to a lone leg; the budget simply ends at two whole pairs.
         let ids: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
         assert_eq!(
             ids,
-            vec![1, 2, 3, 4, 5],
-            "two whole pairs first, then the nearest unspent CE"
+            vec![1, 2, 3, 4],
+            "two whole pairs, and nothing after them"
         );
         assert!(
-            sel.depth_200_lone_leg,
-            "the lone leg must be REPORTED — a consumer computing a cross-leg \
-             quantity from an unpartnered book would be computing from half \
-             the data with no way to know it"
+            !sel.depth_200_lone_leg,
+            "the lone-leg fill is RETIRED: an even budget can only end on a whole \
+             pair, and a third-strike leg is not part of the operator's set"
         );
     }
 
@@ -1383,6 +1754,87 @@ mod tests {
         }
     }
 
+    /// What this selector costs at the authorised scale.
+    ///
+    /// MEASUREMENT, not a gate. `#[ignore]`d so a wall-clock number never
+    /// becomes a flaky CI failure — the house pattern from
+    /// `catch_up_seal_all_sweep_cost_at_the_authorized_ceiling`.
+    ///
+    /// # The number, and the two optimisations it refuted
+    ///
+    /// 44,000 rows across 220 underlyings, release-less debug build in an
+    /// x86 dev container, minimum of five runs:
+    ///
+    /// | version | cost |
+    /// |---|---|
+    /// | before the per-underlying consensus spot | **7.4 ms** |
+    /// | with it (shipped) | **32.3 ms** |
+    /// | normalise once into a `Vec<String>`, carry the spot | **46.1 ms** |
+    /// | borrow the raw `&str` as the map key, zero allocations | **29.7 ms** |
+    ///
+    /// The consensus fix (defect 10) cost 4.4x, which is worth knowing and
+    /// was invisible until timed. Both attempts to win it back FAILED:
+    ///
+    /// - Normalising once up front and carrying the resolved spot on the
+    ///   `usable` tuple made it **43% SLOWER**. Forty-four thousand retained
+    ///   `String`s cost more than twice as many short-lived ones the
+    ///   allocator immediately reuses, and widening the tuple added copy cost
+    ///   through two further `Vec` builds.
+    /// - Borrowing the raw name as the key removes all 88,000 allocations and
+    ///   buys **8%** — which also refutes the diagnosis behind the first
+    ///   attempt. The cost is not the strings. It is two hash lookups per row
+    ///   into a nested map. Eight percent does not pay for the behaviour
+    ///   change it carries (two rows of one underlying written with different
+    ///   casing would get separate consensus prices).
+    ///
+    /// So the shipped version stands, and the honest framing is that ~32 ms
+    /// once a minute is a **0.05% duty cycle** on the rebalance task. Recorded
+    /// rather than optimised, because a measured cost with a stated shape is
+    /// the thing this repository's own complexity table exists to hold — and
+    /// because I nearly recorded "fixed, 4.4x faster" off a single sample of
+    /// an optimisation that was in fact slower.
+    ///
+    /// NOT measured on the prod r8g.xlarge (Graviton4), and not measured in
+    /// release mode; both would be faster.
+    #[test]
+    #[ignore = "wall-clock measurement, run on demand"]
+    fn select_depth_universe_cost_at_the_authorized_ceiling() {
+        // 220 F&O underlyings, 100 strikes each, both legs = 44,000 rows.
+        let mut rows: Vec<DepthCandidate> = Vec::with_capacity(44_000);
+        for u in 0..220 {
+            let name = format!("STK{u:03}");
+            let spot = 1_000.0 + f64::from(u);
+            for k in 0..100 {
+                let strike = spot + f64::from(k - 50) * 10.0;
+                for (leg, off) in [("CE", 0), ("PE", 1)] {
+                    rows.push(DepthCandidate {
+                        underlying: name.clone(),
+                        contract_security_id: i64::from(u) * 1_000 + i64::from(k) * 2 + off + 1,
+                        expiry_micros: 1_900_000_000_000_000,
+                        strike,
+                        spot,
+                        leg: leg.to_owned(),
+                        is_index_option: false,
+                    });
+                }
+            }
+        }
+        // Five runs, reporting the MINIMUM. A single sample in a shared
+        // container is noise, and the minimum is the closest thing to the
+        // cost without interference.
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let got = select_depth_universe(&rows);
+            best = best.min(start.elapsed());
+            assert_eq!(got.refused_stock_option, rows.len());
+        }
+        println!(
+            "MEASURED select_depth_universe: {} rows, 220 underlyings -> {best:?} (min of 5)",
+            rows.len(),
+        );
+    }
+
     /// A chain legitimately carries weeklies AND monthlies. Depth on a far
     /// month is bandwidth spent on an illiquid book, so only the nearest expiry
     /// is subscribed.
@@ -1398,18 +1850,82 @@ mod tests {
         );
     }
 
-    /// A NaN or non-positive price cannot be ranked against ATM. Ranking it
+    /// A NaN or non-positive STRIKE cannot be ranked against ATM. Ranking it
     /// anyway would sort it to an arbitrary position and could put garbage at
     /// the front of the depth-200 pair pool.
+    ///
+    /// **Amended 2026-08-26.** This test used to assert that a row carrying a
+    /// zero SPOT was refused too, and counted BOTH refusals. That was the
+    /// per-row rule, and it cost a socket: spot belongs to the UNDERLYING and
+    /// the chain merely stamps a copy on every row, so one stale or NULL copy
+    /// refused a real contract. Here NIFTY is quoted at 100 by the other row,
+    /// so the contract at strike 100 is a genuine at-the-money contract and is
+    /// now chosen. Only the NaN strike — a defect of the contract itself — is
+    /// refused. See `consensus_spot_by_underlying`.
     #[test]
-    fn test_non_finite_prices_are_refused_and_counted() {
+    fn test_non_finite_strikes_are_refused_and_counted() {
         let mut nan_strike = candidate("NIFTY", 7, f64::NAN, "CE");
         nan_strike.spot = 100.0;
         let mut zero_spot = candidate("NIFTY", 8, 100.0, "PE");
         zero_spot.spot = 0.0;
         let sel = select_depth_universe(&[nan_strike, zero_spot]);
+        assert_eq!(
+            sel.refused_bad_price, 1,
+            "only the NaN strike is the contract's own fault"
+        );
+        assert_eq!(
+            sel.depth_20
+                .iter()
+                .map(|i| i.security_id)
+                .collect::<Vec<_>>(),
+            vec![8],
+            "the contract at the money is chosen from the underlying's quoted price"
+        );
+    }
+
+    /// An underlying with NO usable price ANYWHERE still refuses every one of
+    /// its contracts.
+    ///
+    /// The amendment above narrows what a bad price refuses; it must not
+    /// remove the refusal. With nothing to centre on, a window is centred on a
+    /// guess, and a guessed window subscribes the wrong strikes and reads as a
+    /// quiet book.
+    #[test]
+    fn test_an_underlying_with_no_price_at_all_is_still_refused() {
+        let mut a = candidate("NIFTY", 7, 100.0, "CE");
+        a.spot = 0.0;
+        let mut b = candidate("NIFTY", 8, 100.0, "PE");
+        b.spot = f64::NAN;
+        let sel = select_depth_universe(&[a, b]);
         assert_eq!(sel.refused_bad_price, 2);
         assert!(sel.depth_20.is_empty());
+        assert!(sel.depth_200.is_empty());
+    }
+
+    /// The stale-copy case, end to end, on the shape that actually lost a
+    /// socket: BANKNIFTY offers a whole pair but one leg's row carries an
+    /// unusable spot, while MIDCPNIFTY offers a clean pair.
+    ///
+    /// Under the per-row rule the BANKNIFTY PUT was refused, its strike had no
+    /// whole pair left, and the operator's locked NIFTY/BANKNIFTY-first order
+    /// handed the 200-level sockets to MIDCPNIFTY — on a chain that plainly
+    /// listed a usable BANKNIFTY pair. Found by a property test.
+    #[test]
+    fn test_a_stale_spot_on_one_leg_does_not_cost_a_priority_underlying_its_socket() {
+        let mut bank_ce = candidate("BANKNIFTY", 101, 57_500.0, "CE");
+        bank_ce.spot = 57_500.0;
+        let mut bank_pe = candidate("BANKNIFTY", 102, 57_500.0, "PE");
+        bank_pe.spot = 0.0; // the NULL/stale copy
+        let mut mid_ce = candidate("MIDCPNIFTY", 201, 12_600.0, "CE");
+        mid_ce.spot = 12_600.0;
+        let mut mid_pe = candidate("MIDCPNIFTY", 202, 12_600.0, "PE");
+        mid_pe.spot = 12_600.0;
+        let sel = select_depth_universe(&[bank_ce, bank_pe, mid_ce, mid_pe]);
+        let chosen: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
+        assert!(
+            chosen.contains(&101) && chosen.contains(&102),
+            "BANKNIFTY lost its socket to a stale price copy: {chosen:?}"
+        );
     }
 
     /// Ranking is by distance from spot, not by strike order — otherwise the

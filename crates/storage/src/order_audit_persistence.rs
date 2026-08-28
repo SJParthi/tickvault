@@ -300,6 +300,25 @@ impl OrderAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_order_audit_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Pre-register the discard counter at ZERO before any row is written.
+        //
+        // WHY (measured on the live box 2026-08-26): this series had ZERO lines
+        // in /metrics out of 756 exported, because a counter that has never been
+        // incremented is never exported -- and the CloudWatch agent computes a
+        // counter alarm value as a DELTA between consecutive samples. With no
+        // previous sample it DROPS the first one as its baseline. So the FIRST
+        // discarded SEBI audit row would have been swallowed and
+        // `tv-<env>-order-audit-rows-discarded` would only have fired on the
+        // SECOND. For a rare, legally-retained record, the first is the one that
+        // matters -- and a discard that happens exactly once would never page at
+        // all.
+        //
+        // Publishing a harmless zero here makes THAT the dropped baseline sample.
+        // Same discipline as `SpillDropCounters::new` and `WalRingSink::pre_register`.
+        // The counter is BARE (no labels) at its only emit site in
+        // `discard_pending`, so this pre-registration creates the identical
+        // series rather than a phantom sibling -- verified before writing it.
+        metrics::counter!("tv_order_audit_rows_discarded_total").increment(0);
         let conf = order_audit_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

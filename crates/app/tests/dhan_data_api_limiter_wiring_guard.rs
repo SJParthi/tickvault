@@ -196,6 +196,50 @@ fn ratchet_retry_shaping_is_wired_into_the_ladder_and_run_loop() {
     );
 }
 
+/// The THIRD choke point, added 2026-08-26.
+///
+/// The 15:31 daily cross-verification fires up to one request per target at
+/// the SAME `/v2/charts/intraday` endpoint the spot-1m leg uses — 865 on
+/// 2026-08-26 — and did it in an unpaced sequential loop while this guard
+/// pinned two choke points and called the job done. A guard that enumerates
+/// callers is only as good as its enumeration.
+#[test]
+fn ratchet_crossverify_rest_leg_routes_through_shared_limiter() {
+    let src = read_app_src("src/dhan_live_crossverify.rs");
+    // The pacing sits in a WRAPPER, matching the shape the spot-1m and chain
+    // legs already use: an unpaced `fetch_rest_side_for_target` that is
+    // testable without a limiter, and `fetch_rest_side_paced` around it.
+    let body = fn_body(&src, "async fn fetch_rest_side_paced(");
+    assert!(
+        body.contains("shared_dhan_data_api_limiter()") && body.contains(".acquire()"),
+        "fetch_rest_side_paced must acquire a permit from the SAME shared Dhan \
+         Data-API limiter — it is the choke point every cross-verification \
+         request passes through"
+    );
+    assert!(
+        body.contains("record_429()"),
+        "a real 429 on this leg must feed the shared self-tuner: a limiter that \
+         cannot see this leg's throttling cannot step down for it, and the \
+         collateral lands on the per-minute legs"
+    );
+    assert!(
+        body.contains("XverifyFetchFailureKind::RateLimited"),
+        "the 429 must be recognised from the TYPED failure kind, which is \
+         classified from the real StatusCode — never a substring scan of a \
+         rendered message"
+    );
+
+    // And the unpaced fn must have no OTHER caller: a wrapper only paces what
+    // goes through it.
+    let run = fn_body(&src, "pub async fn run_cross_verification(");
+    assert!(
+        run.contains("fetch_rest_side_paced(") && !run.contains("fetch_rest_side_for_target("),
+        "the run loop must call the PACED wrapper. Calling the unpaced fn \
+         directly is how this leg spent a year outside the pacing contract the \
+         limiter's own header says covers it"
+    );
+}
+
 #[test]
 fn ratchet_limiter_module_is_the_single_pacing_authority() {
     let src = read_app_src("src/dhan_data_api_limiter.rs");

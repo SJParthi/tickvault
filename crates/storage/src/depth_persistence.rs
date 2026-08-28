@@ -135,7 +135,6 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
-use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 
 /// The `market_depth` table name.
@@ -192,6 +191,49 @@ pub const DEPTH_SIDE_BID: &str = "bid";
 
 /// `side` SYMBOL value for the sell side (feed response code 51).
 pub const DEPTH_SIDE_ASK: &str = "ask";
+
+// COMPILE-TIME proof that every closed-set ILP label is already safe, so the
+// write paths can pass them through with ZERO runtime work.
+//
+// Adding a label with a comma, an equals sign, a control byte or a non-ASCII
+// character is a BUILD FAILURE here, not a malformed row discovered in
+// QuestDB. That is what makes it sound for `append_row` to skip the sanitiser
+// for these values — the check did not disappear, it moved to the compiler.
+const _: () = {
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_20
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_200
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_5
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_SIDE_BID
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_SIDE_ASK
+    ));
+    // EXHAUSTIVE over the whole byte space: whatever segment code the wire
+    // carries, its label is clean. Not a sample — all 256.
+    let mut code = 0u16;
+    while code <= u8::MAX as u16 {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            tickvault_common::segment::segment_code_to_str(code as u8)
+        ));
+        code += 1;
+    }
+    // Every feed label, from the enum's own exhaustive list.
+    let feeds = Feed::ALL;
+    let mut i = 0;
+    while i < feeds.len() {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            feeds[i].as_str()
+        ));
+        i += 1;
+    }
+};
 
 /// Timeout for the idempotent QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -677,6 +719,28 @@ fn temp_depth_spill_dir() -> PathBuf {
 /// the operator a manual re-ingest is safe: the depth DEDUP key carries
 /// `depth_kind` and `capture_seq`, so a partially-applied write plus a
 /// re-send collapses instead of duplicating.
+/// How fast a retryable flush failure must come back before the ONE retry is
+/// allowed.
+///
+/// The depth flush runs inside `block_in_place` on the drain task — the task
+/// that folds ticks — and the sender's `request_timeout` is 5,000 ms. An
+/// unconditional retry therefore makes the worst case TEN seconds of drain
+/// occupancy on the largest table in the database, which is the same
+/// socket-buffer-fills-and-the-vendor-skips-us mechanism the whole
+/// zero-tick-loss requirement is about.
+///
+/// A timed-out request and an `EINTR` both surface as
+/// `questdb::ErrorCode::SocketError`, so the error class cannot separate the
+/// case the retry exists for from the case that must not be retried. The clock
+/// can: an interrupted syscall returns in microseconds, a timeout consumes the
+/// full 5,000 ms. One second sits three orders of magnitude above the first
+/// and five times below the second.
+pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS: u64 = 1_000;
+
+/// [`DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS`] as a `Duration`.
+pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS);
+
 #[must_use]
 fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
     matches!(err.code(), questdb::ErrorCode::SocketError)
@@ -798,25 +862,37 @@ impl DepthWriter {
     /// Appends one prepared [`DepthRow`] to the ILP buffer (no flush).
     ///
     /// ILP requires every SYMBOL before any field column, so the four symbols
-    /// are written first. All four come from closed `&'static str` sets, and
-    /// all four are still routed through `sanitize_ilp_symbol` as defence in
-    /// depth against line-protocol injection — the same discipline `ticks`
-    /// applies to its own closed sets.
+    /// are written first. All four come from closed `&'static str` sets whose
+    /// ILP-safety is proven at COMPILE TIME by the `const _` block near the top
+    /// of this file, so none of them is re-checked per row. See the note at the
+    /// call site for why that mattered.
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
         let feed = self.feed.as_str();
+        // Passed through WITHOUT `sanitize_ilp_symbol`, deliberately.
+        //
+        // All four are `&'static str` from CLOSED SETS, and the `const _` block
+        // near the top of this file proves at COMPILE TIME that every member of
+        // every one of those sets is already ILP-safe -- exhaustively, over all
+        // 256 segment codes and every `Feed::ALL` entry. The sanitiser returns
+        // `Cow::Borrowed` for clean input, so it allocated nothing and DHAT
+        // could not see it; what it DID do was walk the characters of the
+        // literal `"bid"` to re-derive an answer fixed when the constant was
+        // written -- four times per row, on a path this module's own header
+        // measures at ~1.53e9 rows per session. The check did not disappear; it
+        // moved to the compiler, which is principle 2 in its literal form.
         self.buffer
             .table(MARKET_DEPTH_TABLE)
             .context("table")?
-            .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
+            .symbol("segment", row.segment)
             .context("segment")?
-            .symbol("depth_kind", sanitize_ilp_symbol(row.depth_kind).as_ref())
+            .symbol("depth_kind", row.depth_kind)
             .context("depth_kind")?
-            .symbol("side", sanitize_ilp_symbol(row.side).as_ref())
+            .symbol("side", row.side)
             .context("side")?
-            .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
+            .symbol("feed", feed)
             .context("feed")?
             .column_i64("security_id", row.security_id)
             .context("security_id")?
@@ -959,15 +1035,22 @@ impl DepthWriter {
             );
             anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
         };
+        let started = std::time::Instant::now();
         let first = sender.flush(&mut self.buffer);
+        let first_failure_elapsed = started.elapsed();
         let outcome = match first {
             Ok(()) => Ok(()),
-            Err(err) if flush_failure_is_retryable(&err) => {
-                // ONE retry, only for the transport class. EINTR and a
-                // connection reset leave the buffer intact and the server
-                // holding nothing to reject, so discarding here throws away
-                // rows that a second attempt would have written -- which is
-                // exactly what happened on 2026-08-25 at 13:12:07, when
+            Err(err)
+                if flush_failure_is_retryable(&err)
+                    && first_failure_elapsed < DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                // ONE retry, only for the transport class, and only when the
+                // first attempt failed FAST.
+                //
+                // EINTR and a connection reset leave the buffer intact and the
+                // server holding nothing to reject, so discarding here throws
+                // away rows that a second attempt would have written -- which
+                // is exactly what happened on 2026-08-25 at 13:12:07, when
                 // `io: Interrupted system call (os error 4)` cost 8,810 rows.
                 //
                 // Bounded at one deliberately. This runs on the flush path, so
@@ -976,6 +1059,17 @@ impl DepthWriter {
                 // upstream instead -- the same loss wearing a different name.
                 // A second failure falls through to the rescue-then-discard
                 // below, unchanged.
+                //
+                // The TIMING condition (added 2026-08-26) is what keeps that
+                // reasoning true. `request_timeout=5000` and an unconditional
+                // retry make the worst case TEN seconds of a flush that runs
+                // inside `block_in_place` on the drain task -- and the drain
+                // task is the tick fold. A timed-out flush maps to the same
+                // `SocketError` class as an EINTR, so without a clock the two
+                // are indistinguishable and the retry doubles the exact stall
+                // it was reasoned to be safe against. An EINTR returns in
+                // microseconds; a timeout consumes the full budget. The window
+                // separates them with three orders of magnitude to spare.
                 metrics::counter!(
                     "tv_depth_flush_retries_total",
                     "feed" => self.feed.as_str(),
@@ -983,7 +1077,18 @@ impl DepthWriter {
                 .increment(1);
                 sender.flush(&mut self.buffer)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                if flush_failure_is_retryable(&err) {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_depth_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
         };
         match outcome {
             Ok(()) => {
@@ -1057,6 +1162,32 @@ pub fn depth_segment_label(code: u8) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The retry window must be far above an interrupted syscall and far below
+    /// the sender's own request timeout — that gap is the whole reason a clock
+    /// can separate two failures the error class cannot.
+    #[test]
+    fn the_retry_window_sits_between_an_eintr_and_the_request_timeout() {
+        // Source-scanned rather than built from a config fixture: the number
+        // the window is reasoned against is the LITERAL in `depth_ilp_http_conf`,
+        // and a change to it must invalidate this test.
+        let src = include_str!("depth_persistence.rs");
+        assert!(
+            src.contains("request_timeout=5000"),
+            "the retry window is reasoned against a 5,000 ms request timeout; if that \
+             literal moved, re-derive the window instead of re-blessing this test"
+        );
+        assert!(
+            DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS < 5_000,
+            "a window at or above the request timeout would allow the retry after a \
+             timeout, doubling a 5s stall on the drain task to 10s"
+        );
+        assert!(
+            DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS >= 100,
+            "a window this tight would refuse the EINTR retry the 2026-08-25 8,810-row \
+             loss is the evidence for"
+        );
+    }
     use super::*;
 
     // ---- flush-failure classification (2026-08-25) ----------------------

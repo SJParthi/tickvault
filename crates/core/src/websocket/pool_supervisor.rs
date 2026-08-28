@@ -276,6 +276,22 @@ pub const SUBSCRIBE_DISPATCH_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_dispatc
 /// than assumed — the arithmetic above is a bound, this is the measurement.
 pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms";
 
+/// Counter: instruments the guard REFUSED to put on the wire because the
+/// connection would then have carried the same one twice. Labels: `endpoint`,
+/// `site` (`new` | `extend` | `swap`).
+///
+/// This one names an 804. Dhan answers a duplicate subscribe with error code
+/// 804, which `classify_disconnect` files as Fatal: the socket closes and this
+/// supervisor parks it for the session rather than redialling into the same
+/// refusal. So a single repeated instrument in ONE batch does not degrade a
+/// connection, it ends it — and every instrument that connection was carrying
+/// goes dark with it.
+///
+/// A non-zero value is therefore a PRODUCER defect that was caught rather than
+/// suffered: some caller built a set with a repeat in it. The instrument is
+/// named in the log line beside this.
+pub const SUBSCRIBE_DUPLICATE_METRIC: &str = "tv_dhan_ws_subscribe_duplicate_total";
+
 // ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
 // ---------------------------------------------------------------------------
@@ -979,6 +995,31 @@ pub enum SubscribeGuardRefusal {
         /// Documented per-connection cap.
         max: u32,
     },
+    /// A swap was asked for against an instrument this connection does not
+    /// hold.
+    ///
+    /// Fail-closed rather than fall back to an append: applying it would
+    /// subscribe the NEW instrument while unsubscribing something that was
+    /// never there, so the retained set would claim an instrument the socket
+    /// does not have and every later reconnect would replay it.
+    #[error("{endpoint} was asked to swap an instrument it does not hold")]
+    NotSubscribed {
+        /// Endpoint type asked for.
+        endpoint: DhanEndpointType,
+    },
+    /// A swap was asked for whose NEW instrument this connection already
+    /// holds.
+    ///
+    /// Fail-closed, and this is the sharpest of the three: applying it would
+    /// send a subscribe for an instrument already on this socket, and Dhan
+    /// answers a duplicate subscribe with an 804 — Fatal, so the connection
+    /// closes and parks for the session. Refusing costs one minute's swap;
+    /// applying costs every instrument the connection was carrying.
+    #[error("{endpoint} was asked to swap in an instrument it already holds")]
+    AlreadySubscribed {
+        /// Endpoint type asked for.
+        endpoint: DhanEndpointType,
+    },
 }
 
 /// The subscription set for ONE connection, and the fact of whether the live
@@ -998,6 +1039,90 @@ pub struct SubscribeGuard {
     confirmed: bool,
 }
 
+/// Drops instruments that would put the same one on a connection twice, and
+/// says so loudly.
+///
+/// # Why the guard does this at all
+///
+/// Every caller today builds a duplicate-free set, and the guard is not
+/// relying on that. It is the LAST place a set can be inspected before it
+/// reaches the wire, it is shared by all four endpoint types, and the cost of
+/// a duplicate reaching Dhan is not a degraded connection but a dead one:
+/// error 804 is Fatal, so the socket closes, the supervisor parks it for the
+/// session, and every instrument that connection was carrying goes dark.
+///
+/// # Why DROP rather than refuse the whole set
+///
+/// Refusing would leave the connection undialed, which is the same outcome as
+/// the 804 it prevents — no connection, no data. Dropping keeps the other 249
+/// instruments live, and because the guard's own `instruments` records the
+/// drop, the retained set still matches the wire exactly: nothing here can
+/// create the believed-held-ahead-of-wire divergence this module exists to
+/// prevent.
+///
+/// The drop is never silent: each one increments
+/// [`SUBSCRIBE_DUPLICATE_METRIC`] and the first is named in a coded `error!`,
+/// because a non-zero count is a producer defect that was caught rather than
+/// suffered.
+///
+/// # Complexity
+///
+/// O(n) with an O(1)-average set probe per instrument; n is at most 5,000 on
+/// a main-feed connection and is walked once, on the cold path, at dial.
+fn drop_duplicates(
+    endpoint: DhanEndpointType,
+    site: &'static str,
+    already: &[SubscribeInstrument],
+    incoming: Vec<SubscribeInstrument>,
+) -> Vec<SubscribeInstrument> {
+    // Explicit loops rather than an iterator-collect, and pre-sized. This is
+    // the DIAL path, not the drain — it runs when a connection is built and
+    // on a live top-up, never per frame — but the file is hot-path-classed
+    // and an exemption comment is a weaker thing to leave behind than code
+    // that does not need one. Both allocations are bounded by the endpoint
+    // cap (5,000 on the main feed, 50 on depth-20) and happen once.
+    let mut seen: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+        std::collections::HashSet::with_capacity(already.len().saturating_add(incoming.len()));
+    for i in already {
+        seen.insert((i.security_id, i.segment));
+    }
+    let before = incoming.len();
+    let mut first_dropped: Option<SubscribeInstrument> = None;
+    let mut kept: Vec<SubscribeInstrument> = Vec::with_capacity(before);
+    for i in incoming {
+        if seen.insert((i.security_id, i.segment)) {
+            kept.push(i);
+        } else if first_dropped.is_none() {
+            first_dropped = Some(i);
+        }
+    }
+    let dropped = before.saturating_sub(kept.len());
+    if dropped > 0 {
+        metrics::counter!(
+            SUBSCRIBE_DUPLICATE_METRIC,
+            "endpoint" => endpoint.as_str(),
+            "site" => site,
+        )
+        .increment(dropped as u64);
+        if let Some(example) = first_dropped {
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                site,
+                dropped,
+                security_id = example.security_id,
+                segment = example.segment.as_str(),
+                "a subscription set carried the same instrument more than once — \
+                 dropped before it reached the wire, because Dhan answers a \
+                 duplicate subscribe with an 804 (Fatal) and the connection \
+                 would have parked for the session. The producer built a set \
+                 with a repeat in it."
+            );
+        }
+    }
+    kept
+}
+
 impl SubscribeGuard {
     /// Builds a guard, refusing a set larger than the endpoint's documented
     /// per-connection cap.
@@ -1013,6 +1138,9 @@ impl SubscribeGuard {
         endpoint: DhanEndpointType,
         instruments: Vec<SubscribeInstrument>,
     ) -> Result<Self, SubscribeGuardRefusal> {
+        // Deduped BEFORE the cap check, so a set that only breaches the
+        // cap because of its own repeats is dialed rather than refused.
+        let instruments = drop_duplicates(endpoint, "new", &[], instruments);
         let max = endpoint.max_instruments_per_connection();
         let requested = instruments.len();
         if u64::try_from(requested).unwrap_or(u64::MAX) > u64::from(max) {
@@ -1140,6 +1268,14 @@ impl SubscribeGuard {
         if more.is_empty() {
             return Ok(self.instruments.len());
         }
+        // Deduped against what this connection ALREADY holds as well as
+        // within the top-up itself. A top-up naming a held instrument is
+        // the most likely shape here: it is what a re-selection produces
+        // when only part of the desired set changed.
+        let more = drop_duplicates(self.endpoint, "extend", &self.instruments, more);
+        if more.is_empty() {
+            return Ok(self.instruments.len());
+        }
         let max = self.endpoint.max_instruments_per_connection();
         let combined = self.instruments.len().saturating_add(more.len());
         if u64::try_from(combined).unwrap_or(u64::MAX) > u64::from(max) {
@@ -1201,6 +1337,232 @@ impl SubscribeGuard {
     pub fn mark_lost(&mut self) {
         self.confirmed = false;
     }
+
+    /// Replaces one live instrument with another on a socket that is already
+    /// up, returning what to send on the wire.
+    ///
+    /// # Why this exists (2026-08-26)
+    ///
+    /// The operator's depth-200 rule is that the four sockets carry the
+    /// AT-THE-MONEY call and put of NIFTY and BANKNIFTY, re-picked every
+    /// minute. An at-the-money strike chosen at 09:10 is not at-the-money at
+    /// 14:00, so a set fixed at attach time silently drifts away from the
+    /// thing it was chosen to be — and drifts SILENTLY, because a
+    /// subscription to a now-far-from-the-money strike is perfectly healthy
+    /// and returns real data all day.
+    ///
+    /// Until now the guard could only GROW ([`SubscribeGuard::try_extend`])
+    /// or be replayed whole. Neither expresses a swap:
+    ///
+    /// - Re-dialing the connection drops depth for the reconnect and is the
+    ///   churn this design exists to avoid — one socket redialled **322
+    ///   times in a single session** on 2026-08-26 before the ranking fix.
+    /// - `try_extend` alone leaves the OLD instrument subscribed. The socket
+    ///   would then hold both, the retained set would claim both, and every
+    ///   later reconnect would replay a set that grows once per ATM change
+    ///   until it hits the per-connection cap.
+    ///
+    /// # What the caller must do with the result
+    ///
+    /// Send [`SubscribeSwap::unsubscribe`] FIRST, then
+    /// [`SubscribeSwap::subscribe`]. Order matters on a depth-200 socket,
+    /// which accepts exactly one instrument: subscribing before unsubscribing
+    /// asks for two, and Dhan answers an over-limit subscribe with **804**,
+    /// which is Fatal — retrying re-sends the identical over-limit set
+    /// forever and can earn an 805 account block.
+    ///
+    /// # Why the retained set is updated even though the wire has not moved
+    ///
+    /// The guard is the REPLAY source for a reconnect. If the swap were
+    /// recorded only after the socket confirmed, a disconnect in between
+    /// would replay the OLD instrument and the sockets would quietly revert
+    /// to a strike nobody chose. Recording it here means a reconnect replays
+    /// the CURRENT intent, and the cost of the socket never receiving the
+    /// swap is one stale minute — recoverable, and visible, because the next
+    /// minute's evaluation asks again.
+    ///
+    /// # Errors
+    ///
+    /// [`SubscribeGuardRefusal::NotSubscribed`] when `old` is not in the set.
+    /// Fail-closed and the guard is left untouched: a swap against an
+    /// instrument this connection never held would otherwise ADD `new`
+    /// while unsubscribing something that was never there, which is
+    /// `try_extend` wearing a swap's name.
+    ///
+    /// A swap of an instrument for ITSELF is a legal no-op — it returns empty
+    /// wire work rather than an error, because the caller asking "make this
+    /// socket carry X" when it already carries X is a correct question with a
+    /// correct answer of "nothing to do". That is the ordinary case every
+    /// minute the market does not move a strike.
+    ///
+    /// # Complexity
+    ///
+    /// O(n) in the instruments held by THIS connection — a linear scan for
+    /// `old`. On a depth-200 connection n is 1 and on depth-20 it is at most
+    /// 50, so this is O(1) in every use it was written for. It is NOT O(1) on
+    /// a 5,000-instrument main-feed connection, and is flagged rather than
+    /// relabelled: swapping on the main feed is not a use this was built for.
+    pub fn try_swap(
+        &mut self,
+        old: SubscribeInstrument,
+        new: SubscribeInstrument,
+    ) -> Result<SubscribeSwap, SubscribeGuardRefusal> {
+        // A linear scan, and it is NOT relabelled as O(1) — the doc above
+        // flags it as O(n) in the instruments held by THIS connection. What
+        // makes it acceptable is what n actually is at the only call sites
+        // this was written for: 1 on a depth-200 connection and at most 50 on
+        // depth-20, once a minute, on the cold path. An index would cost a
+        // second structure that must stay in lockstep with the Vec across
+        // every swap, extend and reconnect replay — and a structure that can
+        // drift is a larger risk than a scan of fifty elements.
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+        let Some(at) = self.instruments.iter().position(|held| *held == old) else {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                held = self.instruments.len(),
+                "refusing a swap whose OLD instrument this connection does not \
+                 hold — applying it would subscribe the new one while \
+                 unsubscribing something that was never there"
+            );
+            return Err(SubscribeGuardRefusal::NotSubscribed {
+                endpoint: self.endpoint,
+            });
+        };
+        if old == new {
+            return Ok(SubscribeSwap::NO_OP);
+        }
+        // The NEW instrument must not already be on this connection, and this
+        // is the sharpest of the guard's three checks.
+        //
+        // `old == new` above catches the no-op. This catches the different
+        // case: `new` is held at some OTHER position, so the swap would
+        // unsubscribe `old` and then subscribe something the socket already
+        // has. Dhan answers that with an 804 — Fatal — and the supervisor
+        // parks the connection for the session, taking every instrument it
+        // carried with it.
+        //
+        // Fail-closed. Refusing costs this minute's swap; the caller retries
+        // next minute, and the set is left exactly as the wire has it.
+        //
+        // Same scan as the one above, same exemption for the same reason.
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+        if self.instruments.contains(&new) {
+            metrics::counter!(
+                SUBSCRIBE_DUPLICATE_METRIC,
+                "endpoint" => self.endpoint.as_str(),
+                "site" => "swap",
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                held = self.instruments.len(),
+                security_id = new.security_id,
+                segment = new.segment.as_str(),
+                "refusing a swap whose NEW instrument this connection already \
+                 holds — subscribing it twice is an 804, which is Fatal and \
+                 parks the connection for the session"
+            );
+            return Err(SubscribeGuardRefusal::AlreadySubscribed {
+                endpoint: self.endpoint,
+            });
+        }
+        // Replace in place rather than remove-then-push: position is the only
+        // thing that distinguishes one depth-20 slot from another when the
+        // caller reasons about the set, and a swap should not reorder the rest.
+        if let Some(slot) = self.instruments.get_mut(at) {
+            *slot = new;
+        }
+        Ok(SubscribeSwap {
+            unsubscribe: Some(old),
+            subscribe: Some(new),
+        })
+    }
+}
+
+/// The wire work one [`SubscribeGuard::try_swap`] implies.
+///
+/// Both fields are `Option` for the same reason: the no-op swap (an
+/// instrument replaced by itself) must be expressible as "send nothing"
+/// rather than as an error or as an empty `Vec` the caller might loop over
+/// and mistake for work. That case is the COMMON one — every minute the
+/// at-the-money strike has not moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeSwap {
+    /// Send this FIRST. See [`SubscribeGuard::try_swap`] for why the order is
+    /// not a preference.
+    pub unsubscribe: Option<SubscribeInstrument>,
+    /// Send this SECOND, and only after the unsubscribe has gone out.
+    pub subscribe: Option<SubscribeInstrument>,
+}
+
+impl SubscribeSwap {
+    /// Nothing to send — the socket already carries what was asked for.
+    pub const NO_OP: Self = Self {
+        unsubscribe: None,
+        subscribe: None,
+    };
+
+    /// `true` when this swap implies no wire traffic at all.
+    #[must_use]
+    pub const fn is_no_op(&self) -> bool {
+        self.unsubscribe.is_none() && self.subscribe.is_none()
+    }
+}
+
+/// How long ONE wire call of a swap may occupy the drain task.
+///
+/// **THIS BOUND IS THE POINT, and without it the swap is dangerous.** Both
+/// wire calls run ON the drain task — the same task that reads frames off the
+/// socket — and the transport's own `SUBSCRIBE_SEND_TIMEOUT` is **10
+/// seconds**. An unsubscribe followed by a subscribe would therefore be a
+/// worst case of **twenty seconds** of drain occupancy, on the very socket the
+/// swap exists to keep useful. During a stall the socket receive buffer fills,
+/// and Dhan's published architecture skips a slow consumer forward to "the
+/// latest available state" — so the ticks in between are dropped at THEIR
+/// side, with no sequence number for us to detect it. That is tick loss caused
+/// by the mechanism meant to improve coverage.
+///
+/// One second each, so a whole swap is bounded at two. A subscribe message is
+/// a few hundred bytes; a socket that cannot write one in a second is sick,
+/// and the reconnect ladder is the right answer to a sick socket — not
+/// waiting nine more seconds on the drain.
+///
+/// At the ~5,000 packet/sec envelope two seconds is ~10,000 packets, inside
+/// the socket receive buffer. Once a minute per socket, and only on a REAL
+/// at-the-money change — the edge-triggered tracker upstream means an ordinary
+/// minute costs zero wire calls and zero stall.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const SWAP_WIRE_BUDGET: Duration = Duration::from_secs(1);
+
+/// A change to what a LIVE socket is subscribed to, sent while it is up.
+///
+/// One channel carries both shapes deliberately. Two optional receivers on
+/// the connection driver would each need their own null check in the drain
+/// loop, and — worse — could deliver an `Extend` and a `Swap` in an order
+/// neither sender chose. One channel gives the sequence the sender wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveSubscriptionCommand {
+    /// Add instruments to a set already on the wire.
+    ///
+    /// The original reason a live command channel exists at all: reaching the
+    /// ~4,150 slots stranded on the boot-dialed spot connection, which is
+    /// exactly what the authorized ATM window was short of. See
+    /// [`SubscribeGuard::try_extend`].
+    Extend(Vec<SubscribeInstrument>),
+    /// Replace one instrument with another, without re-dialing.
+    ///
+    /// The per-minute at-the-money re-selection for depth-200 and depth-20.
+    /// See [`SubscribeGuard::try_swap`] — in particular why the unsubscribe
+    /// must go out before the subscribe.
+    Swap {
+        /// The instrument to drop. Must be one this connection holds, or the
+        /// command is refused fail-closed.
+        old: SubscribeInstrument,
+        /// The instrument to take its place.
+        new: SubscribeInstrument,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1922,6 +2284,22 @@ pub trait DhanFeedSocket: Send {
         &mut self,
         batch: &[SubscribeInstrument],
     ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Send ONE unsubscribe message for the given batch.
+    ///
+    /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. It
+    /// has a default implementation that REFUSES rather than silently
+    /// succeeding: a transport that cannot unsubscribe must fail the swap
+    /// loudly, because the alternative — reporting success and leaving the old
+    /// instrument subscribed — puts a depth-200 connection over its
+    /// one-instrument limit on the very next subscribe, and Dhan answers that
+    /// with a Fatal 804.
+    fn send_unsubscribe(
+        &mut self,
+        batch: &[SubscribeInstrument],
+    ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+        let _ = batch;
+        async { Err(SocketFailure) }
+    }
     /// Send ONE client-originated keepalive Ping.
     ///
     /// Required, not defaulted, deliberately: a default that quietly returned
@@ -1982,28 +2360,35 @@ where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = ()> + Send,
 {
-    run_connection_with_topup(socket, supervisor, guard, sink, refresh_token, None).await
+    run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
 }
 
-/// [`run_connection`] plus a channel that can add instruments to the LIVE
-/// subscription.
+/// [`run_connection`] plus a channel that can change the LIVE subscription
+/// while the socket is up.
 ///
-/// See [`SubscribeGuard::try_extend`] for why a live top-up exists at all: it
-/// is the only way to reach the ~4,150 slots stranded on the boot-dialed spot
-/// connection, and those slots are exactly what the authorized ATM ± 25 window
-/// was short of.
+/// Two commands ride it, and they exist for different reasons.
+/// [`LiveSubscriptionCommand::Extend`] is the only way to reach the ~4,150
+/// slots stranded on the boot-dialed spot connection — exactly what the
+/// authorized ATM ± 25 window was short of. [`LiveSubscriptionCommand::Swap`]
+/// is the per-minute at-the-money re-selection: without it, changing which
+/// strike a depth socket carries means re-dialing it, and that is the churn
+/// that redialled one socket 322 times in a single session.
 ///
-/// `topup` is `None` for every connection that has nothing to add — depth
-/// sockets, and main-feed sockets the attach dialed itself with their final
-/// set. A `None` receiver compiles to a select arm that is never ready, so a
-/// connection without a top-up channel behaves byte-identically to before.
-pub async fn run_connection_with_topup<S, K, F, Fut>(
+/// **RENAMED 2026-08-26** from `run_connection_with_topup`. The old name was
+/// accurate when adding was the only thing the channel could do, and became a
+/// name for one of its two jobs — the same class of mistake this file already
+/// records against `FrameSinkOutcome::Captured`.
+///
+/// `commands` is `None` for every connection with nothing to change. A `None`
+/// receiver costs a null check on an enum discriminant per drain iteration and
+/// nothing else, so such a connection behaves byte-identically to before.
+pub async fn run_connection_with_commands<S, K, F, Fut>(
     mut socket: S,
     mut supervisor: ConnectionSupervisor,
     mut guard: SubscribeGuard,
     sink: std::sync::Arc<K>,
     mut refresh_token: F,
-    mut topup: Option<tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>>,
+    mut commands: Option<tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>>,
 ) -> ConnectionExit
 where
     S: DhanFeedSocket,
@@ -2123,7 +2508,7 @@ where
                     sink.as_ref(),
                     action,
                     &mut guard,
-                    topup.as_mut(),
+                    commands.as_mut(),
                 )
                 .await;
             }
@@ -2300,7 +2685,7 @@ async fn drain<S, K>(
     sink: &K,
     mut action: SupervisorAction,
     guard: &mut SubscribeGuard,
-    mut topup: Option<&mut tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>>,
+    mut commands: Option<&mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>>,
 ) -> SupervisorAction
 where
     S: DhanFeedSocket,
@@ -2344,9 +2729,9 @@ where
         // on an enum discriminant, not an atomic, not a syscall. The cost is
         // present only in the handful of iterations between the socket coming
         // up and the attach sending, and it disappears permanently after.
-        if let Some(rx) = topup.as_mut() {
+        if let Some(rx) = commands.as_mut() {
             match rx.try_recv() {
-                Ok(more) => {
+                Ok(LiveSubscriptionCommand::Extend(more)) => {
                     let added = more.len();
                     match guard.try_extend(more) {
                         Ok(start) => {
@@ -2418,12 +2803,125 @@ where
                         }
                     }
                 }
+                Ok(LiveSubscriptionCommand::Swap { old, new }) => {
+                    match guard.try_swap(old, new) {
+                        Ok(swap) if swap.is_no_op() => {
+                            // The socket already carries what was asked for.
+                            // Not counted and not logged: this is the ORDINARY
+                            // minute, and a line per socket per minute would
+                            // be ~1,500 lines a session saying nothing
+                            // happened. The tracker upstream is edge-triggered
+                            // precisely so this case rarely even reaches here.
+                        }
+                        Ok(swap) => {
+                            // UNSUBSCRIBE FIRST. A depth-200 connection holds
+                            // exactly one instrument; subscribing before
+                            // unsubscribing asks for two, and Dhan answers an
+                            // over-limit subscribe with 804 — Fatal, and
+                            // retrying re-sends the same over-limit set
+                            // forever. The order is the safety property.
+                            // Both calls bounded by `SWAP_WIRE_BUDGET`. See
+                            // that constant: unbounded, these two would be a
+                            // twenty-second drain stall on the socket the
+                            // swap exists to keep useful.
+                            let mut wire_failed = false;
+                            let mut wire_timed_out = false;
+                            if let Some(drop_this) = swap.unsubscribe {
+                                match tokio::time::timeout(
+                                    SWAP_WIRE_BUDGET,
+                                    socket.send_unsubscribe(&[drop_this]),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => wire_failed = true,
+                                    Err(_elapsed) => {
+                                        wire_failed = true;
+                                        wire_timed_out = true;
+                                    }
+                                }
+                            }
+                            if !wire_failed && let Some(add_this) = swap.subscribe {
+                                match tokio::time::timeout(
+                                    SWAP_WIRE_BUDGET,
+                                    socket.send_subscribe(&[add_this]),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => wire_failed = true,
+                                    Err(_elapsed) => {
+                                        wire_failed = true;
+                                        wire_timed_out = true;
+                                    }
+                                }
+                            }
+                            if wire_failed {
+                                // The guard already carries the NEW instrument
+                                // — see `try_swap` for why it is recorded
+                                // before the wire moves. That is what makes
+                                // this recoverable rather than a silent
+                                // revert: the reconnect replays the CURRENT
+                                // intent, so the socket comes back holding the
+                                // strike that was chosen, not the one it had.
+                                error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    "live subscription swap failed on the wire — the retained \
+                                     set already names the new instrument, so the reconnect \
+                                     replay lands it. One stale minute, not a lost strike."
+                                );
+                                metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
+                                if wire_timed_out {
+                                    // Separated from an ordinary write error
+                                    // because they mean different things: a
+                                    // write error is a socket that answered,
+                                    // a timeout is a socket that did not —
+                                    // and the second is the one that also
+                                    // cost the drain a full second.
+                                    metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(1);
+                                }
+                            } else {
+                                info!(
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    total = guard.len(),
+                                    "live subscription swapped — this socket now carries the \
+                                     current at-the-money contract without a re-dial"
+                                );
+                                metrics::counter!("tv_dhan_ws_swap_total").increment(1);
+                            }
+                        }
+                        Err(_) => {
+                            // Fail-closed and LOUD at the emit site, for the
+                            // same reason the refused top-up is: `try_swap`
+                            // explains WHY it refused, this says WHAT IT COSTS
+                            // — this socket keeps carrying a strike that is no
+                            // longer at-the-money, and it will look perfectly
+                            // healthy doing it, because a far-from-the-money
+                            // subscription still delivers real depth all day.
+                            error!(
+                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                held = guard.len(),
+                                "live subscription swap REFUSED — this connection does not hold \
+                                 the instrument it was asked to replace, so it keeps the strike \
+                                 it has. That strike is no longer at-the-money and nothing \
+                                 downstream can tell."
+                            );
+                            metrics::counter!("tv_dhan_ws_swap_refused_total").increment(1);
+                        }
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // The attach sent its one overflow and dropped the sender.
+                    // Every sender is gone: the attach sent its one overflow
+                    // and dropped, or the session's re-selection task ended.
                     // Clearing the Option is what makes the steady-state cost
                     // of this whole block exactly zero.
-                    topup = None;
+                    commands = None;
                 }
             }
         }
@@ -2573,6 +3071,265 @@ mod tests {
             security_id: id,
             segment: ExchangeSegment::NseFno,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // try_swap — the primitive the per-minute at-the-money re-selection
+    // needs (2026-08-26). Without it the only ways to change what a live
+    // socket carries are "grow it" or "re-dial it", and neither is a swap.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_swap_reports_the_unsubscribe_first_and_the_subscribe_second() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let swap = g.try_swap(si(1), si(2)).expect("holds the old one");
+        assert_eq!(swap.unsubscribe, Some(si(1)));
+        assert_eq!(swap.subscribe, Some(si(2)));
+        assert!(!swap.is_no_op());
+    }
+
+    // -- the 804 guard: no connection may carry one instrument twice --------
+    //
+    // Dhan answers a duplicate subscribe with error code 804, which
+    // `classify_disconnect` files as Fatal: the socket closes and the
+    // supervisor parks it for the SESSION. So a repeat is not a wasted slot,
+    // it is the loss of every instrument that connection was carrying.
+    //
+    // Every producer today builds a duplicate-free set. These pin that the
+    // guard does not depend on that — it is the last place a set can be
+    // inspected before the wire, and it is shared by all four endpoint types.
+
+    #[test]
+    fn a_set_carrying_the_same_instrument_twice_only_subscribes_it_once() {
+        let mut set = instruments(3);
+        set.push(set[1]);
+        let guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, set).expect("inside the cap");
+        assert_eq!(guard.len(), 3, "the repeat must not reach the wire");
+        let flat: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
+        let mut seen = std::collections::HashSet::new();
+        for i in &flat {
+            assert!(
+                seen.insert((i.security_id, i.segment)),
+                "duplicate {i:?} in a subscribe batch — that is an 804 (Fatal)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_id_in_two_segments_is_two_instruments_not_a_duplicate() {
+        // I-P1-11: `security_id` ALONE is not an identity. Deduping on the id
+        // would silently drop a real contract and leave the connection
+        // carrying fewer instruments than the operator authorized.
+        let set = vec![
+            SubscribeInstrument {
+                security_id: 7,
+                segment: ExchangeSegment::NseFno,
+            },
+            SubscribeInstrument {
+                security_id: 7,
+                segment: ExchangeSegment::BseFno,
+            },
+        ];
+        let guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, set).expect("inside the cap");
+        assert_eq!(guard.len(), 2, "two segments are two instruments");
+    }
+
+    #[test]
+    fn a_top_up_naming_something_already_held_adds_nothing() {
+        // The likeliest live shape: a re-selection where only part of the
+        // desired set changed, so the top-up repeats what is already there.
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(4)).expect("cap");
+        let start = guard.try_extend(instruments(4)).expect("no cap breach");
+        assert_eq!(guard.len(), 4, "nothing new was added");
+        assert_eq!(
+            guard.batches_from(start).flatten().count(),
+            0,
+            "a top-up of pure repeats must put NO subscribe on the wire"
+        );
+    }
+
+    #[test]
+    fn a_top_up_keeps_the_new_half_and_drops_the_repeated_half() {
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(4)).expect("cap");
+        let mut more = instruments(2);
+        more.extend(instruments_from(4, 3));
+        let start = guard.try_extend(more).expect("no cap breach");
+        assert_eq!(guard.len(), 7, "4 held + 3 genuinely new");
+        let sent: Vec<SubscribeInstrument> = guard.batches_from(start).flatten().copied().collect();
+        assert_eq!(sent.len(), 3, "only the new three go on the wire");
+        for i in &sent {
+            assert!(
+                i.security_id >= 4,
+                "a repeated instrument {i:?} reached the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn a_swap_whose_new_instrument_is_already_held_is_refused() {
+        // Distinct from the `old == new` no-op: here `new` sits at a
+        // DIFFERENT position, so the swap would unsubscribe `old` and then
+        // subscribe something the socket already has.
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(3)).expect("cap");
+        let err = guard
+            .try_swap(instruments(3)[0], instruments(3)[2])
+            .expect_err("subscribing a held instrument is an 804");
+        assert!(matches!(
+            err,
+            SubscribeGuardRefusal::AlreadySubscribed { .. }
+        ));
+        assert_eq!(
+            guard.len(),
+            3,
+            "a refused swap must leave the set exactly as the wire has it"
+        );
+        let flat: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
+        assert!(
+            flat.contains(&instruments(3)[0]),
+            "the OLD instrument must still be held — nothing was unsubscribed"
+        );
+    }
+
+    #[test]
+    fn a_swap_onto_itself_is_still_a_no_op_not_a_refusal() {
+        // The common minute: the at-the-money strike has not moved. This must
+        // stay distinguishable from the duplicate refusal above, or every
+        // quiet minute would log an 804 warning.
+        let mut guard =
+            SubscribeGuard::try_new(DhanEndpointType::Depth200, instruments(1)).expect("cap");
+        let swap = guard
+            .try_swap(instruments(1)[0], instruments(1)[0])
+            .expect("a no-op swap is legal");
+        assert!(swap.is_no_op());
+    }
+
+    /// A depth-200 connection accepts exactly ONE instrument. Subscribing
+    /// before unsubscribing asks for two, and Dhan answers an over-limit
+    /// subscribe with 804 — Fatal, and retrying re-sends the same over-limit
+    /// set forever. The ORDER is the safety property, so it is pinned by the
+    /// field names rather than left to a comment.
+    #[test]
+    fn the_swap_never_leaves_a_depth_200_connection_holding_two_instruments() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let _ = g.try_swap(si(1), si(2)).expect("holds the old one");
+        assert_eq!(g.len(), 1, "a swap must not grow the set");
+    }
+
+    /// The retained set is the REPLAY source. If a swap were recorded only
+    /// after the socket confirmed, a disconnect in between would replay the
+    /// OLD strike and the sockets would quietly revert to one nobody chose.
+    #[test]
+    fn a_reconnect_after_a_swap_replays_the_new_instrument_not_the_old() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let _ = g.try_swap(si(1), si(2)).expect("holds the old one");
+        g.mark_lost();
+        let replayed: Vec<_> = g.batches().flatten().copied().collect();
+        assert_eq!(
+            replayed,
+            vec![si(2)],
+            "the reconnect replayed the OLD strike"
+        );
+    }
+
+    /// The COMMON case, every minute the market has not moved a strike.
+    /// Expressed as "send nothing" rather than as an error, because the
+    /// caller asking "make this socket carry X" when it already carries X is
+    /// a correct question.
+    #[test]
+    fn swapping_an_instrument_for_itself_is_a_silent_no_op() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let swap = g.try_swap(si(1), si(1)).expect("holds it");
+        assert!(
+            swap.is_no_op(),
+            "an unchanged strike must cost no wire traffic"
+        );
+        assert_eq!(swap.unsubscribe, None);
+        assert_eq!(swap.subscribe, None);
+        assert_eq!(g.len(), 1);
+    }
+
+    /// Fail-closed. Falling back to an append here would subscribe the new
+    /// instrument while unsubscribing one that was never there — `try_extend`
+    /// wearing a swap's name, and the retained set would then claim something
+    /// the socket does not hold.
+    #[test]
+    fn a_swap_against_an_instrument_the_connection_never_held_is_refused() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let refusal = g.try_swap(si(99), si(2)).expect_err("does not hold 99");
+        assert!(matches!(
+            refusal,
+            SubscribeGuardRefusal::NotSubscribed { .. }
+        ));
+        assert_eq!(g.len(), 1, "a refused swap must not half-apply");
+        let held: Vec<_> = g.batches().flatten().copied().collect();
+        assert_eq!(held, vec![si(1)], "the refused swap mutated the set");
+    }
+
+    /// `security_id` ALONE is not unique — the only unique key is
+    /// `(security_id, exchange_segment)` per I-P1-11. A swap that matched on
+    /// the id alone would unsubscribe the wrong instrument whenever two
+    /// segments share a number, which they do: id 13 is NIFTY in `IDX_I` and
+    /// an unrelated cash stock in `NSE_EQ`.
+    #[test]
+    fn a_swap_matches_on_the_composite_key_not_the_bare_security_id() {
+        let idx = SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::IdxI,
+        };
+        let eq = SubscribeInstrument {
+            security_id: 13,
+            segment: ExchangeSegment::NseEquity,
+        };
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![idx]).expect("one instrument");
+        let refusal = g
+            .try_swap(eq, si(2))
+            .expect_err("same id, different segment, is a different instrument");
+        assert!(matches!(
+            refusal,
+            SubscribeGuardRefusal::NotSubscribed { .. }
+        ));
+    }
+
+    /// Position is what distinguishes one depth-20 slot from another when a
+    /// caller reasons about the set. A swap replaces in place; it must not
+    /// reorder the instruments around it.
+    #[test]
+    fn a_swap_replaces_in_place_and_leaves_the_rest_in_order() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth20, (0..5).map(si).collect())
+            .expect("under cap");
+        let _ = g.try_swap(si(2), si(42)).expect("holds it");
+        let held: Vec<_> = g.batches().flatten().map(|i| i.security_id).collect();
+        assert_eq!(held, vec![0, 1, 42, 3, 4]);
+    }
+
+    /// A whole session of at-the-money changes must not grow the set. This is
+    /// the failure `try_extend` alone would have produced: one instrument
+    /// added per change until the connection hits its cap and Dhan answers
+    /// 804.
+    #[test]
+    fn four_hundred_swaps_leave_the_set_exactly_one_instrument_long() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(0)])
+            .expect("one instrument");
+        for step in 0..400u64 {
+            let swap = g
+                .try_swap(si(step), si(step + 1))
+                .expect("holds the old one");
+            assert!(!swap.is_no_op());
+        }
+        assert_eq!(g.len(), 1, "the set grew across a session of swaps");
+        let held: Vec<_> = g.batches().flatten().copied().collect();
+        assert_eq!(held, vec![si(400)]);
     }
 
     /// The whole point: reach the slots stranded on a live connection.
@@ -2725,6 +3482,23 @@ mod tests {
 
     fn instruments(n: usize) -> Vec<SubscribeInstrument> {
         (0..n)
+            .map(|i| SubscribeInstrument {
+                security_id: SecurityId::try_from(i).unwrap_or(SecurityId::MAX),
+                segment: ExchangeSegment::NseFno,
+            })
+            .collect()
+    }
+
+    /// `n` instruments whose ids start at `start`, for building a top-up that
+    /// is genuinely NEW rather than a repeat of what the connection holds.
+    ///
+    /// `instruments(n)` always starts at 0, so extending a 250-instrument set
+    /// with `instruments(150)` supplies 150 instruments it ALREADY has. On the
+    /// wire that is 150 duplicate subscribes, and Dhan answers a duplicate
+    /// subscribe with an 804 — Fatal. The guard now drops them, so a test
+    /// wanting a real top-up has to ask for one.
+    fn instruments_from(start: usize, n: usize) -> Vec<SubscribeInstrument> {
+        (start..start.saturating_add(n))
             .map(|i| SubscribeInstrument {
                 security_id: SecurityId::try_from(i).unwrap_or(SecurityId::MAX),
                 segment: ExchangeSegment::NseFno,
@@ -4402,6 +5176,13 @@ mod tests {
         connects: usize,
         subscribes: usize,
         closes: usize,
+        unsubscribe_results: VecDeque<bool>,
+        unsubscribes: usize,
+        /// Every wire call in order, so a test can assert that the
+        /// unsubscribe went out BEFORE the subscribe. On a depth-200 socket
+        /// the reverse order asks for two instruments and earns a Fatal 804,
+        /// so the ORDER is the property under test, not the counts.
+        wire_calls: Vec<&'static str>,
         pings: usize,
     }
 
@@ -4419,6 +5200,24 @@ mod tests {
                     Ok(mut s) => {
                         s.connects += 1;
                         s.connect_results.pop_front().unwrap_or(true)
+                    }
+                    Err(_) => true,
+                };
+                if ok { Ok(()) } else { Err(SocketFailure) }
+            }
+        }
+
+        fn send_unsubscribe(
+            &mut self,
+            _batch: &[SubscribeInstrument],
+        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+            let state = std::sync::Arc::clone(&self.state);
+            async move {
+                let ok = match state.lock() {
+                    Ok(mut s) => {
+                        s.unsubscribes += 1;
+                        s.wire_calls.push("unsubscribe");
+                        s.unsubscribe_results.pop_front().unwrap_or(true)
                     }
                     Err(_) => true,
                 };
@@ -4447,6 +5246,7 @@ mod tests {
                 let ok = match state.lock() {
                     Ok(mut s) => {
                         s.subscribes += 1;
+                        s.wire_calls.push("subscribe");
                         s.subscribe_results.pop_front().unwrap_or(true)
                     }
                     Err(_) => true,
@@ -4709,8 +5509,350 @@ mod tests {
     /// the assertion that matters is the SUBSCRIBE COUNT: 3 messages for the
     /// initial 250, then exactly 2 for the 150 added — never 5, which is what
     /// re-sending the whole set would produce and what Dhan answers with 804.
+    // ------------------------------------------------------------------
+    // Swap over the live command channel (2026-08-26). The pure guard logic
+    // is tested above; these pin the WIRE behaviour, which is where the
+    // 804-shaped mistakes live.
+    // ------------------------------------------------------------------
+
+    fn one_scripted_frame() -> VecDeque<SocketEvent> {
+        VecDeque::from(vec![
+            SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+            SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
+        ])
+    }
+
+    /// THE safety property. A depth-200 connection holds exactly one
+    /// instrument; subscribing before unsubscribing asks for two, and Dhan
+    /// answers an over-limit subscribe with 804 — Fatal, and retrying
+    /// re-sends the identical over-limit set forever.
     #[tokio::test(start_paused = true)]
-    async fn test_run_connection_with_topup_extends_a_live_subscription() {
+    async fn a_swap_unsubscribes_before_it_subscribes() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        // The initial subscribe, then the swap's unsubscribe, then its
+        // subscribe. The ORDER of the last two is the assertion.
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe", "subscribe"],
+            "a swap that subscribes before unsubscribing puts a depth-200 \
+             connection over its one-instrument limit"
+        );
+        assert_eq!(s.connects, 1, "a swap must never re-dial");
+    }
+
+    /// The ordinary minute. An edge-triggered tracker upstream means this
+    /// rarely reaches the socket at all, but when it does it must cost
+    /// nothing — a re-subscribe per socket per minute is ~1,500 needless wire
+    /// messages a session on four sockets.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_to_the_same_instrument_touches_the_wire_not_at_all() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(1),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.unsubscribes, 0, "an unchanged strike sent an unsubscribe");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe"],
+            "only the INITIAL subscribe should be on the wire"
+        );
+    }
+
+    /// A refused swap must leave the socket alone. Sending an unsubscribe for
+    /// an instrument this connection never held would drop nothing and then a
+    /// subscribe would ADD one — turning a refused swap into a silent
+    /// `try_extend`, on a socket whose cap is one.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_swap_sends_nothing_at_all() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(99),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe"],
+            "a refused swap put traffic on the wire"
+        );
+    }
+
+    /// A failed unsubscribe must NOT be followed by the subscribe. Sending it
+    /// anyway is the exact shape that takes a depth-200 connection to two
+    /// instruments and earns the Fatal 804.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_unsubscribe_stops_the_swap_rather_than_subscribing_anyway() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe"],
+            "the subscribe went out after the unsubscribe FAILED — that is the \
+             over-limit shape Dhan answers with a Fatal 804"
+        );
+    }
+
+    /// A socket that never answers must not hold the drain. Unbounded, the
+    /// transport's own 10-second timeout would make one swap a TWENTY-second
+    /// stall on the socket the swap exists to keep useful — and during a
+    /// stall Dhan skips a slow consumer forward, dropping the intervening
+    /// ticks at their side where no counter of ours can see them.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_never_answers_costs_the_drain_two_seconds_not_twenty() {
+        struct HangingSocket {
+            state: std::sync::Arc<Mutex<FakeState>>,
+        }
+        impl DhanFeedSocket for HangingSocket {
+            fn connect(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                async { Ok(()) }
+            }
+            fn send_subscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                let state = std::sync::Arc::clone(&self.state);
+                async move {
+                    let first = match state.lock() {
+                        Ok(mut s) => {
+                            s.subscribes += 1;
+                            s.wire_calls.push("subscribe");
+                            s.subscribes == 1
+                        }
+                        Err(_) => true,
+                    };
+                    // The INITIAL subscribe answers; the swap's does not.
+                    if first {
+                        Ok(())
+                    } else {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                }
+            }
+            fn send_unsubscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                let state = std::sync::Arc::clone(&self.state);
+                async move {
+                    if let Ok(mut s) = state.lock() {
+                        s.unsubscribes += 1;
+                        s.wire_calls.push("unsubscribe");
+                    }
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+            /// This fake exists to HANG a swap, not to exercise keepalive.
+            /// Answering immediately keeps it that way: a pending ping here
+            /// would stall the supervisor for a reason the test is not about,
+            /// and the resulting failure would point at the wrong thing.
+            fn send_ping(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+                async { Ok(()) }
+            }
+            fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send {
+                let state = std::sync::Arc::clone(&self.state);
+                async move {
+                    let next = match state.lock() {
+                        Ok(mut s) => s.recv_events.pop_front(),
+                        Err(_) => None,
+                    };
+                    next.unwrap_or(SocketEvent::Closed {
+                        code: Some(DisconnectCode::AuthenticationFailed),
+                    })
+                }
+            }
+            fn close(&mut self) -> impl std::future::Future<Output = ()> + Send {
+                async {}
+            }
+        }
+
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let started = tokio::time::Instant::now();
+        let _ = run_connection_with_commands(
+            HangingSocket {
+                state: std::sync::Arc::clone(&st),
+            },
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+        let spent = started.elapsed();
+
+        // Paused clock, so this is the virtual time the swap actually
+        // occupied — not wall-clock jitter.
+        assert!(
+            spent < Duration::from_secs(3),
+            "a hanging socket held the drain for {spent:?} — the swap budget \
+             is not bounding it"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe"],
+            "the subscribe went out after the unsubscribe TIMED OUT — that is \
+             the over-limit shape Dhan answers with a Fatal 804"
+        );
+    }
+
+    /// Frames must keep flowing while a swap is processed. The command block
+    /// runs before the select rather than as an arm of it precisely so it
+    /// cannot be starved — but it must not starve the socket either.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_does_not_eat_the_frames_arriving_around_it() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(
+            sink.accepted.lock().map(|g| g.len()).unwrap_or(0),
+            2,
+            "the swap arm ate frames that should have reached the sink"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_extend_command_grows_the_subscription_without_a_redial() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             recv_events: VecDeque::from(vec![
                 SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
@@ -4724,10 +5866,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Queued before the loop starts, so the arm is ready as soon as the
         // scripted frames are drained.
-        tx.send(instruments(150)).await.expect("channel open");
+        // A top-up of instruments the connection does NOT already hold. Ids
+        // 250..400, so nothing here repeats the initial set — see
+        // `instruments_from`.
+        tx.send(LiveSubscriptionCommand::Extend(instruments_from(250, 150)))
+            .await
+            .expect("channel open");
         drop(tx);
 
-        let exit = run_connection_with_topup(
+        let exit = run_connection_with_commands(
             fake(&st),
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
@@ -4754,7 +5901,7 @@ mod tests {
 
     /// A connection given NO channel must behave byte-identically to before.
     #[tokio::test(start_paused = true)]
-    async fn test_run_connection_with_topup_none_is_unchanged_behaviour() {
+    async fn no_command_channel_is_byte_identical_to_before() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa"))]),
             ..FakeState::default()
@@ -4763,7 +5910,7 @@ mod tests {
         let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
             .expect("inside cap");
 
-        let exit = run_connection_with_topup(
+        let exit = run_connection_with_commands(
             fake(&st),
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,

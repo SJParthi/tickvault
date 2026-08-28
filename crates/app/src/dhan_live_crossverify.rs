@@ -199,6 +199,51 @@ pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 /// discover it from a puzzling verdict.
 pub const LIVE_ROW_LIMIT: usize = LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES;
 
+/// Ceiling on the live-read query's size ON THE WIRE, checked before it is
+/// sent.
+///
+/// **Added 2026-08-26 with the target-scoping filter, because that filter is
+/// what created the risk.** The query used to be a fixed ~250 bytes; it now
+/// carries an `IN` list that grows with the target count, and it travels as a
+/// URL QUERY PARAMETER on a GET — so it lands in the server's request-header
+/// buffer, not a body. Past that buffer QuestDB rejects the request, and the
+/// symptom is an opaque HTTP error that reads like an outage rather than like
+/// a query we built too large.
+///
+/// Budgeted against the WIRE size, not the raw string, because they differ by
+/// ~25% here and only one of them is what the server measures: every
+/// separator `,` percent-encodes to `%2C`, every space to `%20`. A first
+/// version of this budget was written against `sql.len()` and read as
+/// comfortable while the encoded form sat 4 KB higher.
+///
+/// **The exact server limit is UNVERIFIED from here** — no QuestDB is
+/// reachable from the dev container — so this is set at 75% of the smallest
+/// default this project has run with (32 KiB) rather than tuned to a number
+/// nobody measured. Measured renderings, 7-digit Dhan ids:
+///
+/// ```text
+///   865 targets (today)          ~8,957 B wire   37% of budget
+/// 2,000 targets (design ceiling) ~20,307 B wire   83% of budget
+/// ```
+///
+/// The ceiling case is tight on purpose: [`LIVE_COVERED_INSTRUMENTS`] is
+/// already the point past which the doc says the answer is a paginated read
+/// rather than a bigger number, and this budget reaches the same conclusion
+/// independently instead of quietly allowing one more doubling.
+pub const LIVE_SQL_WIRE_BUDGET_BYTES: usize = 24 * 1024;
+
+/// Upper bound on how many bytes `sql` becomes as a URL query parameter.
+///
+/// Not an encoder: every byte that is not alphanumeric is ASSUMED to expand to
+/// a 3-byte `%XX` escape. That over-counts slightly (`_`, `-`, `.` and `~` are
+/// unreserved and pass through), which is the correct direction for a budget —
+/// it can refuse a query that would have fitted, and can never wave through
+/// one that would not. Pure, O(n) over a cold-path string.
+#[must_use]
+pub fn url_query_wire_len(sql: &str) -> usize {
+    sql.len() + 2 * sql.chars().filter(|c| !c.is_ascii_alphanumeric()).count()
+}
+
 // ---------------------------------------------------------------------------
 // Config — DEFAULT OFF
 // ---------------------------------------------------------------------------
@@ -431,15 +476,88 @@ pub fn day_bounds_micros(day_start_ist_nanos: i64) -> (i64, i64) {
 ///   complete rather than a false `partial`.
 ///
 /// Pure. Pinned by the digit-magnitude tests below.
+///
+/// # Why the id filter exists (MEASURED 2026-08-26, not modelled)
+///
+/// This read used to be UNIVERSE-WIDE while the REST side is fetched only for
+/// `targets`. `compare_day` emits `missing_rest` for any key the live side has
+/// and the REST side does not — so every instrument outside the target set
+/// produced one finding per minute it traded, purely for being out of scope.
+///
+/// On 2026-08-26 that was **757,273 of 764,002 findings — 99.1%**:
+///
+/// ```text
+/// targets: 865   instruments: 8144   minutes_compared: 12727
+/// cells_diverged: 946   missing_live: 5783   missing_rest: 757273
+/// ```
+///
+/// The excluded majority is F&O by design: `dhan_intraday_instrument_for`
+/// returns `None` for `NSE_FNO` rather than guess between FUTIDX/OPTIDX/
+/// FUTSTK/OPTSTK, so ~22,000 contracts are never targets — yet every one of
+/// them that traded appeared here and was written up as a finding.
+///
+/// Those rows carry NO information. `missing_rest` is explicitly not counted
+/// as divergence, and `missing_live` — the packet-loss proxy this subsystem
+/// exists for — is structurally impossible without REST data. An instrument we
+/// never asked about can produce neither signal, so including it can only
+/// add noise; at ~272 bytes/row it was ~206 MB/day of it, into a volume that
+/// filled to 100% and WAL-suspended fifteen tables the day before.
+///
+/// Scoping the read to the targets also retires the truncation that was
+/// silently limiting coverage: 865 targets x 385 minutes is ~333,000 rows
+/// against a 770,000 cap, where the universe-wide read hit the cap and — being
+/// `ORDER BY ts ASC` — dropped every afternoon.
+///
+/// **That the read came back exactly full is arithmetic, not inference.**
+/// Every in-session live key is either compared or `missing_rest`, so the run's
+/// own published counts recover the row count it read:
+///
+/// ```text
+/// minutes_compared 12,727 + missing_rest 757,273 = 770,000
+///                                  LIVE_ROW_LIMIT = 770,000
+/// ```
+///
+/// To the row. Strictly that means truncated OR a day holding exactly the cap,
+/// which is the distinction the `LIMIT cap + 1` probe exists to make — and the
+/// run summary does not publish `truncated`, so it could not be read off the
+/// log. That field is added alongside this change for exactly that reason.
+///
+/// Why it matters more than the noise: `ORDER BY ts ASC` cuts the END of the
+/// day, and a live minute truncated away is indistinguishable from one never
+/// captured — it returns as `missing_live`, which IS counted as divergence and
+/// is the packet-loss proxy this subsystem exists for. On 2026-08-26 that
+/// effect was small only because 815 of 865 REST fetches failed, so there was
+/// barely any REST tail left to go unmatched. On a day when the REST side
+/// works, a truncated afternoon reads as tick loss.
+///
+/// An EMPTY target list matches nothing rather than falling back to the
+/// universe. With no targets there is no REST side, so a universe-wide read
+/// would make every live row a finding: the 2026-08-26 failure at its maximum.
+/// The honest verdict for that state is no data, and the caller reaches it.
 #[must_use]
-pub fn live_candles_select_sql(day_start_ist_nanos: i64) -> String {
+pub fn live_candles_select_sql(day_start_ist_nanos: i64, target_ids: &[i64]) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
     let probe_limit = LIVE_ROW_LIMIT.saturating_add(1);
+    // `i64` renders as digits only, so this cannot carry an injection: there
+    // is no path from an operator string into the predicate.
+    let scope = if target_ids.is_empty() {
+        // Deliberately unsatisfiable — see the doc comment.
+        "AND 1 = 0".to_string()
+    } else {
+        let mut ids: Vec<i64> = target_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        // No space after the comma: this goes out as a URL QUERY PARAMETER,
+        // where `, ` encodes to `%2C%20` (6 bytes) and `,` to `%2C` (3). At
+        // the design ceiling that is 6 KB of pure separator.
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        format!("AND security_id IN ({list})")
+    };
     format!(
         "SELECT (ts / 1) * 1000 AS ts_nanos, security_id, segment, open, high, \
          low, close, volume \
          FROM candles_1m \
-         WHERE feed = 'dhan' AND ts >= {start} AND ts < {end} \
+         WHERE feed = 'dhan' AND ts >= {start} AND ts < {end} {scope} \
          ORDER BY ts ASC LIMIT {probe_limit}"
     )
 }
@@ -1365,6 +1483,21 @@ pub struct RunReport {
     pub malformed_rows: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
+    /// `true` when the live read came back at [`LIVE_ROW_LIMIT`] + 1 rows, so
+    /// the day was cut short.
+    ///
+    /// **Added 2026-08-26 because its absence hid the diagnosis.** Truncation
+    /// used to be folded straight into `degraded` and dropped, and `degraded`
+    /// is also set by a single REST failure — so a run reporting
+    /// `degraded: true, rest_failures: 815` gave no way to tell whether the
+    /// live read had ALSO been cut. It had: that run's own counts
+    /// (`minutes_compared` + `missing_rest`) summed to exactly the row cap.
+    ///
+    /// Truncation is the more serious of the two, because `ORDER BY ts ASC`
+    /// cuts the END of the day and the missing minutes come back as
+    /// `missing_live` — the packet-loss proxy. Reported separately so the two
+    /// are never again indistinguishable.
+    pub live_truncated: bool,
     /// The vendor's own minute candles, exactly as fetched — added
     /// 2026-08-26 on operator instruction.
     ///
@@ -1387,8 +1520,26 @@ pub async fn read_live_side(
     questdb_exec_url: &str,
     day_start_ist_nanos: i64,
     timeout: std::time::Duration,
+    targets: &[XverifyTarget],
 ) -> Result<(Vec<SideBar>, bool, usize), String> {
-    let sql = live_candles_select_sql(day_start_ist_nanos);
+    let target_ids: Vec<i64> = targets.iter().map(|t| t.security_id).collect();
+    let sql = live_candles_select_sql(day_start_ist_nanos, &target_ids);
+    // Fail CLOSED on an oversized query rather than sending it. Over the
+    // server's header buffer this comes back as an opaque HTTP error that
+    // reads like an outage; refusing here names the real cause and the real
+    // fix, which the LIVE_ROW_LIMIT doc already anticipates (paginate or read
+    // per-instrument, not a bigger number).
+    let wire = url_query_wire_len(&sql);
+    if wire > LIVE_SQL_WIRE_BUDGET_BYTES {
+        return Err(format!(
+            "live read query is ~{wire} bytes on the wire for {} targets, over the \
+             {LIVE_SQL_WIRE_BUDGET_BYTES}-byte budget — it travels as a URL query \
+             parameter and would land in QuestDB's request-header buffer, where the \
+             rejection reads like an outage. The target set has outgrown a \
+             single-request read; paginate it rather than raising this",
+            targets.len()
+        ));
+    }
     let fut = client
         .get(questdb_exec_url)
         .query(&[("query", sql.as_str())])
@@ -1405,6 +1556,12 @@ pub async fn read_live_side(
         .await
         .map_err(|_| "live read body timed out".to_string())?
         .map_err(|e| format!("live read body: {e}"))?;
+    // The SQL narrows on `security_id` ALONE, which is not an identity: Dhan
+    // reuses numeric ids across segments (I-P1-11). Rows for a DIFFERENT
+    // instrument that merely shares a number therefore survive this read —
+    // and are skipped one layer later by `compare_day_in_scope`, which
+    // filters on the full `(security_id, segment)` pair before an instrument
+    // is even counted. One check, at the layer that produces findings.
     parse_live_dataset(&body, LIVE_ROW_LIMIT)
 }
 
@@ -1572,6 +1729,7 @@ pub async fn run_cross_verification(
         questdb_exec_url,
         day_start_ist_nanos,
         std::time::Duration::from_secs(cfg.live_read_timeout_secs),
+        targets,
     )
     .await?;
 
@@ -1707,6 +1865,7 @@ pub async fn run_cross_verification(
         comparison,
         rest_failures,
         rest_failure_breakdown,
+        live_truncated: truncated,
         degraded,
         malformed_rows: live_malformed,
         budget_elapsed,
@@ -1812,7 +1971,7 @@ mod tests {
 
         // And the same guard on the rendered SQL, so a hand-edited format!
         // string cannot regress past the helper.
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         assert!(sql.contains(&format!("ts >= {start}")));
         assert!(sql.contains(&format!("ts < {end}")));
         assert!(
@@ -1863,16 +2022,132 @@ mod tests {
     /// projection) would join on keys 1000× too small and compare nothing.
     #[test]
     fn live_candles_select_sql_rescales_projected_key_to_nanoseconds() {
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         assert!(
             sql.contains("(ts / 1) * 1000 AS ts_nanos"),
             "projection must re-scale micros back to nanos: {sql}"
         );
     }
 
+    /// The 2026-08-26 noise flood, as a test.
+    ///
+    /// That run emitted 757,273 of its 764,002 findings as `missing_rest` —
+    /// 99.1% — because the live read was universe-wide while the REST side is
+    /// fetched only for `targets`. Every instrument outside the target set
+    /// produced one finding per minute it traded, for being out of scope.
+    #[test]
+    fn the_live_read_is_scoped_to_the_rest_targets() {
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[51, 13, 25, 13]);
+        assert!(
+            sql.contains("AND security_id IN (13,25,51)"),
+            "the read must be narrowed to the targets, sorted and deduped so the \
+             query text is deterministic: {sql}"
+        );
+        // The rest of the contract must survive the added clause.
+        assert!(sql.contains("feed = 'dhan'"));
+        assert!(sql.contains("ORDER BY ts ASC"));
+        assert!(sql.contains(&format!("LIMIT {}", LIVE_ROW_LIMIT + 1)));
+    }
+
+    /// The scoping filter made the query grow with the target count, and it
+    /// travels as a URL QUERY PARAMETER on a GET — so it lands in QuestDB's
+    /// request-header buffer. This pins that the DESIGN CEILING still fits,
+    /// not merely that today's 865 do: a budget verified only against today's
+    /// number is a budget nobody checked.
+    #[test]
+    fn the_live_read_sql_fits_its_transport_budget_at_the_design_ceiling() {
+        // Dhan security ids are 7 digits at the top of the observed range.
+        let ids: Vec<i64> = (0..LIVE_COVERED_INSTRUMENTS as i64)
+            .map(|i| 1_000_000 + i)
+            .collect();
+        let sql = live_candles_select_sql(DAY_START_NANOS, &ids);
+        let wire = url_query_wire_len(&sql);
+        assert!(
+            wire <= LIVE_SQL_WIRE_BUDGET_BYTES,
+            "at the {}-target design ceiling the query is ~{} bytes on the wire, \
+             over the {}-byte budget — the read would be refused by the server \
+             with an error that reads like an outage",
+            LIVE_COVERED_INSTRUMENTS,
+            wire,
+            LIVE_SQL_WIRE_BUDGET_BYTES
+        );
+        // And the separator must stay bare INSIDE THE ID LIST: `, ` encodes to
+        // `%2C%20`, which is 6 KB of pure separator at this size. The SELECT
+        // column list above it legitimately uses `, ` and is a fixed ~40 bytes,
+        // so the check is scoped to the clause that scales.
+        let in_clause = sql
+            .split_once("security_id IN (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| list)
+            .expect("the scoped query must carry an IN list");
+        assert!(
+            !in_clause.contains(", "),
+            "a space after the comma doubles the encoded separator cost across \
+             {} ids",
+            LIVE_COVERED_INSTRUMENTS
+        );
+    }
+
+    /// Today's real set, so the margin is a number somebody has seen rather
+    /// than an assumption. If this ever gets close, the guard above fires
+    /// before the server does.
+    #[test]
+    fn todays_target_count_leaves_real_headroom_in_the_query_budget() {
+        let ids: Vec<i64> = (0..865_i64).map(|i| 1_000_000 + i).collect();
+        let sql = live_candles_select_sql(DAY_START_NANOS, &ids);
+        let wire = url_query_wire_len(&sql);
+        assert!(
+            wire * 2 < LIVE_SQL_WIRE_BUDGET_BYTES,
+            "865 targets are ~{} bytes on the wire; the budget is {} — under half \
+             is the headroom this design assumes, and losing it means the target \
+             set grew past what one request can carry",
+            wire,
+            LIVE_SQL_WIRE_BUDGET_BYTES
+        );
+    }
+
+    /// The wire estimate must be an UPPER bound, or the budget it feeds waves
+    /// through queries the server will refuse.
+    #[test]
+    fn the_wire_estimate_never_under_counts_the_encoded_form() {
+        // Alphanumerics pass through untouched.
+        assert_eq!(url_query_wire_len("abc123"), 6);
+        // Everything else is assumed to become a 3-byte escape.
+        assert_eq!(url_query_wire_len(" "), 3);
+        assert_eq!(url_query_wire_len(","), 3);
+        assert_eq!(url_query_wire_len("a,b"), 1 + 3 + 1);
+        assert_eq!(url_query_wire_len(""), 0);
+        // And it must never be SMALLER than the raw length.
+        for probe in ["SELECT * FROM t", "1,2,3", "feed = 'dhan'"] {
+            assert!(
+                url_query_wire_len(probe) >= probe.len(),
+                "the estimate under-counted {probe:?}"
+            );
+        }
+    }
+
+    /// With no targets there is no REST side at all, so a universe-wide read
+    /// would make EVERY live row a finding — the 2026-08-26 failure at its
+    /// maximum. Matching nothing is the honest shape; the verdict then reads
+    /// as no data.
+    #[test]
+    fn an_empty_target_list_reads_nothing_rather_than_the_universe() {
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[]);
+        assert!(
+            sql.contains("AND 1 = 0"),
+            "an empty target set must be unsatisfiable, never an unfiltered \
+             universe read: {sql}"
+        );
+        assert!(
+            !sql.contains("security_id IN ()"),
+            "an empty IN list is a SQL syntax error, which would degrade the \
+             run for the wrong reason: {sql}"
+        );
+    }
+
     #[test]
     fn live_candles_select_sql_is_feed_scoped_ordered_and_limit_probed() {
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         assert!(sql.contains("FROM candles_1m"));
         assert!(sql.contains("feed = 'dhan'"), "must not read another feed");
         assert!(sql.contains("ORDER BY ts ASC"));
@@ -2954,7 +3229,7 @@ mod tests {
     fn test_read_live_side_uses_the_microsecond_window_query() {
         // The runner must go through `live_candles_select_sql`, not a
         // hand-rolled query — that helper is where the #1474 fix lives.
-        let sql = live_candles_select_sql(DAY_START_NANOS);
+        let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         let (start, _) = day_bounds_micros(DAY_START_NANOS);
         assert!(sql.contains(&start.to_string()));
         assert!(!sql.contains(&DAY_START_NANOS.to_string()));
@@ -2987,6 +3262,7 @@ mod tests {
             degraded: true,
             malformed_rows: 0,
             budget_elapsed: true,
+            live_truncated: false,
             rest_tape: Vec::new(),
         };
         assert!(report.degraded);

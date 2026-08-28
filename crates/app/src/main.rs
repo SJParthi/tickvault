@@ -939,6 +939,36 @@ async fn async_main() -> Result<()> {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Step 2: Initialize observability (Prometheus metrics exporter)
+    // -----------------------------------------------------------------------
+    observability::init_metrics(&config.observability)
+        .context("failed to initialize Prometheus metrics")?;
+
+    // MOVED HERE 2026-08-26, and the move is the whole fix.
+    //
+    // This block used to sit ~35 lines ABOVE `init_metrics`, which meant
+    // `SpillDropCounters::new()` resolved its handles against the NO-OP
+    // recorder. `metrics::counter!` with no recorder installed returns a
+    // no-op handle, and this one is CACHED in the struct for the process
+    // lifetime — so the pre-registration was lost AND every later
+    // `increment(1)` on a real frame drop went nowhere. `tv_ticks_lost_total`
+    // and `tv_ws_frame_spill_drop_critical` were therefore absent from
+    // /metrics on the live box (verified 2026-08-26: zero matching lines out
+    // of 756), which makes `tv-<env>-ticks-lost-spill` — the alarm on
+    // UNRECOVERABLE tick loss — incapable of ever firing.
+    //
+    // This exact hazard is documented twice within 40 lines of here: the
+    // STAGE-C.2b comment above ("they hit the no-op recorder and were
+    // silently lost") and `prewarm_dispatcher_counters` below ("Must run
+    // post-install because handles created pre-install resolve to a no-op
+    // counter"). It was fixed for those two and missed here.
+    //
+    // Nothing between the old and new position touched `_ws_frame_spill` —
+    // its only consumer is the stack wiring far below — and the fail-closed
+    // halt is strictly better here: it now happens with the exporter UP, so
+    // the boot-halt is observable rather than silent.
     // PR-C2 (2026-07-13): with the Dhan live WS retired there is no frame
     // APPEND site left in this process (the dhan_rest_stack order-update WS
     // deliberately runs wal_spill=None while dormant — C1 dormancy honesty),
@@ -1565,13 +1595,32 @@ async fn async_main() -> Result<()> {
     // retirement directive 2026-07-13; websocket-connection-scope-lock.md
     // "2026-07-13 Amendment" §B). Every boot flows through ONE path:
     // shared prefix → build_shared_infra → WAL settlement → REST stack
-    // (unconditional) → READY → run_process_runloop. `dhan_enabled=true` is
-    // an ILLEGAL post-retirement config (logged loudly + ignored at the
-    // REST-stack spawn below — dhan_enabled=false is the prod reality).
-    // The OFF-feed-isolation guarantee is now BY CONSTRUCTION: no Dhan auth
-    // beyond the REST stack's own, no instrument fetch, no Dhan WebSocket
-    // (except the stack's functional-dormant order-update WS) exists on any
-    // path.
+    // (unconditional) → READY → run_process_runloop.
+    //
+    // CORRECTED 2026-08-26. This block used to end:
+    //
+    //   "`dhan_enabled=true` is an ILLEGAL post-retirement config (logged
+    //    loudly + ignored at the REST-stack spawn below — dhan_enabled=false
+    //    is the prod reality). The OFF-feed-isolation guarantee is now BY
+    //    CONSTRUCTION: no Dhan auth beyond the REST stack's own, no
+    //    instrument fetch, no Dhan WebSocket ... exists on any path."
+    //
+    // Every clause was false. `config/base.toml` carries `dhan_enabled = true`
+    // (the 2026-08-11 operator flip), `feed_stack_gate` READS that flag rather
+    // than ignoring it, and the lane it gates dials up to 16 Dhan WebSockets.
+    // So this said the shipped production config is illegal, and that no Dhan
+    // WebSocket can exist, in a boot path whose whole job is to bring them up.
+    //
+    // The same correction was already made 640 lines below, at the
+    // `feed_stack_gate` call site, and its note diagnoses this precisely:
+    // "the message survived the revival because nothing tied it to the flag
+    // it described." That is true of this block too — it was updated there
+    // and missed here, which is the partial re-bless that makes a file look
+    // reviewed. `crates/common/tests/dhan_enabled_premise_guard.rs` now ties
+    // both to the real value in base.toml.
+    //
+    // What IS still true and is the point of this block: there is no Dhan
+    // fast/slow boot to choose between, so this is a LOGGING dispatcher only.
     // =======================================================================
     if !config.feeds.dhan_enabled {
         warn!(
@@ -1622,11 +1671,23 @@ async fn async_main() -> Result<()> {
     });
 
     // =====================================================================
-    // BOOT (single path since PR-C2, 2026-07-13 — the Dhan live-WS lane and
-    // its FAST crash-recovery arm are DELETED per the operator's retirement
-    // directive; Groww is the sole live feed, Dhan is REST-only).
+    // BOOT (single path since PR-C2, 2026-07-13 — the Dhan FAST
+    // crash-recovery arm is DELETED per the operator's retirement directive).
+    //
+    // CORRECTED 2026-08-26. The comment and the boot log below both said
+    // "Groww is the sole live feed, Dhan is REST-only". Both halves are dead:
+    // the operator REVIVED the Dhan live WS on 2026-08-09 (`dhan_enabled =
+    // true` since 2026-08-11) and ordered the ENTIRE Groww feed removed on
+    // 2026-08-21 — `groww_enabled` is not even a config field any more.
+    //
+    // The log line is the part that mattered: it is not a comment, it printed
+    // on EVERY boot into CloudWatch, and it told the operator the opposite of
+    // what the process was doing. That is the class this file already records
+    // 560 lines below, on the ERROR message that advised turning off the live
+    // feed: "actively harmful ... an operator who followed the advice would
+    // have turned off the live feed they had just deliberately enabled".
     // =====================================================================
-    info!("standard boot — shared infra, then per-feed lanes (Groww live; Dhan REST-only)");
+    info!("standard boot — shared infra, then per-feed lanes");
 
     // =======================================================================
     // D2 Stage 2 — HOISTED PROCESS-SHARED INFRA (the single boot path)

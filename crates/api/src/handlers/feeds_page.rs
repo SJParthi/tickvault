@@ -91,11 +91,13 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
   <h1>TickVault — Feed Control</h1>
-  <p class="sub"><b>📊 Market data is captured by the per-minute REST cadence
-     pulls (Dhan + Groww) — that capture runs regardless of the switches
-     below.</b> Today's numbers are on the <a href="/board">Live Board</a>.</p>
-  <p class="sub">The switches below control only the RETIRED live-WS lanes —
-     they are OFF by design and safe to leave alone.</p>
+  <p class="sub"><b>📊 Market data comes from two places: the live Dhan
+     price feed, and the per-minute Dhan catch-up pulls. Both run regardless
+     of the switches below.</b> Today's numbers are on the
+     <a href="/board">Live Board</a>.</p>
+  <p class="sub">The switches below do <b>not</b> start or stop the live
+     price feed — that is set before start-up and reported here, not
+     controlled here. Leave them alone unless you have been told otherwise.</p>
 
   <div class="token-row">
     <input id="token" type="password" placeholder="API token (required to toggle feeds)"
@@ -435,14 +437,25 @@ mod tests {
             "has the title"
         );
         // Operator-scare fix (2026-07-20): the REST cadence capture status is
-        // the prominent line; the retired live-WS switches are secondary.
+        // RE-POINTED 2026-08-26. These two pinned "per-minute REST cadence"
+        // and "RETIRED live-WS lanes". The second was the harmful one: the
+        // Dhan live lane was revived 2026-08-09 and runs, so the page told the
+        // operator that the switch beside his RUNNING feed was retired and
+        // safe to ignore — and this assertion is what kept that sentence
+        // there. The page must now say the live feed exists and that these
+        // switches do not control it.
         assert!(
-            FEEDS_PAGE_HTML.contains("per-minute REST cadence"),
-            "prominent REST-cadence capture line present"
+            FEEDS_PAGE_HTML.contains("live Dhan") && FEEDS_PAGE_HTML.contains("catch-up pulls"),
+            "the page must name BOTH market-data sources"
         );
         assert!(
-            FEEDS_PAGE_HTML.contains("RETIRED live-WS lanes"),
-            "retired live-WS framing present"
+            FEEDS_PAGE_HTML.contains("do <b>not</b> start or stop the live"),
+            "the page must say plainly that these switches do not control the \
+             live feed"
+        );
+        assert!(
+            !FEEDS_PAGE_HTML.contains("RETIRED live-WS lanes"),
+            "the live-WS lane is not retired — it was revived 2026-08-09"
         );
     }
 
