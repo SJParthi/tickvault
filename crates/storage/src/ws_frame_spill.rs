@@ -1361,34 +1361,6 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
     }
 }
 
-/// The highest `frame_seq` already committed to disk under `wal_dir`.
-///
-/// # Why a restart needs this
-///
-/// [`next_frame_seq`] returns `max(prev + 1, wall_clock)`. Above roughly 7,600
-/// frames/second the `prev + 1` arm wins and the counter runs AHEAD of the wall
-/// clock — its own header says so. A process that then restarts re-seeds from
-/// `AtomicU64::new(0)` plus the wall clock, i.e. from a value BELOW the
-/// high-water mark it had reached, and begins re-issuing sequence numbers that
-/// are already rows in the database. Those rows share the full DEDUP key with
-/// the new ticks and upsert them away.
-///
-/// It is the same silent loss as the two-process case, reached by one process
-/// and a crash instead of by two. So the counter has to be a ratchet ACROSS
-/// restarts, not only within one run.
-///
-/// # Cost
-///
-/// Only the NEWEST segment of each of the three directories (live, `replaying/`,
-/// `archive/`) is scanned, and only record HEADERS are read — frame payloads are
-/// seeked past, never copied. Sequences increase in append order and segments
-/// rotate in order, so the newest segment holds the maximum. Three bounded
-/// header walks on a cold boot path.
-///
-/// Returns `0` when the directory is absent, empty, or holds only v1 (`TVW1`)
-/// records, which predate `frame_seq`. `0` is the correct answer there: it
-/// leaves the wall clock as the seed, exactly as before.
-#[must_use]
 /// How many trailing segments per directory the boot high-water probe reads.
 ///
 /// # Why more than one
@@ -1410,11 +1382,47 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
 /// observed crash has produced.
 const HIGH_WATER_SEGMENTS_PER_DIR: usize = 4;
 
+/// The highest `frame_seq` already committed to disk under `wal_dir`.
+///
+/// # Why a restart needs this
+///
+/// [`next_frame_seq`] returns `max(prev + 1, wall_clock)`. Above roughly 7,600
+/// frames/second the `prev + 1` arm wins and the counter runs AHEAD of the wall
+/// clock — its own header says so. A process that then restarts re-seeds from
+/// `AtomicU64::new(0)` plus the wall clock, i.e. from a value BELOW the
+/// high-water mark it had reached, and begins re-issuing sequence numbers that
+/// are already rows in the database. Those rows share the full DEDUP key with
+/// the new ticks and upsert them away.
+///
+/// It is the same silent loss as the two-process case, reached by one process
+/// and a crash instead of by two. So the counter has to be a ratchet ACROSS
+/// restarts, not only within one run.
+///
+/// # Cost
+///
+/// At most [`HIGH_WATER_SEGMENTS_PER_DIR`] trailing segments of each of the
+/// three directories (live, `replaying/`, `archive/`) are scanned, and only
+/// record HEADERS are read — frame payloads are seeked past, never copied. The
+/// walk stops at the first segment that yields a sequence, so the common case
+/// reads exactly one file per directory; the extra three exist for the crash
+/// window that leaves a zero-byte or torn newest segment.
+///
+/// CORRECTED 2026-08-28: this paragraph said "Only the NEWEST segment … is
+/// scanned … Three bounded header walks", which was true when written and
+/// stopped being true in the same change that made the walk read backwards.
+/// A cost claim that describes the previous behaviour is exactly the stale-doc
+/// class this file's own corrections keep recording.
+///
+/// Returns `0` when the directory is absent, empty, or holds only v1 (`TVW1`)
+/// records, which predate `frame_seq`. `0` is the correct answer there: it
+/// leaves the wall clock as the seed, exactly as before.
+///
 /// The greatest `frame_seq` written to any segment under `wal_dir`.
 ///
 /// Best-effort and deliberately so — see [`highest_frame_seq_in_segment`]. A
 /// LOWER bound is strictly better than the wall clock alone; refusing to boot
 /// over a torn tail would turn a safety net into an outage.
+#[must_use]
 pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
     let mut highest = 0u64;
     for dir in [
