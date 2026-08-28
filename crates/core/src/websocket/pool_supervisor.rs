@@ -2947,6 +2947,13 @@ where
                             // swap exists to keep useful.
                             let mut wire_failed = false;
                             let mut wire_timed_out = false;
+                            // Tracked separately from `wire_failed` because the two
+                            // halves leave the socket in OPPOSITE states. A failed
+                            // unsubscribe means the socket still holds its OLD
+                            // instrument and is still delivering; a failed subscribe
+                            // AFTER a successful unsubscribe means it holds nothing.
+                            // Only the second is worth tearing the socket down for.
+                            let mut unsubscribe_succeeded = false;
                             if let Some(drop_this) = swap.unsubscribe {
                                 match tokio::time::timeout(
                                     SWAP_WIRE_BUDGET,
@@ -2954,7 +2961,7 @@ where
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(())) => unsubscribe_succeeded = true,
                                     Ok(Err(_)) => wire_failed = true,
                                     Err(_elapsed) => {
                                         wire_failed = true;
@@ -2978,6 +2985,63 @@ where
                                 }
                             }
                             if wire_failed {
+                                // FORCE A REDIAL when the swap left the socket
+                                // holding LESS than it should — added
+                                // 2026-08-28.
+                                //
+                                // The order of the two wire calls is a safety
+                                // property (see the comment above), and it has
+                                // a consequence this arm used to ignore: when
+                                // the unsubscribe SUCCEEDS and the subscribe
+                                // then fails, a depth-200 socket — which holds
+                                // exactly one instrument — is left holding
+                                // NOTHING.
+                                //
+                                // The error line below has always claimed "the
+                                // reconnect replay lands it. One stale minute,
+                                // not a lost strike." The first half was true
+                                // and the second was an assumption: nothing
+                                // scheduled a reconnect. Only two things do —
+                                // a `Disconnected` event from the read half,
+                                // and the idle watchdog. Neither fires here.
+                                // The socket is transport-healthy (that is why
+                                // the write did not error), and depth-200 is
+                                // client-pinged by us with Dhan ponging back,
+                                // so `KeepAliveReceived` keeps resetting the
+                                // watchdog on a socket carrying no data at all.
+                                //
+                                // It is not permanent — the next ATM move
+                                // issues a fresh swap, and `depth200_atm`
+                                // skips only while the strike is UNCHANGED —
+                                // and the 600s deaf-socket alarm does page. So
+                                // this was detected and simply never
+                                // remediated: an empty socket for as long as
+                                // the strike holds still, which on a flat
+                                // afternoon is the rest of the session.
+                                //
+                                // `ConnEvent::SubscribeFailed` is the right
+                                // event and already exists: the initial
+                                // subscribe path fires it for the same shape
+                                // (a set the wire did not carry), and it
+                                // schedules a redial through the normal
+                                // backoff ladder rather than a bare reconnect
+                                // — so a socket failing this repeatedly backs
+                                // off and parks instead of spinning.
+                                //
+                                // Gated on `lost_instruments` rather than on
+                                // `wire_failed` alone, because a swap whose
+                                // UNSUBSCRIBE failed never sent the subscribe:
+                                // that socket still holds its old instrument
+                                // and is still delivering, so tearing it down
+                                // would trade a stale strike for a real gap.
+                                // The socket is EMPTY only when the unsubscribe landed
+                                // and the subscribe did not. A failed unsubscribe
+                                // never sends the subscribe at all, so that socket
+                                // still holds its old instrument and is still
+                                // delivering — tearing it down would trade a stale
+                                // strike for a real gap.
+                                let lost_instruments =
+                                    unsubscribe_succeeded && swap.subscribe.is_some();
                                 // The guard already carries the NEW instrument
                                 // — see `try_swap` for why it is recorded
                                 // before the wire moves. That is what makes
@@ -2989,9 +3053,14 @@ where
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                     endpoint = supervisor.slot().endpoint.as_str(),
                                     pool_index = supervisor.slot().pool_index,
-                                    "live subscription swap failed on the wire — the retained \
-                                     set already names the new instrument, so the reconnect \
-                                     replay lands it. One stale minute, not a lost strike."
+                                    lost_instruments,
+                                    wire_timed_out,
+                                    "live subscription swap failed on the wire. The retained set \
+                                     already names the new instrument, so a reconnect replay lands \
+                                     the right strike. When the unsubscribe had already succeeded \
+                                     the socket is now carrying NOTHING, and a redial is scheduled \
+                                     here to recover it — without one, a transport-healthy socket \
+                                     keeps ponging while delivering no data."
                                 );
                                 metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
                                 if wire_timed_out {
@@ -3002,6 +3071,18 @@ where
                                     // and the second is the one that also
                                     // cost the drain a full second.
                                     metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(1);
+                                }
+                                if lost_instruments {
+                                    metrics::counter!("tv_dhan_ws_swap_emptied_socket_total")
+                                        .increment(1);
+                                    action = supervisor
+                                        .on_event(ConnEvent::SubscribeFailed, Instant::now());
+                                    // Leave the drain so the outer loop can act
+                                    // on the scheduled redial. Returning the
+                                    // action rather than continuing is what
+                                    // makes this a remediation instead of
+                                    // another log line.
+                                    return action;
                                 }
                             } else {
                                 info!(
@@ -5819,6 +5900,86 @@ mod tests {
             vec!["subscribe", "unsubscribe"],
             "the subscribe went out after the unsubscribe FAILED — that is the \
              over-limit shape Dhan answers with a Fatal 804"
+        );
+    }
+
+    /// A swap whose unsubscribe LANDS and whose subscribe FAILS leaves the
+    /// socket carrying nothing — and must force a redial.
+    ///
+    /// The order of the two wire calls is a safety property (subscribing first
+    /// on a one-instrument depth socket asks for two and earns a Fatal 804), and
+    /// this is its consequence: when the first call succeeds and the second does
+    /// not, a depth-200 connection holds ZERO instruments.
+    ///
+    /// Until 2026-08-28 that arm only logged, under a line claiming "the
+    /// reconnect replay lands it. One stale minute, not a lost strike." The
+    /// first half was true — the guard already names the new instrument, so any
+    /// reconnect restores the right strike — and the second half was an
+    /// assumption. Nothing scheduled a reconnect. Only a `Disconnected` event
+    /// and the idle watchdog do, and neither fires here: the socket is
+    /// transport-healthy, and depth-200 is client-pinged with Dhan ponging back,
+    /// so the watchdog keeps being reset on a socket carrying no data at all.
+    ///
+    /// It was not permanent — the next ATM move issues a fresh swap — but on a
+    /// flat afternoon the strike does not move, and the socket stays empty for
+    /// the rest of the session.
+    #[tokio::test]
+    async fn a_swap_that_empties_the_socket_forces_a_redial() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            // The initial subscribe succeeds; the swap's subscribe fails.
+            subscribe_results: VecDeque::from(vec![true, false]),
+            // The swap's unsubscribe LANDS — this is what empties the socket.
+            unsubscribe_results: VecDeque::from(vec![true]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            &s.wire_calls[..3],
+            &["subscribe", "unsubscribe", "subscribe"],
+            "the swap must unsubscribe before it subscribes — that ordering is \
+             what makes the empty-socket case possible in the first place"
+        );
+        // The FOURTH call is the point: it is the redial re-subscribing the
+        // guard's retained set, which already names the NEW instrument. Before
+        // this fix the sequence stopped at three and the socket kept draining
+        // while holding nothing.
+        assert_eq!(
+            s.wire_calls.len(),
+            4,
+            "the redial must replay the retained set; got {:?}",
+            s.wire_calls
+        );
+        // The redial is the point. Without it the drain keeps running on a
+        // socket that holds nothing, answers pings, and delivers no data.
+        assert!(
+            s.connects > 1,
+            "a swap that emptied the socket must force a redial so the guard's \
+             retained set is replayed; got {} dial(s), meaning the drain stayed \
+             on a connection carrying zero instruments",
+            s.connects
         );
     }
 
