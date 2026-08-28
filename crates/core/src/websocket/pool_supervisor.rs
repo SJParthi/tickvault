@@ -3098,18 +3098,17 @@ where
                                 // revert: the reconnect replays the CURRENT
                                 // intent, so the socket comes back holding the
                                 // strike that was chosen, not the one it had.
+                                // The `source` field below is the CloudWatch
+                                // filter's discriminator, and a string rather
+                                // than the `lost_instruments` bool because
+                                // filter PATTERN syntax is validated only by
+                                // the real PutMetricFilter call at apply time:
+                                // a malformed pattern passes every PR check and
+                                // breaks the post-merge apply lane. This reuses
+                                // the exact three-condition shape already
+                                // proven live by the ws-gap-03 filters.
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                    // Discriminator for the CloudWatch filter,
-                                    // and a string rather than the
-                                    // `lost_instruments` bool below on purpose:
-                                    // filter PATTERN syntax is validated only
-                                    // by the real PutMetricFilter call at apply
-                                    // time, so a malformed pattern passes every
-                                    // PR check and breaks the post-merge apply
-                                    // lane. This reuses the exact
-                                    // three-condition shape already proven live
-                                    // by the ws-gap-03 filters.
                                     source = if lost_instruments {
                                         "swap_emptied_socket"
                                     } else {
@@ -6601,6 +6600,82 @@ mod tests {
         assert!(
             !trait_body.contains("async") && !trait_body.contains("Future"),
             "FrameSink::accept must stay synchronous"
+        );
+    }
+
+    /// The WAL receipt must be WRITTEN, not merely representable.
+    ///
+    /// # The defect this pins
+    ///
+    /// TVW3 added an 8-byte `received_at_nanos` to the WAL record on
+    /// 2026-08-28, and `append_with_seq_at` was written to persist it. It then
+    /// had ZERO production callers: both real append sites went through
+    /// `append_with_seq`, which passes `WAL_RECEIPT_UNKNOWN_NANOS`. So every
+    /// record on the box carried the sentinel while the format claimed to carry
+    /// a receipt, and boot replay re-stamped `now()` — the moment of REPLAY,
+    /// not of arrival. Since `received_at` is the candle BUCKETING clock, that
+    /// silently re-buckets every recovered frame into the minute the process
+    /// happened to restart in.
+    ///
+    /// A format that advertises a field nothing fills is worse than one that
+    /// does not advertise it, because the reader has no way to tell.
+    #[test]
+    fn the_capture_path_persists_the_frame_receipt() {
+        let source = include_str!("pool_supervisor.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        assert!(
+            production_half.contains("append_with_seq_at("),
+            "FrameSink::accept must call append_with_seq_at, not append_with_seq. \
+             append_with_seq records the UNKNOWN sentinel, so the TVW3 receipt field \
+             would be written as 0 on every frame and replay would re-stamp now() — the \
+             moment of REPLAY rather than of arrival, on the clock that buckets candles."
+        );
+        assert!(
+            production_half.contains("receipt_nanos_from(received_at)"),
+            "the receipt must be DERIVED from the `received_at` instant already stamped \
+             at the top of accept, never read from a clock here: this file bans \
+             wall-clock reads so an NTP step cannot expire all sixteen sockets at once, \
+             and that ban is right."
+        );
+        assert!(
+            !production_half.contains("append_with_seq(self.ws_type"),
+            "no production append may go through append_with_seq — it hardcodes the \
+             unknown-receipt sentinel"
+        );
+    }
+
+    /// The anchor the receipt is derived from must be RE-TAKEN, not boot-only.
+    ///
+    /// `Instant` is CLOCK_MONOTONIC and `SystemTime` is CLOCK_REALTIME; NTP
+    /// SLEWS the latter at up to 500 ppm, so a single boot anchor drifts ~1.8 s
+    /// per hour — ~16 s over a session. On the candle bucketing clock that
+    /// files bars in the wrong second by a margin that GROWS all day, which is
+    /// the error shape hardest to notice and hardest to reconstruct afterwards.
+    #[test]
+    fn the_receipt_anchor_is_refreshed_off_the_hot_path() {
+        let lane = include_str!("../../../app/src/dhan_feed_stack.rs");
+        let production_half = lane
+            .split_once("#[cfg(test)]")
+            .map_or(lane, |(prod, _)| prod);
+        assert!(
+            production_half.contains("refresh_receipt_anchor()"),
+            "some off-hot-path timer must re-take the receipt anchor; a boot-only anchor \
+             drifts against the wall clock under NTP slew for the whole session"
+        );
+        let refresh = production_half
+            .rfind("refresh_receipt_anchor()")
+            .expect("checked above");
+        let silence_arm = production_half
+            .rfind("silence_timer.tick()")
+            .expect("the lane must still have its 30s silence timer");
+        assert!(
+            silence_arm < refresh,
+            "the refresh must sit on the 30s silence arm, never the 500 ms flush arm: it \
+             is a wall-clock syscall plus an allocation, and 30 s already bounds the drift \
+             to ~15 ms at the worst permitted slew — three orders of magnitude inside a \
+             one-second bucket."
         );
     }
 }

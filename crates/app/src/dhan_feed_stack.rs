@@ -1230,15 +1230,36 @@ impl LiveIngest {
         &mut self,
         feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     ) -> std::io::Result<()> {
-        let placeholder = TickWriter::for_test(Feed::Dhan);
-        let live = std::mem::replace(&mut self.writer, placeholder);
-        let (producer, mut sink, rx) = live.split_for_offload();
-        self.writer = producer;
-        self.writer_offloaded = true;
+        // SPAWN FIRST, SPLIT SECOND (2026-08-28, round-2 fix).
+        //
+        // This used to split the writer and THEN spawn, with the `?` on the
+        // spawn. A failed spawn — `EAGAIN`, `RLIMIT_NPROC`, a thread-starved
+        // box — therefore dropped the sink and its receiver while leaving the
+        // producer with NO sender and an OPEN queue with nothing on the other
+        // end. Every subsequent flush hit `Disconnected`, rescued to the spill
+        // tier, and at this lane's row rate exhausted the spill cap within
+        // minutes; after that, rows were dropped outright. The boot handler
+        // meanwhile logged that the flush "stays ON the frame drain" — the
+        // precise opposite of what had happened.
+        //
+        // The fix is ordering, not recovery: the thread is created first and
+        // parks on a one-shot, and the writer is split only once the thread
+        // provably exists. There is no window in which a half-split writer can
+        // be reached, so no reversal is needed and none can be forgotten.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (sink_tx, sink_rx) = std::sync::mpsc::sync_channel::<(
+            tickvault_storage::tick_persistence::TickWriterSink,
+            std::sync::mpsc::Receiver<tickvault_storage::tick_persistence::FlushBatch>,
+        )>(1);
         let handle = std::thread::Builder::new()
             .name("tv-tick-writer".to_owned())
             .spawn(move || {
+                // Parks until the caller hands over. `Err` means the caller
+                // went away between the spawn and the hand-off, which is not a
+                // failure to report — there is simply nothing to write.
+                let Ok((mut sink, rx)) = sink_rx.recv() else {
+                    return;
+                };
                 // `recv` ends only when every sender is dropped, i.e. when the
                 // drain itself is gone. There is no other exit, deliberately:
                 // a writer that could stop on its own would leave the producer
@@ -1277,11 +1298,99 @@ impl LiveIngest {
                     );
                 }
             })?;
+        // The thread exists. Splitting is now safe.
+        let placeholder = TickWriter::for_test(Feed::Dhan);
+        let live = std::mem::replace(&mut self.writer, placeholder);
+        let (producer, sink, rx) = live.split_for_offload();
+        self.writer = producer;
+        self.writer_offloaded = true;
+        if sink_tx.send((sink, rx)).is_err() {
+            // Unreachable: the thread parks on this receive as its first act
+            // and cannot have exited. Reported rather than ignored, because if
+            // it ever happens the writer is split with no thread — the exact
+            // state this ordering exists to make impossible.
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the tick writer thread vanished before the hand-off — the writer is split \
+                 with nothing on the other end and every flush will rescue to the spill tier"
+            );
+        }
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
         Ok(())
     }
 
+    /// Moves the DEPTH ILP round trip onto its own OS thread.
+    ///
+    /// Delegates to [`DepthIngest::spawn_offload_writer`] — see there for why
+    /// depth mattered more than ticks.
+    ///
+    /// The `None` arm is a no-op rather than an error, and it is UNREACHABLE
+    /// today: the lane sets `with_inline_depth` unconditionally at boot. It is
+    /// written as a no-op anyway because a lane without depth is a legitimate
+    /// shape — but it is recorded as unreachable so a future reader does not
+    /// read a silent skip as normal operation.
+    ///
+    /// # Errors
+    /// Propagates a thread-spawn failure from the depth ingest.
+    pub fn spawn_depth_offload_writer(&mut self) -> std::io::Result<()> {
+        let Some(depth) = self.depth_sink() else {
+            return Ok(());
+        };
+        depth.spawn_offload_writer()
+    }
+
+    /// Closes the depth hand-off queue and waits for its writer thread.
+    ///
+    /// Idempotent and safe on a lane with no depth ingest, or one that was
+    /// never offloaded.
+    pub fn shutdown_depth_offload_writer(&mut self, deadline: std::time::Instant) {
+        if let Some(depth) = self.depth_sink() {
+            depth.shutdown_offload_writer(deadline);
+        }
+    }
+
+    /// Closes BOTH hand-off queues, then flushes what the close left behind.
+    ///
+    /// # Why the close is separate from the join
+    ///
+    /// The shutdown joins two writer threads against ONE deadline. Closing each
+    /// queue inside its own join meant the depth queue only closed after the
+    /// tick join RETURNED — so a wedged tick writer consumed the whole deadline
+    /// and the depth thread, which had not even been told to finish, was then
+    /// joined with zero time left. The comment claimed they drained in
+    /// parallel; they did not.
+    ///
+    /// # Why a flush follows the close
+    ///
+    /// A flush that met a FULL queue returns `Ok` and keeps its rows — correct,
+    /// because backpressure is not loss. But the shutdown tail flush is the
+    /// last one, and QuestDB being slow is exactly when the queue is full and
+    /// exactly when the tail matters. Closing the queue then discarded the
+    /// producer's retained rows with no spill, no counter and no log line: up
+    /// to a full flush threshold of rows, gone silently, every weekday at the
+    /// 17:30 stop. That is the same silent-tail failure the depth-flush reorder
+    /// fixed hours earlier, re-entered through the backpressure arm.
+    ///
+    /// The close puts both writers back on the SYNCHRONOUS arm with their
+    /// senders long gone to the sinks, so this flush rescues to the spill tier
+    /// — durable, counted, coded, re-ingestable. Rows on disk and named is the
+    /// correct end-of-session outcome; rows vanishing is not.
+    pub fn close_offload_queues(&mut self) {
+        self.writer.close_offload();
+        self.writer_offloaded = false;
+        let dropped = self.writer.discard_pending();
+        if dropped > 0 {
+            warn!(
+                rows = dropped,
+                "tick rows were still held by the producer at shutdown because the writer \
+                 queue was full — rescued to the tick spill tier, see the preceding coded line"
+            );
+        }
+        if let Some(depth) = self.depth_sink() {
+            depth.close_offload_queue();
+        }
+    }
     /// Closes the hand-off queue and WAITS for the writer thread to finish.
     ///
     /// Call once, after the shutdown tail flush. The order is load-bearing:
@@ -1291,9 +1400,9 @@ impl LiveIngest {
     /// Skipping the join loses exactly the rows the tail flush exists to save.
     ///
     /// Idempotent and safe on a lane that was never offloaded.
-    pub fn shutdown_offload_writer(&mut self) {
-        self.writer.close_offload();
-        self.writer_offloaded = false;
+    pub fn shutdown_offload_writer(&mut self, deadline: std::time::Instant) {
+        // The queue was already closed by `close_offload_queues` before ANY join
+        // began; this is the wait only.
         let Some(handle) = self.writer_thread.take() else {
             return;
         };
@@ -1301,10 +1410,19 @@ impl LiveIngest {
         // own 5 s request timeout — one in-flight flush plus the queue behind
         // it — but it is finite, because a writer wedged on a hung socket must
         // not be able to hang the box's shutdown.
-        let finished = self
-            .writer_done
-            .take()
-            .is_some_and(|rx| rx.recv_timeout(OFFLOAD_SHUTDOWN_GRACE).is_ok());
+        //
+        // A DEADLINE, not a per-writer duration, since 2026-08-28: the lane now
+        // joins TWO writer threads (ticks and depth) and `main` gives this whole
+        // task ONE `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`. Two independent
+        // graces would SUM past that budget, which is exactly the arithmetic the
+        // compile-time assert in `main.rs` exists to keep honest. Sharing a
+        // deadline makes the total the MAX of the two waits rather than the sum,
+        // and costs nothing: both queues are closed before either join, so the
+        // two threads drain in parallel.
+        let finished = self.writer_done.take().is_some_and(|rx| {
+            rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .is_ok()
+        });
         if !finished {
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
@@ -1355,7 +1473,13 @@ impl LiveIngest {
             counters().depth_flush_failed.increment(1);
             error!(
                 code = "TICK-FLUSH-01",
-                error = %format!("{err:#}"),
+                // `?err` and NOT `%format!("{err:#}")`: this arm is reachable
+                // from the frame drain via `pending_rows >= FLUSH_ROW_THRESHOLD`,
+                // i.e. up to ~5/s, and it fires exactly when the depth writer is
+                // already struggling — the worst moment to allocate a formatted
+                // anyhow chain ON the drain. `Debug` on `anyhow::Error` already
+                // renders the full cause chain, at zero allocation here.
+                error = ?err,
                 "inline-depth flush FAILED — those depth rows are lost (the \
                  ILP buffer is discarded on a failed flush). Tick persistence \
                  is unaffected."
@@ -4201,7 +4325,8 @@ async fn run_frame_drain(
     //
     // `flush_depth` used to sit AFTER `shutdown_offload_writer`, and that
     // ordering silently dropped the depth tail on exactly the days it matters.
-    // The offload shutdown blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS` (30s)
+    // The offload shutdown blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS` (12s, and shared with the depth
+    // join since 2026-08-28)
     // waiting for the tick writer thread to drain, while main gives this whole
     // task only `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` (20s) before it logs
     // "did NOT finish within 20s" and exits. When QuestDB is slow -- which is
@@ -4224,7 +4349,25 @@ async fn run_frame_drain(
     // batch to the writer thread; without this join the process can exit while
     // that batch is still in flight, which would lose precisely the rows the
     // tail flush exists to save. No-op on a lane that was never offloaded.
-    ingest.shutdown_offload_writer();
+    // ONE deadline, TWO writers. `main` budgets this whole task at
+    // `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`; two independent graces would sum
+    // past it and the second join would be cut off by the process exiting —
+    // silently, which is the failure the depth-tail reorder above already fixed
+    // once. Taken BEFORE either call so the shared clock starts once.
+    // CLOSE BOTH QUEUES FIRST, then join. Closing each inside its own join meant
+    // the depth queue only closed after the tick join RETURNED, so a wedged tick
+    // writer ate the whole deadline and depth was joined with zero time left --
+    // while the comment claimed they drained in parallel. The close also rescues
+    // any rows a full queue left in either producer, which the close would
+    // otherwise have discarded with no spill, no counter and no log.
+    ingest.close_offload_queues();
+    let offload_deadline = std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE;
+    ingest.shutdown_offload_writer(offload_deadline);
+    // And the depth writer, against the SAME deadline. Its queue is closed at
+    // the top of that call, so by the time the tick join above has returned the
+    // depth thread has usually already drained — the total is the max of the
+    // two waits, not the sum.
+    ingest.shutdown_depth_offload_writer(offload_deadline);
     publish_fold_depth(&ingest);
     let depth_dropped = ingest.depth_dropped_rows();
     warn!(
@@ -4560,6 +4703,12 @@ pub struct DepthFrameOutcome {
 pub struct DepthIngest {
     writer: DepthWriter,
     buf: DepthLevelBuffer,
+    /// The dedicated depth ILP writer thread, when this ingest has been
+    /// offloaded. `None` on a lane that never called `spawn_offload_writer`.
+    writer_thread: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the writer thread once its queue is fully drained. This is
+    /// what makes the shutdown join BOUNDED rather than a blind `join()`.
+    writer_done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl DepthIngest {
@@ -4571,6 +4720,8 @@ impl DepthIngest {
         Self {
             writer: DepthWriter::new(questdb, Feed::Dhan),
             buf: DepthLevelBuffer::new(),
+            writer_thread: None,
+            writer_done: None,
         }
     }
 
@@ -4581,9 +4732,166 @@ impl DepthIngest {
         Self {
             writer: DepthWriter::for_test(Feed::Dhan),
             buf: DepthLevelBuffer::new(),
+            writer_thread: None,
+            writer_done: None,
         }
     }
 
+    /// Moves the depth ILP round trip onto a dedicated OS thread.
+    ///
+    /// # The coupling this removes — and why it mattered MORE here
+    ///
+    /// The tick writer was taken off the frame-drain task on 2026-08-25. The
+    /// depth writer was not, and depth is the bigger of the two by a wide
+    /// margin: a MEASURED 1,530,651,649 rows per session against 64,349,753
+    /// ticks — 24x the volume and the largest payload in the process — flushed
+    /// synchronously with a 5,000 ms ILP timeout, on the tick fold's own task,
+    /// up to ~5 times a second at the modelled rate.
+    ///
+    /// `blocking_flush` wrapped it in `block_in_place`, which is a real
+    /// mitigation for the RUNTIME — a replacement worker is spun up so other
+    /// tasks keep running — and does nothing for the DRAIN, which is the only
+    /// thing emptying the socket. So a slow QuestDB stopped the fold, the
+    /// receive buffer filled, and Dhan — whose published behaviour is to skip a
+    /// slow consumer forward to "the latest available state" with no sequence
+    /// number — discarded the intermediate ticks at their side. The loss was
+    /// invisible to every counter we own, and no amount of provisioned disk
+    /// throughput removes it, because the coupling is structural.
+    ///
+    /// # Health is deliberately NOT reported from this thread
+    ///
+    /// The tick writer's thread calls `record_ticks`, because ticks are what
+    /// feed liveness. Depth is not: a session with healthy ticks and no depth
+    /// rows is degraded, not dead, and reporting depth landings into the same
+    /// registry would let a flowing depth stream mask a silent tick lane. Depth
+    /// health is its own counters — `tv_depth_rows_dropped_total` and the
+    /// spill/queue counters — every one of which the sink increments itself.
+    ///
+    /// # Errors
+    /// Propagates a thread-spawn failure. A lane that cannot spawn its writer
+    /// must not silently fall back to the synchronous flush, because that is
+    /// the defect this removes.
+    pub fn spawn_offload_writer(&mut self) -> std::io::Result<()> {
+        // SPAWN FIRST, SPLIT SECOND — same ordering as the tick writer, and for
+        // the same reason. See `LiveIngest::spawn_offload_writer` for the full
+        // account: a split-then-spawn that fails leaves a producer with no
+        // sender and an open queue with nothing behind it, so every flush
+        // rescues to the spill tier until the cap is reached and rows are then
+        // dropped outright — while the boot handler logs the opposite.
+        //
+        // On this path the consequence is worse, because depth is ~24x the tick
+        // row volume: the 512 MiB depth spill cap is minutes away at full rate.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (sink_tx, sink_rx) = std::sync::mpsc::sync_channel::<(
+            tickvault_storage::depth_persistence::DepthWriterSink,
+            std::sync::mpsc::Receiver<tickvault_storage::depth_persistence::DepthFlushBatch>,
+        )>(1);
+        let handle = std::thread::Builder::new()
+            .name("tv-depth-writer".to_owned())
+            .spawn(move || {
+                let Ok((mut sink, rx)) = sink_rx.recv() else {
+                    return;
+                };
+                // `recv` ends only when every sender is dropped, i.e. when the
+                // drain itself is gone. There is no other exit, deliberately: a
+                // writer that could stop on its own would leave the producer
+                // handing rows to a closed queue.
+                while let Ok(mut batch) = rx.recv() {
+                    let _landed = sink.write(&mut batch);
+                }
+                info!("depth writer thread exiting — the drain closed its queue");
+                if done_tx.send(()).is_err() {
+                    tracing::debug!(
+                        "depth writer finished AFTER the shutdown grace expired — \
+                         the timeout already reported; the rows are accounted for"
+                    );
+                }
+            })?;
+        let placeholder = DepthWriter::for_test(Feed::Dhan);
+        let live = std::mem::replace(&mut self.writer, placeholder);
+        let (producer, sink, rx) = live.split_for_offload();
+        self.writer = producer;
+        if sink_tx.send((sink, rx)).is_err() {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the depth writer thread vanished before the hand-off — the writer is split \
+                 with nothing on the other end and every flush will rescue to the spill tier"
+            );
+        }
+        self.writer_thread = Some(handle);
+        self.writer_done = Some(done_rx);
+        Ok(())
+    }
+
+    /// Closes the depth hand-off queue and rescues anything the close leaves
+    /// behind, WITHOUT waiting for the thread.
+    ///
+    /// Split from the join so the shutdown can close both queues before either
+    /// wait begins — see [`LiveIngest::close_offload_queues`] for the two
+    /// failures that ordering fixes.
+    pub fn close_offload_queue(&mut self) {
+        self.writer.close_offload();
+        // The close returned this writer to the synchronous arm, whose sender
+        // went to the sink at split time — so this rescues to the depth spill
+        // tier rather than writing. That is the point: a flush that met a full
+        // queue kept its rows, and without this they would be discarded by the
+        // close with no spill, no counter and no log.
+        let dropped = self.writer.discard_pending();
+        if dropped > 0 {
+            warn!(
+                rows = dropped,
+                "depth rows were still held by the producer at shutdown because the writer \
+                 queue was full — rescued to the depth spill tier, see the preceding coded line"
+            );
+        }
+    }
+    /// Closes the hand-off queue and WAITS for the depth writer thread.
+    ///
+    /// Call once, after the shutdown tail flush. The order is load-bearing: the
+    /// tail flush hands the last batch to the queue, closing the queue tells the
+    /// writer there is no more, and the join is what guarantees that batch
+    /// reaches QuestDB (or the depth spill tier) before the process goes away.
+    ///
+    /// Idempotent and safe on an ingest that was never offloaded.
+    pub fn shutdown_offload_writer(&mut self, deadline: std::time::Instant) {
+        // The queue was already closed by `close_offload_queue`; this is the wait only.
+        let Some(handle) = self.writer_thread.take() else {
+            return;
+        };
+        // BOUNDED, not `join()`. Generous against the ILP client's own 5 s
+        // request timeout — one in-flight flush plus the queue behind it — but
+        // finite, because a writer wedged on a hung socket must not be able to
+        // hang the box's shutdown. Shares the tick writer's grace so the two
+        // joins cannot together exceed the lane's flush budget; the
+        // compile-time assert in `main.rs` pins that arithmetic.
+        let finished = self.writer_done.take().is_some_and(|rx| {
+            rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .is_ok()
+        });
+        if !finished {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                grace_secs = OFFLOAD_SHUTDOWN_GRACE_SECS,
+                // Shares ONE deadline with the tick writer join, never its own
+                // grace: `main` gives this whole task a single flush budget, so
+                // two independent graces would SUM past it -- exactly the
+                // arithmetic the compile-time assert in `main.rs` exists to keep
+                // honest. Both queues are closed before either join, so the two
+                // threads drain in parallel and the total is the MAX, not the sum.
+                "the depth writer did not finish within the shutdown grace — its last \
+                 batch may not have reached QuestDB. Rows it failed to write are on the \
+                 depth spill tier and are re-ingestable; rows still in the queue are not."
+            );
+        }
+        drop(handle);
+    }
+
+    /// True once [`Self::spawn_offload_writer`] has run.
+    #[must_use]
+    // TEST-EXEMPT: read by the offload tests below and by the lane's wiring.
+    pub const fn is_offloaded(&self) -> bool {
+        self.writer.is_offloaded()
+    }
     /// Rows appended but not yet flushed.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
@@ -8026,6 +8334,34 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         }
     }
 
+    // The SAME move for depth, and depth is the one that needed it more.
+    //
+    // Depth is ~24x the tick row volume (a MEASURED 1,530,651,649 rows per
+    // session against 64,349,753 ticks) and it was the writer still flushing
+    // synchronously on this task, with a 5,000 ms ILP timeout, up to ~5 times
+    // a second. Everything the comment above says about a slow database
+    // stalling the fold applies here with 24x the force.
+    //
+    // Same fallback posture: a spawn failure is degraded, not broken, and it
+    // says so. The lane keeps running on the synchronous path.
+    match ingest.spawn_depth_offload_writer() {
+        Ok(()) => {
+            info!(
+                "depth writer: the ILP flush now runs on its own thread — the largest \
+                 payload in the process can no longer stall the frame drain"
+            );
+        }
+        Err(err) => {
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                error = %err,
+                "depth writer thread could not be spawned — the depth ILP flush stays ON \
+                 the frame drain, where a slow database stalls the fold and ticks are \
+                 lost upstream at the vendor. The lane still runs."
+            );
+        }
+    }
+
     // Seed BEFORE any socket opens, so an instrument that never delivers a
     // single tick is reported as silent rather than being invisible to the gap
     // detector — the difference between "we saw nothing" and "nothing came".
@@ -9374,6 +9710,171 @@ pub fn now_ist_secs_of_day() -> u64 {
 #[cfg(test)]
 mod tests {
 
+    /// Both queues must be closed BEFORE either join begins.
+    ///
+    /// Closing inside each join meant the depth queue only closed after the
+    /// tick join RETURNED — so a wedged tick writer consumed the whole shared
+    /// deadline and the depth thread, which had not even been told to finish,
+    /// was joined with zero time left. Up to a full queue of depth batches was
+    /// abandoned on a detached thread, and a healthy shutdown reported a false
+    /// "depth writer did not finish". The comment claimed they drained in
+    /// parallel; ordering is what makes that true.
+    #[test]
+    fn both_queues_close_before_either_join() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        let close = production_half
+            .rfind("ingest.close_offload_queues();")
+            .expect("the shutdown must close both queues");
+        let tick_join = production_half
+            .rfind("ingest.shutdown_offload_writer(offload_deadline);")
+            .expect("the shutdown must join the tick writer");
+        let depth_join = production_half
+            .rfind("ingest.shutdown_depth_offload_writer(offload_deadline);")
+            .expect("the shutdown must join the depth writer");
+        assert!(
+            close < tick_join && close < depth_join,
+            "the close must come first — otherwise the two joins do not overlap and the \
+             second one inherits whatever the first left of the deadline"
+        );
+    }
+
+    /// A full queue at the shutdown tail must RESCUE, never vanish.
+    ///
+    /// `flush` returns `Ok` on a full queue and keeps its rows, which is right:
+    /// backpressure is not loss. But the shutdown tail flush is the last one,
+    /// and a slow QuestDB is exactly when the queue is full AND exactly when
+    /// the tail matters. Closing the queue then discarded those retained rows
+    /// with no spill, no counter and no log — the same silent-tail failure the
+    /// depth-flush reorder fixed hours earlier, re-entered through the
+    /// backpressure arm. The close now flushes on the synchronous arm, whose
+    /// sender went to the sink, so the rows land on disk named and counted.
+    #[test]
+    fn closing_the_queues_rescues_what_backpressure_retained() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        let close_fn = production_half
+            .split_once("pub fn close_offload_queues(&mut self) {")
+            .map(|(_, rest)| rest.split_once("\n    }").map_or(rest, |(b, _)| b))
+            .expect("close_offload_queues must exist");
+        assert!(
+            close_fn.contains("discard_pending()"),
+            "closing the tick queue must rescue the producer's retained rows — without it \
+             a full-queue tail is discarded silently"
+        );
+        let depth_close = production_half
+            .split_once("pub fn close_offload_queue(&mut self) {")
+            .map(|(_, rest)| rest.split_once("\n    }").map_or(rest, |(b, _)| b))
+            .expect("DepthIngest::close_offload_queue must exist");
+        assert!(
+            depth_close.contains("discard_pending()"),
+            "closing the depth queue must rescue the producer's retained rows"
+        );
+    }
+
+    /// The writer thread must exist BEFORE the writer is split.
+    ///
+    /// Split-then-spawn leaves a producer with no sender and an open queue with
+    /// nothing behind it when the spawn fails: every flush then rescues to the
+    /// spill tier until the cap is reached and rows are dropped outright —
+    /// while the boot handler logs that the flush "stays ON the frame drain",
+    /// the precise opposite of what happened. Ordering removes the window
+    /// entirely, which is better than a recovery path someone can forget.
+    #[test]
+    fn the_writer_thread_exists_before_the_writer_is_split() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        for (name, thread_name) in [
+            ("tick", "\"tv-tick-writer\".to_owned()"),
+            ("depth", "\"tv-depth-writer\".to_owned()"),
+        ] {
+            let spawn = production_half
+                .find(thread_name)
+                .unwrap_or_else(|| panic!("{name} writer thread must be named"));
+            let split = production_half[spawn..]
+                .find("split_for_offload()")
+                .unwrap_or_else(|| panic!("{name} writer must be split"));
+            assert!(
+                split > 0,
+                "the {name} split must come AFTER the spawn, so a failed spawn cannot leave \
+                 a producer with no sender and an open queue"
+            );
+        }
+    }
+    /// The depth flush must be OFF the frame drain — and the lane must
+    /// actually ask for it.
+    ///
+    /// This exists because the sibling fix shipped half-done once already:
+    /// `receipt_nanos_from` was written, documented at length, and had ZERO
+    /// callers, so every WAL record carried the unknown sentinel while the
+    /// format claimed to carry a receipt. A `pub fn` that nothing calls is not
+    /// a feature; it is a claim. Depth is the same shape and 24x the volume, so
+    /// it gets a guard rather than a hope.
+    #[test]
+    fn the_lane_actually_moves_the_depth_flush_off_the_drain() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        assert!(
+            production_half.contains("ingest.spawn_depth_offload_writer()"),
+            "the boot path must call spawn_depth_offload_writer. Depth is ~24x the tick \
+             row volume and its ILP flush has a 5,000 ms timeout; left on the drain it \
+             stops the fold, fills the socket receive buffer, and Dhan discards the \
+             intermediate ticks at THEIR side with no sequence number for us to detect it."
+        );
+        assert!(
+            production_half.contains("ingest.shutdown_depth_offload_writer(offload_deadline)"),
+            "the shutdown must join the depth writer against the SHARED deadline. Without \
+             the join the process exits with the last batch in flight; without the SHARED \
+             deadline the two joins sum past the lane's flush budget and the second one is \
+             cut off by the exit — silently."
+        );
+    }
+
+    /// One deadline for both writer joins, never two graces.
+    ///
+    /// `main` budgets this whole task at `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`
+    /// and its compile-time assert compares that against ONE
+    /// `OFFLOAD_SHUTDOWN_GRACE_SECS`. That assert is only true while the joins
+    /// share a deadline: two independent graces would sum to 2x and the second
+    /// join would be cut off by the process exiting, losing exactly the tail
+    /// batch the join exists to save — and the assert would still pass, because
+    /// it cannot see the second call.
+    #[test]
+    fn the_two_writer_joins_share_one_deadline() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        assert!(
+            production_half.contains("let offload_deadline = std::time::Instant::now()"),
+            "the shutdown must take ONE deadline before either join"
+        );
+        // `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` is private to `main.rs`, so it is
+        // read from source rather than imported: a scan that breaks when the
+        // literal moves is better than an import that cannot exist.
+        let main_rs = include_str!("main.rs");
+        let budget: u64 = main_rs
+            .split_once("const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = ")
+            .and_then(|(_, rest)| rest.split_once(";"))
+            .and_then(|(n, _)| n.trim().parse().ok())
+            .expect("main.rs must declare the lane shutdown flush budget");
+        assert!(
+            2 * OFFLOAD_SHUTDOWN_GRACE_SECS > budget,
+            "if two sequential graces ({} s) WOULD fit inside the lane budget ({budget} s) \
+             then this guard is pinning a constraint that no longer binds — re-derive it \
+             rather than deleting it, because the sharing is still what keeps main.rs's \
+             compile-time assert honest",
+            2 * OFFLOAD_SHUTDOWN_GRACE_SECS
+        );
+    }
     /// The depth tail must flush BEFORE the blocking offload join.
     ///
     /// `shutdown_offload_writer` blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS`
@@ -9397,7 +9898,7 @@ mod tests {
             .split_once("#[cfg(test)]")
             .map_or(source, |(prod, _)| prod);
         let join = production_half
-            .rfind("ingest.shutdown_offload_writer();")
+            .rfind("ingest.shutdown_offload_writer(offload_deadline);")
             .expect("the shutdown tail must join the offload writer");
         let depth = production_half
             .rfind("flush_depth(ingest.depth_sink());")
@@ -13321,9 +13822,13 @@ mod tests {
             "the rows left the drain's buffer on hand-off"
         );
 
-        // Shutdown order under test: close the queue, then wait. This is the
-        // step that makes the tail of a session durable rather than in-flight.
-        ingest.shutdown_offload_writer();
+        // Shutdown order under test, and it is the PRODUCTION order: close BOTH
+        // queues first, then wait against one shared deadline. Split that way
+        // on 2026-08-28 because closing inside each join meant the depth queue
+        // only closed after the tick join returned, so a wedged tick writer ate
+        // the whole deadline while depth had not even been told to finish.
+        ingest.close_offload_queues();
+        ingest.shutdown_offload_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
         assert!(
             !ingest.writer_is_offloaded(),
             "after shutdown the lane falls back to the synchronous arm, so a \
@@ -13346,10 +13851,10 @@ mod tests {
         // `shutdown_offload_writer` joins. It would hang forever if closing
         // the queue did not actually wake the writer's blocking `recv`, so
         // reaching the next line at all is the assertion.
-        ingest.shutdown_offload_writer();
+        ingest.shutdown_offload_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
 
         // Idempotent: a second call must not panic on an already-taken handle.
-        ingest.shutdown_offload_writer();
+        ingest.shutdown_offload_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
     }
 
     #[test]
@@ -13506,7 +14011,7 @@ mod tests {
              than losing the tail batch"
         );
         assert!(
-            production_half.contains("ingest.shutdown_offload_writer()"),
+            production_half.contains("ingest.shutdown_offload_writer(offload_deadline)"),
             "the drain must JOIN the writer thread after its tail flush — that \
              flush only HANDS OFF the last batch of the session, so without the \
              join the process can exit with it still in flight, losing exactly \

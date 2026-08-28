@@ -1098,8 +1098,40 @@ fn take_anchor() -> ReceiptAnchor {
 /// wall-clock syscall and an allocation, and both belong nowhere near the
 /// capture path.
 pub fn refresh_receipt_anchor() {
-    anchor_cell().store(std::sync::Arc::new(take_anchor()));
-    metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER).increment(1);
+    let cell = anchor_cell();
+    let old = cell.load();
+    let new = take_anchor();
+    // MONOTONIC RATCHET (2026-08-28, round-2 fix).
+    //
+    // Re-anchoring bounds the drift, and taken naively it also introduces a way
+    // to move time BACKWARDS: if CLOCK_REALTIME has slewed slower than
+    // CLOCK_MONOTONIC, or stepped back, the fresh anchor projects a LATER frame
+    // to an EARLIER receipt than the old anchor would have. Since `received_at`
+    // is the candle bucketing clock, that files a frame into a second that may
+    // already be sealed — and the whole reason to derive receipts from a
+    // monotonic instant rather than read the clock per frame is that a time
+    // step must not be able to reorder two frames. A refresh that can reorder
+    // them gives that property back with one hand.
+    //
+    // So the new anchor is adopted only when it does not rewind what the old
+    // one was already projecting. Refusing it costs one interval of drift
+    // correction; accepting it costs an out-of-order frame, and those are not
+    // the same size of mistake.
+    let projected_now = old.nanos.saturating_add(
+        i64::try_from(
+            new.instant
+                .saturating_duration_since(old.instant)
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX),
+    );
+    if new.nanos < projected_now {
+        metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "refused_backward")
+            .increment(1);
+        return;
+    }
+    cell.store(std::sync::Arc::new(new));
+    metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
 }
 
 /// The UTC-epoch-nanos receipt for a monotonic capture instant.
@@ -1224,6 +1256,33 @@ impl WalDirGuard {
 ///
 /// Contention only. A creation failure is `Ok(None)`, never `Err`.
 pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
+    // CREATE THE DIRECTORY FIRST (2026-08-28, round-2 fix).
+    //
+    // The claim moved ahead of `replay_all` earlier today, which was right —
+    // but `create_dir_all` stayed inside `WsFrameSpill::new_with_guard`, 145
+    // lines later. On any boot where the WAL directory does not yet exist
+    // (first deploy, a fresh volume, the post-recreate box) `OpenOptions::open`
+    // then returned `NotFound`, which lands in the degrade arm below and turns
+    // dual-writer protection OFF for the entire process — silently, and with a
+    // coded error blaming "an unwritable directory or a full disk" when the
+    // real cause is the ordinary first boot.
+    //
+    // Here rather than at the call site so EVERY caller is protected: a guard
+    // that depends on its caller remembering something is not a guard.
+    let created = std::fs::create_dir_all(wal_dir); // O(1) EXEMPT: one-shot boot claim, never the per-frame append
+    if let Err(e) = created {
+        metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            wal_dir = ?wal_dir,
+            error = %e,
+            "could not create the WAL directory, so one-writer-per-directory is NOT \
+             enforced for this process. Continuing anyway: the spill writer survives and \
+             recovers from an unwritable directory, and killing the feed over it would be \
+             the worse failure. While this persists, a second process would not be refused."
+        );
+        return Ok(None);
+    }
     let path = wal_dir.join(WAL_DIR_LOCK_FILE);
     // `create(true)` and deliberately NOT `create_new(true)`: the file survives
     // a clean shutdown and carries no state — the kernel lock IS the state — so
@@ -4907,5 +4966,59 @@ mod tests {
             "this runs at boot over three directories; an unbounded walk would turn a \
              safety net into a slow start"
         );
+    }
+
+    /// The refresh must never rewind the projected clock.
+    ///
+    /// Re-anchoring bounds NTP drift; done naively it also creates a way to
+    /// move receipts BACKWARDS, and `received_at` is the candle bucketing
+    /// clock — so a rewound receipt files a frame into a second that may
+    /// already be sealed. The whole reason receipts are derived from a
+    /// monotonic instant rather than read per frame is that a time step must
+    /// not be able to reorder two frames; a refresh that can reorder them
+    /// would hand that property straight back.
+    #[test]
+    fn a_refresh_never_moves_a_receipt_backwards() {
+        // Take a baseline, then read the same instant twice across a refresh.
+        // Whatever the wall clock did in between, the second reading may not be
+        // smaller than the first.
+        let probe = Instant::now();
+        let before = receipt_nanos_from(probe);
+        refresh_receipt_anchor();
+        let after = receipt_nanos_from(probe);
+        assert!(
+            after >= before,
+            "a refresh moved a fixed instant's receipt backwards: {before} -> {after}. \
+             That reorders frames across the refresh boundary, which is precisely what \
+             deriving receipts from a monotonic clock exists to prevent."
+        );
+    }
+
+    /// Two frames that arrived in order must read back in order, across any
+    /// number of refreshes.
+    #[test]
+    fn receipts_stay_ordered_across_repeated_refreshes() {
+        let first = Instant::now();
+        let first_receipt = receipt_nanos_from(first);
+        for _ in 0..5 {
+            refresh_receipt_anchor();
+        }
+        let second = Instant::now();
+        let second_receipt = receipt_nanos_from(second);
+        assert!(
+            second_receipt >= first_receipt,
+            "a later frame read back EARLIER than an earlier one across refreshes: \
+             {first_receipt} then {second_receipt}"
+        );
+    }
+
+    /// A receipt for an instant before the anchor flattens rather than going
+    /// negative — a panic here would cost the socket, and a negative timestamp
+    /// would be worse than a flattened one.
+    #[test]
+    fn an_instant_before_the_anchor_flattens_instead_of_panicking() {
+        let now = Instant::now();
+        let r = receipt_nanos_from(now);
+        assert!(r > 0, "a receipt must be a real epoch value, got {r}");
     }
 }

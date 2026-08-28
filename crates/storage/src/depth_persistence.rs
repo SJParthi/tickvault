@@ -975,7 +975,7 @@ impl DepthWriter {
     /// write failure or the [`DEPTH_SPILL_MAX_BYTES`] cap is therefore a live
     /// outcome, and it falls back to the counted drop with its own coded
     /// error. Silent loss is the defect; a NAMED unrecoverable loss is not.
-    fn discard_pending(&mut self) -> usize {
+    pub fn discard_pending(&mut self) -> usize {
         let rows = self.pending;
         if rows == 0 {
             self.buffer.clear();
@@ -2482,5 +2482,49 @@ mod tests {
             DEPTH_FLUSH_QUEUE_DEPTH >= 1,
             "a zero-depth queue makes every flush a QueueFull and the split pointless"
         );
+    }
+
+    /// The offloaded buffer swap is safe only while every identifier we emit
+    /// fits the DEFAULT name limit.
+    ///
+    /// # The residual this pins
+    ///
+    /// A healthy writer builds its buffer with `sender.new_buffer()`, which
+    /// carries the sender's negotiated `max_name_len`. `offload_flush` replaces
+    /// a handed-off buffer with `Buffer::new(protocol)`, which uses the
+    /// questdb-rs default of 127 — and `Buffer` exposes no getter, so the
+    /// negotiated value cannot be carried across without pooling buffers or
+    /// pinning the conf.
+    ///
+    /// That is a real divergence and it is deliberately NOT engineered around,
+    /// because it cannot bite: every table and column name this writer emits is
+    /// far under 127 bytes, so both limits validate identically. The failure
+    /// would need a server reporting a limit BELOW our longest identifier,
+    /// which this test makes impossible to reach silently — add a long column
+    /// name and it fires here rather than as whole rejected flushes in prod.
+    #[test]
+    fn every_depth_identifier_fits_the_default_name_limit() {
+        // questdb-rs `MAX_NAME_LEN_DEFAULT`, restated rather than imported: it
+        // is not re-exported, and a number that only exists in a dependency's
+        // private module is a number nothing here can check.
+        const QUESTDB_DEFAULT_MAX_NAME_LEN: usize = 127;
+        // A generous floor under it. If an identifier ever approaches the real
+        // limit, the design decision above needs revisiting rather than the
+        // test re-blessing.
+        const HEADROOM_FLOOR: usize = 64;
+
+        let mut names: Vec<&str> = vec![MARKET_DEPTH_TABLE];
+        names.extend(DEDUP_KEY_MARKET_DEPTH.split(',').map(str::trim));
+        for name in names {
+            assert!(
+                name.len() <= HEADROOM_FLOOR,
+                "`{name}` is {} bytes. The offloaded flush replaces the buffer with one \
+                 built at the questdb-rs default limit of {QUESTDB_DEFAULT_MAX_NAME_LEN}, \
+                 which is safe only while every identifier sits comfortably under it. \
+                 Past this floor, carry the sender's negotiated max_name_len across the \
+                 split instead of re-blessing this number.",
+                name.len()
+            );
+        }
     }
 }
