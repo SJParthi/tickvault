@@ -3188,7 +3188,29 @@ pub const SILENCE_DETECTOR_REFUSED_GAUGE: &str = "tv_dhan_feed_silence_detector_
 /// on the wire, plus the queue behind it, plus slack. Finite by requirement —
 /// `JoinHandle::join` has no timeout, and a writer wedged on a hung socket
 /// would otherwise hang a shutdown that the host's cost control depends on.
-pub const OFFLOAD_SHUTDOWN_GRACE_SECS: u64 = 30;
+///
+/// # Why 12 and not 30 (CORRECTED 2026-08-28)
+///
+/// This was 30 s, and 30 s was never available. `main` gives this whole lane
+/// task `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` (20 s) before it logs "did NOT
+/// finish" and exits the process. A 30 s wait nested inside a 20 s budget can
+/// only ever be cut short: on a slow QuestDB — the only condition under which
+/// a tail flush is worth anything — the outer timer fires first, the lane task
+/// is abandoned mid-join, and the writer thread dies with the process holding
+/// up to `FLUSH_QUEUE_DEPTH` queued batches plus the one in flight. No spill,
+/// no counter, no log line. Silent, and on the 17:30 stop it was every
+/// weekday the database was busy.
+///
+/// 12 s is chosen so the join can COMPLETE inside the budget rather than be
+/// truncated by it: it covers two full 5 s ILP round trips with slack, and
+/// leaves ~8 s of the 20 s for the rest of the tail (the close seal, the tick
+/// flush, the depth flush, the counter publish). A shorter-but-completing wait
+/// saves strictly more rows than a longer one that is always abandoned.
+///
+/// The relationship is asserted at compile time in `main.rs` — see
+/// `SHUTDOWN_GRACE_FITS_LANE_BUDGET`. Raising either constant without the
+/// other now fails the build instead of silently re-opening this hole.
+pub const OFFLOAD_SHUTDOWN_GRACE_SECS: u64 = 12;
 
 /// [`OFFLOAD_SHUTDOWN_GRACE_SECS`] as a `Duration`.
 pub const OFFLOAD_SHUTDOWN_GRACE: std::time::Duration =
