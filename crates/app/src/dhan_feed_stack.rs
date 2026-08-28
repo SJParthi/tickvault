@@ -3149,14 +3149,37 @@ const CATCHUP_SEAL_INTERVAL: std::time::Duration =
 
 /// How far BEHIND the watermark the catch-up cutoff sits.
 ///
-/// The watermark is the highest exchange timestamp across ALL instruments,
-/// and ticks arrive out of order between them — so sealing exactly at the
+/// The watermark is the highest FOLD-CLOCK second across ALL instruments, and
+/// ticks arrive out of order between them — so sealing exactly at the
 /// watermark would close a bucket whose own last ticks are still in flight,
 /// producing a truncated bar. That is strictly worse than the late bar this
 /// mechanism exists to fix, so the margin is not optional.
 ///
 /// 2s covers the observed inter-instrument reordering window with room to
 /// spare, at the cost of 2s of extra latency on every catch-up bar.
+///
+/// ⚠ CORRECTED 2026-08-28. This said "the highest EXCHANGE TIMESTAMP across
+/// all instruments". That stopped being true when the grid moved to the
+/// receipt clock the same day, and the identical sentence was fixed twenty
+/// lines from `catch_up_seal` while this copy was missed — two statements of
+/// one fact, one updated.
+///
+/// The distinction is not pedantry, and an adversarial audit ran aground on
+/// it the same day: it read the 2s margin against this repo's MEASURED
+/// delivery lag (p90 8.50s, p99 46.37s — `tf_index.rs`,
+/// `MAX_PLAUSIBLE_RECEIPT_LAG_SECS`) and concluded the margin was undersized
+/// by an order of magnitude. Those are the right numbers for the WRONG CLOCK.
+/// Delivery lag is exchange-stamp-to-receipt; this margin governs the spread
+/// between INSTRUMENTS on the RECEIPT clock, where every trusted tick is
+/// stamped at essentially "now" and the spread is sub-second.
+///
+/// So the margin is NOT changed here, and deliberately: changing a seal
+/// cutoff on a number measured against a different clock is how a latency fix
+/// becomes the truncated-bar bug this doc opens by warning about. What the
+/// audit was really seeing is the fallback branch — a stale-LTT snapshot
+/// whose fold clock snaps back MINUTES, which no seconds-scale margin
+/// reaches. That is a separate finding and needs its own measurement of the
+/// receipt-clock spread before anyone touches this constant.
 const CATCHUP_LATENESS_MARGIN_SECS: u32 = 2;
 
 /// How often the lane asks the gap detector what it has recorded.
