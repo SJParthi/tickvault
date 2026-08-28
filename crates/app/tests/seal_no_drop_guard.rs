@@ -466,3 +466,46 @@ fn the_escalation_spawn_is_idempotent_like_its_two_neighbours() {
         "self-test: an ignored set() must fail the scan"
     );
 }
+
+/// The cancel install is the FOURTH thing `spawn_seal_writer_loop` installs,
+/// and it was the one still ignoring its result — three days after the guard
+/// above was written about exactly this asymmetry.
+///
+/// `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` looks like a discarded unit. It
+/// is a discarded SENDER: `OnceLock::set` hands the value back in `Err`, so on
+/// a second entry the `let _` dropped the only sender for the `cancel_rx` that
+/// was about to be moved into the spawn. A seal-writer loop whose cancel
+/// channel is closed is the one shape that loop cannot survive — pre-fix it
+/// spun a core forever and drained nothing (see
+/// `seal_writer_loop::a_dropped_cancel_sender_ends_the_loop_instead_of_spinning`).
+///
+/// Compounding it: the spawn also overwrote `SEAL_WRITER_HANDLE`, so shutdown
+/// would join the new task and leave the REAL writer unsignalled — no final
+/// drain, and the session's closing candles die with the runtime.
+#[test]
+fn the_cancel_install_is_gated_like_its_three_neighbours() {
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    let code = squash(&main);
+    assert!(
+        code.contains("if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {"),
+        "the cancel install must be gated on set() succeeding — an ignored \
+         `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` drops the sender and spawns a loop \
+         that can never be cancelled"
+    );
+    assert!(
+        !code.contains("let _ = SEAL_WRITER_CANCEL.set("),
+        "the ignoring form must not come back"
+    );
+    assert!(
+        code.contains("drop(cancel_rx);"),
+        "the already-installed arm must drop the receiver and NOT spawn — a second loop \
+         sharing one runner's work is not the fallback, skipping is"
+    );
+
+    // Self-test: the scan can bite.
+    let ignored = squash("let _ = SEAL_WRITER_CANCEL.set(cancel_tx);");
+    assert!(
+        !ignored.contains("if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {"),
+        "self-test: an ignored set() must fail the scan"
+    );
+}
