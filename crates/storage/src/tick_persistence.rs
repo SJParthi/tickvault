@@ -834,22 +834,48 @@ fn spill_failed_ilp(
     // O(1) EXEMPT: end
 }
 
-/// Total bytes currently held in the spill directory.
+/// Total bytes of the spill directory, INCLUDING the quarantine subtree.
 ///
-/// Non-recursive and best-effort: an unreadable entry contributes 0 rather
-/// than aborting the sweep, because failing to measure the cap must not also
-/// fail the rescue the cap is protecting.
+/// # Why quarantine is counted (2026-08-28)
+///
+/// This was non-recursive, and `quarantine/` is a subdirectory — so files the
+/// replay set aside as permanently refused counted toward NOTHING: not this
+/// ceiling, and not any free-space check. They accumulated with no bound at
+/// all, on the same volume that filled completely on 2026-08-25 and
+/// WAL-suspended fifteen tables while every writer reported success.
+///
+/// Quarantined files are not junk. The quarantine docstring records that of
+/// 1,293 rows in one refused file, 1,292 were recoverable — a whole file is
+/// set aside because ONE row is malformed. So they are real ticks, they are
+/// never retried, and they were silently eating the disk.
+///
+/// Counting them is a deliberate trade and worth stating both ways. It means a
+/// large quarantine can consume the rescue ceiling and cause new spills to be
+/// refused — bounded, counted, loud tick loss. Not counting them means the
+/// quarantine consumes the VOLUME instead, which is unbounded and takes every
+/// table down with it. The 2026-08-25 incident is what that second option
+/// actually costs, so the first is the better failure.
+///
+/// Still best-effort: an unreadable entry contributes 0 rather than aborting
+/// the sweep, because failing to MEASURE the cap must not also fail the rescue
+/// the cap is protecting. Descent is exactly one level deep — the quarantine
+/// subtree is flat — so this cannot become an unbounded walk.
 fn spill_dir_bytes(dir: &Path) -> u64 {
     // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| e.metadata().ok())
-        .filter(std::fs::Metadata::is_file)
-        .map(|m| m.len())
-        .sum()
+    fn files_in(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    }
+    files_in(dir).saturating_add(files_in(
+        &dir.join(crate::tick_spill_replay::QUARANTINE_DIR),
+    ))
     // O(1) EXEMPT: end
 }
 
@@ -2896,6 +2922,58 @@ mod tests {
         );
         spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
         assert_eq!(spill_dir_bytes(&dir), 10, "exactly the bytes written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quarantined files count toward the spill ceiling.
+    ///
+    /// Before 2026-08-28 `spill_dir_bytes` was non-recursive and `quarantine/`
+    /// is a subdirectory, so files the replay set aside as permanently refused
+    /// counted toward NOTHING — not this ceiling and not any free-space check.
+    /// They grew without any bound at all, on the same volume that filled
+    /// completely on 2026-08-25 and WAL-suspended fifteen tables.
+    ///
+    /// They are not junk: a whole file is quarantined because ONE row is
+    /// malformed, and a recorded case had 1,292 good rows out of 1,293. So this
+    /// was real tick data silently consuming the disk.
+    #[test]
+    fn quarantined_bytes_count_toward_the_spill_ceiling() {
+        let dir = scratch_dir("quarantine-counts");
+        spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
+        assert_eq!(spill_dir_bytes(&dir), 10, "baseline: the live spill file");
+
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("quarantine dir");
+        std::fs::write(q.join("refused-0001.ilp"), b"abcdefghijklmno").expect("quarantined file");
+
+        assert_eq!(
+            spill_dir_bytes(&dir),
+            25,
+            "a quarantined file must count against the ceiling — uncounted, it \
+             grows without bound and consumes the volume instead, which is what \
+             took fifteen tables down on 2026-08-25"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The descent is exactly one level. A directory nested INSIDE quarantine is
+    /// not walked, so this can never become an unbounded filesystem sweep on a
+    /// path that runs before every rescue.
+    #[test]
+    fn the_spill_size_walk_descends_exactly_one_level() {
+        let dir = scratch_dir("quarantine-depth");
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        let deeper = q.join("nested");
+        std::fs::create_dir_all(&deeper).expect("nested dir");
+        std::fs::write(q.join("counted.ilp"), b"12345").expect("counted");
+        std::fs::write(deeper.join("ignored.ilp"), b"9999999999").expect("ignored");
+
+        assert_eq!(
+            spill_dir_bytes(&dir),
+            5,
+            "only the quarantine directory itself is walked; going deeper would \
+             make a pre-rescue sizing call an unbounded tree walk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

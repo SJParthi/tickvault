@@ -1637,3 +1637,108 @@ first removes both.
 `enable_alarm_actions` before `set_alarm_state` in either gate; drops
 `ok_actions` from the five alarms above as an alternative fix (it silences the
 real recovery too); or removes the guard pinning the order.
+
+### §2.3l — 2026-08-28: two counters that report permanent loss, one of them from inside the task whose death it reports
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "hwo will youa cheiev always O(1) alogn with nto even a signel ticks loss across the entire codebase and workspace even Especially cover all kinds of extreme permuations combiantions of excpeitons errors situations conditions bugs scenarios ideas etc etc etc inclduign out of box also dude okay?"
+
+> "esnire to fix and reosleve evrythgin entirley dude okay?"
+
+Given while an adversarial permutation sweep of the aggregator and seal path was
+running. Both findings below came out of that sweep and neither was known when
+the session started. This dated row is the rule-file edit §3 requires before any
+new Dhan-scoped page, recorded BEFORE the terraform.
+
+#### Finding 1 — the seal-writer death signal is published from inside the dead task
+
+`tv_dhan_feed_seals_rescued_total` has **zero occurrences anywhere under
+`deploy/`**: not EMF-selected, not charted, not alarmed. It is the counter that
+increments when a seal cannot be handed to the seal writer and is escalated to
+disk instead — which is precisely what happens when that writer is dead or its
+channel is saturated.
+
+What *is* alarmed is `tv_seal_writer_drain_total{kind="dropped"}`
+(`seal-drop-alarm.tf`). That counter is incremented **inside the seal writer's
+own drain loop**. So if the loop exits, the alarm's input stops moving and the
+alarm reads a flat, healthy zero — the failure silences its own detector. A
+whole session running on disk-spill instead of the writer is invisible.
+
+A panic is loud (`panic = "abort"`), so the dangerous case is the quiet one: a
+clean exit of the task, or a persistently full channel. Neither aborts, and
+neither moves the alarmed counter.
+
+#### Finding 2 — slot exhaustion is permanent, latched, and unalarmed
+
+`AGGREGATOR_MAX_SLOTS` is 25,000 against an authorized universe of ~24,600, and
+slots are **never released** — a workspace scan for `remove` / `swap_remove` /
+`release` / `reclaim` across the aggregator returns zero. The per-minute ATM
+re-fit is additive by design, so the count only climbs through the session.
+
+Past the cap, `slot_index` returns `None` and that instrument **derives no
+candles for the process lifetime**. Ticks are still persisted — only the candle
+is lost — so nothing else reports it.
+
+Detection today is one latched log line (`exhausted_logged` means only the FIRST
+instrument ever logs, so instruments 2..N are silent) plus
+`tv_aggregator_slot_exhausted_total`, which is EMF-selected and on the dashboard
+but in **no alarm**. There is also no gauge of slots-in-use, so the approach to
+the cap is unobservable: an operator can see the crash after it happened, on a
+chart, and never see it coming.
+
+#### What this authorizes — family (5) gains a SIXTEENTH and SEVENTEENTH signal
+
+| Alarm | Metric | Fires when | Why it is not noise |
+|---|---|---|---|
+| `tv-<env>-seal-writer-rescued` | `tv_dhan_feed_seals_rescued_total` | `Sum >= 1` in a period | A seal that could not reach the writer went to disk. On a healthy lane this is exactly zero; non-zero means the writer is dead, saturated, or the disk tier is carrying the session. |
+| `tv-<env>-aggregator-slots-exhausted` | `tv_aggregator_slot_exhausted_total` | `Sum >= 1` in a period | An instrument was permanently refused a candle slot. Zero on a healthy lane by construction — the cap is above the authorized universe, so any non-zero means the universe outgrew it. |
+
+Both `treat_missing_data = notBreaching` and ungated: the box is stopped
+overnight so no-data is the normal off-hours state, and each reports a DEFECT
+rather than silence. The dark-lane case is already owned by
+`dhan-no-ticks-flowing` (§2.3b-i). Neither takes `ok_actions` — a counter aging
+out of its window is not a repair, and in both cases the loss already happened.
+
+**Threshold 1, not a rate.** Both are zero-on-a-healthy-lane by construction,
+so there is no baseline to calibrate against and any non-zero reading is the
+event itself. A rate threshold here would be a number invented and then
+presented as a measurement.
+
+#### Honest cost
+
+`tv_aggregator_slot_exhausted_total` is already EMF-selected, so it is +1 alarm
+≈ $0.10/mo. `tv_dhan_feed_seals_rescued_total` is +1 EMF name ≈ $0.30 and +1
+alarm ≈ $0.10. **~$0.50/mo total.**
+
+§2.3k put a maximal month at ~$120.68 and the depth-discriminator change earlier
+today took it to ~$122.38; this takes it to **~$122.88** against the automatic
+`STOP_EC2_INSTANCES` line at **$117.00**. The live account is far below it
+(August MTD $48.87, forecast $61.51, measured 2026-08-25), so nothing fires
+today, but the maximal-month arithmetic is now ~$5.88 past that line and widens
+with each addition. Unchanged levers, neither taken here: the already-approved
+Quote 10 Elastic IP release (−$3.60/mo), or an operator decision on
+`limit_amount`.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on slot exhaustion does not create slots, and an alarm on rescued seals
+does not restart the writer. Neither changes the ~400 slots of headroom, and
+neither adds the slots-in-use gauge that would let an operator see the cap
+approaching rather than being told it was crossed. Both convert a permanent loss
+visible only on a chart into one that reaches the operator — that is the entire
+claim.
+
+The seal writer still has **no respawn**. This makes its death detectable; it
+does not make it survivable.
+
+#### What a PR that violates §2.3l looks like (REJECT)
+
+- Alarms either counter on a RATE rather than `>= 1` — both are zero on a
+  healthy lane, so a rate threshold invents a baseline that does not exist.
+- Gives either `ok_actions` (the loss already happened; a counter aging out is
+  not a repair).
+- Makes either `breaching` on missing data (pages every night and weekend).
+- Adds a per-INSTRUMENT dimension to either (the §2.3 cardinality rule stands).
+- Claims the seal writer is now resilient — it is detectable, not respawned.

@@ -1083,8 +1083,19 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // limit_amount.
     assert_eq!(
         names.len(),
-        95,
-        "Z+ L2 VERIFY ratchet: expected exactly 95 names in the MAIN EMF \
+        98,
+        "Z+ L2 VERIFY ratchet: expected exactly 98 names in the MAIN EMF \
+         (2026-08-28 SIXTH: 96 -> 98, tv_tick_spill_replay_quarantined_total \
+         + tv_wal_catchup_budget_exhausted_total. Both reported PERMANENT or \
+         soon-permanent tick loss and both reached zero operator surfaces; \
+         the quarantine one also counted toward no size ceiling, so it grew \
+         unbounded on the volume that filled on 2026-08-25. +$0.60/mo, \
+         maximal month ~$122.68 -> ~$123.28 (+2 alarms $0.20 = ~$123.48). \
+         (2026-08-28 FIFTH: 95 -> 96, tv_dhan_feed_seals_rescued_total -- the \
+         alarm that was supposed to cover seal-writer death publishes from \
+         INSIDE the writer loop, so a dead writer reads a healthy zero; this \
+         counter is incremented by the still-running producer instead. \
+         +$0.30/mo, maximal month ~$122.38 -> ~$122.68. \
          (2026-08-28 FOURTH: 93 -> 95, the two depth loss discriminators -- \
          see the block above: without them tv_depth_rows_dropped_total cannot \
          be read as either survivable or permanent. \

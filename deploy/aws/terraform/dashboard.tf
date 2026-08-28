@@ -891,7 +891,25 @@ resource "aws_cloudwatch_dashboard" "operator" {
             # there is data to threshold against.
             [local.dash_namespace, "tv_candle_tick_discarded_late_total", { label = "candle cells that lost a late tick", stat = "Sum" }],
             [local.dash_namespace, "tv_aggregator_slot_exhausted_total", { label = "instruments refused a candle slot", stat = "Sum" }],
-            [local.dash_namespace, "tv_dhan_feed_abandoned_bytes_total", { label = "undecodable frame bytes abandoned", stat = "Sum" }]
+            [local.dash_namespace, "tv_dhan_feed_abandoned_bytes_total", { label = "undecodable frame bytes abandoned", stat = "Sum" }],
+            # The two DEPTH loss discriminators, added 2026-08-28.
+            #
+            # tv_depth_rows_dropped_total is shipped AND alarmed, and it
+            # increments on BOTH branches of discard_pending: once when the
+            # buffer was successfully RESCUED to the spill file, once when the
+            # rescue FAILED and the rows are permanently gone. Same series,
+            # same alarm, opposite meanings.
+            #
+            # These two are what let that page be read. "Spilled" is the
+            # survivable half; permanent depth loss is dropped minus spilled,
+            # exactly the subtraction the tick side already supports. The
+            # write-errors line is the rescue tier itself failing, which is
+            # the one that is never recoverable.
+            #
+            # Neither is alarmed on its own: the existing loss alarm is the
+            # pager, and a second alarm for the same event pages twice.
+            [local.dash_namespace, "tv_depth_rows_spilled_total", { label = "depth rows rescued to disk (survivable)", stat = "Sum" }],
+            [local.dash_namespace, "tv_depth_spill_write_errors_total", { label = "depth rescue FAILED (permanent loss)", stat = "Sum" }]
           ]
           period = 300
         }
