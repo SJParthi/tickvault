@@ -5356,7 +5356,7 @@ pub struct DhanFeedStackParams {
     /// recovered frame can never race a live one.
     ///
     /// Empty on a clean boot, which is the overwhelmingly common case.
-    pub wal_replay_live_feed: Vec<(u64, bytes::Bytes)>,
+    pub wal_replay_live_feed: Vec<(u64, i64, bytes::Bytes)>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -7292,7 +7292,7 @@ pub struct WalRefoldOutcome {
 /// The gate-disabled path in `spawn_dhan_feed_stack` deliberately does NOT call
 /// this: `main.rs` reads the identical gate and has already logged the drop
 /// itself, so reporting again would double-count the same frames.
-pub fn report_unfolded_wal_frames(frames: &[(u64, bytes::Bytes)], refusal: &str) {
+pub fn report_unfolded_wal_frames(frames: &[(u64, i64, bytes::Bytes)], refusal: &str) {
     if frames.is_empty() {
         return;
     }
@@ -7343,7 +7343,7 @@ pub fn report_unfolded_wal_frames(frames: &[(u64, bytes::Bytes)], refusal: &str)
 /// recovery of every other frame beside it.
 pub fn refold_wal_frames(
     ingest: &mut LiveIngest,
-    frames: &[(u64, bytes::Bytes)],
+    frames: &[(u64, i64, bytes::Bytes)],
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
 
@@ -7375,12 +7375,75 @@ pub fn refold_wal_frames(
     // `recv_millis` keeps wall-clock "now" deliberately: it feeds the
     // delivery-lag reading, where a replayed frame's lag is meaningless
     // either way, and it is NOT an input to bucketing.
-    let received_at_nanos = tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS;
+    // CORRECTED AGAIN 2026-08-28, hours after the block above.
+    //
+    // That correction replaced `Utc::now()` with the UNKNOWN sentinel and
+    // justified it: "the receipt instant died with the process." **It did not
+    // die.** The same day's `TVW3` record format added an 8-byte
+    // `received_at_nanos` to every WAL record for exactly this purpose, and
+    // `ReplayedFrame::received_at_nanos` carries it here with a doc that says
+    // in as many words: "A replay consumer MUST prefer this over a fresh clock
+    // read." Nothing read it. The field had ZERO consumers in the workspace --
+    // written to disk on every frame, then discarded at its only reader.
+    //
+    // The cost was not a wasted field. `row_timestamp_ist_nanos` DERIVES a
+    // never-traded tick's `ts` from the receipt, and `ts` is the first column
+    // of the `ticks` DEDUP key. So live wrote `ts = receipt`, replay wrote
+    // `ts = the sentinel LTT`, and the same observation became TWO rows in
+    // different partitions instead of collapsing -- across the ~950k
+    // sentinel-LTT rows a session carries, compounding on every replay.
+    //
+    // Threading the persisted receipt makes replay reproduce the live
+    // bucketing exactly, which is the only definition of a correct replay.
+    // v1/v2 records still carry `WAL_RECEIPT_UNKNOWN_NANOS`, because for those
+    // the receipt genuinely never existed -- so the sentinel's fallback is
+    // right for them and wrong for everything written since.
     let recv_millis =
         u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000)
             .unwrap_or(0);
 
-    for (frame_seq, bytes) in frames {
+    // Seed the aggregator's event-time watermark to the START OF TODAY (IST)
+    // before a single recovered frame is folded.
+    //
+    // `replay_all` globs every unconfirmed `*.wal` segment with NO day
+    // scoping, so a segment left behind at yesterday's shutdown -- the NORMAL
+    // outcome whenever the replay budget defers segments, measured live as 13
+    // deferred on 2026-08-28 -- arrives here the next morning against a fresh
+    // aggregator whose watermark is 0.
+    //
+    // `consume_tick` ADVANCES the watermark before it checks the
+    // stale-trading-day gate. Without this seed the first prior-day frame
+    // therefore sets the very value it is compared against, passes, and folds
+    // into a bucket on a day that closed hours ago. That bar is rebuilt from
+    // ONLY the deferred subset, and `candles_*` dedups on
+    // `(ts, security_id, segment, feed)` with no completeness column
+    // (`shadow_persistence::DEDUP_KEY_CANDLES`) -- so the PARTIAL bar UPSERTS
+    // over the COMPLETE one the previous session wrote. Silent corruption of a
+    // closed day's tape, on the one path whose entire purpose is not to lose
+    // data.
+    //
+    // Seeding refuses those frames as `stale_trading_day`, which is a
+    // CANDLE-ONLY refusal (`refused_candle_only` below): the row still reaches
+    // `ticks` and only the bogus bar is skipped. Same-day frames -- the
+    // ordinary crash-restart case, and the one this path is used for daily --
+    // are unaffected, because their day index equals the seed's.
+    //
+    // Fail-safe direction, stated rather than assumed: if the host clock reads
+    // a FUTURE day this refuses today's genuine replay bars while still
+    // writing every row. We would lose recovered candles, never rows, and
+    // never overwrite a good bar. Trusting the frame instead is the corruption
+    // above, so the default is the survivable one.
+    //
+    // O(1): two arithmetic ops and one `max` store, independent of frame count.
+    let ist_now_secs = chrono::Utc::now().timestamp().saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    let ist_day_start_secs = u32::try_from(ist_now_secs.max(0) / 86_400 * 86_400).unwrap_or(0);
+    ingest
+        .aggregator
+        .seed_watermark_at_least(ist_day_start_secs);
+
+    for (frame_seq, wal_received_at_nanos, bytes) in frames {
         let mut offset = 0usize;
         let mut packets = 0u32;
         while offset < bytes.len() {
@@ -7396,7 +7459,7 @@ pub fn refold_wal_frames(
                 break;
             }
             if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) =
-                dispatch_frame(&bytes[offset..end], received_at_nanos)
+                dispatch_frame(&bytes[offset..end], *wal_received_at_nanos)
             {
                 // Deliberately NOT calling `record_ws_lag`: a replayed frame
                 // has no meaningful delivery latency, and feeding "now minus
@@ -13732,9 +13795,61 @@ mod tests {
 mod wal_refold_tests {
     use super::*;
     use tickvault_common::feed::Feed;
+    use tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS;
 
     fn ingest() -> LiveIngest {
         LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+    }
+
+    #[test]
+    /// The boot replay MUST seed the aggregator watermark before it folds a
+    /// single recovered frame.
+    ///
+    /// The behavioural proof lives in `multi_tf_aggregator` (an unseeded
+    /// prior-day frame folds, a seeded one is refused). What that test cannot
+    /// see is whether this lane actually CALLS the seed -- and without the
+    /// call the fix is inert while every test still passes. So this pins the
+    /// call site, its position (before the fold loop, not after), and that it
+    /// is derived from the clock rather than a literal.
+    #[test]
+    fn the_boot_refold_seeds_the_watermark_before_it_folds_anything() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .expect("refold_wal_frames must exist");
+        // Comment-stripped, so the long rationale block above the call cannot
+        // satisfy this by mentioning the symbol in prose.
+        let code: String = body
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let seed_at = code.find("seed_watermark_at_least(").expect(
+            "boot replay must seed the watermark -- without it a \
+                    prior-day segment folds into a closed day and its partial \
+                    bar upserts over the complete one",
+        );
+        let fold_at = code
+            .find("ingest_tick_at(")
+            .expect("refold must fold ticks");
+        assert!(
+            seed_at < fold_at,
+            "the seed must run BEFORE the first fold; seeding afterwards \
+             leaves every replayed frame judged against a watermark of 0"
+        );
+        assert!(
+            code.contains("IST_UTC_OFFSET_SECONDS"),
+            "the seed must be derived from the clock in IST, not a literal -- \
+             a hardcoded day would be wrong on every other day"
+        );
+        assert!(
+            code.contains("86_400"),
+            "and must be floored to the IST DAY start: the stale-day gate \
+             compares day indices, so seeding mid-day would refuse this \
+             morning's own frames"
+        );
     }
 
     #[test]
@@ -13748,7 +13863,11 @@ mod wal_refold_tests {
         // A frame whose first byte is not a known packet code. The batch must
         // survive it — one corrupt frame must never cost the recovery of the
         // frames beside it — but it must NOT vanish silently either.
-        let frames = vec![(1u64, bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]))];
+        let frames = vec![(
+            1u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]),
+        )];
         let out = refold_wal_frames(&mut ingest(), &frames);
         assert_eq!(out.refolded, 0, "garbage must not produce ticks");
         assert_eq!(
@@ -13762,7 +13881,11 @@ mod wal_refold_tests {
         // Claims a ticker packet but carries fewer bytes than one. The walker
         // must stop at the boundary rather than reading past it or
         // resynchronising on a guess, which would fabricate ticks.
-        let frames = vec![(7u64, bytes::Bytes::from_static(&[2, 0, 0, 0]))];
+        let frames = vec![(
+            7u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            bytes::Bytes::from_static(&[2, 0, 0, 0]),
+        )];
         let out = refold_wal_frames(&mut ingest(), &frames);
         assert_eq!(out.refolded, 0);
         assert!(out.unparseable >= 1, "a truncated packet must be counted");
@@ -15351,6 +15474,7 @@ mod frame_walk_accounting_tests {
 #[cfg(test)]
 mod late_seed_tests {
     use super::*;
+    use tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS;
 
     /// The drain must accept a seed batch and make those instruments visible
     /// to the silence detector.
@@ -15441,7 +15565,11 @@ mod late_seed_tests {
         // The refusal string is the whole diagnostic value of the line: it is
         // what separates "the pool could not be planned" from "authentication
         // did not finish", which need different responses from the operator.
-        let frames = vec![(1u64, bytes::Bytes::from_static(&[8, 0, 0, 0]))];
+        let frames = vec![(
+            1u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            bytes::Bytes::from_static(&[8, 0, 0, 0]),
+        )];
         report_unfolded_wal_frames(&frames, "token_manager_missing");
         let src = include_str!("dhan_feed_stack.rs");
         let body = src

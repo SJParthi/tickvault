@@ -1068,6 +1068,21 @@ const ARCHIVE_SUBDIR: &str = "archive";
 /// budget converts an unbounded allocation into a bounded one whose remainder
 /// is picked up by machinery that already exists and is already tested.
 ///
+/// **CORRECTED 2026-08-28.** That paragraph was true of the segments it was
+/// written about — live `*.wal` files — and FALSE for the other source
+/// `replay_all` globs. A leftover already inside `replaying/` from a crashed
+/// prior boot is NOT "left as `*.wal` in the live dir": it stays in the
+/// staging area, and `confirm_replayed` archives everything it finds there,
+/// read or not. So for that class a budget deferral did NOT defer, it
+/// DELETED — silently, with no counter and no error.
+///
+/// The claim is now true again because the code makes it true: deferred
+/// leftovers are RESTORED to the live dir before this function returns, so
+/// "unconsumed ⇒ still a live `*.wal`" holds for both sources. Recorded rather
+/// than quietly reworded, because the sentence being corrected was a
+/// SAFETY ARGUMENT — it is what a reader consults instead of tracing the
+/// archive path, and it argued the hazard out of existence.
+///
 /// # Honest cost
 ///
 /// Frames past the budget are recovered on a LATER boot rather than this one,
@@ -1082,6 +1097,15 @@ pub const WAL_REPLAY_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 /// Counter: segments `replay_all` deferred to the next boot for the budget.
 pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_total";
+
+/// Counter: DEFERRED segments `replay_all` could not restore out of the replay
+/// staging area back to the live directory.
+///
+/// Non-zero means captured frames are sitting where the confirm step archives
+/// them unread -- the single path by which WAL recovery can lose data. It is
+/// incremented unconditionally (by zero on a clean boot) so the series exists
+/// before the first real occurrence.
+pub const WAL_REPLAY_RESTORE_FAILED_COUNTER: &str = "tv_wal_replay_restore_failed_total";
 
 // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
@@ -1152,6 +1176,75 @@ pub fn replay_all_with_budget<P: AsRef<Path>>(
         }
         consumed += 1;
     }
+    // RESTORE any DEFERRED segment that came from `replaying/` back to the
+    // live dir, BEFORE anything else can observe the deferral.
+    //
+    // This closes a silent, permanent tick-loss path found by an adversarial
+    // sweep on 2026-08-28 and verified in source:
+    //
+    //   1. A boot stages segments L1..L5 into `replaying/` and crashes before
+    //      `confirm_replayed`. Correct so far -- that is the crash-safety
+    //      design working.
+    //   2. The next boot re-globs `replaying/` (L1..L5) plus this crash's
+    //      fresh `*.wal` files. Leftovers sort FIRST (smaller nanos), so the
+    //      budget can run out INSIDE them -- say after L3.
+    //   3. Staging below moves only `take(consumed)`, so L4 and L5 are never
+    //      touched. They are still sitting in `replaying/`.
+    //   4. The refold succeeds, so the caller calls `confirm_replayed`, which
+    //      globs ALL of `replaying/` and archives every file it finds --
+    //      including L4 and L5, which THIS BOOT NEVER READ.
+    //
+    // An archived segment is never re-globbed. Those frames are gone: captured
+    // to disk, then deleted from the recovery path without ever reaching the
+    // database, with no counter and no error. That is precisely the class the
+    // whole capture-at-receipt chain exists to make impossible.
+    //
+    // The staging comment below already states the invariant that was being
+    // broken -- "an archived segment is NEVER re-globbed, so its frames would
+    // be lost for good. This slice is the whole safety of the budget above."
+    // It is correct about the slice it controls and blind to the leftovers it
+    // does not, because `confirm_replayed` archives by GLOB, not by that slice.
+    //
+    // Restoring is the minimal repair that keeps `confirm_replayed`'s glob
+    // correct BY CONSTRUCTION: after this loop, `replaying/` contains only
+    // segments this boot actually read, which is exactly what that function
+    // assumes. It needs no signature change and no manifest file.
+    //
+    // A failed restore is LOUD, never silent: the segment stays in
+    // `replaying/` and would be archived unread, so it is the one residual
+    // and it gets a coded error plus a counter rather than a shrug. Both
+    // renames are within one filesystem between sibling directories, so a
+    // failure here means the staging renames below are failing too.
+    let mut restore_failures = 0usize;
+    for path in segments.iter().skip(consumed) {
+        if path.parent() != Some(replaying_dir.as_path()) {
+            continue; // never staged; a live `*.wal` is already re-globbable
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        // O(1) EXEMPT: boot replay restore, cold path, bounded by deferred count
+        if let Err(err) = std::fs::rename(path, wal_dir.join(name)) {
+            restore_failures = restore_failures.saturating_add(1);
+            error!(
+                code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                segment = ?path,
+                error = %err,
+                "WAL replay could not restore a DEFERRED staged segment to the \
+                 live directory. It is still in the replay staging area, where \
+                 the confirm step archives everything it finds -- so these \
+                 captured frames may be archived without ever being replayed. \
+                 This is the one path by which recovery can lose data."
+            );
+        }
+    }
+    // Unconditional so the series exists from the first clean boot: the
+    // CloudWatch agent drops each counter series' first sample as its delta
+    // baseline, and a restore failure is a rare once-ever event where the
+    // first occurrence is the only one you get.
+    // APPROVED: cast -- restore_failures is O(segments) <= u64 always.
+    metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(restore_failures as u64);
+
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {
         metrics::counter!(WAL_REPLAY_DEFERRED_COUNTER).increment(deferred as u64);
@@ -2241,6 +2334,94 @@ mod tests {
             !rest.is_empty(),
             "the deferred frames must be recoverable on a later boot"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The silent, permanent tick-loss path an adversarial sweep found on
+    /// 2026-08-28, reproduced end to end.
+    ///
+    /// The sequence needs THREE things to line up, which is why nothing caught
+    /// it: a boot must stage segments and crash before confirming, the next
+    /// boot must hit its RAM budget INSIDE those leftovers, and the refold
+    /// must then succeed so the caller confirms. Each step is individually
+    /// correct; together they archive segments that were never read, and
+    /// archived segments are never re-globbed.
+    ///
+    /// The assertion that actually bites is the last one: the frames must
+    /// still be recoverable. Without the restore loop the deferred leftovers
+    /// stay in `replaying/`, `confirm_replayed` archives all three, and this
+    /// recovers NOTHING -- captured to disk, then deleted from the recovery
+    /// path with no counter and no error.
+    #[test]
+    fn a_budget_deferral_inside_staged_leftovers_never_archives_them_unread() {
+        let dir = tmp_dir("replay-defer-leftovers");
+        let replaying = dir.join(REPLAYING_SUBDIR);
+
+        // Three segments, each with a distinct payload so recovery is provable
+        // by content and not merely by count.
+        for byte in [1u8, 2u8, 3u8] {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![byte; 64]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let total = wal_segments_in(&dir).len();
+        assert!(
+            total >= 3,
+            "fixture must produce >= 3 segments, found {total}"
+        );
+
+        // --- boot A: consumes everything, stages it, then CRASHES ----------
+        // (no `confirm_replayed` -- that is the crash.)
+        let a = replay_all_with_budget(&dir, usize::MAX).expect("boot A replay");
+        assert_eq!(a.len(), total, "boot A must read every segment");
+        assert_eq!(
+            wal_segments_in(&replaying).len(),
+            total,
+            "boot A must stage every consumed segment"
+        );
+        assert!(
+            wal_segments_in(&dir).is_empty(),
+            "and leave nothing in the live dir"
+        );
+
+        // --- boot B: budget runs out INSIDE the staged leftovers -----------
+        let b = replay_all_with_budget(&dir, 1).expect("boot B replay");
+        assert!(
+            !b.is_empty(),
+            "forward progress: one segment is always read"
+        );
+        assert_eq!(
+            wal_segments_in(&replaying).len(),
+            1,
+            "only the segment boot B actually READ may remain staged -- \
+             confirm_replayed archives `replaying/` by glob, so anything else \
+             left there is archived without ever being replayed"
+        );
+        assert_eq!(
+            wal_segments_in(&dir).len(),
+            total - 1,
+            "every deferred leftover must be restored to the live dir, where \
+             the next boot re-globs it"
+        );
+
+        // --- the refold succeeded, so the caller confirms ------------------
+        confirm_replayed(&dir);
+        assert!(
+            wal_segments_in(&replaying).is_empty(),
+            "confirm archives what was read"
+        );
+
+        // --- boot C: the deferred frames must still be there ---------------
+        let c = replay_all_with_budget(&dir, usize::MAX).expect("boot C replay");
+        assert_eq!(
+            c.len(),
+            total - b.len(),
+            "every frame boot B deferred must still be recoverable -- if this \
+             is 0, the confirm step deleted captured ticks from the recovery \
+             path and they are gone for good"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
