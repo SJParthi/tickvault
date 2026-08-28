@@ -1685,10 +1685,20 @@ impl LiveIngest {
         // old trade time, carrying live open interest and bid/ask. Discarding
         // it would lose the ability to tell "did not trade today" from "did
         // not capture", which is the same false-OK the 2026-08-20 fix removed.
+        // `out_of_band_timestamp` joins the candle-only set on 2026-08-28, and
+        // it is the largest of them: 2,008,916 ticks in one measured session,
+        // 2.41% of every tick decoded, previously HARD-refused with no row at
+        // all. See the arm in `multi_tf_aggregator` for why the row is safe —
+        // in one line, `row_timestamp_ist_nanos` already falls back to the
+        // receipt for an out-of-band LTT and always has, so these rows were
+        // being thrown away by the fold before reaching a writer built to
+        // take them. It is candle-only and not a full acceptance because an
+        // out-of-band second still cannot be placed in a bucket.
         let candle_only_refusal = (stats.out_of_session
             || stats.untraded_sentinel
             || stats.stale_trading_day
-            || stats.untraded_timestamp)
+            || stats.untraded_timestamp
+            || stats.out_of_band_timestamp)
             && !hard_refusal;
 
         if hard_refusal {
@@ -7297,14 +7307,38 @@ pub fn refold_wal_frames(
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
 
-    // Recovered frames are historical: their exchange timestamps are whatever
-    // the exchange stamped, and the receipt instant is gone with the dead
-    // process. Using "now" is deliberate and only affects the delivery-lag
-    // reading, which is meaningless for a replayed frame — the tick's own
-    // exchange timestamp, which decides the candle bucket, is read from the
-    // packet exactly as on the live path.
-    let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let recv_millis = u64::try_from(received_at_nanos.max(0) / 1_000_000).unwrap_or(0);
+    // CORRECTED 2026-08-28. This block used `Utc::now()` for BOTH values, and
+    // justified it with: "the tick's own exchange timestamp, which decides the
+    // candle bucket, is read from the packet exactly as on the live path."
+    //
+    // That sentence was true when written and became FALSE the same day, when
+    // bucketing moved to `fold_clock_ist_secs`. The failure it opened is a
+    // CLIFF, not a gradient, and it is worst exactly when it matters most:
+    //
+    //   * a crash-restart replaying frames LESS than
+    //     `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) old passes the delta guard,
+    //     so those frames bucket on REPLAY TIME — shifted forward by up to
+    //     five minutes into bars they were never part of;
+    //   * frames older than that fall back and land correctly.
+    //
+    // So the fastest, most successful restarts — the ones that recover within
+    // five minutes — are the ones that mis-file their recovered ticks, and
+    // nothing counts which side of the cliff a replayed tick landed on.
+    //
+    // The fix is to say what is true: the receipt instant died with the
+    // process. `WAL_RECEIPT_UNKNOWN_NANOS` is the sentinel the fold clock
+    // already reads as "no receipt", so every replayed frame falls back to its
+    // exchange stamp unconditionally and lands in the bar it originally
+    // belonged to. That is the behaviour the old comment described; it is now
+    // the behaviour the code has.
+    //
+    // `recv_millis` keeps wall-clock "now" deliberately: it feeds the
+    // delivery-lag reading, where a replayed frame's lag is meaningless
+    // either way, and it is NOT an input to bucketing.
+    let received_at_nanos = tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS;
+    let recv_millis =
+        u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000)
+            .unwrap_or(0);
 
     for (frame_seq, bytes) in frames {
         let mut offset = 0usize;

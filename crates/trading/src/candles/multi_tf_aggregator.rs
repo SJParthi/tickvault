@@ -207,6 +207,22 @@ pub struct ConsumeStats {
     /// partition.
     pub untraded_timestamp: bool,
     /// `true` when `exchange_timestamp` fell outside
+    /// `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]`
+    /// **but a real receipt time is available**, so the writer can stamp the
+    /// row safely.
+    ///
+    /// Added 2026-08-28 after the live box hard-refused **2,008,916 ticks in
+    /// one session (2.41% of every tick decoded)** on this shape, writing NO
+    /// ROW at all. The third instance of the same class, after the price
+    /// sentinel (2026-08-20) and the zero-timestamp sentinel (2026-08-26).
+    ///
+    /// CANDLE-only, like both of those: the second cannot be bucketed, but
+    /// `tick_persistence::row_timestamp_ist_nanos` already falls back to the
+    /// receipt for any out-of-band value, so the row lands in TODAY's
+    /// partition. Without a receipt the tick stays a HARD refusal
+    /// ([`Self::refused_timestamp`]) — no safe stamp exists there.
+    pub out_of_band_timestamp: bool,
+    /// `true` when `exchange_timestamp` fell outside
     /// `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]`.
     /// Nothing was folded and the watermark was NOT advanced.
     pub refused_timestamp: bool,
@@ -267,6 +283,7 @@ impl ConsumeStats {
             && !self.untraded_sentinel
             && !self.stale_trading_day
             && !self.untraded_timestamp
+            && !self.out_of_band_timestamp
     }
 }
 
@@ -633,6 +650,56 @@ impl MultiTfAggregator {
         if tick.exchange_timestamp < MIN_PLAUSIBLE_EXCHANGE_TS_SECS
             || tick.exchange_timestamp > MAX_PLAUSIBLE_EXCHANGE_TS_SECS
         {
+            // MEASURED 2026-08-28 on the production box: this arm hard-refused
+            // **2,008,916 ticks in one session — 2.41% of all 83,446,729
+            // decoded** — and a hard refusal writes NO ROW AT ALL. Not a
+            // missing candle: no record the instrument was even seen.
+            //
+            // THIS IS THE THIRD TIME THIS EXACT SHAPE HAS BEEN FOUND, and the
+            // repetition is the point:
+            //
+            //   2026-08-20  price sentinel `0.0`      ~22,000 ticks/session
+            //   2026-08-26  timestamp sentinel `0`     825,783 ticks/session
+            //   2026-08-28  out-of-band timestamp    2,008,916 ticks/session
+            //
+            // Each time the reasoning was identical and is repeated verbatim
+            // here: a tick whose TIMESTAMP we cannot trust is not a tick whose
+            // CONTENTS are corrupt. It carries a real last-traded price, real
+            // open interest, real bid/ask. Discarding the row loses the ability
+            // to tell "did not trade" from "did not capture" — and each fix
+            // was silently defeated by a check that ran EARLIER and refused
+            // harder.
+            //
+            // WHY THE ROW IS SAFE, by construction rather than by assertion:
+            // `tick_persistence::row_timestamp_ist_nanos` ALREADY substitutes
+            // the receipt time for an out-of-band LTT, and says so in its own
+            // words — "Out of band falls back to the receipt time, exactly as
+            // below-floor does." The writer was built for this case. The fold
+            // refused the rows before they could reach it, so that path has
+            // been unreachable since it was written.
+            //
+            // The split is on whether a SAFE STAMP EXISTS, which is the same
+            // condition the untraded-sentinel arm above uses:
+            //
+            //   receipt present -> CANDLE-ONLY. Folding is still refused (an
+            //     out-of-band second cannot be bucketed), but the row is kept
+            //     and lands in TODAY's partition under the receipt time.
+            //   receipt absent  -> HARD refusal, unchanged. This is the WAL
+            //     replay path, where no safe stamp exists and writing the row
+            //     would put it in a 1970 or year-2106 partition that retention
+            //     and archival can never reach.
+            //
+            // So the 2026-08-25 garbage-partition regression stays closed: the
+            // fold keeps the row precisely when the writer can stamp it safely.
+            if tick.received_at_nanos != 0 {
+                crate::candles::fold_counters::fold_counters()
+                    .tick_out_of_band_timestamp
+                    .increment(1);
+                return ConsumeStats {
+                    out_of_band_timestamp: true,
+                    ..ConsumeStats::default()
+                };
+            }
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_timestamp
                 .increment(1);
@@ -2125,6 +2192,7 @@ mod tests {
             untraded_sentinel: _,
             stale_trading_day: _,
             untraded_timestamp: _,
+            out_of_band_timestamp: _,
         } = ConsumeStats::default();
 
         assert!(
@@ -2179,6 +2247,13 @@ mod tests {
                 "untraded_timestamp",
                 ConsumeStats {
                     untraded_timestamp: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "out_of_band_timestamp",
+                ConsumeStats {
+                    out_of_band_timestamp: true,
                     ..ConsumeStats::default()
                 },
             ),
@@ -2805,5 +2880,85 @@ mod receipt_clock_end_to_end_tests {
              exchange clock the earlier-traded 107.0 would have been refused \
              by the order guard and the bar would have closed at 100.0"
         );
+    }
+}
+
+// -- the out-of-band timestamp: candle refused, ROW KEPT ---------------------
+//
+// MEASURED on production 2026-08-27: this population was 2,008,916 ticks in a
+// single session — 2.41% of all 83,446,729 decoded — and every one of them was
+// HARD-refused, meaning no row was written at all. Not a missing candle: no
+// record the instrument was even seen.
+//
+// It is the THIRD instance of one shape (price sentinel 2026-08-20, zero
+// timestamp 2026-08-26, this), and the repetition is why these tests exist as
+// behaviour pins rather than as comments.
+#[cfg(test)]
+mod out_of_band_timestamp_tests {
+    use super::tests::{CANDLE_OPEN, SEG_IDX, tick};
+    use super::*;
+
+    /// The whole point: a real price with an unusable trade time must still
+    /// reach the writer. `folded()` false means "not in a candle"; the drain
+    /// reads `out_of_band_timestamp` to know the ROW is still safe to write.
+    #[test]
+    fn an_out_of_band_stamp_with_a_receipt_is_candle_only_not_a_hard_refusal() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
+
+        // Below the 2020 floor, but a real price and a real receipt.
+        let mut t = tick(13, SEG_IDX, 1_000_000_000, 100.0, 10);
+        t.received_at_nanos = (i64::from(CANDLE_OPEN) - 19_800) * 1_000_000_000;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.out_of_band_timestamp,
+            "an out-of-band stamp WITH a receipt must be the candle-only class"
+        );
+        assert!(
+            !stats.refused_timestamp,
+            "it must NOT be the hard refusal — that is what threw the row away"
+        );
+        assert!(
+            !stats.folded(),
+            "it is still not folded: an out-of-band second cannot be bucketed"
+        );
+    }
+
+    /// The other half, and the reason the split is on the receipt rather than
+    /// on the timestamp alone: with NO receipt there is no safe stamp, so the
+    /// writer would put the row in a 1970 or year-2106 partition that
+    /// retention and archival can never reach. That stays a hard refusal.
+    #[test]
+    fn an_out_of_band_stamp_without_a_receipt_stays_a_hard_refusal() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
+
+        let t = tick(13, SEG_IDX, 1_000_000_000, 100.0, 10);
+        assert_eq!(t.received_at_nanos, 0, "fixture models the WAL-replay path");
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.refused_timestamp,
+            "no receipt means no safe stamp — the row must NOT be written"
+        );
+        assert!(!stats.out_of_band_timestamp);
+    }
+
+    /// Non-vacuity. A normal in-band tick must be unaffected by either arm —
+    /// without this the two tests above would pass on a fold that refused
+    /// everything.
+    #[test]
+    fn an_in_band_stamp_is_untouched_by_the_split() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
+
+        let mut t = tick(13, SEG_IDX, CANDLE_OPEN + 60, 100.0, 10);
+        t.received_at_nanos = (i64::from(CANDLE_OPEN) + 62 - 19_800) * 1_000_000_000;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(!stats.out_of_band_timestamp);
+        assert!(!stats.refused_timestamp);
+        assert!(stats.folded(), "an ordinary tick must still fold");
     }
 }

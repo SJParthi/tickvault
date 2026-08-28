@@ -1392,3 +1392,58 @@ the bill.
   stands).
 - Bumps the EMF name count without a dated cost note — the ratchet's own
   instruction, and the reason this section exists.
+
+## COST NOTE 2026-08-28 — the refusal family had never been visible, and it was hiding 2.4% tick loss (+~$0.30/mo)
+
+**Authorization:** operator, 2026-08-28, verbatim: *"Always ensure saving into db
+and auditing logging tracking capturing debugging finding searching monitoring
+dashboard vislualisign extremeims analyzing easil yaccessibel eveyrhtign also by
+covering entirely each and every nook and corner but always ensure to achieve
+O(1) always"*. Recorded here before the selector change, per the rule-file-first
+law.
+
+**What was added:** `tv_aggregator_tick_refused_total` to the EMF selector.
+**+1 metric name ≈ $0.30/mo, no new alarm, no user-data byte** (the selector
+moved out of the boot template in #1815, so an EMF name is now free of the byte
+budget that blocked three earlier additions).
+
+**Why it earns the money, measured rather than argued.** The candle fold has
+FIVE refusal reasons — six as of today — and **not one of them has ever reached
+CloudWatch**. `aws cloudwatch list-metrics --metric-name
+tv_aggregator_tick_refused_total` returned `{"Metrics": []}`.
+
+The consequence, read from the live account for 2026-08-27:
+
+| Reading | Value |
+|---|---|
+| Ticks decoded (`tv_dhan_feed_ingest_ticks_total`) | **83,446,729** |
+| Ticks HARD-refused on timestamp, no row written | **2,008,916** |
+| Share of the session | **2.41%** |
+| Where this was visible | one 30-second log line, and nowhere else |
+
+A loss of that size ran every session and could not be charted, alarmed, or
+trended. That is the "paid for and unwatched" shape inverted: not paid for and
+not watched.
+
+**⚠ HONEST LIMIT.** The EMF processor folds label values into one summed series
+per host, so this publishes the TOTAL refusal rate and NOT the per-reason split.
+The split stays in the `AGGREGATOR-DROP-01` line, which already carries
+`refused_price` / `refused_timestamp` / `refused_slot_exhausted` as separate
+fields. A total is what was missing — the reason a 2.4% loss went unnoticed is
+that nobody could see a number at all, not that they saw the wrong breakdown.
+
+**NOT claimed:** that this alarms. It is charted, not paged. A threshold needs a
+baseline nobody has yet — the honest baseline is being established by this very
+change, and the loss it was hiding is FIXED in the same commit (the out-of-band
+class becomes candle-only, so the row is written). An alarm on a number that is
+about to change by 2.4% would be calibrated against the defect rather than
+against health.
+
+**Budget position.** The COST NOTE of 2026-08-25 (THIRD) put a maximal month at
+~$119.28 against the 90% `STOP_EC2_INSTANCES` line of $117.00. This takes it to
+~$119.58, about $2.58 over that automatic action line, against the operator's
+$125 hard cap (Quote 18). The live account is far below it (MTD $48.87, forecast
+$61.51, measured 2026-08-25), so nothing fires today — but the maximal-month
+arithmetic crosses the line and widens with each addition. Unchanged levers,
+neither taken here: the already-approved Quote 10 Elastic IP release
+(−$3.60/mo), or an operator decision on `limit_amount`.

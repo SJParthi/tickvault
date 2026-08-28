@@ -951,8 +951,17 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // section 2.3j.
     assert_eq!(
         names.len(),
-        88,
-        "Z+ L2 VERIFY ratchet: expected exactly 84 names in the MAIN EMF \
+        89,
+        "Z+ L2 VERIFY ratchet: expected exactly 89 names in the MAIN EMF \
+         (2026-08-28: 88 -> 89, tv_aggregator_tick_refused_total. The whole \
+         refusal family had NEVER been EMF-selected, which is why the box \
+         could hard-refuse 2,008,916 ticks in the measured 2026-08-27 session \
+         -- 2.41% of all 83,446,729 decoded, with NO row written -- and the \
+         only trace anywhere was a 30-second log line. Cost ~$0.30/mo, no \
+         user-data byte. HONEST LIMIT: the EMF processor folds the `reason` \
+         label into one summed series per host, so this gives the TOTAL \
+         refusal rate, not the per-reason split; the split stays in the \
+         AGGREGATOR-DROP-01 log line. A total is what was missing.) \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
          loss counters added 2026-08-11 when the lane was switched on, plus the 4 \

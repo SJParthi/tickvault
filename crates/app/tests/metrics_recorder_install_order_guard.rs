@@ -166,3 +166,81 @@ fn guard_self_test_ignores_mentions_inside_comments() {
          site — otherwise the guard passes a file whose real order is wrong"
     );
 }
+
+/// Count occurrences of `needle` OUTSIDE `//` comments, across the whole file.
+///
+/// The sibling helper stops at the FIRST hit, which is what makes it right for
+/// the ordering tests and blind to the defect below.
+fn code_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack
+        .lines()
+        .map(|line| {
+            let code = line.split_once("//").map_or(line, |(before, _)| before);
+            code.matches(needle).count()
+        })
+        .sum()
+}
+
+/// `init_metrics` must be called EXACTLY ONCE.
+///
+/// This is a count, not an order, and the distinction is the entire point.
+/// `PrometheusBuilder::install()` binds the exporter's HTTP listener, so a
+/// second call binds the same port a second time in the same process and
+/// returns EADDRINUSE; `main` propagates that with `?` and the binary cannot
+/// start at all.
+///
+/// It happened. On 2026-08-26 the install was moved ahead of STAGE-C to fix a
+/// recorder-ordering bug, and the move COPIED rather than MOVED -- leaving two
+/// calls. Every ordering test in this file still passed, because the FIRST
+/// call was in exactly the right place; ordering was never violated. The
+/// binary shipped to prod on 2026-08-28, systemd retried it eight times in
+/// eighteen seconds, gave up with "Start request repeated too quickly", and
+/// the box sat with no app through the 09:15 market open.
+///
+/// The failure mode is worth naming because it wastes the responder's time:
+/// EADDRINUSE reads as "another process has the port", so the instinct is to
+/// hunt an orphan. There was none -- `ss`, `lsof` and `fuser` all reported
+/// 9091 free while a fresh `systemctl start` still failed. A port that is
+/// provably free and still collides means the process is colliding with
+/// itself.
+#[test]
+fn init_metrics_is_called_exactly_once() {
+    let src = main_rs();
+
+    let calls = code_occurrences(&src, "observability::init_metrics");
+
+    assert_eq!(
+        calls, 1,
+        "main.rs calls observability::init_metrics {calls} times; it must be \
+         called EXACTLY ONCE.\n\n\
+         init_metrics installs the Prometheus exporter, which BINDS an HTTP \
+         listener. A second call binds the same port again in the same \
+         process and fails with `Address in use (os error 98)`, which `?` \
+         turns into a boot failure -- the binary cannot start at all.\n\n\
+         If you are MOVING the call to fix an ordering problem, delete the \
+         old one in the same edit. The ordering tests in this file cannot \
+         catch a duplicate: they check where the FIRST call sits, and a \
+         copy leaves that first call exactly where it belongs."
+    );
+}
+
+/// Self-test: the count guard must actually bite on a duplicated call.
+///
+/// Without this, a helper that silently returned 1 would leave the guard
+/// permanently green -- the same shape of false-OK the guard exists to stop.
+#[test]
+fn count_guard_self_test_detects_a_duplicated_call() {
+    let one = "    observability::init_metrics(&cfg)?;\n";
+    let two = format!("{one}{one}");
+
+    assert_eq!(code_occurrences(one, "observability::init_metrics"), 1);
+    assert_eq!(code_occurrences(&two, "observability::init_metrics"), 2);
+
+    // ...and a commented-out mention must NOT count, or the guard would fire
+    // on the prose that documents it.
+    let commented = "    // observability::init_metrics is installed above\n";
+    assert_eq!(
+        code_occurrences(commented, "observability::init_metrics"),
+        0
+    );
+}

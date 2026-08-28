@@ -310,10 +310,34 @@ fn a_zero_timestamp_without_a_receipt_time_is_still_refused_outright() {
 }
 
 #[test]
-fn genuinely_corrupt_timestamps_stay_hard_refusals_even_with_a_receipt_time() {
-    // Only EXACTLY zero is the sentinel. 0xFFFFFFFF is ~year 2106 and a
-    // below-floor non-zero value is corruption; both must keep costing the row,
-    // because writing them puts a row under a garbage designated timestamp.
+fn corrupt_timestamps_keep_their_row_when_a_receipt_time_can_stamp_it() {
+    // CORRECTED 2026-08-28. This test previously asserted the opposite --
+    // that a corrupt (non-zero, out-of-band) LTT stayed a HARD refusal even
+    // with a receipt -- on the stated grounds that "writing them puts a row
+    // under a garbage designated timestamp".
+    //
+    // That premise is FALSE, and the code it describes says so verbatim.
+    // `tick_persistence::row_timestamp_ist_nanos` bands the LTT and then:
+    //
+    //     received_at_ist_nanos.unwrap_or(ltt_nanos)
+    //
+    // under its own comment "Out of band falls back to the receipt time,
+    // exactly as below-floor does." The fallback is keyed on the BAND, not on
+    // the value being exactly zero -- so a row for ts = u32::MAX carried with
+    // a receipt is stamped from the RECEIPT, in band, in the live range, and
+    // reachable by retention and archival. There is no garbage timestamp to
+    // avoid.
+    //
+    // The cost of the old behaviour was measured, not theoretical: a hard
+    // refusal DISCARDS THE ROW ENTIRELY, so the tick's price never reached the
+    // database at all. On 2026-08-27 that was 2,008,916 ticks -- 2.41% of the
+    // session -- thrown away to avoid writing a timestamp the writer already
+    // knew how to replace. This is the same shape as the zero-sentinel case
+    // the sibling test above covers, and it is resolved the same way.
+    //
+    // What is NOT relaxed: the tick is still refused for CANDLES. A corrupt
+    // LTT cannot place a bar, so no bucket opens and nothing seals. The row is
+    // kept; the fold is not.
     let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
 
     for poison in [u32::MAX, 1, 1_599_999_999, 2_524_608_001] {
@@ -321,14 +345,62 @@ fn genuinely_corrupt_timestamps_stay_hard_refusals_even_with_a_receipt_time() {
             Feed::Dhan,
             &tick_with_receipt(poison, 100.0, 1_787_000_000_000_000_000),
             None,
+            |_, _, _, _, _| panic!("a corrupt timestamp must never seal a bucket"),
+        );
+        assert!(
+            s.out_of_band_timestamp,
+            "ts {poison} is out of band and must be classified as such"
+        );
+        assert!(
+            !s.refused_timestamp,
+            "ts {poison} carries a receipt, so the writer can stamp the row \
+             from it -- discarding the row costs real market data for nothing"
+        );
+        assert!(
+            !s.folded(),
+            "ts {poison} cannot place a bar, so no candle may be folded"
+        );
+        assert!(
+            !s.untraded_timestamp,
+            "ts {poison} is not the zero sentinel"
+        );
+    }
+}
+
+#[test]
+fn corrupt_timestamps_without_a_receipt_time_are_still_refused_outright() {
+    // The half of the old assertion that REMAINS true, kept as its own test so
+    // relaxing the receipt case above cannot be mistaken for relaxing both.
+    //
+    // With no receipt, `row_timestamp_ist_nanos` has nothing to fall back to
+    // and returns the raw value -- so keeping the row would put ts = u32::MAX
+    // (~year 2106) or ts = 1 (1970) into the DESIGNATED timestamp, creating a
+    // QuestDB partition that retention and archival, both keyed on the trading
+    // day, can never reach, while every `max(ts)` over `ticks` silently
+    // includes it. That is the unreachable-partition defect the 2026-08-25
+    // ceiling was added for, and it stays closed.
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+
+    for poison in [u32::MAX, 1, 1_599_999_999, 2_524_608_001] {
+        let s = agg.consume_tick(
+            Feed::Dhan,
+            &tick_with_receipt(poison, 100.0, 0),
+            None,
             |_, _, _, _, _| panic!("must never seal"),
         );
         assert!(
             s.refused_timestamp,
-            "ts {poison} is corruption, not the never-traded sentinel, and must \
-             stay a hard refusal"
+            "ts {poison} with NO receipt cannot be stamped safely, so the row \
+             must be refused outright"
         );
-        assert!(!s.untraded_timestamp, "ts {poison} is not the sentinel");
+        assert!(
+            !s.out_of_band_timestamp,
+            "the hard refusal is the classification"
+        );
+        assert!(
+            !s.untraded_timestamp,
+            "ts {poison} is not the zero sentinel"
+        );
     }
 }
 

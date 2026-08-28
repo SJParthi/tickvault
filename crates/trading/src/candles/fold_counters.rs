@@ -90,6 +90,15 @@ pub(crate) struct FoldCounters {
     /// Ticks whose `exchange_timestamp` was EXACTLY 0 — the vendor's "no last
     /// trade time" sentinel. Candle-only refusal; the row is still written.
     pub(crate) tick_untraded_timestamp: metrics::Counter,
+
+    /// Ticks whose `exchange_timestamp` fell outside the plausibility band but
+    /// which carried a real receipt time. Candle-only refusal; the row is
+    /// still written, stamped with the receipt.
+    ///
+    /// Added 2026-08-28: this population was 2,008,916 ticks in one measured
+    /// session (2.41% of all decoded) and was being HARD-refused, so no row
+    /// existed at all.
+    pub(crate) tick_out_of_band_timestamp: metrics::Counter,
 }
 
 impl FoldCounters {
@@ -140,6 +149,10 @@ impl FoldCounters {
             tick_untraded_timestamp: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
                 "reason" => "untraded_timestamp"
+            ),
+            tick_out_of_band_timestamp: metrics::counter!(
+                "tv_aggregator_tick_refused_total",
+                "reason" => "out_of_band_timestamp"
             ),
         }
     }
