@@ -409,6 +409,10 @@ pub struct WsFrameSpill {
     /// `None` keeps the spill feed-health-agnostic (byte-identical hot path).
     /// Read ONLY in the cold drop arms; never on the hot `Spilled` path.
     feed_health: Option<Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
+    /// The exclusive claim on the WAL directory, held for as long as this spill
+    /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
+    /// release it on drop so the next process can start. See [`WalDirGuard`].
+    _dir_guard: WalDirGuard,
 }
 
 impl WsFrameSpill {
@@ -418,6 +422,29 @@ impl WsFrameSpill {
         let wal_dir = wal_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
             .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
+
+        // ORDER IS LOAD-BEARING, and this is the first thing that happens.
+        //
+        // 1. CLAIM the directory exclusively, or refuse to start. Two processes
+        //    sharing one WAL directory mint `capture_seq` from two independent
+        //    clock-seeded counters, collide inside the `ticks` DEDUP key, and
+        //    destroy ticks with no counter anywhere to show it. See
+        //    [`lock_wal_dir`] for why this is fail-closed rather than a warning.
+        // 2. Only THEN read the on-disk high-water mark and ratchet the counter
+        //    past it. Doing this before the lock would race a live incumbent
+        //    that is still appending, and could seed from a value it is about
+        //    to exceed.
+        // 3. Only THEN spawn the writer thread, so nothing can append at a
+        //    sequence below the high-water mark.
+        let dir_guard = lock_wal_dir(&wal_dir)?;
+        let disk_high = seed_frame_seq_from_disk(&wal_dir);
+        if disk_high > 0 {
+            tracing::debug!(
+                wal_dir = ?wal_dir,
+                disk_high,
+                "WAL directory claimed exclusively; sequence ratcheted past disk"
+            );
+        }
 
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         let drop_critical = Arc::new(AtomicU64::new(0));
@@ -480,6 +507,7 @@ impl WsFrameSpill {
             persisted_total,
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
+            _dir_guard: dir_guard,
         })
     }
 
@@ -502,6 +530,18 @@ impl WsFrameSpill {
     /// writer-dead drop path is loud (WS-SPILL-02), not silent.
     #[cfg(test)]
     fn new_with_dead_writer_for_test() -> Self {
+        // A unique directory per call so the flock is always free: this
+        // constructor exists to exercise the dead-writer arm, and a lock
+        // contention failure here would prove nothing about that arm.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-wal-dead-writer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        let dir_guard = lock_wal_dir(&dir).expect("fresh temp dir is never contended");
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         drop(rx); // no writer ever runs → channel is Disconnected for sends
         Self {
@@ -510,6 +550,7 @@ impl WsFrameSpill {
             persisted_total: Arc::new(AtomicU64::new(0)),
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
+            _dir_guard: dir_guard,
         }
     }
 
@@ -930,6 +971,270 @@ pub fn next_frame_seq() -> u64 {
             return next;
         }
     }
+}
+
+/// The exclusive lock file held for the lifetime of the process that owns a
+/// WAL directory.
+///
+/// It lives INSIDE the WAL directory rather than beside it so the lock and the
+/// thing it protects can never be separated by a config change: whoever points
+/// at this directory takes this lock, whatever the directory is called.
+pub const WAL_DIR_LOCK_FILE: &str = ".wal-owner.lock";
+
+/// Counter: a process REFUSED to open the WAL directory because another live
+/// process already owns it. This is the fail-closed arm and it is a refusal,
+/// never a loss — the frames the incumbent is capturing are unaffected.
+pub const WAL_DIR_LOCK_REFUSED_COUNTER: &str = "tv_wal_dir_lock_refused_total";
+
+/// Counter: the boot re-seed advanced [`WAL_FRAME_SEQ`] past a high-water mark
+/// found on disk. Non-zero means a restart WOULD have re-issued sequence values
+/// already in the database, and did not.
+pub const WAL_SEQ_RESEED_ADVANCED_COUNTER: &str = "tv_wal_seq_reseed_advanced_total";
+
+/// An exclusive, kernel-held claim on one WAL directory.
+///
+/// # Why this exists
+///
+/// `capture_seq` is a column of the `ticks` DEDUP UPSERT key
+/// `(ts, security_id, segment, capture_seq, feed)`. Two DIFFERENT ticks that
+/// arrive carrying the same key do not both survive — QuestDB upserts one away,
+/// and **no counter in this process reports it**, because from here both rows
+/// were appended successfully. It is silent, unrecoverable tick loss that shows
+/// up only as a number that should have been bigger.
+///
+/// The sequence making that key unique is [`WAL_FRAME_SEQ`], a process-global
+/// counter seeded from the wall clock. That is airtight WITHIN one process and
+/// worth nothing ACROSS two: a second process starts its own counter from the
+/// same clock, mints the same 131 µs bases, and every instrument that ticks
+/// twice inside one exchange-second can lose a tick. Nothing notices, because
+/// the collision happens inside the database rather than in our code.
+///
+/// So the invariant is narrow and load-bearing: **one live process per WAL
+/// directory**. It is `flock(LOCK_EX | LOCK_NB)` through
+/// `std::fs::File::try_lock` (std since Rust 1.89 — no new dependency), which
+/// means the KERNEL releases it when the process dies, including on `SIGKILL`,
+/// an OOM kill, or a container stop. That is the property a PID file cannot
+/// offer: a stale PID file after a hard kill locks a healthy restart out of its
+/// own data, trading silent loss for guaranteed downtime.
+///
+/// # Why fail-closed
+///
+/// The alternative — warn and continue — is what existed before 2026-08-28, and
+/// it is the bug. A refusal costs one boot and says so loudly; proceeding costs
+/// ticks that cannot be reconstructed from anything, because both writers
+/// believe they succeeded.
+///
+/// The guard is held by value inside [`WsFrameSpill`], so dropping the spill
+/// releases the directory for the next process.
+#[derive(Debug)]
+pub struct WalDirGuard {
+    /// Held open purely so the `flock` stays taken. Dropping this releases it,
+    /// which is the intended release path.
+    _lock: File,
+    path: PathBuf,
+}
+
+impl WalDirGuard {
+    /// The lock file this guard holds.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Take the exclusive claim on `wal_dir`, or refuse.
+///
+/// # Errors
+///
+/// - the lock file cannot be created — a permissions or disk problem the caller
+///   must not paper over, since an unwritable WAL directory has no durable
+///   floor at all;
+/// - another live process already holds it. The error names the file so an
+///   operator can identify the incumbent with `fuser` or `lsof`.
+pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<WalDirGuard> {
+    let path = wal_dir.join(WAL_DIR_LOCK_FILE);
+    // `create(true)` and deliberately NOT `create_new(true)`: the file survives
+    // a clean shutdown and carries no state — the kernel lock IS the state — so
+    // an existing file is the normal case and is reused.
+    let lock = std::fs::OpenOptions::new() // O(1) EXEMPT: one-shot boot claim, never the per-frame append
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("open WAL lock file {path:?}: {e}"))?;
+
+    match lock.try_lock() {
+        Ok(()) => Ok(WalDirGuard { _lock: lock, path }),
+        Err(e) => {
+            metrics::counter!(WAL_DIR_LOCK_REFUSED_COUNTER).increment(1);
+            Err(anyhow::anyhow!(
+                "WAL directory {wal_dir:?} is already owned by another live process \
+                 (lock file {path:?}: {e}). REFUSING to start a second writer: two \
+                 processes minting capture_seq from their own clocks silently destroy \
+                 ticks through the ticks DEDUP key, with no counter to show it. \
+                 Identify the incumbent with `fuser -v` on the lock file and stop it, \
+                 or point this process at its own WAL directory."
+            ))
+        }
+    }
+}
+
+/// The highest `frame_seq` already committed to disk under `wal_dir`.
+///
+/// # Why a restart needs this
+///
+/// [`next_frame_seq`] returns `max(prev + 1, wall_clock)`. Above roughly 7,600
+/// frames/second the `prev + 1` arm wins and the counter runs AHEAD of the wall
+/// clock — its own header says so. A process that then restarts re-seeds from
+/// `AtomicU64::new(0)` plus the wall clock, i.e. from a value BELOW the
+/// high-water mark it had reached, and begins re-issuing sequence numbers that
+/// are already rows in the database. Those rows share the full DEDUP key with
+/// the new ticks and upsert them away.
+///
+/// It is the same silent loss as the two-process case, reached by one process
+/// and a crash instead of by two. So the counter has to be a ratchet ACROSS
+/// restarts, not only within one run.
+///
+/// # Cost
+///
+/// Only the NEWEST segment of each of the three directories (live, `replaying/`,
+/// `archive/`) is scanned, and only record HEADERS are read — frame payloads are
+/// seeked past, never copied. Sequences increase in append order and segments
+/// rotate in order, so the newest segment holds the maximum. Three bounded
+/// header walks on a cold boot path.
+///
+/// Returns `0` when the directory is absent, empty, or holds only v1 (`TVW1`)
+/// records, which predate `frame_seq`. `0` is the correct answer there: it
+/// leaves the wall clock as the seed, exactly as before.
+#[must_use]
+pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
+    let mut highest = 0u64;
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(ARCHIVE_SUBDIR),
+    ] {
+        let mut segs = wal_segments_in(&dir);
+        // Lexicographic == chronological: the name is the zero-padded rotation
+        // nanos, so the last is the newest and holds the maximum.
+        segs.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot-time seed, cold path
+        if let Some(newest) = segs.last() {
+            highest = highest.max(highest_frame_seq_in_segment(newest));
+        }
+    }
+    highest
+}
+
+/// Header-only walk of one segment, returning the greatest `frame_seq` in it.
+///
+/// Deliberately tolerant: this is a best-effort high-water probe, not a replay.
+/// A torn tail, an unknown magic, or a short read simply ends the walk and
+/// returns what was seen — a LOWER bound is still strictly better than the wall
+/// clock alone, and refusing to boot over a torn tail would turn a safety net
+/// into an outage. Corruption accounting belongs to [`replay_segment`], which
+/// walks the same files moments later and reports it properly.
+fn highest_frame_seq_in_segment(path: &Path) -> u64 {
+    let Ok(mut f) = File::open(path) else {
+        return 0;
+    };
+    let mut highest = 0u64;
+    // One header at a time; v3 is the largest at 29 bytes.
+    let mut head = [0u8; WAL_MIN_RECORD_V3];
+    loop {
+        let mut filled = 0usize;
+        while filled < head.len() {
+            match std::io::Read::read(&mut f, &mut head[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return highest,
+            }
+        }
+        if filled < WAL_MIN_RECORD_V1 {
+            return highest;
+        }
+        let magic = &head[0..4];
+        let is_v3 = magic == WAL_MAGIC_V3;
+        let is_v2 = magic == WAL_MAGIC_V2;
+        let is_v1 = magic == WAL_MAGIC;
+        if !is_v1 && !is_v2 && !is_v3 {
+            return highest;
+        }
+        let min_rec = if is_v3 {
+            WAL_MIN_RECORD_V3
+        } else if is_v2 {
+            WAL_MIN_RECORD_V2
+        } else {
+            WAL_MIN_RECORD_V1
+        };
+        if filled < min_rec {
+            return highest;
+        }
+        // v1: [magic|ws|len|frame|crc]                 -> len at 5
+        // v2: [magic|ws|seq(8)|len|frame|crc]           -> seq at 5, len at 13
+        // v3: [magic|ws|seq(8)|recv(8)|len|frame|crc]   -> seq at 5, len at 21
+        let len_off = if is_v3 {
+            21
+        } else if is_v2 {
+            13
+        } else {
+            5
+        };
+        if (is_v2 || is_v3)
+            && let Ok(seq_bytes) = <[u8; 8]>::try_from(&head[5..13])
+        {
+            highest = highest.max(u64::from_le_bytes(seq_bytes));
+        }
+        let Ok(len_bytes) = <[u8; 4]>::try_from(&head[len_off..len_off + 4]) else {
+            return highest;
+        };
+        let frame_len = u64::from(u32::from_le_bytes(len_bytes));
+        // Skip the payload and its 4-byte CRC. The header read may have
+        // over-read into the payload, so the seek is relative to where the
+        // header actually ended, not to where the cursor now sits.
+        let over_read = i64::try_from(filled - min_rec).unwrap_or(i64::MAX);
+        let Ok(skip) = i64::try_from(frame_len + 4) else {
+            return highest;
+        };
+        let Some(delta) = skip.checked_sub(over_read) else {
+            return highest;
+        };
+        if std::io::Seek::seek(&mut f, std::io::SeekFrom::Current(delta)).is_err() {
+            return highest;
+        }
+    }
+}
+
+/// Ratchet [`WAL_FRAME_SEQ`] past everything already on disk under `wal_dir`.
+///
+/// Idempotent and monotonic: it only ever RAISES the counter, so calling it
+/// twice, or after frames have already been minted, can neither lower it nor
+/// reissue a value. Returns the high-water mark found, for logging.
+pub fn seed_frame_seq_from_disk(wal_dir: &Path) -> u64 {
+    let disk_high = highest_frame_seq_on_disk(wal_dir);
+    if disk_high == 0 {
+        return 0;
+    }
+    // Advance to disk_high + one base unit so the very next mint is strictly
+    // greater than anything already written. `fetch_max` keeps it monotonic
+    // against a concurrent minter.
+    let target = (disk_high >> PACKET_INDEX_BITS)
+        .saturating_add(1)
+        .min(u64::MAX >> PACKET_INDEX_BITS)
+        << PACKET_INDEX_BITS;
+    let prev = WAL_FRAME_SEQ.fetch_max(target, Ordering::SeqCst);
+    if prev < target {
+        metrics::counter!(WAL_SEQ_RESEED_ADVANCED_COUNTER).increment(1);
+        tracing::info!(
+            disk_high_water = disk_high,
+            seeded_to = target,
+            was = prev,
+            "WAL sequence re-seeded past the on-disk high-water mark — a restart \
+             below it would have re-issued capture_seq values already in the \
+             database, silently upserting live ticks away"
+        );
+    }
+    disk_high
 }
 
 /// The replay-stable `capture_seq` for packet `packet_index` of the frame whose
@@ -3914,6 +4219,277 @@ mod tests {
             expected,
             (WS_TYPE_COUNT as u64) * 3,
             "the sweep must have covered every WsType three times"
+        );
+    }
+
+    /// The fail-closed half: a second claim on a directory a live guard already
+    /// owns must be REFUSED, not warned about.
+    ///
+    /// This is the whole point of the lock. Two processes on one WAL directory
+    /// mint `capture_seq` from independent clock-seeded counters, collide inside
+    /// the `ticks` DEDUP key, and destroy ticks with nothing to show for it. A
+    /// refusal costs one boot; proceeding costs data nothing can rebuild.
+    #[test]
+    fn a_second_claim_on_a_live_wal_directory_is_refused() {
+        let dir = tmp_dir("wal-lock-refuse");
+        let first = lock_wal_dir(&dir).expect("first claim must succeed");
+        let second = lock_wal_dir(&dir);
+        assert!(
+            second.is_err(),
+            "a second live process took the same WAL directory — this is the \
+             silent capture_seq collision the lock exists to prevent"
+        );
+        let msg = format!("{:#}", second.unwrap_err());
+        assert!(
+            msg.contains("already owned by another live process"),
+            "the refusal must name the cause so an operator can act on it, got: {msg}"
+        );
+        assert!(
+            msg.contains("capture_seq"),
+            "the refusal must say WHY it matters, got: {msg}"
+        );
+        drop(first);
+    }
+
+    /// Dropping the guard releases the directory, so a clean restart is not
+    /// locked out of its own data.
+    ///
+    /// The kernel does this for us on process death, including SIGKILL — which
+    /// is exactly why this is `flock` and not a PID file. This test covers the
+    /// in-process half of the same property.
+    #[test]
+    fn dropping_the_guard_frees_the_wal_directory_for_the_next_process() {
+        let dir = tmp_dir("wal-lock-release");
+        let first = lock_wal_dir(&dir).expect("first claim");
+        drop(first);
+        assert!(
+            lock_wal_dir(&dir).is_ok(),
+            "a released directory must be claimable, or a restart after a clean \
+             shutdown would be locked out of its own WAL"
+        );
+    }
+
+    /// Two DIFFERENT directories are independent — the lock is per-directory,
+    /// not global, so a second feed with its own WAL is unaffected.
+    #[test]
+    fn two_different_wal_directories_are_independently_claimable() {
+        let a = tmp_dir("wal-lock-a");
+        let b = tmp_dir("wal-lock-b");
+        let ga = lock_wal_dir(&a).expect("claim a");
+        let gb = lock_wal_dir(&b).expect("claim b must not be blocked by a");
+        assert_ne!(ga.path(), gb.path());
+    }
+
+    /// The re-seed must find the high-water mark that a restart would otherwise
+    /// re-issue.
+    ///
+    /// Scenario, which is the real one: a process running above ~7,600 frames/s
+    /// has driven the counter AHEAD of the wall clock on the `prev + 1` arm, then
+    /// dies. A fresh process seeds from `AtomicU64::new(0)` + the wall clock —
+    /// BELOW the mark — and starts re-issuing sequences already in the database,
+    /// where they upsert live ticks away.
+    #[test]
+    fn the_reseed_finds_the_high_water_mark_a_restart_would_have_reissued() {
+        let dir = tmp_dir("wal-reseed");
+        // A sequence far above any plausible wall clock, i.e. one that the
+        // clock-seeded counter could not reach on its own.
+        let far_future = (u64::MAX >> 2) & !MAX_PACKET_INDEX;
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[1, 2, 3, 4]),
+            frame_seq: far_future,
+            received_at_nanos: 42,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            far_future,
+            "the probe must read the sequence back out of the record header"
+        );
+
+        seed_frame_seq_from_disk(&dir);
+        let next = next_frame_seq();
+        assert!(
+            next > far_future,
+            "the next mint ({next}) must exceed the on-disk high-water mark \
+             ({far_future}); minting at or below it re-issues capture_seq values \
+             that are already rows, and QuestDB upserts the live tick away"
+        );
+    }
+
+    /// The re-seed is a RATCHET: it never lowers the counter, so calling it on a
+    /// directory whose high-water mark is behind the live counter is a no-op.
+    ///
+    /// This matters because the probe is best-effort — a torn tail returns a
+    /// LOWER bound — and a lower bound must never be allowed to walk the
+    /// sequence backwards into values already issued this session.
+    #[test]
+    fn the_reseed_never_lowers_the_live_sequence() {
+        let dir = tmp_dir("wal-reseed-ratchet");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[9]),
+            // Deliberately tiny: far below any wall-clock-seeded value.
+            frame_seq: 1 << PACKET_INDEX_BITS,
+            received_at_nanos: 7,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+
+        let before = next_frame_seq();
+        seed_frame_seq_from_disk(&dir);
+        let after = next_frame_seq();
+        assert!(
+            after > before,
+            "a stale, lower high-water mark must not rewind the live counter \
+             (before {before}, after {after})"
+        );
+    }
+
+    /// A torn tail ends the probe walk instead of panicking or looping, and what
+    /// it found before the tear is still returned.
+    ///
+    /// Refusing to boot over a torn tail would turn a safety net into an outage,
+    /// and a lower bound is still strictly better than the wall clock alone.
+    #[test]
+    fn the_reseed_probe_tolerates_a_torn_tail_and_keeps_what_it_read() {
+        let dir = tmp_dir("wal-reseed-torn");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let good_seq = 12_345u64 << PACKET_INDEX_BITS;
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[1, 2, 3]),
+            frame_seq: good_seq,
+            received_at_nanos: 5,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+        // Append a half-written header: magic present, the rest missing.
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("reopen");
+        std::io::Write::write_all(&mut appended, &WAL_MAGIC_V3).expect("torn magic");
+        std::io::Write::write_all(&mut appended, &[0u8; 3]).expect("torn body");
+        drop(appended);
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            good_seq,
+            "a torn tail must end the walk and keep the last complete record's \
+             sequence, not return zero and not panic"
+        );
+    }
+
+    /// An empty or absent directory seeds nothing, leaving the wall clock as the
+    /// seed exactly as before. A first-ever boot must not be penalised.
+    #[test]
+    fn an_empty_wal_directory_seeds_nothing() {
+        let dir = tmp_dir("wal-reseed-empty");
+        assert_eq!(highest_frame_seq_on_disk(&dir), 0);
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir.join("does-not-exist")),
+            0,
+            "an absent directory must be 0, not a panic"
+        );
+    }
+
+    /// v1 (`TVW1`) records predate `frame_seq` entirely, so a directory holding
+    /// only them yields 0 — the correct answer, not a fabricated sequence.
+    #[test]
+    fn v1_only_segments_seed_nothing_because_they_carry_no_sequence() {
+        let dir = tmp_dir("wal-reseed-v1");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&WAL_MAGIC);
+        bytes.push(WsType::LiveFeed.as_u8());
+        let frame = [7u8, 7, 7];
+        bytes.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&frame);
+        let mut crc_in = Vec::new();
+        crc_in.push(WsType::LiveFeed.as_u8());
+        crc_in.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        crc_in.extend_from_slice(&frame);
+        bytes.extend_from_slice(&crc32_ieee_of(&[&crc_in]).to_le_bytes());
+        std::fs::write(&seg, &bytes).expect("write v1");
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            0,
+            "v1 records carry no sequence; inventing one would be worse than 0"
+        );
+    }
+
+    /// The property that actually protects production: constructing a SECOND
+    /// spill on a directory a live spill already owns must FAIL.
+    ///
+    /// The helper-level test above proves the lock works; this proves it is
+    /// wired into the only constructor production uses. Without this, the lock
+    /// could be present, correct, and never called.
+    #[test]
+    fn a_second_spill_on_a_live_wal_directory_refuses_to_construct() {
+        let dir = tmp_dir("spill-second-ctor");
+        let first = WsFrameSpill::new(&dir).expect("first spill must construct");
+        let second = WsFrameSpill::new(&dir);
+        assert!(
+            second.is_err(),
+            "two WsFrameSpill instances took the same WAL directory. Both would \
+             mint capture_seq from independent clock-seeded counters, collide in \
+             the ticks DEDUP key, and destroy ticks with no counter to show it."
+        );
+        drop(first);
+        assert!(
+            WsFrameSpill::new(&dir).is_ok(),
+            "after the incumbent drops, the directory must be claimable again — \
+             otherwise a clean restart is locked out of its own WAL"
+        );
+    }
+
+    /// A spill constructed on a directory that already holds frames must mint
+    /// sequences ABOVE them, end to end.
+    ///
+    /// This is the restart case as production actually reaches it: the previous
+    /// process's segments are on disk, this process constructs a fresh spill,
+    /// and the first frame it appends must not reuse a sequence already in the
+    /// database.
+    #[test]
+    fn a_restart_mints_above_the_sequences_already_on_disk() {
+        let dir = tmp_dir("spill-restart-above");
+        let far_future = (u64::MAX >> 2) & !MAX_PACKET_INDEX;
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[1, 2, 3, 4]),
+            frame_seq: far_future,
+            received_at_nanos: 11,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+
+        let _spill = WsFrameSpill::new(&dir).expect("construct over existing segments");
+        let next = next_frame_seq();
+        assert!(
+            next > far_future,
+            "constructing a spill over existing segments must ratchet the \
+             sequence past them (next {next} vs on-disk {far_future}); minting \
+             at or below re-issues capture_seq values that are already rows"
         );
     }
 }

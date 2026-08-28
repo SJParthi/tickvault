@@ -3486,6 +3486,40 @@ const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 20;
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
 
+/// The inner join must COMPLETE inside the outer budget, not be truncated by it.
+///
+/// `run_frame_drain`'s shutdown tail calls `shutdown_offload_writer`, which
+/// blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS` waiting for the tick writer to
+/// drain its queue. That whole tail runs under
+/// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`]. Until 2026-08-28 the inner wait
+/// (30 s) was LONGER than the outer budget (20 s), so on a slow QuestDB the
+/// outer timer always won: the lane task was abandoned mid-join and the
+/// writer thread died holding queued batches — no spill, no counter, no log.
+///
+/// The margin is not decoration. The tail also seals open buckets, flushes
+/// ticks, flushes depth and publishes counters before it ever reaches the
+/// join, so the join needs room left over, not merely "less than".
+///
+/// A compile-time assert rather than a test: two constants in two files that
+/// must agree are exactly the pair a future edit separates, and a build
+/// failure is the only kind of reminder that cannot be skipped.
+const SHUTDOWN_GRACE_MARGIN_SECS: u64 = 5;
+const _: () = assert!(
+    tickvault_app_shutdown_grace() + SHUTDOWN_GRACE_MARGIN_SECS
+        <= DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+    "OFFLOAD_SHUTDOWN_GRACE_SECS + margin must fit inside \
+     DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS, or the offload join is abandoned \
+     mid-flight and the tick tail is lost silently. Lower the grace or raise \
+     the lane budget — and if you raise the lane budget, re-check it against \
+     the systemd stop timeout."
+);
+
+/// Indirection so the assert above reads the live value from the lane module
+/// rather than a copy. A copy is what rots.
+const fn tickvault_app_shutdown_grace() -> u64 {
+    tickvault_app::dhan_feed_stack::OFFLOAD_SHUTDOWN_GRACE_SECS
+}
+
 async fn run_process_runloop(
     api_handle: Option<tokio::task::JoinHandle<()>>,
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
