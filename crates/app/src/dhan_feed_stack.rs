@@ -7977,6 +7977,32 @@ pub struct WalRefoldOutcome {
     pub lost: u64,
     /// Frames whose bytes could not be parsed at all.
     pub unparseable: u64,
+    /// Packets the decoder REFUSED (2026-08-28).
+    ///
+    /// Distinct from `unparseable`, which counts a frame whose PACKET
+    /// BOUNDARIES could not be read. This counts a packet whose boundaries
+    /// were fine and whose CONTENT the decoder rejected. Until now the fold
+    /// swallowed those in an `if let Ok(..)` with no `else` — no counter, no
+    /// log — and `confirm_replayed` then archived the segment as successfully
+    /// replayed. Captured ticks, permanently gone, reported by nothing.
+    pub undecodable: u64,
+    /// Packets that decoded fine and carry no tick (2026-08-28).
+    ///
+    /// Open interest, previous close, disconnect and market-status frames are
+    /// legitimate and expected in a replayed segment; they are NOT loss. They
+    /// are counted separately so the `undecodable` number above means what it
+    /// says — the same `if let Ok(..)` swallowed both, which is why a real
+    /// decode failure was indistinguishable from an ordinary OI packet.
+    pub non_tick: u64,
+    /// Inline depth rows re-appended on replay (2026-08-28).
+    ///
+    /// The fold matched `TickWithDepth(tick, _)` and threw the five levels
+    /// away, while the LIVE path persists them through `append_inline_depth`.
+    /// So a crash-restart silently dropped every replayed packet's depth. The
+    /// re-append is DEDUP-idempotent for the same reason the tick re-append is:
+    /// `capture_seq` is derived from `(frame_seq, packet_index)`, both of which
+    /// replay reproduces exactly.
+    pub inline_depth_rows: u64,
 }
 /// Reports live-feed frames the lane recovered from the write-ahead log but
 /// will never fold, because bring-up refused before reaching the re-fold.
@@ -8026,6 +8052,75 @@ pub fn report_unfolded_wal_frames(frames: &[(u64, i64, bytes::Bytes)], refusal: 
         "ws_type" => "live_feed"
     )
     .increment(dropped);
+}
+
+/// Fold ONE replayed tick and classify the outcome.
+///
+/// Extracted 2026-08-28 when the caller's `if let Ok(..)` became an exhaustive
+/// match: the `Tick` and `TickWithDepth` arms do the same thing with the tick,
+/// and two copies of a classification this fiddly would have drifted.
+fn refold_one_tick(
+    ingest: &mut LiveIngest,
+    tick: &tickvault_common::tick_types::ParsedTick,
+    frame_seq: u64,
+    packet_index: u32,
+    recv_millis: u64,
+    out: &mut WalRefoldOutcome,
+) {
+    // Deliberately NOT calling `record_ws_lag`: a replayed frame has no
+    // meaningful delivery latency, and feeding "now minus the exchange stamp"
+    // into the lag histogram would poison the one number the operator uses to
+    // judge the live feed.
+    match ingest.ingest_tick_at(tick, frame_seq, packet_index, recv_millis) {
+        // `WrittenOutOfSession` counts as RECOVERED, not lost, and the
+        // distinction is the whole point of the variant: the row reached the
+        // writer, only the candle was skipped because the tick falls outside
+        // the aggregating session.
+        //
+        // **CORRECTED 2026-08-28: this named "(the 09:00-09:15 pre-open)" as
+        // the example, and that window is now IN session.** The candle grid
+        // opens at 09:00, so a 09:00-09:14 tick folds into a real pre-open bar
+        // and this arm is no longer reached for it. What DOES reach here is a
+        // tick whose FOLD-CLOCK second falls before 09:00 or at or after 15:40.
+        //
+        // **RE-CORRECTED 2026-08-28, same day.** The sentence that stood here
+        // read "the persistence window is wider than the candle window at both
+        // ends". That is FALSE in both halves, and one grep settles it:
+        //
+        //     TICK_PERSIST_START_SECS_OF_DAY_IST  = 32_400  (09:00)
+        //     TICK_PERSIST_END_SECS_OF_DAY_IST    = 56_400  (15:40)
+        //     CANDLE_SESSION_OPEN_SECS_OF_DAY_IST = 32_400  (09:00)
+        //     MARKET_CLOSE_SECS_OF_DAY_IST        = 56_400  (15:40)
+        //
+        // The windows are IDENTICAL, not wider. And the second half is wrong in
+        // a way the first conceals: there is no persistence window GATE on this
+        // lane at all — `tick_persistence.rs` references neither constant
+        // (grep: zero hits). A row outside the window is written because
+        // NOTHING STOPS THE WRITER, not because a wider window permits it. The
+        // two readings differ the moment someone tries to change the
+        // persistence window by editing the constant, which would do nothing.
+        //
+        // Recorded rather than quietly amended because of what it is: the
+        // sentence being corrected was ITSELF a correction of a stale
+        // reachability claim, written hours earlier, and it closed by saying "a
+        // reachability claim is one grep of the gate constant and must be
+        // re-run when written, not carried." It then made a claim about two
+        // gate constants without running that grep. Stating the rule is not the
+        // same as following it, and a correction carries no more authority than
+        // the sentence it replaced.
+        //
+        // Counting it as `lost` would report real recovered rows as data loss;
+        // folding it into `refolded` silently would erase the fact that no bar
+        // was produced. It is a row, so it belongs on the row side.
+        IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession => {
+            out.refolded = out.refolded.saturating_add(1);
+        }
+        IngestOutcome::SeqUnrepresentable
+        | IngestOutcome::AggregatorRefused
+        | IngestOutcome::WriteFailed => {
+            out.lost = out.lost.saturating_add(1);
+        }
+    }
 }
 
 /// Re-folds live-feed frames recovered from the write-ahead log.
@@ -8171,74 +8266,61 @@ pub fn refold_wal_frames(
                 out.unparseable = out.unparseable.saturating_add(1);
                 break;
             }
-            if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _)) =
-                dispatch_frame(&bytes[offset..end], *wal_received_at_nanos)
-            {
-                // Deliberately NOT calling `record_ws_lag`: a replayed frame
-                // has no meaningful delivery latency, and feeding "now minus
-                // the exchange stamp" into the lag histogram would poison the
-                // one number the operator uses to judge the live feed.
-                match ingest.ingest_tick_at(&tick, *frame_seq, packets, recv_millis) {
-                    // `WrittenOutOfSession` counts as RECOVERED, not lost, and
-                    // the distinction is the whole point of the variant: the
-                    // row reached the writer, only the candle was skipped
-                    // because the tick falls outside the aggregating session.
+            // Was `if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _))`,
+            // and BOTH halves of that pattern lost data (2026-08-28).
+            //
+            // The `_` discarded the five inline depth levels the LIVE path
+            // persists through `append_inline_depth`, so a crash-restart
+            // silently dropped every replayed packet's depth. And the bare
+            // `if let Ok(..)` swallowed every `Err` AND every non-tick variant
+            // with no counter and no log — `out.lost` is only touched INSIDE
+            // the matched arm — after which `confirm_replayed` archived the
+            // segment as successfully replayed and it was never re-globbed.
+            //
+            // An exhaustive match is what makes both visible, and it is written
+            // exhaustively on purpose: a future `ParsedFrame` variant now has
+            // to be classified here rather than silently joining the swallowed
+            // set.
+            match dispatch_frame(&bytes[offset..end], *wal_received_at_nanos) {
+                Ok(ParsedFrame::TickWithDepth(tick, levels)) => {
+                    // Depth FIRST, matching the live drain's order, and through
+                    // the same function so the two cannot produce different
+                    // rows. DEDUP-idempotent on re-append: `capture_seq` is
+                    // derived from `(frame_seq, packet_index)`, and replay
+                    // reproduces both exactly — the same property the tick
+                    // re-append already relies on.
                     //
-                    // **CORRECTED 2026-08-28: this named "(the 09:00-09:15
-                    // pre-open)" as the example, and that window is now IN
-                    // session.** The candle grid opens at 09:00, so a
-                    // 09:00-09:14 tick folds into a real pre-open bar and this
-                    // arm is no longer reached for it. What DOES reach here is
-                    // a tick whose FOLD-CLOCK second falls before 09:00 or at
-                    // or after 15:40.
-                    //
-                    // **RE-CORRECTED 2026-08-28, same day.** The sentence that
-                    // stood here read "the persistence window is wider than
-                    // the candle window at both ends". That is FALSE in both
-                    // halves, and one grep settles it:
-                    //
-                    //     TICK_PERSIST_START_SECS_OF_DAY_IST = 32_400  (09:00)
-                    //     TICK_PERSIST_END_SECS_OF_DAY_IST   = 56_400  (15:40)
-                    //     CANDLE_SESSION_OPEN_SECS_OF_DAY_IST = 32_400 (09:00)
-                    //     MARKET_CLOSE_SECS_OF_DAY_IST        = 56_400 (15:40)
-                    //
-                    // The windows are IDENTICAL, not wider. And the second
-                    // half is wrong in a way the first conceals: there is no
-                    // persistence window GATE on this lane at all --
-                    // `tick_persistence.rs` references neither constant (grep:
-                    // zero hits). A row outside the window is written because
-                    // NOTHING STOPS THE WRITER, not because a wider window
-                    // permits it. The two readings differ the moment someone
-                    // tries to change the persistence window by editing the
-                    // constant, which would do nothing.
-                    //
-                    // Recorded rather than quietly amended because of what it
-                    // is: the sentence being corrected was ITSELF a correction
-                    // of a stale reachability claim, written hours earlier,
-                    // and it closed by saying "a reachability claim is one
-                    // grep of the gate constant and must be re-run when
-                    // written, not carried." It then made a claim about two
-                    // gate constants without running that grep. Stating the
-                    // rule is not the same as following it, and a correction
-                    // carries no more authority than the sentence it replaced.
-                    //
-                    // Counting it as `lost` would
-                    // report real recovered rows as data loss; folding it into
-                    // `refolded` silently would erase the fact that no bar was
-                    // produced. It is a row, so it belongs on the row side.
-                    //
-                    // This arm exists because two sessions' work met here: the
-                    // re-fold arrived from one branch, the out-of-session split
-                    // from another, and the exhaustive match is what forced the
-                    // question to be answered rather than defaulted.
-                    IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession => {
-                        out.refolded = out.refolded.saturating_add(1);
+                    // The shed gate is deliberately NOT consulted here. Shedding
+                    // exists to protect a live session from a filling disk; a
+                    // boot-time replay of a bounded, already-captured segment is
+                    // not that, and skipping it would turn a full disk at boot
+                    // into permanent loss of data we are holding in our hand.
+                    if let Some(sink) = ingest.inline_depth.as_mut() {
+                        let rows = append_inline_depth(
+                            sink,
+                            &tick,
+                            &levels,
+                            *wal_received_at_nanos,
+                            *frame_seq,
+                            packets,
+                            counters(),
+                        );
+                        out.inline_depth_rows = out.inline_depth_rows.saturating_add(rows);
                     }
-                    IngestOutcome::SeqUnrepresentable
-                    | IngestOutcome::AggregatorRefused
-                    | IngestOutcome::WriteFailed => {
-                        out.lost = out.lost.saturating_add(1);
-                    }
+                    refold_one_tick(ingest, &tick, *frame_seq, packets, recv_millis, &mut out);
+                }
+                Ok(ParsedFrame::Tick(tick)) => {
+                    refold_one_tick(ingest, &tick, *frame_seq, packets, recv_millis, &mut out);
+                }
+                Ok(_non_tick) => {
+                    // Open interest, previous close, disconnect, market status.
+                    // Legitimate and expected in a replayed segment, and NOT
+                    // loss — counted separately so `undecodable` below means
+                    // what it says.
+                    out.non_tick = out.non_tick.saturating_add(1);
+                }
+                Err(_) => {
+                    out.undecodable = out.undecodable.saturating_add(1);
                 }
             }
             packets = packets.saturating_add(1);
@@ -8249,6 +8331,36 @@ pub fn refold_wal_frames(
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "refolded")
         .increment(out.refolded);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "lost").increment(out.lost);
+    // The two outcomes the swallowing `if let` hid, on the SAME metric so an
+    // operator reading one series sees the whole verdict for a replay (2026-08-28).
+    //
+    // `undecodable` is the one that matters: it is captured, durably written,
+    // never-recovered data, and it was reported by nothing at all while
+    // `confirm_replayed` archived the segment as a success. `non_tick` is
+    // published beside it precisely so `undecodable` cannot be read as
+    // including ordinary OI and previous-close packets — the old code could not
+    // tell them apart, and neither could a reader.
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "undecodable")
+        .increment(out.undecodable);
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "non_tick")
+        .increment(out.non_tick);
+    if out.undecodable > 0 {
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            undecodable = out.undecodable,
+            refolded = out.refolded,
+            "WAL replay: packets were captured and could NOT be decoded — these are \
+             permanently unrecovered, and the segment is archived either way. Until \
+             2026-08-28 this was swallowed with no counter and no log."
+        );
+    }
+    if out.inline_depth_rows > 0 {
+        info!(
+            rows = out.inline_depth_rows,
+            "WAL replay: inline depth levels re-appended — until 2026-08-28 the refold \
+             discarded them while the live path persisted them"
+        );
+    }
 
     out
 }
@@ -15246,6 +15358,157 @@ mod wal_refold_tests {
         );
     }
 
+    /// Drops `//` comment lines so a source scan cannot match prose.
+    ///
+    /// House convention, and earned here: the exhaustive-match replacement
+    /// carries a comment quoting the swallowing `if let` it replaced, and the
+    /// first version of the guard below matched that quote and failed.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A legitimate NON-TICK packet must be counted, not swallowed.
+    ///
+    /// Until 2026-08-28 the fold was `if let Ok(..) = dispatch_frame(..)` with
+    /// no `else`. A decode failure incremented nothing and logged nothing —
+    /// `out.lost` is only touched INSIDE the matched arm — and
+    /// `confirm_replayed` then archived the segment as successfully replayed,
+    /// after which it is never re-globbed. Captured ticks, permanently gone,
+    /// reported by nothing.
+    #[test]
+    fn a_legitimate_non_tick_packet_is_counted_not_swallowed() {
+        // An open-interest packet: well-formed, walkable, decodes cleanly, and
+        // carries no tick. The old `if let Ok(ParsedFrame::Tick(..) | ..)` let
+        // it fall through with no counter and no log, so it was
+        // indistinguishable from a genuine decode failure — and both were
+        // indistinguishable from nothing having happened.
+        let mut bytes = vec![0u8; tickvault_common::constants::OI_PACKET_SIZE];
+        bytes[0] = tickvault_common::constants::RESPONSE_CODE_OI;
+        let frames = vec![(11u64, WAL_RECEIPT_UNKNOWN_NANOS, bytes::Bytes::from(bytes))];
+        let out = refold_wal_frames(&mut ingest(), &frames);
+
+        assert_eq!(out.refolded, 0, "an OI packet carries no tick");
+        assert_eq!(out.lost, 0, "and it is NOT a loss");
+        assert_eq!(
+            out.non_tick, 1,
+            "it must be counted as what it is — the defect was that it was \
+             counted as nothing at all"
+        );
+        assert_eq!(out.undecodable, 0, "it decoded fine");
+        assert_eq!(out.unparseable, 0, "and its boundaries walked fine");
+    }
+
+    /// Every packet is accounted for in exactly one bucket.
+    ///
+    /// This is the invariant the old `if let` broke: a packet could be walked,
+    /// decoded, and then silently discarded without appearing in any total. A
+    /// count that does not add up is how loss hides.
+    #[test]
+    fn every_walked_packet_lands_in_exactly_one_bucket() {
+        // Comment-BLIND, and that is not fussiness: the replacement code carries
+        // a comment QUOTING the old swallowing `if let` so the next reader knows
+        // what was removed, and a naive scan matched its own explanation.
+        let src = strip_line_comments(include_str!("dhan_feed_stack.rs"));
+        let src = src.as_str();
+        let from = src
+            .find("\npub fn refold_wal_frames")
+            .expect("refold_wal_frames must exist");
+        let to = src[from + 1..]
+            .find("\npub fn ")
+            .map_or(src.len(), |o| from + 1 + o);
+        let body = &src[from..to];
+
+        assert!(
+            !body.contains("if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth"),
+            "the swallowing `if let` must not come back: it discarded the inline \
+             depth levels AND every decode failure, with no counter and no log"
+        );
+        assert!(
+            body.contains("Err(_) =>") && body.contains("out.undecodable"),
+            "a decode failure must be counted"
+        );
+        assert!(
+            body.contains("Ok(_non_tick) =>") && body.contains("out.non_tick"),
+            "a legitimate non-tick packet must be counted SEPARATELY, or \
+             `undecodable` silently includes ordinary OI and prev-close frames"
+        );
+        assert!(
+            body.contains("append_inline_depth("),
+            "the replay must persist the five inline depth levels the live path \
+             persists; matching `TickWithDepth(tick, _)` threw them away"
+        );
+    }
+
+    /// The replay must PERSIST the inline depth, not merely mention it.
+    ///
+    /// The source scan above proves the call is written; this proves it
+    /// produces rows. The defect was `ParsedFrame::TickWithDepth(tick, _)` —
+    /// syntactically fine, and it threw five levels away on every replayed
+    /// Full-mode packet while the live path persisted them.
+    #[test]
+    fn the_replay_persists_the_inline_depth_a_full_packet_carries() {
+        // A minimal well-formed Full-mode packet. The depth block is parsed
+        // from fixed offsets whatever it contains, so real prices are only
+        // needed where the append path would refuse a zero.
+        let mut buf = vec![0u8; tickvault_common::constants::FULL_QUOTE_PACKET_SIZE];
+        buf[0] = tickvault_common::constants::RESPONSE_CODE_FULL;
+        buf[1..3].copy_from_slice(
+            &(tickvault_common::constants::FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes(),
+        );
+        buf[3] = 0; // IDX_I
+        buf[4..8].copy_from_slice(&13u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&100.5f32.to_le_bytes()); // LTP
+        buf[14..18].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // LTT
+
+        let frames = vec![(3u64, WAL_RECEIPT_UNKNOWN_NANOS, bytes::Bytes::from(buf))];
+
+        let without = refold_wal_frames(&mut ingest(), &frames);
+        assert_eq!(
+            without.inline_depth_rows, 0,
+            "with no inline-depth sink there is nothing to append to"
+        );
+
+        let mut with_sink = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_inline_depth(DepthIngest::for_test());
+        let with = refold_wal_frames(&mut with_sink, &frames);
+
+        assert_eq!(
+            with.inline_depth_rows, 10,
+            "5 levels x 2 sides — the packet's depth must be persisted on replay, \
+             exactly as the live path persists it"
+        );
+        assert_eq!(
+            with.undecodable, 0,
+            "a well-formed Full packet is not a decode failure"
+        );
+        assert_eq!(with.non_tick, 0, "and it is not a non-tick frame");
+    }
+    /// The refold must not consult the ingest-shed gate.
+    ///
+    /// Shedding protects a LIVE session from a filling disk. A boot-time replay
+    /// of a bounded, already-captured segment is not that, and skipping it
+    /// would turn a full disk at boot into permanent loss of data we are
+    /// holding in our hand.
+    #[test]
+    fn the_replay_does_not_shed_the_depth_it_is_recovering() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let from = src
+            .find("\npub fn refold_wal_frames")
+            .expect("refold_wal_frames must exist");
+        let to = src[from + 1..]
+            .find("\npub fn ")
+            .map_or(src.len(), |o| from + 1 + o);
+        let body = &src[from..to];
+        assert!(
+            !body.contains("allows_inline_depth()"),
+            "a replay must recover what it captured; shedding here converts a \
+             boot-time disk problem into permanent loss"
+        );
+    }
+
     #[test]
     fn test_refold_wal_frames_empty_batch_recovers_nothing() {
         let out = refold_wal_frames(&mut ingest(), &[]);
@@ -15293,15 +15556,21 @@ mod wal_refold_tests {
         let out = refold_wal_frames(&mut ingest(), &[]);
         assert_eq!(out.refolded, 0);
         assert_eq!(out.lost, 0);
-        // Structural: the fold loop's match arms are disjoint by construction —
+        // Structural: the fold's match arms are disjoint by construction —
         // `Folded` increments `refolded`, every other outcome increments `lost`,
         // and there is no arm that touches both.
+        //
+        // 2026-08-28: re-anchored from `refold_wal_frames` to `refold_one_tick`.
+        // The classification moved into that helper when the caller became an
+        // exhaustive match, and this slice would otherwise have found ZERO
+        // increment sites and passed for the wrong reason — a guard that stops
+        // matching is worse than one that fails.
         let src = include_str!("dhan_feed_stack.rs");
         let body = src
-            .split("pub fn refold_wal_frames")
+            .split("fn refold_one_tick")
             .nth(1)
-            .expect("refold_wal_frames must exist");
-        let loop_body = &body[..body.find("metrics::counter!").unwrap_or(body.len())];
+            .expect("refold_one_tick must exist");
+        let loop_body = &body[..body.find("\npub fn ").unwrap_or(body.len())];
         assert_eq!(
             loop_body.matches("out.refolded = out.refolded").count(),
             1,
