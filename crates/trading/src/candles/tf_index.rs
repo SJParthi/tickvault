@@ -100,7 +100,16 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// |---|---|
 /// | **D1 (86_400 s)** | `bucket_start` returns `session_open` for the daily bar, so **every daily candle's `ts` moves 09:15 -> 09:00** |
 /// | 2m (120), 30m (1800), 60m (3600) | 900 is not a multiple of any of them |
-/// | 7s, 8s, 11s, 13s, 14s | GDF-gated, zero rows today — latent, not live |
+/// | 7s, 8s, 11s, 13s, 14s | live — see the correction below |
+///
+/// **CORRECTED before this shipped:** the row above first read "GDF-gated,
+/// zero rows today — latent, not live". That is true of the `spot_bar_store`
+/// RAM rings, which allocate capacity-1 placeholders for second-scale frames,
+/// and it is FALSE of the candle tables. `AggregatorCell` folds `TfIndex::ALL`
+/// with no `is_second_scale` filter, so all 24 frames write real
+/// `candles_<tf>` rows on the live Dhan lane. Those five grids therefore move
+/// for real, not latently. The distinction matters because "latent" is how a
+/// reader decides not to check something.
 ///
 /// Unchanged: 1s, 2s, 3s, 5s, 6s, 9s, 10s, 12s, 15s, 20s, 30s, 1m, 3m, 5m,
 /// 15m (900 divides all of them).
@@ -108,6 +117,34 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// Clock-aligned is the more conventional answer and is what every external
 /// chart shows, but it IS a change, and it is why this must land BEFORE a
 /// session opens rather than during one.
+///
+/// **THREE CONSEQUENCES BEYOND THE GRID, found by an adversarial boundary
+/// sweep and disclosed rather than discovered later.**
+///
+/// 1. **D1/M30/M60 high and low now include pre-open auction prints.** Those
+///    buckets SPAN 09:00-09:15, so the fold widens their range with auction
+///    LTPs, which can sit outside the exchange's regular-session day high/low.
+///    The `day_ohlc_tracker` stays 09:15-gated (2026-08-25 scope lock), so the
+///    D1 candle and the day-OHLC tracker CAN now legitimately disagree on high
+///    and low. Both are correct for their own question; anything comparing
+///    them must not treat the difference as an error.
+/// 2. **Pre-open bars persist `open_pct = 0.0`.** `session_open` is the
+///    exchange's `day_open`, which is 0 during the auction because no trade
+///    has printed, and `pct_change` correctly refuses a non-positive baseline.
+///    So ~15 bars per instrument per day carry a zero that means "no session
+///    open exists yet" but is indistinguishable from "flat". Semantically
+///    right, and worth knowing before reading a pre-open chart.
+/// 3. **A counter changes shape.** Roughly 400,000 ticks per session move
+///    from `refused(out_of_session)` to `folded`. Any baseline or alarm
+///    threshold derived from that counter's historical value is now measuring
+///    a different population.
+///
+/// One more, recorded because it is correct only by arithmetic coincidence:
+/// `tf_consistency_boot::is_on_grid` re-anchors to 09:00 and therefore
+/// re-classifies rows written on the OLD grid. It survives because that
+/// verifier covers M3/M5/M15 only, and 900 divides all three. Adding any
+/// frame where `900 % S != 0` to it — M2, M30, M60 — would make every
+/// historical row report `OffGridTs`.
 ///
 /// **The mid-session hazard, precisely.** The `candles_<tf>` DEDUP key is
 /// `(ts, security_id, segment, feed)` — it carries no grid identity. So a

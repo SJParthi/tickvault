@@ -947,9 +947,38 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // ONE gauge for both pools: they share the loop, so they fail together.
     // +$0.30/mo, and it backs a real gated alarm rather than being a
     // diagnostic-only name.
+    // 2026-08-28, PLUS 4: the WAL replay path. tv_wal_replay_recovered_total,
+    // tv_wal_replay_deferred_segments_total, tv_dhan_wal_refolded_total and
+    // tv_wal_replay_unknown_magic_total. The write-ahead log is the durable
+    // floor the entire zero-tick-loss claim rests on, and until now its
+    // RECOVERY side reached CloudWatch not at all -- frames staged at boot
+    // were given back, or not, and no number anyone watched moved either way.
+    //
+    // The fourth name is the one that earns the group. A binary meeting a
+    // record magic it cannot read returned Ok(vec![]) -- an empty replay,
+    // indistinguishable from a clean one -- and the segment was then staged
+    // and archived as successfully replayed. Every frame in it gone,
+    // permanently, with no payload left to count and no parse left to fail.
+    // The concrete path is a DEPLOY ROLLBACK: a TVW3 segment written this
+    // morning, read by a rolled-back binary that knows only TVW1 and TVW2.
+    // That is capture-at-receipt failing in the one direction nothing else
+    // can see, so it gets an ungated alarm (WAL replay runs at BOOT, before
+    // the market-hours gate opens -- gating it would make it structurally
+    // unable to fire on the path it exists to watch).
+    //
+    // The other three are shipped WITHOUT alarms and deliberately so: all
+    // three rise on NORMAL recovery, so an alarm on any of them pages when
+    // the system is working.
+    //
+    // +$1.30/mo. Recorded honestly rather than absorbed: this takes the
+    // maximal-month projection to ~$120.58 against the budget's automatic
+    // STOP_EC2_INSTANCES line at $117.00. The live account is far below that
+    // (Aug MTD $48.87), but the gap is now the widest it has been. Full
+    // reasoning and the two levers: dhan-rest-only-noise-lock-2026-07-14.md
+    // section 2.3j.
     assert_eq!(
         names.len(),
-        84,
+        88,
         "Z+ L2 VERIFY ratchet: expected exactly 84 names in the MAIN EMF \
          metric_selectors list (11 post-stage-4, plus the 30 failure/saturation/loss \
          names added 2026-08-09 for the metric-blindness fix, plus the 7 Dhan live-lane \
