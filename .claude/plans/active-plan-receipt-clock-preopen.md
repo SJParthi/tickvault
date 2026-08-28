@@ -99,18 +99,62 @@ Both inputs — `prev_day_close` and `session_open` — are already populated pe
 into the same `LiveCandleState`. Compute at seal time, guarded against a zero or
 non-finite previous close.
 
-### W5 — Per-minute ATM re-fit from 09:16, additive-only
+### W5 — Per-minute ATM re-fit from 09:16 ✅ ALREADY BUILT AND LIVE — this plan item was WRONG
 
-A 60-second timer on the attach task recomputes the ATM ±25 selection, diffs
-against what was sent, and forwards **only additions** through the existing
-top-up channel. Never a swap: the transport has no `send_unsubscribe`, the
-subscribe guard's instrument set is the reconnect replay, and error 805 is a
-disconnect.
+**This section previously specified work that already exists.** It is corrected
+rather than deleted, because the wrong version is the more useful record: it says
+what happens when a plan is written from a partial read instead of from the code.
 
-Measured reality, recorded so the mechanism is understood: median strike spacing
-2.63% of price, average intraday drift 0.8 strikes, worst-case 6 strikes against
-a 25-strike half-window, and 39% of ladders already fully covered. On a normal
-day this sends nothing.
+The draft read:
+
+> A 60-second timer on the attach task recomputes the ATM ±25 selection, diffs
+> against what was sent, and forwards **only additions** through the existing
+> top-up channel. Never a swap: the transport has no `send_unsubscribe`, the
+> subscribe guard's instrument set is the reconnect replay, and error 805 is a
+> disconnect.
+
+**Every load-bearing claim in that paragraph is false.** Verified in source:
+
+| The draft claimed | Source says |
+|---|---|
+| "the transport has no `send_unsubscribe`" | `crates/core/src/websocket/connection.rs:1243` `send_unsubscribe`, plus `:900` `send_unsubscribe_in_mode` |
+| "the subscribe guard has no removal API" | `pool_supervisor.rs:1405` `SubscribeGuard::try_swap`, `:1492` `SubscribeSwap` |
+| "never a swap" | `pool_supervisor.rs:1559` `LiveSubscriptionCommand::Swap { old, new }`, documented verbatim as "the per-minute at-the-money re-selection" |
+| "a 60-second timer on the attach task" | a dedicated spawned task: `depth_rebalance.rs:1125` `run_depth_rebalance`, spawned from `dhan_feed_stack.rs:6959` |
+| the re-fit is not built | it is built, wired, spawned in production, and edge-triggered |
+
+**What actually runs today**, every minute, for the session:
+
+* `run_depth_rebalance` sleeps to `REBALANCE_OFFSET_SECS = 8` past each minute —
+  not :00, deliberately: a candle seals AT the boundary and the writer needs a
+  moment, so a query at :00 reads the minute before last and the whole loop runs
+  a minute behind the market "a bug that would look exactly like normal
+  operation" (`depth_rebalance.rs:835`).
+* It reloads candidates and movers, then runs `plan_depth20_minute` for the
+  20-level windows and `plan_minute` (`Depth200AtmTracker`) for the deep sockets.
+* **Edge-triggered:** `if decision.is_quiet() { continue; }` with no log line —
+  "~375 of these a session would bury the ones that matter".
+* It runs **off the drain task**, so a slow QuestDB query cannot stall tick
+  decoding.
+* The heartbeat is stamped every iteration including quiet ones, and published by
+  a SEPARATE ticker task, because publishing from the loop would freeze the gauge
+  at its last value if the loop wedged — "a frozen zero reads as perfectly
+  healthy".
+* Counters: `tv_depth_rebalance_age_secs`, `tv_depth_rebalance_swaps_sent_total`,
+  `tv_depth_rebalance_swaps_refused_total`, all pre-registered at 0.
+
+The measured drift figures below remain accurate and remain the reason the loop
+is edge-triggered rather than unconditional: median strike spacing 2.63% of
+price, average intraday drift 0.8 strikes, worst case 6 strikes against a
+25-strike half-window, and 39% of ladders already fully covered — so on a normal
+day it sends nothing, which is exactly what `is_quiet` encodes.
+
+**The lesson, which is the part worth keeping.** This item was written from a
+grep that found no `send_unsubscribe` in the file I happened to open, and the
+conclusion "never a swap" was then built on top of it and carried into a
+published report. One `grep -rn "fn send_unsubscribe" crates/` refutes it. A
+plan item that specifies work already done is not a harmless surplus — it would
+have produced a SECOND re-fit loop racing the first one over the same sockets.
 
 ---
 
