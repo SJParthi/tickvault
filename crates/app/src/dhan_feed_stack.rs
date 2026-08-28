@@ -2534,6 +2534,47 @@ pub const TOKEN_MANAGER_WAIT_ATTEMPTS: u64 = 60;
 /// almost nothing, since the loop exits on the first success.
 pub const TOKEN_MANAGER_WAIT_INTERVAL_SECS: u64 = 5;
 
+/// How many times the WAL refold re-checks for the seal writer before
+/// refusing to fold.
+///
+/// Short by design, and the reason is the ordering it protects rather than any
+/// latency budget: this check sits BELOW the token-manager wait above, and the
+/// manager is registered only after an SSM read, a TOTP computation and an
+/// HTTPS round trip. By the time control reaches here, `main` is long past its
+/// seal-writer spawn, so the sender is already installed and the loop exits on
+/// its first look. A long wait would therefore buy nothing real -- if the
+/// sender is missing after two seconds it is missing because the writer failed
+/// to install, not because it is slow, and continuing to sleep only delays the
+/// honest refusal. 20 x 100ms = 2s.
+pub const SEAL_WRITER_WAIT_ATTEMPTS: u64 = 20;
+
+/// Milliseconds between seal-writer re-checks. Milliseconds, not seconds,
+/// because the expected wait is zero: this exists to convert an ordering that
+/// currently holds by accident into one that holds by construction, not to
+/// absorb a real delay.
+pub const SEAL_WRITER_WAIT_INTERVAL_MS: u64 = 100;
+
+/// Wall-clock budget for the boot WAL catch-up drain, in seconds.
+///
+/// Bounded by TIME rather than bytes because the constraint that actually
+/// matters is being subscribed before the market opens. On the 08:30 boot this
+/// drain begins around 08:33 -- the token-manager wait above cannot complete
+/// faster -- and `PREOPEN_READY_DEADLINE_IST_SECS` is 09:12, so five minutes
+/// leaves over half an hour of margin.
+///
+/// Running out is not a failure mode: whatever is left stays a `*.wal` file
+/// exactly as it did before this drain existed, so the loop can only ever
+/// recover MORE than the old single-batch behaviour, never less.
+pub const WAL_CATCHUP_BUDGET_SECS: u64 = 300;
+
+/// Hard round cap for the same drain, independent of the clock.
+///
+/// At `WAL_REPLAY_MAX_BYTES` (512 MiB) per round, 120 rounds is ~60 GB --
+/// roughly twice the largest backlog measured on this box (244 segments,
+/// 31 GB). It exists so a pathological condition that makes `replay_all`
+/// return non-empty forever cannot spin the boot path, not because the count
+/// itself is expected to bind.
+pub const WAL_CATCHUP_MAX_ROUNDS: u32 = 120;
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -7902,93 +7943,263 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // `capture_seq`, and the gap detector already knows every instrument, so a
     // recovered tick lands against a seeded slot rather than creating one.
     if !params.wal_replay_live_feed.is_empty() {
-        let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
-        if outcome.lost == 0 {
-            info!(
-                frames = params.wal_replay_live_feed.len(),
-                ticks = outcome.refolded,
-                "recovered live-feed frames from the write-ahead log and folded them — \
-                 ticks captured by a previous session are now in the database"
-            );
-        } else {
-            // Never silently green: a frame we could not re-fold is data we
-            // captured and then failed to save, which is exactly what this
-            // path exists to stop.
+        // ORDERING PIN -- added 2026-08-28.
+        //
+        // Every candle this refold seals goes through the seal closure, which
+        // reads `global_seal_sender()`. When that is `None` the seal is not
+        // buffered anywhere -- the absorption ring lives INSIDE
+        // `SealWriterRunner`, so before the runner exists there is no tier to
+        // absorb into -- and `escalate_refused_seal` records it as lost.
+        //
+        // Today the window is closed transitively rather than deliberately:
+        // this code sits below the token-manager wait above, and the manager
+        // is registered by `dhan_rest_stack` only after an SSM read, a TOTP
+        // computation and an HTTPS round trip, by which time `main` is long
+        // past the seal-writer spawn. That is a race won by a wide margin, not
+        // an ordering -- and it would break silently if either side moved.
+        //
+        // So it is checked. If the sender genuinely is not installed, the
+        // right move is NOT to fold into a void: refusing leaves the segments
+        // unconfirmed in `replaying/`, so the NEXT boot re-stages and re-folds
+        // them. Losing the seals AND archiving their segments -- which is what
+        // an unchecked fold would do -- is the only outcome that is
+        // unrecoverable.
+        let mut seal_writer_ready = false;
+        for attempt in 0..SEAL_WRITER_WAIT_ATTEMPTS {
+            if tickvault_storage::seal_writer_runner::global_seal_sender().is_some() {
+                if attempt > 0 {
+                    info!(
+                        waited_ms = attempt * SEAL_WRITER_WAIT_INTERVAL_MS,
+                        "WAL refold: seal writer registered — proceeding to fold"
+                    );
+                }
+                seal_writer_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                SEAL_WRITER_WAIT_INTERVAL_MS,
+            ))
+            .await;
+        }
+        if !seal_writer_ready {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "refold_no_seal_writer",
                 frames = params.wal_replay_live_feed.len(),
-                ticks = outcome.refolded,
-                lost = outcome.lost,
-                "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
+                waited_ms = SEAL_WRITER_WAIT_ATTEMPTS * SEAL_WRITER_WAIT_INTERVAL_MS,
+                "the seal writer is not installed, so any candle this refold sealed would \
+                 be dropped with nothing to absorb it. REFUSING to fold. The WAL segments \
+                 stay unconfirmed and the next boot will re-stage them — the frames are \
+                 not lost, the recovery is deferred."
+            );
+            report_unfolded_wal_frames(&params.wal_replay_live_feed, "seal_writer_missing");
+        } else {
+            let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
+            if outcome.lost == 0 {
+                info!(
+                    frames = params.wal_replay_live_feed.len(),
+                    ticks = outcome.refolded,
+                    "recovered live-feed frames from the write-ahead log and folded them — \
+                 ticks captured by a previous session are now in the database"
+                );
+            } else {
+                // Never silently green: a frame we could not re-fold is data we
+                // captured and then failed to save, which is exactly what this
+                // path exists to stop.
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    frames = params.wal_replay_live_feed.len(),
+                    ticks = outcome.refolded,
+                    lost = outcome.lost,
+                    "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
                  NOT be folded — the raw frames remain in the WAL archive and can be \
                  recovered manually",
-                outcome.lost
-            );
+                    outcome.lost
+                );
+            }
+
+            // CRASH-SAFETY CONFIRM — deliberately HERE, not at boot (2026-08-21).
+            //
+            // `confirm_replayed` moves the staged segments out of `replaying/` so
+            // they never re-stage. Its own doc says to call it "ONLY after the
+            // frames returned by `replay_all` have been durably re-captured into
+            // the live pipeline". Boot called it unconditionally, several thousand
+            // lines BEFORE this refold — the only code that makes that sentence
+            // true. Between those two points the segments sat in `archive/`,
+            // where the next boot does not look, while the frames they contained
+            // were still only in memory. A crash in that window lost them for
+            // good, and the archive pruner then deleted the raw bytes on a timer
+            // under a doc-comment asserting they were already persisted.
+            //
+            // Confirming here closes that window. If this process dies before
+            // reaching this line, the segments stay in `replaying/` and the next
+            // boot replays them again — which is idempotent, because every
+            // affected table dedups on its upsert key.
+            //
+            // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
+            // in the database, and the ones we could not are unfoldable rather
+            // than unread — re-replaying them next boot would fail identically
+            // while re-staging forever (the WS-REINJECT-01 growth-storm class).
+            // The `error!` above is what carries those, and it names the count.
+            // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
+            // default) rather than threaded through the params struct: one shared
+            // helper cannot drift out of sync with itself, whereas a second copy
+            // of the path in a struct field can.
+            // FLUSH BEFORE CONFIRMING -- added 2026-08-28.
+            //
+            // The block above says the confirm was moved here because it must run
+            // "ONLY after the frames have been durably re-captured into the live
+            // pipeline". Moving it shrank the window from several thousand lines
+            // to one. It did not CLOSE it: `refold_wal_frames` folds into an
+            // in-memory ILP buffer, and the drain that flushes that buffer is not
+            // spawned until well below this point. So "durably re-captured" still
+            // meant "buffered", and the segments were archived on the strength of
+            // it.
+            //
+            // The failure is the same one the block above describes itself
+            // fixing, one tier down: die before the drain's first flush and those
+            // frames are in `archive/`, where the next boot does not look, while
+            // their rows never reached the database. Silent and permanent.
+            //
+            // Flushing here makes the sentence true rather than nearly true. It
+            // is a boot-path call on a buffer holding at most one replay batch,
+            // so the cost is one ILP round trip before the sockets open -- and a
+            // failed flush is not silent either: `flush` counts it, logs it
+            // coded, and the rescue-to-spill tier below it still applies.
+            //
+            // Wrapped in `blocking_flush` like every other production flush: this
+            // is a boot-path call, but it is still on an async worker, and
+            // `LiveIngest::flush` flushes the inline-depth sink over blocking
+            // ILP-over-HTTP. The bare form was written first and
+            // `test_drain_never_flushes_bare_on_the_async_worker` rejected it --
+            // the guard held a line I walked into, which is what it is for.
+            let flushed = blocking_flush(|| ingest.flush());
+            tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
+            if flushed > 0 {
+                info!(
+                    rows = flushed,
+                    "flushed the re-folded WAL rows before archiving their segments — \
+                 the recovered ticks are in the database, not just buffered"
+                );
+            }
         }
 
-        // CRASH-SAFETY CONFIRM — deliberately HERE, not at boot (2026-08-21).
+        // ---- CATCH-UP DRAIN --------------------------------------------
         //
-        // `confirm_replayed` moves the staged segments out of `replaying/` so
-        // they never re-stage. Its own doc says to call it "ONLY after the
-        // frames returned by `replay_all` have been durably re-captured into
-        // the live pipeline". Boot called it unconditionally, several thousand
-        // lines BEFORE this refold — the only code that makes that sentence
-        // true. Between those two points the segments sat in `archive/`,
-        // where the next boot does not look, while the frames they contained
-        // were still only in memory. A crash in that window lost them for
-        // good, and the archive pruner then deleted the raw bytes on a timer
-        // under a doc-comment asserting they were already persisted.
+        // The block above replays ONE batch: `replay_all` stops at
+        // `WAL_REPLAY_MAX_BYTES` (512 MiB) because it accumulates every frame
+        // into a single `Vec` before returning, and a 32 GiB box shared with
+        // QuestDB cannot hold more than that at once.
         //
-        // Confirming here closes that window. If this process dies before
-        // reaching this line, the segments stay in `replaying/` and the next
-        // boot replays them again — which is idempotent, because every
-        // affected table dedups on its upsert key.
+        // A session writes far more than 512 MiB of WAL -- measured on this box
+        // at 244 segments, 31 GB -- so ONE batch recovers roughly 1.6% of a
+        // backlog. Everything past it stays a `*.wal` file, is never reached by
+        // the next boot either (which also stops at 512 MiB), and is eventually
+        // deleted by the age or byte prune. The backlog could never drain, so
+        // stranded frames were guaranteed to be destroyed rather than merely at
+        // risk.
         //
-        // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
-        // in the database, and the ones we could not are unfoldable rather
-        // than unread — re-replaying them next boot would fail identically
-        // while re-staging forever (the WS-REINJECT-01 growth-storm class).
-        // The `error!` above is what carries those, and it names the count.
-        // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
-        // default) rather than threaded through the params struct: one shared
-        // helper cannot drift out of sync with itself, whereas a second copy
-        // of the path in a struct field can.
-        // FLUSH BEFORE CONFIRMING -- added 2026-08-28.
+        // Draining in ROUNDS fixes that without touching the RAM bound: replay a
+        // batch, fold it, flush it, confirm it, and go round again. Peak memory
+        // stays one batch; what changes is that the loop keeps going until the
+        // backlog is gone.
         //
-        // The block above says the confirm was moved here because it must run
-        // "ONLY after the frames have been durably re-captured into the live
-        // pipeline". Moving it shrank the window from several thousand lines
-        // to one. It did not CLOSE it: `refold_wal_frames` folds into an
-        // in-memory ILP buffer, and the drain that flushes that buffer is not
-        // spawned until well below this point. So "durably re-captured" still
-        // meant "buffered", and the segments were archived on the strength of
-        // it.
+        // Bounded by WALL CLOCK, not by bytes, because the thing that actually
+        // matters is being subscribed before the market opens. On the 08:30 boot
+        // this code runs at roughly 08:33 (the token-manager wait above cannot
+        // complete faster), and `PREOPEN_READY_DEADLINE_IST_SECS` is 09:12 -- so
+        // a 5-minute drain leaves over half an hour of margin. If the budget runs
+        // out, whatever is left stays a `*.wal` file exactly as before: this can
+        // only recover more than the old code, never less.
         //
-        // The failure is the same one the block above describes itself
-        // fixing, one tier down: die before the drain's first flush and those
-        // frames are in `archive/`, where the next boot does not look, while
-        // their rows never reached the database. Silent and permanent.
+        // On a normal day it does nothing at all. A session with no ring sheds
+        // leaves no backlog, the first `replay_all` returns empty, and the loop
+        // exits without a single round -- which is what 21, 27 and 28 August all
+        // looked like (`tv_dhan_ws_ring_full_total` = 0).
         //
-        // Flushing here makes the sentence true rather than nearly true. It
-        // is a boot-path call on a buffer holding at most one replay batch,
-        // so the cost is one ILP round trip before the sockets open -- and a
-        // failed flush is not silent either: `flush` counts it, logs it
-        // coded, and the rescue-to-spill tier below it still applies.
-        //
-        // Wrapped in `blocking_flush` like every other production flush: this
-        // is a boot-path call, but it is still on an async worker, and
-        // `LiveIngest::flush` flushes the inline-depth sink over blocking
-        // ILP-over-HTTP. The bare form was written first and
-        // `test_drain_never_flushes_bare_on_the_async_worker` rejected it --
-        // the guard held a line I walked into, which is what it is for.
-        let flushed = blocking_flush(|| ingest.flush());
-        tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
-        if flushed > 0 {
-            info!(
-                rows = flushed,
-                "flushed the re-folded WAL rows before archiving their segments — \
-                 the recovered ticks are in the database, not just buffered"
+        // Placed AFTER the first batch deliberately: the aggregator is seeded
+        // once, above, and every round folds against that same seeded state.
+        let catchup_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(WAL_CATCHUP_BUDGET_SECS);
+        let mut rounds = 0u32;
+        let mut catchup_frames = 0usize;
+        let mut catchup_ticks = 0u64;
+        while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
+            let wal_dir = crate::boot_helpers::ws_wal_dir();
+            let batch = match tickvault_storage::ws_frame_spill::replay_all(&wal_dir) {
+                Ok(b) => b,
+                Err(err) => {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "wal_catchup_replay_failed",
+                        round = rounds,
+                        error = %err,
+                        "the WAL catch-up drain could not read another batch. Stopping the \
+                         drain -- whatever is left stays on disk for the next boot."
+                    );
+                    break;
+                }
+            };
+            if batch.is_empty() {
+                break;
+            }
+            let staged: Vec<(u64, i64, bytes::Bytes)> = batch
+                .into_iter()
+                .filter(|f| f.ws_type == tickvault_storage::ws_frame_spill::WsType::LiveFeed)
+                .map(|f| {
+                    (
+                        f.frame_seq,
+                        f.received_at_nanos,
+                        bytes::Bytes::from(f.frame),
+                    )
+                })
+                .collect();
+            if staged.is_empty() {
+                // Nothing this lane folds, but the segments WERE consumed and
+                // staged -- confirm so the loop cannot spin on them forever.
+                tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
+                rounds = rounds.saturating_add(1);
+                continue;
+            }
+            let outcome = refold_wal_frames(&mut ingest, &staged);
+            let flushed = blocking_flush(|| ingest.flush());
+            tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
+            catchup_frames = catchup_frames.saturating_add(staged.len());
+            catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
+            rounds = rounds.saturating_add(1);
+            if outcome.lost > 0 {
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "wal_catchup_unfolded",
+                    round = rounds,
+                    frames = staged.len(),
+                    lost = outcome.lost,
+                    "the WAL catch-up drain could not fold {} tick(s) in this round",
+                    outcome.lost
+                );
+            }
+            tracing::debug!(
+                round = rounds,
+                frames = staged.len(),
+                ticks = outcome.refolded,
+                rows_flushed = flushed,
+                "WAL catch-up drain round complete"
             );
+        }
+        if rounds > 0 {
+            let exhausted =
+                tokio::time::Instant::now() >= catchup_deadline || rounds >= WAL_CATCHUP_MAX_ROUNDS;
+            info!(
+                rounds,
+                frames = catchup_frames,
+                ticks = catchup_ticks,
+                budget_exhausted = exhausted,
+                "WAL catch-up drain finished — recovered a backlog that a single \
+                 512 MiB replay batch could never have reached"
+            );
+            if exhausted {
+                metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(1);
+            }
         }
     }
 
@@ -13193,15 +13404,22 @@ mod tests {
         // total: `flush_and_record` must still contain exactly TWO, so the
         // helper cannot be inlined back into the drain and a drain flush
         // cannot bypass it — regardless of how many boot-path flushes exist.
-        assert_eq!(
-            wrapped, 3,
-            "expected exactly THREE wrapped ingest.flush() calls — the two \
-             arms of `flush_and_record` plus the boot-path flush that precedes \
-             `confirm_replayed`. Found {wrapped}: a flush site was added or \
-             removed without updating this pin"
-        );
-        // The real invariant, independent of the total above: both DRAIN
-        // flushes live inside the one helper.
+        //
+        // 2026-08-28 (SECOND time the same day): the exact total needed
+        // bumping again, for the boot catch-up drain. Twice in one session is
+        // the signal that the TOTAL was never the invariant -- it was a proxy
+        // for one, and a proxy that has to be edited every time a legitimate
+        // flush is added is a proxy that will eventually be edited past the
+        // thing it was standing in for.
+        //
+        // So it is replaced by the property itself, stated directly: every
+        // wrapped flush is EITHER inside `flush_and_record` OR on the boot
+        // path above the drain wiring. A new BOOT flush is then free; a new
+        // DRAIN flush outside the helper fails here, which is the only case
+        // that was ever dangerous.
+        //
+        // The choke point itself, checked first because the loop below needs
+        // the helper bounds: both DRAIN flushes live inside the one helper.
         let helper_start = production_half
             .find("fn flush_and_record")
             .expect("flush_and_record must exist");
@@ -13219,6 +13437,20 @@ mod tests {
              was inlined back into the drain (which re-opens the \
              four-sites-to-keep-in-sync problem) or a drain flush bypassed it"
         );
+        let drain_wiring_at = production_half
+            .find("let (frame_tx, frame_rx)")
+            .expect("the drain's channel wiring must exist — it is the boot/drain boundary");
+        for (idx, _) in production_half.match_indices("blocking_flush(|| ingest.flush())") {
+            let in_helper = idx > helper_start && idx < helper_end;
+            let on_boot_path = idx < drain_wiring_at;
+            assert!(
+                in_helper || on_boot_path,
+                "a wrapped ingest.flush() at byte offset {idx} sits on the DRAIN and \
+                 outside `flush_and_record`. Every drain flush must route through the \
+                 helper — that single choke point is the only thing that can keep the \
+                 blocking call and the feed-health report in step"
+            );
+        }
         let recorded_sites = production_half
             .matches("flush_and_record(&mut ingest, &feed_health)")
             .count();

@@ -175,7 +175,26 @@ fn record_cycle_observability(outcome: &CycleOutcome, dropped_this_cycle: u64) {
     if dropped_this_cycle > 0 {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped")
             .increment(dropped_this_cycle);
-        // The CycleOutcome contract: truly-dropped seals (ring + spill +
+        // A SECOND, UNLABELLED counter for the same event -- added 2026-08-28,
+        // and it is not duplication.
+        //
+        // `tv-<env>-seal-writer-dropped` is meant to be the redundant
+        // metric-side pager for this exact loss, so a sealed candle still pages
+        // when the log-filter leg is degraded (the 2026-07-06 class). Its
+        // `metric_name` was `tv_seal_writer_drain_dropped_total` -- a name with
+        // ZERO producers anywhere in the workspace -- while its own description
+        // said it read `tv_seal_writer_drain_total kind=dropped`. The field and
+        // the description disagreed, and the field is the half AWS reads, so the
+        // redundancy it promised never existed and the alarm has been
+        // permanently green since it shipped.
+        //
+        // Pointing the alarm at the labelled counter instead would be WORSE than
+        // leaving it dead: the EMF processor folds label values into one summed
+        // series per host, so `tv_seal_writer_drain_total` in CloudWatch is
+        // submitted + flushed_rows + rescued_spill + rescued_dlq + dropped --
+        // dominated by successes, and a `>= 1` threshold on it would fire on
+        // every healthy cycle. A drop needs its own name to be visible at all.
+        metrics::counter!("tv_seal_writer_drain_dropped_total").increment(dropped_this_cycle);
         // DLQ all failed) MUST fire AGGREGATOR-DROP-01 — silent data loss
         // for a sealed candle is the ONLY thing this code path can mean.
         error!(

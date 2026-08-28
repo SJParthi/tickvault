@@ -1014,10 +1014,56 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // it has been -- stated rather than absorbed. Levers unchanged: the
     // already-approved Elastic IP release (-$3.60/mo) alone puts the maximal
     // month back under the line.
+    // 2026-08-28 (THIRD, same day): 92 -> 93, tv_seal_writer_drain_dropped_total.
+    //
+    // `tv-<env>-seal-writer-dropped` exists to be the METRIC-side pager for a
+    // sealed candle lost after ring + spill + DLQ all failed -- redundant with
+    // the errcode-aggregator-drop-01 log-filter alarm precisely so the loss
+    // still pages when one shipping leg is degraded (the 2026-07-06 class).
+    // Its `metric_name` field named `tv_seal_writer_drain_dropped_total`, a
+    // name with ZERO producers anywhere in the workspace, while its own
+    // alarm_description said it read `tv_seal_writer_drain_total kind=dropped`.
+    // The description and the field disagreed; AWS reads the field. So the
+    // redundancy it promised was never wired, and the alarm has been
+    // permanently green since it shipped.
+    //
+    // Repointing the alarm at the labelled counter would have been WORSE than
+    // leaving it dead: EMF folds label values into one summed series, so
+    // `tv_seal_writer_drain_total` is submitted + flushed_rows + rescued_spill
+    // + rescued_dlq + dropped -- dominated by successes, and a `>= 1` threshold
+    // on it would fire every healthy cycle. The drop needed its own unlabelled
+    // name to be visible at all, and now has one.
+    //
+    // ⚠ WHY THIS GUARD DID NOT CATCH IT, recorded because the hole outlives the
+    // fix. `test_every_alarm_metric_has_a_rust_emit_site` reads exactly TWO
+    // terraform files -- app-alarms.tf and silent-feed-alarms.tf -- while
+    // alarms live across roughly twenty. `seal-drop-alarm.tf` was never
+    // scanned. That is the same one-file/one-prefix scope hole the dashboard
+    // visibility guard was widened for days earlier: a guard that checks a
+    // SUBSET reads exactly like a guard that checks everything.
+    //
+    // Widening it to glob every `*.tf` was ATTEMPTED in this change and backed
+    // out, because it surfaces a genuine second-order problem rather than a
+    // list of real defects: many alarm metrics correctly have no Rust emit site
+    // (terraform mints them from log metric filters via
+    // `metric_transformation`), and `is_metric_emitted` additionally matches
+    // only STRING LITERALS inside a `counter!` call, so any metric emitted
+    // through a `const &str` reads as missing. Deriving the first is clean;
+    // resolving the second needs constant resolution, not a string scan. Both
+    // belong in a change of their own -- wedging them in here would have meant
+    // shipping either a red build or a broad allowlist, and an allowlist is how
+    // a guard stops guarding.
+    //
+    // +$0.30/mo. Maximal-month projection ~$121.48 -> ~$121.78 against the
+    // automatic STOP_EC2_INSTANCES line at $117.00. Same two levers, unchanged.
     assert_eq!(
         names.len(),
-        92,
-        "Z+ L2 VERIFY ratchet: expected exactly 92 names in the MAIN EMF \
+        93,
+        "Z+ L2 VERIFY ratchet: expected exactly 93 names in the MAIN EMF \
+         (2026-08-28 THIRD: 92 -> 93, tv_seal_writer_drain_dropped_total -- the \
+         seal-writer-dropped alarm named a metric with zero producers, so the \
+         redundant pager it promised for permanent sealed-candle loss was never \
+         wired; see the block above, incl. why this guard missed it. \
          (2026-08-28 SECOND: 89 -> 92, tv_candle_tick_discarded_late_total + \
          tv_aggregator_slot_exhausted_total + tv_dhan_feed_abandoned_bytes_total \
          -- see the block above; the late-discard counter alone read 51,227,651 \

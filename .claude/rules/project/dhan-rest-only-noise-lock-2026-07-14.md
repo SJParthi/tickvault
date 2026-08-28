@@ -1557,3 +1557,83 @@ $61.51, measured 2026-08-25), so nothing fires today — but the maximal-month
 arithmetic crosses the line and widens with each addition. Unchanged levers,
 neither taken here: the already-approved Quote 10 Elastic IP release
 (−$3.60/mo), or an operator decision on `limit_amount`.
+
+### §2.3k — 2026-08-28: the gates paged five "recovered" messages every trading morning, for alarms that were never broken
+
+**The operator demand this answers (2026-08-27/28, typed directly in-session —
+preserve EXACTLY, expletives and typos included):**
+
+> "why and how the fuck this fuckign issues or rerros rot elgram issues telegram ntoifications occurign always"
+
+Repeated the following day. This dated row records a change that REMOVES
+pages; §3's REJECT list governs ADDING them, so no new authorization is
+claimed — but an alerting-behaviour change gets recorded either way, because
+the next reader needs to know why a "recovered" message they used to see every
+morning stopped arriving.
+
+#### The mechanism, verified in source
+
+Both window gates do the same two things in the same wrong order.
+`market_hours_gate.rs` (`OpenDecision::Enable`) and `alarm_gate.rs`
+(`GateMode::Open`) each call:
+
+1. `enable_alarm_actions()`
+2. `set_alarm_state(OK)` — "so a stale ALARM from a prior window does not
+   immediately re-fire on the first enabled evaluation"
+
+AWS executes an alarm's actions on `SetAlarmState` **when the new state
+differs from the previous one**. So the sequence every trading day is:
+
+| When | What | Result |
+|---|---|---|
+| 17:30 | box stops; no data all night | — |
+| overnight | `treat_missing_data = "breaching"` → alarm enters ALARM | no page (actions disabled — correct) |
+| 09:20 | gate ENABLES actions | stale ALARM now has live actions |
+| 09:20 | gate resets to OK — state DIFFERS | **`ok_actions` fires → Telegram** |
+
+Five gated alarms are both `breaching` and carry `ok_actions`, verified per
+alarm: `dhan_live_lane_down`, `dhan_no_ticks_flowing`, `depth_steering_stalled`
+(all `live-lane-alarms.tf`), `market_hours_liveness_missing`
+(`market-hours-liveness-alarm.tf`), `app_log_ingestion_silent`
+(`log-retention.tf`). That is **five "✅ recovered" messages at the same minute
+every trading morning** — roughly 110 a month — reporting recovery from a
+condition that was the box being switched off overnight, exactly as scheduled.
+
+#### The fix, and why it is the ordering rather than the `ok_actions`
+
+The obvious fix is to drop `ok_actions` on those five. It is the WRONG fix: it
+would also silence the genuine case, where one of these alarms fires
+mid-session and then really does recover — which is a signal the operator
+wants.
+
+The gates now **reset to OK first, then enable actions**. The state change
+happens while actions are still disabled, so it pages nobody, and the alarm
+begins its enabled life already in OK — which is what the original comment
+says it wanted. Every alarm keeps its `ok_actions` and every real in-session
+recovery still pages.
+
+This also closes a second, quieter hole in the same two statements: enabling
+first leaves a window in which a stale ALARM has LIVE actions, so the old
+order could fire a spurious ALARM page as well as the spurious OK. Resetting
+first removes both.
+
+#### What this does NOT do (Rule 11)
+
+- It does not reduce the page count of a REAL incident. The five alarms above
+  still fire, and still send their recovery.
+- It does not touch the larger finding from the same sweep: **ALARM records are
+  never deduplicated anywhere between CloudWatch and Telegram.** The Lambda's
+  `should_suppress_ok` cache covers OK only, by an explicit never-drop law, so
+  one flapping alarm still pages once per flap — `risk-gap-03` produced 25
+  pages in a single session, recorded verbatim in `error-code-alarms.tf`.
+  Changing that means editing a law written in capitals and belongs in its own
+  change with its own row.
+- It does not remove the four dead monitors found by the same sweep
+  (`seal_writer_dropped`, `order_fill_lag_high`, `orders_placed_storm`,
+  `api_auth_failed` — each alarms a metric with no producer or no EMF entry, so
+  none can ever fire). They cost no pages; they cost false confidence.
+
+**What a PR that violates §2.3k looks like (REJECT):** restores
+`enable_alarm_actions` before `set_alarm_state` in either gate; drops
+`ok_actions` from the five alarms above as an alternative fix (it silences the
+real recovery too); or removes the guard pinning the order.
