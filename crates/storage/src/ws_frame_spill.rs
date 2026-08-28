@@ -46,12 +46,12 @@ use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are 
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
 
@@ -310,6 +310,59 @@ const WAL_WRITER_RESPAWN_BACKOFF: Duration = Duration::from_millis(200); // APPR
 /// WAL floor for a transient I/O hiccup.
 const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50); // APPROVED: this IS the named constant the rule asks for
 
+/// How long the writer blocks on an EMPTY channel before re-checking the
+/// shutdown flag.
+///
+/// The loop used a plain blocking `recv()`, whose only wake-up was a record
+/// arriving or every sender being dropped. Neither can happen at shutdown: the
+/// sender lives inside `WsFrameSpill`, which is held in an `Arc` shared with
+/// the drain paths, so nothing can drop it, and by shutdown no more frames are
+/// arriving. A timed receive is what gives the thread a chance to notice that
+/// it has been asked to stop.
+///
+/// 200 ms is chosen for what it costs when NOTHING is happening: four
+/// wake-ups a second on an otherwise idle thread. While frames ARE flowing the
+/// timeout never fires, so the hot path is byte-identical to the blocking form.
+const WAL_WRITER_STOP_POLL: Duration = Duration::from_millis(200); // APPROVED: this IS the named constant the rule asks for
+
+/// How often [`WsFrameSpill::shutdown`] re-checks the queue and the thread.
+const WAL_SHUTDOWN_POLL: Duration = Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
+
+/// Seconds `main` gives the WAL spill's final drain before abandoning it.
+///
+/// Sized small on purpose. By the time this runs the sockets are shut and the
+/// lane is joined, so the queue holds only what the writer had not yet reached
+/// — at the 5,000 fps envelope the writer clears a full 524,288-slot channel in
+/// well under a second of disk time. Ten seconds is therefore a stall budget,
+/// not a throughput budget: it covers a writer parked in
+/// [`WAL_WRITER_IO_RETRY_BACKOFF`] against a briefly-wedged disk, and refuses
+/// to hold the process any longer than that, because systemd's `TimeoutStopSec`
+/// escalates to SIGKILL and a SIGKILL loses the very records this is here to
+/// save.
+///
+/// Counted in the sequential sum that
+/// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs` checks against the
+/// unit file — a third budget on the same path is exactly the kind of addition
+/// that guard exists to catch.
+pub const WAL_SPILL_SHUTDOWN_BUDGET_SECS: u64 = 10;
+
+/// [`WAL_SPILL_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
+pub const WAL_SPILL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(WAL_SPILL_SHUTDOWN_BUDGET_SECS);
+
+/// Records still queued when the final drain was abandoned — i.e. frames that
+/// were captured, acknowledged as `Spilled`, and then lost with the process.
+///
+/// Non-zero means the durable floor did not hold for that shutdown. It is the
+/// WAL-side twin of `tv_offload_writer_shutdown_incomplete_total`, which counts
+/// the same class for the tick and depth ILP writers; the WAL is the one tier
+/// that had no such counter, which is why an abandoned queue here was invisible.
+///
+/// Deliberately a RECORD count, not an episode count: unlike the offload
+/// writers — whose in-flight batches are ILP buffers whose row counts were
+/// consumed when they were sent — the channel can be asked its exact length, so
+/// there is a real number to report and no need to fabricate one.
+pub const WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER: &str = "tv_wal_spill_shutdown_incomplete_total";
+
 // ---------------------------------------------------------------------------
 // WsFrameSpill
 // ---------------------------------------------------------------------------
@@ -427,6 +480,20 @@ pub struct WsFrameSpill {
     /// `None` keeps the spill feed-health-agnostic (byte-identical hot path).
     /// Read ONLY in the cold drop arms; never on the hot `Spilled` path.
     feed_health: Option<Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
+    /// Set once by [`WsFrameSpill::shutdown`]. The writer exits cleanly the
+    /// first time it finds this set AND the channel empty — which is the only
+    /// way this thread can be asked to stop, because the sole `Sender` lives in
+    /// this struct and the struct is shared through an `Arc` that nothing can
+    /// drop while a drain path still holds it.
+    stop: Arc<AtomicBool>,
+    /// The writer's join handle, so the final drain can WAIT for it instead of
+    /// letting the process exit out from under it.
+    ///
+    /// Behind a `Mutex<Option<..>>` rather than owned by value because
+    /// `shutdown` is reached through the same `Arc<WsFrameSpill>` the append
+    /// paths hold: there is no `self` to consume. The lock is taken exactly
+    /// once, at shutdown, and never on the append path.
+    writer: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
     /// The exclusive claim on the WAL directory, held for as long as this spill
     /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
     /// release it on drop so the next process can start. See [`WalDirGuard`].
@@ -509,7 +576,17 @@ impl WsFrameSpill {
 
         let persisted_for_thread = persisted_total.clone(); // APPROVED: Arc clone in the one-shot constructor
         let wal_dir_for_thread = wal_dir.clone(); // APPROVED: one-shot constructor, not per-frame
-        thread::Builder::new()
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop); // APPROVED: Arc clone in the one-shot constructor
+
+        // Register the abandoned-records series at zero. The CloudWatch agent
+        // computes counter deltas and DROPS the first sample of a series it has
+        // never seen, so a counter that only ever increments on the bad day
+        // would publish nothing on the bad day. Seeding here is what makes a
+        // clean shutdown provable rather than merely unreported.
+        metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(0);
+
+        let writer = thread::Builder::new()
             .name("ws-frame-spill-writer".to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
@@ -521,7 +598,12 @@ impl WsFrameSpill {
                 // outlives any panic, keeping the channel alive across respawns.
                 loop {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        writer_loop(&rx, &wal_dir_for_thread, &persisted_for_thread)
+                        writer_loop(
+                            &rx,
+                            &wal_dir_for_thread,
+                            &persisted_for_thread,
+                            &stop_for_thread,
+                        )
                     }));
                     match outcome {
                         Ok(Ok(())) => {
@@ -564,6 +646,8 @@ impl WsFrameSpill {
             persisted_total,
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
+            stop,
+            writer: std::sync::Mutex::new(Some(writer)),
             _dir_guard: dir_guard,
         })
     }
@@ -607,6 +691,8 @@ impl WsFrameSpill {
             persisted_total: Arc::new(AtomicU64::new(0)),
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            writer: std::sync::Mutex::new(None),
             _dir_guard: dir_guard,
         }
     }
@@ -762,16 +848,146 @@ impl WsFrameSpill {
     pub fn persisted_count(&self) -> u64 {
         self.persisted_total.load(Ordering::Relaxed)
     }
+
+    /// Records still sitting in the writer's queue right now.
+    ///
+    /// This is the size of the loss window an abrupt exit would take: `append`
+    /// returns [`AppendOutcome::Spilled`] the instant a record is QUEUED, and
+    /// the writer thread is what turns queued into bytes.
+    #[must_use]
+    pub fn queued_records(&self) -> usize {
+        self.spill_tx.len()
+    }
+
+    /// Drain the writer's queue and stop it, bounded by `budget`.
+    ///
+    /// # The hole this closes
+    ///
+    /// The writer thread was spawned and DETACHED — its `JoinHandle` was
+    /// discarded at the `map_err`. Nothing waited for it, and nothing could:
+    /// the only `Sender` lives in this struct, the struct is shared through an
+    /// `Arc` the drain paths hold, so the channel could never close and the
+    /// thread never had a reason to exit. At shutdown the process simply ended
+    /// while up to [`SPILL_CHANNEL_CAPACITY`] records — 524,288, ~100 s of
+    /// frames at the 5,000 fps envelope — sat unwritten.
+    ///
+    /// Every one of those was already reported to its caller as `Spilled`, and
+    /// counted by nothing on the way out: `persisted_total` counts `write_all`
+    /// and `drop_critical` counts only what `try_send` refused outright. So the
+    /// durable floor — the guarantee the whole ring → spill → WAL chain rests
+    /// on — had an unmeasured hole at exactly the moment it was most likely to
+    /// matter. The tick and depth ILP writers had this fixed on 2026-08-28
+    /// (`tv_offload_writer_shutdown_incomplete_total`); the WAL itself did not.
+    ///
+    /// # Ordering
+    ///
+    /// Call this AFTER the sockets are closed and the lane is joined, or the
+    /// queue is still being filled while this waits on it.
+    ///
+    /// # What it does not promise
+    ///
+    /// Returns the number of records still queued when the budget expired —
+    /// `0` for a clean drain. A non-zero return is a real, permanent loss and
+    /// says so, at `error!` and on
+    /// [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`]; it is reported rather than
+    /// waited out because systemd's `TimeoutStopSec` escalates to SIGKILL, and
+    /// a SIGKILL loses strictly more.
+    ///
+    /// Even a `0` return leaves the `write_all`-not-`fsync` residual: the exit
+    /// flush pushes the 256 KiB `BufWriter` into the page cache, not onto the
+    /// platter. That is the same durability boundary the whole module has
+    /// always had (there is no `fsync` anywhere in this file) and this method
+    /// deliberately does not claim to have changed it.
+    pub fn shutdown(&self, budget: Duration) -> usize {
+        self.stop.store(true, Ordering::Release);
+
+        let deadline = Instant::now() + budget;
+
+        // Phase 1: wait for the queue itself to empty. This is the number that
+        // matters — a record still in the channel has not been written at all.
+        while !self.spill_tx.is_empty() && Instant::now() < deadline {
+            thread::sleep(WAL_SHUTDOWN_POLL);
+        }
+        let queued = self.spill_tx.len();
+
+        // Phase 2: wait for the thread to notice, flush, and exit. Polled
+        // rather than joined outright: a writer parked in
+        // `WAL_WRITER_IO_RETRY_BACKOFF` against a wedged disk must not hold the
+        // process past the budget, and a blocking `join` has no timeout.
+        if let Ok(mut slot) = self.writer.lock()
+            && let Some(handle) = slot.take()
+        {
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(WAL_SHUTDOWN_POLL);
+            }
+            if handle.is_finished() {
+                // Only join a thread that has already finished, so this cannot
+                // block. A panic that reaches the handle is reported rather
+                // than swallowed: the supervisor catches panics and respawns,
+                // so a panic arriving HERE means the supervisor loop itself is
+                // over — the writer is gone and anything still queued is lost.
+                if handle.join().is_err() {
+                    error!(
+                        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                        "WAL spill writer PANICKED out of its supervisor loop during shutdown"
+                    );
+                }
+            } else {
+                // Deliberately abandoned. Put nothing back in the slot — the
+                // handle is dropped, the thread is detached, and the process is
+                // about to exit anyway.
+                warn!(
+                    budget_secs = budget.as_secs(),
+                    queued,
+                    "WAL spill writer did not exit within the shutdown budget — abandoning it"
+                );
+            }
+        }
+
+        if queued > 0 {
+            metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(queued as u64);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                queued,
+                budget_secs = budget.as_secs(),
+                "WAL spill: the final drain was ABANDONED with records still queued — these \
+                 frames were captured and acknowledged but never written; they are gone"
+            );
+        } else {
+            info!(
+                persisted = self.persisted_count(),
+                "WAL spill: final drain complete on shutdown; queue empty"
+            );
+        }
+
+        queued
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Background writer thread
 // ---------------------------------------------------------------------------
 
+/// Flush and close the current segment on the way out of [`writer_loop`].
+///
+/// Shared by the two exit arms so a future third one cannot quietly forget the
+/// flush: `persist_record_resilient` counts a record as persisted when
+/// `write_all` lands it in the 256 KiB `BufWriter`, not when the buffer reaches
+/// the platter, so dropping an unflushed writer loses records that
+/// `persisted_count()` has already claimed.
+fn flush_on_exit(current: &mut Option<BufWriter<File>>, stage: &'static str) {
+    if let Some(mut w) = current.take()
+        && let Err(err) = w.flush()
+    {
+        report_io_error(stage, &err);
+    }
+}
+
 fn writer_loop(
     rx: &Receiver<WalRecord>,
     wal_dir: &Path,
     persisted: &AtomicU64,
+    stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     // `None` = no open segment; the next record reopens one. A transient disk
     // error sets this back to `None` instead of propagating out of the thread.
@@ -794,30 +1010,43 @@ fn writer_loop(
     // 2026-08-28.
     depth_gauge.set(0.0);
     high_water_gauge.set(0.0);
-
     loop {
-        // Block until at least one record arrives. Exit cleanly (and ONLY here)
-        // when all senders are dropped — that is the clean-shutdown signal.
-        let first = match rx.recv() {
+        // Timed, not blocking, so the thread can notice a shutdown request.
+        //
+        // The clean exit used to be reachable ONLY by every `Sender` being
+        // dropped. That can never happen here: the sole sender lives inside
+        // `WsFrameSpill`, which the drain paths hold through an `Arc`, so the
+        // channel stays open for the life of the process and the writer stayed
+        // parked in `recv()` while the process exited around it. Everything
+        // still queued went with it — captured, acknowledged as `Spilled`, and
+        // counted by nothing. This arm is what ends that.
+        let first = match rx.recv_timeout(WAL_WRITER_STOP_POLL) {
             Ok(r) => r,
-            Err(_) => {
-                if let Some(mut w) = current.take() {
-                    // Reported, not discarded. This was `drop(w.flush())`, and
-                    // the buffer it drops is `WAL_WRITER_BUFFER` = 256 KiB --
-                    // roughly 1,300 records that `persisted` has ALREADY
-                    // counted, because `persist_record_resilient` increments on
-                    // a successful `write_all` into the buffer, not on a
-                    // successful flush to the platter.
-                    //
-                    // So the old form did two wrong things at once: it lost the
-                    // records, and it left `persisted_count()` over-reporting by
-                    // exactly the number it lost. The sibling flush thirty lines
-                    // below has always called `report_io_error` -- this arm and
-                    // the rotation arm were the two that did not.
-                    if let Err(err) = w.flush() {
-                        report_io_error("flush_on_close", &err);
-                    }
+            Err(RecvTimeoutError::Timeout) => {
+                // Empty channel by construction — `recv_timeout` only times out
+                // when nothing arrived. So a stop request that reaches here has
+                // a fully drained queue behind it and it is safe to close.
+                if stop.load(Ordering::Acquire) {
+                    flush_on_exit(&mut current, "flush_on_stop");
+                    info!("ws-frame-spill-writer stop requested and queue drained; exiting");
+                    return Ok(());
                 }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // Reported, not discarded. This was `drop(w.flush())`, and
+                // the buffer it drops is `WAL_WRITER_BUFFER` = 256 KiB --
+                // roughly 1,300 records that `persisted` has ALREADY
+                // counted, because `persist_record_resilient` increments on
+                // a successful `write_all` into the buffer, not on a
+                // successful flush to the platter.
+                //
+                // So the old form did two wrong things at once: it lost the
+                // records, and it left `persisted_count()` over-reporting by
+                // exactly the number it lost. The sibling flush thirty lines
+                // below has always called `report_io_error` -- this arm and
+                // the rotation arm were the two that did not.
+                flush_on_exit(&mut current, "flush_on_close");
                 info!("ws-frame-spill-writer channel closed; exiting");
                 return Ok(());
             }
@@ -2876,6 +3105,128 @@ mod tests {
             "spill did not persist {} frames (got {})",
             target,
             spill.persisted_count()
+        );
+    }
+
+    /// C1: the writer's queue is DRAINED at shutdown, not abandoned.
+    ///
+    /// Before this the thread was detached and unreachable: the only `Sender`
+    /// lives inside `WsFrameSpill`, held through an `Arc`, so the channel could
+    /// never close and the thread never had a reason to exit. Everything queued
+    /// died with the process, already acknowledged to its caller as `Spilled`
+    /// and counted by nothing.
+    #[test]
+    fn shutdown_drains_the_queue_and_joins_the_writer() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+
+        for i in 0..500u32 {
+            assert!(matches!(
+                spill.append(WsType::LiveFeed, i.to_le_bytes().to_vec()),
+                AppendOutcome::Spilled
+            ));
+        }
+
+        let abandoned = spill.shutdown(Duration::from_secs(5));
+
+        assert_eq!(abandoned, 0, "a healthy drain must abandon nothing");
+        assert_eq!(
+            spill.persisted_count(),
+            500,
+            "every queued record must be written before the drain reports clean"
+        );
+        assert_eq!(spill.queued_records(), 0, "queue must be empty after drain");
+    }
+
+    /// The records must actually be ON DISK — a drain that merely emptied the
+    /// channel while leaving the 256 KiB `BufWriter` unflushed would report
+    /// clean and still lose the tail, because `persist_record_resilient`
+    /// counts a `write_all` into the buffer, not a flush to the file.
+    #[test]
+    fn shutdown_flushes_the_buffer_so_replay_sees_every_record() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+
+        for i in 0..64u32 {
+            let _ = spill.append(WsType::LiveFeed, i.to_le_bytes().to_vec());
+        }
+        assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
+        drop(spill);
+
+        let frames = replay_all(&dir).expect("replay");
+        assert_eq!(
+            frames.len(),
+            64,
+            "every drained record must be readable from disk"
+        );
+    }
+
+    /// Shutdown is reached through an `Arc` on a signal path, so a second call
+    /// (a retry, a double-signal) must be harmless rather than a panic on an
+    /// already-taken handle.
+    #[test]
+    fn shutdown_called_twice_is_harmless() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+        let _ = spill.append(WsType::LiveFeed, vec![1, 2, 3]);
+
+        assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
+        assert_eq!(
+            spill.shutdown(Duration::from_secs(5)),
+            0,
+            "a second shutdown must not panic and must still report a clean queue"
+        );
+    }
+
+    /// A drain with nothing queued still stops the thread, so an idle process
+    /// exits promptly instead of burning its whole budget.
+    #[test]
+    fn shutdown_on_an_empty_queue_returns_immediately_clean() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+
+        let started = Instant::now();
+        assert_eq!(spill.shutdown(Duration::from_secs(30)), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an empty drain must not spend its budget waiting; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `queued_records` is the size of the loss window an abrupt exit takes.
+    /// It must be readable BEFORE any shutdown, so an operator can see the
+    /// exposure rather than infer it.
+    #[test]
+    fn queued_records_is_zero_on_a_drained_spill() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+        let _ = spill.append(WsType::LiveFeed, vec![9; 16]);
+        wait_until_persisted(&spill, 1);
+        assert_eq!(spill.queued_records(), 0);
+    }
+
+    /// The three sequential shutdown budgets must fit inside systemd's stop
+    /// timeout. The cross-file half of that is pinned by
+    /// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs`; this pins the
+    /// half that lives here, so a local edit cannot silently make the WAL
+    /// drain the dominant cost.
+    #[test]
+    fn the_wal_shutdown_budget_stays_a_stall_budget_not_a_throughput_budget() {
+        assert!(
+            WAL_SPILL_SHUTDOWN_BUDGET_SECS >= 5,
+            "below ~5s a briefly-wedged disk (WAL_WRITER_IO_RETRY_BACKOFF loops) \
+             would abandon records that were about to land"
+        );
+        assert!(
+            WAL_SPILL_SHUTDOWN_BUDGET_SECS <= 30,
+            "this budget is for a STALLED writer, not for throughput: the writer \
+             clears a full 524,288-slot channel in well under a second of healthy \
+             disk time, and every second here is a second nearer systemd's SIGKILL"
+        );
+        assert_eq!(
+            WAL_SPILL_SHUTDOWN_BUDGET,
+            Duration::from_secs(WAL_SPILL_SHUTDOWN_BUDGET_SECS)
         );
     }
 
