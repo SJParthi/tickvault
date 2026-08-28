@@ -8,6 +8,7 @@
 //! |---|---|---|
 //! | `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` | 20s | first (main.rs:3552) |
 //! | `SEAL_WRITER_SHUTDOWN_BUDGET_SECS` | 75s | second (main.rs:3585) |
+//! | `WAL_SPILL_SHUTDOWN_BUDGET_SECS` | 10s | third (added 2026-08-28) |
 //!
 //! …for a worst case of **95 seconds**, while `deploy/systemd/tickvault.service`
 //! carried `TimeoutStopSec=30`. systemd therefore SIGKILLed the process 65s
@@ -84,17 +85,23 @@ fn timeout_stop_secs(unit: &str) -> u64 {
 #[test]
 fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
     let main_rs = read("crates/app/src/main.rs");
+    let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
     let unit = read("deploy/systemd/tickvault.service");
 
     let lane = const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS");
     let seal = const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS");
+    // Third wait, and it lives in ANOTHER CRATE. `main` reaches it through
+    // `WsFrameSpill::shutdown`, so a guard that only ever read main.rs would
+    // have been structurally blind to it — the same shape as the unit file
+    // being invisible to a compile-time assert.
+    let wal = const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS");
     let timeout = timeout_stop_secs(&unit);
 
-    // The two waits are SEQUENTIAL on the same path, so the worst case is the
+    // The waits are SEQUENTIAL on the same path, so the worst case is the
     // SUM. Summing (rather than taking the max) is the whole point: the bug
     // was that the seal writer inherited only the remainder after the lane
     // flush had already spent its budget.
-    let worst_case = lane + seal;
+    let worst_case = lane + seal + wal;
 
     assert!(
         worst_case < timeout,
@@ -102,6 +109,7 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
          \n\
            DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = {lane}s (runs first)\n\
            SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = {seal}s (runs second)\n\
+           WAL_SPILL_SHUTDOWN_BUDGET_SECS       = {wal}s (runs third)\n\
            worst-case app shutdown              = {worst_case}s\n\
            systemd TimeoutStopSec               = {timeout}s\n\
          \n\
@@ -119,10 +127,12 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
 #[test]
 fn stop_timeout_keeps_a_real_margin_not_a_hairline() {
     let main_rs = read("crates/app/src/main.rs");
+    let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
     let unit = read("deploy/systemd/tickvault.service");
 
     let worst_case = const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS")
-        + const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS");
+        + const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS")
+        + const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS");
     let timeout = timeout_stop_secs(&unit);
     let margin = timeout.saturating_sub(worst_case);
 
@@ -140,12 +150,13 @@ fn stop_timeout_keeps_a_real_margin_not_a_hairline() {
 #[test]
 fn the_stop_timeout_is_documented_as_derived_not_guessed() {
     let unit = read("deploy/systemd/tickvault.service");
-    // The value is load-bearing arithmetic, so the unit file must NAME both
-    // constants it is derived from. Renaming a constant without updating the
+    // The value is load-bearing arithmetic, so the unit file must NAME every
+    // constant it is derived from. Renaming a constant without updating the
     // rationale leaves the next reader unable to re-derive the number.
     for needle in [
         "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS",
         "SEAL_WRITER_SHUTDOWN_BUDGET_SECS",
+        "WAL_SPILL_SHUTDOWN_BUDGET_SECS",
     ] {
         assert!(
             unit.contains(needle),

@@ -1024,7 +1024,7 @@ async fn async_main() -> Result<()> {
     // post-install because handles created pre-install resolve to a no-op
     // counter"). It was fixed for those two and missed here.
     //
-    // Nothing between the old and new position touched `_ws_frame_spill` —
+    // Nothing between the old and new position touched `ws_frame_spill` —
     // its only consumer is the stack wiring far below — and the fail-closed
     // halt is strictly better here: it now happens with the exporter UP, so
     // the boot-halt is observable rather than silent.
@@ -1033,7 +1033,7 @@ async fn async_main() -> Result<()> {
     // deliberately runs wal_spill=None while dormant — C1 dormancy honesty),
     // but the WAL WRITER + fail-closed init are KEPT: the WAL dir remains the
     // replay/archive floor consumed above and by the 15:40 conservation audit.
-    let _ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new_with_guard(
+    let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new_with_guard(
         &ws_wal_path,
         ws_wal_guard,
     ) {
@@ -2618,7 +2618,7 @@ async fn async_main() -> Result<()> {
             // 2026-07-13 (the note there — "there is no frame APPEND site left
             // in this process" — is what this line changes). `None` refuses
             // the lane outright rather than capturing without a durable floor.
-            spill: _ws_frame_spill.clone(),
+            spill: ws_frame_spill.clone(),
             // Both paths seal into the same `candles_<tf>` tables under
             // `feed='dhan'`, and the dedup key has no column that separates
             // them. Passing the fold's real state lets the lane refuse rather
@@ -2672,6 +2672,7 @@ async fn async_main() -> Result<()> {
         trading_calendar.clone(),
         dhan_feed_shutdown,
         dhan_feed_stack_monitor,
+        ws_frame_spill,
     )
     .await
 }
@@ -3639,6 +3640,12 @@ async fn run_process_runloop(
     // never runs and the day's tail dies with the process.
     dhan_feed_shutdown: std::sync::Arc<tokio::sync::Notify>,
     dhan_feed_stack_monitor: Option<tokio::task::JoinHandle<()>>,
+    // The WAL spill, so the run loop can drain its writer queue before exit
+    // (2026-08-28). Threaded in for the same reason as the two above: this
+    // function owns the only place the drain can run, and until it did the
+    // writer thread was abandoned mid-queue with every record in it already
+    // reported to its caller as `Spilled`.
+    ws_frame_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Result<()> {
     // Truthfulness rider: the runtime is dry-run/paper only — no real-money
     // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
@@ -3953,6 +3960,38 @@ async fn run_process_runloop(
         }
     }
 
+    // 5b-3. WAL spill final drain (2026-08-28).
+    //
+    // LAST of the three, and it must be: this is the durable floor every tier
+    // above it falls back onto, so it can only be closed once nothing can still
+    // append to it — the sockets are shut (5b) and the seal writer is done
+    // (5b-2).
+    //
+    // Until now the writer thread was DETACHED. Its `JoinHandle` was discarded
+    // at the spawn, nothing signalled it, and nothing could: the only `Sender`
+    // lives inside `WsFrameSpill`, which the drain paths hold through an `Arc`,
+    // so the channel never closed and the thread stayed parked in `recv()`
+    // while the process exited around it. Up to 524,288 records — every one of
+    // them already reported to its caller as `Spilled` — went with it, counted
+    // by nothing: `persisted_total` counts `write_all` and `drop_critical`
+    // counts only what `try_send` refused outright.
+    //
+    // That is the same class fixed for the tick and depth ILP writers on
+    // 2026-08-28 (`tv_offload_writer_shutdown_incomplete_total`). The WAL, the
+    // one tier whose whole job is to be the thing that does not lose frames,
+    // was the tier still missing it.
+    if let Some(spill) = ws_frame_spill.as_ref() {
+        let abandoned =
+            spill.shutdown(tickvault_storage::ws_frame_spill::WAL_SPILL_SHUTDOWN_BUDGET);
+        if abandoned > 0 {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                abandoned,
+                "WAL spill: {abandoned} captured frames were NEVER written — exiting anyway so \
+                 systemd does not SIGKILL us, but these frames are permanently lost"
+            );
+        }
+    }
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
     // shutdown_flush — a black-holed Telegram can never hang exit).
