@@ -2553,6 +2553,28 @@ pub const SEAL_WRITER_WAIT_ATTEMPTS: u64 = 20;
 /// currently holds by accident into one that holds by construction, not to
 /// absorb a real delay.
 pub const SEAL_WRITER_WAIT_INTERVAL_MS: u64 = 100;
+
+/// Wall-clock budget for the boot WAL catch-up drain, in seconds.
+///
+/// Bounded by TIME rather than bytes because the constraint that actually
+/// matters is being subscribed before the market opens. On the 08:30 boot this
+/// drain begins around 08:33 -- the token-manager wait above cannot complete
+/// faster -- and `PREOPEN_READY_DEADLINE_IST_SECS` is 09:12, so five minutes
+/// leaves over half an hour of margin.
+///
+/// Running out is not a failure mode: whatever is left stays a `*.wal` file
+/// exactly as it did before this drain existed, so the loop can only ever
+/// recover MORE than the old single-batch behaviour, never less.
+pub const WAL_CATCHUP_BUDGET_SECS: u64 = 300;
+
+/// Hard round cap for the same drain, independent of the clock.
+///
+/// At `WAL_REPLAY_MAX_BYTES` (512 MiB) per round, 120 rounds is ~60 GB --
+/// roughly twice the largest backlog measured on this box (244 segments,
+/// 31 GB). It exists so a pathological condition that makes `replay_all`
+/// return non-empty forever cannot spin the boot path, not because the count
+/// itself is expected to bind.
+pub const WAL_CATCHUP_MAX_ROUNDS: u32 = 120;
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -8061,6 +8083,124 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
         }
+
+        // ---- CATCH-UP DRAIN --------------------------------------------
+        //
+        // The block above replays ONE batch: `replay_all` stops at
+        // `WAL_REPLAY_MAX_BYTES` (512 MiB) because it accumulates every frame
+        // into a single `Vec` before returning, and a 32 GiB box shared with
+        // QuestDB cannot hold more than that at once.
+        //
+        // A session writes far more than 512 MiB of WAL -- measured on this box
+        // at 244 segments, 31 GB -- so ONE batch recovers roughly 1.6% of a
+        // backlog. Everything past it stays a `*.wal` file, is never reached by
+        // the next boot either (which also stops at 512 MiB), and is eventually
+        // deleted by the age or byte prune. The backlog could never drain, so
+        // stranded frames were guaranteed to be destroyed rather than merely at
+        // risk.
+        //
+        // Draining in ROUNDS fixes that without touching the RAM bound: replay a
+        // batch, fold it, flush it, confirm it, and go round again. Peak memory
+        // stays one batch; what changes is that the loop keeps going until the
+        // backlog is gone.
+        //
+        // Bounded by WALL CLOCK, not by bytes, because the thing that actually
+        // matters is being subscribed before the market opens. On the 08:30 boot
+        // this code runs at roughly 08:33 (the token-manager wait above cannot
+        // complete faster), and `PREOPEN_READY_DEADLINE_IST_SECS` is 09:12 -- so
+        // a 5-minute drain leaves over half an hour of margin. If the budget runs
+        // out, whatever is left stays a `*.wal` file exactly as before: this can
+        // only recover more than the old code, never less.
+        //
+        // On a normal day it does nothing at all. A session with no ring sheds
+        // leaves no backlog, the first `replay_all` returns empty, and the loop
+        // exits without a single round -- which is what 21, 27 and 28 August all
+        // looked like (`tv_dhan_ws_ring_full_total` = 0).
+        //
+        // Placed AFTER the first batch deliberately: the aggregator is seeded
+        // once, above, and every round folds against that same seeded state.
+        let catchup_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(WAL_CATCHUP_BUDGET_SECS);
+        let mut rounds = 0u32;
+        let mut catchup_frames = 0usize;
+        let mut catchup_ticks = 0u64;
+        while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
+            let wal_dir = crate::boot_helpers::ws_wal_dir();
+            let batch = match tickvault_storage::ws_frame_spill::replay_all(&wal_dir) {
+                Ok(b) => b,
+                Err(err) => {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "wal_catchup_replay_failed",
+                        round = rounds,
+                        error = %err,
+                        "the WAL catch-up drain could not read another batch. Stopping the \
+                         drain -- whatever is left stays on disk for the next boot."
+                    );
+                    break;
+                }
+            };
+            if batch.is_empty() {
+                break;
+            }
+            let staged: Vec<(u64, i64, bytes::Bytes)> = batch
+                .into_iter()
+                .filter(|f| f.ws_type == tickvault_storage::ws_frame_spill::WsType::LiveFeed)
+                .map(|f| {
+                    (
+                        f.frame_seq,
+                        f.received_at_nanos,
+                        bytes::Bytes::from(f.frame),
+                    )
+                })
+                .collect();
+            if staged.is_empty() {
+                // Nothing this lane folds, but the segments WERE consumed and
+                // staged -- confirm so the loop cannot spin on them forever.
+                tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
+                rounds = rounds.saturating_add(1);
+                continue;
+            }
+            let outcome = refold_wal_frames(&mut ingest, &staged);
+            let flushed = blocking_flush(|| ingest.flush());
+            tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
+            catchup_frames = catchup_frames.saturating_add(staged.len());
+            catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
+            rounds = rounds.saturating_add(1);
+            if outcome.lost > 0 {
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "wal_catchup_unfolded",
+                    round = rounds,
+                    frames = staged.len(),
+                    lost = outcome.lost,
+                    "the WAL catch-up drain could not fold {} tick(s) in this round",
+                    outcome.lost
+                );
+            }
+            tracing::debug!(
+                round = rounds,
+                frames = staged.len(),
+                ticks = outcome.refolded,
+                rows_flushed = flushed,
+                "WAL catch-up drain round complete"
+            );
+        }
+        if rounds > 0 {
+            let exhausted =
+                tokio::time::Instant::now() >= catchup_deadline || rounds >= WAL_CATCHUP_MAX_ROUNDS;
+            info!(
+                rounds,
+                frames = catchup_frames,
+                ticks = catchup_ticks,
+                budget_exhausted = exhausted,
+                "WAL catch-up drain finished — recovered a backlog that a single \
+                 512 MiB replay batch could never have reached"
+            );
+            if exhausted {
+                metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(1);
+            }
+        }
     }
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
@@ -13264,15 +13404,22 @@ mod tests {
         // total: `flush_and_record` must still contain exactly TWO, so the
         // helper cannot be inlined back into the drain and a drain flush
         // cannot bypass it — regardless of how many boot-path flushes exist.
-        assert_eq!(
-            wrapped, 3,
-            "expected exactly THREE wrapped ingest.flush() calls — the two \
-             arms of `flush_and_record` plus the boot-path flush that precedes \
-             `confirm_replayed`. Found {wrapped}: a flush site was added or \
-             removed without updating this pin"
-        );
-        // The real invariant, independent of the total above: both DRAIN
-        // flushes live inside the one helper.
+        //
+        // 2026-08-28 (SECOND time the same day): the exact total needed
+        // bumping again, for the boot catch-up drain. Twice in one session is
+        // the signal that the TOTAL was never the invariant -- it was a proxy
+        // for one, and a proxy that has to be edited every time a legitimate
+        // flush is added is a proxy that will eventually be edited past the
+        // thing it was standing in for.
+        //
+        // So it is replaced by the property itself, stated directly: every
+        // wrapped flush is EITHER inside `flush_and_record` OR on the boot
+        // path above the drain wiring. A new BOOT flush is then free; a new
+        // DRAIN flush outside the helper fails here, which is the only case
+        // that was ever dangerous.
+        //
+        // The choke point itself, checked first because the loop below needs
+        // the helper bounds: both DRAIN flushes live inside the one helper.
         let helper_start = production_half
             .find("fn flush_and_record")
             .expect("flush_and_record must exist");
@@ -13290,6 +13437,20 @@ mod tests {
              was inlined back into the drain (which re-opens the \
              four-sites-to-keep-in-sync problem) or a drain flush bypassed it"
         );
+        let drain_wiring_at = production_half
+            .find("let (frame_tx, frame_rx)")
+            .expect("the drain's channel wiring must exist — it is the boot/drain boundary");
+        for (idx, _) in production_half.match_indices("blocking_flush(|| ingest.flush())") {
+            let in_helper = idx > helper_start && idx < helper_end;
+            let on_boot_path = idx < drain_wiring_at;
+            assert!(
+                in_helper || on_boot_path,
+                "a wrapped ingest.flush() at byte offset {idx} sits on the DRAIN and \
+                 outside `flush_and_record`. Every drain flush must route through the \
+                 helper — that single choke point is the only thing that can keep the \
+                 blocking call and the feed-health report in step"
+            );
+        }
         let recorded_sites = production_half
             .matches("flush_and_record(&mut ingest, &feed_health)")
             .count();
