@@ -784,6 +784,13 @@ pub struct DepthWriter {
     /// split by [`DepthWriter::split_for_offload`]. `None` means the
     /// synchronous arm, which is what every non-lane caller still uses.
     offload: Option<std::sync::mpsc::SyncSender<DepthFlushBatch>>,
+    /// Set by [`DepthWriter::split_rescue_offload`]. When present,
+    /// [`DepthWriter::discard_pending`] hands the buffer to a dedicated rescue
+    /// thread instead of writing up to 32 MiB on the frame-drain task.
+    ///
+    /// Separate from `offload` on purpose: the rescue exists precisely for the
+    /// two cases that queue cannot serve — it is FULL, or its thread is GONE.
+    rescue: Option<std::sync::mpsc::SyncSender<DepthRescueBatch>>,
     /// Consecutive flush spans the producer has RETAINED because the hand-off
     /// queue was full. Bounded by [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] so
     /// backpressure cannot silently widen a commit without limit.
@@ -875,6 +882,7 @@ impl DepthWriter {
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
                     offload: None,
+                    rescue: None,
                     retained_spans: 0,
                 }
             }
@@ -893,6 +901,7 @@ impl DepthWriter {
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
                     offload: None,
+                    rescue: None,
                     retained_spans: 0,
                 }
             }
@@ -918,6 +927,7 @@ impl DepthWriter {
             rescued: 0,
             spill_dir: temp_depth_spill_dir(),
             offload: None,
+            rescue: None,
             retained_spans: 0,
         }
     }
@@ -1055,70 +1065,90 @@ impl DepthWriter {
     /// write failure or the [`DEPTH_SPILL_MAX_BYTES`] cap is therefore a live
     /// outcome, and it falls back to the counted drop with its own coded
     /// error. Silent loss is the defect; a NAMED unrecoverable loss is not.
+    /// Rescue the buffered levels to the spill tier instead of losing them.
+    ///
+    /// # Why this hands off instead of writing (2026-08-28)
+    ///
+    /// The tick writer's twin of this function was taken off the drain earlier
+    /// today; this is the same fix on the writer that carries **24x the rows**
+    /// — a measured 1,530,651,649 depth rows per session against 64,349,753
+    /// ticks — and on a path with one more way in: the frame arm, the 500 ms
+    /// timer arm, and the shutdown tail all reach it.
+    ///
+    /// Inline it did `create_dir_all`, a `read_dir` + per-entry `metadata()`
+    /// walk of the depth spill directory, a live free-space probe that FORKS
+    /// `df` on its first call, and then up to
+    /// [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] — 32 MiB — of file write. All on the
+    /// frame-drain task, and all on the volume QuestDB is stalling on.
+    ///
+    /// And it fires at the worst instant BY CONSTRUCTION: the cut that calls it
+    /// only trips after the hand-off queue has been full for
+    /// [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] consecutive flushes, i.e. only when
+    /// the database is already behind. A stalled drain stops emptying the
+    /// socket, the receive buffer fills, and Dhan — which skips a slow consumer
+    /// forward to "the latest available state" with no sequence number —
+    /// discards the intermediate ticks at THEIR side, where nothing we own can
+    /// see them.
+    ///
+    /// The fallback is deliberately the OLD behaviour, never a drop: a full
+    /// rescue queue or a dead rescue thread writes inline exactly as before.
     pub fn discard_pending(&mut self) -> usize {
         let rows = self.pending;
         if rows == 0 {
             self.buffer.clear();
             return 0;
         }
-        let payload_len = self.buffer.as_bytes().len();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        match spill_failed_depth_ilp(
-            &self.spill_dir,
-            self.buffer.as_bytes(),
-            self.feed,
-            now,
-            depth_spill_max_bytes(),
-        ) {
-            Ok(path) => {
-                self.rescued = self.rescued.saturating_add(rows as u64);
-                // BOTH counters, and the EMF-shipped one is not optional: it
-                // is the only depth series an alarm watches, so incrementing
-                // only the new name would divert the common flush failure off
-                // the pager that exists for it.
-                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
+
+        // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
+        // MOVED, and the replacement is the same empty one `offload_flush`
+        // already installs on every successful hand-off.
+        if let Some(tx) = self.rescue.as_ref() {
+            let protocol = self.buffer.protocol_version();
+            let batch = DepthRescueBatch {
+                buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+                rows,
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    metrics::counter!(
+                        DEPTH_RESCUE_QUEUED_COUNTER,
+                        "feed" => self.feed.as_str()
+                    )
                     .increment(rows as u64);
-                metrics::counter!("tv_depth_rows_spilled_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
-                error!(
-                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                    feed = self.feed.as_str(),
-                    rescued = rows,
-                    bytes = payload_len,
-                    path = %path.display(),
-                    "market_depth flush failed — the buffered levels were RESCUED to the \
-                     depth spill file named here, not lost. They are NOT in QuestDB yet. \
-                     Re-ingest is one command and is safe to repeat, because the depth \
-                     dedup key carries depth_kind and capture_seq: \
-                     curl --data-binary @<path> http://<questdb>:9000/write"
-                );
-            }
-            Err(err) => {
-                // The rescue itself failed — cap reached, disk full, or no
-                // permission. Count it as the genuine unrecoverable loss it is.
-                if err.kind() == std::io::ErrorKind::StorageFull {
-                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
-                        .increment(1);
-                } else {
-                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write")
-                        .increment(1);
+                    // Counted as rescued HERE, not on the thread, because the
+                    // caller's log-wording branch reads this field one line
+                    // after the call and a queued payload IS on its way to the
+                    // spill file. The rare case where it does not arrive is the
+                    // shutdown abandonment, which has its own counter and its
+                    // own coded error rather than being folded into this one.
+                    self.rescued = self.rescued.saturating_add(rows as u64);
+                    self.pending = 0;
+                    self.dropped = self.dropped.saturating_add(rows as u64);
+                    return rows;
                 }
-                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
-                error!(
-                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                    feed = self.feed.as_str(),
-                    dropped = rows,
-                    cap_bytes = depth_spill_max_bytes(),
-                    spill_dir = %self.spill_dir.display(),
-                    spill_error = %err,
-                    "market_depth flush failed AND the depth spill rescue also failed — \
-                     these levels are permanently lost and nothing re-inserts them. The \
-                     raw frames remain in the write-ahead log for manual recovery."
-                );
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    self.buffer = returned.buffer;
+                    metrics::counter!(
+                        DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
+                        "feed" => self.feed.as_str(),
+                        "reason" => "queue_full"
+                    )
+                    .increment(1);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    self.buffer = returned.buffer;
+                    metrics::counter!(
+                        DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
+                        "feed" => self.feed.as_str(),
+                        "reason" => "thread_gone"
+                    )
+                    .increment(1);
+                }
             }
+        }
+
+        if perform_depth_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, rows) {
+            self.rescued = self.rescued.saturating_add(rows as u64);
         }
         self.buffer.clear();
         self.pending = 0;
@@ -1159,6 +1189,31 @@ impl DepthWriter {
         };
         self.offload = Some(tx);
         (self, sink, rx)
+    }
+    /// Hands the depth rescue write to a dedicated thread.
+    ///
+    /// Separate from [`DepthWriter::split_for_offload`] because it solves the
+    /// case that split CANNOT: the rescue fires exactly when the flush queue is
+    /// full or its thread is gone, so it cannot ride the same queue.
+    pub fn split_rescue_offload(
+        &mut self,
+    ) -> (DepthRescueSink, std::sync::mpsc::Receiver<DepthRescueBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_RESCUE_QUEUE_DEPTH);
+        let sink = DepthRescueSink {
+            spill_dir: self.spill_dir.clone(),
+            feed: self.feed,
+        };
+        self.rescue = Some(tx);
+        (sink, rx)
+    }
+
+    /// Closes the depth rescue queue so its thread can exit.
+    ///
+    /// Leaves the writer in the INLINE state on purpose: a rescue after this
+    /// point writes synchronously rather than being refused, so end-of-session
+    /// levels still reach the spill tier.
+    pub fn close_rescue_offload(&mut self) {
+        self.rescue = None;
     }
 
     /// Closes the hand-off queue, so the writer thread sees the end of the
@@ -1489,6 +1544,131 @@ pub fn depth_segment_label(code: u8) -> Option<&'static str> {
 /// that SHOULD surface as backpressure, because it is one.
 pub const DEPTH_FLUSH_QUEUE_DEPTH: usize = 4;
 
+// ---------------------------------------------------------------------------
+// Off-drain RESCUE for DEPTH (2026-08-28)
+// ---------------------------------------------------------------------------
+
+/// Depth of the hand-off queue between the drain and the depth rescue thread.
+///
+/// TWO, matching the tick side and small for the same reason: a rescue only
+/// happens when the flush queue has already been full for
+/// [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] consecutive flushes, so this is not a
+/// buffer for a busy day — it is somewhere to put ONE oversized payload while
+/// the previous one is being written. Deeper would hold more rows that exist
+/// nowhere else, which is the trade the rescue tier exists to avoid.
+pub const DEPTH_RESCUE_QUEUE_DEPTH: usize = 2;
+
+/// Depth rows handed to the rescue thread rather than written on the drain.
+pub const DEPTH_RESCUE_QUEUED_COUNTER: &str = "tv_depth_rescue_queued_total";
+
+/// Depth rescues that had to be written INLINE on the drain after all.
+///
+/// Non-zero means the drain took the stall this hand-off exists to remove.
+/// Not a loss: nothing is dropped on either arm.
+pub const DEPTH_RESCUE_INLINE_FALLBACK_COUNTER: &str = "tv_depth_rescue_inline_fallback_total";
+
+/// Depth rescue payloads abandoned because the rescue thread did not finish.
+pub const DEPTH_RESCUE_ABANDONED_COUNTER: &str = "tv_depth_rescue_abandoned_total";
+
+/// One oversized depth ILP payload on its way to the spill tier.
+pub struct DepthRescueBatch {
+    buffer: Buffer,
+    rows: usize,
+}
+
+impl DepthRescueBatch {
+    /// Rows this payload carries — the number an abandoned batch loses.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// The depth rescue thread's half: everything the write needs, and nothing else.
+pub struct DepthRescueSink {
+    spill_dir: PathBuf,
+    feed: Feed,
+}
+
+impl DepthRescueSink {
+    /// Writes one queued payload to the depth spill tier.
+    ///
+    /// Identical code to the inline fallback — both call
+    /// [`perform_depth_rescue`] — so an operator cannot tell which path ran,
+    /// and should not have to.
+    pub fn rescue(&self, batch: &DepthRescueBatch) {
+        perform_depth_rescue(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            self.feed,
+            batch.rows,
+        );
+    }
+}
+
+/// The depth rescue write itself — the part that touches the disk.
+///
+/// Returns `true` when the payload LANDED, so the inline caller can keep its
+/// `rescued` accounting exactly as it was before the split. Extracted so the
+/// SAME code serves the thread and the fallback; two copies would have drifted,
+/// and the one that drifted would have been the fallback — the path that only
+/// runs on the worst day.
+fn perform_depth_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, rows: usize) -> bool {
+    let payload_len = payload.len();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    match spill_failed_depth_ilp(spill_dir, payload, feed, now, depth_spill_max_bytes()) {
+        Ok(path) => {
+            // BOTH counters, and the EMF-shipped one is not optional: it is the
+            // only depth series an alarm watches, so incrementing only the new
+            // name would divert the common flush failure off the pager that
+            // exists for it.
+            metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed.as_str())
+                .increment(rows as u64);
+            metrics::counter!("tv_depth_rows_spilled_total", "feed" => feed.as_str())
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                rescued = rows,
+                bytes = payload_len,
+                path = %path.display(),
+                "market_depth flush failed — the buffered levels were RESCUED to the \
+                 depth spill file named here, not lost. They are NOT in QuestDB yet. \
+                 Re-ingest is one command and is safe to repeat, because the depth \
+                 dedup key carries depth_kind and capture_seq: \
+                 curl --data-binary @<path> http://<questdb>:9000/write"
+            );
+            true
+        }
+        Err(err) => {
+            // The rescue itself failed — cap reached, disk full, or no
+            // permission. Count it as the genuine unrecoverable loss it is.
+            if err.kind() == std::io::ErrorKind::StorageFull {
+                metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
+                    .increment(1);
+            } else {
+                metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write")
+                    .increment(1);
+            }
+            metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed.as_str())
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                dropped = rows,
+                cap_bytes = depth_spill_max_bytes(),
+                spill_dir = %spill_dir.display(),
+                spill_error = %err,
+                "market_depth flush failed AND the depth spill rescue also failed — \
+                 these levels are permanently lost and nothing re-inserts them. The \
+                 raw frames remain in the write-ahead log for manual recovery."
+            );
+            false
+        }
+    }
+}
 /// How much un-handed-off ILP text the depth PRODUCER may hold before it
 /// rescues to the spill tier.
 ///
@@ -2008,6 +2188,105 @@ mod tests {
             parts.push(hay.to_string());
         }
         Some(parts.join("|"))
+    }
+
+    /// The drain must not write the depth rescue file itself.
+    ///
+    /// The tick twin of this was fixed earlier the same day; this is the same
+    /// defect on the writer that carries 24x the rows, reachable from the frame
+    /// arm, the 500 ms timer arm AND the shutdown tail.
+    #[test]
+    fn a_split_depth_writer_hands_the_rescue_off_instead_of_writing_it() {
+        let dir = spill_tmp("depth-rescue-handoff");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+
+        w.append_row(&row()).expect("append");
+        let rescued = w.discard_pending();
+
+        assert_eq!(rescued, 1, "the rows are accounted for either way");
+        assert_eq!(w.pending(), 0, "the producer must let go of them");
+        assert_eq!(
+            w.rescued(),
+            1,
+            "a queued payload IS on its way to the spill file — the caller's \
+             log-wording branch reads this one line later"
+        );
+        let batch = rx
+            .try_recv()
+            .expect("the payload must be on the rescue queue, not on disk");
+        assert_eq!(batch.rows(), 1);
+        assert_eq!(
+            spill_files(&dir).len(),
+            0,
+            "the drain must not have touched the depth spill directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full depth rescue queue falls back to the OLD behaviour, never a drop.
+    #[test]
+    fn a_full_depth_rescue_queue_writes_inline_rather_than_dropping() {
+        let dir = spill_tmp("depth-rescue-full");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+
+        assert!(
+            spill_files(&dir).len() > 0,
+            "with the queue full the rescue must have been written inline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A depth writer that was never split behaves exactly as before.
+    #[test]
+    fn an_unsplit_depth_writer_still_rescues_inline() {
+        let dir = spill_tmp("depth-rescue-unsplit");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_row(&row()).expect("append");
+
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            spill_files(&dir).len() > 0,
+            "no rescue channel means the old synchronous path, unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the depth rescue queue restores the inline path, not a refusal.
+    #[test]
+    fn closing_the_depth_rescue_queue_restores_the_inline_path() {
+        let dir = spill_tmp("depth-rescue-closed");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+        w.close_rescue_offload();
+
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            spill_files(&dir).len() > 0,
+            "after close the rescue must still land on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both rescue queues are shallow, and identically so: every payload in one
+    /// is rows that exist nowhere else in the process.
+    #[test]
+    fn the_depth_rescue_queue_matches_the_tick_one() {
+        assert_eq!(
+            DEPTH_RESCUE_QUEUE_DEPTH,
+            crate::tick_persistence::RESCUE_QUEUE_DEPTH,
+            "two writers with the same failure mode must not drift into \
+             different crash-loss windows"
+        );
     }
 
     #[test]
