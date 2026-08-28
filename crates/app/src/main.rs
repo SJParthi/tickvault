@@ -1128,6 +1128,74 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_tick_spill_replay_quarantined_total").increment(0);
     metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(0);
 
+    // Four MORE alarmed counters that were never registered (2026-08-28,
+    // found by an adversarial sweep of the loss paths).
+    //
+    // Each of these is EMF-selected AND carries an alarm, and each is emitted
+    // ONLY at its failure site — so the series was born AT the incident and the
+    // CloudWatch agent's dropped-first-sample delta baseline WAS the incident.
+    // Every one of the four alarms was therefore dead on arrival for the
+    // single-episode case, which for all four is the dominant shape:
+    //
+    //   tv_wal_replay_unknown_magic_total   a rolled-back binary meeting a
+    //                                       newer WAL record format. Once-ever
+    //                                       by nature, so the first occurrence
+    //                                       is the ONLY occurrence.
+    //   tv_seal_writer_drain_dropped_total  candle loss with all three
+    //                                       absorption tiers failed. Note the
+    //                                       name: it is NOT the labelled
+    //                                       `tv_seal_writer_drain_total{kind=
+    //                                       "dropped"}` seeded above — that is
+    //                                       a different series, and seeding one
+    //                                       never registered the other.
+    //   tv_ws_frame_spill_write_errors_total  the durable floor's OWN write
+    //                                       failing. The rarest and most severe
+    //                                       event in the process.
+    //   tv_tick_rows_refused_total          a row refused before it is written,
+    //                                       so nothing downstream counts it.
+    //
+    // One label value per name is enough: the EMF processor folds label values
+    // into one summed series per host, so the folded NAME is what the alarm
+    // reads and registering any member registers it. Both `reason` values are
+    // seeded for the refusal counter anyway — there are only two, and a reader
+    // comparing this block against the emit sites should find them all.
+    metrics::counter!("tv_wal_replay_unknown_magic_total").increment(0);
+    metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
+    metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
+        .increment(0);
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width").increment(0);
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite").increment(0);
+
+    // Seven MORE alarmed counters found unregistered by the guard that was
+    // written for the four above (2026-08-28, same sweep).
+    //
+    // Writing the guard turned a four-item finding into a twenty-item one, and
+    // that is the point of writing it: the four were what one agent happened to
+    // look at, and the class was never four. Each of these is read by an alarm
+    // in `deploy/aws/terraform/` and emitted only at a failure site, so each was
+    // dead on arrival for the single-episode case exactly as the four were.
+    //
+    // One label value per name is enough — the EMF processor folds label values
+    // into one summed series per host, so the folded NAME is what an alarm
+    // reads and registering any member registers it. The value chosen is the
+    // one an operator is most likely to see first.
+    metrics::counter!("tv_order_audit_persist_errors_total", "stage" => "append").increment(0);
+    metrics::counter!("tv_order_update_events_persist_errors_total", "stage" => "append")
+        .increment(0);
+    metrics::counter!("tv_order_update_events_dropped_total", "reason" => "channel_full")
+        .increment(0);
+    metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
+        .increment(0);
+    metrics::counter!("tv_partition_archive_failed_total", "stage" => "drop").increment(0);
+    metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(0);
+    metrics::counter!("tv_disk_watcher_respawn_total").increment(0);
+    metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => "live_feed").increment(0);
+    metrics::counter!(
+        tickvault_storage::ilp_overflow::PENDING_DISCARDED_COUNTER,
+        "table" => "ticks"
+    )
+    .increment(0);
+
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations
