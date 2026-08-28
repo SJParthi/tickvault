@@ -46,7 +46,7 @@ use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
-use crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST;
+use crate::candles::tf_index::{MARKET_OPEN_SECS_OF_DAY_IST, fold_clock_ist_secs};
 use crate::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
 // ---------------------------------------------------------------------------
@@ -430,7 +430,11 @@ impl AggregatorCell {
     /// quiet tick pays two register comparisons and nothing else. No
     /// allocation.
     #[inline]
-    pub fn observe_session_extremes(&mut self, tick: &ParsedTick) -> SessionExtremeDelta {
+    pub fn observe_session_extremes(
+        &mut self,
+        tick: &ParsedTick,
+        fold_secs: u32,
+    ) -> SessionExtremeDelta {
         let mut delta = SessionExtremeDelta {
             prev_observed_ts: self.last_observed_ts,
             ..SessionExtremeDelta::default()
@@ -446,7 +450,12 @@ impl AggregatorCell {
         let carries_extremes =
             usable_exchange_price(tick.day_high) || usable_exchange_price(tick.day_low);
         if carries_extremes {
-            self.last_observed_ts = tick.exchange_timestamp;
+            // 2026-08-28: the FOLD clock. This value is compared against a
+            // `bucket_start` at the session-extreme attribution site, so it
+            // must be measured on the same clock the buckets are. Passed IN,
+            // never recomputed — same hot-path contract as `prices` and
+            // `cumulative_volume`: derived once per TICK, above the loop.
+            self.last_observed_ts = fold_secs;
         }
 
         // A packet claiming a session high BELOW its own session low is
@@ -575,6 +584,12 @@ impl AggregatorCell {
     ///
     /// # Complexity
     /// O(1) — [`Self::consume_tick_with_prices`] plus at most two compares.
+    // Same hot-path contract as `fold` below: every one of these is derived
+    // ONCE per tick and passed down, never recomputed per timeframe. Bundling
+    // them into a struct would either reintroduce that per-timeframe cost or
+    // add an indirection on the per-tick path, for no behavioural gain.
+    // APPROVED: argument count is the hot-path contract, see above.
+    #[allow(clippy::too_many_arguments)]
     pub fn consume_tick_with_extremes(
         &mut self,
         tf: TfIndex,
@@ -584,6 +599,7 @@ impl AggregatorCell {
         strategy: FeedStrategy,
         cumulative_volume: u64,
         extremes: SessionExtremeDelta,
+        fold_secs: u32,
     ) -> ConsumeOutcome {
         self.fold(
             tf,
@@ -593,6 +609,7 @@ impl AggregatorCell {
             strategy,
             cumulative_volume,
             extremes,
+            fold_secs,
         )
     }
 
@@ -625,6 +642,7 @@ impl AggregatorCell {
             strategy,
             cumulative_volume,
             SessionExtremeDelta::default(),
+            fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
         )
     }
 
@@ -646,9 +664,23 @@ impl AggregatorCell {
         strategy: FeedStrategy,
         cumulative_volume: u64,
         extremes: SessionExtremeDelta,
+        fold_secs: u32,
     ) -> ConsumeOutcome {
         let ord = tf.as_ordinal();
-        let bucket_start = tf.bucket_start(tick.exchange_timestamp);
+        // 2026-08-28: THE bucketing decision, now on the receipt clock.
+        // `exchange_timestamp` is Dhan's LAST TRADE TIME - for a dormant
+        // contract that is whenever it last printed (measured mean 5 hours,
+        // max 34 days), so bucketing on it files a tick we received at 09:12
+        // into a bar dated days ago. See `fold_clock_ist_secs` for the delta
+        // guard that keeps a replayed or clock-stepped stamp from doing the
+        // same thing in the other direction.
+        //
+        // `fold_secs` is an ARGUMENT, not a local: it is derived ONCE per
+        // tick above the caller's timeframe loop, exactly like `prices` and
+        // `cumulative_volume`. Recomputing it here would pay the conversion
+        // 24 times per tick for one answer — the same hoisting defect this
+        // module's header records from 2026-08-10.
+        let bucket_start = tf.bucket_start(fold_secs);
 
         if self.slots[ord].is_uninitialised() {
             // The slot is empty, but `last_sealed` may still hold a bucket
@@ -661,7 +693,7 @@ impl AggregatorCell {
                 if matches!(strategy.late_policy, LatePolicy::Refold)
                     && bucket_start == last.bucket_start_ist_secs
                 {
-                    fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
+                    fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
                     // SEAL SITE 5 of 5 — and the one that proves the guard
                     // earns its keep. I wrote this change believing there
                     // were four emission points; the source scan found this
@@ -694,11 +726,28 @@ impl AggregatorCell {
             // opens at 09:00, so pre-open ticks reach this fold". They no
             // longer do — `MultiTfAggregator::consume_tick` refuses anything
             // with `secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST` before it gets
-            // here. The consume-on-use rule below is still right and is kept:
-            // it is what makes the arm robust to ANY tick that cannot supply
-            // an open, and a comment describing a reachable path that is no
-            // longer reachable would send the next reader hunting a defect
-            // that has already been closed upstream.
+            // here.
+            //
+            // **RE-CORRECTED 2026-08-28, and the 2026-08-25 correction above
+            // is now itself the stale claim.** The fold gate moved to 09:00,
+            // so pre-open ticks DO reach this fold again — the original
+            // sentence was right, the correction was right when written, and
+            // it went stale three days later. A reader trusting it concludes
+            // pre-open ticks cannot get here and stops looking, which is the
+            // false-certification class this repository has now recorded
+            // three times (the `day_ohlc_tracker` row, `WAL-SUSPEND-01`, and
+            // the not-invoked-alarm bullet). The durable lesson is not "check
+            // harder": a reachability claim is one `grep` of the gate
+            // constant, so it must be re-run at the moment of writing.
+            //
+            // The consume-on-use rule below is what makes this safe either
+            // way, and is unchanged: a pre-open tick carries `day_open = 0`
+            // (no trade has printed, so the exchange publishes none),
+            // `usable_exchange_price` rejects it, the arm is NOT consumed,
+            // and the real 09:15 open is still stamped when it arrives —
+            // via the in-bucket re-arm path for the M30/M60/D1 buckets that
+            // SPAN 09:15, and via the normal open path for the frames whose
+            // 09:15 bucket opens fresh.
             //
             // Consuming it only on use means a pre-open tick leaves the arm
             // intact, and the first tick that actually carries a positive
@@ -735,6 +784,7 @@ impl AggregatorCell {
                 use_day_open,
                 first_bucket_of_day,
                 cumulative_volume,
+                fold_secs,
             );
             return ConsumeOutcome::Updated;
         }
@@ -779,7 +829,13 @@ impl AggregatorCell {
             // majority — never pays the bucket arithmetic.
             let attributable =
                 !extremes.is_empty() && tf.bucket_start(extremes.prev_observed_ts) == bucket_start;
-            fold_in_bucket(&mut self.slots[ord], tick, prices, cumulative_volume);
+            fold_in_bucket(
+                &mut self.slots[ord],
+                tick,
+                prices,
+                cumulative_volume,
+                fold_secs,
+            );
             // Session extremes keep arriving through the first bucket's life,
             // so re-adopt on every tick of it — `day_high` at the bucket's LAST
             // tick is the one that matters, and max/min converge to it.
@@ -817,6 +873,7 @@ impl AggregatorCell {
                     // this is the scope guarantee of plan Item 6.
                     false,
                     cumulative_volume,
+                    fold_secs,
                 ),
             );
             // SEAL SITE 1 of 5 (see `stamp_seal_percentages`). Stamped
@@ -831,7 +888,7 @@ impl AggregatorCell {
         if matches!(strategy.late_policy, LatePolicy::Refold) {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
-                fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
+                fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
                 // SEAL SITE 4 of 5, and one of the two a careless fix misses: the
                 // late tick just moved `close`, so a percentage stamped at
                 // the original seal is now stale for the row that actually
@@ -987,6 +1044,26 @@ fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
     // `TfIndex::bucket_start` and `catch_up_seal` were: a second call site
     // would silently reintroduce a remote abort, and the cost of preventing
     // that is one word.
+    // 2026-08-28: this stays anchored on the MARKET OPEN (09:15) even though
+    // the candle GRID moved to 09:00, and the distinction is the whole point.
+    //
+    // This predicate decides which bar adopts the exchange's OFFICIAL day
+    // open / day high / day low. Those fields describe the REGULAR SESSION.
+    // During the 09:00-09:12 pre-open auction no trade has printed, so the
+    // exchange publishes no day_open at all (0.0, the documented absent
+    // sentinel) - and moving this anchor to 09:00 would have handed the
+    // official day OHLC to a bar that closed fifteen minutes before the
+    // market opened. Every "first bucket adopts the day open" test in this
+    // module caught exactly that, which is why it is worth saying here: the
+    // GRID question ("where do buckets start?") and the ATTRIBUTION question
+    // ("which bar owns the day's official open?") have different answers, and
+    // conflating them silently mis-stamps the opening bar of every day.
+    //
+    // Note this expression already does the right thing on the new grid
+    // WITHOUT arithmetic changes: `bucket_start(09:15)` returns whichever
+    // bucket CONTAINS the market open - 09:15 for 1m/3m/5m/15m, and 09:00 for
+    // the 30m/60m frames whose bucket spans it. That is correct in both
+    // cases: the official open belongs to the bar it actually falls inside.
     bucket_start == tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))
 }
 
@@ -1048,6 +1125,7 @@ fn open_bucket(
     use_day_open: bool,
     first_bucket_of_day: bool,
     cumulative_volume: u64,
+    fold_secs: u32,
 ) -> LiveCandleState {
     let price = prices.last_traded_price;
     // `day_open` is already `0.0` unless the raw field was strictly positive
@@ -1067,7 +1145,10 @@ fn open_bucket(
         bucket_start_cumulative,
         oi: i64::from(tick.open_interest),
         tick_count: 1,
-        close_ts_ist_secs: tick.exchange_timestamp,
+        // 2026-08-28: the fold clock, so the close-ordering guards below
+        // compare like with like. Mixing clocks here would let a tick with a
+        // later receipt but an earlier trade time silently lose the close.
+        close_ts_ist_secs: fold_secs,
         // Same reasoning as `session_open` below: the gated widened value,
         // never the raw wire field.
         prev_day_close: prices.day_close,
@@ -1185,6 +1266,7 @@ fn fold_in_bucket(
     tick: &ParsedTick,
     prices: TickPrices,
     cumulative_volume: u64,
+    fold_secs: u32,
 ) {
     let price = prices.last_traded_price;
     if price > state.high {
@@ -1208,10 +1290,10 @@ fn fold_in_bucket(
     // Captured BEFORE the close guard mutates `close_ts_ist_secs`, so the OI
     // rule below reads "is this the newest packet we have seen" rather than a
     // value that depends on statement order two lines up.
-    let tick_is_newest = tick.exchange_timestamp >= state.close_ts_ist_secs;
+    let tick_is_newest = fold_secs >= state.close_ts_ist_secs;
     if tick_is_newest {
         state.close = price;
-        state.close_ts_ist_secs = tick.exchange_timestamp;
+        state.close_ts_ist_secs = fold_secs;
     }
     // MERGE 2026-08-25: the order guard above and the non-zero guard here fix
     // DIFFERENT halves of the same field, and OI needs BOTH.
@@ -1288,12 +1370,13 @@ fn fold_in_bucket(
 /// Folds a LATE tick into an already-sealed bucket's high / low / close.
 ///
 /// `close` is overwritten ONLY when the late tick is genuinely the bucket's
-/// last tick (`exchange_timestamp >= close_ts_ist_secs`), so an out-of-order
-/// EARLIER late tick can never clobber a truly-later close. `open` /
+/// last tick (`fold_secs >= close_ts_ist_secs` — the RECEIPT clock since
+/// 2026-08-28), so an out-of-order EARLIER late tick can never clobber a
+/// truly-later close. `open` /
 /// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
 /// cumulative snapshots are order-dependent and ambiguous for a latecomer.
 #[inline]
-fn fold_late_hlc(state: &mut LiveCandleState, tick: &ParsedTick, prices: TickPrices) {
+fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32) {
     let price = prices.last_traded_price;
     if price > state.high {
         state.high = price;
@@ -1301,9 +1384,9 @@ fn fold_late_hlc(state: &mut LiveCandleState, tick: &ParsedTick, prices: TickPri
     if price < state.low {
         state.low = price;
     }
-    if tick.exchange_timestamp >= state.close_ts_ist_secs {
+    if fold_secs >= state.close_ts_ist_secs {
         state.close = price;
-        state.close_ts_ist_secs = tick.exchange_timestamp;
+        state.close_ts_ist_secs = fold_secs;
     }
     state.tick_count = state.tick_count.saturating_add(1);
 }
@@ -1391,7 +1474,6 @@ mod tests {
         assert_eq!(cell.snapshot(TfIndex::M1).volume, 1_400);
     }
 
-    #[test]
     /// The half the 2026-08-25 merge lost by nesting OI inside the close
     /// order guard, reproduced from the input CI actually found.
     ///
@@ -2413,7 +2495,10 @@ mod session_extreme_delta_tests {
     /// Drives the cell exactly as the real fan-out does: observe the packet's
     /// session extremes ONCE, then fold it into one timeframe.
     fn feed(cell: &mut AggregatorCell, tf: TfIndex, tick: &ParsedTick, cum: u32) {
-        let delta = cell.observe_session_extremes(tick);
+        let delta = cell.observe_session_extremes(
+            tick,
+            fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
+        );
         cell.consume_tick_with_extremes(
             tf,
             tick,
@@ -2422,6 +2507,7 @@ mod session_extreme_delta_tests {
             FeedStrategy::DEFAULT,
             u64::from(cum),
             delta,
+            fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
         );
     }
 
@@ -2592,7 +2678,10 @@ mod session_extreme_delta_tests {
         let mut t = tick_at(OPEN, 100.0, 10);
         t.day_high = 250.0;
         t.day_low = 90.0;
-        let d = cell.observe_session_extremes(&t);
+        let d = cell.observe_session_extremes(
+            &t,
+            fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
+        );
         assert!(d.is_empty(), "no previous packet means no delta");
     }
 
@@ -2615,21 +2704,30 @@ mod session_extreme_delta_tests {
         let mut fresh = tick_at(second + 10, 100.0, 25);
         fresh.day_high = 130.0;
         fresh.day_low = 100.0;
-        let d = cell.observe_session_extremes(&fresh);
+        let d = cell.observe_session_extremes(
+            &fresh,
+            fold_clock_ist_secs(fresh.exchange_timestamp, fresh.received_at_nanos),
+        );
         assert_eq!(d.new_high, Some(f32_to_f64_clean(130.0)), "a real rise");
 
         // A LATE packet from before that print, carrying the older high.
         let mut stale = tick_at(second + 3, 100.0, 22);
         stale.day_high = 100.0;
         stale.day_low = 100.0;
-        let d = cell.observe_session_extremes(&stale);
+        let d = cell.observe_session_extremes(
+            &stale,
+            fold_clock_ist_secs(stale.exchange_timestamp, stale.received_at_nanos),
+        );
         assert!(d.new_high.is_none(), "a fall is never a delta");
 
         // The next fresh packet re-states 130. It must NOT read as a rise.
         let mut echo = tick_at(second + 20, 100.0, 30);
         echo.day_high = 130.0;
         echo.day_low = 100.0;
-        let d = cell.observe_session_extremes(&echo);
+        let d = cell.observe_session_extremes(
+            &echo,
+            fold_clock_ist_secs(echo.exchange_timestamp, echo.received_at_nanos),
+        );
         assert!(
             d.new_high.is_none(),
             "restoring a level we already recorded is not a new print"
@@ -2640,7 +2738,10 @@ mod session_extreme_delta_tests {
         let mut higher = tick_at(second + 30, 100.0, 35);
         higher.day_high = 131.0;
         higher.day_low = 100.0;
-        let d = cell.observe_session_extremes(&higher);
+        let d = cell.observe_session_extremes(
+            &higher,
+            fold_clock_ist_secs(higher.exchange_timestamp, higher.received_at_nanos),
+        );
         assert_eq!(
             d.new_high,
             Some(f32_to_f64_clean(131.0)),
@@ -2661,7 +2762,10 @@ mod session_extreme_delta_tests {
             let mut t = tick_at(second + 5, 100.0, 25);
             t.day_high = bad;
             t.day_low = bad;
-            let d = cell.observe_session_extremes(&t);
+            let d = cell.observe_session_extremes(
+                &t,
+                fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
+            );
             assert!(
                 d.is_empty(),
                 "an unusable session extreme must produce no delta"
@@ -2672,7 +2776,10 @@ mod session_extreme_delta_tests {
         let mut good = tick_at(second + 10, 100.0, 30);
         good.day_high = 101.0;
         good.day_low = 100.0;
-        let d = cell.observe_session_extremes(&good);
+        let d = cell.observe_session_extremes(
+            &good,
+            fold_clock_ist_secs(good.exchange_timestamp, good.received_at_nanos),
+        );
         assert_eq!(
             d.new_high,
             Some(f32_to_f64_clean(101.0)),
@@ -2719,7 +2826,10 @@ mod session_extreme_delta_tests {
         let mut today = tick_at(OPEN + 86_400, 90.0, 5);
         today.day_high = 90.0;
         today.day_low = 90.0;
-        let d = cell.observe_session_extremes(&today);
+        let d = cell.observe_session_extremes(
+            &today,
+            fold_clock_ist_secs(today.exchange_timestamp, today.received_at_nanos),
+        );
         assert!(
             d.is_empty(),
             "the first packet of a new day is a baseline, not a fall"
@@ -2728,7 +2838,10 @@ mod session_extreme_delta_tests {
         let mut later = tick_at(OPEN + 86_400 + 10, 91.0, 8);
         later.day_high = 91.0;
         later.day_low = 90.0;
-        let d = cell.observe_session_extremes(&later);
+        let d = cell.observe_session_extremes(
+            &later,
+            fold_clock_ist_secs(later.exchange_timestamp, later.received_at_nanos),
+        );
         assert_eq!(
             d.new_high,
             Some(f32_to_f64_clean(91.0)),
@@ -2775,20 +2888,44 @@ mod session_extreme_delta_tests {
             let mut t = tick_at(ts, 100.0, cum);
             t.day_high = 100.0;
             t.day_low = 100.0;
-            let delta = cell.observe_session_extremes(&t);
+            let delta = cell.observe_session_extremes(
+                &t,
+                fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
+            );
             let prices = TickPrices::from_tick(&t);
             for tf in TfIndex::ALL {
-                cell.consume_tick_with_extremes(tf, &t, prices, 0, strategy, u64::from(cum), delta);
+                cell.consume_tick_with_extremes(
+                    tf,
+                    &t,
+                    prices,
+                    0,
+                    strategy,
+                    u64::from(cum),
+                    delta,
+                    fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
+                );
             }
         }
 
         let mut spike = tick_at(OPEN + 80, 100.0, 30);
         spike.day_high = 107.0;
         spike.day_low = 100.0;
-        let delta = cell.observe_session_extremes(&spike);
+        let delta = cell.observe_session_extremes(
+            &spike,
+            fold_clock_ist_secs(spike.exchange_timestamp, spike.received_at_nanos),
+        );
         let prices = TickPrices::from_tick(&spike);
         for tf in TfIndex::ALL {
-            cell.consume_tick_with_extremes(tf, &spike, prices, 0, strategy, 30, delta);
+            cell.consume_tick_with_extremes(
+                tf,
+                &spike,
+                prices,
+                0,
+                strategy,
+                30,
+                delta,
+                fold_clock_ist_secs(spike.exchange_timestamp, spike.received_at_nanos),
+            );
         }
 
         // M1 and M3 both have a prior in-bucket tick, so both recover it.
@@ -2983,7 +3120,10 @@ mod permutation_regression_tests {
         let mut a = tick_at(OPEN, 100.0, 10);
         a.day_high = 100.0;
         a.day_low = 100.0;
-        let d = cell.observe_session_extremes(&a);
+        let d = cell.observe_session_extremes(
+            &a,
+            fold_clock_ist_secs(a.exchange_timestamp, a.received_at_nanos),
+        );
         cell.consume_tick_with_extremes(
             TfIndex::M1,
             &a,
@@ -2992,12 +3132,16 @@ mod permutation_regression_tests {
             strategy(),
             10,
             d,
+            fold_clock_ist_secs(a.exchange_timestamp, a.received_at_nanos),
         );
 
         // 09:16 bucket: a Ticker packet -- no day fields at all.
         let silent = tick_at(OPEN + 70, 100.0, 20);
         assert_eq!(silent.day_high, 0.0, "fixture models a Ticker packet");
-        let d = cell.observe_session_extremes(&silent);
+        let d = cell.observe_session_extremes(
+            &silent,
+            fold_clock_ist_secs(silent.exchange_timestamp, silent.received_at_nanos),
+        );
         cell.consume_tick_with_extremes(
             TfIndex::M1,
             &silent,
@@ -3006,6 +3150,7 @@ mod permutation_regression_tests {
             strategy(),
             20,
             d,
+            fold_clock_ist_secs(silent.exchange_timestamp, silent.received_at_nanos),
         );
 
         // 09:16 again: a Quote with a risen high. The rise could have printed
@@ -3014,7 +3159,10 @@ mod permutation_regression_tests {
         let mut c = tick_at(OPEN + 80, 100.0, 30);
         c.day_high = 105.0;
         c.day_low = 100.0;
-        let d = cell.observe_session_extremes(&c);
+        let d = cell.observe_session_extremes(
+            &c,
+            fold_clock_ist_secs(c.exchange_timestamp, c.received_at_nanos),
+        );
         cell.consume_tick_with_extremes(
             TfIndex::M1,
             &c,
@@ -3023,6 +3171,7 @@ mod permutation_regression_tests {
             strategy(),
             30,
             d,
+            fold_clock_ist_secs(c.exchange_timestamp, c.received_at_nanos),
         );
 
         assert_eq!(
@@ -3176,7 +3325,10 @@ mod open_bucket_ordering_tests {
         let mut inverted = tick_at(OPEN + 10, 100.0, 10);
         inverted.day_high = 50.0;
         inverted.day_low = 150.0;
-        let delta = cell.observe_session_extremes(&inverted);
+        let delta = cell.observe_session_extremes(
+            &inverted,
+            fold_clock_ist_secs(inverted.exchange_timestamp, inverted.received_at_nanos),
+        );
         assert!(
             delta.is_empty(),
             "an inverted pair must never produce a widening"

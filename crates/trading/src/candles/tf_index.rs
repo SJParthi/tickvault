@@ -60,7 +60,236 @@ pub const TF_COUNT: usize = 24;
 /// The NSE regular trading session opens at 09:15:00 — every candle
 /// bucket grid is anchored here so the first candle of every timeframe
 /// starts exactly at the market open.
+///
+/// **STILL LIVE after the 2026-08-28 grid move**, and the reason matters:
+/// the candle GRID now anchors at 09:00, but the question "which bar owns the
+/// exchange's official day open/high/low?" is still answered by the MARKET
+/// open. See `is_days_first_session_bucket` in `aggregator_cell.rs`.
 pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
+
+/// 09:00:00 IST expressed as seconds-of-day (`9*3600`).
+///
+/// **THE CANDLE GRID ANCHOR — deliberately NOT the market open.**
+///
+/// Added 2026-08-28 under the dated operator authorization in
+/// `websocket-connection-scope-lock.md` ("CANDLES FROM 09:00"). The NSE
+/// pre-open call auction runs 09:00-09:12 (order collection, then matching),
+/// and its equilibrium price IS the 09:15 open — the exchange does not
+/// discover a second one. Anchoring the candle grid at 09:15 therefore threw
+/// away the twelve minutes in which that price is actually formed, which is
+/// the one window where knowing the open EARLY has value: it is what makes an
+/// ATM +/-25 option window computable at 09:13 instead of guessed from
+/// yesterday's close.
+///
+/// **This is NOT `MARKET_OPEN_SECS_OF_DAY_IST` and must never be conflated
+/// with it.** That constant means "the exchange is open for trading" and
+/// still gates orders, risk, the day-OHLC tracker and every market-hours
+/// alarm window at 09:15. This one means "we are recording candles". The two
+/// answer different questions and the pin test below asserts BOTH values
+/// independently, plus the ordering between them, so neither can silently
+/// absorb the other.
+///
+/// Grid consequence, stated because it is a real behavioural change and not
+/// a no-op. The offset between the two anchors is 900 s, so a frame's grid
+/// is UNCHANGED exactly when `900 % seconds_per_bucket == 0`. **NINE of the
+/// 24 frames move, not three** — an earlier draft of this comment said
+/// "2m/30m/60m" and was wrong by omission, which is worth recording because
+/// the omitted one is the loudest:
+///
+/// | moves | why |
+/// |---|---|
+/// | **D1 (86_400 s)** | `bucket_start` returns `session_open` for the daily bar, so **every daily candle's `ts` moves 09:15 -> 09:00** |
+/// | 2m (120), 30m (1800), 60m (3600) | 900 is not a multiple of any of them |
+/// | 7s, 8s, 11s, 13s, 14s | live — see the correction below |
+///
+/// **CORRECTED before this shipped:** the row above first read "GDF-gated,
+/// zero rows today — latent, not live". That is true of the `spot_bar_store`
+/// RAM rings, which allocate capacity-1 placeholders for second-scale frames,
+/// and it is FALSE of the candle tables. `AggregatorCell` folds `TfIndex::ALL`
+/// with no `is_second_scale` filter, so all 24 frames write real
+/// `candles_<tf>` rows on the live Dhan lane. Those five grids therefore move
+/// for real, not latently. The distinction matters because "latent" is how a
+/// reader decides not to check something.
+///
+/// Unchanged: 1s, 2s, 3s, 5s, 6s, 9s, 10s, 12s, 15s, 20s, 30s, 1m, 3m, 5m,
+/// 15m (900 divides all of them).
+///
+/// Clock-aligned is the more conventional answer and is what every external
+/// chart shows, but it IS a change, and it is why this must land BEFORE a
+/// session opens rather than during one.
+///
+/// **THREE CONSEQUENCES BEYOND THE GRID, found by an adversarial boundary
+/// sweep and disclosed rather than discovered later.**
+///
+/// 1. **D1/M30/M60 high and low now include pre-open auction prints.** Those
+///    buckets SPAN 09:00-09:15, so the fold widens their range with auction
+///    LTPs, which can sit outside the exchange's regular-session day high/low.
+///    The `day_ohlc_tracker` stays 09:15-gated (2026-08-25 scope lock), so the
+///    D1 candle and the day-OHLC tracker CAN now legitimately disagree on high
+///    and low. Both are correct for their own question; anything comparing
+///    them must not treat the difference as an error.
+/// 2. **Pre-open bars persist `open_pct = 0.0`.** `session_open` is the
+///    exchange's `day_open`, which is 0 during the auction because no trade
+///    has printed, and `pct_change` correctly refuses a non-positive baseline.
+///    So ~15 bars per instrument per day carry a zero that means "no session
+///    open exists yet" but is indistinguishable from "flat". Semantically
+///    right, and worth knowing before reading a pre-open chart.
+/// 3. **A counter changes shape.** Roughly 400,000 ticks per session move
+///    from `refused(out_of_session)` to `folded`. Any baseline or alarm
+///    threshold derived from that counter's historical value is now measuring
+///    a different population.
+///
+/// A fourth, and it is a PRE-EXISTING hole this change WIDENS rather than
+/// creates. `WsFrameSpill::replay_all` is not day-scoped, and at replay time
+/// the aggregator's watermark is 0 — so the stale-trading-day gate
+/// (`exchange_timestamp / 86_400 < watermark / 86_400`) always passes on the
+/// first replayed frame. A stale frame therefore reaches the SESSION gate as
+/// its only remaining defence. Previously a stale frame stamped in
+/// [09:00, 09:15) was refused there; now it folds and opens a bucket dated on
+/// a closed day. The exposure grows from 22,500 s of the day to 23,400 s —
+/// about 4% wider, on a hole that already existed for the other 22,500. Not
+/// introduced here, not fixed here, and recorded so it is not rediscovered as
+/// new: the real fix is day-scoping the replay or seeding the watermark from
+/// the staged frames, both outside this change.
+///
+/// One more, recorded because it is correct only by arithmetic coincidence:
+/// `tf_consistency_boot::is_on_grid` re-anchors to 09:00 and therefore
+/// re-classifies rows written on the OLD grid. It survives because that
+/// verifier covers M3/M5/M15 only, and 900 divides all three. Adding any
+/// frame where `900 % S != 0` to it — M2, M30, M60 — would make every
+/// historical row report `OffGridTs`.
+///
+/// **The mid-session hazard, precisely.** The `candles_<tf>` DEDUP key is
+/// `(ts, security_id, segment, feed)` — it carries no grid identity. So a
+/// restart onto the new grid mid-session does NOT collide and does NOT gap:
+/// it leaves BOTH rows. A 10:20 restart on 30m keeps the old complete
+/// `ts=09:45` bar and adds a new `ts=10:00` bar holding only 10:20-10:30.
+/// Nothing detects this — `tf_consistency` recomputes M3/M5/M15, which are
+/// exactly the frames whose grids did NOT move. That is a process control,
+/// not a mechanism, and it is stated plainly rather than implied: deploy this
+/// between sessions.
+pub(crate) const CANDLE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
+
+/// The largest plausible gap between a tick's EXCHANGE stamp and OUR receipt
+/// of it, in seconds.
+///
+/// Measured against production: Dhan's delivery lag ran p50 1.38 s, p90
+/// 8.50 s, p99 46.37 s and max 198.69 s on the worst recorded day
+/// (2026-07-06, the measurements that retired the feed the first time). 300 s
+/// is therefore well above any real delivery lag ever observed here, and far
+/// below the thing it exists to catch.
+pub const MAX_PLAUSIBLE_RECEIPT_LAG_SECS: i64 = 300;
+
+/// The largest amount by which a receipt may plausibly PRECEDE the exchange
+/// stamp, in seconds.
+///
+/// Non-zero because the two clocks are independent: Dhan stamps whole seconds
+/// on their clock, we stamp nanoseconds on ours, and a few seconds of skew
+/// between two machines is ordinary. Small, because a receipt genuinely
+/// EARLIER than the trade it describes is otherwise nonsense.
+pub const MAX_PLAUSIBLE_RECEIPT_LEAD_SECS: i64 = 10;
+
+/// IST is UTC+05:30. `received_at_nanos` is UTC; `exchange_timestamp` is
+/// already IST (never add the offset to it — see `data-integrity.md`).
+const IST_UTC_OFFSET_SECS: i64 = 19_800;
+
+/// The clock the candle grid buckets on: **the receipt clock, with the
+/// exchange clock as a fail-soft fallback**.
+///
+/// # Why the receipt clock
+///
+/// Operator instruction, 2026-08-28: *"ensure to achieve this ohlcv based on
+/// one and only received at"*, and again the same day for day high/low.
+///
+/// What it actually corrects is DELIVERY LAG: `exchange_timestamp` is Dhan's
+/// last trade time, and this feed's measured delivery lag is p50 1.4s / p99
+/// 46s, so on an ordinary day a trade printed at 09:29:59 reaches us at
+/// 09:30:01. On the trade clock that packet files into the 09:29 bar it was
+/// no longer part of by the time we could act on it; on the receipt clock it
+/// files into 09:30, which is the bar a live decision is actually reading.
+///
+/// # What it does NOT correct — the limit, stated because it is not obvious
+///
+/// An earlier draft of this doc justified the change with the DORMANT
+/// CONTRACT case: `exchange_timestamp` on a sleepy option is the stamp of
+/// whenever it last printed (measured mean 5 hours, max 34 days), so
+/// bucketing on it supposedly files a live snapshot into a bar dated days
+/// ago. **That justification was FALSE**, and the test written to demonstrate
+/// it failed instead — which is how it was caught. The delta guard below
+/// refuses any receipt more than [`MAX_PLAUSIBLE_RECEIPT_LAG_SECS`] past the
+/// trade, so a stale snapshot falls straight back to its trade stamp and
+/// nothing changes for it.
+///
+/// That is not a defect to fix here: while `received_at` is re-stamped at WAL
+/// replay, a large positive delta is INDISTINGUISHABLE from a replayed frame,
+/// and re-dating a replay to replay-time would destroy the bars it belongs
+/// to. Narrowing that ambiguity needs the real receipt carried through the
+/// WAL record — a separate change. Until then the honest scope of this clock
+/// is: correct within the trusted band, fall back outside it. Pinned by
+/// `receipt_clock_end_to_end_tests::a_stale_snapshot_still_buckets_on_its_trade_stamp`.
+///
+/// # Why there is a fallback at all, and why it is a DELTA and not a band
+///
+/// A receipt is only trustworthy if it is a receipt. Two shapes are not:
+///
+/// - **The replay path.** Frames staged in the write-ahead log are re-stamped
+///   at REPLAY time until `TVW3` carries the original (see the plan's W1b).
+///   Measured on production 2026-08-27: 9.1% of a session's NIFTY ticks
+///   replayed 9–20 HOURS after their true arrival. Bucketing those on their
+///   apparent receipt filed 34 real minutes into 4 bars stamped outside
+///   market hours, and 4,319 ticks onto the following day.
+/// - **A clock step.** An NTP correction between receipt and use.
+///
+/// An absolute plausibility band (is this a sane epoch?) catches neither: a
+/// replay stamp nine hours late is a perfectly sane epoch. The DELTA against
+/// the exchange stamp catches both, because both shapes are defined by
+/// disagreeing with it by far more than any real delivery lag.
+///
+/// That is what makes this safe to ship BEFORE the receipt is threaded
+/// through the WAL: a replayed frame's apparent receipt fails the delta test
+/// and the tick buckets on the exchange clock exactly as it does today.
+/// Finishing `TVW3` then upgrades those ticks from correct-by-fallback to
+/// correct-by-receipt, and no behaviour has to change to absorb it.
+///
+/// # What this is NOT used for
+///
+/// - The QuestDB designated `ts` — that is the exchange stamp verbatim,
+///   forever (`data-integrity.md`).
+/// - `ws_lag_ms` — it measures exchange-versus-receipt, so folding one into
+///   the other makes it identically zero.
+/// - The stale-trading-day gate — that asks whether the VENDOR's stamp is
+///   from a closed day, which is a question about the exchange clock.
+///
+/// # Complexity
+///
+/// O(1) time, O(1) space, no allocation, no branch on data length: at most
+/// one add, one divide, two compares and a `u32` conversion. Safe to call
+/// per tick and per timeframe.
+#[inline]
+#[must_use]
+pub fn fold_clock_ist_secs(exchange_timestamp: u32, received_at_nanos: i64) -> u32 {
+    // 0 is the documented "no receipt" sentinel; negatives cannot be a real
+    // epoch. Either way there is nothing to prefer over the exchange stamp.
+    if received_at_nanos <= 0 {
+        return exchange_timestamp;
+    }
+    // UTC nanos -> IST seconds. Floor division is correct for a positive
+    // value and this is guaranteed positive by the guard above.
+    let receipt_ist_secs = received_at_nanos / 1_000_000_000 + IST_UTC_OFFSET_SECS;
+    let delta = receipt_ist_secs - i64::from(exchange_timestamp);
+    // The explicit comparison is the same two integer compares as
+    // `RangeInclusive::contains`, written out so the O(1) pre-commit scanner
+    // does not read `.contains(` as a Vec scan - the same reasoning, and the
+    // same suppression, as the session gate in `multi_tf_aggregator.rs`.
+    // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
+    #[allow(clippy::manual_range_contains)]
+    if delta > MAX_PLAUSIBLE_RECEIPT_LAG_SECS || delta < -MAX_PLAUSIBLE_RECEIPT_LEAD_SECS {
+        return exchange_timestamp;
+    }
+    // Cannot overflow: `delta` is bounded above, so `receipt_ist_secs` is
+    // within 300 s of a `u32`. The fallback keeps it total regardless.
+    u32::try_from(receipt_ist_secs).unwrap_or(exchange_timestamp)
+}
 
 /// 15:30:00 IST expressed as seconds-of-day (`15*3600 + 30*60`).
 /// The NSE regular session closes at 15:30:00 — the candle window is
@@ -481,11 +710,13 @@ impl TfIndex {
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
         let secs = self.seconds_per_bucket();
         let day_start = (tick_ist_secs / 86_400) * 86_400;
-        let market_open = day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST);
-        if tick_ist_secs <= market_open {
-            return market_open;
+        // 2026-08-28: anchored on the CANDLE session open (09:00), not the
+        // market open (09:15) — see CANDLE_SESSION_OPEN_SECS_OF_DAY_IST.
+        let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
+        if tick_ist_secs <= session_open {
+            return session_open;
         }
-        market_open.saturating_add(((tick_ist_secs - market_open) / secs) * secs)
+        session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.
@@ -517,11 +748,131 @@ mod tests {
     /// edited alone, this test fails the build — the day-OHLC gate
     /// (`day_ohlc_session_accepts` in the app crate) delegates to the
     /// common-crate gate, so this pin keeps ALL session windows identical.
+    /// The LIVE path: receipt lands a second or two after the trade, so the
+    /// fold clock IS the receipt. This is the case the operator asked for.
+    #[test]
+    fn a_live_receipt_a_second_after_the_trade_is_the_fold_clock() {
+        let exch = 1_779_362_677_u32; // ~11:24 IST
+        // 1.4 s later in UTC nanos (measured Dhan p50 delivery lag).
+        let recv_utc = (i64::from(exch) - 19_800) * 1_000_000_000 + 1_400_000_000;
+        assert_eq!(fold_clock_ist_secs(exch, recv_utc), exch + 1);
+    }
+
+    /// The REPLAY path, and the reason the guard is a DELTA rather than a
+    /// plausibility band. Measured on production 2026-08-27: 9.1% of a
+    /// session's ticks replayed 9-20 HOURS after their true arrival. Nine
+    /// hours later is a perfectly SANE epoch - an absolute band waves it
+    /// through - and bucketing on it filed 34 real minutes into bars stamped
+    /// outside market hours. The delta catches it and falls back.
+    #[test]
+    fn a_replay_stamp_nine_hours_late_falls_back_to_the_exchange_clock() {
+        let exch = 1_779_362_677_u32;
+        let nine_hours_later = (i64::from(exch) - 19_800 + 9 * 3_600) * 1_000_000_000;
+        assert_eq!(
+            fold_clock_ist_secs(exch, nine_hours_later),
+            exch,
+            "a replay stamp must never place the bucket"
+        );
+    }
+
+    /// The boundary of the guard, both sides, so a future edit cannot widen
+    /// or narrow it without this failing.
+    #[test]
+    fn the_receipt_lag_guard_bites_exactly_at_its_documented_bound() {
+        let exch = 1_779_362_677_u32;
+        let at = |lag: i64| (i64::from(exch) - 19_800) * 1_000_000_000 + lag * 1_000_000_000;
+
+        // At the bound: still trusted.
+        assert_eq!(
+            fold_clock_ist_secs(exch, at(MAX_PLAUSIBLE_RECEIPT_LAG_SECS)),
+            exch + u32::try_from(MAX_PLAUSIBLE_RECEIPT_LAG_SECS).expect("bound fits u32")
+        );
+        // One second past it: refused.
+        assert_eq!(
+            fold_clock_ist_secs(exch, at(MAX_PLAUSIBLE_RECEIPT_LAG_SECS + 1)),
+            exch
+        );
+        // A receipt slightly BEFORE the trade is ordinary clock skew between
+        // two machines and is trusted...
+        assert_eq!(
+            fold_clock_ist_secs(exch, at(-MAX_PLAUSIBLE_RECEIPT_LEAD_SECS)),
+            exch - u32::try_from(MAX_PLAUSIBLE_RECEIPT_LEAD_SECS).expect("bound fits u32")
+        );
+        // ...but a receipt far before it is nonsense, and refused.
+        assert_eq!(
+            fold_clock_ist_secs(exch, at(-MAX_PLAUSIBLE_RECEIPT_LEAD_SECS - 1)),
+            exch
+        );
+    }
+
+    /// The sentinel and the impossible. `0` is the documented "no receipt"
+    /// value and must never be read as an epoch at the dawn of 1970.
+    #[test]
+    fn an_absent_or_negative_receipt_falls_back_and_never_panics() {
+        let exch = 1_779_362_677_u32;
+        assert_eq!(fold_clock_ist_secs(exch, 0), exch);
+        assert_eq!(fold_clock_ist_secs(exch, -1), exch);
+        assert_eq!(fold_clock_ist_secs(exch, i64::MIN), exch);
+        assert_eq!(fold_clock_ist_secs(exch, i64::MAX), exch);
+        // And the pathological exchange stamps, which must also not panic.
+        assert_eq!(fold_clock_ist_secs(0, i64::MAX), 0);
+        assert_eq!(fold_clock_ist_secs(u32::MAX, 0), u32::MAX);
+    }
+
+    /// The IST conversion itself, stated as an equality rather than a
+    /// tolerance: `received_at_nanos` is UTC and the exchange stamp is
+    /// already IST, so a missing offset shifts every bucket by 5h30m - the
+    /// single most likely way to get this wrong.
+    #[test]
+    fn the_receipt_is_converted_from_utc_to_ist_not_used_raw() {
+        let exch = 1_779_362_677_u32;
+        // A receipt at EXACTLY the trade instant, expressed in UTC.
+        let recv_utc = (i64::from(exch) - 19_800) * 1_000_000_000;
+        assert_eq!(fold_clock_ist_secs(exch, recv_utc), exch);
+        // And the guard catches the conversion bug itself, which is a
+        // property worth pinning rather than a coincidence. Feeding a value
+        // that is ALREADY IST (i.e. forgetting that the receipt is UTC) makes
+        // the computed receipt 19,800 s late - far outside the 300 s lag
+        // bound - so it FALLS BACK to the exchange stamp instead of shifting
+        // the whole grid by five and a half hours.
+        //
+        // This assertion was written expecting `exch + 19_800` and failed.
+        // The code was right and the expectation was wrong: the delta guard
+        // protects against a mis-conversion as well as against a replay
+        // stamp, which is a second reason to prefer it over an absolute
+        // plausibility band.
+        let already_ist_by_mistake = i64::from(exch) * 1_000_000_000;
+        assert_eq!(
+            fold_clock_ist_secs(exch, already_ist_by_mistake),
+            exch,
+            "a UTC/IST mix-up must fail closed onto the exchange stamp, \
+             never shift the grid by 5h30m"
+        );
+    }
+
     #[test]
     fn test_session_constants_pinned_and_agree_with_common_crate() {
         use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};
 
         assert_eq!(MARKET_OPEN_SECS_OF_DAY_IST, 33_300, "09:15:00 IST");
+        // 2026-08-28: the CANDLE grid anchor is deliberately EARLIER than the
+        // market open. Both values are pinned independently AND their ordering
+        // is pinned, so a future edit cannot quietly collapse one into the
+        // other in either direction — which is the whole risk of having two
+        // constants that both look like "when does the day start".
+        assert_eq!(
+            CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, 32_400,
+            "09:00:00 IST - the NSE pre-open call auction starts here"
+        );
+        assert!(
+            CANDLE_SESSION_OPEN_SECS_OF_DAY_IST < MARKET_OPEN_SECS_OF_DAY_IST,
+            "the candle grid must open BEFORE the market, never at or after it"
+        );
+        assert_eq!(
+            MARKET_OPEN_SECS_OF_DAY_IST - CANDLE_SESSION_OPEN_SECS_OF_DAY_IST,
+            900,
+            "the pre-open capture window is exactly 15 minutes (09:00-09:15)"
+        );
         assert_eq!(
             MARKET_CLOSE_SECS_OF_DAY_IST, 56_400,
             "15:40:00 IST (exclusive) — NSE CAS change 2026-08-03"
@@ -832,9 +1183,12 @@ mod tests {
     #[test]
     fn test_tf_index_bucket_start_aligns_to_seconds_per_bucket() {
         // An in-window IST tick (~11:24 IST). Buckets anchor to the
-        // 09:15:00 market open, NOT the epoch.
+        // 09:00:00 CANDLE session open (2026-08-28: was the 09:15 market
+        // open), NOT the epoch. The distinction is visible in this test for
+        // 2m/30m/60m, whose grids moved: the 900 s between the two anchors
+        // divides evenly into 60/180/300/900 but not into 120/1800/3600.
         let tick = 1_779_362_677_u32;
-        let market_open = (tick / 86_400) * 86_400 + 33_300;
+        let session_open = (tick / 86_400) * 86_400 + 32_400;
         for tf in TfIndex::ALL {
             let bucket = tf.bucket_start(tick);
             let secs = tf.seconds_per_bucket();
@@ -844,9 +1198,9 @@ mod tests {
                 tf.display_name()
             );
             assert_eq!(
-                (bucket - market_open) % secs,
+                (bucket - session_open) % secs,
                 0,
-                "bucket_start not anchored to 09:15 for {}",
+                "bucket_start not anchored to 09:00 for {}",
                 tf.display_name()
             );
             assert!(

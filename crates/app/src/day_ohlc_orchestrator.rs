@@ -137,6 +137,40 @@ pub fn spawn_day_ohlc_tick_consumer(
                     // high/low/close. Always-on SIDs (GIFT Nifty §30) are
                     // EXEMPT, matching the candle aggregator. O(1) skip, no
                     // per-tick log.
+                    // 2026-08-28: this gate stays on the EXCHANGE clock, and
+                    // that is deliberate — it is the ONE site the receipt-clock
+                    // change deliberately does NOT touch.
+                    //
+                    // An earlier draft of this change DID move it, with a
+                    // comment asserting "a pre-open tick is still refused, on
+                    // either clock". That was FALSE, and an adversarial sweep
+                    // proved it the same day: the window is a COMPARISON
+                    // against a clock, so moving the clock moves the boundary
+                    // in effect. A trade printed at 09:14:58 and received at
+                    // 09:15:00 — the p50 lag, i.e. every trading day — would
+                    // have been ADMITTED into day HIGH/LOW/CLOSE, and at the
+                    // +300s trusted bound up to five minutes of the pre-open
+                    // auction with it. That is exactly what the 2026-08-25
+                    // scope lock's REJECT list forbids: "Admits pre-open ticks
+                    // into day HIGH/LOW/CLOSE under cover of this quote — it
+                    // authorizes the OPEN only."
+                    //
+                    // The mirror at 15:30 was the same defect pointing the
+                    // other way: a genuine 15:29:58 print received at 15:30:02
+                    // would have been DROPPED from the day's close.
+                    //
+                    // The right rule is the one that was here all along:
+                    // "is this a REGULAR-SESSION trade?" is a property of the
+                    // TRADE, so it is judged on the trade's own clock. The
+                    // operator's "day high/low on received_at" is satisfied
+                    // without it — a day high is a running max, which has no
+                    // clock dependence, and the ORDERING that does (which bar
+                    // a tick lands in, which tick owns a close) moved to the
+                    // receipt clock in the aggregator where it belongs.
+                    //
+                    // A dormant contract whose last print was days ago is
+                    // refused here, and that is correct rather than a loss:
+                    // it has no day OHLC today to record.
                     if !day_ohlc_gate_allows(
                         &always_on,
                         tick.security_id,

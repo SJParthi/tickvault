@@ -1906,3 +1906,151 @@ separate fields. A number that is only ever quoted is not evidence.
 **Still true, and unaffected by the correction:** the NTM rows really were
 being resolved and never selected; BSE really is excluded; the ISIN join
 really does run fail-closed. Those were checked in source, not quoted.
+
+### 2026-08-28 — CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK, PER-MINUTE ATM RE-FIT, AND THE PERCENTAGE COLUMNS
+
+**The verbatim operator demands (2026-08-28, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "Yes fox and resolve everything always ensure to start eelvery candles starting at 9 am dude okay"
+
+> "Meanwhile ensure to achieve this ohlcv based on one and only received at dude okay?"
+
+> "See clealry ensure whenever the pre marketbope ticks and candles get finished ensure to provide this fucking atm plus minus depths also dude and starting 9.16 am every one minute resubscribe also right dude of current atm and what about pre oopem marketbpercentage change and even percentage change also dude okay?"
+
+**Preceding demands from the same session (2026-08-27), which these reaffirm:**
+
+> "still now nowhere I can see our entire ohlcv is nowhere captured based on revived at still it is looking at Ts soclelary ensure to use received at dude okay?"
+
+> "see meanwhile at 3.40 pm we need to pull all the entire underlying spots data right that too one and only for one minute right to do the cross verification between these and our cnaldes 1 min right whether everything is entirely mat he'd right dud eam I right dude"
+
+> "high low shoudl be on place base don current second and current minute to precisely capture day high day low"
+
+This dated record is written BEFORE any code, per the rule-file-first law.
+
+#### ⚠ The reaffirmation, recorded so the decision is auditable
+
+The receipt-clock instruction was given, measured against, reported back with
+contrary evidence, and then **reaffirmed**. The measurement is recorded here in
+full because it constrains HOW the instruction must be implemented, not whether:
+
+| Measured on production, 2026-08-27, NIFTY | Exchange clock | `received_at` clock |
+|---|---|---|
+| Session minutes present | 385 / 385 | **351 / 385** |
+| Bars exactly matching the vendor's own tape | 382 (99.2%) | 321 (83.4%) |
+| Phantom bars stamped outside market hours | 0 | **4** |
+| Ticks filed on the WRONG DAY | 0 | **4,319** |
+| **Ticks that would change minute on the LIVE path** | — | **0 of 83,871** |
+
+The last row is the load-bearing one. On the live path the two clocks are not
+merely close, they are **identical** — the exchange stamps whole seconds and we
+receive inside the same second, so the minute is never in dispute. The clocks
+diverge **only** on ticks replayed from the WAL, and there `received_at` carries
+the moment of REPLAY rather than the moment of receipt.
+
+**That is a DEFECT in how `received_at` is populated, not a property of the
+clock.** The true receipt instant is captured correctly and early — `FrameSink::
+accept` stamps it BEFORE the WAL append — and is then discarded at the WAL record
+boundary, because the record format carries `ws_type`, `frame_seq` and the frame
+bytes and nothing else. Replay therefore re-stamps with `now()`.
+
+**So the instruction is implementable and, once the defect is repaired, the
+receipt clock is strictly BETTER than today**: identical on the live path, correct
+on the replay path where today's exchange-clock rows are merely lucky, and it
+retires the entire late-arrival/refold policy because receipt is monotone per
+drain. The operator's instruction stands and is adopted.
+
+#### What is authorized
+
+| # | Surface | From | To |
+|---|---|---|---|
+| 1 | WAL record format | `TVW2` (ws_type, frame_seq, frame) | **`TVW3`** — adds an 8-byte LE `received_at_nanos`. Replay restores it instead of re-stamping `now()`. `TVW1`/`TVW2` records replay with `0`, which the persistence layer already maps to NULL — never a lying timestamp |
+| 2 | Candle bucketing clock | `exchange_timestamp` | **`received_at`**, for every timeframe |
+| 3 | Candle session start | 09:15:00 | **09:00:00**, for every timeframe |
+| 4 | ATM re-fit cadence | once at attach, top-up until 09:30 | **every minute from 09:16**, additive-only |
+| 5 | Percentage columns | four columns, all hard-coded `0.0` | **computed** — `change_pct`, `close_pct_from_prev_day`, `open_pct`, `open_gap_pct` (the pre-open gap) |
+| 6 | Cross-verification | already runs 15:41 over ~868 spots | **UNCHANGED in scope** — the operator's ask is already met; only the time budget is a real gap |
+
+#### ⚠ What must NOT move, and why (getting this wrong breaks the only ground truth)
+
+**`MARKET_OPEN_IST_NANOS` (09:15) STAYS.** It gates tick *persistence* and the
+DAY OHLC tracker — not candles. Moving it would admit pre-open ticks into the day
+high/low/close, which this file's own 2026-08-25 section forbids in as many
+words: *"Admits pre-open ticks into day HIGH/LOW/CLOSE under cover of this quote
+— it authorizes the OPEN only."* Only the trading-crate candle constant moves.
+The compile-time cross-assert that currently binds the two must be **deliberately
+severed with a comment**, never silently deleted, or the day gate follows the
+candle gate and the 2026-08-25 rule is breached by accident.
+
+**The cross-verification's 09:15 / 385-minute window STAYS.** Dhan's own tape has
+no pre-open minutes. Widening it would report 09:00–09:14 as `missing_rest` on
+every instrument every day and destroy the only ground truth the revived feed
+has. Pre-open live rows must be EXCLUDED from the comparison, never counted as
+missing.
+
+#### ⚠ MEASURED: the per-minute ATM re-fit will almost always be a no-op
+
+Recorded because the operator asked for a mechanism, and the mechanism should be
+built knowing what it will actually do:
+
+| Measured, 210 F&O underlyings, current expiry, 2026-08-27 | Value |
+|---|---|
+| Median strike spacing | **2.63% of price** |
+| Average intraday drift from the open | 2.20% = **0.8 strikes** |
+| Worst single underlying that day (15.86%) | **6.0 strikes** |
+| Window half-width | **25 strikes** |
+| Ladders where ±25 ALREADY takes every strike that exists | **81 of 210 (39%)** |
+
+The worst stock on that day moved **6 strikes inside a 25-strike buffer**, and
+for 39% of underlyings there is nowhere to re-centre to because the window
+already covers the entire ladder. The re-fit is therefore built **additive-only
+and delta-driven**: it recomputes every minute, and on a normal day it sends
+nothing. It is not built as a swap.
+
+**Additive-only is not a preference, it is the only safe shape today**, for four
+independent reasons: the transport has no `send_unsubscribe`; `SubscribeGuard`
+has no removal API and its instrument set IS the reconnect replay, so an
+unsubscribed instrument silently returns on the next reconnect; unsubscribe
+acknowledgement is undocumented; and error 805 is a DISCONNECT, so doubling wire
+traffic to reclaim slots trades bounded memory for tick loss — the wrong
+direction against the operator's own no-tick-loss mandate.
+
+**What bounds it, stated plainly:** ~2,000 spare aggregator slots against ~23,000
+already subscribed. A drift of one strike per underlying per minute would exhaust
+that in ~10 minutes. The measured drift is 0.8 strikes per DAY, so the headroom is
+ample in practice — but the re-fit must carry a per-minute cap and must fail
+CLOSED and LOUD at the ceiling: it stops adding, counts the refusal, and reports.
+It must never silently narrow the window.
+
+#### ⚠ What the pre-open candles will actually contain
+
+Not a uniform 15 extra minutes. A bucket exists only if a tick opens it; there is
+no synthetic fill and no carry-forward. Measured on 2026-08-27:
+
+- **~120 indices** tick continuously from 09:00 → full coverage across all frames.
+- **~750 equities** deliver one stale snapshot at ~08:30 (outside the window, so
+  rejected) and then **nothing until the 09:07 auction print** → the 09:00–09:06
+  buckets produce **no rows at all**, one bar at 09:07, then nothing until 09:15.
+
+Any consumer assuming "N bars per session" must treat pre-open absence as NORMAL,
+not as a gap. `tf_consistency` and the cross-verify comparator both make that
+assumption today and must be taught the difference.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Moves `MARKET_OPEN_IST_NANOS`, the day-OHLC gate, or the cross-verify window to
+  09:00 (breaches the 2026-08-25 rule and blinds the only ground truth).
+- Deletes rather than deliberately severs the compile-time assert binding the
+  candle gate to the persistence gate.
+- Switches the bucketing clock WITHOUT the `TVW3` receipt-preserving WAL record —
+  that is the combination measured to lose 8.8% of a session.
+- Implements the ATM re-fit as a SWAP, or wires unsubscribe, without first
+  building `send_unsubscribe`, a `SubscribeGuard` removal API, and aggregator slot
+  release with a full cell reset (a reused slot inheriting a foreign volume
+  baseline is the documented 9.2×-volume corruption class).
+- Lets the re-fit run on the socket reader task, or sends full sets rather than
+  deltas, or omits the 25 ms inter-batch pacing.
+- Computes a percentage change without guarding a zero or non-finite previous
+  close (this codebase has already been bitten by a NaN poisoning indicator state
+  for the life of the process).
+- Reports a pre-open minute with no ticks as a missing bar rather than as normal.

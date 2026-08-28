@@ -23,9 +23,24 @@
 // durability floor; overstating that floor is how a gap gets discovered late.
 // Adding a real fsync is a deliberate throughput trade, not a typo fix.
 //
-// Record format on disk:
-//     [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame:len bytes][crc32:u32 LE]
-// CRC32 is computed over ws_type || len || frame.
+// Record format on disk (three versions; replay accepts all three):
+//     v1 [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame][crc32:u32 LE]
+//     v2 [MAGIC:4="TVW2"][ws_type:u8][frame_seq:u64 LE][len:u32 LE][frame][crc32]
+//     v3 [MAGIC:4="TVW3"][ws_type:u8][frame_seq:u64 LE][received_at_nanos:i64 LE]
+//        [len:u32 LE][frame][crc32]
+// CRC32 covers every header byte of that version, in order, then the frame.
+//
+// WHY v3 EXISTS (2026-08-28). The receipt instant is stamped in
+// `FrameSink::accept` BEFORE this append — correctly, and early. It was then
+// discarded here, because the record had nowhere to put it. Replay therefore
+// re-stamped with `now()`, which was harmless while candles bucketed on the
+// EXCHANGE clock and became load-bearing the moment they bucket on receipt:
+// measured on 2026-08-27, 9.1% of a session's ticks replayed 9-20 hours after
+// their true arrival, which under receipt-bucketing would file 34 real minutes
+// into 4 bars stamped outside market hours. v3 carries the receipt so replay
+// restores it instead of inventing one. A v1/v2 record replays with `0`, which
+// the persistence layer already maps to NULL - a missing timestamp, never a
+// false one.
 
 use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
 use std::io::{BufWriter, Read, Write};
@@ -124,6 +139,11 @@ struct WalRecord {
     /// internally at `append` time; a later slice hoists the stamp to the WS
     /// read loop so it equals the per-tick `capture_seq`.
     frame_seq: u64,
+    /// TVW3 (2026-08-28): the frame's TRUE arrival instant as UTC epoch nanos,
+    /// stamped by the caller at receipt. Persisted so replay restores it rather
+    /// than re-stamping `now()`. [`WAL_RECEIPT_UNKNOWN_NANOS`] when the caller
+    /// has none — never a synthesized clock read.
+    received_at_nanos: i64,
     // Zero-tick-loss PR-8a (H1): `Bytes` (Arc-refcounted) so the WS read
     // loop hands ownership to the disk-writer thread with an O(1) refcount
     // bump instead of a per-frame `Vec<u8>` malloc. Derefs to `&[u8]`, so
@@ -149,6 +169,15 @@ pub struct ReplayedFrame {
     /// TICK-SEQ-01: the `frame_seq` read back from the v2 record (replay-stable).
     /// `0` for legacy v1 records that predate the field.
     pub frame_seq: u64,
+    /// TVW3: the frame's ORIGINAL arrival instant (UTC epoch nanos), read back
+    /// from the v3 record. [`WAL_RECEIPT_UNKNOWN_NANOS`] for v1/v2 records that
+    /// predate the field.
+    ///
+    /// A replay consumer MUST prefer this over a fresh clock read. Using `now()`
+    /// is what placed 9.1% of a session's ticks 9-20 hours from their true
+    /// arrival — invisible while candles bucketed on the exchange clock, and
+    /// data-losing once they bucket on receipt.
+    pub received_at_nanos: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,11 +223,55 @@ const SPILL_CHANNEL_CAPACITY: usize = 524_288;
 /// records are always written v2.
 const WAL_MAGIC: [u8; 4] = *b"TVW1";
 const WAL_MAGIC_V2: [u8; 4] = *b"TVW2";
+/// `TVW3` = v3 record: v2 plus an 8-byte LE `received_at_nanos` after
+/// `frame_seq`. NEW records are always written v3.
+const WAL_MAGIC_V3: [u8; 4] = *b"TVW3";
 
 /// Minimum on-disk record size per version, used by the replay loop guard:
 /// v1 = magic(4)+ws_type(1)+len(4)+crc(4) = 13; v2 inserts frame_seq(8) = 21.
 const WAL_MIN_RECORD_V1: usize = 13;
 const WAL_MIN_RECORD_V2: usize = 21;
+/// v3 inserts received_at_nanos(8) after frame_seq: 21 + 8 = 29.
+const WAL_MIN_RECORD_V3: usize = 29;
+
+/// Sentinel written when a caller has no receipt instant to offer, and the
+/// value a v1/v2 record replays with. NEVER a synthesized "now" — see the
+/// module header. `tick_persistence` already maps 0 to NULL.
+pub const WAL_RECEIPT_UNKNOWN_NANOS: i64 = 0;
+
+/// Plausibility band for a receipt, in UTC epoch NANOS. Mirrors the band the
+/// aggregator applies to the exchange timestamp
+/// (`MIN/MAX_PLAUSIBLE_EXCHANGE_TS_SECS`), which the receipt path did not have.
+///
+/// The asymmetry mattered: `tick_persistence` treats any non-zero
+/// `received_at` as usable and, for a tick whose exchange timestamp is the
+/// vendor's never-traded sentinel, promotes it to the row's DESIGNATED
+/// timestamp. A negative or absurd value would therefore create a pre-1970
+/// QuestDB partition that retention and archival — both keyed on the trading
+/// day — can never reach. Out-of-band values are recorded as
+/// [`WAL_RECEIPT_UNKNOWN_NANOS`], never persisted as-is: a missing timestamp
+/// is recoverable, a lying one is not.
+///
+/// 2020-09-13 .. 2050-01-01, the same span as the exchange band.
+const MIN_PLAUSIBLE_RECEIPT_NANOS: i64 = 1_600_000_000_000_000_000;
+const MAX_PLAUSIBLE_RECEIPT_NANOS: i64 = 2_524_608_000_000_000_000;
+
+/// Clamp a caller-supplied receipt to the plausible band.
+///
+/// Returns the value unchanged when it is in band, and
+/// [`WAL_RECEIPT_UNKNOWN_NANOS`] otherwise — including for the sentinel itself,
+/// which is idempotent. O(1), two comparisons, no allocation.
+#[must_use]
+#[inline]
+pub const fn plausible_receipt_nanos(received_at_nanos: i64) -> i64 {
+    if received_at_nanos >= MIN_PLAUSIBLE_RECEIPT_NANOS
+        && received_at_nanos <= MAX_PLAUSIBLE_RECEIPT_NANOS
+    {
+        received_at_nanos
+    } else {
+        WAL_RECEIPT_UNKNOWN_NANOS
+    }
+}
 
 /// Rotate to a new segment after this many bytes.
 const WAL_SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
@@ -462,9 +535,38 @@ impl WsFrameSpill {
         frame: impl Into<Bytes>,
         frame_seq: u64,
     ) -> AppendOutcome {
+        // No receipt instant offered — record the sentinel, NEVER a clock read
+        // here. Minting one would be indistinguishable on replay from a real
+        // arrival time, which is the exact defect TVW3 exists to close.
+        self.append_with_seq_at(ws_type, frame, frame_seq, WAL_RECEIPT_UNKNOWN_NANOS)
+    }
+
+    /// Like [`WsFrameSpill::append_with_seq`] but also persists the frame's
+    /// TRUE arrival instant (UTC epoch nanos), so boot replay can restore it
+    /// instead of re-stamping `now()`.
+    ///
+    /// The caller stamps `received_at_nanos` at the read instant, BEFORE this
+    /// append. Hot path, O(1), zero-alloc — the extra field is 8 bytes on an
+    /// already-moved struct.
+    // TEST-EXEMPT: same `try_send` path as `append_with_seq`; the receipt round-trip is covered by tvw3_roundtrip_preserves_received_at and tvw1_and_tvw2_records_replay_with_unknown_receipt.
+    pub fn append_with_seq_at(
+        &self,
+        ws_type: WsType,
+        frame: impl Into<Bytes>,
+        frame_seq: u64,
+        received_at_nanos: i64,
+    ) -> AppendOutcome {
         let record = WalRecord {
             ws_type,
             frame_seq,
+            // Banded at the boundary, not trusted. An out-of-band value is
+            // recorded as UNKNOWN rather than persisted, because
+            // `tick_persistence` promotes a non-zero receipt to the row's
+            // DESIGNATED timestamp whenever the exchange stamp is the vendor's
+            // never-traded sentinel — so a negative receipt would mint a
+            // pre-1970 partition that retention and archival, both keyed on the
+            // trading day, can never reach. Two comparisons, O(1), no alloc.
+            received_at_nanos: plausible_receipt_nanos(received_at_nanos),
             frame: frame.into(),
         };
         match self.spill_tx.try_send(record) {
@@ -838,16 +940,19 @@ fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL frame > u32::MAX")
     })?;
     let frame_seq = r.frame_seq.to_le_bytes();
-    // CRC covers ws_type || frame_seq || len || frame.
+    let receipt = r.received_at_nanos.to_le_bytes();
+    // CRC covers ws_type || frame_seq || received_at_nanos || len || frame.
     let crc = crc32_ieee_of(&[
         &[r.ws_type.as_u8()],
         &frame_seq[..],
+        &receipt[..],
         &frame_len.to_le_bytes()[..],
         &r.frame,
     ]);
-    w.write_all(&WAL_MAGIC_V2)?;
+    w.write_all(&WAL_MAGIC_V3)?;
     w.write_all(&[r.ws_type.as_u8()])?;
     w.write_all(&frame_seq)?;
+    w.write_all(&receipt)?;
     w.write_all(&frame_len.to_le_bytes())?;
     w.write_all(&r.frame)?;
     w.write_all(&crc.to_le_bytes())?;
@@ -855,8 +960,9 @@ fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
 }
 
 fn record_disk_size(r: &WalRecord) -> u64 {
-    // v2: magic(4) + ws_type(1) + frame_seq(8) + len(4) + frame + crc(4) = 21 + frame
-    WAL_MIN_RECORD_V2 as u64 + r.frame.len() as u64
+    // v3: magic(4) + ws_type(1) + frame_seq(8) + receipt(8) + len(4) + frame
+    //     + crc(4) = 29 + frame
+    WAL_MIN_RECORD_V3 as u64 + r.frame.len() as u64
 }
 
 fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
@@ -1564,15 +1670,53 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
     // so a partial v2 tail can never be read as if its frame_seq were payload.
     while i + WAL_MIN_RECORD_V1 <= buf.len() {
         let magic = &buf[i..i + 4];
+        let is_v3 = magic == WAL_MAGIC_V3;
         let is_v2 = magic == WAL_MAGIC_V2;
         let is_v1 = magic == WAL_MAGIC;
-        if !is_v1 && !is_v2 {
-            warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
+        if !is_v1 && !is_v2 && !is_v3 {
+            // An unknown magic at offset 0 means the WHOLE segment is
+            // unreadable — and the overwhelmingly likely cause is a DEPLOY
+            // ROLLBACK: a newer binary wrote a record version this one cannot
+            // parse. That is not a torn tail, it is total loss of a segment
+            // that was captured successfully, and the caller stages and
+            // archives a zero-frame result exactly as it would a clean replay.
+            //
+            // So it is separated from the mid-segment case and raised as a
+            // CODED error, not a bare `warn!`. Before 2026-08-28 this arm was
+            // uncoded, which meant no CloudWatch metric filter could match it:
+            // the loss was not merely unrecovered, it was unpageable. A silent
+            // unrecoverable loss on the durability floor is the false-OK class
+            // this file exists to prevent.
+            //
+            // The segment itself is NOT deleted here — it is moved to the
+            // archive directory by the caller and survives until pruning, so a
+            // manual recovery with the newer binary remains possible. That is
+            // the reason this is loud-and-counted rather than fail-closed.
+            if i == 0 {
+                metrics::counter!("tv_wal_replay_unknown_magic_total").increment(1);
+                error!(
+                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                    segment = ?path,
+                    magic = ?magic,
+                    bytes = buf.len(),
+                    "WAL segment is unreadable by this binary — every frame in it \
+                     is unrecovered. Most likely a deploy ROLLBACK: a newer build \
+                     wrote a record version this one cannot parse. The file is \
+                     retained in the archive directory, so re-running the newer \
+                     build can still recover it."
+                );
+            } else {
+                warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
+            }
             break;
         }
         // Version disambiguation + per-version minimum-size guard (security
-        // review HIGH): a v2 record needs 21 bytes before its variable frame.
-        let min_rec = if is_v2 {
+        // review HIGH): a v2 record needs 21 bytes before its variable frame,
+        // a v3 record 29. Checked BEFORE any header field is read, so a
+        // partial tail can never be reinterpreted as payload.
+        let min_rec = if is_v3 {
+            WAL_MIN_RECORD_V3
+        } else if is_v2 {
             WAL_MIN_RECORD_V2
         } else {
             WAL_MIN_RECORD_V1
@@ -1589,15 +1733,35 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
                 break;
             }
         };
-        // v1: [magic|ws|len|frame|crc]; v2: [magic|ws|frame_seq(8)|len|frame|crc].
-        let (frame_seq, len_off) = if is_v2 {
+        // v1: [magic|ws|len|frame|crc]
+        // v2: [magic|ws|frame_seq(8)|len|frame|crc]
+        // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
+        let (frame_seq, received_at_nanos, len_off) = if is_v3 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
                 Err(_) => break,
             };
-            (u64::from_le_bytes(seq_bytes), i + 13)
+            let recv_bytes: [u8; 8] = match buf[i + 13..i + 21].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            (
+                u64::from_le_bytes(seq_bytes),
+                i64::from_le_bytes(recv_bytes),
+                i + 21,
+            )
+        } else if is_v2 {
+            let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            (
+                u64::from_le_bytes(seq_bytes),
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                i + 13,
+            )
         } else {
-            (0u64, i + 5)
+            (0u64, WAL_RECEIPT_UNKNOWN_NANOS, i + 5)
         };
         let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
             Ok(b) => b,
@@ -1626,9 +1790,20 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             Err(_) => break,
         };
         let expected = u32::from_le_bytes(crc_bytes);
-        // CRC covers the version's exact header bytes: v2 includes frame_seq.
+        // CRC covers the version's exact header bytes, in write order: v2 adds
+        // frame_seq, v3 adds received_at_nanos after it. Using the wrong
+        // version's byte set here would reject every record of that version as
+        // corrupt, so the arms mirror `write_record` exactly.
         let len_le = (frame_len as u32).to_le_bytes();
-        let actual = if is_v2 {
+        let actual = if is_v3 {
+            crc32_ieee_of(&[
+                &[ws_byte],
+                &frame_seq.to_le_bytes()[..],
+                &received_at_nanos.to_le_bytes()[..],
+                &len_le[..],
+                &frame,
+            ])
+        } else if is_v2 {
             crc32_ieee_of(&[
                 &[ws_byte],
                 &frame_seq.to_le_bytes()[..],
@@ -1646,6 +1821,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             ws_type,
             frame,
             frame_seq,
+            received_at_nanos,
         });
         i = record_end;
     }
@@ -2161,6 +2337,290 @@ mod tests {
             "truncated v2 header must recover 0 frames"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- TVW3: the receipt-preserving record (2026-08-28) -------------------
+
+    /// T1 — the whole reason v3 exists: a receipt stamped by the caller must
+    /// survive the disk round-trip EXACTLY, so boot replay never has to invent
+    /// one. If this regresses, candle bucketing on the receipt clock silently
+    /// files replayed ticks at the wrong minute.
+    #[test]
+    fn tvw3_roundtrip_preserves_received_at() {
+        let dir = tmp_dir("v3-roundtrip");
+        // Two distinct, plausible receipts ~7 hours apart, so a truncation or
+        // a byte-order slip cannot coincidentally produce the right answer.
+        let first: i64 = 1_787_800_000_000_000_000;
+        let second: i64 = 1_787_825_000_000_000_000;
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append_with_seq_at(WsType::LiveFeed, vec![1, 2, 3], 11, first);
+            spill.append_with_seq_at(WsType::LiveFeed, vec![4, 5, 6], 12, second);
+            wait_until_persisted(&spill, 2);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].frame, vec![1, 2, 3]);
+        assert_eq!(frames[1].frame, vec![4, 5, 6]);
+        assert_eq!(frames[0].frame_seq, 11);
+        assert_eq!(frames[1].frame_seq, 12);
+        assert_eq!(
+            frames[0].received_at_nanos, first,
+            "v3 must return the caller's receipt verbatim, not a re-stamp"
+        );
+        assert_eq!(frames[1].received_at_nanos, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2 — a v1 or v2 segment written by an older binary must replay with the
+    /// SENTINEL, never a synthesized time. A fabricated receipt is worse than
+    /// a missing one: it is indistinguishable from a real arrival, which is the
+    /// exact defect v3 closes.
+    #[test]
+    fn tvw1_and_tvw2_records_replay_with_unknown_receipt() {
+        let dir = tmp_dir("v3-backcompat");
+        let seg = dir.join("ws-frames-00000000000000000003.wal");
+        let mut bytes = encode_v1_record(WsType::LiveFeed, &[7, 7, 7]);
+        bytes.extend_from_slice(&encode_v2_record(WsType::LiveFeed, 99, &[8, 8]));
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 2, "both legacy versions must still recover");
+        assert_eq!(frames[0].frame, vec![7, 7, 7]);
+        assert_eq!(frames[0].frame_seq, 0);
+        assert_eq!(
+            frames[0].received_at_nanos, WAL_RECEIPT_UNKNOWN_NANOS,
+            "a v1 record has no receipt — it must read as UNKNOWN, never as now()"
+        );
+        assert_eq!(frames[1].frame, vec![8, 8]);
+        assert_eq!(frames[1].frame_seq, 99, "v2 keeps its frame_seq");
+        assert_eq!(
+            frames[1].received_at_nanos, WAL_RECEIPT_UNKNOWN_NANOS,
+            "a v2 record has no receipt field either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2b — `append_with_seq` (the receipt-less entry point) must record the
+    /// sentinel rather than reading a clock. A clock read here would be
+    /// indistinguishable on replay from a genuine arrival.
+    #[test]
+    fn append_without_a_receipt_records_the_sentinel_not_a_clock_read() {
+        let dir = tmp_dir("v3-no-receipt");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append_with_seq(WsType::LiveFeed, vec![3, 3], 42);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_seq, 42);
+        assert_eq!(
+            frames[0].received_at_nanos, WAL_RECEIPT_UNKNOWN_NANOS,
+            "no receipt offered => sentinel, never a synthesized timestamp"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2c — a TRUNCATED v3 header (21 bytes: magic+ws+seq+receipt, but no
+    /// len/frame/crc) passes the v1 outer guard and would reach the field reads
+    /// if the per-version minimum were wrong. Must reject cleanly: no panic, no
+    /// out-of-bounds read, zero frames. This is the v3 twin of the v2 guard.
+    #[test]
+    fn tvw3_truncated_header_recovers_nothing_and_does_not_panic() {
+        let dir = tmp_dir("v3-truncated");
+        let seg = dir.join("ws-frames-00000000000000000004.wal");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&WAL_MAGIC_V3); // 4
+        bytes.push(WsType::LiveFeed.as_u8()); // +1 = 5
+        bytes.extend_from_slice(&[0u8; 8]); // +8 frame_seq = 13
+        bytes.extend_from_slice(&[0u8; 8]); // +8 receipt   = 21, still < 29
+        assert_eq!(bytes.len(), 21);
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap(); // must not panic
+        assert!(
+            frames.is_empty(),
+            "a truncated v3 header must recover 0 frames"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2d — a v3 record whose CRC does not cover the receipt bytes would let a
+    /// corrupted timestamp through silently. Flip one byte INSIDE the receipt
+    /// field and require the record to be rejected.
+    #[test]
+    fn tvw3_crc_covers_the_receipt_field() {
+        let dir = tmp_dir("v3-crc");
+        let seg = dir.join("ws-frames-00000000000000000005.wal");
+        let mut bytes = encode_v3_record(WsType::LiveFeed, 5, 1_787_800_000_000_000_000, &[1, 2]);
+        // Receipt occupies bytes 13..21. Corrupt one of them; the CRC must fail.
+        bytes[13] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert!(
+            frames.is_empty(),
+            "a receipt-byte flip must fail CRC — otherwise the CRC does not \
+             cover the field and a corrupt timestamp reaches the aggregator"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T3 — the size accounting used for segment rotation must match what the
+    /// writer actually emits, or segments overrun (or under-run) their cap.
+    #[test]
+    fn tvw3_record_disk_size_matches_the_bytes_written() {
+        let frame = vec![1u8, 2, 3, 4, 5];
+        let encoded = encode_v3_record(WsType::LiveFeed, 1, 1_787_800_000_000_000_000, &frame);
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: 1,
+            received_at_nanos: 1_787_800_000_000_000_000,
+            frame: Bytes::from(frame.clone()),
+        };
+        assert_eq!(
+            record_disk_size(&rec) as usize,
+            encoded.len(),
+            "rotation accounting must equal the real on-disk size"
+        );
+        assert_eq!(
+            encoded.len(),
+            WAL_MIN_RECORD_V3 + frame.len(),
+            "v3 overhead must be exactly {WAL_MIN_RECORD_V3} bytes"
+        );
+    }
+
+    /// An implausible receipt must never be persisted. It is recorded as the
+    /// sentinel instead, because `tick_persistence` promotes a non-zero receipt
+    /// to the row's DESIGNATED timestamp for a sentinel-LTT tick — so a
+    /// negative value would create a pre-1970 partition that retention and
+    /// archival can never reach. A missing timestamp is recoverable; a lying
+    /// one is not.
+    #[test]
+    fn an_implausible_receipt_is_recorded_as_unknown_not_persisted() {
+        // In band — kept verbatim.
+        let good: i64 = 1_787_800_000_000_000_000;
+        assert_eq!(plausible_receipt_nanos(good), good);
+        // Every out-of-band shape collapses to the sentinel.
+        for bad in [
+            -1_i64,
+            i64::MIN,
+            i64::MAX,
+            1,
+            1_599_999_999_999_999_999, // just before the band opens
+            2_524_608_000_000_000_001, // just after it closes
+            WAL_RECEIPT_UNKNOWN_NANOS, // the sentinel itself is idempotent
+        ] {
+            assert_eq!(
+                plausible_receipt_nanos(bad),
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                "{bad} must be refused, not persisted"
+            );
+        }
+        // Both edges are inclusive.
+        assert_eq!(
+            plausible_receipt_nanos(MIN_PLAUSIBLE_RECEIPT_NANOS),
+            MIN_PLAUSIBLE_RECEIPT_NANOS
+        );
+        assert_eq!(
+            plausible_receipt_nanos(MAX_PLAUSIBLE_RECEIPT_NANOS),
+            MAX_PLAUSIBLE_RECEIPT_NANOS
+        );
+    }
+
+    /// End-to-end twin of the test above: a negative receipt handed to the
+    /// append path must reach disk as the sentinel, not as a negative number.
+    #[test]
+    fn a_negative_receipt_never_reaches_the_wal() {
+        let dir = tmp_dir("v3-negative-receipt");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append_with_seq_at(WsType::LiveFeed, vec![1], 1, -42);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].received_at_nanos, WAL_RECEIPT_UNKNOWN_NANOS,
+            "a negative receipt must be banded away before it is written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment written by a NEWER binary (a deploy rollback) must be reported
+    /// LOUDLY and COUNTED, not swallowed as a clean zero-frame replay. Before
+    /// 2026-08-28 this arm was an uncoded `warn!`, so no CloudWatch filter
+    /// could match it and the loss was unpageable as well as unrecovered.
+    #[test]
+    fn a_segment_from_a_newer_binary_recovers_nothing_and_does_not_panic() {
+        let dir = tmp_dir("v3-future-magic");
+        let seg = dir.join("ws-frames-00000000000000000006.wal");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TVW9"); // a version this binary cannot parse
+        bytes.push(WsType::LiveFeed.as_u8());
+        bytes.extend_from_slice(&[0u8; 40]); // plausible-looking body
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap(); // must not panic
+        assert!(
+            frames.is_empty(),
+            "an unparseable segment must recover 0 frames rather than guess"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test-only encoder for a v2 record. The writer no longer emits v2, so
+    /// this is the ONLY way to build the legacy shape that backward-compat
+    /// replay must still accept — without it, the v2 path would be untested
+    /// from the day v3 shipped.
+    fn encode_v2_record(ws: WsType, frame_seq: u64, frame: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(frame.len()).expect("test frame fits u32");
+        let seq = frame_seq.to_le_bytes();
+        let crc = crc32_ieee_of(&[&[ws.as_u8()], &seq[..], &len.to_le_bytes()[..], frame]);
+        let mut v = Vec::new();
+        v.extend_from_slice(&WAL_MAGIC_V2);
+        v.push(ws.as_u8());
+        v.extend_from_slice(&seq);
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(frame);
+        v.extend_from_slice(&crc.to_le_bytes());
+        v
+    }
+
+    /// Test-only encoder for a v3 record, byte-for-byte mirroring
+    /// `write_record`. Kept beside the tests that use it so a divergence
+    /// between the two shows up as a failing round-trip rather than silently.
+    fn encode_v3_record(
+        ws: WsType,
+        frame_seq: u64,
+        received_at_nanos: i64,
+        frame: &[u8],
+    ) -> Vec<u8> {
+        let len = u32::try_from(frame.len()).expect("test frame fits u32");
+        let seq = frame_seq.to_le_bytes();
+        let recv = received_at_nanos.to_le_bytes();
+        let crc = crc32_ieee_of(&[
+            &[ws.as_u8()],
+            &seq[..],
+            &recv[..],
+            &len.to_le_bytes()[..],
+            frame,
+        ]);
+        let mut v = Vec::new();
+        v.extend_from_slice(&WAL_MAGIC_V3);
+        v.push(ws.as_u8());
+        v.extend_from_slice(&seq);
+        v.extend_from_slice(&recv);
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(frame);
+        v.extend_from_slice(&crc.to_le_bytes());
+        v
     }
 
     #[test]
