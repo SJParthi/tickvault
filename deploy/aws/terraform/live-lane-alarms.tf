@@ -779,6 +779,8 @@ resource "aws_cloudwatch_metric_alarm" "depth_steering_stalled" {
   alarm_actions   = local.app_alarm_actions
   # Steering resuming is a real, self-explanatory recovery — the sockets
   # re-aim on the next minute and the age falls back to near zero.
+  ok_actions = local.app_alarm_ok
+}
 
 # 14. ONE SOCKET WENT DEAF (2026-08-26) — operator-approved
 # ---------------------------------------------------------------------------
