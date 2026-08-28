@@ -1660,12 +1660,42 @@ impl LiveIngest {
         // outside a 30-year band, or an unidentifiable instrument — and
         // writing any of them would put a corrupt row in `ticks` under a
         // garbage designated timestamp, which is worse than losing it.
-        // Three conditions refuse the WHOLE tick, because writing the row
-        // would put corrupt data in `ticks` under a garbage designated
-        // timestamp: a price outside `[0, MAX]` (NaN and both infinities fall
-        // outside by comparison), a timestamp beyond a 30-year band, and an
-        // instrument with no fold slot at all.
-        let hard_refusal = stats.refused_price || stats.refused_timestamp || stats.slot_exhausted;
+        // TWO conditions refuse the WHOLE tick, because writing the row would
+        // put corrupt data in `ticks` under a garbage designated timestamp: a
+        // price outside `[0, MAX]` (NaN and both infinities fall outside by
+        // comparison), and a timestamp beyond a 30-year band with no receipt
+        // time to stamp the row from instead.
+        //
+        // `slot_exhausted` was the THIRD until 2026-08-28 and never belonged
+        // here. The justification this comment used to carry -- that such a row
+        // would land "under a garbage designated timestamp" -- is false, and
+        // the gate ORDER proves it: `multi_tf_aggregator::consume_tick` checks
+        // the timestamp band, then the price, then the trading day, then the
+        // session window, and only THEN asks for a fold slot. A tick that
+        // reaches the slot check has already passed every validity gate the
+        // writer cares about. Slot exhaustion is a statement about OUR
+        // capacity, not about the tick.
+        //
+        // This is the FOURTH instance of one shape, and the repetition is the
+        // finding rather than any single case:
+        //
+        //     2026-08-20  price sentinel 0.0            ~22,000 ticks/session
+        //     2026-08-26  timestamp sentinel 0           825,783 ticks/session
+        //     2026-08-28  out-of-band timestamp        2,008,916 ticks/session
+        //     2026-08-28  slot exhaustion              (unmeasured -- see below)
+        //
+        // Every time, a tick we could not FOLD was treated as a tick we could
+        // not STORE, and the row was discarded with it.
+        //
+        // Reachability is not theoretical: `AGGREGATOR_MAX_SLOTS` is 25,000 and
+        // the authorized universe is ~24,600, so the headroom is ~400 -- and
+        // the per-minute ATM re-fit ADDS instruments during the session. Worse,
+        // `tv_aggregator_slot_exhausted_total` is not in the EMF selector, so
+        // crossing that line would have silently discarded every further
+        // instrument's rows with nothing on any dashboard to show it. Keeping
+        // the row means an instrument past the cap still has a complete tick
+        // record; only its candles are missing, and the counter says so.
+        let hard_refusal = stats.refused_price || stats.refused_timestamp;
 
         // Two refuse only the CANDLE and keep the row — see above. They are
         // mutually exclusive with the three by construction, which is why this
@@ -1698,7 +1728,8 @@ impl LiveIngest {
             || stats.untraded_sentinel
             || stats.stale_trading_day
             || stats.untraded_timestamp
-            || stats.out_of_band_timestamp)
+            || stats.out_of_band_timestamp
+            || stats.slot_exhausted)
             && !hard_refusal;
 
         if hard_refusal {
@@ -1708,9 +1739,6 @@ impl LiveIngest {
             } else if stats.refused_timestamp {
                 self.refused_timestamp = self.refused_timestamp.saturating_add(1);
                 "timestamp"
-            } else if stats.slot_exhausted {
-                self.refused_slot = self.refused_slot.saturating_add(1);
-                "slot_exhausted"
             } else {
                 self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
                 "out_of_session"
@@ -1748,8 +1776,20 @@ impl LiveIngest {
             // bucket". What changed is that they are now also rows in `ticks`,
             // which the return value says explicitly rather than leaving the
             // caller to infer it from a counter.
-            self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
-            counters().refused("out_of_session").increment(1);
+            // `slot_exhausted` keeps its OWN reason label rather than folding
+            // into `out_of_session`, because the two say opposite things about
+            // the system: out-of-session is the market being shut, which is
+            // normal and expected every single day; slot exhaustion is US
+            // being full, which is a capacity ceiling an operator has to act
+            // on. Collapsing them would bury a real ceiling inside a count
+            // that is large and boring by design.
+            if stats.slot_exhausted {
+                self.refused_slot = self.refused_slot.saturating_add(1);
+                counters().refused("slot_exhausted").increment(1);
+            } else {
+                self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
+                counters().refused("out_of_session").increment(1);
+            }
             return IngestOutcome::WrittenOutOfSession;
         }
         IngestOutcome::Folded {
@@ -7373,11 +7413,38 @@ pub fn refold_wal_frames(
                     // session.** The candle grid opens at 09:00, so a
                     // 09:00-09:14 tick folds into a real pre-open bar and this
                     // arm is no longer reached for it. What DOES reach here is
-                    // a tick before 09:00 or at/after 15:40 — the persistence
-                    // window is wider than the candle window at both ends.
-                    // Third stale-reachability comment corrected in this
-                    // change; a reachability claim is one grep of the gate
-                    // constant and must be re-run when written, not carried.
+                    // a tick whose FOLD-CLOCK second falls before 09:00 or at
+                    // or after 15:40.
+                    //
+                    // **RE-CORRECTED 2026-08-28, same day.** The sentence that
+                    // stood here read "the persistence window is wider than
+                    // the candle window at both ends". That is FALSE in both
+                    // halves, and one grep settles it:
+                    //
+                    //     TICK_PERSIST_START_SECS_OF_DAY_IST = 32_400  (09:00)
+                    //     TICK_PERSIST_END_SECS_OF_DAY_IST   = 56_400  (15:40)
+                    //     CANDLE_SESSION_OPEN_SECS_OF_DAY_IST = 32_400 (09:00)
+                    //     MARKET_CLOSE_SECS_OF_DAY_IST        = 56_400 (15:40)
+                    //
+                    // The windows are IDENTICAL, not wider. And the second
+                    // half is wrong in a way the first conceals: there is no
+                    // persistence window GATE on this lane at all --
+                    // `tick_persistence.rs` references neither constant (grep:
+                    // zero hits). A row outside the window is written because
+                    // NOTHING STOPS THE WRITER, not because a wider window
+                    // permits it. The two readings differ the moment someone
+                    // tries to change the persistence window by editing the
+                    // constant, which would do nothing.
+                    //
+                    // Recorded rather than quietly amended because of what it
+                    // is: the sentence being corrected was ITSELF a correction
+                    // of a stale reachability claim, written hours earlier,
+                    // and it closed by saying "a reachability claim is one
+                    // grep of the gate constant and must be re-run when
+                    // written, not carried." It then made a claim about two
+                    // gate constants without running that grep. Stating the
+                    // rule is not the same as following it, and a correction
+                    // carries no more authority than the sentence it replaced.
                     //
                     // Counting it as `lost` would
                     // report real recovered rows as data loss; folding it into
