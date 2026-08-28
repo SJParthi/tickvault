@@ -1381,6 +1381,7 @@ impl LiveIngest {
     pub fn shutdown_depth_offload_writer(&mut self, deadline: std::time::Instant) {
         if let Some(depth) = self.depth_sink() {
             depth.shutdown_offload_writer(deadline);
+            depth.shutdown_rescue_writer(deadline);
         }
     }
 
@@ -4830,6 +4831,10 @@ pub struct DepthIngest {
     /// Signalled by the writer thread once its queue is fully drained. This is
     /// what makes the shutdown join BOUNDED rather than a blind `join()`.
     writer_done: Option<std::sync::mpsc::Receiver<()>>,
+    /// The depth rescue thread's join handle (2026-08-28). Joined on the
+    /// shutdown path: a payload still in its queue at exit is rows the producer
+    /// already counted as rescued that never reached the spill file.
+    rescue_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DepthIngest {
@@ -4842,6 +4847,7 @@ impl DepthIngest {
             writer: DepthWriter::new(questdb, Feed::Dhan),
             buf: DepthLevelBuffer::new(),
             writer_thread: None,
+            rescue_thread: None,
             writer_done: None,
         }
     }
@@ -4854,6 +4860,7 @@ impl DepthIngest {
             writer: DepthWriter::for_test(Feed::Dhan),
             buf: DepthLevelBuffer::new(),
             writer_thread: None,
+            rescue_thread: None,
             writer_done: None,
         }
     }
@@ -4939,6 +4946,21 @@ impl DepthIngest {
                  with nothing on the other end and every flush will rescue to the spill tier"
             );
         }
+
+        // Rescue thread (2026-08-28) — the depth twin of `tv-tick-rescue`,
+        // on the writer that carries 24x the rows. Same reason it cannot ride
+        // the queue above: it exists for the cases where that queue is full or
+        // its thread is gone.
+        let (rescue_sink, rescue_rx) = self.writer.split_rescue_offload();
+        let rescue_handle = std::thread::Builder::new()
+            .name("tv-depth-rescue".to_owned())
+            .spawn(move || {
+                while let Ok(batch) = rescue_rx.recv() {
+                    rescue_sink.rescue(&batch);
+                }
+                info!("depth rescue thread exiting — the drain closed its queue");
+            })?;
+        self.rescue_thread = Some(rescue_handle);
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
         Ok(())
@@ -4963,6 +4985,49 @@ impl DepthIngest {
                 rows = dropped,
                 "depth rows were still held by the producer at shutdown because the writer \
                  queue was full — rescued to the depth spill tier, see the preceding coded line"
+            );
+            // Close the rescue queue AFTER the tail rescue above may have used
+            // it. Leaves the writer inline, so a later rescue still reaches disk.
+            self.writer.close_rescue_offload();
+        }
+    }
+
+    /// Waits for the depth rescue thread to finish its queue.
+    ///
+    /// Shares the SAME deadline as every other join on this path, so the total
+    /// stays the MAX of the waits rather than their sum — the arithmetic the
+    /// compile-time assert in `main.rs` pins.
+    pub fn shutdown_rescue_writer(&mut self, deadline: std::time::Instant) {
+        let Some(handle) = self.rescue_thread.take() else {
+            return;
+        };
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(RESCUE_JOIN_POLL);
+        }
+        if !handle.is_finished() {
+            metrics::counter!(
+                tickvault_storage::depth_persistence::DEPTH_RESCUE_ABANDONED_COUNTER,
+                "writer" => "depth"
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the depth RESCUE thread did not finish within the shutdown budget — a \
+                 rescued payload may never have reached the depth spill file. Those levels \
+                 were counted as rescued and are not in QuestDB either."
+            );
+            return;
+        }
+        if handle.join().is_err() {
+            metrics::counter!(
+                tickvault_storage::depth_persistence::DEPTH_RESCUE_ABANDONED_COUNTER,
+                "writer" => "depth"
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the depth rescue thread PANICKED — a rescued payload may never have \
+                 reached the depth spill file."
             );
         }
     }
