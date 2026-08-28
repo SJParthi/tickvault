@@ -2074,8 +2074,10 @@ impl LiveIngest {
     /// # The cutoff, and why it is not just the watermark
     ///
     /// The cutoff is `watermark − CATCHUP_LATENESS_MARGIN_SECS`, never the
-    /// watermark itself. The watermark is the highest exchange timestamp seen
-    /// across ALL instruments, and ticks arrive out of order between them, so
+    /// watermark itself. The watermark is the highest FOLD-CLOCK second seen
+    /// across ALL instruments (receipt where trusted, exchange stamp where not
+    /// — corrected 2026-08-28; it said "exchange timestamp", which stopped
+    /// being true when the grid moved to the receipt clock), and ticks arrive out of order between them, so
     /// sealing right at the watermark would close a bucket whose own final
     /// ticks are still in flight — turning a latency fix into a truncated-bar
     /// bug, which is strictly worse than the problem it solves. The margin

@@ -27,16 +27,62 @@ Replay accepts all three magics; `TVW1`/`TVW2` records replay with `0`, which th
 persistence layer already maps to NULL — a missing timestamp, never a false one.
 No data migration. Cost: 8 bytes/frame and one clock read per frame.
 
-### W2 — Bucket every candle on `received_at`
+### W2 — Bucket every candle on `received_at` ✅ SHIPPED 2026-08-28
 
-`AggregatorCell::fold` currently buckets on `tick.exchange_timestamp`. Switch to
-the receipt clock, converted to IST seconds-of-day. This is a single bucketing
-call plus the gates and watermarks that read the same field.
+`AggregatorCell::fold` bucketed on `tick.exchange_timestamp`. It now buckets on
+`fold_clock_ist_secs(exchange_timestamp, received_at_nanos)` — the receipt clock
+with the exchange stamp as fail-soft fallback — and so do the seven other sites
+that must agree with it: the watermark, the stale-trading-day gate, the session
+gate, `last_observed_ts`, `close_ts_ist_secs` at bucket open, the in-bucket close
+guard, and the late-refold close guard.
 
-Receipt is monotone per drain, and replay runs strictly before any socket opens,
-so the late-arrival/refold policy becomes structurally unreachable. It is
-**retained and counted, not deleted** — a policy that flatlines is evidence the
-switch worked; a deleted one leaves no way to detect a violated assumption.
+**The guard is on the DELTA, not on an absolute band, and that is what made W2
+safe to ship BEFORE W1b.** A replayed WAL frame carries a re-stamped `received_at`
+that is a perfectly sane epoch — an absolute plausibility band waves it straight
+through — but its delta against the trade stamp is hours, so it falls back and
+lands in the bar it originally belonged to. That converts W1b from a blocker into
+an accuracy improvement.
+
+**Hot-path shape (O(1), zero-alloc).** `fold_secs` is derived ONCE per tick above
+the timeframe loop and threaded down, exactly like `prices` and
+`cumulative_volume`. An adversarial O(1) audit caught the first draft recomputing
+it 48× per tick — the same hoisting defect this module recorded on 2026-08-10 —
+and the fix is pinned by the module's own stated contract. DHAT re-run with a
+non-zero receipt in the fixture: still zero-alloc.
+
+**⚠ THE HONEST LIMIT, and it is not the one the first draft claimed.** The
+justification originally written into `fold_clock_ist_secs` was the DORMANT
+CONTRACT: a sleepy option's trade stamp is hours old, so bucketing on it files a
+live snapshot into a bar dated hours ago. **That was FALSE.** The delta guard
+refuses any receipt more than `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) past the
+trade, so a stale snapshot falls back and nothing changes for it. The test written
+to demonstrate the claim FAILED, which is how it was caught, and the boundary is
+now pinned as a test rather than asserted in prose
+(`receipt_clock_end_to_end_tests::a_stale_snapshot_still_buckets_on_its_trade_stamp`).
+
+What W2 actually corrects is **delivery lag inside the band** — measured p50 1.4s,
+p99 46s on this feed — which is precisely where a minute boundary gets crossed on
+an ordinary day: a trade printed 09:29:59 and delivered 09:30:01 now files into
+the 09:30 bar a live decision is reading, instead of the 09:29 bar it had already
+left. Widening that scope needs the real receipt carried through the WAL record
+(W1b), because until then a large positive delta is indistinguishable from a
+replay.
+
+**Coverage gap closed in the same change.** Every candle fixture in the workspace
+left `received_at_nanos` at its `Default` 0 — the sentinel — so the whole suite
+had been exercising the FALLBACK and passing "by construction, not by agreement".
+Four end-to-end tests now drive a non-zero receipt through a real fold: the
+minute-boundary case, the stale-snapshot limit, the replay fallback, and close
+ownership by last-received packet.
+
+**One site deliberately NOT moved:** the day-OHLC session gate in
+`day_ohlc_orchestrator.rs`. Moving it admitted pre-open auction prints into day
+HIGH/LOW/CLOSE at the p50 lag — i.e. every trading day — which the 2026-08-25
+scope lock REJECTs explicitly, and dropped genuine 15:29:5x prints at the other
+edge. "Is this a regular-session trade" is a property of the TRADE, so it is
+judged on the trade's clock. Day high/low is a running max/min, which has no clock
+dependence; the ordering that does have one moved to the receipt clock in the
+aggregator, where it belongs.
 
 ### W3 — Candle session opens at 09:00
 
