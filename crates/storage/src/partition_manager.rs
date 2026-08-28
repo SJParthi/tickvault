@@ -546,6 +546,25 @@ pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     )
 }
 
+/// Hour-granular twin of [`build_detach_list_sql`].
+///
+/// Byte-for-byte the same query but for the unit: `dateadd('h', -N, now())`
+/// instead of `'d'`. Kept as a separate function rather than a unit parameter
+/// so the two call paths are visibly different at every call site — the day
+/// path is safe for every table, the hour path is safe only for the arrival-
+/// stamped allowlist, and a shared signature would make that distinction easy
+/// to lose in a refactor.
+///
+/// `table` is the same trusted-constant class as the day builder: it comes
+/// from `ARRIVAL_STAMPED_HOUR_TABLES`, never from external input.
+pub(crate) fn build_detach_list_sql_hours(table: &str, cutoff_hours: u32) -> String {
+    format!(
+        "SELECT name, active FROM table_partitions('{}') \
+         WHERE minTimestamp < dateadd('h', -{}, now())",
+        table, cutoff_hours
+    )
+}
+
 /// Validates a QuestDB partition name before it is interpolated into a
 /// `DETACH PARTITION LIST '<name>'` DDL statement.
 ///

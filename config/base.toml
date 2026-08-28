@@ -366,6 +366,32 @@ pressure_max_passes = 4
 # of writes. Ticks are NEVER shed at any level.
 ingest_shed_session_burn_bytes = 0
 
+# Hours of market_depth to keep on LOCAL disk during a pressure episode.
+# 0 = OFF (the default). Set to 6 to reclaim roughly 78 GB mid-session.
+#
+# Why hours and not days. Every other window here is in DAYS and the pressure
+# path floors at 2 of them, while market_depth writes ~13 GB per HOUR. So a
+# mid-session episode is asked a question whose answer is always "nothing":
+# today's partitions are ineligible until tomorrow, and if the post-close leg
+# already ran, yesterday's are gone. The archiver is not broken — it has
+# nothing it is permitted to reclaim while the disk fills at 13 GB an hour.
+#
+# NOTHING IS LOST when this is on. Each hour is copied to S3, its rows are
+# counted there against the table, and only a verified copy is dropped from
+# local disk. That is the policy the 2026-08-15 depth authorization already
+# describes: "the hot window on local disk is simply short".
+#
+# Applies to market_depth ONLY. ticks is excluded on purpose: its timestamp is
+# the exchange last-trade time and ~10% of a session's ticks arrive more than
+# an hour late, into hours that are already closed — archiving those by the
+# hour would race a live write against a detach. Enforced in code by
+# partition_archive::ARRIVAL_STAMPED_HOUR_TABLES.
+#
+# Values below 4 are clamped up to 4: a WAL replay after a mid-session restart
+# re-writes frames at their ORIGINAL arrival time, so replay is the one writer
+# that can move backwards into a closed hour.
+depth_hot_hours = 0
+
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
 # in PR #764.
