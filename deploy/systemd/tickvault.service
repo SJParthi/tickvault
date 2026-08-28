@@ -235,9 +235,9 @@ PrivateTmp=true
 # The app's shutdown path runs TWO bounded waits SEQUENTIALLY, both in
 # crates/app/src/main.rs:
 #
-#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = 20   (lane flush, runs first)
+#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = 30   (lane flush, runs first)
 #   SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = 75   (final seal drain, second)
-#   worst case                           = 95s
+#   worst case                           = 105s
 #
 # At 30s the seal writer could receive at most 10s of its 75s budget, and at
 # the measured ~10,200 seals/sec that drains ~102,000 of a possible 600,000
@@ -248,15 +248,25 @@ PrivateTmp=true
 # very tail this exists to save" — the two files had simply drifted, with
 # nothing pinning them together.
 #
-# 120 = the 95s worst case + 25s margin. Raising it is fail-SAFE: it only
+# 130 = the 105s worst case + 25s margin. Raising it is fail-SAFE: it only
 # ever grants more time, never less. The daily 17:30 IST auto-stop is
-# unaffected — a 95s shutdown completes by ~17:31:35, and the stop-verify
+# unaffected — a 105s shutdown completes by ~17:31:45, and the stop-verify
 # lambda does not fire until 17:45 IST.
+#
+# 2026-08-28: 120 -> 130, because the lane budget went 20s -> 30s to cover
+# the spawn-failure fallback, where the tail flushes depth AND ticks
+# synchronously (5s + 5s of ILP timeout) BEFORE the 12s join deadline even
+# starts. The guard below caught the overrun; the note that raised the lane
+# budget claimed 30s was "still far inside TimeoutStopSec=120" and was WRONG
+# — a .service file is invisible to the compile-time assert in main.rs, and
+# that is exactly the blind spot this test exists to cover. Fix applied in
+# the direction the guard prescribes: raise the timeout, never shrink a drain
+# budget that was sized from a real failure mode.
 #
 # Pinned by crates/app/tests/shutdown_budget_fits_systemd_guard.rs — the
 # relationship, not the number: raising either app budget past this timeout
 # now fails the build.
-TimeoutStopSec=120
+TimeoutStopSec=130
 KillMode=mixed
 KillSignal=SIGTERM
 
