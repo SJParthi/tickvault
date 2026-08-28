@@ -1060,6 +1060,47 @@ impl LiveIngest {
         self
     }
 
+    /// The lane's ONE depth sink.
+    ///
+    /// Added 2026-08-28 so the dedicated depth path (d20/d200) and the inline
+    /// d5 path write through the SAME `DepthIngest` instead of two. Both wrote
+    /// the same `market_depth` table through separate ILP buffers on separate
+    /// flush rhythms -- inline rode `LiveIngest::flush` at the TICK threshold
+    /// (1,000 tick rows), dedicated rode `DEPTH_FLUSH_ROW_THRESHOLD` (10,000
+    /// depth rows) -- so whichever committed second carried rows older than
+    /// the table's current max timestamp, forcing an out-of-order merge with
+    /// an eight-column dedup comparison into a partition holding tens of
+    /// millions of rows.
+    ///
+    /// Measured consequence, 2026-08-28: `market_depth` WAL apply fell from 78
+    /// transactions behind at 10:15 IST to 26,602 by 13:10, monotonically,
+    /// while the depth ROW RATE was flat-to-declining (18M -> 15M per 15 min).
+    /// Constant input with degrading apply is merge cost growing against
+    /// partition size, and `ticks` -- same host, same cpuset, same workers,
+    /// same dedup mechanism, one tenth the rows -- was not lagging at all.
+    ///
+    /// One buffer makes every commit contiguous in time, so the second commit
+    /// is never older than the first.
+    pub fn depth_sink(&mut self) -> Option<&mut DepthIngest> {
+        self.inline_depth.as_mut()
+    }
+
+    /// Rows buffered in the depth sink, for the size-trigger flush.
+    #[must_use]
+    pub fn depth_pending_rows(&self) -> usize {
+        self.inline_depth
+            .as_ref()
+            .map_or(0, DepthIngest::pending_rows)
+    }
+
+    /// Depth rows this lane has dropped, for the shutdown accounting line.
+    #[must_use]
+    pub fn depth_dropped_rows(&self) -> u64 {
+        self.inline_depth
+            .as_ref()
+            .map_or(0, DepthIngest::dropped_rows)
+    }
+
     /// Sizes the silence detector's slot table independently of the fold's
     /// pre-size.
     ///
@@ -3452,7 +3493,6 @@ fn flush_depth(depth: Option<&mut DepthIngest>) {
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
-    mut depth_ingest: Option<DepthIngest>,
     main_feed_budget: Arc<RingByteBudget>,
     depth_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -3643,7 +3683,7 @@ async fn run_frame_drain(
                         } else {
                             DepthFeedKind::TwoHundred
                         };
-                        match depth_ingest.as_mut() {
+                        match ingest.depth_sink() {
                             // The ingest-shed gate, read here rather than
                             // inside `drain_depth_frame`, so a shed frame
                             // costs one relaxed atomic load and NOT a parse.
@@ -3691,10 +3731,10 @@ async fn run_frame_drain(
                 // Depth gets its OWN size trigger — see
                 // `DEPTH_FLUSH_ROW_THRESHOLD` for why reusing the tick one
                 // would have turned the drain into a synchronous HTTP loop.
-                if depth_ingest.as_ref().is_some_and(|d| {
-                    u64::try_from(d.pending_rows()).unwrap_or(u64::MAX) >= DEPTH_FLUSH_ROW_THRESHOLD
-                }) {
-                    flush_depth(depth_ingest.as_mut());
+                if u64::try_from(ingest.depth_pending_rows()).unwrap_or(u64::MAX)
+                    >= DEPTH_FLUSH_ROW_THRESHOLD
+                {
+                    flush_depth(ingest.depth_sink());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
                     publish_fold_depth(&ingest);
@@ -3735,7 +3775,7 @@ async fn run_frame_drain(
                 // leave exactly the rows sealing just created.
                 let (emitted, dropped) = ingest.catch_up_seal();
                 flush_and_record(&mut ingest, &feed_health);
-                flush_depth(depth_ingest.as_mut());
+                flush_depth(ingest.depth_sink());
                 if dropped > 0 {
                     error!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
@@ -3758,7 +3798,7 @@ async fn run_frame_drain(
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
                 flush_and_record(&mut ingest, &feed_health);
-                flush_depth(depth_ingest.as_mut());
+                flush_depth(ingest.depth_sink());
                 publish_fold_depth(&ingest);
             }
             // Mid-session catch-up seal. Deliberately BEFORE the silence arm
@@ -4135,17 +4175,17 @@ async fn run_frame_drain(
     //
     // Flushing depth BEFORE the blocking join fixes it without tuning two
     // constants in two files to agree -- which is the version that rots. The
-    // two ingests are independent (`depth_ingest` is its own `DepthIngest`
-    // with its own buffer and sender), so nothing about the tick offload join
-    // has to happen first.
-    flush_depth(depth_ingest.as_mut());
+    // ONE sink now serves both the inline and dedicated depth paths (see
+    // `LiveIngest::depth_sink`), and it is independent of the TICK offload
+    // writer, so nothing about that join has to happen first.
+    flush_depth(ingest.depth_sink());
     // Close the hand-off queue and WAIT. The tail flush above only handed the
     // batch to the writer thread; without this join the process can exit while
     // that batch is still in flight, which would lose precisely the rows the
     // tail flush exists to save. No-op on a lane that was never offloaded.
     ingest.shutdown_offload_writer();
     publish_fold_depth(&ingest);
-    let depth_dropped = depth_ingest.as_ref().map_or(0, DepthIngest::dropped_rows);
+    let depth_dropped = ingest.depth_dropped_rows();
     warn!(
         code = ErrorCode::WsGapConnectionState.code_str(),
         frames = seen,
@@ -8275,7 +8315,6 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Cost of building unconditionally: one lazily-connected ILP sender that
     // stays idle if depth never attaches. In exchange `depth_unconsumed` keeps
     // its meaning as a pure wiring-bug signal and should now be unreachable.
-    let depth_ingest = Some(DepthIngest::new(&params.questdb));
     // Bounded, and small on purpose: the late-attach pass sends at most a
     // handful of batches in a session. A large buffer here would only delay
     // discovering that nobody is receiving.
@@ -8283,7 +8322,6 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
-        depth_ingest,
         Arc::clone(&main_feed_budget),
         Arc::clone(&depth_budget),
         Arc::clone(&params.shutdown),
@@ -9321,7 +9359,7 @@ mod tests {
             .rfind("ingest.shutdown_offload_writer();")
             .expect("the shutdown tail must join the offload writer");
         let depth = production_half
-            .rfind("flush_depth(depth_ingest.as_mut());")
+            .rfind("flush_depth(ingest.depth_sink());")
             .expect("the shutdown tail must flush depth");
         assert!(
             depth < join,
@@ -9572,22 +9610,36 @@ mod tests {
         let src = include_str!("dhan_feed_stack.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
-        // Anchored on the BINDING itself, not on the predicate. The same
-        // `params.depth_20_instruments.is_empty()` test appears a few lines
-        // below to gate the late-attach SPAWN, where it is exactly right — a
-        // blanket ban on the predicate would fail on correct code, and a guard
-        // that fails for a reason unrelated to what it protects teaches the
-        // next reader to delete it.
+        // 2026-08-28: re-anchored. The separate `let depth_ingest = Some(...)`
+        // binding is GONE -- the dedicated and inline depth paths now share
+        // ONE sink (`LiveIngest::depth_sink`), because two ILP buffers into
+        // one table on two different flush rhythms is what drove the
+        // out-of-order merge that put `market_depth` 26,602 WAL transactions
+        // behind on 2026-08-28.
+        //
+        // The property this guard protects is UNCHANGED and still exactly as
+        // load-bearing: the sink must be built UNCONDITIONALLY, never gated on
+        // the boot-time depth sets, because those sets are always empty at
+        // boot and depth attaches after 09:16 IST. Only the expression it
+        // reads has moved, from the deleted binding to the builder call.
         let binding = production
             .lines()
-            .find(|l| l.trim_start().starts_with("let depth_ingest"))
-            .expect("the depth ingest binding must exist");
+            .find(|l| l.contains(".with_inline_depth("))
+            .expect("the depth sink must be attached to the lane's ingest");
         assert!(
-            binding.contains("Some(DepthIngest::new("),
-            "the depth ingest must be built UNCONDITIONALLY — gating it on the \
-             boot-time depth sets makes it None for the WHOLE session, because \
+            binding.contains("with_inline_depth(DepthIngest::new("),
+            "the depth sink must be built UNCONDITIONALLY — gating it on the \
+             boot-time depth sets makes it absent for the WHOLE session, because \
              those sets are always empty at boot and depth attaches later. \
              Found: {binding}"
+        );
+        assert!(
+            !production.contains("let depth_ingest"),
+            "a SECOND DepthIngest has come back. Two ILP buffers writing one \
+             `market_depth` table on different flush rhythms is what forced the \
+             out-of-order merge behind the 2026-08-28 apply-lag incident: \
+             whichever buffer commits second carries rows older than the table's \
+             max timestamp. There must be exactly one depth sink"
         );
     }
 
@@ -12995,7 +13047,6 @@ mod tests {
             run_frame_drain(
                 rx,
                 ingest,
-                None,
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
@@ -13061,7 +13112,6 @@ mod tests {
         let drain = tokio::spawn(run_frame_drain(
             rx,
             ingest,
-            None,
             Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
             Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
@@ -13161,7 +13211,6 @@ mod tests {
             run_frame_drain(
                 rx,
                 ingest,
-                None,
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
