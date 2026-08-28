@@ -1,5 +1,7 @@
 //! Order runtime (dry-run) — the single-owner task that finally gives the
-//! order machinery real inputs on the prod (dhan-off, groww-on) profile.
+//! order machinery real inputs. (CORRECTED 2026-08-26: this said "on the
+//! prod (dhan-off, groww-on) profile" — prod has been dhan-ON since the
+//! 2026-08-11 flip, and the Groww feed was removed entirely on 2026-08-21.)
 //!
 //! Cluster A, operator directive 2026-07-14
 //! (`.claude/plans/active-plan-order-runtime-dryrun.md`). Before this module,

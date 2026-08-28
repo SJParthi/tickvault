@@ -187,7 +187,9 @@ impl WalProbeFailure {
 /// for the mandatory columns) are skipped defensively so one bad row
 /// cannot blind the probe to the remaining tables — but ALL of them being
 /// skipped is drift, not an empty answer, and is reported as such.
-pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalProbeFailure> {
+pub fn parse_wal_tables_response(
+    body: &Value,
+) -> Result<(Vec<WalTableRow>, usize), WalProbeFailure> {
     let columns = body
         .get("columns")
         .and_then(Value::as_array)
@@ -210,7 +212,7 @@ pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalPr
     // An absent/empty dataset is a legitimate "no WAL tables" answer.
     let rows = match body.get("dataset").and_then(Value::as_array) {
         Some(rows) => rows,
-        None => return Ok(Vec::new()),
+        None => return Ok((Vec::new(), 0)),
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -253,7 +255,18 @@ pub fn parse_wal_tables_response(body: &Value) -> Result<Vec<WalTableRow>, WalPr
     if out.is_empty() && !rows.is_empty() {
         return Err(WalProbeFailure::AllRowsSkipped);
     }
-    Ok(out)
+    // SOME rows skipped is not the same answer as none skipped, and until
+    // 2026-08-26 the difference was invisible. `observe` derives its FALLING
+    // edge from ABSENCE -- a latched table missing from the row set is read as
+    // "recovered" -- so one row failing to parse made a still-suspended table
+    // emit a false recovery `info!`, clear its latch, and drop out of the
+    // gauge, on the one failure mode where ILP keeps ACKing and every loss
+    // counter reads zero. The defensive per-row skip stays (one bad row must
+    // not blind the probe to the other tables); what changes is that the
+    // caller now KNOWS the observation was partial and refuses to conclude
+    // recovery from it.
+    let skipped = rows.len().saturating_sub(out.len());
+    Ok((out, skipped))
 }
 
 /// What one observation of the current `wal_tables()` rows changed,
@@ -335,6 +348,69 @@ impl WalSuspensionTracker {
         }
     }
 
+    /// Feed one SUCCESSFUL but possibly PARTIAL probe's rows.
+    ///
+    /// `complete` is false when the parse skipped one or more malformed rows.
+    /// A partial observation may ADD knowledge (a table it did see suspended
+    /// is really suspended, so the rising edge still fires) but must never
+    /// SUBTRACT it on SILENCE: the falling edge is derived from ABSENCE, and a
+    /// table absent because its row failed to parse is not a table that
+    /// recovered. A table that IS in `rows` saying `suspended: false` is a
+    /// first-hand recovery report and IS honoured, partial view or not.
+    ///
+    /// Before 2026-08-26 there was only the complete form, so a single
+    /// malformed row for a latched table produced a false "recovered" `info!`,
+    /// cleared the latch, and dropped the table out of
+    /// `tv_questdb_wal_suspended_tables` -- on the one failure mode where ILP
+    /// keeps ACKing, `flush()` returns `Ok`, every loss counter reads zero and
+    /// the rows are simply not there. The alarm this module exists to feed
+    /// would have read green while the table stayed suspended.
+    pub fn observe_with_completeness(
+        &mut self,
+        rows: &[WalTableRow],
+        complete: bool,
+    ) -> WalSuspensionDelta {
+        let delta = self.observe(rows);
+        if complete {
+            return delta;
+        }
+        // Restore ONLY the names this view could not SEE.
+        //
+        // `delta.recovered` mixes two different things: a table absent because
+        // its row failed to parse, and a table PRESENT in `rows` saying
+        // `suspended: false`. The second is a real, first-hand recovery report
+        // and must be honoured; the first is silence and must not be read as
+        // one.
+        //
+        // CORRECTED 2026-08-26, hours after the first version shipped: that
+        // version restored every name in `delta.recovered` without checking,
+        // so a table that explicitly reported HEALTHY on a partial poll was
+        // re-latched. With drift that makes every poll partial -- exactly the
+        // `AllRowsSkipped` shape this module already has a variant for -- the
+        // falling edge became unreachable and the gauge stuck above zero
+        // forever, turning the alarm into a permanent page for a healthy
+        // table. Strictly worse than the false recovery it replaced: a false
+        // alarm that can never clear trains an operator to ignore the one
+        // detector for silent WAL loss.
+        for name in &delta.recovered {
+            let seen_healthy = rows.iter().any(|r| &r.name == name);
+            if !seen_healthy {
+                self.suspended.insert(name.clone());
+            }
+        }
+        let recovered: Vec<String> = delta
+            .recovered
+            .iter()
+            .filter(|name| rows.iter().any(|r| &r.name == *name))
+            .cloned()
+            .collect();
+        WalSuspensionDelta {
+            newly_suspended: delta.newly_suspended,
+            recovered,
+            currently_suspended: self.suspended.len(),
+        }
+    }
+
     /// 2026-07-10 hostile-review LOW guard: a 2xx response whose dataset
     /// is EMPTY while the latch holds suspended tables is treated as
     /// SUSPICIOUS (server mid-start, tables not yet registered) rather
@@ -363,6 +439,16 @@ pub const WAL_APPLY_LAG_MIN_TXN: i64 = 1_000;
 /// Consecutive polls of NON-DECREASING lag (above the floor) before the
 /// growing-lag signal fires. At the 60s poll interval this is five minutes.
 pub const WAL_APPLY_LAG_GROWING_POLLS: u32 = 5;
+
+/// Hard ceiling on distinct table names the lag tracker will follow.
+///
+/// This product has ~41 QuestDB tables; 256 leaves an order of magnitude of
+/// room while making the map's memory a fixed, known quantity rather than a
+/// function of whatever strings the server returns.
+pub const MAX_LAG_TRACKED_TABLES: usize = 256;
+
+/// Refusal count for the power-of-two log throttle on the cap above.
+static LAG_REFUSED_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Consecutive failed probes before the watcher declares itself BLIND.
 ///
@@ -445,6 +531,34 @@ impl WalLagTracker {
                 continue;
             };
             let lag = seq.saturating_sub(writer);
+            // A CAP, because "bounded by the table count" is caller convention,
+            // not a bound — the exact wording class CLAUDE.md's own table
+            // records as insufficient for `oms/engine` and `order_runtime`.
+            // `row.name` is server-supplied, so a QuestDB that starts reporting
+            // per-partition or per-WAL-segment names would grow this map for
+            // the process lifetime with nothing to stop it.
+            //
+            // Refusal is the right shape here, unlike the position map: a table
+            // this tracker never admits simply has no lag verdict, which the
+            // `continue` above already treats as "no reading, never a
+            // fabricated zero". Nothing is lost that was ever held.
+            if !self.state.contains_key(&row.name) && self.state.len() >= MAX_LAG_TRACKED_TABLES {
+                metrics::counter!("tv_wal_lag_tracker_refused_total").increment(1);
+                let n = LAG_REFUSED_SEEN
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(1);
+                if n.is_power_of_two() {
+                    warn!(
+                        table = %row.name,
+                        tracked = self.state.len(),
+                        max = MAX_LAG_TRACKED_TABLES,
+                        occurrences = n,
+                        "WAL lag tracker is FULL — refusing a new table; it gets no \
+                         growing-lag verdict. Already-tracked tables are unaffected."
+                    );
+                }
+                continue;
+            }
             let entry = self.state.entry(row.name.clone()).or_insert(LagState {
                 last_lag: lag,
                 growing_polls: 0,
@@ -480,6 +594,14 @@ impl WalLagTracker {
 
     /// Tables currently latched as growing — exposed for tests and for the
     /// startup log line.
+    /// How many distinct tables the lag map currently holds. Exists so the
+    /// cap above is assertable — a ceiling nothing can observe is a promise,
+    /// not a bound.
+    #[must_use]
+    pub fn tracked_len(&self) -> usize {
+        self.state.len()
+    }
+
     #[must_use]
     pub fn reported_count(&self) -> usize {
         self.state.values().filter(|s| s.reported).count()
@@ -494,7 +616,7 @@ impl WalLagTracker {
 /// [`WalProbeFailure::Http`] so the caller's skip-tick semantics are
 /// uniform. Never panics.
 // TEST-EXEMPT: thin I/O shell — the pure parse core (`parse_wal_tables_response`) and the edge machine (`WalSuspensionTracker`) are fully unit-tested; this fn needs a live QuestDB to exercise and is covered by the first live boot (honest live-unverified note in the plan).
-async fn probe_wal_tables(base_url: &str) -> Result<Vec<WalTableRow>, WalProbeFailure> {
+async fn probe_wal_tables(base_url: &str) -> Result<(Vec<WalTableRow>, usize), WalProbeFailure> {
     let client = match crate::http_client::shared_probe_client() {
         Ok(client) => client,
         Err(err) => {
@@ -643,7 +765,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
         loop {
             ticker.tick().await;
             match probe_wal_tables(&base_url).await {
-                Ok(rows) => {
+                Ok((rows, skipped)) => {
                     schema_warned = false;
                     if blind_announced {
                         info!(
@@ -668,13 +790,30 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                         );
                         continue;
                     }
-                    let delta = tracker.observe(&rows);
+                    if skipped > 0 {
+                        // Loud, and NOT a probe failure: the rows that DID
+                        // parse are real and their rising edges must still
+                        // fire. What the count buys is the refusal to read a
+                        // table missing from a partial view as recovered.
+                        warn!(
+                            skipped,
+                            parsed = rows.len(),
+                            "wal_tables() rows failed to parse -- this poll is a \
+                             PARTIAL view, so no table will be reported \
+                             recovered from it"
+                        );
+                    }
+                    let delta = tracker.observe_with_completeness(&rows, skipped == 0);
                     emit_wal_delta(&delta);
                     // The 2026-08-25 gap: a table can stop applying rows
                     // WITHOUT the `suspended` flag ever being set, and that
                     // is the state that actually happened. See
                     // `WalLagTracker` for why the signal is growth rather
                     // than magnitude.
+                    // The GAUGE fires every poll (the number an operator asks for
+                    // mid-incident); the growth signal below fires only on a
+                    // sustained climb and so cannot answer "how far behind now".
+                    emit_wal_apply_lag_gauge(&rows);
                     emit_wal_lag(&lag_tracker.observe(&rows));
                     // Attempt recovery, CONDITIONALLY. The module header
                     // above says a resume is an operator decision because it
@@ -909,8 +1048,104 @@ pub fn spawn_supervised_wal_suspension_watcher(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The worst apply lag across every table in one poll's view. Pure, so the
+/// arithmetic is testable without a metrics recorder.
+///
+/// Rows missing either diagnostic column contribute NOTHING — the columns are
+/// `Option` by design (the probe tolerates a QuestDB that omits them), and a
+/// missing column must never read as an enormous lag. A `writerTxn` somehow
+/// ahead of the sequencer saturates to zero rather than wrapping.
+fn max_apply_lag(rows: &[WalTableRow]) -> i64 {
+    let mut max_lag: i64 = 0;
+    for row in rows {
+        if let (Some(seq), Some(writer)) = (row.sequencer_txn, row.writer_txn) {
+            max_lag = max_lag.max(seq.saturating_sub(writer).max(0));
+        }
+    }
+    max_lag
+}
+
+/// Publish the CURRENT apply lag as a gauge, every poll, unconditionally.
+///
+/// WHY THIS EXISTS — 2026-08-26, live incident. `market_depth` reached
+/// **48,454 transactions behind** and stayed there ~95 minutes: rows accepted
+/// and ACKed by ILP, written to the WAL, and never becoming queryable.
+/// `max(ts)` froze at 11:44:46 while the depth sockets stayed connected and
+/// Dhan kept acking subscriptions. Every dashboard read green, because the
+/// only WAL signal reaching CloudWatch is `tv_questdb_wal_suspended_tables`
+/// and `suspended` was FALSE throughout. The cliff was watched; the slope was
+/// not.
+///
+/// `emit_wal_lag` DID detect it and DID page, but ~85 minutes after the
+/// freeze: its condition is five CONSECUTIVE polls of non-decreasing lag, and
+/// a real backlog oscillates — one poll where apply gains a little resets the
+/// counter to zero. That signal is still worth having; it separates "busy"
+/// from "losing ground". What it cannot answer is "how far behind are we RIGHT
+/// NOW", which is the question an operator actually asks, and which no chart
+/// could answer because the number was never published.
+///
+/// O(1) per poll and no added cardinality: ONE gauge carrying the maximum
+/// across all tables, not a series per table. At ~41 tables a per-table gauge
+/// would be 41 CloudWatch series for a number whose only operative value is
+/// the worst one.
+// TEST-EXEMPT: one metric side effect over the fully-tested `max_apply_lag`.
+fn emit_wal_apply_lag_gauge(rows: &[WalTableRow]) {
+    // APPROVED: cast — a txn lag is bounded by the sequencer counter and is
+    // rendered for a gauge; f64 carries every i64 an operator will ever see.
+    metrics::gauge!("tv_questdb_wal_apply_lag_max").set(max_apply_lag(rows) as f64);
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The gauge must report the WORST table, every poll, whatever the growth
+    /// detector is doing. This is the number the operator asks for during an
+    /// incident ("how far behind are we RIGHT NOW"), and on 2026-08-26 there
+    /// was no way to answer it: `market_depth` sat 48,454 transactions behind
+    /// for ~95 minutes with `suspended = false` and every dashboard green.
+    #[test]
+    fn the_lag_gauge_reports_the_worst_table_not_the_first() {
+        // Shape taken from the live box at 13:31 IST on 2026-08-26.
+        let rows = vec![
+            lag_row("ticks", 60_714, 60_051),         // 663 behind — healthy
+            lag_row("market_depth", 115_503, 67_049), // 48,454 behind
+            lag_row("candles_1m", 1_000, 1_000),      // level
+        ];
+        assert_eq!(
+            max_apply_lag(&rows),
+            48_454,
+            "the gauge must carry the WORST lag"
+        );
+    }
+
+    /// A row missing either diagnostic column contributes nothing rather than
+    /// poisoning the maximum. The columns are `Option` by design — the probe
+    /// tolerates a QuestDB that does not return them — and a missing column
+    /// must never read as an enormous lag.
+    #[test]
+    fn a_row_without_txn_columns_cannot_inflate_the_gauge() {
+        let mut partial = lag_row("mystery", 0, 0);
+        partial.sequencer_txn = None;
+        partial.writer_txn = None;
+        let rows = vec![partial, lag_row("ticks", 5_000, 4_000)];
+        assert_eq!(max_apply_lag(&rows), 1_000);
+    }
+
+    /// An empty or fully-healthy view reports zero, not a stale previous
+    /// value — the gauge is recomputed from the rows on every poll.
+    #[test]
+    fn a_healthy_view_reports_zero_lag() {
+        assert_eq!(max_apply_lag(&[]), 0);
+        assert_eq!(max_apply_lag(&[lag_row("ticks", 42, 42)]), 0);
+    }
+
+    /// writerTxn ahead of sequencerTxn is nonsense QuestDB should never
+    /// produce, but if it does the gauge must saturate at zero rather than
+    /// wrap into a huge positive via an underflow.
+    #[test]
+    fn a_negative_lag_saturates_to_zero_rather_than_wrapping() {
+        assert_eq!(max_apply_lag(&[lag_row("odd", 100, 500)]), 0);
+    }
     use super::*;
     use serde_json::json;
 
@@ -938,7 +1173,8 @@ mod tests {
             ],
             "count": 2
         });
-        let rows = parse_wal_tables_response(&body).expect("canonical shape parses");
+        let (rows, skipped) = parse_wal_tables_response(&body).expect("canonical shape parses");
+        assert_eq!(skipped, 0, "a clean body skips nothing");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "ticks");
         assert!(!rows[0].suspended);
@@ -957,7 +1193,7 @@ mod tests {
             "columns": header(&["suspended", "errorMessage", "name", "sequencerTxn"]),
             "dataset": [[true, "boom", "ticks", 7]],
         });
-        let rows = parse_wal_tables_response(&shuffled).expect("shuffled shape parses");
+        let (rows, _skipped) = parse_wal_tables_response(&shuffled).expect("shuffled shape parses");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "ticks");
         assert!(rows[0].suspended);
@@ -1003,7 +1239,7 @@ mod tests {
         }
         // Absent dataset with a valid header = legitimately zero rows.
         let no_dataset = json!({ "columns": header(&["name", "suspended"]) });
-        assert_eq!(parse_wal_tables_response(&no_dataset), Ok(Vec::new()));
+        assert_eq!(parse_wal_tables_response(&no_dataset), Ok((Vec::new(), 0)));
     }
 
     #[test]
@@ -1018,7 +1254,12 @@ mod tests {
                 ["good_table", true],  // valid — must survive
             ],
         });
-        let rows = parse_wal_tables_response(&body).expect("valid rows must survive bad ones");
+        let (rows, skipped) =
+            parse_wal_tables_response(&body).expect("valid rows must survive bad ones");
+        assert!(
+            skipped > 0,
+            "the bad rows must be COUNTED, not silently gone"
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "good_table");
         assert!(rows[0].suspended);
@@ -1057,7 +1298,7 @@ mod tests {
             "columns": header(&["name", "suspended"]),
             "dataset": [],
         });
-        assert_eq!(parse_wal_tables_response(&empty), Ok(Vec::new()));
+        assert_eq!(parse_wal_tables_response(&empty), Ok((Vec::new(), 0)));
     }
 
     #[test]
@@ -1073,7 +1314,8 @@ mod tests {
                 ["market_depth", true],
             ],
         });
-        let rows = parse_wal_tables_response(&mixed).expect("one good row survives");
+        let (rows, skipped) = parse_wal_tables_response(&mixed).expect("one good row survives");
+        assert!(skipped > 0, "the skipped row must be counted");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "market_depth");
         assert!(rows[0].suspended);
@@ -1110,7 +1352,7 @@ mod tests {
             "columns": header(&["name", "suspended", "errorTag", "errorMessage"]),
             "dataset": [["ticks", true, "", ""]],
         });
-        let rows = parse_wal_tables_response(&body).expect("parses");
+        let (rows, _skipped) = parse_wal_tables_response(&body).expect("parses");
         assert_eq!(rows[0].error_tag, None);
         assert_eq!(rows[0].error_message, None);
     }
@@ -1294,6 +1536,150 @@ mod tests {
             assert!(d.recovered.is_empty());
             assert_eq!(d.currently_suspended, 1);
         }
+    }
+
+    /// BITE (2026-08-26, second round): a table that SAYS it is healthy on a
+    /// partial poll must be believed.
+    ///
+    /// The first version of `observe_with_completeness` restored every name in
+    /// `delta.recovered` without asking whether the table had actually been
+    /// ABSENT. So a table present in `rows` with `suspended: false` — a
+    /// first-hand recovery report — was re-latched. With drift that makes every
+    /// poll partial (the `AllRowsSkipped` shape this module already has a
+    /// variant for), the falling edge became unreachable and the gauge stuck
+    /// above zero forever: a permanent page for a healthy table, which is
+    /// strictly worse than the false recovery it replaced.
+    #[test]
+    fn a_partial_view_still_believes_a_table_that_reports_itself_healthy() {
+        let mut t = WalSuspensionTracker::new();
+        t.observe(&[row("ticks", true), row("market_depth", true)]);
+        assert_eq!(t.currently_suspended(), 2);
+
+        // Partial poll: `ticks` is PRESENT and says healthy; `market_depth`'s
+        // row failed to parse and is simply absent.
+        let d = t.observe_with_completeness(&[row("ticks", false)], false);
+        assert_eq!(
+            d.recovered,
+            vec!["ticks".to_string()],
+            "a table that reported itself healthy recovered, partial view or not"
+        );
+        assert_eq!(
+            d.currently_suspended, 1,
+            "only the table the view could not SEE stays latched"
+        );
+        assert_eq!(t.currently_suspended(), 1);
+    }
+
+    /// And the leak: permanent drift must not make the latch permanent.
+    #[test]
+    fn persistent_drift_does_not_strand_a_healthy_table_in_the_latch_forever() {
+        let mut t = WalSuspensionTracker::new();
+        t.observe(&[row("ticks", true)]);
+        assert_eq!(t.currently_suspended(), 1);
+        // 500 consecutive PARTIAL polls, every one of them reporting `ticks`
+        // healthy. The gauge must reach zero and stay there.
+        for i in 0..500 {
+            let d = t.observe_with_completeness(&[row("ticks", false)], false);
+            assert_eq!(
+                d.currently_suspended, 0,
+                "poll {i}: ticks reported healthy and must not be re-latched"
+            );
+        }
+        assert_eq!(t.currently_suspended(), 0);
+    }
+
+    /// The lag map's own doc claimed it was "bounded by the table count
+    /// (~30 in this product)" — caller convention, not a bound. `row.name` is
+    /// server-supplied, so a QuestDB that starts reporting per-partition names
+    /// would grow it for the process lifetime.
+    #[test]
+    fn the_lag_tracker_refuses_a_new_table_past_its_ceiling() {
+        let mut t = WalLagTracker::new();
+        // Fill to the ceiling.
+        let rows: Vec<WalTableRow> = (0..MAX_LAG_TRACKED_TABLES)
+            .map(|i| lag_row(&format!("t{i}"), 100, 100))
+            .collect();
+        t.observe(&rows);
+        assert_eq!(t.tracked_len(), MAX_LAG_TRACKED_TABLES);
+        // One more distinct name is REFUSED, not admitted.
+        t.observe(&[lag_row("one_too_many", 100, 100)]);
+        assert_eq!(
+            t.tracked_len(),
+            MAX_LAG_TRACKED_TABLES,
+            "past the ceiling a NEW table is refused; the map is a fixed size"
+        );
+        // An ALREADY-tracked table keeps working — refusal must not blind the
+        // detector to what it was already watching.
+        let fired = t.observe(&[lag_row("t0", 500_000, 100)]);
+        assert!(
+            fired.is_empty(),
+            "one poll is not yet the growing condition"
+        );
+        assert_eq!(t.tracked_len(), MAX_LAG_TRACKED_TABLES);
+    }
+    /// BITE (2026-08-26): a PARTIAL view must never report a recovery.
+    ///
+    /// The falling edge is derived from ABSENCE, and `parse_wal_tables_response`
+    /// skips a malformed row defensively — so before this fix, one row failing
+    /// to parse made a still-suspended table emit a false "recovered" `info!`,
+    /// clear its latch and drop out of `tv_questdb_wal_suspended_tables`. On
+    /// the one failure mode where ILP keeps ACKing and every loss counter reads
+    /// zero, the alarm would have gone green while the table stayed suspended.
+    #[test]
+    fn a_partial_observation_never_reports_a_recovery() {
+        let mut t = WalSuspensionTracker::new();
+        t.observe(&[row("ticks", true), row("market_depth", true)]);
+        assert_eq!(t.currently_suspended(), 2);
+
+        // `market_depth`'s row failed to parse, so it is simply absent.
+        let d = t.observe_with_completeness(&[row("ticks", true)], false);
+        assert!(
+            d.recovered.is_empty(),
+            "a table absent from a PARTIAL view has not recovered — it was not seen"
+        );
+        assert_eq!(
+            d.currently_suspended, 2,
+            "the gauge must keep counting the table the partial view could not see"
+        );
+        assert_eq!(t.currently_suspended(), 2, "and the latch must survive");
+
+        // The very same absence on a COMPLETE view IS a recovery — the
+        // distinction is the whole point, not a blanket refusal to ever fall.
+        let d = t.observe_with_completeness(&[row("ticks", true)], true);
+        assert_eq!(d.recovered, vec!["market_depth".to_string()]);
+        assert_eq!(d.currently_suspended, 1);
+    }
+
+    /// A partial view may still ADD knowledge: a table it DID see suspended is
+    /// really suspended, so the rising edge fires as normal. Refusing to page
+    /// on a partial poll would trade a false recovery for a missed detection,
+    /// which is the same class of error in the other direction.
+    #[test]
+    fn a_partial_observation_still_fires_the_rising_edge() {
+        let mut t = WalSuspensionTracker::new();
+        let d = t.observe_with_completeness(&[row("ticks", true)], false);
+        assert_eq!(d.newly_suspended.len(), 1);
+        assert_eq!(d.newly_suspended[0].name, "ticks");
+        assert_eq!(d.currently_suspended, 1);
+    }
+
+    /// The count itself: `skipped` must be the number of rows that arrived and
+    /// did not become a `WalTableRow`, because that count is what decides
+    /// whether the poll is treated as complete.
+    #[test]
+    fn the_skipped_count_is_the_rows_that_did_not_parse() {
+        let body = serde_json::json!({
+            "columns": [{"name": "name"}, {"name": "suspended"}],
+            "dataset": [
+                ["ticks", true],
+                ["market_depth", "true"],   // string, not bool — skipped
+                "not-an-array",             // not a row at all — skipped
+                ["candles_1m", false],
+            ],
+        });
+        let (rows, skipped) = parse_wal_tables_response(&body).expect("two rows survive");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(skipped, 2);
     }
 
     #[test]

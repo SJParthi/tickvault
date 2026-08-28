@@ -54,7 +54,7 @@
 //! # Complexity
 //! | Path | Cost | Note |
 //! |---|---|---|
-//! | [`classify_frame`] | O(1), zero alloc | length check + two fixed-offset byte reads |
+//! | [`classify_frame`] | O(1) on the exact-length path; **O(packets per frame)** on the stacked walk, zero alloc either way | An exact-length frame is a length check plus two fixed-offset byte reads. A main-feed frame of any OTHER length walks packet boundaries looking for a stacked disconnect (`stacked_disconnect_reason`), bounded by `MAX_PACKETS_PER_FRAME` (70,000). Corrected 2026-08-26: this row still claimed the pre-2026-08-25 cost, which is the stale-complexity-claim class this repo has recorded five times. |
 //! | [`DhanFeedSocketImpl::recv`] steady state | O(1), zero alloc *of ours* | `Bytes` move; tungstenite owns the decode buffer |
 //! | [`build_feed_url`] | O(n) in url length, allocates | cold path, once per dial |
 //! | [`build_subscribe_payload`] | O(n) in batch, allocates | cold path, ~50 messages per connect |
@@ -102,7 +102,8 @@ use super::pool_budget::{DhanEndpointType, MAIN_FEED_INSTRUMENTS_PER_CONNECTION}
 use super::pool_supervisor::{DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument};
 use super::subscription_builder::{
     build_subscription_messages, build_twenty_depth_subscription_messages,
-    build_two_hundred_depth_subscription_message,
+    build_twenty_depth_unsubscription_messages, build_two_hundred_depth_subscription_message,
+    build_two_hundred_depth_unsubscription_message, build_unsubscription_messages,
 };
 use super::tls::{build_websocket_tls_connector, build_websocket_tls_connector_no_alpn};
 use super::types::{DisconnectCode, InstrumentSubscription};
@@ -655,6 +656,72 @@ pub fn build_subscribe_payload(
     messages.pop().ok_or(SubscribePayloadError::EmptyBatch)
 }
 
+/// The unsubscribe twin of [`build_subscribe_payload`].
+///
+/// **ADDED 2026-08-26** for the per-minute at-the-money re-selection: a depth
+/// socket that swaps which strike it carries must drop the old one, and until
+/// now nothing in the transport could say so — the three message builders
+/// existed and had no caller.
+///
+/// It mirrors the subscribe path deliberately, arm for arm, because the two
+/// must agree on what a batch MEANS. If depth-200 rejects a 2-instrument
+/// subscribe and its unsubscribe silently accepted one, a swap could send an
+/// unsubscribe the socket never applied and then a subscribe that takes the
+/// connection over its one-instrument limit — which Dhan answers with a Fatal
+/// 804.
+///
+/// # Errors
+///
+/// The same shapes as [`build_subscribe_payload`]: an empty batch, a
+/// depth-200 batch of more than one, a segment the depth endpoints refuse, or
+/// a batch that split into anything other than exactly one message.
+pub fn build_unsubscribe_payload(
+    endpoint: DhanEndpointType,
+    feed_mode: FeedMode,
+    batch: &[SubscribeInstrument],
+) -> Result<String, SubscribePayloadError> {
+    let Some(first) = batch.first() else {
+        return Err(SubscribePayloadError::EmptyBatch);
+    };
+
+    if endpoint == DhanEndpointType::Depth200 {
+        if batch.len() > 1 {
+            return Err(SubscribePayloadError::Depth200Overfull { got: batch.len() });
+        }
+        return build_two_hundred_depth_unsubscription_message(first.segment, first.security_id)
+            .map_err(|reason| SubscribePayloadError::Refused { reason });
+    }
+
+    let mut instruments = Vec::with_capacity(batch.len());
+    for instrument in batch {
+        instruments.push(InstrumentSubscription::new(
+            instrument.segment,
+            instrument.security_id,
+        ));
+    }
+    let mut messages = match endpoint {
+        // NOT segment-validated, and the asymmetry with the subscribe arm is
+        // deliberate rather than an oversight. Subscribe refuses a BSE_FNO
+        // contract because depth is NSE-only at the vendor and a BSE subscribe
+        // comes back as SILENCE — indistinguishable from a quiet book.
+        // Unsubscribe has no such failure mode: dropping an instrument the
+        // socket does not hold is a no-op, while REFUSING to drop one would
+        // strand it subscribed, which is the outcome the refusal exists to
+        // prevent. Fail-safe runs the opposite way on this path.
+        DhanEndpointType::Depth20 => {
+            build_twenty_depth_unsubscription_messages(&instruments, batch.len())
+        }
+        _ => build_unsubscription_messages(&instruments, feed_mode, batch.len()),
+    };
+    if messages.len() != 1 {
+        return Err(SubscribePayloadError::BatchSplit {
+            instruments: batch.len(),
+            messages: messages.len(),
+        });
+    }
+    messages.pop().ok_or(SubscribePayloadError::EmptyBatch)
+}
+
 // ---------------------------------------------------------------------------
 // Frame classification — control plane only
 // ---------------------------------------------------------------------------
@@ -822,6 +889,102 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         )
         .increment(1);
     }
+    /// Writes ONE unsubscribe message.
+    ///
+    /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. It
+    /// deliberately reuses the subscribe path's failure metrics and error
+    /// code rather than minting new ones: an operator asking "did this socket
+    /// fail to change what it is subscribed to?" wants one answer, and the
+    /// `reason` label already separates a payload refusal from a dead socket
+    /// from a write failure from a timeout.
+    async fn send_unsubscribe_in_mode(
+        &mut self,
+        batch: &[SubscribeInstrument],
+        feed_mode: FeedMode,
+    ) -> Result<(), SocketFailure> {
+        let endpoint = self.params.endpoint;
+        let payload = match build_unsubscribe_payload(endpoint, feed_mode, batch) {
+            Ok(p) => p,
+            Err(err) => {
+                metrics::counter!(
+                    SUBSCRIBE_FAILED_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => "unsubscribe_payload",
+                )
+                .increment(1);
+                error!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    reason = %err,
+                    "Dhan unsubscribe payload could not be built — the instrument stays \
+                     subscribed, so this socket keeps carrying a contract that is no longer \
+                     the one that was chosen"
+                );
+                return Err(SocketFailure);
+            }
+        };
+
+        let Some(stream) = self.stream.as_mut() else {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => "unsubscribe_not_connected",
+            )
+            .increment(1);
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                "unsubscribe attempted with no live Dhan socket"
+            );
+            return Err(SocketFailure);
+        };
+
+        let send = stream.send(Message::Text(payload.into()));
+        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
+            Ok(Ok(())) => {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    "Dhan unsubscribe batch sent"
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                metrics::counter!(
+                    SUBSCRIBE_FAILED_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => "unsubscribe_send",
+                )
+                .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    reason = %safe_err(&err),
+                    "Dhan unsubscribe batch could not be written to the socket"
+                );
+                Err(SocketFailure)
+            }
+            Err(_elapsed) => {
+                metrics::counter!(
+                    SUBSCRIBE_FAILED_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "reason" => "unsubscribe_timeout",
+                )
+                .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments = batch.len(),
+                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
+                    "Dhan unsubscribe batch write timed out"
+                );
+                Err(SocketFailure)
+            }
+        }
+    }
+
     async fn send_subscribe_in_mode(
         &mut self,
         batch: &[SubscribeInstrument],
@@ -1075,6 +1238,35 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
             self.send_subscribe_in_mode(&others, configured).await?;
         }
         self.send_subscribe_in_mode(&indices, IDX_I_FEED_MODE).await
+    }
+
+    async fn send_unsubscribe(
+        &mut self,
+        batch: &[SubscribeInstrument],
+    ) -> Result<(), SocketFailure> {
+        // Mirrors `send_subscribe` arm for arm, including the index split. An
+        // IDX_I instrument was SUBSCRIBED in Quote mode while everything else
+        // went out in Full (the 2026-08-21 index-mode carve-out), and the
+        // unsubscribe RequestCode is derived from the feed mode — so
+        // unsubscribing an index with the Full code would send a code the
+        // instrument was never subscribed under, and Dhan would have nothing
+        // to remove. The socket would look fine and keep the instrument.
+        let configured = self.params.feed_mode;
+        if self.params.endpoint != DhanEndpointType::MainFeed {
+            return self.send_unsubscribe_in_mode(batch, configured).await;
+        }
+
+        let (indices, others) = partition_index_batch(batch);
+
+        if indices.is_empty() {
+            return self.send_unsubscribe_in_mode(batch, configured).await;
+        }
+
+        if !others.is_empty() {
+            self.send_unsubscribe_in_mode(&others, configured).await?;
+        }
+        self.send_unsubscribe_in_mode(&indices, IDX_I_FEED_MODE)
+            .await
     }
 
     /// Send ONE client-originated keepalive Ping.

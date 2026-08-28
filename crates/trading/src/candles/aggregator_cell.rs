@@ -662,6 +662,13 @@ impl AggregatorCell {
                     && bucket_start == last.bucket_start_ist_secs
                 {
                     fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
+                    // SEAL SITE 5 of 5 — and the one that proves the guard
+                    // earns its keep. I wrote this change believing there
+                    // were four emission points; the source scan found this
+                    // fifth `AmendedLate` arm on its first run. Same reason
+                    // as site 4: the late tick moved `close`, so the
+                    // percentages beside it must be recomputed.
+                    self.last_sealed[ord].stamp_seal_percentages();
                     return ConsumeOutcome::AmendedLate {
                         amended_state: self.last_sealed[ord],
                     };
@@ -797,7 +804,7 @@ impl AggregatorCell {
         // risk of a later bucket claiming it.
         if bucket_start > open_start {
             self.armed_for_day_open[ord] = false;
-            let sealed_state = std::mem::replace(
+            let mut sealed_state = std::mem::replace(
                 &mut self.slots[ord],
                 open_bucket(
                     tick,
@@ -812,6 +819,10 @@ impl AggregatorCell {
                     cumulative_volume,
                 ),
             );
+            // SEAL SITE 1 of 5 (see `stamp_seal_percentages`). Stamped
+            // BEFORE `last_sealed` is written, so the late-refold path below
+            // amends an already-stamped bar rather than a blank one.
+            sealed_state.stamp_seal_percentages();
             self.last_sealed[ord] = sealed_state;
             return ConsumeOutcome::Sealed { sealed_state };
         }
@@ -821,6 +832,11 @@ impl AggregatorCell {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
                 fold_late_hlc(&mut self.last_sealed[ord], tick, prices);
+                // SEAL SITE 4 of 5, and one of the two a careless fix misses: the
+                // late tick just moved `close`, so a percentage stamped at
+                // the original seal is now stale for the row that actually
+                // gets persisted. Re-stamp from the amended close.
+                self.last_sealed[ord].stamp_seal_percentages();
                 return ConsumeOutcome::AmendedLate {
                     amended_state: self.last_sealed[ord],
                 };
@@ -857,10 +873,10 @@ impl AggregatorCell {
         if self.slots[ord].is_uninitialised() {
             return None;
         }
-        Some(std::mem::replace(
-            &mut self.slots[ord],
-            LiveCandleState::empty(),
-        ))
+        let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
+        // SEAL SITE 2 of 5 (see `stamp_seal_percentages`).
+        sealed.stamp_seal_percentages();
+        Some(sealed)
     }
 
     /// Watermark-aware INTRADAY catch-up seal: seals the open bucket ONLY
@@ -897,7 +913,10 @@ impl AggregatorCell {
         {
             return None;
         }
-        let sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
+        let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
+        // SEAL SITE 3 of 5 (see `stamp_seal_percentages`). Stamped before
+        // `last_sealed` so a subsequent late refold amends a stamped bar.
+        sealed.stamp_seal_percentages();
         self.last_sealed[ord] = sealed;
         Some(sealed)
     }
@@ -1186,28 +1205,52 @@ fn fold_in_bucket(
     // arrived last rather than the one that traded last. `>=` is deliberate:
     // many packets share one LTT second, and within a second last-write-wins
     // is the pre-existing, correct behaviour.
-    if tick.exchange_timestamp >= state.close_ts_ist_secs {
+    // Captured BEFORE the close guard mutates `close_ts_ist_secs`, so the OI
+    // rule below reads "is this the newest packet we have seen" rather than a
+    // value that depends on statement order two lines up.
+    let tick_is_newest = tick.exchange_timestamp >= state.close_ts_ist_secs;
+    if tick_is_newest {
         state.close = price;
         state.close_ts_ist_secs = tick.exchange_timestamp;
-        // MERGE 2026-08-25: the order guard above and the non-zero guard here
-        // fix DIFFERENT halves of the same field, and OI needs BOTH.
-        //
-        // The order guard answers "is this packet newer?". It cannot answer
-        // "does this packet carry an OI reading at all". `0` is the ABSENT
-        // sentinel — a Ticker-mode packet has no OI field and an equity never
-        // has one — so a NEWER blank packet passes the order guard and would
-        // still erase a real OI that an earlier tick in the SAME bucket had
-        // established. Order alone does not make a blank field into news.
-        //
-        // Last NON-ZERO wins, exactly like `prev_day_close` / `session_open`
-        // below, which carry the same reasoning for the same reason.
-        if tick.open_interest != 0 {
+    }
+    // MERGE 2026-08-25: the order guard above and the non-zero guard here fix
+    // DIFFERENT halves of the same field, and OI needs BOTH.
+    //
+    // The order guard answers "is this packet newer?". It cannot answer "does
+    // this packet carry an OI reading at all". `0` is the ABSENT sentinel — a
+    // Ticker-mode packet has no OI field and an equity never has one — so a
+    // NEWER blank packet passes the order guard and would still erase a real
+    // OI that an earlier tick in the SAME bucket had established. Order alone
+    // does not make a blank field into news.
+    //
+    // UN-NESTED 2026-08-26. The merge put this INSIDE the order guard, which
+    // silently gave OI a third rule nobody wrote down: "last non-zero wins,
+    // among packets that happened to arrive in timestamp order". Arrival order
+    // is arbitrary — this feed carries no sequence number, which is the stated
+    // premise of the whole permutation suite — so an out-of-order packet
+    // carrying a REAL reading was dropped entirely and the bar kept a 0.
+    //
+    // Reproduced exactly, not inferred: a blank packet at t+20 arriving first,
+    // then a real OI of 5,000 at t+3, left the bar at `oi = 0` — a reading we
+    // held and threw away. `fold_properties::
+    // a_blank_open_interest_never_erases_a_real_one` caught it in CI; it is
+    // rare only because that generator draws OI from `0..5_000`, so the
+    // absent sentinel appears about once in five thousand ticks. 60,000 local
+    // cases did not hit it. Rarity in a generator is not rarity in a feed:
+    // every Ticker-mode packet carries `open_interest = 0`.
+    //
+    // Last NON-ZERO wins, by EXCHANGE TIMESTAMP — plus "anything beats
+    // nothing", which is what the un-nesting adds.
+    if tick.open_interest != 0 {
+        // `state.oi == 0` first: with no reading at all, an older real one is
+        // strictly better than none.
+        if state.oi == 0 || tick_is_newest {
             state.oi = i64::from(tick.open_interest);
-        } else if state.oi != 0 {
-            crate::candles::fold_counters::fold_counters()
-                .oi_zero_ignored
-                .increment(1);
         }
+    } else if state.oi != 0 {
+        crate::candles::fold_counters::fold_counters()
+            .oi_zero_ignored
+            .increment(1);
     }
     // Exchange cumulative volume only ever rises, so a bucket's traded volume
     // is monotone too. `saturating_sub` bounded the ARITHMETIC against
@@ -1346,6 +1389,77 @@ mod tests {
             1_500,
         );
         assert_eq!(cell.snapshot(TfIndex::M1).volume, 1_400);
+    }
+
+    #[test]
+    /// The half the 2026-08-25 merge lost by nesting OI inside the close
+    /// order guard, reproduced from the input CI actually found.
+    ///
+    /// A blank packet at the LATER timestamp arrives first; the real reading
+    /// at the earlier timestamp arrives second. Under the nested rule the
+    /// order guard rejected the whole packet and the bar kept `oi = 0` — a
+    /// reading we held and discarded. Arrival order is arbitrary on a feed
+    /// with no sequence number, which is the premise the permutation suite is
+    /// built on, so this is an ordinary shape and not an exotic one.
+    #[test]
+    fn a_reordered_packet_still_delivers_its_open_interest() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::default();
+
+        // Later timestamp, BLANK oi, arrives FIRST — a Ticker-mode packet.
+        let mut blank_later = tick_at(OPEN + 20, 100.0, 10);
+        blank_later.open_interest = 0;
+        cell.consume_tick(TfIndex::M1, &blank_later, 0, strategy, 10);
+        assert_eq!(cell.snapshot(TfIndex::M1).oi, 0, "nothing known yet");
+
+        // Earlier timestamp, REAL oi, arrives SECOND — a Quote packet that
+        // overtook it on the wire.
+        let mut real_earlier = tick_at(OPEN + 3, 101.0, 20);
+        real_earlier.open_interest = 5_000;
+        cell.consume_tick(TfIndex::M1, &real_earlier, 0, strategy, 20);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).oi,
+            5_000,
+            "an out-of-order packet's REAL open interest must still land when \
+             the bar holds none — anything beats nothing, and dropping it \
+             loses a reading we actually received"
+        );
+
+        // And it must not move `close` backwards while doing so: the two
+        // guards are separate again, which is the entire point.
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).close_ts_ist_secs,
+            OPEN + 20,
+            "un-nesting OI must not weaken the close order guard"
+        );
+        assert!(
+            (cell.snapshot(TfIndex::M1).close - 100.0).abs() < f64::EPSILON,
+            "close still belongs to the latest timestamp"
+        );
+    }
+
+    /// Once a reading exists, an OLDER real one must not replace it — the
+    /// other direction of the same rule, and the reason the fix is not simply
+    /// "always take a non-zero OI".
+    #[test]
+    fn an_older_open_interest_never_replaces_a_newer_one() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::default();
+
+        let mut newer = tick_at(OPEN + 30, 100.0, 10);
+        newer.open_interest = 6_000;
+        cell.consume_tick(TfIndex::M1, &newer, 0, strategy, 10);
+
+        let mut older = tick_at(OPEN + 5, 99.0, 20);
+        older.open_interest = 4_000;
+        cell.consume_tick(TfIndex::M1, &older, 0, strategy, 20);
+
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).oi,
+            6_000,
+            "the newer reading must win; `anything beats nothing` applies only \
+             when the bar has nothing"
+        );
     }
 
     #[test]
@@ -3067,5 +3181,231 @@ mod open_bucket_ordering_tests {
             delta.is_empty(),
             "an inverted pair must never produce a widening"
         );
+    }
+    // ------------------------------------------------------------------
+    // Item 25 (2026-08-26): the percentage columns are stamped at EVERY
+    // emission site.
+    //
+    // Before this, all three shipped as `0.0` on every candle ever written:
+    // 17,409,304 bars across six frames on the live box, none with a value.
+    // The plumbing and the columns were both fine — only the arithmetic was
+    // missing, which is why nothing ever failed.
+    // ------------------------------------------------------------------
+
+    /// A tick carrying the exchange's own day open and previous close.
+    fn tick_with_baselines(ts: u32, price: f32, cum_volume: u32) -> ParsedTick {
+        ParsedTick {
+            day_open: 24_341.95,
+            day_close: 24_334.55,
+            ..tick_at(ts, price, cum_volume)
+        }
+    }
+
+    #[test]
+    fn seal_site_1_an_intraday_crossing_carries_the_percentages() {
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN, 24_341.95, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 60, 24_273.15, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        let ConsumeOutcome::Sealed { sealed_state } = out else {
+            panic!("expected a seal, got {out:?}");
+        };
+        assert!(
+            sealed_state.open_gap_pct != 0.0,
+            "the overnight gap was not stamped at the intraday seal"
+        );
+        assert!(
+            (sealed_state.open_gap_pct - 0.030_41).abs() < 0.000_5,
+            "gap pct was {}",
+            sealed_state.open_gap_pct
+        );
+    }
+
+    #[test]
+    fn seal_site_2_force_seal_carries_the_percentages() {
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN, 24_341.95, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 30, 24_273.15, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        let sealed = cell.force_seal(TfIndex::M1).expect("bucket drained");
+        assert!(
+            (sealed.open_pct - -0.282_63).abs() < 0.000_5,
+            "force_seal pre-open pct was {}",
+            sealed.open_pct
+        );
+        assert!(
+            (sealed.open_gap_pct - 0.030_41).abs() < 0.000_5,
+            "force_seal gap pct was {}",
+            sealed.open_gap_pct
+        );
+    }
+
+    #[test]
+    fn seal_site_3_catch_up_seal_carries_the_percentages() {
+        // This is the site that seals ILLIQUID instruments on time — the very
+        // instruments whose percentages an operator is most likely to be
+        // reading, because nothing else about them is moving.
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 5, 24_273.15, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let sealed = cell
+            .catch_up_seal(TfIndex::M1, OPEN + 60)
+            .expect("bucket end reached");
+        assert!(
+            (sealed.open_pct - -0.282_63).abs() < 0.000_5,
+            "catch_up_seal pre-open pct was {}",
+            sealed.open_pct
+        );
+    }
+
+    #[test]
+    fn seal_site_4_a_late_tick_that_moves_the_close_restamps_the_percentages() {
+        // The site a careless fix misses. The bar was already sealed and
+        // already stamped; a late tick then moves `close`, and the amended
+        // state is what gets persisted. A percentage left over from the
+        // original seal would sit in the same row as a close it does not
+        // describe.
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN, 24_341.95, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 60, 24_341.95, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        let ConsumeOutcome::Sealed { sealed_state } = out else {
+            panic!("expected a seal, got {out:?}");
+        };
+        let pct_at_seal = sealed_state.open_pct;
+
+        // A late tick for the FIRST bucket, later within it than its close,
+        // so it genuinely rewrites the close.
+        let late = cell.consume_tick(
+            TfIndex::M1,
+            &tick_with_baselines(OPEN + 30, 24_273.15, 21),
+            20,
+            FeedStrategy::DEFAULT,
+            21,
+        );
+        let ConsumeOutcome::AmendedLate { amended_state } = late else {
+            panic!("expected a late amend, got {late:?}");
+        };
+        assert!(
+            (amended_state.close - 24_273.15).abs() < 0.01,
+            "the late tick did not move the close: {}",
+            amended_state.close
+        );
+        assert!(
+            (amended_state.open_pct - pct_at_seal).abs() > 0.000_1,
+            "the amended bar kept the percentage from before the amend \
+             ({pct_at_seal}) — the row would persist a percentage that does \
+             not describe its own close"
+        );
+        assert!(
+            (amended_state.open_pct - -0.282_63).abs() < 0.000_5,
+            "amended pre-open pct was {}",
+            amended_state.open_pct
+        );
+    }
+
+    /// The durable half. Four emission sites exist today; a fifth added next
+    /// month would silently ship zeros again, and every existing test would
+    /// still pass — exactly how the original defect survived from the Wave-5
+    /// seal-column work until 2026-08-26.
+    ///
+    /// This counts the sites in this file's own source and requires each to
+    /// stamp. It cannot prove a future site stamps CORRECTLY, but it makes
+    /// adding one without thinking about it fail the build.
+    #[test]
+    fn every_seal_emission_site_stamps_the_percentages() {
+        // Scan the PRODUCTION half only. This test's own assertion messages
+        // name the symbol, and counting those would make the guard pass or
+        // fail on how it is worded rather than on what the code does.
+        let whole = include_str!("aggregator_cell.rs");
+        let prod = whole
+            .split_once("\n#[cfg(test)]")
+            .map_or(whole, |(before, _)| before);
+        assert!(
+            prod.len() < whole.len(),
+            "the test-module split marker was not found — the guard would be \
+             scanning its own source and is no longer trustworthy"
+        );
+
+        let stamps = prod.matches(".stamp_seal_percentages()").count();
+        assert_eq!(
+            stamps, 5,
+            "expected exactly 5 stamp calls (one per emission site), found \
+             {stamps}. If you ADDED an emission path, stamp it and raise this \
+             number. If you REMOVED one, lower it. Do not delete this assertion."
+        );
+
+        let markers = prod.matches("SEAL SITE").count();
+        assert_eq!(
+            markers, 5,
+            "each stamp call must carry its `SEAL SITE n of 5` marker so the \
+             next reader can find all of them from any one of them"
+        );
+
+        // Every emission of a bar-carrying outcome must have a stamp close
+        // above it. Crude by choice: a precise check would need a parser, and
+        // a parser is a thing that can itself be wrong in a way nobody
+        // notices for months — which is exactly how this defect survived.
+        for outcome in ["ConsumeOutcome::Sealed {", "ConsumeOutcome::AmendedLate {"] {
+            let mut from = 0usize;
+            let mut emissions = 0usize;
+            while let Some(rel) = prod[from..].find(outcome) {
+                let at = from + rel;
+                let window = &prod[at.saturating_sub(700)..at];
+                if window.contains("return ") || window.contains("= ") {
+                    assert!(
+                        window.contains(".stamp_seal_percentages()"),
+                        "an emission of `{outcome}` at byte {at} has no stamp \
+                         within the preceding 700 bytes — that bar would ship \
+                         three zeros"
+                    );
+                    emissions += 1;
+                }
+                from = at + outcome.len();
+            }
+            assert!(
+                emissions >= 1,
+                "found no emission of `{outcome}` in the production half — the \
+                 guard is scanning the wrong text"
+            );
+        }
     }
 }

@@ -44,6 +44,7 @@
 //! invariant must hold for future scope extension.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use papaya::HashMap as PapayaHashMap;
 use parking_lot::Mutex;
@@ -75,6 +76,61 @@ pub struct DayOhlc {
     /// does not use volume, our trading decisions do not reference volume.
     armed: bool,
 }
+
+/// Smallest exchange-supplied day open treated as a real price.
+///
+/// A hundredth of the 0.05 NSE tick, so no real instrument can fall below it,
+/// while every f64 subnormal (the `5e-324` class that is finite and positive
+/// and passes every other check) is refused. Absolute rather than relative
+/// BECAUSE relative was tried first and was wrong: see the refusal site.
+pub const DAY_OPEN_MIN_PLAUSIBLE_PRICE: f64 = 0.000_5;
+
+/// Largest exchange-supplied day open treated as a real price.
+///
+/// One crore rupees. The most expensive scrip ever listed on an Indian
+/// exchange is orders of magnitude below this, and `f32::MAX` (3.4e38) --
+/// the corrupt-payload shape that motivated the band -- is thirty-one orders
+/// of magnitude above it. The gap is deliberately enormous: this bound exists
+/// to reject numbers that are not prices, never to have an opinion about a
+/// price that is.
+pub const DAY_OPEN_MAX_PLAUSIBLE_PRICE: f64 = 10_000_000.0;
+
+/// Is this a plausible rupee price at all?
+///
+/// The single predicate behind BOTH the last-traded-price gate and the
+/// exchange-day-open gate, so the two can never drift apart — which they had,
+/// and the drift was found by the day-open gate's own regression test: a
+/// subnormal `1e-320` was refused as an OPEN and accepted as a PRICE in the
+/// same call, moving `day_low` to a number 320 orders of magnitude below a
+/// paisa.
+///
+/// `is_finite() && > 0.0` is not enough on its own. Every f64 subnormal is
+/// finite and positive, and so is `f32::MAX` widened to f64 — the two shapes
+/// that actually appear in corrupt payloads. This holds NO opinion about how
+/// far a price may move (an option can legitimately go from 5.60 to 0.05 in a
+/// session); it only asks whether the number could be a price on an Indian
+/// exchange at all.
+#[must_use]
+pub fn is_plausible_price(price: f64) -> bool {
+    if !price.is_finite() {
+        return false;
+    }
+    // Two gates disagree about the next line and only an exemption satisfies
+    // both: the banned-pattern scanner reads any `.contains(` as the O(n) `Vec`
+    // form, while clippy's `manual_range_contains` rejects the two-comparison
+    // spelling. The exemption is honest rather than a way around a check --
+    // `RangeInclusive::contains` on an `f64` IS two comparisons, with no
+    // iteration and no allocation. Split from the `is_finite` guard so the
+    // exemption sits on the line immediately above the call, which is the only
+    // place the scanner reads it.
+    // O(1) EXEMPT: RangeInclusive::contains on a scalar is two comparisons, not a scan.
+    (DAY_OPEN_MIN_PLAUSIBLE_PRICE..=DAY_OPEN_MAX_PLAUSIBLE_PRICE).contains(&price)
+}
+
+/// How many exchange day-opens have been refused this process, for the
+/// power-of-two log throttle. Separate from the metric because
+/// `metrics::Counter` does not expose its value.
+static REFUSED_DAY_OPEN_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl DayOhlc {
     /// Sentinel `disarmed` state — all fields meaningless until first tick.
@@ -146,7 +202,13 @@ impl DayOhlc {
         // Dormant today (no tick publisher exists) but not hypothetical: the
         // Dhan live main-feed revival was operator-authorized 2026-08-09, and
         // restoring the publisher is precisely what that work does.
-        if !last_price.is_finite() || last_price <= 0.0 {
+        // 2026-08-26: was `!is_finite() || <= 0.0`. That admitted every f64
+        // subnormal -- finite, positive, and 320 orders of magnitude below a
+        // paisa -- straight into `day_low`, where it is absorbing until the
+        // IST-midnight reset. Found by the day-open gate's own regression
+        // test refusing a value as an OPEN that this line accepted as a PRICE
+        // in the same call. One predicate now decides both.
+        if !is_plausible_price(last_price) {
             return;
         }
         if !self.armed {
@@ -204,13 +266,76 @@ impl DayOhlc {
     /// ingest gate above exists for. Either one leaves the first-tick open
     /// exactly as it was — never overwritten with zero.
     pub fn update_tick_with_exchange_open(&mut self, last_price: f64, exchange_day_open: f64) {
+        // Whether THIS packet's price passed the ingest gate, decided BEFORE
+        // the mutation so the answer is about this tick and not about history.
+        //
+        // 2026-08-26: this used to be `if !self.armed { return; }`, whose
+        // comment ("an instrument whose LTP was refused has no armed state to
+        // attach an open to") is true only of the FIRST tick. For every tick
+        // after arming, `armed` is already true, so a packet whose LTP was
+        // refused as corrupt still had its `day_open` adopted — and adopting
+        // one field of a packet whose other field is proven garbage is exactly
+        // the trust this gate exists to withhold. The parsers are PROVEN to
+        // emit NaN LTP (`quote.rs:382` asserts it on a real packet shape), so
+        // the corrupt-packet case is not hypothetical.
+        let price_accepted = is_plausible_price(last_price);
         self.update_tick(last_price);
-        // Only after the tick gate has run: an instrument whose LTP was
-        // refused has no armed state to attach an open to.
-        if !self.armed {
+        if !price_accepted || !self.armed {
             return;
         }
         if !exchange_day_open.is_finite() || exchange_day_open <= 0.0 {
+            return;
+        }
+        // An ABSOLUTE plausibility band, not a ratio against this packet's own
+        // price. The adopted open WIDENS the range (see the invariant note
+        // above), and that widening is irreversible until the IST-midnight
+        // reset, so a single bad packet permanently distorts the day's high or
+        // low for that instrument. Something must refuse `3.4e38` (f32::MAX)
+        // and the subnormal class, both of which are finite and positive and
+        // pass every check above.
+        //
+        // CORRECTED 2026-08-26, hours after the ratio version shipped: a 100x
+        // ratio band was WRONG, and wrong in the direction that re-creates the
+        // bug this whole change exists to fix. Its justification was "NSE
+        // circuit limits cap a day's move at +/-20%" -- true of EQUITIES, and
+        // options have no circuit limit at all. An option opening at 5.60 and
+        // trading at the 0.05 tick floor is a 112x ratio and an utterly
+        // ordinary expiry-day print; the ratio band silently discarded the
+        // exchange's open for it and left the first-observed-tick open in
+        // place, which across ~20,000 subscribed stock options is a systematic
+        // error rather than an edge case. The band also stopped being a bound
+        // at all in the subnormal region, where `last_price / 100.0` underflows
+        // to 0.0 and lets anything positive through.
+        //
+        // An absolute band holds no opinion about how far a price may MOVE, so
+        // it cannot reject a real move however violent. It only asks whether
+        // the number is a plausible rupee price at all. Every instrument on
+        // NSE and BSE lives inside it with orders of magnitude to spare: the
+        // floor is a hundredth of the 0.05 tick, and the ceiling is far above
+        // the most expensive scrip ever listed.
+        if !is_plausible_price(exchange_day_open) {
+            metrics::counter!("tv_day_ohlc_exchange_open_refused_total").increment(1);
+            // Logged, not only counted: a counter that reaches no operator
+            // surface measures the loss and then discards the measurement.
+            // Throttled to powers of two so a corrupt-payload storm cannot
+            // flood the sink -- the house pattern, and the reason this is a
+            // `warn!` rather than an unconditional line on a per-tick path.
+            let n = REFUSED_DAY_OPEN_SEEN
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    exchange_day_open,
+                    last_price,
+                    min = DAY_OPEN_MIN_PLAUSIBLE_PRICE,
+                    max = DAY_OPEN_MAX_PLAUSIBLE_PRICE,
+                    occurrences = n,
+                    "exchange day open REFUSED as corrupt -- it is not a plausible \
+                     rupee price, so adopting it would have widened the day range \
+                     irreversibly until the IST-midnight reset. The previous open is \
+                     kept."
+                );
+            }
             return;
         }
         self.day_open = exchange_day_open;
@@ -456,6 +581,128 @@ pub fn ist_seconds_of_day() -> u32 {
 #[cfg(test)]
 mod tests {
 
+    /// BITE (2026-08-26, second round): the band must never reject a real
+    /// OPTION open.
+    ///
+    /// The first version of this gate was a 100x ratio against the packet's own
+    /// last price, justified by "NSE circuit limits cap a day's move at
+    /// +/-20%". Circuit limits are an EQUITY rule; options have none. An option
+    /// that opens at 5.60 and trades at the 0.05 tick floor is a 112x ratio and
+    /// an ordinary expiry-day print — and the ratio band discarded the
+    /// exchange's open for it, re-creating for ~20,000 stock options exactly
+    /// the systematic error this whole mechanism exists to remove.
+    #[test]
+    fn a_real_option_open_is_never_rejected_however_violent_the_move() {
+        for (open, last) in [
+            (5.60, 0.05),           // expiry-day decay to the tick floor: 112x
+            (12.00, 0.05),          // 240x
+            (0.05, 48.00),          // the other way: a 960x expiry-day spike
+            (0.05, 1_200.00),       // 24,000x — still an ordinary option
+            (24_341.95, 24_343.05), // an index, for contrast
+        ] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(last, open);
+            assert_eq!(
+                d.day_open, open,
+                "open {open} with last {last} is a real print and must be adopted"
+            );
+        }
+    }
+
+    /// BITE: and the band must still refuse what is not a price at all.
+    /// Subnormals are the case the ratio version silently let through, because
+    /// `last_price / 100.0` underflows to 0.0 and stops being a bound.
+    #[test]
+    fn a_number_that_is_not_a_price_is_still_refused() {
+        for (open, last) in [
+            (3.4e38, 100.0),  // f32::MAX
+            (1e-38, 100.0),   // f32 subnormal class
+            (5e-324, 1e-320), // f64 subnormal — the ratio band ACCEPTED this
+            (f64::MAX, 100.0),
+            (1e12, 100.0), // a trillion rupees is not a price
+        ] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(100.0, 100.0);
+            let before = (d.day_open, d.day_high, d.day_low);
+            d.update_tick_with_exchange_open(last, open);
+            assert_eq!(
+                (d.day_open, d.day_high, d.day_low),
+                before,
+                "open {open} with last {last} is not a rupee price and must not widen the range"
+            );
+        }
+    }
+
+    /// BITE (2026-08-26): a packet whose LTP is refused must not have its
+    /// `day_open` trusted either.
+    ///
+    /// The old guard was `if !self.armed { return; }`, which is only about the
+    /// FIRST tick. Once armed, a NaN-LTP packet — a shape the Dhan parsers are
+    /// PROVEN to emit — still had its `day_open` adopted, and because the
+    /// adopted open WIDENS high/low, one such packet distorted the day's range
+    /// irreversibly until the IST-midnight reset.
+    #[test]
+    fn a_refused_price_does_not_let_its_day_open_through() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(100.0, 100.0);
+        assert_eq!(d.day_open, 100.0);
+        assert_eq!(d.day_high, 100.0);
+        assert_eq!(d.day_low, 100.0);
+
+        // NaN LTP with a finite, positive, plausible-looking open.
+        d.update_tick_with_exchange_open(f64::NAN, 101.0);
+        assert_eq!(d.day_open, 100.0, "the corrupt packet's open is refused");
+        assert_eq!(d.day_high, 100.0);
+        assert_eq!(d.day_low, 100.0);
+
+        // Zero and negative LTP are the quieter variants of the same class.
+        d.update_tick_with_exchange_open(0.0, 101.0);
+        d.update_tick_with_exchange_open(-5.0, 101.0);
+        assert_eq!(d.day_open, 100.0);
+    }
+
+    /// BITE: the corruption band. `f32::MAX` and the subnormal class are both
+    /// finite and positive, so every earlier check passes them; only a band
+    /// against the packet's own price rejects them.
+    #[test]
+    fn an_absurd_day_open_is_refused_rather_than_widening_the_range() {
+        let mut d = DayOhlc::disarmed();
+        d.update_tick_with_exchange_open(100.0, 100.0);
+
+        d.update_tick_with_exchange_open(100.0, 3.4e38);
+        assert_eq!(d.day_high, 100.0, "f32::MAX must not become the day high");
+        assert_eq!(d.day_open, 100.0);
+
+        d.update_tick_with_exchange_open(100.0, 1e-38);
+        assert_eq!(d.day_low, 100.0, "a subnormal must not become the day low");
+        assert_eq!(d.day_open, 100.0);
+
+        d.update_tick_with_exchange_open(100.0, 5e-324);
+        assert_eq!(d.day_low, 100.0);
+    }
+
+    /// The band must never reject a REAL move. NSE circuit limits cap a day at
+    /// +/-20%, so this sweeps well past anything the exchange permits and
+    /// asserts every one of them is still adopted.
+    #[test]
+    fn every_move_an_exchange_can_actually_produce_is_still_adopted() {
+        for (price, open) in [
+            (100.0, 80.0),       // -20%, the circuit floor
+            (100.0, 125.0),      // +25%, past the ceiling
+            (100.0, 10.0),       // 10x, impossible on NSE
+            (100.0, 1000.0),     // 10x the other way
+            (0.05, 0.5),         // a penny option, 10x
+            (99_000.0, 9_900.0), // an index-scale price, 10x
+        ] {
+            let mut d = DayOhlc::disarmed();
+            d.update_tick_with_exchange_open(price, open);
+            assert_eq!(
+                d.day_open, open,
+                "price {price} with open {open} is inside every real market's range"
+            );
+        }
+    }
+
     /// The exchange's own open replaces the first-tick open.
     ///
     /// Operator 2026-08-25: the 09:15 open IS the 09:08-09:12 pre-open
@@ -475,6 +722,73 @@ mod tests {
             (d.day_close - 105.0).abs() < f64::EPSILON,
             "close is still the tick"
         );
+    }
+
+    /// THE OPERATOR'S RULE, stated as a test with the numbers the live box
+    /// actually produced on 2026-08-26.
+    ///
+    /// "Always ensure the finalised pre-open 9.12 close price as the 9.15 am
+    /// open price" (operator, 2026-08-26; the same requirement as his
+    /// 2026-08-25 quote recorded in websocket-connection-scope-lock.md).
+    ///
+    /// The shape this pins is the one indices hit EVERY morning and which the
+    /// sibling test above does NOT cover: the first ticks we see are pre-open
+    /// (09:00), and Dhan sends them with NO day-open field at all -- measured
+    /// live, NIFTY's 09:00:02 rows carry `open = NULL`. Only at 09:15 does the
+    /// exchange publish its equilibrium open. If the fallback open taken from
+    /// that first pre-open print were sticky, NIFTY's recorded day open would
+    /// be 24035.25 -- a PRE-OPEN price -- instead of the exchange's 24341.95,
+    /// and it would be wrong by ~307 points on the headline index every day.
+    ///
+    /// Live evidence the adoption works today (`ticks`, 2026-08-26):
+    ///   09:00:02  ltp 24035.25  open NULL      <- pre-open, no open yet
+    ///   09:15:00  ltp 24343.05  open 24341.95  <- exchange equilibrium open
+    /// and note the 09:15 LTP and the open DIFFER, so "first tick at or after
+    /// 09:15" would also have been wrong. Only the exchange's own field is
+    /// right.
+    #[test]
+    fn a_late_exchange_open_corrects_the_preopen_price_we_fell_back_to() {
+        let mut d = DayOhlc::disarmed();
+
+        // 09:00 pre-open: a real print, but the packet carries no day open.
+        // 0.0 is the documented absent sentinel.
+        d.update_tick_with_exchange_open(24035.25, 0.0);
+        assert!(
+            (d.day_open - 24035.25).abs() < f64::EPSILON,
+            "with no exchange open yet, the first print is the only candidate"
+        );
+
+        // 09:15: the exchange publishes its equilibrium open. It must WIN,
+        // even though we already had an open.
+        d.update_tick_with_exchange_open(24343.05, 24341.95);
+        assert!(
+            (d.day_open - 24341.95).abs() < f64::EPSILON,
+            "the exchange open must replace the pre-open fallback, got {}",
+            d.day_open
+        );
+        assert!(
+            (d.day_open - 24035.25).abs() > 1.0,
+            "the PRE-OPEN price must not survive as the day open"
+        );
+    }
+
+    /// The corrective adoption must not be a one-shot: an index that receives
+    /// several pre-open prints before 09:15 still ends the day on the
+    /// exchange's open, whichever print happened to arrive first.
+    #[test]
+    fn many_preopen_prints_still_end_on_the_exchange_open() {
+        let mut d = DayOhlc::disarmed();
+        for p in [24035.25_f64, 24009.75, 24004.95, 24120.10] {
+            d.update_tick_with_exchange_open(p, 0.0);
+        }
+        d.update_tick_with_exchange_open(24343.05, 24341.95);
+        assert!(
+            (d.day_open - 24341.95).abs() < f64::EPSILON,
+            "exchange open must win over every pre-open print, got {}",
+            d.day_open
+        );
+        // And the invariant the range depends on still holds.
+        assert!(d.day_low <= d.day_open && d.day_open <= d.day_high);
     }
 
     /// `low <= open <= high` must hold even when the adopted open sits

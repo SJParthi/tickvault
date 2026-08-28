@@ -181,7 +181,6 @@ pub fn select_live_universe(
         .map(|i| (i.security_id, i.segment))
         .collect();
     let mut instruments = index_universe.to_vec();
-    let mut master_indices = 0usize;
 
     for entry in master {
         if entry.security_id == 0 {
@@ -196,9 +195,6 @@ pub fn select_live_universe(
         if !seen.insert(key) {
             deduped += 1;
             continue;
-        }
-        if segment == ExchangeSegment::IdxI {
-            master_indices += 1;
         }
         instruments.push(SubscribeInstrument {
             security_id: key.0,
@@ -234,18 +230,50 @@ pub fn select_live_universe(
     // rows leaves the seeds in place — a broken master must degrade to the
     // old behaviour, not to no indices at all, which would turn a data
     // problem into an outage.
-    if master_indices > 0 {
+    //
+    // The master's index ids are collected into a SET first, and the swap
+    // fires on that set rather than on how many index rows survived the loop
+    // above. Two defects lived in the difference, and a property test found
+    // both in one counterexample:
+    //
+    //   DUPLICATE. The old loop re-pushed every master index row without
+    //   consulting `seen`, so an index listed twice in the artifact landed
+    //   twice in the subscription. Duplicates are not exotic in that file --
+    //   its `mappings` array carries one row per (index list, stock)
+    //   membership pair, which is why 4,565 rows resolve to ~870 instruments.
+    //   Downstream `dedup_subscribe_set` would have caught it before the wire,
+    //   but only after this function had already counted the duplicate against
+    //   the capacity envelope, and an over-count here falls the WHOLE universe
+    //   back to four ids.
+    //
+    //   MISSED SWAP. The trigger counted NEWLY INSERTED index rows, so a
+    //   master whose index ids all coincide with the hardcoded seeds inserted
+    //   nothing new, the swap never fired, and the remaining seeds survived --
+    //   the ids measured receiving zero packets of any code. The comment above
+    //   says the swap fires "when the master yields indices"; counting
+    //   insertions asked a different question.
+    let mut master_index_ids: Vec<SecurityId> = Vec::new();
+    let mut master_index_seen: std::collections::HashSet<SecurityId> =
+        std::collections::HashSet::new();
+    for entry in master {
+        if entry.security_id == 0 {
+            continue;
+        }
+        if ExchangeSegment::from_byte(entry.exchange_segment_code) != Some(ExchangeSegment::IdxI) {
+            continue;
+        }
+        let id = entry.security_id as SecurityId;
+        if master_index_seen.insert(id) {
+            master_index_ids.push(id);
+        }
+    }
+    if !master_index_ids.is_empty() {
         instruments.retain(|i| i.segment != ExchangeSegment::IdxI);
-        for entry in master {
-            let Some(segment) = ExchangeSegment::from_byte(entry.exchange_segment_code) else {
-                continue;
-            };
-            if segment == ExchangeSegment::IdxI && entry.security_id != 0 {
-                instruments.push(SubscribeInstrument {
-                    security_id: entry.security_id as SecurityId,
-                    segment,
-                });
-            }
+        for security_id in master_index_ids {
+            instruments.push(SubscribeInstrument {
+                security_id,
+                segment: ExchangeSegment::IdxI,
+            });
         }
     }
 
@@ -843,6 +871,77 @@ pub async fn await_mapping_artifact(
 
 #[cfg(test)]
 mod tests {
+
+    /// An index listed TWICE in the artifact is subscribed ONCE.
+    ///
+    /// Duplicates are not exotic in that file: its `mappings` array carries
+    /// one row per (index list, stock) membership pair, which is why 4,565
+    /// rows resolve to about 870 instruments. The seed-swap used to re-push
+    /// every master index row without consulting what was already selected.
+    ///
+    /// Downstream `dedup_subscribe_set` would have removed it before the wire
+    /// — but only after this function counted the duplicate against the
+    /// capacity envelope, and an over-count here falls the WHOLE universe back
+    /// to four ids. Found by a property test.
+    #[test]
+    fn an_index_listed_twice_in_the_master_is_subscribed_once() {
+        let seeds = [13_u64, 25].map(|security_id| SubscribeInstrument {
+            security_id,
+            segment: ExchangeSegment::IdxI,
+        });
+        let master = [
+            MasterEntry {
+                security_id: 99,
+                exchange_segment_code: ExchangeSegment::IdxI as u8,
+            },
+            MasterEntry {
+                security_id: 99,
+                exchange_segment_code: ExchangeSegment::IdxI as u8,
+            },
+        ];
+        let got = select_live_universe(&seeds, Some(&master), 50);
+        assert_eq!(
+            got.instruments,
+            vec![SubscribeInstrument {
+                security_id: 99,
+                segment: ExchangeSegment::IdxI,
+            }],
+            "the duplicate index row reached the subscription"
+        );
+    }
+
+    /// A master whose index ids all coincide with the seeds STILL drops the
+    /// seeds it does not name.
+    ///
+    /// The swap used to fire on how many index rows were newly INSERTED, so a
+    /// master that named only ids already seeded inserted nothing, the swap
+    /// never ran, and the other seeds survived — ids measured receiving zero
+    /// packets of any response code, including the code-6 PrevClose Dhan
+    /// support confirmed is emitted for IDX_I on any subscription in any mode.
+    ///
+    /// The trigger is now the master's index SET, which is the question the
+    /// surrounding comment always claimed to be asking. Found by the same
+    /// property test as the duplicate above, in the same counterexample.
+    #[test]
+    fn a_master_naming_only_a_seed_index_still_drops_the_other_seeds() {
+        let seeds = [13_u64, 25, 51, 21].map(|security_id| SubscribeInstrument {
+            security_id,
+            segment: ExchangeSegment::IdxI,
+        });
+        let master = [MasterEntry {
+            security_id: 13,
+            exchange_segment_code: ExchangeSegment::IdxI as u8,
+        }];
+        let got = select_live_universe(&seeds, Some(&master), 50);
+        assert_eq!(
+            got.instruments,
+            vec![SubscribeInstrument {
+                security_id: 13,
+                segment: ExchangeSegment::IdxI,
+            }],
+            "seeds the master did not name survived"
+        );
+    }
 
     /// The three spot-universe sources must produce THREE distinct labels.
     ///

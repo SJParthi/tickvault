@@ -112,8 +112,9 @@ use tickvault_core::websocket::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
 };
 use tickvault_core::websocket::pool_supervisor::{
-    CapturedFrame, ConnectionSupervisor, PoolSupervisor, RingByteBudget, SubscribeGuard,
-    SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection_with_topup,
+    CapturedFrame, ConnectionSupervisor, LiveSubscriptionCommand, PoolSupervisor, RingByteBudget,
+    SubscribeGuard, SubscribeGuardRefusal, SubscribeInstrument, WalRingSink,
+    run_connection_with_commands,
 };
 use tickvault_storage::depth_persistence::{
     DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
@@ -2266,6 +2267,7 @@ impl LiveIngest {
 pub struct DrainCounters {
     folded: metrics::Counter,
     non_tick: metrics::Counter,
+    main_feed_disconnects: metrics::Counter,
     unparseable: metrics::Counter,
     seq_unrepresentable: metrics::Counter,
     aggregator_refused: metrics::Counter,
@@ -2340,6 +2342,7 @@ pub fn counters() -> &'static DrainCounters {
     COUNTERS.get_or_init(|| DrainCounters {
         folded: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "folded"),
         non_tick: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "non_tick"),
+        main_feed_disconnects: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "disconnect"),
         unparseable: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "unparseable"),
         seq_unrepresentable: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "seq_unrepresentable"),
         aggregator_refused: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "aggregator_refused"),
@@ -4222,6 +4225,40 @@ pub fn drain_main_feed_frame(
                     IngestOutcome::WriteFailed => c.write_failed.increment(1),
                 }
             }
+            // A disconnect the drain DECODED. It is split out of the untyped
+            // `non_tick` bucket above because of a divergence found on
+            // 2026-08-26: `classify_frame` requires the WHOLE frame to walk
+            // cleanly before it will act on a stacked disconnect (deliberate --
+            // it stops a 16-byte frame whose first byte happens to be 50 from
+            // parking a healthy socket on a reason read out of random data),
+            // while THIS walk stops AT the bad packet, having already decoded
+            // everything before it. So `[disconnect 804][unknown code]`
+            // reaches here as a real, parsed 804 that the classifier called
+            // `Data`.
+            //
+            // That asymmetry is not resolved here -- relaxing the classifier
+            // would trade away a documented fail-safe -- but the reason no
+            // longer vanishes. 804 means the subscribe set exceeds the
+            // per-connection cap and is ruled Fatal precisely because retrying
+            // re-sends the identical over-limit set forever and can earn an
+            // 805 account block, so "the reason reached no log and no metric"
+            // was the part that made it unfixable from outside.
+            //
+            // Not throttled: a disconnect packet ends the socket, so this is
+            // bounded by reconnects, not by frame rate.
+            Ok(ParsedFrame::Disconnect(reason)) => {
+                c.main_feed_disconnects.increment(1);
+                out.disconnects = out.disconnects.saturating_add(1);
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "drain_decoded_disconnect",
+                    reason = ?reason,
+                    "the main feed decoded a DISCONNECT packet inside a frame — \
+                     if this reason is not also on a socket-close line, the \
+                     classifier could not act on it and the reconnect ladder is \
+                     treating a possibly-fatal reason as transient"
+                );
+            }
             // Non-tick frames are real protocol traffic, not errors: OI and
             // previous-close arrive as their own packets, market-status and
             // disconnect are control. Counted so the traffic mix is visible,
@@ -4256,6 +4293,10 @@ pub fn drain_main_feed_frame(
 pub struct FrameOutcome {
     /// Packets in this frame that became a buffered row.
     pub folded: u64,
+    /// DISCONNECT packets this frame carried and the drain decoded. Split
+    /// out of the untyped non-tick count on 2026-08-26 so a reason the
+    /// classifier could not act on is still visible — see the drain arm.
+    pub disconnects: u64,
     /// Packets refused by the parser or by an unknown response code.
     pub unparseable: u64,
     /// Depth rows appended from the 5 levels carried INLINE in Full-mode tick
@@ -5642,7 +5683,12 @@ pub const DEPTH_ATTACH_MIN_WINDOW_SECS: u64 = 30 * 60;
 pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 = 15 * 3_600 + 30 * 60;
 
 /// Current IST second-of-day.
-fn ist_second_of_day_now() -> u32 {
+///
+/// `pub(crate)` since 2026-08-26: the per-minute depth rebalance
+/// (`crate::depth_rebalance`) needs the SAME clock this lane uses. A second
+/// implementation would be one more place for the IST offset to drift, and a
+/// drift there puts every rebalance in the wrong minute.
+pub(crate) fn ist_second_of_day_now() -> u32 {
     let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
     ));
@@ -5713,7 +5759,7 @@ fn top_up_late_contracts(
     sent: &mut std::collections::HashSet<(u64, u8)>,
     slots: &mut [(
         tokio::sync::mpsc::Sender<
-            Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+            tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
         >,
         usize,
     )],
@@ -5772,7 +5818,7 @@ fn top_up_late_contracts(
         }
         let take = (*room).min(delta.len() - cursor);
         let chunk = delta[cursor..cursor + take].to_vec();
-        match tx.try_send(chunk) {
+        match tx.try_send(LiveSubscriptionCommand::Extend(chunk)) {
             Ok(()) => {
                 for instrument in &delta[cursor..cursor + take] {
                     sent.insert(contract_identity(instrument));
@@ -5975,7 +6021,7 @@ async fn attach_depth_when_available(
     // the only slots that exist are the ones already paid for on this socket.
     spot_topup: Option<(
         tokio::sync::mpsc::Sender<
-            Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+            tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
         >,
         usize,
     )>,
@@ -6051,7 +6097,16 @@ async fn attach_depth_when_available(
     // Top-up channels for connections that are already live, with the room
     // left on each. Populated by the contract dial and by the spot
     // connection's leftover after the initial overflow.
-    let mut live_topups: Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)> =
+    // One entry per DEPTH connection the attach dials, holding the channel a
+    // swap travels down and the instruments that connection was dialed with.
+    // Collected here rather than derived later because only the dial knows
+    // which connection the pool gave which instruments to.
+    let mut depth_commands: Vec<(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )> = Vec::new();
+    let mut live_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     // The contract capacity budget, FROZEN at the first selection.
     //
@@ -6200,6 +6255,108 @@ async fn attach_depth_when_available(
             }
         };
 
+        // The FIFTH depth-200 socket: the day's biggest mover.
+        //
+        // It cannot come from the pair selector. That selector fills in PAIRS
+        // and its budget is even precisely so a half-filled pair can never
+        // strand a lone leg on an odd socket. So the fifth is appended here,
+        // from a different question entirely — which stock has moved furthest
+        // today — and only when the four ATM sockets are already accounted
+        // for.
+        //
+        // Appended BEFORE planning, not dialed separately, because `plan_pool`
+        // assigns instruments to connections in order: five depth-200
+        // instruments become five connections at indices 0..4, and index 4 is
+        // exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it afterwards would
+        // need the pool a second time, which one task cannot hold twice.
+        let mut selection = selection;
+        if !depth_done {
+            // ONE load for both halves. Two loads a few seconds apart can
+            // disagree, and a disagreement here fills the movers sockets from
+            // one moment's ranking while the fifth depth-200 socket is chosen
+            // from another's.
+            let inputs = crate::depth_rebalance::load_attach_inputs(
+                &questdb,
+                &today_date,
+                ymd_from_ist_date(&today_date),
+                today_nanos / 1_000,
+            )
+            .await;
+
+            // ---- depth-20: the operator's layout, when it can be built ----
+            //
+            // The adaptive selection stays as the FALLBACK, and that ordering
+            // is deliberate. Before the chain publishes, the layout has no
+            // strikes to centre on and returns nothing; overwriting a working
+            // selection with an empty one would trade "the wrong 250" for
+            // "no depth at all", which is strictly worse. So the layout is
+            // taken only when it actually produced instruments.
+            let layout =
+                crate::depth20_layout::build_depth20_layout(&inputs.candidates, &inputs.movers);
+            if layout.instrument_count() > 0 {
+                let flattened = layout.flattened();
+                info!(
+                    instruments = flattened.len(),
+                    sockets = layout.sockets.len(),
+                    index_unresolved = layout.index_underlyings_unresolved.len(),
+                    movers_unresolved = layout.movers_unresolved,
+                    gainers = layout.ranking.gainers.len(),
+                    losers = layout.ranking.losers.len(),
+                    "depth-20: using the operator layout — index windows plus today's movers"
+                );
+                selection.depth_20 = flattened;
+            } else {
+                // Normal before ~09:16, when no chain has published yet.
+                tracing::debug!(
+                    adaptive_instruments = selection.depth_20.len(),
+                    "depth-20: the operator layout has nothing to build from yet — keeping \
+                     the adaptive selection for this attempt"
+                );
+            }
+
+            // ---- depth-200: the fifth socket ----
+            //
+            // Appended BEFORE planning, not dialed separately, because
+            // `plan_pool` assigns instruments to connections in order: five
+            // depth-200 instruments become five connections at indices 0..4,
+            // and index 4 is exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it
+            // afterwards would need the pool a second time, which one task
+            // cannot hold twice.
+            if selection.depth_200.len() == crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS {
+                match crate::depth_rebalance::top_mover_pick(&inputs.movers, &inputs.candidates)
+                    .and_then(|pick| {
+                        u64::try_from(pick.leg_security_id())
+                            .ok()
+                            .filter(|id| *id > 0)
+                            .map(|security_id| {
+                                tickvault_core::websocket::pool_supervisor::SubscribeInstrument {
+                                    security_id,
+                                    segment: pick.contract_segment,
+                                }
+                            })
+                    }) {
+                    Some(fifth) => {
+                        selection.depth_200.push(fifth);
+                        info!(
+                            security_id = fifth.security_id,
+                            "depth-200: the fifth socket takes the day's biggest mover"
+                        );
+                    }
+                    None => {
+                        // Normal before the open and on a flat morning: no
+                        // stock has a measurable move yet, so there is nothing
+                        // to put on it. The retry loop asks again; if the
+                        // whole session stays flat the socket simply goes
+                        // unused, which is honest.
+                        tracing::debug!(
+                            "depth-200: no leading mover yet — the fifth socket stays \
+                             undialed this attempt"
+                        );
+                    }
+                }
+            }
+        }
+
         // The contract universe rides the SAME retry loop, and that is not a
         // convenience — both wait on evidence that only exists after the open
         // (depth on the chain leg's first publish, contracts on the first
@@ -6347,7 +6504,7 @@ async fn attach_depth_when_available(
                             // connection task may be mid-frame, and waiting on
                             // it here would stall the depth dial behind a
                             // socket that is doing its job.
-                            match tx.try_send(overflow.to_vec()) {
+                            match tx.try_send(LiveSubscriptionCommand::Extend(overflow.to_vec())) {
                                 Ok(()) => {
                                     spot_topup_used = true;
                                     for instrument in overflow {
@@ -6424,6 +6581,7 @@ async fn attach_depth_when_available(
                                 // possible; `top_up_late_contracts` is what
                                 // makes it safe.
                                 out_topups: Some(&mut live_topups),
+                                out_depth_commands: None,
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -6507,6 +6665,7 @@ async fn attach_depth_when_available(
                                 depth_budget: &depth_budget,
                                 ws_audit_tx: Some(&ws_audit_tx),
                                 out_topups: None,
+                                out_depth_commands: Some(&mut depth_commands),
                             },
                         );
                         depth_done = true;
@@ -6664,6 +6823,21 @@ async fn attach_depth_when_available(
                     "late-attach finished: both halves on the wire and the late top-up window \
                      is closed"
                 );
+                // Hand the depth-200 channels to the per-minute rebalance
+                // BEFORE returning, and hand them by MOVE.
+                //
+                // This is the line that makes the at-the-money machinery
+                // live. Until now `depth_commands` was collected here and
+                // dropped on return, which closed every channel the instant
+                // the attach finished — so the tracker, the planner and the
+                // ranking were all correct and none of them could ever reach
+                // a socket.
+                //
+                // Only Depth200 connections go. A depth-200 connection holds
+                // exactly ONE instrument, which is what makes a one-for-one
+                // swap meaningful; depth-20 holds up to 50 and needs its own
+                // shape, which is a separate change.
+                spawn_depth_rebalance(&questdb, &today_date, std::mem::take(&mut depth_commands));
                 return;
             }
         }
@@ -6677,6 +6851,118 @@ async fn attach_depth_when_available(
     }
 }
 
+/// Turns the attach's dialed depth channels into the rebalance's socket list.
+///
+/// Pure, and separate from the spawn, because the FILTER is the load-bearing
+/// part: only `Depth200` connections belong here. A depth-200 connection holds
+/// exactly one instrument, which is what makes a one-for-one swap meaningful.
+/// A depth-20 connection holds up to 50, so the same swap would drop one of
+/// fifty and add another — a valid wire operation and completely the wrong
+/// one, with nothing downstream able to tell.
+///
+/// A connection dialed with anything other than exactly one instrument is
+/// SKIPPED rather than taken with its first: the rebalance's `held` must
+/// mirror the wire, and taking one of several would leave the others
+/// untracked and the socket ordering wrong for every underlying after it.
+#[must_use]
+pub fn depth200_rebalance_sockets(
+    dialed: Vec<(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )>,
+) -> Vec<crate::depth_rebalance::RebalanceSocket> {
+    let mut out = Vec::new();
+    for (endpoint, tx, instruments) in dialed {
+        if endpoint != DhanEndpointType::Depth200 {
+            continue;
+        }
+        let [only] = instruments[..] else {
+            warn!(
+                dialed_with = instruments.len(),
+                "depth rebalance: a depth-200 connection was dialed with something other \
+                 than exactly one instrument, so it is not steerable — a swap names the \
+                 instrument it replaces, and that is only unambiguous at one"
+            );
+            continue;
+        };
+        out.push(crate::depth_rebalance::RebalanceSocket {
+            tx,
+            held: Some(only),
+        });
+    }
+    out
+}
+
+/// The depth-20 connections, in dial order, with what each actually carries.
+///
+/// Unlike its depth-200 sibling this takes connections dialed with ANY number
+/// of instruments — a depth-20 connection legitimately holds up to 50, and a
+/// window that is short near the edge of a freshly-listed expiry holds fewer.
+/// A connection dialed with NONE is skipped: an empty socket has no window to
+/// move, and a swap naming an instrument it does not hold is refused by the
+/// guard anyway.
+#[must_use]
+pub fn depth20_track_sockets(
+    dialed: &[(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )],
+) -> Vec<crate::depth20_track::Depth20LiveSocket> {
+    dialed
+        .iter()
+        .filter(|(endpoint, _, instruments)| {
+            *endpoint == DhanEndpointType::Depth20 && !instruments.is_empty()
+        })
+        .map(
+            |(_, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
+                tx: tx.clone(),
+                held: instruments.clone(),
+            },
+        )
+        .collect()
+}
+/// Spawns the per-minute depth rebalance for the rest of the session.
+// TEST-EXEMPT: spawn wrapper over depth200_rebalance_sockets + run_depth_rebalance, both tested.
+fn spawn_depth_rebalance(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    date_ist: &str,
+    dialed: Vec<(
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    )>,
+) {
+    let depth20 = depth20_track_sockets(&dialed);
+    let sockets = depth200_rebalance_sockets(dialed);
+    if sockets.is_empty() && depth20.is_empty() {
+        // Not an error here: a session that dialed NEITHER depth pool has
+        // nothing to rebalance, and the loop would say so once and exit.
+        // Skipping the spawn says the same thing without a task that exists
+        // only to complain.
+        //
+        // The test is on BOTH pools deliberately. The first version returned
+        // on depth-200 alone, which would have killed depth-20 tracking for
+        // the whole session any time the depth-200 dial came back empty —
+        // two independent pools, one of them silently taken down by the
+        // other's bad morning.
+        info!("depth rebalance not started: neither depth pool has a steerable connection");
+        return;
+    }
+    let questdb = questdb.clone();
+    let date_ist = date_ist.to_owned();
+    let today_ymd = ymd_from_ist_date(&date_ist);
+    let today_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
+    tokio::spawn(crate::depth_rebalance::run_depth_rebalance(
+        questdb,
+        date_ist,
+        today_ymd,
+        today_micros,
+        sockets,
+        depth20,
+    ));
+}
 /// How long to wait before the next late-attach attempt, given the IST second.
 ///
 /// Pure so the boundary behaviour is testable without a clock: the whole point
@@ -6723,7 +7009,25 @@ struct DialContext<'a> {
     /// later contract attach can reach the slots the spot universe does not
     /// use; the attach passes `None`, because its own connections are dialed
     /// with their final set and have nothing left to add.
-    out_topups: Option<&'a mut Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)>>,
+    out_topups: Option<&'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>>,
+    /// Collects a command sender for every DEPTH connection dialed, paired
+    /// with the instruments that connection was dialed holding.
+    ///
+    /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. The
+    /// tracker and the swap primitive both existed and had nowhere to send:
+    /// depth sockets were dialed with no command channel at all, so a strike
+    /// chosen at 09:10 stayed chosen until the session ended.
+    ///
+    /// The instruments come back with the sender because a swap must name the
+    /// OLD one, and only the dial knows which connection got which. Deriving
+    /// it later from the selection would be guessing at the pool's packing.
+    out_depth_commands: Option<
+        &'a mut Vec<(
+            DhanEndpointType,
+            tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+            Vec<SubscribeInstrument>,
+        )>,
+    >,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -6736,6 +7040,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         depth_budget,
         ws_audit_tx,
         mut out_topups,
+        mut out_depth_commands,
     } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -6819,12 +7124,29 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             }
             _ => None,
         };
+        // Depth sockets get their OWN channel, and it stays open for the
+        // session rather than being consumed once. A top-up is a single event
+        // — the contract overflow — so its channel is depth 1 and its sender
+        // is dropped after. A swap channel must survive every minute of the
+        // day, so the sender is held by the re-selection task and the depth
+        // is 4: enough that a busy minute cannot block the sender, small
+        // enough that a wedged connection surfaces as a refused try_send the
+        // caller LOGS rather than as a queue that hides it.
+        let topup_rx = match (endpoint, topup_rx, out_depth_commands.as_deref_mut()) {
+            (DhanEndpointType::Depth20 | DhanEndpointType::Depth200, None, Some(depth_vec)) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
+                depth_vec.push((endpoint, tx, held));
+                Some(rx)
+            }
+            (_, existing, _) => existing,
+        };
         tokio::spawn(async move {
             // Moved in, so the socket's lifetime and the guard's are the same
             // object. Whatever ends this task — a clean return, an early
             // return, or an unwind — the count comes back down.
             let alive = alive;
-            let exit = run_connection_with_topup(
+            let exit = run_connection_with_commands(
                 socket,
                 supervisor,
                 guard,
@@ -7518,7 +7840,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // universe packs onto one connection and leaves the rest of it empty; this
     // is how the later contract attach reaches that room instead of stranding
     // it. See `SubscribeGuard::try_extend`.
-    let mut main_feed_topups: Vec<(tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize)> =
+    let mut main_feed_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     let dialed = dial_planned_connections(
         plan,
@@ -7531,6 +7853,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             depth_budget: &depth_budget,
             ws_audit_tx: Some(&ws_audit_tx),
             out_topups: Some(&mut main_feed_topups),
+            out_depth_commands: None,
         },
     );
 
@@ -8057,6 +8380,13 @@ pub fn spawn_daily_crossverify(
                         rest_failure_reasons = %report.rest_failure_breakdown.summary(),
                         malformed_rows = report.malformed_rows,
                         budget_elapsed = report.budget_elapsed,
+                        // Reported beside `degraded`, never folded into it: a
+                        // single REST failure also sets `degraded`, so the two
+                        // together were indistinguishable — which is why the
+                        // 2026-08-26 short live read left no trace in this
+                        // line even though the run's own counts summed to the
+                        // cap exactly.
+                        live_truncated = report.live_truncated,
                         degraded = report.degraded,
                         vacuous = c.is_vacuous(),
                         "Dhan live-feed cross-verification finished — this is the honest \
@@ -8192,8 +8522,22 @@ fn persist_xverify_report(
     // shape that grows.
     const PERSIST_BATCH_ROWS: usize = 20_000;
     let mut batch_errors = 0_usize;
+    //
+    // MERGED 2026-08-27: two sessions fixed this independently, one bounding
+    // ROWS and one bounding BYTES, and the bounds are not interchangeable.
+    // Rows give a predictable batch size; BYTES is the quantity that actually
+    // breached the ceiling, and it is the one that survives a row shape
+    // getting wider — which the batch-size note directly above names as the
+    // thing it is buying headroom against. Keeping only the row bound would
+    // have re-created that assumption one layer down.
     let flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
-        if w.pending() >= PERSIST_BATCH_ROWS && w.flush().is_err() {
+        let failed = if w.pending() >= PERSIST_BATCH_ROWS {
+            w.flush().is_err()
+        } else {
+            // Byte-bounded: a no-op below the threshold, one `len()` compare.
+            w.flush_if_large().is_err()
+        };
+        if failed {
             // One batch lost, named, and the run continues. Before this the
             // same failure took the whole day with it.
             *errs += 1;
@@ -8220,6 +8564,11 @@ fn persist_xverify_report(
         flush_if_full(&mut writer, &mut batch_errors);
     }
 
+    // The daily row now meets a nearly-empty buffer. That matters more than it
+    // looks: it is appended AFTER the cells, so under the old single-flush
+    // shape an oversized cell buffer destroyed the one row recording that a
+    // comparison happened at all — the detail and the evidence of its loss
+    // went in the same refusal.
     let daily = xverify_daily_row(c, tolerance_paise);
     let daily_err = writer.append_daily(&daily).err();
 
@@ -8231,6 +8580,15 @@ fn persist_xverify_report(
                 // Partial writes are reported, never rounded up to success:
                 // an audit table that silently drops rows is worse than one
                 // that is honestly incomplete.
+                //
+                // `chunk_flush_errors` joined this condition with the
+                // 2026-08-26 chunking, and it is the reason chunking is safe
+                // to do at all. Draining in pieces converts "no rows today"
+                // into "most rows today", which is an IMPROVEMENT only while
+                // the shortfall is visible — a silently-short audit table
+                // reads as a complete one. Each failed chunk discards its own
+                // buffer, so the rows lost are bounded by the flush threshold
+                // rather than by the run.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "xverify_persist_partial",
@@ -8241,7 +8599,8 @@ fn persist_xverify_report(
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),
                     "Dhan live-feed cross-verification persisted with gaps — some findings \
-                     could not be appended, so the audit tables are incomplete for today"
+                     could not be appended or a chunk flush was refused, so the audit \
+                     tables are incomplete for today"
                 );
             }
         }
@@ -8713,11 +9072,26 @@ mod tests {
     fn topup_slot(
         room: usize,
     ) -> (
-        (tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>, usize),
-        tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>,
+        (tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize),
+        tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         ((tx, room), rx)
+    }
+
+    /// Unwraps the `Extend` payload a top-up sends.
+    ///
+    /// The channel carries a command enum since 2026-08-26 (it also carries
+    /// `Swap`, for the per-minute at-the-money re-selection). A top-up only
+    /// ever sends `Extend`, and a test that received a `Swap` here would be
+    /// reporting a real defect, so this panics rather than returning empty.
+    fn extended(cmd: LiveSubscriptionCommand) -> Vec<SubscribeInstrument> {
+        match cmd {
+            LiveSubscriptionCommand::Extend(more) => more,
+            LiveSubscriptionCommand::Swap { .. } => {
+                panic!("a top-up sent a Swap — it must only ever Extend")
+            }
+        }
     }
 
     #[test]
@@ -8738,7 +9112,7 @@ mod tests {
         assert_eq!(placed, 1, "only the instrument nobody has been told about");
         let got = rx.try_recv().expect("the delta must reach the channel");
         assert_eq!(
-            got,
+            extended(got),
             vec![inst(3, ExchangeSegment::NseFno)],
             "re-sending an already-live instrument is a silent double-subscribe, and Dhan \
              answers an over-limit subscribe with 804 by dropping the connection"
@@ -8788,7 +9162,7 @@ mod tests {
             "keying on security_id alone would withhold the BSE_FNO contract forever"
         );
         assert_eq!(
-            rx.try_recv().expect("a send"),
+            extended(rx.try_recv().expect("a send")),
             vec![inst(42, ExchangeSegment::BseFno)]
         );
     }
@@ -8796,7 +9170,7 @@ mod tests {
     #[test]
     fn top_up_late_contracts_does_not_mark_a_refused_send_as_subscribed() {
         let mut sent = std::collections::HashSet::new();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<LiveSubscriptionCommand>(1);
         drop(rx); // the connection task is gone: every send is refused
         let mut slots = [(tx, 100)];
         let selection = [inst(9, ExchangeSegment::NseFno)];
@@ -8824,8 +9198,16 @@ mod tests {
         let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 5);
-        assert_eq!(rx_first.try_recv().expect("first").len(), 2, "its room");
-        assert_eq!(rx_second.try_recv().expect("second").len(), 3, "the rest");
+        assert_eq!(
+            extended(rx_first.try_recv().expect("first")).len(),
+            2,
+            "its room"
+        );
+        assert_eq!(
+            extended(rx_second.try_recv().expect("second")).len(),
+            3,
+            "the rest"
+        );
         assert_eq!(slots[0].1, 0, "room is decremented as sends succeed");
         assert_eq!(slots[1].1, 7);
     }
@@ -8856,7 +9238,7 @@ mod tests {
         let mut sent = std::collections::HashSet::new();
         let mut slots: [(
             tokio::sync::mpsc::Sender<
-                Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
+                tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
             >,
             usize,
         ); 0] = [];
@@ -8972,7 +9354,7 @@ mod tests {
         let placed = top_up_late_contracts(&selection, &mut sent, &mut slots, 1, 10_000);
 
         assert_eq!(placed, 2, "the repeat must not reach the wire");
-        let got = rx.try_recv().expect("a send");
+        let got = extended(rx.try_recv().expect("a send"));
         assert_eq!(got.len(), 2);
         assert_eq!(
             got.iter().filter(|i| i.security_id == 5).count(),
@@ -9356,9 +9738,12 @@ mod tests {
     // -- the gate -----------------------------------------------------------
 
     #[test]
-    fn test_feed_stack_gate_is_shut_by_the_shipped_config() {
-        // `dhan_enabled = false` in BOTH config/base.toml and
-        // config/production.toml since the 2026-07-13 retirement.
+    fn test_feed_stack_gate_is_shut_when_the_config_flag_is_off() {
+        // NOTE (2026-08-26): base.toml now carries dhan_enabled = TRUE; this
+        // test passes `false` explicitly to exercise the gate arm, and does
+        // not describe the shipped config. Was written when both files said
+        // `dhan_enabled = false`, which was true from the 2026-07-13
+        // retirement until the 2026-08-11 flip.
         assert_eq!(
             feed_stack_gate(false, Some(DHAN_LIVE_FEED_ENV_ON)),
             FeedStackGate::DisabledByConfig
@@ -10418,6 +10803,81 @@ mod tests {
         assert!(
             src.contains("pub questdb: tickvault_common::config::QuestDbConfig"),
             "CrossverifyDeps must carry the ILP write config"
+        );
+    }
+
+    /// The 2026-08-26 loss, pinned at the call site.
+    ///
+    /// That session's 764,003 findings built a 207,965,278-byte ILP buffer
+    /// against the server's 104,857,600 cap; the single flush was refused and
+    /// the poisoned-buffer defence discarded every row, so the feed's only
+    /// ground truth has no record for the day.
+    ///
+    /// Two halves, and BOTH are load-bearing. The chunked flush stops the
+    /// buffer growing without bound — but it also converts "no rows today"
+    /// into "most rows today", which is an improvement only while the
+    /// shortfall is visible. A caller that chunked and then ignored the
+    /// failures would ship a silently-short audit table, which reads as a
+    /// complete one and is strictly worse than the honest total loss it
+    /// replaced.
+    #[test]
+    fn the_xverify_persist_drains_in_chunks_and_reports_what_it_lost() {
+        let src = include_str!("dhan_feed_stack.rs");
+
+        let body_start = src
+            .find("fn persist_xverify_report(")
+            .expect("the persister must exist");
+        // Bound the slice to the FUNCTION, not to end-of-file. This test's own
+        // string literals below contain every marker it looks for, so an
+        // unbounded slice would match itself and pass while production code had
+        // lost the call entirely — a guard that reads its own source is the
+        // purest form of the false-OK this file keeps finding.
+        let body_end = body_start
+            + 1
+            + src[body_start + 1..]
+                .find("\n}\n")
+                .expect("the persister must end at column 0");
+        let body = &src[body_start..body_end];
+        assert!(
+            !body.contains("fn the_xverify_persist_drains"),
+            "the scanned slice has swallowed this test — it would then match its \
+             own assertions and pass vacuously"
+        );
+
+        assert!(
+            body.contains("flush_if_full(&mut writer, &mut batch_errors)"),
+            "the append loop must drain in batches. Appending every finding and \
+             flushing once is what built a 207,965,278-byte buffer on \
+             2026-08-26 and lost all 764,003 rows to a refused flush"
+        );
+        // BOTH bounds, not either. Rows give a predictable batch size; BYTES
+        // is the quantity that actually breached, and the only one that
+        // survives a row shape getting wider.
+        assert!(
+            body.contains("w.pending() >= PERSIST_BATCH_ROWS"),
+            "the row bound must survive"
+        );
+        assert!(
+            body.contains("w.flush_if_large()"),
+            "the BYTE bound must survive: a row bound alone re-creates the \
+             'the rows can never get wider' assumption one layer down, which \
+             is what the batch-size note itself warns about"
+        );
+
+        let counted = body
+            .find("*errs += 1")
+            .expect("a refused batch must be counted, not swallowed");
+        let reported = body
+            .find("batch_errors > 0")
+            .expect("the count must reach the degraded-run condition");
+        let logged = body
+            .find("batch_errors,")
+            .expect("the count must be a field on the partial-write error line");
+        assert!(
+            counted < reported && reported < logged,
+            "the batch-failure count must be incremented, then gate the \
+             partial-write verdict, then be logged — a count that never \
+             reaches the verdict makes a short audit table look complete"
         );
     }
 
@@ -11887,10 +12347,17 @@ mod tests {
         // middle of the next packet and fabricates ticks from misaligned
         // bytes, so it is pinned per code rather than trusted to the
         // vendor-supplied length field in the header.
+        // Code 1 (INDEX ticker) shares the 16-byte ticker layout and is
+        // accepted by `dispatch_frame`; it was absent from BOTH this list and
+        // the table until 2026-08-26, so the test agreed with the bug. The
+        // exhaustive sweep in `parser::dispatcher`'s own tests is the real
+        // guard now — this stays as the readable smoke check.
+        assert_eq!(main_feed_packet_len(&[1]), Some(TICKER_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[2]), Some(TICKER_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[4]), Some(QUOTE_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[5]), Some(OI_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[6]), Some(PREVIOUS_CLOSE_PACKET_SIZE));
+        assert!(main_feed_packet_len(&[7]).is_some());
         assert_eq!(main_feed_packet_len(&[8]), Some(FULL_QUOTE_PACKET_SIZE));
         assert_eq!(main_feed_packet_len(&[50]), Some(DISCONNECT_PACKET_SIZE));
         // Unknown code and empty input: `None`, so the walker stops rather
@@ -12969,9 +13436,25 @@ mod tests {
         );
     }
 
-    /// The pricing quorum holds CONTRACTS. It must never hold DEPTH — depth
-    /// reads the option chain, not spot prices, so waiting for a stock to
-    /// print cannot make its instruments arrive any sooner.
+    /// The pricing quorum holds CONTRACTS. It must never hold DEPTH.
+    ///
+    /// **CORRECTED 2026-08-26.** This said depth "reads the option chain, not
+    /// spot prices". Both halves of that are now false: depth reads the
+    /// CONTRACT ARTIFACT (`load_depth_candidates` -> `read_contract_artifact`,
+    /// with the chain only as an unreachable fallback), and it very much does
+    /// read spot prices — `fetch_spot_prices` is how at-the-money is located
+    /// at all. The test was right; its reason was not, which is worse than no
+    /// reason, because a reader checking whether the coupling still matters
+    /// would have been told to look at the wrong thing.
+    ///
+    /// The REAL reason is a timing one, and it is what makes the operator's
+    /// 09:13 deadline reachable. Depth needs spot prices, which exist from
+    /// 09:00 — pre-open ticks are persisted even though they are not folded
+    /// into candles. The CONTRACT half additionally waits on a pricing quorum
+    /// across ~208 stock underlyings so the at-the-money window is not sized
+    /// against a near-empty price map. Those are different questions with
+    /// different answers at 09:13, so coupling them would make depth wait for
+    /// something it never needed.
     #[test]
     fn outstanding_halves_holds_contracts_while_pending_but_never_depth() {
         assert_eq!(
@@ -14956,6 +15439,217 @@ mod late_seed_tests {
         assert!(
             stamp < push,
             "the stamp must be taken before the rows that carry it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod depth_rebalance_wiring_tests {
+    use super::*;
+
+    fn instrument(id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment: tickvault_common::types::ExchangeSegment::NseFno,
+        }
+    }
+
+    fn dialed(
+        endpoint: DhanEndpointType,
+        instruments: Vec<SubscribeInstrument>,
+    ) -> (
+        DhanEndpointType,
+        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+        Vec<SubscribeInstrument>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // Keep the receiver alive for the life of the test so a closed channel
+        // never masquerades as a filtered one.
+        std::mem::forget(rx);
+        (endpoint, tx, instruments)
+    }
+
+    #[test]
+    fn only_depth_200_connections_are_steerable() {
+        // A depth-20 connection holds up to 50 instruments, so a one-for-one
+        // swap would drop one of fifty and add another — a valid wire
+        // operation and completely the wrong one.
+        let got = depth200_rebalance_sockets(vec![
+            dialed(DhanEndpointType::Depth200, vec![instrument(1)]),
+            dialed(DhanEndpointType::Depth20, vec![instrument(2)]),
+            dialed(DhanEndpointType::MainFeed, vec![instrument(3)]),
+            dialed(DhanEndpointType::OrderUpdate, vec![]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(4)]),
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].held, Some(instrument(1)));
+        assert_eq!(got[1].held, Some(instrument(4)));
+    }
+
+    #[test]
+    fn dial_order_is_preserved_because_the_planner_indexes_by_it() {
+        // plan_swaps assumes NIFTY call, NIFTY put, BANKNIFTY call, BANKNIFTY
+        // put in dial order. Reordering here would swap NIFTY's call onto
+        // BANKNIFTY's socket — a perfectly valid subscription to entirely the
+        // wrong contract.
+        let got = depth200_rebalance_sockets(vec![
+            dialed(DhanEndpointType::Depth200, vec![instrument(10)]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(20)]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(30)]),
+            dialed(DhanEndpointType::Depth200, vec![instrument(40)]),
+        ]);
+        let ids: Vec<u64> = got
+            .iter()
+            .filter_map(|s| s.held.map(|i| i.security_id))
+            .collect();
+        assert_eq!(ids, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn a_connection_dialed_with_more_than_one_instrument_is_skipped_not_truncated() {
+        // Taking the first of several would leave the rest untracked AND shift
+        // every socket index after it, so the planner would steer the wrong
+        // underlying's socket for the whole session.
+        let got = depth200_rebalance_sockets(vec![
+            dialed(
+                DhanEndpointType::Depth200,
+                vec![instrument(1), instrument(2)],
+            ),
+            dialed(DhanEndpointType::Depth200, vec![instrument(3)]),
+        ]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].held, Some(instrument(3)));
+    }
+
+    #[test]
+    fn a_connection_dialed_with_nothing_is_skipped() {
+        let got = depth200_rebalance_sockets(vec![dialed(DhanEndpointType::Depth200, vec![])]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn no_depth_200_connection_yields_no_sockets() {
+        let got = depth200_rebalance_sockets(vec![dialed(
+            DhanEndpointType::Depth20,
+            vec![instrument(1)],
+        )]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn the_attach_hands_its_channels_over_before_returning() {
+        // The whole point of this change. `depth_commands` used to be dropped
+        // on return, closing every channel the instant the attach finished, so
+        // the entire rebalance was unreachable. A source pin, because the only
+        // symptom of losing it is that nothing ever happens.
+        let source = include_str!("dhan_feed_stack.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("spawn_depth_rebalance(")
+                && production.contains("std::mem::take(&mut depth_commands)"),
+            "the attach must MOVE its depth channels into the rebalance; dropping them \
+             closes every channel and the machinery goes silently inert"
+        );
+    }
+}
+
+#[cfg(test)]
+mod depth20_layout_wiring_tests {
+    fn production() -> &'static str {
+        let source = include_str!("dhan_feed_stack.rs");
+        source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before)
+    }
+
+    #[test]
+    fn depth20_tracking_is_wired_into_the_rebalance_spawn() {
+        // Without this the depth-20 layout is a boot-time choice that decays
+        // all session: NIFTY walks off its own +/-12 window on a 150-point
+        // move, and the movers sockets keep a 09:16 ranking.
+        let p = production();
+        assert!(
+            p.contains("depth20_track_sockets(&dialed)"),
+            "the spawn no longer builds the depth-20 sockets, so nothing tracks them"
+        );
+        assert!(
+            p.contains("depth20,"),
+            "the depth-20 sockets are built and then not handed to the loop"
+        );
+    }
+
+    #[test]
+    fn an_empty_depth200_dial_does_not_take_depth20_tracking_down_with_it() {
+        // Two independent pools. The first version of this guard returned on
+        // depth-200 alone, which would have killed depth-20 tracking for the
+        // whole session on any morning the depth-200 dial came back empty.
+        let p = production();
+        assert!(
+            p.contains("sockets.is_empty() && depth20.is_empty()"),
+            "the rebalance spawn gates on one pool, so the other can be silently lost"
+        );
+    }
+
+    #[test]
+    fn the_attach_dials_the_operator_layout_not_the_adaptive_window() {
+        // The adaptive window fills all 250 slots with two indices at strikes
+        // fifty steps out and carries no stock at all. It is a valid selection
+        // and completely the wrong one.
+        assert!(
+            production().contains("crate::depth20_layout::build_depth20_layout("),
+            "the attach must build the operator layout for depth-20"
+        );
+    }
+
+    #[test]
+    fn an_empty_layout_never_wipes_a_working_selection() {
+        // Before the chain publishes the layout has no strikes to centre on
+        // and returns nothing. Overwriting a working adaptive selection with
+        // an empty one trades "the wrong 250" for "no depth at all", which is
+        // strictly worse — and it would look like the layout succeeding.
+        let p = production();
+        let guarded = p.contains("if layout.instrument_count() > 0 {");
+        assert!(
+            guarded,
+            "the layout must be taken only when it produced instruments"
+        );
+    }
+
+    #[test]
+    fn both_halves_read_one_load_so_they_cannot_disagree() {
+        // Two loads a few seconds apart fill the movers sockets from one
+        // moment's ranking and choose the fifth depth-200 socket from
+        // another's.
+        let p = production();
+        assert!(
+            p.contains("crate::depth_rebalance::load_attach_inputs("),
+            "the attach must load candidates and movers once for both halves"
+        );
+        assert_eq!(
+            p.matches("crate::depth_rebalance::load_attach_inputs(")
+                .count(),
+            1,
+            "exactly one load — a second call is a second moment"
+        );
+    }
+
+    #[test]
+    fn the_fifth_socket_is_appended_before_planning_not_dialed_after() {
+        // plan_pool assigns instruments to connections in order, so the
+        // append is what puts the top mover at index 4. Dialing it afterwards
+        // needs the pool a second time, which one task cannot hold twice.
+        let p = production();
+        let append = p
+            .find("selection.depth_200.push(fifth);")
+            .expect("the fifth socket must be appended");
+        let plan = p
+            .find("&selection.depth_200,")
+            .expect("the plan must read depth_200");
+        assert!(
+            append < plan,
+            "the fifth socket must be appended BEFORE the pool is planned"
         );
     }
 }
