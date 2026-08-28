@@ -453,6 +453,177 @@ fn decide_shed_level_by_runway(current: ShedLevel, runway: f64) -> ShedLevel {
     }
     current
 }
+
+// ---------------------------------------------------------------------------
+// Self-measured exhaustion — the box answers the question itself
+// ---------------------------------------------------------------------------
+
+/// Minimum observation window before a burn RATE is trusted.
+///
+/// Two hours, and the reason is that the early session is not representative:
+/// the box boots at 08:30 and burns almost nothing until the feed opens at
+/// 09:00, so a projection taken at 09:15 divides a real burn by a mostly-idle
+/// elapsed time and reads far too slow. By 11:00 the rate is the session's
+/// actual rate.
+///
+/// Erring long is the safe direction here: too short gives a wrong number,
+/// too long merely delays the trigger to a point where the fractional gate is
+/// still nowhere near arming anyway.
+pub const MIN_BURN_OBSERVATION_SECS: u64 = 7_200;
+
+/// A burn measurement is discarded above this rate.
+///
+/// 200 MB/s sustained is roughly 4.8 TB across a session — two orders of
+/// magnitude above the measured 138 GB. A reading that large is not a fast
+/// day, it is a bad measurement: a volume swap, a resize, a `df` on the wrong
+/// mount, or a probe that read a different filesystem. Acting on it would shed
+/// every order-book row on the strength of a number nobody could produce.
+pub const MAX_PLAUSIBLE_BURN_BYTES_PER_SEC: u64 = 200_000_000;
+
+/// Seconds until the volume is full at the observed burn rate, or `None` when
+/// there is nothing trustworthy to say.
+///
+/// `None` — never a guess, and never a zero — for every one of:
+///
+/// * the observation window is too short ([`MIN_BURN_OBSERVATION_SECS`]);
+/// * free space did NOT fall, so there is no burn to measure. This is the
+///   normal case right after an archival pass reclaims space, and it must read
+///   as "no measurement", never as "burning zero, infinite runway";
+/// * the clock went backwards or stood still (an NTP step, a suspend);
+/// * the rate exceeds [`MAX_PLAUSIBLE_BURN_BYTES_PER_SEC`].
+///
+/// O(1): two subtractions, a divide, three comparisons. No allocation.
+#[must_use]
+pub fn seconds_to_disk_full(
+    anchor_free_bytes: u64,
+    anchor_secs: u64,
+    free_bytes_now: u64,
+    secs_now: u64,
+) -> Option<u64> {
+    let elapsed = secs_now.checked_sub(anchor_secs)?;
+    if elapsed < MIN_BURN_OBSERVATION_SECS {
+        return None;
+    }
+    // `checked_sub` rather than `saturating_sub`: free space GROWING is a
+    // different event from free space holding steady, and only the second is
+    // "no burn". Both return None, but the distinction is why this is not a
+    // saturating subtract that would silently call a 40 GB reclaim "zero
+    // burn" and then divide by it.
+    let burned = anchor_free_bytes.checked_sub(free_bytes_now)?;
+    if burned == 0 {
+        return None;
+    }
+    let rate = burned / elapsed;
+    if rate == 0 || rate > MAX_PLAUSIBLE_BURN_BYTES_PER_SEC {
+        return None;
+    }
+    Some(free_bytes_now / rate)
+}
+
+/// Seconds left in the capture window, or `None` once it has closed.
+///
+/// The window is the one the writers actually use — `TICK_PERSIST_*` — not the
+/// box's uptime. Burn happens while the feed is up; after 15:40 the volume
+/// stops filling and there is nothing to protect against.
+#[must_use]
+pub fn seconds_left_in_capture_window(secs_of_day_ist: u32) -> Option<u32> {
+    crate::constants::TICK_PERSIST_END_SECS_OF_DAY_IST.checked_sub(secs_of_day_ist)
+}
+
+/// Will the disk outlast the session? The whole decision, in one comparison.
+///
+/// Reuses the [`SHED_INLINE_DEPTH_BELOW_RUNWAY`] family verbatim rather than
+/// introducing a second set of ratios: "1.5 sessions of runway" and "1.5x the
+/// time left in this session" are the same statement, and two sets of numbers
+/// meaning the same thing is how they drift apart.
+///
+/// Same SHAPE as [`decide_shed_level`] — restore first, then shed, `max` on
+/// the middle rung so a call at that threshold can never de-escalate a gate
+/// already at [`ShedLevel::AllDepth`].
+#[must_use]
+pub fn decide_shed_level_by_exhaustion(
+    current: ShedLevel,
+    secs_to_full: u64,
+    secs_left_in_window: u32,
+) -> ShedLevel {
+    let left = f64::from(secs_left_in_window);
+    if left <= 0.0 {
+        // The window is closed; nothing is burning. Hold — restoring belongs
+        // to the free-space measurement, which is evidence about the disk
+        // rather than about the clock.
+        return current;
+    }
+    // Precision: both values are seconds within a day, far below 2^53.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: see above.
+    let ratio = secs_to_full as f64 / left;
+
+    if ratio >= RESTORE_INLINE_DEPTH_ABOVE_RUNWAY {
+        return ShedLevel::None;
+    }
+    if ratio >= RESTORE_ALL_DEPTH_ABOVE_RUNWAY && current == ShedLevel::AllDepth {
+        return ShedLevel::InlineDepth;
+    }
+    if ratio < SHED_ALL_DEPTH_BELOW_RUNWAY {
+        return ShedLevel::AllDepth;
+    }
+    if ratio < SHED_INLINE_DEPTH_BELOW_RUNWAY {
+        return current.max(ShedLevel::InlineDepth);
+    }
+    current
+}
+
+/// The full decision: fractional gate, configured runway, and the box's own
+/// measurement, combined as the MOST protective of the three.
+///
+/// # Why this needs no number from an operator
+///
+/// `ingest_shed`'s founding directive (2026-08-19) is that the box must manage
+/// itself *"on a fixed instance, with no human in the loop"*. A trigger that
+/// requires someone to measure a session and type the figure in is a human in
+/// the loop, and it goes stale the moment the subscribed universe changes.
+/// Measuring its own burn is the version of this feature that actually honours
+/// that directive.
+///
+/// # The asymmetry, stated because it is the whole justification
+///
+/// A false shed costs order-book depth for a while, reversibly, on data that
+/// has no live reader. A false NON-shed costs ticks — permanently, upstream,
+/// where no counter of ours can even see them. Those are not comparable, so
+/// this errs toward shedding.
+#[must_use]
+#[allow(clippy::too_many_arguments)] // APPROVED: three independent measurements
+pub fn decide_shed_level_all_signals(
+    current: ShedLevel,
+    free_fraction: f64,
+    free_bytes: u64,
+    session_burn_bytes: u64,
+    retention_at_floor: bool,
+    anchor: Option<(u64, u64)>,
+    secs_now: u64,
+    secs_of_day_ist: u32,
+) -> ShedLevel {
+    let by_configured = decide_shed_level_with_runway(
+        current,
+        free_fraction,
+        free_bytes,
+        session_burn_bytes,
+        retention_at_floor,
+    );
+
+    let Some((anchor_free, anchor_secs)) = anchor else {
+        return by_configured;
+    };
+    let Some(secs_to_full) = seconds_to_disk_full(anchor_free, anchor_secs, free_bytes, secs_now)
+    else {
+        return by_configured;
+    };
+    let Some(left) = seconds_left_in_capture_window(secs_of_day_ist) else {
+        return by_configured;
+    };
+
+    by_configured.max(decide_shed_level_by_exhaustion(current, secs_to_full, left))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,5 +1128,214 @@ mod tests {
             ShedLevel::AllDepth,
             "a NaN fraction must not restore a shed gate"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-measured exhaustion — every way the measurement can be wrong
+    // -----------------------------------------------------------------------
+
+    const H: u64 = 3_600;
+    /// 138 GB across the 24,000 s capture window = 5.75 MB/s.
+    const RATE_2026_08_28: u64 = 5_750_000;
+
+    #[test]
+    fn a_short_observation_window_is_not_a_measurement() {
+        // The box boots at 08:30 and burns almost nothing until the feed opens
+        // at 09:00. A projection taken early divides a real burn by a mostly
+        // idle elapsed time and reads far too slow.
+        for elapsed in [0, 1, 60, MIN_BURN_OBSERVATION_SECS - 1] {
+            assert_eq!(
+                seconds_to_disk_full(300_000_000_000, 0, 200_000_000_000, elapsed),
+                None,
+                "trusted a {elapsed}s window"
+            );
+        }
+        // At the boundary it becomes a measurement.
+        assert!(
+            seconds_to_disk_full(
+                300_000_000_000,
+                0,
+                200_000_000_000,
+                MIN_BURN_OBSERVATION_SECS
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn free_space_growing_is_no_measurement_never_infinite_runway() {
+        // The normal state right after an archival pass reclaims space. The
+        // dangerous reading is "burned 0 bytes, therefore the disk lasts
+        // forever" — which would RESTORE every depth feed at the exact moment
+        // the archiver proved the disk was under pressure.
+        assert_eq!(
+            seconds_to_disk_full(200_000_000_000, 0, 260_000_000_000, 4 * H),
+            None,
+            "a 60 GB reclaim must read as no-measurement, not as zero burn"
+        );
+        // Dead flat is also no measurement.
+        assert_eq!(
+            seconds_to_disk_full(200_000_000_000, 0, 200_000_000_000, 4 * H),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clock_that_moves_backward_or_stands_still_yields_nothing() {
+        // An NTP step, a VM suspend/resume, a container clock skew.
+        assert_eq!(
+            seconds_to_disk_full(300_000_000_000, 10 * H, 200_000_000_000, 4 * H),
+            None,
+            "negative elapsed must not underflow into a huge window"
+        );
+        assert_eq!(
+            seconds_to_disk_full(300_000_000_000, 4 * H, 200_000_000_000, 4 * H),
+            None
+        );
+    }
+
+    #[test]
+    fn an_impossible_burn_rate_is_discarded_not_acted_on() {
+        // A volume swap, a resize, a probe that read a different mount. 500 GB
+        // vanishing in two hours is ~69 MB/s... plausible. 5 PB is not.
+        assert_eq!(
+            seconds_to_disk_full(u64::MAX, 0, 1_000, 2 * H),
+            None,
+            "an absurd rate must be refused — acting on it sheds everything"
+        );
+        // Just under the ceiling still measures.
+        let just_under = MAX_PLAUSIBLE_BURN_BYTES_PER_SEC * 2 * H - 1;
+        assert!(seconds_to_disk_full(just_under + 1_000, 0, 1_000, 2 * H).is_some());
+    }
+
+    #[test]
+    fn the_2026_08_28_session_is_caught_before_the_disk_fills() {
+        // Two hours in: 314 GB at open, so ~273 GB left, burning 5.75 MB/s.
+        // 47,478 s to full against 16,800 s of capture window remaining — the
+        // disk comfortably outlasts the session, so nothing sheds. Correct.
+        let free_at_11 = 314_000_000_000 - (RATE_2026_08_28 * 2 * H);
+        let to_full = seconds_to_disk_full(314_000_000_000, 0, free_at_11, 2 * H)
+            .expect("a two-hour window is a measurement");
+        let left = seconds_left_in_capture_window(39_600).expect("11:00 is inside the window");
+        assert_eq!(
+            decide_shed_level_by_exhaustion(ShedLevel::None, to_full, left),
+            ShedLevel::None,
+            "a disk that outlasts the session must not shed"
+        );
+
+        // Now the case that matters: same rate, but the volume started the day
+        // far fuller — 60 GB free at 11:00. 10,434 s to full against 16,800 s
+        // of session left. It does NOT survive the day.
+        let to_full_tight = seconds_to_disk_full(
+            60_000_000_000 + RATE_2026_08_28 * 2 * H,
+            0,
+            60_000_000_000,
+            2 * H,
+        )
+        .expect("measurement");
+        assert_eq!(
+            decide_shed_level_by_exhaustion(ShedLevel::None, to_full_tight, left),
+            ShedLevel::AllDepth,
+            "a disk that runs out before the close must shed every depth row"
+        );
+    }
+
+    #[test]
+    fn ticks_survive_every_exhaustion_verdict() {
+        // The one invariant that must hold at every level, under every input.
+        for secs_to_full in [0_u64, 1, 1_000, 100_000, u64::MAX] {
+            for left in [1_u32, 600, 16_800, 24_000] {
+                for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+                    let level = decide_shed_level_by_exhaustion(current, secs_to_full, left);
+                    assert!(
+                        level.allows_ticks(),
+                        "a tick was shed at secs_to_full={secs_to_full} left={left}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_capture_window_holds_rather_than_restoring() {
+        // After 15:40 nothing is burning, so the clock is not evidence about
+        // the disk. Restoring belongs to the free-space measurement.
+        assert_eq!(seconds_left_in_capture_window(56_400), Some(0));
+        assert_eq!(seconds_left_in_capture_window(56_401), None);
+        assert_eq!(
+            decide_shed_level_by_exhaustion(ShedLevel::AllDepth, u64::MAX, 0),
+            ShedLevel::AllDepth,
+            "an idle window must not hand back a gate the disk earned"
+        );
+    }
+
+    #[test]
+    fn the_combined_decision_is_never_quieter_than_any_single_signal() {
+        // The property that makes adding a third signal safe: it may only ever
+        // make the gate MORE protective. If this can fail, a change meant to
+        // catch more is silently catching less.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            for &free_fraction in &[0.0, 0.10, 0.55, 1.0] {
+                for &free_bytes in &[1_000_u64, 60_000_000_000, 300_000_000_000] {
+                    for &burn in &[0_u64, 148_000_000_000] {
+                        for &at_floor in &[false, true] {
+                            for anchor in [None, Some((314_000_000_000_u64, 0_u64))] {
+                                let all = decide_shed_level_all_signals(
+                                    current,
+                                    free_fraction,
+                                    free_bytes,
+                                    burn,
+                                    at_floor,
+                                    anchor,
+                                    4 * H,
+                                    39_600,
+                                );
+                                let fraction_only =
+                                    decide_shed_level(current, free_fraction, at_floor);
+                                let configured = decide_shed_level_with_runway(
+                                    current,
+                                    free_fraction,
+                                    free_bytes,
+                                    burn,
+                                    at_floor,
+                                );
+                                assert!(
+                                    all >= fraction_only && all >= configured,
+                                    "combining signals made the gate QUIETER: \
+                                     current={current:?} frac={free_fraction} \
+                                     bytes={free_bytes} burn={burn} \
+                                     floor={at_floor} anchor={anchor:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_anchor_the_measurement_changes_nothing() {
+        // A restart clears the anchor. Until two hours of fresh observation
+        // exist the box must behave exactly as it did before this feature.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            for &free_fraction in &[0.03, 0.20, 0.55] {
+                for &at_floor in &[false, true] {
+                    assert_eq!(
+                        decide_shed_level_all_signals(
+                            current,
+                            free_fraction,
+                            60_000_000_000,
+                            0,
+                            at_floor,
+                            None,
+                            4 * H,
+                            39_600,
+                        ),
+                        decide_shed_level(current, free_fraction, at_floor),
+                    );
+                }
+            }
+        }
     }
 }
