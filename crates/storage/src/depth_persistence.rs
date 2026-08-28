@@ -65,6 +65,53 @@
 //! the write path that must not fail is a worse trade than 17% of disk. Measure
 //! it against a live QuestDB first.
 //!
+//!
+//! ## ⚠ CORRECTED 2026-08-28 — the table above lists TWO sources; there are THREE
+//!
+//! `DEPTH_KIND_5` is missing from it, and it is the LARGEST of the three.
+//! Added with the 2026-08-19 Full-mode flip, it writes the 5 order-book levels
+//! that ride inside **every Full-mode tick packet** — 10 rows per packet (5
+//! levels x 2 sides) across the whole subscribed universe, not just the 250
+//! instruments the dedicated depth-20 pool covers.
+//!
+//! The measured session settles the split. 1,530,651,649 rows x 72 B =
+//! **110.2 GB**, decomposing as:
+//!
+//! | Kind | Instruments | Rows per update | Rows/session | GB | Basis |
+//! |---|---|---|---:|---:|---|
+//! | **d5** | the WHOLE universe (~23,000) | 10 per tick packet | **~643.5 M** | **46.3** | Derived: 64,349,753 ticks x 10 |
+//! | d20 | 250 | 10,000 | ~739.3 M | 53.2 | Derived at equal cadence |
+//! | d200 | 5 | <= 2,000 | ~147.9 M | 10.6 | Derived; row count is variable, so an upper bound |
+//! | **Total** | | | **1,530.65 M** | **110.2** | MEASURED |
+//!
+//! Why the omission mattered rather than being a tidy-up: the old table's own
+//! bounds are 21 GB/day low and 104 GB/day high, so the measured 110.2 GB sits
+//! ABOVE the stated ceiling — and a reader reconciling that would have gone
+//! looking for a cadence problem in the two pools the table names, when the
+//! missing 46.3 GB is a third source that scales with the TICK count rather
+//! than with either pool's instrument count. Doubling the depth-20 pool does
+//! not move it; widening the subscribed universe does.
+//!
+//! ## The shed gate's rungs, in gigabytes
+//!
+//! Worth stating here because the connection is invisible from either side:
+//! `ingest_shed::ShedLevel::InlineDepth` gates EXACTLY the `DEPTH_KIND_5`
+//! write (`dhan_feed_stack.rs`, the `INGEST_SHED.allows_inline_depth()` arm),
+//! and `AllDepth` gates the dedicated pools as well.
+//!
+//! | Rung | Stops | GB/session |
+//! |---|---|---:|
+//! | `InlineDepth` | d5 | **46.3** (42% of depth) |
+//! | `AllDepth` | d5 + d20 + d200 | **110.2** (80% of the 138 GB session burn) |
+//! | any rung | ticks | **never** |
+//!
+//! So the first rung alone is the single largest lever the box has, it needs
+//! no schema change and no scope decision, and it is fully reversible on the
+//! next poll. What it lacked was a trigger that fires on a day like
+//! 2026-08-28, which closed at 55% free — nowhere near the 15% fractional bar
+//! — while roughly one session of writing from a full disk. That is what
+//! `ingest_shed::SESSION_BURN_BYTES_DEFAULT` and the runway trigger add.
+//!
 //! See the rule-file section for the same-day S3 archival that keeps "nothing
 //! is dropped" true regardless of which end of that range the feed lands on.
 //!
