@@ -694,11 +694,28 @@ impl AggregatorCell {
             // opens at 09:00, so pre-open ticks reach this fold". They no
             // longer do — `MultiTfAggregator::consume_tick` refuses anything
             // with `secs_of_day < MARKET_OPEN_SECS_OF_DAY_IST` before it gets
-            // here. The consume-on-use rule below is still right and is kept:
-            // it is what makes the arm robust to ANY tick that cannot supply
-            // an open, and a comment describing a reachable path that is no
-            // longer reachable would send the next reader hunting a defect
-            // that has already been closed upstream.
+            // here.
+            //
+            // **RE-CORRECTED 2026-08-28, and the 2026-08-25 correction above
+            // is now itself the stale claim.** The fold gate moved to 09:00,
+            // so pre-open ticks DO reach this fold again — the original
+            // sentence was right, the correction was right when written, and
+            // it went stale three days later. A reader trusting it concludes
+            // pre-open ticks cannot get here and stops looking, which is the
+            // false-certification class this repository has now recorded
+            // three times (the `day_ohlc_tracker` row, `WAL-SUSPEND-01`, and
+            // the not-invoked-alarm bullet). The durable lesson is not "check
+            // harder": a reachability claim is one `grep` of the gate
+            // constant, so it must be re-run at the moment of writing.
+            //
+            // The consume-on-use rule below is what makes this safe either
+            // way, and is unchanged: a pre-open tick carries `day_open = 0`
+            // (no trade has printed, so the exchange publishes none),
+            // `usable_exchange_price` rejects it, the arm is NOT consumed,
+            // and the real 09:15 open is still stamped when it arrives —
+            // via the in-bucket re-arm path for the M30/M60/D1 buckets that
+            // SPAN 09:15, and via the normal open path for the frames whose
+            // 09:15 bucket opens fresh.
             //
             // Consuming it only on use means a pre-open tick leaves the arm
             // intact, and the first tick that actually carries a positive

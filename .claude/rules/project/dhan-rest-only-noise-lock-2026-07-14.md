@@ -1295,3 +1295,100 @@ adds a per-CONNECTION dimension (the §2.3 cardinality rule stands — sixteen
 dimensions ≈ $4.80/mo to answer a yes/no question one series answers);
 or lowers the threshold below the lane alarm's ten minutes without a measured
 baseline.
+
+### §2.3j — 2026-08-28: the durable floor's recovery path becomes visible, and the one way it loses ticks silently becomes pageable
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "I dont need any hallucination or illusion I just need the working guaranteed assurance solution"
+
+> "Irrespective of any situations i need clearly note frontend backend db or it cna be anyhtign always i need ultra fast extreme speed ... by covering all worst cases situations scenarios errors exceptions bugs issues causes shoudl be always comprehensively fully extremely automated alogn with real time checks"
+
+Given as a standing constraint across the session in which the write-ahead
+log's record format gained a receipt field (`TVW3`). This dated row is the
+rule-file edit §3 demands before any new Dhan-scoped page, recorded BEFORE
+the terraform.
+
+#### What became visible
+
+Four counters on the WAL replay path joined the EMF selector (84 → 88 names):
+
+| Metric | What a non-zero value means |
+|---|---|
+| `tv_wal_replay_recovered_total` | frames staged at boot were successfully given back — the durable floor doing its job |
+| `tv_wal_replay_deferred_segments_total` | a segment was left for a later pass |
+| `tv_dhan_wal_refolded_total` | recovered frames were re-folded into candles |
+| **`tv_wal_replay_unknown_magic_total`** | **a segment carried a record format this binary cannot read** |
+
+#### Why the fourth one gets an alarm and the others do not
+
+The first three describe recovery WORKING. The fourth describes recovery
+being **impossible**, and its failure mode is the exact class this file
+exists to stop.
+
+A binary that meets an unreadable segment magic has, until 2026-08-27,
+returned `Ok(vec![])` — an empty replay, indistinguishable from a clean one.
+The segment is then STAGED AND ARCHIVED as successfully replayed. Every
+frame in it is gone, permanently, and nothing anywhere reports a loss:
+there is no payload left to count, no parse to fail, and no downstream
+consumer that knows those frames were ever captured.
+
+**The concrete way this happens is a deploy rollback.** A `TVW3` segment
+written this morning, read by a rolled-back binary that only knows `TVW1`
+and `TVW2`, is silently destroyed. That is capture-at-receipt — the floor
+the whole zero-tick-loss claim rests on — failing in the one direction no
+other signal can see.
+
+Family (5) therefore gains a **FOURTEENTH** signal:
+`tv-<env>-wal-replay-unknown-magic` on `tv_wal_replay_unknown_magic_total`,
+`Sum >= 1` over one 300 s period, `treat_missing_data = notBreaching`,
+`ok_actions = []` (a counter aging out of its window is not a repair —
+the frames do not come back).
+
+**Ungated, deliberately.** WAL replay runs at BOOT, and the box boots at
+08:30 — before the market-hours gate opens. Gating this alarm would make it
+structurally incapable of firing on the one path it exists to watch. It is
+also the correct shape for an out-of-hours deploy, which is exactly when a
+rollback happens.
+
+#### ⚠ Honest cost, and it crosses a line this file has been tracking
+
+4 EMF names × $0.30 + 1 alarm × $0.10 = **~$1.30/mo**.
+
+The COST NOTE of 2026-08-25 (THIRD) put a maximal month at **~$119.28**
+against the budget's automatic `STOP_EC2_INSTANCES` line of **$117.00**
+(90% of the $130 `limit_amount`). This takes it to **~$120.58** — about
+**$3.58 above the line that switches the trading box off** in a maximal
+month. The live account is nowhere near it (August MTD $48.87, forecast
+$61.51), so nothing fires today, but the gap widens with every addition and
+is now the largest it has been.
+
+This is stated rather than absorbed because the alternative was to ship the
+three diagnostic names unalarmed — the "paid for and unwatched" shape this
+very list has twice refused — or to ship nothing and leave the durable
+floor's recovery invisible while the operator's hardest stated requirement
+is that not one tick is lost. Shipping four names and pricing them honestly
+is the defensible middle; pretending the budget position did not move would
+not be.
+
+The levers are unchanged and neither is taken here: the already-approved
+Quote 10 Elastic IP release (−$3.60/mo, bundled with an instance recreate,
+which alone would put the maximal month back UNDER the line), or an
+operator decision on `limit_amount` — which Quote 18 forbids raising above
+125, and which cannot be set to 125 because 90% of that is $112.50, below
+the bill.
+
+#### What a PR that violates §2.3j looks like (REJECT)
+
+- Alarms `tv_wal_replay_recovered_total` or `tv_dhan_wal_refolded_total` —
+  both rise on NORMAL recovery, so an alarm on either pages on the system
+  working.
+- Market-hours-gates the unknown-magic alarm (WAL replay runs at boot,
+  before the gate opens — gating it makes it unable to fire).
+- Gives it `ok_actions` (the frames are permanently gone; a counter aging
+  out is not a recovery).
+- Adds a per-SEGMENT or per-FEED dimension (the §2.3 cardinality rule
+  stands).
+- Bumps the EMF name count without a dated cost note — the ratchet's own
+  instruction, and the reason this section exists.

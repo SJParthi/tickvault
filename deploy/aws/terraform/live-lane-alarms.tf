@@ -847,3 +847,52 @@ resource "aws_cloudwatch_metric_alarm" "dhan_worst_socket_deaf" {
   # counters, where a delta returning to zero never means the data came back.
   ok_actions = local.app_alarm_ok
 }
+
+# ---------------------------------------------------------------------------
+# 14. WAL REPLAY MET A RECORD FORMAT IT CANNOT READ — the deploy-rollback
+#     tick-loss path (2026-08-28, dhan-rest-only-noise-lock §2.3j)
+# ---------------------------------------------------------------------------
+# Alarms 3, 9 and 10 watch frames lost on the way IN. This one watches frames
+# lost on the way BACK OUT, and it is the only arm of the durable floor whose
+# failure leaves no evidence at all.
+#
+# A binary that meets a segment magic it does not recognise cannot decode the
+# frames inside it. Until 2026-08-27 it returned an EMPTY replay — which is
+# byte-identical, to every caller, to a segment that genuinely held nothing —
+# and the segment was then staged and archived as successfully replayed. The
+# frames are gone permanently: no payload left to count, no parse left to
+# fail, no downstream consumer that knew they existed.
+#
+# The concrete path is a DEPLOY ROLLBACK. A `TVW3` segment written this
+# morning, read by a rolled-back binary that knows only `TVW1` and `TVW2`,
+# is destroyed silently. That is capture-at-receipt failing in the one
+# direction nothing else in this system can see.
+resource "aws_cloudwatch_metric_alarm" "wal_replay_unknown_magic" {
+  alarm_name        = "tv-${var.environment}-wal-replay-unknown-magic"
+  alarm_description = "WAL replay met a record format this binary cannot read, and the frames in that segment are PERMANENTLY LOST — they are not recoverable by replay, backfill or cross-verification, and no other signal in this system reports them. The overwhelmingly likely cause is a DEPLOY ROLLBACK: a segment written by a newer binary (record magic TVW3, which carries a receipt timestamp) being read by an older one that knows only TVW1/TVW2. Triage: (1) confirm which binary is on the box and whether it was rolled back — compare the running version against the last deploy; (2) STOP rolling further back, since each older binary destroys more segments; (3) roll FORWARD to a binary that reads TVW3, then let the remaining staged segments replay. Do NOT clear the spill directory to make this alarm stop: that destroys the segments a forward-roll could still recover. Frames already reported here do not come back."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_wal_replay_unknown_magic_total"
+  namespace           = local.app_namespace
+  # Threshold 1 / eval 1, for the same reason as alarm 9: there is no
+  # acceptable number of segments to destroy, and a second confirming window
+  # only lets the boot finish destroying the rest of them.
+  period    = 300
+  statistic = "Sum"
+  dimensions = local.app_dimensions
+  # UNGATED, deliberately, and this differs from most of family (5).
+  # WAL replay runs at BOOT. The box boots at 08:30, before the market-hours
+  # gate opens at 09:20 — so gating this alarm would make it structurally
+  # incapable of firing on the only path it exists to watch. It is also the
+  # correct shape for an out-of-hours deploy, which is exactly when a rollback
+  # happens.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. The counter returning to zero means no ADDITIONAL segments
+  # were destroyed — never that the destroyed ones came back. An OK page here
+  # would be a false recovery of data that does not exist.
+  ok_actions = []
+}
