@@ -60,7 +60,65 @@ pub const TF_COUNT: usize = 24;
 /// The NSE regular trading session opens at 09:15:00 — every candle
 /// bucket grid is anchored here so the first candle of every timeframe
 /// starts exactly at the market open.
+///
+/// **STILL LIVE after the 2026-08-28 grid move**, and the reason matters:
+/// the candle GRID now anchors at 09:00, but the question "which bar owns the
+/// exchange's official day open/high/low?" is still answered by the MARKET
+/// open. See `is_days_first_session_bucket` in `aggregator_cell.rs`.
 pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
+
+/// 09:00:00 IST expressed as seconds-of-day (`9*3600`).
+///
+/// **THE CANDLE GRID ANCHOR — deliberately NOT the market open.**
+///
+/// Added 2026-08-28 under the dated operator authorization in
+/// `websocket-connection-scope-lock.md` ("CANDLES FROM 09:00"). The NSE
+/// pre-open call auction runs 09:00-09:12 (order collection, then matching),
+/// and its equilibrium price IS the 09:15 open — the exchange does not
+/// discover a second one. Anchoring the candle grid at 09:15 therefore threw
+/// away the twelve minutes in which that price is actually formed, which is
+/// the one window where knowing the open EARLY has value: it is what makes an
+/// ATM +/-25 option window computable at 09:13 instead of guessed from
+/// yesterday's close.
+///
+/// **This is NOT `MARKET_OPEN_SECS_OF_DAY_IST` and must never be conflated
+/// with it.** That constant means "the exchange is open for trading" and
+/// still gates orders, risk, the day-OHLC tracker and every market-hours
+/// alarm window at 09:15. This one means "we are recording candles". The two
+/// answer different questions and the pin test below asserts BOTH values
+/// independently, plus the ordering between them, so neither can silently
+/// absorb the other.
+///
+/// Grid consequence, stated because it is a real behavioural change and not
+/// a no-op. The offset between the two anchors is 900 s, so a frame's grid
+/// is UNCHANGED exactly when `900 % seconds_per_bucket == 0`. **NINE of the
+/// 24 frames move, not three** — an earlier draft of this comment said
+/// "2m/30m/60m" and was wrong by omission, which is worth recording because
+/// the omitted one is the loudest:
+///
+/// | moves | why |
+/// |---|---|
+/// | **D1 (86_400 s)** | `bucket_start` returns `session_open` for the daily bar, so **every daily candle's `ts` moves 09:15 -> 09:00** |
+/// | 2m (120), 30m (1800), 60m (3600) | 900 is not a multiple of any of them |
+/// | 7s, 8s, 11s, 13s, 14s | GDF-gated, zero rows today — latent, not live |
+///
+/// Unchanged: 1s, 2s, 3s, 5s, 6s, 9s, 10s, 12s, 15s, 20s, 30s, 1m, 3m, 5m,
+/// 15m (900 divides all of them).
+///
+/// Clock-aligned is the more conventional answer and is what every external
+/// chart shows, but it IS a change, and it is why this must land BEFORE a
+/// session opens rather than during one.
+///
+/// **The mid-session hazard, precisely.** The `candles_<tf>` DEDUP key is
+/// `(ts, security_id, segment, feed)` — it carries no grid identity. So a
+/// restart onto the new grid mid-session does NOT collide and does NOT gap:
+/// it leaves BOTH rows. A 10:20 restart on 30m keeps the old complete
+/// `ts=09:45` bar and adds a new `ts=10:00` bar holding only 10:20-10:30.
+/// Nothing detects this — `tf_consistency` recomputes M3/M5/M15, which are
+/// exactly the frames whose grids did NOT move. That is a process control,
+/// not a mechanism, and it is stated plainly rather than implied: deploy this
+/// between sessions.
+pub(crate) const CANDLE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
 
 /// 15:30:00 IST expressed as seconds-of-day (`15*3600 + 30*60`).
 /// The NSE regular session closes at 15:30:00 — the candle window is
@@ -481,11 +539,13 @@ impl TfIndex {
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
         let secs = self.seconds_per_bucket();
         let day_start = (tick_ist_secs / 86_400) * 86_400;
-        let market_open = day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST);
-        if tick_ist_secs <= market_open {
-            return market_open;
+        // 2026-08-28: anchored on the CANDLE session open (09:00), not the
+        // market open (09:15) — see CANDLE_SESSION_OPEN_SECS_OF_DAY_IST.
+        let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
+        if tick_ist_secs <= session_open {
+            return session_open;
         }
-        market_open.saturating_add(((tick_ist_secs - market_open) / secs) * secs)
+        session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.
@@ -522,6 +582,24 @@ mod tests {
         use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};
 
         assert_eq!(MARKET_OPEN_SECS_OF_DAY_IST, 33_300, "09:15:00 IST");
+        // 2026-08-28: the CANDLE grid anchor is deliberately EARLIER than the
+        // market open. Both values are pinned independently AND their ordering
+        // is pinned, so a future edit cannot quietly collapse one into the
+        // other in either direction — which is the whole risk of having two
+        // constants that both look like "when does the day start".
+        assert_eq!(
+            CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, 32_400,
+            "09:00:00 IST - the NSE pre-open call auction starts here"
+        );
+        assert!(
+            CANDLE_SESSION_OPEN_SECS_OF_DAY_IST < MARKET_OPEN_SECS_OF_DAY_IST,
+            "the candle grid must open BEFORE the market, never at or after it"
+        );
+        assert_eq!(
+            MARKET_OPEN_SECS_OF_DAY_IST - CANDLE_SESSION_OPEN_SECS_OF_DAY_IST,
+            900,
+            "the pre-open capture window is exactly 15 minutes (09:00-09:15)"
+        );
         assert_eq!(
             MARKET_CLOSE_SECS_OF_DAY_IST, 56_400,
             "15:40:00 IST (exclusive) — NSE CAS change 2026-08-03"
@@ -832,9 +910,12 @@ mod tests {
     #[test]
     fn test_tf_index_bucket_start_aligns_to_seconds_per_bucket() {
         // An in-window IST tick (~11:24 IST). Buckets anchor to the
-        // 09:15:00 market open, NOT the epoch.
+        // 09:00:00 CANDLE session open (2026-08-28: was the 09:15 market
+        // open), NOT the epoch. The distinction is visible in this test for
+        // 2m/30m/60m, whose grids moved: the 900 s between the two anchors
+        // divides evenly into 60/180/300/900 but not into 120/1800/3600.
         let tick = 1_779_362_677_u32;
-        let market_open = (tick / 86_400) * 86_400 + 33_300;
+        let session_open = (tick / 86_400) * 86_400 + 32_400;
         for tf in TfIndex::ALL {
             let bucket = tf.bucket_start(tick);
             let secs = tf.seconds_per_bucket();
@@ -844,9 +925,9 @@ mod tests {
                 tf.display_name()
             );
             assert_eq!(
-                (bucket - market_open) % secs,
+                (bucket - session_open) % secs,
                 0,
-                "bucket_start not anchored to 09:15 for {}",
+                "bucket_start not anchored to 09:00 for {}",
                 tf.display_name()
             );
             assert!(

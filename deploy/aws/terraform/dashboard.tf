@@ -842,6 +842,37 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
       {
         type   = "metric"
+        x      = 0
+        y      = 92
+        width  = 12
+        height = 6
+        properties = {
+          # Crash recovery, charted for the first time. All four of these were
+          # emitted and shipped nowhere, which meant a boot that recovered zero
+          # of fifty thousand captured frames looked identical to a clean one.
+          #
+          # Read them as a pair of questions, not as pass/fail lines:
+          #   recovered / refolded  - did recovery actually do anything
+          #   deferred              - is the WAL outgrowing what replay drains
+          #   unreadable segments   - a rollback to a binary that cannot parse
+          #                           the record version the last one wrote.
+          #                           This one SHOULD sit flat at zero forever;
+          #                           any non-zero reading is unrecovered
+          #                           capture, and it also raises a coded error.
+          title  = "WAL crash recovery - did the durable floor give the frames back"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_wal_replay_recovered_total", { label = "frames recovered from disk", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_wal_refolded_total", { label = "frames re-folded into candles", stat = "Sum" }],
+            [local.dash_namespace, "tv_wal_replay_deferred_segments_total", { label = "segments deferred (budget)", stat = "Sum" }],
+            [local.dash_namespace, "tv_wal_replay_unknown_magic_total", { label = "UNREADABLE segments (rollback)", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
         x      = 18
         y      = 86
         width  = 6

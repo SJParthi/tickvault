@@ -536,7 +536,23 @@ pub fn day_bounds_micros(day_start_ist_nanos: i64) -> (i64, i64) {
 /// The honest verdict for that state is no data, and the caller reaches it.
 #[must_use]
 pub fn live_candles_select_sql(day_start_ist_nanos: i64, target_ids: &[i64]) -> String {
-    let (start, end) = day_bounds_micros(day_start_ist_nanos);
+    let (day_start, end) = day_bounds_micros(day_start_ist_nanos);
+    // 2026-08-28: floor the read at THIS MODULE'S session open (09:15), not
+    // at midnight.
+    //
+    // The candle grid moved to 09:00 that day, so `candles_1m` now legitimately
+    // holds ~15 pre-open rows per instrument. This module's comparison window
+    // is unchanged and correctly stays at 09:15 — Dhan's REST tape has no
+    // pre-open minutes, so a pre-open row can only ever be classified
+    // `out_of_session`. The problem is not the classification, it is the
+    // BUDGET: the query is `ORDER BY ts ASC LIMIT cap + 1`, so those rows sort
+    // to the FRONT and push an equal number of afternoon rows off the TAIL.
+    // At ~865 targets that is ~13,000 rows of head-of-budget spent to fetch
+    // data this module then discards — and the module's own header warns that
+    // a truncated afternoon "reads as tick loss". Excluding them in the
+    // predicate is free and keeps the truncation probe meaningful.
+    let start =
+        day_start.saturating_add(SESSION_OPEN_SECS_OF_DAY_IST.saturating_mul(MICROS_PER_SEC));
     let probe_limit = LIVE_ROW_LIMIT.saturating_add(1);
     // `i64` renders as digits only, so this cannot carry an injection: there
     // is no path from an operator string into the predicate.
@@ -1971,8 +1987,20 @@ mod tests {
 
         // And the same guard on the rendered SQL, so a hand-edited format!
         // string cannot regress past the helper.
+        //
+        // 2026-08-28: the rendered floor is the day start PLUS this module's
+        // own session open (09:15) - pre-open candles exist since the grid
+        // moved to 09:00 and would otherwise consume head-of-budget under
+        // `ORDER BY ts ASC LIMIT cap + 1`, truncating the afternoon. The UNIT
+        // property this test exists for (microseconds, never nanoseconds) is
+        // unchanged and is what the assertions below check.
         let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
-        assert!(sql.contains(&format!("ts >= {start}")));
+        let session_floor = start + SESSION_OPEN_SECS_OF_DAY_IST * MICROS_PER_SEC;
+        assert!(sql.contains(&format!("ts >= {session_floor}")), "{sql}");
+        assert!(
+            session_floor < 100_000_000_000_000_000,
+            "floor {session_floor} is far too large to be microseconds"
+        );
         assert!(sql.contains(&format!("ts < {end}")));
         assert!(
             !sql.contains(&DAY_START_NANOS.to_string()),
@@ -3231,7 +3259,10 @@ mod tests {
         // hand-rolled query — that helper is where the #1474 fix lives.
         let sql = live_candles_select_sql(DAY_START_NANOS, &[13, 25, 51]);
         let (start, _) = day_bounds_micros(DAY_START_NANOS);
-        assert!(sql.contains(&start.to_string()));
+        // 2026-08-28: the rendered floor is day-start + this module's session
+        // open (09:15), not the bare day start - see `live_candles_select_sql`.
+        let session_floor = start + SESSION_OPEN_SECS_OF_DAY_IST * MICROS_PER_SEC;
+        assert!(sql.contains(&session_floor.to_string()), "{sql}");
         assert!(!sql.contains(&DAY_START_NANOS.to_string()));
     }
 

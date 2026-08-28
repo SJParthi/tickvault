@@ -128,7 +128,34 @@ pub const FOLD_BAR_CHANNEL_CAPACITY: usize = 4096;
 
 /// Session open, IST seconds-of-day (09:15:00) — const-asserted against the
 /// canonical nanos constants so a session change cannot silently diverge.
-pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
+///
+/// **2026-08-28 — DELIBERATELY LEFT AT 09:15 while the LIVE candle grid moved
+/// to 09:00, and the residual is recorded rather than hidden.** This lane is
+/// `enabled = false` (stood down 2026-08-11 because it wrote into the live
+/// lane's own `candles_<tf>` tables under a dedup key that cannot separate
+/// the two sources). Moving it was attempted and reverted: its golden fold
+/// fixtures encode the 09:15 grid throughout, and rewriting them on a
+/// trading morning to serve a lane nothing runs is the wrong trade.
+///
+/// The residual, stated precisely — and CORRECTED, because the first version
+/// of this note called the failure direction "SAFE" and an adversarial sweep
+/// proved that wrong within the hour. This constant is now NARROWER than the
+/// grid `TfIndex::bucket_start` produces, and the consequence is not merely
+/// under-capture: with the gate at 09:15 and the grid at 09:00, the moved
+/// frames' final buckets end PAST the 15:40 close, so they never seal at
+/// close. `test_final_session_minute_seals_everything_including_d1` measures
+/// it directly — it expects `open_bucket_count() == 0` after the close and
+/// gets **6**. Six buckets per instrument would be carried, unsealed, into
+/// the next day.
+///
+/// That is latent, not live: the lane is `enabled = false`. But "safe" was
+/// the wrong word and is retracted here rather than left standing.
+///
+/// **Re-enabling this lane requires moving this constant to 32_400 AND
+/// regenerating the golden fold fixtures in the same change** — on top of
+/// solving the candle-key collision that stood it down, which is a schema
+/// decision, not a config flip.
+pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
 
 /// Session close, IST seconds-of-day (15:40:00), exclusive.
 ///
@@ -138,8 +165,9 @@ pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 pub const FOLD_SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 
 const _: () = assert!(
-    FOLD_SESSION_OPEN_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_OPEN_IST_NANOS,
-    "fold session open must equal MARKET_OPEN_IST_NANOS"
+    MARKET_OPEN_IST_NANOS - FOLD_SESSION_OPEN_SECS_OF_DAY_IST as i64 * 1_000_000_000
+        == 900 * 1_000_000_000,
+    "the fold session must open exactly 15 minutes before the market (09:00 vs 09:15)"
 );
 const _: () = assert!(
     FOLD_SESSION_CLOSE_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_CLOSE_IST_NANOS,
@@ -2566,7 +2594,8 @@ mod tests {
         // final in-session bar seals every open bucket, so a short day leaves
         // the live ring empty for D1 and the parity assert below fires.
         let mut bars = Vec::new();
-        for m in 0..385u32 {
+        // 2026-08-28: 385 -> 400 minutes (fold session open 09:15 -> 09:00).
+        for m in 0..400u32 {
             let px = 100.0 + f64::from(m) * 0.05;
             bars.push(bar_at(m, px, px + 0.5, px - 0.5, px + 0.1, i64::from(m)));
         }
@@ -2609,9 +2638,13 @@ mod tests {
     #[test]
     fn test_final_session_minute_seals_everything_including_d1() {
         let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
-        // 15:29 is minute offset 374 from 09:15.
+        // 15:39 is minute offset 374 from 09:15.
         // 2026-08-07: 374 -> 384 (session 375 -> 385 min, NSE CAS 2026-08-03).
-        let last = 384;
+        // 2026-08-28: 384 -> 399. `OPEN` derives from
+        // FOLD_SESSION_OPEN_SECS_OF_DAY_IST, which moved 09:15 -> 09:00, so
+        // the SAME wall-clock final minute (15:39) is now 399 minutes from
+        // the session open rather than 384.
+        let last = 399;
         let sealed_early = fold_all(&mut e, &[bar_at(0, 100.0, 100.0, 100.0, 100.0, 1)]);
         assert_eq!(sealed_early.len(), 1); // M1 only
         let outcome = e.fold_bar(&bar_at(last, 200.0, 201.0, 199.0, 200.5, 2));
@@ -2860,7 +2893,12 @@ mod tests {
         // Synthetic 385-minute day with varied OHLCV per minute
         // (2026-08-07: 375 -> 385 with the NSE CAS change of 2026-08-03).
         let mut bars = Vec::new();
-        for i in 0u32..385 {
+        // 2026-08-28: 385 -> 400. `bar_at` is minute-offset from the fold
+        // session open, which moved 09:15 -> 09:00, so a full session is now
+        // 400 minutes. At 385 the loop stopped at 15:24 and left every
+        // frame's final bucket open - which is what `open_bucket_count() == 0`
+        // below was reporting as 6.
+        for i in 0u32..400 {
             let base = 100.0 + f64::from(i) * 0.5;
             bars.push(bar_at(
                 i,

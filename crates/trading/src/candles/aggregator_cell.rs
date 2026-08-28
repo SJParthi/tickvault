@@ -987,6 +987,26 @@ fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
     // `TfIndex::bucket_start` and `catch_up_seal` were: a second call site
     // would silently reintroduce a remote abort, and the cost of preventing
     // that is one word.
+    // 2026-08-28: this stays anchored on the MARKET OPEN (09:15) even though
+    // the candle GRID moved to 09:00, and the distinction is the whole point.
+    //
+    // This predicate decides which bar adopts the exchange's OFFICIAL day
+    // open / day high / day low. Those fields describe the REGULAR SESSION.
+    // During the 09:00-09:12 pre-open auction no trade has printed, so the
+    // exchange publishes no day_open at all (0.0, the documented absent
+    // sentinel) - and moving this anchor to 09:00 would have handed the
+    // official day OHLC to a bar that closed fifteen minutes before the
+    // market opened. Every "first bucket adopts the day open" test in this
+    // module caught exactly that, which is why it is worth saying here: the
+    // GRID question ("where do buckets start?") and the ATTRIBUTION question
+    // ("which bar owns the day's official open?") have different answers, and
+    // conflating them silently mis-stamps the opening bar of every day.
+    //
+    // Note this expression already does the right thing on the new grid
+    // WITHOUT arithmetic changes: `bucket_start(09:15)` returns whichever
+    // bucket CONTAINS the market open - 09:15 for 1m/3m/5m/15m, and 09:00 for
+    // the 30m/60m frames whose bucket spans it. That is correct in both
+    // cases: the official open belongs to the bar it actually falls inside.
     bucket_start == tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST))
 }
 
