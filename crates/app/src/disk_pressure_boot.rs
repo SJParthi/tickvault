@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::ingest_shed::{INGEST_SHED, decide_shed_level, free_fraction_from_used_pct};
+use tickvault_common::ingest_shed::{
+    INGEST_SHED, decide_shed_level_with_runway, free_fraction_from_used_pct, runway_sessions,
+};
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
     PressureAction, PressureProbe, PressureState, apply_action, decide_pressure_action,
@@ -178,6 +180,12 @@ async fn run_disk_pressure_loop(
         ticker.tick().await;
         let now_secs = started.elapsed().as_secs();
 
+        // Carried beside the probe rather than inside it: `PressureProbe` is a
+        // storage-crate type whose only job is the retention decision, and the
+        // runway trigger needs the RAW byte count that the percentage threw
+        // away. Widening that type to serve a second consumer would couple two
+        // decisions that must be able to disagree.
+        let mut free_bytes_seen: Option<u64> = None;
         let probe = match probe_disk_free_bytes(&data_dir) {
             DiskHealthOutcome::Ok {
                 free_bytes,
@@ -185,6 +193,7 @@ async fn run_disk_pressure_loop(
             } => match used_pct_from(free_bytes, total_bytes) {
                 Some(pct) => {
                     used_gauge.set(f64::from(pct));
+                    free_bytes_seen = Some(free_bytes);
                     PressureProbe::used(pct)
                 }
                 None => {
@@ -216,7 +225,7 @@ async fn run_disk_pressure_loop(
         //
         // `Escalate` is exactly that signal: it means every partition old
         // enough to archive already is, so retention is at its floor. On a
-        // poll where it does NOT fire, `decide_shed_level` HOLDS the current
+        // poll where it does NOT fire, the decision HOLDS the current
         // level rather than lifting it — restoring is governed by the free
         // space recovering, not by a quiet poll.
         //
@@ -227,13 +236,39 @@ async fn run_disk_pressure_loop(
         if let Some(pct) = probe.used_pct {
             let free = free_fraction_from_used_pct(pct);
             let retention_at_floor = matches!(action, PressureAction::Escalate);
-            let next = decide_shed_level(INGEST_SHED.level(), free, retention_at_floor);
+            // The runway half, and the fallback is the load-bearing part. A
+            // byte count we did not get is an UNKNOWN runway, never a zero
+            // one: `runway_sessions` is inert on a zero BURN, so standing the
+            // burn down leaves the fractional half deciding alone. Passing a
+            // 0-byte fallback with a real burn would read as no runway at all
+            // and shed everything on a poll that saw nothing — the same class
+            // of blind-reading bug the `Some(pct)` binding above prevents.
+            let (runway_free_bytes, runway_burn) = match free_bytes_seen {
+                Some(bytes) => (bytes, cfg.ingest_shed_session_burn_bytes),
+                None => (0, 0),
+            };
+            let next = decide_shed_level_with_runway(
+                INGEST_SHED.level(),
+                free,
+                runway_free_bytes,
+                runway_burn,
+                retention_at_floor,
+            );
+            // Published every poll, not only on a transition: a runway that
+            // is quietly shortening across a session is the signal an
+            // operator wants BEFORE the gate arms, and a gauge that only
+            // moved at transitions could never show the approach.
+            let runway = runway_sessions(runway_free_bytes, runway_burn);
+            if let Some(sessions) = runway {
+                metrics::gauge!("tv_disk_runway_sessions").set(sessions);
+            }
             if INGEST_SHED.set(next) {
                 metrics::counter!("tv_ingest_shed_transitions_total", "level" => next.as_str())
                     .increment(1);
                 warn!(
                     level = next.as_str(),
                     used_pct = pct,
+                    runway_sessions = runway.unwrap_or(f64::NAN),
                     retention_at_floor,
                     "ingest shedding CHANGED — the box is writing less to stay alive on a \
                      full disk. Ticks are never shed at any level; order-book depth is \
@@ -530,7 +565,7 @@ mod tests {
         let blind_used = 0_u8; // what `unwrap_or(0)` produces
         let free = free_fraction_from_used_pct(blind_used);
         assert_eq!(
-            decide_shed_level(
+            tickvault_common::ingest_shed::decide_shed_level(
                 tickvault_common::ingest_shed::ShedLevel::AllDepth,
                 free,
                 true
@@ -538,6 +573,82 @@ mod tests {
             tickvault_common::ingest_shed::ShedLevel::None,
             "a blind probe fed through as 0% used restores everything — which \
              is precisely why it must never reach the decision"
+        );
+    }
+
+    #[test]
+    fn the_pressure_loop_decides_shedding_on_runway_as_well_as_percentage() {
+        // The 2026-08-28 session ended at 55% free — nowhere near the 15%
+        // fractional bar — and roughly one session of writes from a full
+        // disk. A loop that consults only the percentage cannot see that, so
+        // this pins that it consults both.
+        let src = include_str!("disk_pressure_boot.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("decide_shed_level_with_runway("),
+            "the loop must use the runway-aware decision; the percentage-only \
+             gate never armed on the day this trigger was written for"
+        );
+        assert!(
+            production.contains("cfg.ingest_shed_session_burn_bytes"),
+            "the burn must come from config — a hardcoded number would decide \
+             what a box captures without an operator ever setting it"
+        );
+        assert!(
+            production.contains("tv_disk_runway_sessions"),
+            "the runway must be published every poll, or an operator can only \
+             ever learn about it from the transition that already happened"
+        );
+    }
+
+    #[test]
+    fn a_byte_count_the_probe_never_returned_stands_the_runway_down() {
+        // The blind-reading bug, in its runway form. `free_bytes_seen` is set
+        // in the SAME match arm as `used_pct`, so today they are `Some`
+        // together — but that coupling is implicit, and a future edit that
+        // moved either one would leave `0` bytes flowing into a live burn.
+        // Zero free bytes against a real burn reads as ZERO runway, which
+        // sheds every order-book row on a poll that saw nothing at all.
+        let src = include_str!("disk_pressure_boot.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("None => (0, 0)"),
+            "an absent byte count must stand the BURN down too — passing 0 \
+             bytes with a live burn is the blind-probe restore bug inverted"
+        );
+        assert!(
+            !production.contains("free_bytes_seen.unwrap_or(0)"),
+            "a bare 0-byte fallback is exactly the shape this guard forbids"
+        );
+
+        // And the arithmetic behind it, so the scan above is pinned to a real
+        // failure rather than to a spelling.
+        assert_eq!(
+            decide_shed_level_with_runway(
+                tickvault_common::ingest_shed::ShedLevel::None,
+                0.55,            // a healthy-looking disk
+                0,               // the byte count we did NOT get
+                148_000_000_000, // a real measured burn
+                false,
+            ),
+            tickvault_common::ingest_shed::ShedLevel::AllDepth,
+            "0 bytes with a live burn sheds everything — which is precisely \
+             why the burn is stood down when the byte count is missing"
+        );
+        assert_eq!(
+            decide_shed_level_with_runway(
+                tickvault_common::ingest_shed::ShedLevel::None,
+                0.55,
+                0, // same blind reading …
+                0, // … with the burn stood down, as production does
+                false,
+            ),
+            tickvault_common::ingest_shed::ShedLevel::None,
+            "with the burn stood down a blind byte count changes nothing"
         );
     }
 }

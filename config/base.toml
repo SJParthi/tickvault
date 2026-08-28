@@ -349,6 +349,23 @@ pressure_min_interval_secs = 900
 # volume is not recoverable by retention and the operator needs to hear so.
 pressure_max_passes = 4
 
+# One trading session's disk burn, in BYTES. 0 = the runway trigger is OFF,
+# and OFF is deliberate: this number decides what the box stops capturing, so
+# it must be a MEASURED session, never an estimate.
+#
+# Why bytes and not another percentage. Every threshold above is a fraction of
+# the volume, and 2026-08-28 showed that is the wrong unit. That session burned
+# 138 GB and ended at 55% free — a healthy-looking disk about one session from
+# full — while the shed gate (15% free) never came close and the frame ring
+# refused 508,598 times. Worse, growing the volume moves every percentage bar
+# FURTHER AWAY in bytes while the daily burn is unchanged, so the obvious
+# remedy disarms the safety net.
+#
+# To arm it, set this to the burn of a real session (2026-08-28 = 148000000000)
+# and the box sheds order-book depth when free space drops under ~1.5 sessions
+# of writes. Ticks are NEVER shed at any level.
+ingest_shed_session_burn_bytes = 0
+
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
 # in PR #764.
