@@ -428,3 +428,41 @@ fn guard_self_test_offload_scans_can_bite() {
         "self-test: an on_lost hook that ignores the seal must fail the paging scan"
     );
 }
+
+#[test]
+fn the_escalation_spawn_is_idempotent_like_its_two_neighbours() {
+    // `spawn_seal_writer_loop` installs three things in sequence — the seal
+    // sender, the overflow escalator, and (since 2026-08-28) the escalation
+    // thread. The first two are each written to survive a second entry with
+    // an "idempotent skip" warn. The third was not, and that asymmetry is the
+    // defect: unguarded, a second entry spawns a SECOND thread, overwrites
+    // SEAL_ESCALATION_THREAD, and orphans the FIRST — whose stop flag is
+    // unreachable, because the OnceLock already holds the first one. Shutdown
+    // would then signal a thread it never joins and join a thread it never
+    // signalled, and whatever the orphan still held would die with the
+    // process, uncounted.
+    //
+    // Not reachable today (one production call site), which is exactly why it
+    // needs a guard rather than a comment: the thing that makes it
+    // unreachable is a fact about a caller, not about this code.
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    let code = squash(&main);
+    assert!(
+        code.contains("if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {"),
+        "the escalation spawn must be gated on the OnceLock set succeeding — an ignored \
+         `let _ = ...set(...)` spawns an unstoppable orphan on a second entry"
+    );
+    assert!(
+        code.contains("drop(sink);"),
+        "the already-installed arm must DROP the sink, which disconnects the new sender so \
+         that overflow escalates inline — the documented lossless fallback. Leaving the sink \
+         alive would queue into a channel no thread is draining."
+    );
+
+    // Self-test: the scan can bite.
+    let ignored = squash("let _ = SEAL_ESCALATION_STOP.set(sink.stop_flag());");
+    assert!(
+        !ignored.contains("if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {"),
+        "self-test: an ignored set() must fail the scan"
+    );
+}
