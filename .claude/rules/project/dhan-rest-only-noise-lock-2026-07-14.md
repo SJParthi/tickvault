@@ -2002,3 +2002,98 @@ design decision, not an edit.
 - Raises `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` without re-checking it against
   the unit's `TimeoutStopSec` by hand — a `.service` file is invisible to the
   compile-time assert, which is that guard's honest limit.
+
+### §2.3o — 2026-08-28 INCIDENT: five pagers, one cascade, and a discriminator that could not discriminate
+
+**The operator's report (2026-08-28, a Telegram screenshot, typed verbatim):**
+
+> "See why these Many errors bro can you fix and resolev all of these dude okay?"
+
+The screenshot shows the same five alerts repeating on a ~7-minute cycle from
+15:23 IST: *Market data persistence loss · Ticks dropped · Questdb wal probe
+failed · Ticks spilling · Ws ring full.*
+
+#### What actually happened — MEASURED from CloudWatch, not inferred
+
+| Series | Session total (09:00–17:30 IST) |
+|---|---:|
+| `tv_dhan_feed_ingest_ticks_total` | **82,254,468** |
+| `tv_ticks_dropped_total` | 308,818 |
+| `tv_ticks_spilled_total` | **308,818 — identical** |
+| `tv_dhan_ws_wal_dropped_total` | **0** |
+| `tv_dhan_ws_ring_full_total` | 508,598 |
+| `tv_questdb_wal_suspended_tables` | 0 (max) |
+| `tv_wal_suspension_probe_failed_total` | 44 |
+| `tv_depth_rows_dropped_total` | 104,540 |
+| `tv_depth_rows_spilled_total` | **no series at all** |
+| `tv_aggregator_tick_refused_total` | **5,748,026 (7.0% of ingest)** |
+| `tv_spill_dir_free_bytes` | 314 GB → **176 GB** (−138 GB in one session) |
+
+**On the TICK path nothing was permanently lost.** `dropped` and `spilled` are
+equal to the row, which is the documented proof that every dropped tick was
+rescued to the spill tier and is re-ingestable. `tv_dhan_ws_wal_dropped_total`
+= 0 means the durable floor held for the entire session: no frame was ever
+un-captured. So five alarms fired repeatedly, and the tick loss they implied
+was **zero**.
+
+#### The real defect the incident exposed
+
+**`tv_depth_rows_spilled_total` published NO SERIES while its sibling counted
+104,540 drops.** The CloudWatch agent computes a counter as the delta between
+consecutive samples and drops the first sample of a series it has never seen,
+so a counter that is never incremented is never registered — and an ABSENT
+series is indistinguishable from a healthy zero one.
+
+The tick side seeds both names at construction, which is exactly why the tick
+verdict above is provable. The depth side seeded only `dropped`. So for depth
+the answer is **Unknown**: 104,540 rows either all rescued or all permanently
+gone, and the instrument built to tell those apart was silent in the one case
+it exists for. That is the false-OK class, arriving inside the fix that was
+supposed to end it — the discriminators were ADDED on 2026-08-28 (the FOURTH
+count bump in `cloudwatch_app_alarms_wiring`) and shipped unseeded.
+
+**FIXED the same day:** `register_depth_drop_baseline` now seeds
+`tv_depth_rows_spilled_total`, both `stage` values of
+`tv_depth_spill_write_errors_total`, and both of
+`tv_depth_persist_errors_total`; `register_drop_baseline` gains
+`tv_tick_persist_errors_total`. Pinned by
+`crates/storage/tests/loss_series_seeding_guard.rs` (4 tests), including one
+that asserts a drop counter is never seeded without its rescue discriminator,
+and one that bite-proves the extractor cannot mistake a real `increment(n)`
+for a seed. Verified by reverting the fix: 2 tests fail, restored: 4 pass.
+
+#### ⚠ What is NOT fixed, and is the actual cause of the storm
+
+1. **Disk burn.** 138 GB consumed in one session. That is the engine of the
+   whole cascade: as free space falls, QuestDB's merges slow, ILP flushes reach
+   their timeout, the frame ring fills (508,598 times today), rows spill — and
+   spilling writes MORE to the same disk. It is a positive feedback loop, and
+   no alarm added here slows it.
+2. **Five pagers for one cascade, on a ~7-minute repeat.** Each alarm is
+   individually correct and they describe one event. This file already records
+   that ALARM records are never deduplicated between CloudWatch and Telegram
+   (only OK is), so a repeating condition pages once per evaluation. Fixing it
+   means editing a law written in capitals in the Lambda and belongs in its own
+   change with its own row.
+3. **`tv_aggregator_tick_refused_total` = 5,748,026 — 7.0% of the session.**
+   The 2026-08-28 note recording this family's first EMF selection measured
+   2.41% on 2026-08-27 and reported the out-of-band class fixed. It is now
+   roughly three times higher. Unexplained, and recorded rather than guessed at.
+4. **`tv_wal_suspension_probe_failed_total` = 44.** The gauge the
+   `questdb-wal-suspended` alarm reads showed 0 all session while its producer
+   failed 44 times. §2.3g states the principle: alarming a gauge whose producer
+   can fail is alarming a lie. The probe now fails loud rather than open, so
+   the 44 are visible — but a zero on that gauge today is worth less than it
+   looks.
+
+#### What a PR that violates §2.3o looks like (REJECT)
+
+- Ships a drop counter without seeding its rescue discriminator in the same
+  change (the guard fails the build; do not weaken it to pass).
+- Reads an absent CloudWatch series as a zero anywhere — in an alarm, a
+  dashboard, a runbook or a report.
+- Reports the 104,540 depth rows of 2026-08-28 as either lost or rescued. The
+  data to decide does not exist for that session and never will; the fix makes
+  the NEXT session answerable, not this one.
+- Claims the tick path lost data on 2026-08-28. It did not: dropped equals
+  spilled, and the WAL drop count is zero.
