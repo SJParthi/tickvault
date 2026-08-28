@@ -1125,6 +1125,16 @@ pub struct TickWriter {
     /// was never split behaves byte-for-byte as before — this is an opt-in
     /// added to one call site, not a behaviour change to the type.
     offload: Option<std::sync::mpsc::SyncSender<FlushBatch>>,
+    /// Set by [`TickWriter::split_rescue_offload`]. When present,
+    /// [`TickPersistenceWriter::discard_pending`] hands the buffer to a
+    /// dedicated rescue thread instead of writing up to 32 MiB to disk on the
+    /// frame-drain task.
+    ///
+    /// `None` by DEFAULT and on every existing constructor, so an unsplit
+    /// writer behaves exactly as before. Separate from `offload` on purpose:
+    /// the rescue exists precisely for the two cases where the offload queue
+    /// cannot help — it is FULL, or its thread is GONE.
+    rescue: Option<std::sync::mpsc::SyncSender<RescueBatch>>,
     /// Consecutive flushes whose rows the producer RETAINED because the queue
     /// was full. Reset to zero on every successful hand-off.
     ///
@@ -1189,6 +1199,7 @@ impl TickWriter {
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
+                    rescue: None,
                     retained_spans: 0,
                 }
             }
@@ -1206,6 +1217,7 @@ impl TickWriter {
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
+                    rescue: None,
                     retained_spans: 0,
                 }
             }
@@ -1241,6 +1253,7 @@ impl TickWriter {
             last_capture_seq: 0,
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
             offload: None,
+            rescue: None,
             retained_spans: 0,
         }
     }
@@ -1526,6 +1539,36 @@ impl TickWriter {
         self.offload = None;
     }
 
+    /// Hands the rescue write to a dedicated thread.
+    ///
+    /// Separate from [`TickWriter::split_for_offload`] because it solves the
+    /// case that split CANNOT: the rescue fires exactly when the flush queue is
+    /// full or its thread is gone, so it cannot ride the same queue.
+    ///
+    /// Returns the thread's half and the receiver. Until the caller wires
+    /// them, `discard_pending` keeps writing inline — this is opt-in, and the
+    /// unwired behaviour is the old behaviour.
+    pub fn split_rescue_offload(
+        &mut self,
+    ) -> (TickRescueSink, std::sync::mpsc::Receiver<RescueBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(RESCUE_QUEUE_DEPTH);
+        let sink = TickRescueSink {
+            spill_dir: self.spill_dir.clone(),
+            feed: self.feed,
+        };
+        self.rescue = Some(tx);
+        (sink, rx)
+    }
+
+    /// Closes the rescue queue so its thread can exit.
+    ///
+    /// Shutdown-only, and it leaves the writer in the INLINE state on purpose:
+    /// a rescue after this point writes synchronously rather than being
+    /// refused, so the end-of-session rows still reach the spill tier.
+    pub fn close_rescue_offload(&mut self) {
+        self.rescue = None;
+    }
+
     /// Hands the pending buffer to the writer thread without touching the
     /// network.
     ///
@@ -1611,83 +1654,236 @@ impl TickWriter {
         }
     }
 
+    /// Rescue the buffered rows to the spill tier instead of losing them.
+    ///
+    /// # Why this hands off instead of writing (2026-08-28)
+    ///
+    /// This is reached from `try_offload`'s `WidthCapped` and `SinkGone` arms,
+    /// which run ON THE FRAME-DRAIN TASK. The write it used to perform inline
+    /// is not small: `create_dir_all`, a `read_dir` + per-entry `metadata()`
+    /// walk of the spill directory AND its quarantine subdirectory, a live
+    /// `statvfs`, and then up to [`MAX_PRODUCER_BUFFER_BYTES`] — 32 MiB — of
+    /// file write. All of it on the same volume QuestDB is stalling on.
+    ///
+    /// And it fires at the worst possible instant BY CONSTRUCTION. The cut
+    /// that calls it only trips after the hand-off queue has been full for
+    /// `MAX_RETAINED_FLUSH_SPANS` consecutive flushes — that is, only when the
+    /// database is already not keeping up, which on this box means the disk is
+    /// already wedged. So the rescue did its single biggest write, on the
+    /// decoder thread, precisely when a write was slowest.
+    ///
+    /// That is the same coupling the 2026-08-25 tick split and the 2026-08-28
+    /// depth split were built to remove, one layer further in: a stalled drain
+    /// stops emptying the socket, the receive buffer fills, and Dhan — which
+    /// skips a slow consumer forward to "the latest available state" with no
+    /// sequence number — discards the intermediate ticks at THEIR side, where
+    /// no counter of ours can see them.
+    ///
+    /// So the buffer is now handed to a dedicated rescue thread by pointer.
+    /// The fallback is deliberately the OLD behaviour, never a drop: if the
+    /// rescue queue is full or its thread is gone, the write happens inline
+    /// exactly as before. A slow drain is bad; a lost tick is worse.
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
-        if dropped > 0 {
-            let payload_len = self.buffer.as_bytes().len();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-            match spill_failed_ilp(&self.spill_dir, self.buffer.as_bytes(), self.feed, now) {
-                Ok(path) => {
-                    // BOTH counters, and the alarmed one is not optional.
-                    //
-                    // `tv_ticks_dropped_total` is EMF-selected and carries the
-                    // `dhan_ticks_dropped` alarm (`live-lane-alarms.tf`).
-                    // `tv_ticks_spilled_total` carries NEITHER. Incrementing
-                    // only the new name would have DIVERTED the common flush
-                    // failure — the exact 2026-08-21 timeout — off the only
-                    // pager that watches it, so the operator would have been
-                    // told less than before the rescue existed. That is a
-                    // false-OK (audit Rule 11), and a rescue that blinds the
-                    // alarm is a worse outcome than the loss it prevents.
-                    //
-                    // The alarmed counter is also the SEMANTICALLY correct one
-                    // here: it means "rows left the buffer without reaching
-                    // QuestDB", which is TRUE of a rescued row — the file is on
-                    // disk, the database does not have it. `spilled` is the
-                    // strictly narrower fact "and it is recoverable", which is
-                    // why it is a second increment rather than a replacement.
+        if dropped == 0 {
+            self.buffer.clear();
+            self.pending = 0;
+            return 0;
+        }
+
+        // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
+        // MOVED, and the replacement is the same empty one `offload_flush`
+        // already installs on every successful hand-off.
+        if let Some(tx) = self.rescue.as_ref() {
+            let protocol = self.buffer.protocol_version();
+            let batch = RescueBatch {
+                buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+                rows: dropped,
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
                     metrics::counter!(
-                        "tv_ticks_dropped_total",
+                        TICK_RESCUE_QUEUED_COUNTER,
                         "feed" => self.feed.as_str()
                     )
                     .increment(dropped as u64);
-                    metrics::counter!(
-                        "tv_ticks_spilled_total",
-                        "feed" => self.feed.as_str()
-                    )
-                    .increment(dropped as u64);
-                    error!(
-                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                        feed = self.feed.as_str(),
-                        rescued = dropped,
-                        bytes = payload_len,
-                        path = %path.display(),
-                        "tick flush failed — the buffered rows were RESCUED to the tick \
-                         spill file named here, not lost. They are NOT in QuestDB yet. \
-                         Re-ingest is one command and is safe to repeat, because the \
-                         ticks dedup key carries capture_seq: \
-                         curl --data-binary @<path> http://<questdb>:9000/write"
-                    );
+                    self.pending = 0;
+                    return dropped;
                 }
-                Err(err) => {
-                    // The rescue itself failed (disk full, cap reached, no
-                    // permission). Fall back to the counted drop — a spill that
-                    // cannot be written must never mask the loss.
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    // The rescue thread is behind. Take the buffer BACK and
+                    // write inline below — slower, but nothing is lost and
+                    // nothing is reported as lost.
+                    self.buffer = returned.buffer;
                     metrics::counter!(
-                        "tv_ticks_dropped_total",
-                        "feed" => self.feed.as_str()
+                        TICK_RESCUE_INLINE_FALLBACK_COUNTER,
+                        "feed" => self.feed.as_str(),
+                        "reason" => "queue_full"
                     )
-                    .increment(dropped as u64);
-                    error!(
-                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                        feed = self.feed.as_str(),
-                        dropped,
-                        spill_error = %err,
-                        "tick flush failed AND the spill rescue also failed — these ticks \
-                         are permanently lost and nothing re-inserts them. The raw frames \
-                         remain in the write-ahead log for manual recovery."
-                    );
+                    .increment(1);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    self.buffer = returned.buffer;
+                    metrics::counter!(
+                        TICK_RESCUE_INLINE_FALLBACK_COUNTER,
+                        "feed" => self.feed.as_str(),
+                        "reason" => "thread_gone"
+                    )
+                    .increment(1);
                 }
             }
         }
+
+        perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
         self.buffer.clear();
         self.pending = 0;
         dropped
     }
 }
 
+/// The rescue write itself — the part that touches the disk.
+///
+/// Extracted 2026-08-28 so the SAME code serves both the dedicated rescue
+/// thread and the inline fallback in [`TickPersistenceWriter::discard_pending`].
+/// Two copies would have drifted, and the copy that drifted would have been the
+/// fallback — the one that only runs on the worst day.
+fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: usize) {
+    let payload_len = payload.len();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    match spill_failed_ilp(spill_dir, payload, feed, now) {
+        Ok(path) => {
+            // BOTH counters, and the alarmed one is not optional.
+            //
+            // `tv_ticks_dropped_total` is EMF-selected and carries the
+            // `dhan_ticks_dropped` alarm (`live-lane-alarms.tf`).
+            // `tv_ticks_spilled_total` carries NEITHER. Incrementing only the
+            // new name would have DIVERTED the common flush failure — the exact
+            // 2026-08-21 timeout — off the only pager that watches it, so the
+            // operator would have been told less than before the rescue
+            // existed. That is a false-OK (audit Rule 11), and a rescue that
+            // blinds the alarm is a worse outcome than the loss it prevents.
+            //
+            // The alarmed counter is also the SEMANTICALLY correct one here: it
+            // means "rows left the buffer without reaching QuestDB", which is
+            // TRUE of a rescued row — the file is on disk, the database does
+            // not have it. `spilled` is the strictly narrower fact "and it is
+            // recoverable", which is why it is a second increment rather than a
+            // replacement.
+            metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
+                .increment(dropped as u64);
+            metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str())
+                .increment(dropped as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                rescued = dropped,
+                bytes = payload_len,
+                path = %path.display(),
+                "tick flush failed — the buffered rows were RESCUED to the tick \
+                 spill file named here, not lost. They are NOT in QuestDB yet. \
+                 Re-ingest is one command and is safe to repeat, because the \
+                 ticks dedup key carries capture_seq: \
+                 curl --data-binary @<path> http://<questdb>:9000/write"
+            );
+        }
+        Err(err) => {
+            // The rescue itself failed (disk full, cap reached, no
+            // permission). Fall back to the counted drop — a spill that
+            // cannot be written must never mask the loss.
+            metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
+                .increment(dropped as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                dropped,
+                spill_error = %err,
+                "tick flush failed AND the spill rescue also failed — these ticks \
+                 are permanently lost and nothing re-inserts them. The raw frames \
+                 remain in the write-ahead log for manual recovery."
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Off-drain RESCUE (2026-08-28)
+// ---------------------------------------------------------------------------
+
+/// Depth of the hand-off queue between the drain and the rescue thread.
+///
+/// TWO, and small on purpose. A rescue only happens when the flush queue has
+/// already been full for [`MAX_RETAINED_FLUSH_SPANS`] consecutive flushes, so
+/// this queue is not a buffer for a busy day — it is a place to put ONE
+/// oversized payload while the previous one is being written. Anything deeper
+/// would hold more rows in memory that exist nowhere else, which is the trade
+/// the whole rescue tier exists to avoid.
+pub const RESCUE_QUEUE_DEPTH: usize = 2;
+
+/// Rows handed to the rescue thread rather than written on the drain.
+///
+/// NOT a loss counter. It says the rescue was queued; `tv_ticks_spilled_total`
+/// (incremented by the thread) says it landed. The gap between them is the
+/// window a crash would take, which is why the queue is two deep.
+pub const TICK_RESCUE_QUEUED_COUNTER: &str = "tv_tick_rescue_queued_total";
+
+/// Rescues that had to be written INLINE on the drain after all.
+///
+/// Non-zero means the drain took the stall this hand-off exists to remove —
+/// either the rescue thread was behind (`queue_full`) or it was gone
+/// (`thread_gone`). Not a loss: nothing is dropped on either arm.
+pub const TICK_RESCUE_INLINE_FALLBACK_COUNTER: &str = "tv_tick_rescue_inline_fallback_total";
+
+/// Rescue payloads abandoned because the rescue thread did not finish.
+///
+/// These rows were counted as rescued by the producer and never reached the
+/// spill file, so they are a REAL loss — the WAL-shutdown class, one tier out.
+pub const TICK_RESCUE_ABANDONED_COUNTER: &str = "tv_tick_rescue_abandoned_total";
+
+/// One oversized ILP payload on its way to the spill tier.
+///
+/// Carries the `Buffer` by move, so the hand-off costs a pointer write on the
+/// drain rather than a copy of up to [`MAX_PRODUCER_BUFFER_BYTES`].
+pub struct RescueBatch {
+    buffer: Buffer,
+    rows: usize,
+}
+
+impl RescueBatch {
+    /// Rows this payload carries — the number an abandoned batch loses.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// The rescue thread's half: everything the write needs, and nothing else.
+///
+/// Deliberately owns no `Sender` and no `Buffer` — it cannot flush to QuestDB
+/// and it cannot be confused with [`TickWriterSink`]. Its only job is to turn
+/// a queued payload into a named file on disk.
+pub struct TickRescueSink {
+    spill_dir: PathBuf,
+    feed: Feed,
+}
+
+impl TickRescueSink {
+    /// Writes one queued payload to the spill tier.
+    ///
+    /// Identical code to the inline fallback — same counters, same coded
+    /// error, same one-command recovery text — because both call
+    /// [`perform_tick_rescue`]. An operator cannot tell which path ran, and
+    /// should not have to.
+    pub fn rescue(&self, batch: &RescueBatch) {
+        perform_tick_rescue(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            self.feed,
+            batch.rows,
+        );
+    }
+}
 // ---------------------------------------------------------------------------
 // Off-drain flush (2026-08-25)
 // ---------------------------------------------------------------------------
@@ -2937,6 +3133,111 @@ mod tests {
             rescued.len(),
             1,
             "the payload was RESCUED to the spill tier, not dropped"
+        );
+    }
+
+    /// The drain must not write the rescue file itself.
+    ///
+    /// This is the defect the split exists to remove: `discard_pending` used to
+    /// do `create_dir_all`, a `read_dir` + per-entry `metadata()` walk of the
+    /// spill directory AND its quarantine subdirectory, a live free-space probe
+    /// (which forks `df` on its first call), and up to 32 MiB of file write —
+    /// all on the frame-drain task, and all at the one moment the disk is
+    /// already wedged, because the cut that calls it only trips when the flush
+    /// queue has been full for several consecutive flushes.
+    #[test]
+    fn a_split_writer_hands_the_rescue_off_instead_of_writing_it() {
+        let dir = scratch_dir("rescue-handoff");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        assert_eq!(w.pending(), 1);
+
+        let rescued = w.discard_pending();
+
+        assert_eq!(rescued, 1, "the rows are accounted for either way");
+        assert_eq!(w.pending(), 0, "the producer must let go of them");
+        let batch = rx
+            .try_recv()
+            .expect("the payload must be on the rescue queue, not on disk");
+        assert_eq!(batch.rows(), 1);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) == 0,
+            "the drain must not have touched the spill directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full rescue queue falls back to the OLD behaviour, never to a drop.
+    ///
+    /// The whole point of the fallback: a slow drain is bad, a lost tick is
+    /// worse. If this ever became a refusal, the change would have traded a
+    /// stall for exactly the loss it was built to prevent.
+    #[test]
+    fn a_full_rescue_queue_writes_inline_rather_than_dropping() {
+        let dir = scratch_dir("rescue-full");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+
+        // Fill the queue: RESCUE_QUEUE_DEPTH payloads with nothing draining.
+        for _ in 0..RESCUE_QUEUE_DEPTH {
+            w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        // The next one cannot be queued and must therefore land on disk.
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+
+        let files = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert!(
+            files > 0,
+            "with the queue full the rescue must have been written inline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writer that was never split behaves exactly as before.
+    #[test]
+    fn an_unsplit_writer_still_rescues_inline() {
+        let dir = scratch_dir("rescue-unsplit");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "no rescue channel means the old synchronous path, unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the rescue queue must leave the writer rescuing inline, not
+    /// refusing — the end-of-session rows still have to reach the spill tier.
+    #[test]
+    fn closing_the_rescue_queue_restores_the_inline_path() {
+        let dir = scratch_dir("rescue-closed");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+        w.close_rescue_offload();
+
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "after close the rescue must still land on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The queue is deliberately shallow: every payload in it is rows that
+    /// exist nowhere else, so depth here is a crash-loss window.
+    #[test]
+    fn the_rescue_queue_is_shallow_on_purpose() {
+        assert!(
+            RESCUE_QUEUE_DEPTH >= 1 && RESCUE_QUEUE_DEPTH <= 4,
+            "one payload in flight plus a slot to hand the next one over; \
+             deeper holds more rows that exist only in this process"
         );
     }
 
