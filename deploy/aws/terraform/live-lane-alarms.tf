@@ -182,25 +182,71 @@ resource "aws_cloudwatch_metric_alarm" "dhan_socket_parked" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
   alarm_name        = "tv-${var.environment}-ticks-dropped"
-  alarm_description = "Live ticks were DROPPED before reaching QuestDB. This repo's own EMF notes call tv_ticks_dropped_total the single largest tick-loss window, and until 2026-08-14 it was published to CloudWatch with no alarm consuming it — paid for and unwatched. A drop here is real data loss: the frame is in the write-ahead log, but nothing re-folds from the WAL, so the row never appears in the ticks table. The usual cause is backpressure, not a bug: a QuestDB stall blocks the drain, the ring fills, and the sink drops the NEWEST frames. Triage: check QuestDB health and ILP flush latency first, then the ring-full counters (tv_dhan_ws_ring_full_total / tv_dhan_ws_ring_bytes_full_total) to confirm the ring was the choke point."
+  alarm_description = "Live ticks were PERMANENTLY lost before reaching QuestDB. This fires on dropped MINUS spilled, so it is silent when the rescue tier caught the rows and loud only when it did not. The usual cause is backpressure, not a bug: a QuestDB stall blocks the drain, the ring fills, and the sink drops the newest frames; the rescue path normally saves them to the tick spill tier, where they are re-ingestable by the curl command the HOT-PATH-02 log line prints. A non-zero value here means that rescue also failed - disk full, spill cap reached, or no permission. Triage: (1) check disk free and tv_ticks_spilled_total, which is charted beside this; (2) check QuestDB health and ILP flush latency; (3) tv_dhan_ws_ring_full_total confirms whether the ring was the choke point. Rows counted here are gone: nothing re-folds live-feed frames from the write-ahead log."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
+  # Eval 1 with datapoints_to_alarm 1: permanent loss must page on the first
+  # window. This alarm does NOT get the M-of-N treatment its siblings do,
+  # because it is already rare by construction - it fires only when the rescue
+  # tier failed too.
   evaluation_periods  = 1
-  metric_name         = "tv_ticks_dropped_total"
-  namespace           = local.app_namespace
-  # Threshold 1 / eval 1: a dropped tick is unrecoverable. There is no
-  # "acceptable" number of them, and waiting for a second window to confirm
-  # only delays the page while more are lost.
-  period             = 300
-  statistic          = "Sum"
-  dimensions         = local.app_dimensions
-  treat_missing_data = "notBreaching"
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
 
   alarm_actions = local.app_alarm_actions
   # NO ok_actions: the loss is permanent. Deltas returning to zero can never
   # mean the dropped ticks came back.
   ok_actions = []
+
+  # METRIC MATH, since 2026-08-28. This alarmed on `tv_ticks_dropped_total`
+  # alone, and the live session of 2026-08-28 showed what that costs: dropped
+  # and spilled were EQUAL to the row - 308,818 each - which is the documented
+  # arithmetic proof that every dropped tick was rescued to disk and nothing
+  # was permanently lost. The operator was paged anyway, repeatedly, and the
+  # alarm text told him the rows were gone.
+  #
+  # The discriminator existed as data the whole time. `discard_pending` and
+  # `rescue` increment BOTH names on the rescue-succeeded arm and only
+  # `dropped` when the rescue itself fails, so `dropped - spilled` IS the
+  # count of permanently lost rows. Nothing anywhere computed it: a scan of
+  # the terraform found `tv_ticks_spilled_total` in one alarm and two
+  # comments, and no expression subtracting the two.
+  #
+  # FILL(m,0) on both legs is load-bearing: an expression over two series
+  # evaluates to no-data if EITHER is missing, and a counter that legitimately
+  # did not increment in a window has no sample. Without FILL, a window where
+  # nothing was rescued would silence the very loss this alarm exists for.
+  metric_query {
+    id          = "permanently_lost_ticks"
+    expression  = "FILL(m_dropped,0)-FILL(m_spilled,0)"
+    label       = "ticks dropped AND not rescued (permanent loss)"
+    return_data = true
+  }
+
+  metric_query {
+    id          = "m_dropped"
+    return_data = false
+    metric {
+      metric_name = "tv_ticks_dropped_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m_spilled"
+    return_data = false
+    metric {
+      metric_name = "tv_ticks_spilled_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -228,7 +274,14 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_full" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_dhan_ws_ring_full_total"
   namespace           = local.app_namespace
   period              = 300
@@ -247,7 +300,14 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_dhan_ws_ring_bytes_full_total"
   namespace           = local.app_namespace
   period              = 300
@@ -701,7 +761,14 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_ticks_spilled_total"
   namespace           = local.app_namespace
   period              = 300
