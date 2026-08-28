@@ -7297,14 +7297,38 @@ pub fn refold_wal_frames(
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
 
-    // Recovered frames are historical: their exchange timestamps are whatever
-    // the exchange stamped, and the receipt instant is gone with the dead
-    // process. Using "now" is deliberate and only affects the delivery-lag
-    // reading, which is meaningless for a replayed frame — the tick's own
-    // exchange timestamp, which decides the candle bucket, is read from the
-    // packet exactly as on the live path.
-    let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let recv_millis = u64::try_from(received_at_nanos.max(0) / 1_000_000).unwrap_or(0);
+    // CORRECTED 2026-08-28. This block used `Utc::now()` for BOTH values, and
+    // justified it with: "the tick's own exchange timestamp, which decides the
+    // candle bucket, is read from the packet exactly as on the live path."
+    //
+    // That sentence was true when written and became FALSE the same day, when
+    // bucketing moved to `fold_clock_ist_secs`. The failure it opened is a
+    // CLIFF, not a gradient, and it is worst exactly when it matters most:
+    //
+    //   * a crash-restart replaying frames LESS than
+    //     `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) old passes the delta guard,
+    //     so those frames bucket on REPLAY TIME — shifted forward by up to
+    //     five minutes into bars they were never part of;
+    //   * frames older than that fall back and land correctly.
+    //
+    // So the fastest, most successful restarts — the ones that recover within
+    // five minutes — are the ones that mis-file their recovered ticks, and
+    // nothing counts which side of the cliff a replayed tick landed on.
+    //
+    // The fix is to say what is true: the receipt instant died with the
+    // process. `WAL_RECEIPT_UNKNOWN_NANOS` is the sentinel the fold clock
+    // already reads as "no receipt", so every replayed frame falls back to its
+    // exchange stamp unconditionally and lands in the bar it originally
+    // belonged to. That is the behaviour the old comment described; it is now
+    // the behaviour the code has.
+    //
+    // `recv_millis` keeps wall-clock "now" deliberately: it feeds the
+    // delivery-lag reading, where a replayed frame's lag is meaningless
+    // either way, and it is NOT an input to bucketing.
+    let received_at_nanos = tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS;
+    let recv_millis =
+        u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000)
+            .unwrap_or(0);
 
     for (frame_seq, bytes) in frames {
         let mut offset = 0usize;
