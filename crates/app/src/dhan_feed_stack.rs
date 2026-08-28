@@ -1424,6 +1424,7 @@ impl LiveIngest {
                 .is_ok()
         });
         if !finished {
+            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(1);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 grace_secs = OFFLOAD_SHUTDOWN_GRACE.as_secs(),
@@ -1438,6 +1439,7 @@ impl LiveIngest {
             return;
         }
         if handle.join().is_err() {
+            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(1);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 "the tick writer thread PANICKED — the final batch of the session \
@@ -1480,9 +1482,12 @@ impl LiveIngest {
                 // anyhow chain ON the drain. `Debug` on `anyhow::Error` already
                 // renders the full cause chain, at zero allocation here.
                 error = ?err,
-                "inline-depth flush FAILED — those depth rows are lost (the \
-                 ILP buffer is discarded on a failed flush). Tick persistence \
-                 is unaffected."
+                "inline-depth flush FAILED. Disposition depends on which writer \
+                 is live: with the offload writer running, a refusal means the \
+                 rows were RESCUED to the depth spill tier and are re-ingestable; \
+                 on the synchronous fallback the ILP buffer is discarded and they \
+                 are gone. Check the depth spill directory before assuming loss. \
+                 Tick persistence is unaffected either way."
             );
         }
         if self.pending_rows == 0 {
@@ -3340,6 +3345,32 @@ pub const OFFLOAD_SHUTDOWN_GRACE_SECS: u64 = 12;
 pub const OFFLOAD_SHUTDOWN_GRACE: std::time::Duration =
     std::time::Duration::from_secs(OFFLOAD_SHUTDOWN_GRACE_SECS);
 
+/// One increment per writer whose shutdown did NOT complete — the queue it was
+/// holding died with the process.
+///
+/// # Why an EPISODE counter and not a row count
+///
+/// When the join times out we do not know, and cannot know, how many rows were
+/// in flight: the queue is owned by a thread we have just given up on, and the
+/// batches are `Buffer`s whose row counts were consumed when they were sent.
+/// Publishing a guessed number into a loss counter would be a fabricated
+/// figure inside the one metric whose purpose is to stop fabrication, so this
+/// counts EPISODES: "a writer shutdown was abandoned", once, per writer.
+///
+/// It exists because the arm was previously silent. `tv_ticks_dropped_total`
+/// and `tv_depth_rows_dropped_total` — the only alarmed loss series — are
+/// incremented by the writer thread on rows it actually refused, and a thread
+/// that never got to run its drain increments neither. So the largest single
+/// loss the shutdown path can produce (up to `FLUSH_QUEUE_DEPTH` batches, plus
+/// the one in flight) was reported by a free-text log line and nothing else.
+///
+/// The `writer` label separates ticks from depth. The EMF processor folds
+/// label values into one summed series per host, so the ALARM sees the total —
+/// which is the right shape here, because either writer abandoning its queue
+/// is the same operator action: check the spill directory before the next
+/// session.
+pub const OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER: &str = "tv_offload_writer_shutdown_incomplete_total";
+
 pub const LAST_TICK_AGE_GAUGE: &str = "tv_dhan_feed_last_tick_age_secs";
 
 /// The value [`LAST_TICK_AGE_GAUGE`] publishes.
@@ -4869,6 +4900,8 @@ impl DepthIngest {
                 .is_ok()
         });
         if !finished {
+            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth")
+                .increment(1);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 grace_secs = OFFLOAD_SHUTDOWN_GRACE_SECS,
@@ -4882,8 +4915,25 @@ impl DepthIngest {
                  batch may not have reached QuestDB. Rows it failed to write are on the \
                  depth spill tier and are re-ingestable; rows still in the queue are not."
             );
+            // Deliberately NOT joined after a timeout: joining here is the
+            // unbounded wait the grace exists to avoid.
+            return;
         }
-        drop(handle);
+        // JOINED, not dropped (2026-08-28). `drop(handle)` detaches the thread,
+        // which silently discards the one signal a finished-but-broken writer
+        // can still give us: a panic. The tick path has always joined here; the
+        // depth path did not, so a panicking depth writer looked identical to a
+        // clean one. Depth is 24x the row volume, so it is the LAST writer that
+        // should have had the weaker check.
+        if handle.join().is_err() {
+            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth")
+                .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the depth writer thread PANICKED — its final batch may not have \
+                 reached QuestDB. Check the depth spill directory."
+            );
+        }
     }
 
     /// True once [`Self::spawn_offload_writer`] has run.
@@ -9866,13 +9916,37 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once(";"))
             .and_then(|(n, _)| n.trim().parse().ok())
             .expect("main.rs must declare the lane shutdown flush budget");
+        // RE-DERIVED 2026-08-28. The original form asserted
+        // `2 * grace > budget`, which was true at a 20 s budget and stopped
+        // being true when the budget rose to 30 to cover the spawn-failure
+        // fallback's two sequential ILP timeouts. The constraint the sharing
+        // actually protects was never "two graces alone overflow" — it is that
+        // two graces PLUS the pre-join work overflow, which is what makes
+        // `main.rs`'s assert (which only ever sees ONE grace) load-bearing.
+        //
+        // The margin is read from `main.rs` rather than recomputed here, for
+        // the same reason the budget is: a second copy of a number is a number
+        // that rots.
+        let margin: u64 = main_rs
+            .split_once("const SHUTDOWN_GRACE_MARGIN_SECS: u64 =")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(expr, _)| expr)
+            .and_then(|expr| {
+                // `2 * tickvault_storage::depth_persistence::ILP_REQUEST_TIMEOUT_SECS`
+                // — take the leading multiplier and apply it to the real
+                // constant, so raising the ILP timeout moves this guard too.
+                let factor: u64 = expr.trim().split('*').next()?.trim().parse().ok()?;
+                Some(factor * tickvault_storage::depth_persistence::ILP_REQUEST_TIMEOUT_SECS)
+            })
+            .expect("main.rs must derive SHUTDOWN_GRACE_MARGIN_SECS from the ILP timeout");
         assert!(
-            2 * OFFLOAD_SHUTDOWN_GRACE_SECS > budget,
-            "if two sequential graces ({} s) WOULD fit inside the lane budget ({budget} s) \
-             then this guard is pinning a constraint that no longer binds — re-derive it \
-             rather than deleting it, because the sharing is still what keeps main.rs's \
-             compile-time assert honest",
-            2 * OFFLOAD_SHUTDOWN_GRACE_SECS
+            2 * OFFLOAD_SHUTDOWN_GRACE_SECS + margin > budget,
+            "two sequential graces plus the pre-join margin ({} s) now FIT inside the lane \
+             budget ({budget} s), so sharing the deadline is no longer what keeps main.rs's \
+             compile-time assert honest. Re-derive this guard against whatever the binding \
+             constraint has become — do not delete it. Sharing is still correct; what \
+             changed is only the arithmetic that proves it must be.",
+            2 * OFFLOAD_SHUTDOWN_GRACE_SECS + margin
         );
     }
     /// The depth tail must flush BEFORE the blocking offload join.
