@@ -940,11 +940,30 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 2: Initialize observability (Prometheus metrics exporter)
-    // -----------------------------------------------------------------------
-    observability::init_metrics(&config.observability)
-        .context("failed to initialize Prometheus metrics")?;
+    // The SECOND `observability::init_metrics` call that stood here is
+    // DELETED (2026-08-28). The 2026-08-26 change that moved the install
+    // ahead of STAGE-C -- for the recorder-ordering reason written at that
+    // call site ~100 lines above -- COPIED it instead of MOVING it, and left
+    // this one behind. `PrometheusBuilder::install()` binds the exporter's
+    // HTTP listener, so the second call bound 9091 a second time in the same
+    // process and returned EADDRINUSE, which `?` turned into a boot failure:
+    //
+    //     Error: failed to initialize Prometheus metrics
+    //       0: failed to install Prometheus metrics exporter
+    //       1: failed to create HTTP listener: Address in use (os error 98)
+    //
+    // The binary could therefore NEVER start. Live on prod 2026-08-28: the
+    // deploy swapped the binary at 08:55 IST, systemd retried 8 times in 18
+    // seconds, hit "Start request repeated too quickly" and stopped trying;
+    // the box sat with no app through the 09:15 open until the previous
+    // binary was restored. Nothing in the port was ever wrong -- `ss`, `lsof`
+    // and `fuser` all showed 9091 free while a fresh start still failed,
+    // which is what identifies the collision as self-inflicted rather than an
+    // orphaned process.
+    //
+    // Pinned by metrics_recorder_install_order_guard::
+    // init_metrics_is_called_exactly_once, so a future move that copies
+    // instead of moving fails the build rather than the boot.
 
     // MOVED HERE 2026-08-26, and the move is the whole fix.
     //
