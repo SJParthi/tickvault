@@ -1048,3 +1048,47 @@ resource "aws_cloudwatch_metric_alarm" "wal_catchup_budget_exhausted" {
   alarm_actions = local.app_alarm_actions
   ok_actions    = []
 }
+
+# ---------------------------------------------------------------------------
+# Family (5) alarm 19 — a writer shutdown that abandoned its queue.
+#
+# Authorized 2026-08-28 by dhan-rest-only-noise-lock-2026-07-14.md §2.3n.
+#
+# The lane joins two writer threads at shutdown. Either join can time out, and
+# when it does the thread is deliberately detached rather than joined - joining
+# after a timeout is the unbounded wait the grace exists to avoid. The batches
+# that thread held then die with the process: up to the queue depth plus the one
+# in flight, which at the depth writer's row threshold is roughly 50,000 rows.
+#
+# Until this alarm, no counter moved. The two alarmed loss series on this path
+# are incremented by the writer thread on rows it actually refused, and a thread
+# that never ran its drain increments neither - so the largest loss the shutdown
+# path can produce was reported by free text in a log and by nothing else.
+#
+# An EPISODE counter, not a row count: the queue belongs to a thread we have
+# just given up on and the batch row counts were consumed when they were sent,
+# so any number here would be invented. It counts "a writer shutdown was
+# abandoned", once, per writer.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "offload_writer_shutdown_incomplete" {
+  alarm_name        = "tv-${var.environment}-offload-writer-shutdown-incomplete"
+  alarm_description = "A persistence writer did NOT finish its shutdown: it either ran past the join grace or panicked, and the batches it was still holding died with the process. At the depth writer's row threshold that is roughly 50,000 rows, and they are not recoverable - the queue is in memory, not on disk. This counts episodes, not rows, because the row counts are gone with the thread. Triage: (1) check the tick and depth spill directories - rows the writer REFUSED were rescued there and are re-ingestable, rows still queued were not; (2) look for a preceding QuestDB stall, which is what makes a drain overrun its grace; (3) if this repeats, the grace is too short for the observed flush latency, or the writer is panicking - the accompanying log line says which. Fires once at process exit, so a return to OK means the datapoint aged out, never that the rows arrived."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_offload_writer_shutdown_incomplete_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+
+  # notBreaching: the box is stopped overnight, so no-data is the normal
+  # off-hours state. The dark-lane case is owned by dhan-no-ticks-flowing.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. This fires once, at process exit. A return to OK is the
+  # datapoint aging out of its window - the abandoned queue does not come back.
+  ok_actions = []
+}

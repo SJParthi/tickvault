@@ -1054,11 +1054,41 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the already-approved Quote 10 Elastic IP release (-$3.60/mo, which alone
     // returns the maximal month to under the line), or an operator decision on
     // limit_amount.
+    //
+    // 2026-08-28 (SEVENTH): 98 -> 99, tv_offload_writer_shutdown_incomplete_total.
+    //
+    // The lane joins TWO writer threads at shutdown. Either join can time out,
+    // and when it does the thread is deliberately detached rather than joined
+    // -- joining after a timeout is the unbounded wait the grace exists to
+    // avoid. The batches that thread held then die with the process: up to the
+    // queue depth plus the one in flight, which at the depth writer's row
+    // threshold is roughly 50,000 rows.
+    //
+    // No counter moved. tv_ticks_dropped_total and tv_depth_rows_dropped_total
+    // are incremented by the WRITER THREAD on rows it actually refused, and a
+    // thread that never ran its drain increments neither. So the largest single
+    // loss the shutdown path can produce was reported by free text in a log and
+    // by nothing an alarm could read.
+    //
+    // An EPISODE counter, deliberately not a row count: the queue belongs to a
+    // thread we have just given up on and the batch row counts were consumed
+    // when they were sent, so any number here would be invented -- a fabricated
+    // figure inside the one class of metric whose purpose is to stop
+    // fabrication.
+    //
+    // Authorized by dhan-rest-only-noise-lock-2026-07-14.md §2.3n.
+    // +$0.30/mo + 1 alarm $0.10 = +$0.40. Maximal month ~$123.48 -> ~$123.88
+    // against the automatic STOP_EC2_INSTANCES line at $117.00 and the
+    // operator's $125 hard cap (Quote 18) -- now under $1.20 of room. The next
+    // addition of any size must come with a LEVER, not just a cost note. Same
+    // two levers, unchanged: the already-approved Quote 10 Elastic IP release
+    // (-$3.60/mo, which alone returns the maximal month to under both lines),
+    // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        98,
-        "Z+ L2 VERIFY ratchet: expected exactly 98 names in the MAIN EMF \
-         (2026-08-28 SIXTH: 96 -> 98, tv_tick_spill_replay_quarantined_total \
+        99,
+        "Z+ L2 VERIFY ratchet: expected exactly 99 names in the MAIN EMF \
+         (2026-08-28 SEVENTH: 98 -> 99, tv_offload_writer_shutdown_incomplete_total -- an abandoned writer-join queue, roughly 50,000 depth rows, moved NO counter; see the block above. (2026-08-28 SIXTH: 96 -> 98, tv_tick_spill_replay_quarantined_total \
          + tv_wal_catchup_budget_exhausted_total. Both reported PERMANENT or \
          soon-permanent tick loss and both reached zero operator surfaces; \
          the quarantine one also counted toward no size ceiling, so it grew \

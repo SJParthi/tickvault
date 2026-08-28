@@ -1879,3 +1879,126 @@ would put the maximal month back under the line), or an operator decision on
   behind" without a bound is an unbounded memory path in a costume.
 - Uses a blocking `send` on the hand-off queue, which re-creates the exact
   coupling one queue further out.
+
+### §2.3n — 2026-08-28: the shutdown that abandons a writer's queue was reported by a log line and nothing else
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "hwo will youa cheiev always O(1) alogn with nto even a signel ticks loss across the entire codebase and workspace"
+
+> "Always ensure auditing logging dashboard vislualisign extremeims analyzing easil yaccessibel eveyrhtign also"
+
+> "I dont need any hallucination or illusion I just need the working guaranteed assurance solution"
+
+Given while an adversarial sweep of the writer-offload path was running. The
+finding below came out of that sweep and was not known when the session
+started. This dated row is the rule-file edit §3 requires before any new
+Dhan-scoped page, recorded BEFORE the terraform.
+
+#### The gap
+
+The lane joins two writer threads at shutdown — ticks and depth. Either join
+can time out, and when it does the thread is deliberately detached rather than
+joined (joining after a timeout is the unbounded wait the grace exists to
+avoid). The batches that thread was holding — up to `FLUSH_QUEUE_DEPTH` plus
+the one in flight, at the depth writer's 10,000-row threshold roughly **50,000
+rows** — then die with the process.
+
+**No counter moved.** `tv_ticks_dropped_total` and `tv_depth_rows_dropped_total`
+are the only alarmed loss series on this path, and both are incremented by the
+WRITER THREAD on rows it actually refused. A thread that never got to run its
+drain increments neither. So the single largest loss the shutdown path can
+produce was reported by free text in a log and by nothing an alarm can read.
+
+The depth side was worse in a second way: its join arm ended in `drop(handle)`,
+which detaches unconditionally, so a depth writer that finished-but-PANICKED
+looked identical to a clean one. The tick path has always joined and checked.
+Depth carries 24x the row volume and had the weaker check.
+
+#### What this authorizes — family (5) gains an EIGHTEENTH signal
+
+`tv-<env>-offload-writer-shutdown-incomplete` on
+`tv_offload_writer_shutdown_incomplete_total`, `Sum >= 1` in a period,
+`treat_missing_data = notBreaching`, `ok_actions = []`.
+
+**An EPISODE counter, not a row count, and that is deliberate.** When the join
+times out we do not know how many rows were in flight: the queue belongs to a
+thread we have just given up on, and the batches are ILP buffers whose row
+counts were consumed when they were sent. Publishing a guessed number into a
+loss counter would be a fabricated figure inside the one metric whose purpose
+is to stop fabrication. So it counts EPISODES — "a writer shutdown was
+abandoned" — once, per writer.
+
+`notBreaching` because the box is stopped overnight and no-data is the normal
+off-hours state; the dark-lane case is already owned by `dhan-no-ticks-flowing`
+(§2.3b-i). `ok_actions = []` because this fires once at process exit — a return
+to OK is the datapoint aging out, never a repair. The rows do not come back.
+
+The `writer` label separates ticks from depth. The EMF processor folds label
+values into one summed series per host, so the alarm sees the total — the right
+shape here, because either writer abandoning its queue calls for the same
+operator action: check the spill directory before the next session.
+
+#### Also fixed in the same change, and not alarmed
+
+- **The lane shutdown budget was arithmetically wrong in the spawn-failure
+  fallback.** Both offload spawns are allowed to fail and fall back to the
+  synchronous writer. In that mode the tail flushes depth and then ticks, each
+  able to block one full ILP request timeout, BEFORE the join deadline starts:
+  5 + 5 + 12 = 22 inside a 20 s budget, so the outer timer won and abandoned the
+  lane task mid-join — the exact failure the compile-time assert exists to
+  prevent, arriving through the door it was not watching. The budget is now 30 s
+  (still far inside the unit's `TimeoutStopSec=120`) and the margin is DERIVED
+  from `ILP_REQUEST_TIMEOUT_SECS` rather than being a hardcoded 5 that happened
+  to equal it.
+- **A false loss claim in the depth-flush log.** It read "those depth rows are
+  lost" on every error. Under the offload writer the only errors reachable are
+  the two that RESCUED the rows to the depth spill tier. An operator triaging
+  that line was told data was gone while a re-ingestable file existed.
+
+#### ⚠ Honest cost, and it moves further past the automatic action line
+
++1 EMF name ≈ $0.30/mo, +1 alarm ≈ $0.10/mo ⇒ **~$0.40/mo**, no user-data byte.
+
+§2.3l put a maximal month at **~$122.88** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`). This
+takes it to **~$123.28 — about $6.28 above the line that switches the trading
+box off** in a maximal month, and against the operator's $125 hard cap
+(Quote 18) it now has under $2 of room. The live account is far below it
+(August MTD $48.87, forecast $61.51, measured 2026-08-25), so nothing fires
+today, but the maximal-month arithmetic is now the tightest it has been and
+**the next addition of any size must come with a lever, not just a cost note.**
+The levers are unchanged and neither is taken here: the already-approved
+Quote 10 Elastic IP release (−$3.60/mo, which alone would put the maximal month
+back under both lines), or an operator decision on `limit_amount`.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on an abandoned shutdown does not save the queue. It converts the
+largest silent loss on the shutdown path into one the operator is told about —
+that is the entire claim. It does not shorten the drain, does not add a respawn,
+and does not make the rows recoverable: an abandoned queue is gone, and the
+alarm's job is only to stop that being invisible.
+
+It also does not address the finding that `discard_pending` performs a
+synchronous spill write of up to 32 MiB ON the frame-drain task in the
+`WidthCapped` and `SinkGone` arms. Moving the ILP flush off the drain removed a
+5 s network round trip and left a filesystem write in its place, on the same
+volume QuestDB is stalling. Smaller constant, same mechanism. Recorded here as
+a known open item rather than quietly fixed, because the safe shape for it is a
+design decision, not an edit.
+
+#### What a PR that violates §2.3n looks like (REJECT)
+
+- Turns the episode counter into a guessed ROW count (a fabricated figure in a
+  loss metric is the thing the counter exists to avoid).
+- Gives the alarm `ok_actions` (the rows do not come back; an aged-out
+  datapoint is not a repair).
+- Makes it `breaching` on missing data (pages every night and weekend).
+- Restores `drop(handle)` on the depth join, hiding a panicking depth writer.
+- Re-hardcodes `SHUTDOWN_GRACE_MARGIN_SECS` instead of deriving it from the ILP
+  timeout.
+- Raises `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` without re-checking it against
+  the unit's `TimeoutStopSec` by hand — a `.service` file is invisible to the
+  compile-time assert, which is that guard's honest limit.

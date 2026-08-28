@@ -3554,10 +3554,23 @@ async fn build_shared_infra(
 /// Bounded in both directions on purpose. Unbounded, a hung or unreachable
 /// QuestDB holds the process past systemd's stop timeout, systemd escalates to
 /// SIGKILL, and we lose the exact tail this wait exists to save. Too short and
-/// a healthy-but-busy flush is cut off. 20s sits comfortably inside the
-/// service's stop timeout while being far longer than a flush of one
-/// sub-threshold ILP batch needs.
-const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 20;
+/// a healthy-but-busy flush is cut off.
+///
+/// RAISED 20 -> 30 on 2026-08-28, because 20 was not enough in the one mode
+/// nobody had costed: the SPAWN-FAILURE FALLBACK. Both offload spawns are
+/// allowed to fail and fall back to the synchronous writer, and in that mode
+/// the tail runs the depth flush and the tick flush back to back, each able to
+/// block for one full `ILP_REQUEST_TIMEOUT_SECS`, BEFORE the join deadline
+/// clock even starts. 5 + 5 + 12 = 22, inside a 20 s budget: the outer timer
+/// won and abandoned the lane task mid-join — the precise failure the assert
+/// below was written to prevent, arriving through the door it was not watching.
+///
+/// 30 s still sits far inside the unit's `TimeoutStopSec=120`
+/// (`deploy/systemd/tickvault.service`), so there is no new SIGKILL risk. If
+/// that unit value is ever lowered, this constant has to be re-checked by hand
+/// — a `.service` file is not visible to a compile-time assert, which is the
+/// honest limit of the guard below.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
 
 /// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
@@ -3580,7 +3593,21 @@ const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
 /// A compile-time assert rather than a test: two constants in two files that
 /// must agree are exactly the pair a future edit separates, and a build
 /// failure is the only kind of reminder that cannot be skipped.
-const SHUTDOWN_GRACE_MARGIN_SECS: u64 = 5;
+/// The pre-join work the tail must fit BEFORE the offload deadline starts.
+///
+/// DERIVED, not chosen. Until 2026-08-28 this was a hardcoded `5`, which was
+/// correct — and correct by coincidence, because it happened to equal one ILP
+/// request timeout. Two things were wrong with that. The timeout could be
+/// raised and leave the assert passing while the real shutdown ran over. And
+/// the worst case was never ONE timeout: in the spawn-failure fallback the
+/// tail flushes DEPTH synchronously and then TICKS synchronously, so it is
+/// two, back to back, before the join clock starts.
+///
+/// Deriving it from the timeout means raising the timeout moves this in
+/// lockstep and the build tells you if the budget no longer fits, rather than
+/// the box telling you by losing a session tail.
+const SHUTDOWN_GRACE_MARGIN_SECS: u64 =
+    2 * tickvault_storage::depth_persistence::ILP_REQUEST_TIMEOUT_SECS;
 const _: () = assert!(
     tickvault_app_shutdown_grace() + SHUTDOWN_GRACE_MARGIN_SECS
         <= DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
