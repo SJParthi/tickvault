@@ -3087,10 +3087,46 @@ where
                                 // is still not lost: the wire returned an
                                 // error, the subscribe was never sent, and that
                                 // socket is still delivering its old strike.
-                                let unsubscribe_may_have_landed = unsubscribe_succeeded
-                                    || (wire_timed_out && swap.unsubscribe.is_some());
+                                // TWO facts, deliberately kept apart
+                                // (RE-NARROWED 2026-08-28 after this widening
+                                // hung CI).
+                                //
+                                // `lost_instruments` is the REMEDIATION
+                                // trigger: it returns `SubscribeFailed`, which
+                                // makes the outer loop redial. It stays gated
+                                // on an unsubscribe that ANSWERED `Ok`.
+                                //
+                                // `possibly_emptied` is the VISIBILITY fact: a
+                                // timed-out unsubscribe may still have reached
+                                // the wire, so the socket may be empty even
+                                // though nothing here can know it. That is the
+                                // blindness worth counting, and counting it
+                                // costs nothing.
+                                //
+                                // Why they are not the same bool: making a
+                                // TIMEOUT trigger the redial turned a bounded
+                                // failure into an unbounded one. The redial
+                                // re-enters `send_subscribe`, and this code
+                                // path has no timeout of its own around that
+                                // call — so a socket that never answers took
+                                // the redial, hung on the replayed subscribe,
+                                // and held the drain forever. CI caught it as
+                                // a 180-second test timeout on
+                                // `a_socket_that_never_answers_costs_the_drain_two_seconds_not_twenty`,
+                                // which passes on main and hung here: proof
+                                // that the widening, not the test, was wrong.
+                                //
+                                // The reasoning that produced the widening was
+                                // still right — a timed-out unsubscribe really
+                                // may have landed — so the FACT is kept and
+                                // only the ACTION is withheld. Acting on it
+                                // safely needs a bounded redial, which is its
+                                // own change.
                                 let lost_instruments =
-                                    unsubscribe_may_have_landed && swap.subscribe.is_some();
+                                    unsubscribe_succeeded && swap.subscribe.is_some();
+                                let possibly_emptied = wire_timed_out
+                                    && swap.unsubscribe.is_some()
+                                    && swap.subscribe.is_some();
                                 // The guard already carries the NEW instrument
                                 // — see `try_swap` for why it is recorded
                                 // before the wire moves. That is what makes
@@ -3109,21 +3145,38 @@ where
                                 // proven live by the ws-gap-03 filters.
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    // Three values, not two. The alarm keys on
+                                    // `swap_emptied_socket` only, because that
+                                    // is the case a redial is scheduled for.
+                                    // `swap_maybe_emptied` is the honest third
+                                    // state: the unsubscribe did not answer, so
+                                    // whether the socket is empty is UNKNOWN
+                                    // here. Folding it into either of the other
+                                    // two would be a claim this code cannot
+                                    // make -- one direction hides an empty
+                                    // socket, the other pages for a socket that
+                                    // is fine.
                                     source = if lost_instruments {
                                         "swap_emptied_socket"
+                                    } else if possibly_emptied {
+                                        "swap_maybe_emptied"
                                     } else {
                                         "swap_wire_failed"
                                     },
                                     endpoint = supervisor.slot().endpoint.as_str(),
                                     pool_index = supervisor.slot().pool_index,
                                     lost_instruments,
+                                    possibly_emptied,
                                     wire_timed_out,
                                     "live subscription swap failed on the wire. The retained set \
                                      already names the new instrument, so a reconnect replay lands \
                                      the right strike. When the unsubscribe had already succeeded \
                                      the socket is now carrying NOTHING, and a redial is scheduled \
                                      here to recover it — without one, a transport-healthy socket \
-                                     keeps ponging while delivering no data."
+                                     keeps ponging while delivering no data. When the unsubscribe \
+                                     TIMED OUT instead, whether the socket is empty is unknown \
+                                     from here: no redial is scheduled, and this line is the only \
+                                     record that the question exists."
                                 );
                                 metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
                                 if wire_timed_out {
