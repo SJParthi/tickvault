@@ -7330,8 +7330,20 @@ pub fn refold_wal_frames(
                     // `WrittenOutOfSession` counts as RECOVERED, not lost, and
                     // the distinction is the whole point of the variant: the
                     // row reached the writer, only the candle was skipped
-                    // because the tick falls outside the aggregating session
-                    // (the 09:00–09:15 pre-open). Counting it as `lost` would
+                    // because the tick falls outside the aggregating session.
+                    //
+                    // **CORRECTED 2026-08-28: this named "(the 09:00-09:15
+                    // pre-open)" as the example, and that window is now IN
+                    // session.** The candle grid opens at 09:00, so a
+                    // 09:00-09:14 tick folds into a real pre-open bar and this
+                    // arm is no longer reached for it. What DOES reach here is
+                    // a tick before 09:00 or at/after 15:40 — the persistence
+                    // window is wider than the candle window at both ends.
+                    // Third stale-reachability comment corrected in this
+                    // change; a reachability claim is one grep of the gate
+                    // constant and must be re-run when written, not carried.
+                    //
+                    // Counting it as `lost` would
                     // report real recovered rows as data loss; folding it into
                     // `refolded` silently would erase the fact that no bar was
                     // produced. It is a row, so it belongs on the row side.

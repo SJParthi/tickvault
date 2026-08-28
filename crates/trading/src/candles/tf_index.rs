@@ -139,6 +139,19 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 ///    threshold derived from that counter's historical value is now measuring
 ///    a different population.
 ///
+/// A fourth, and it is a PRE-EXISTING hole this change WIDENS rather than
+/// creates. `WsFrameSpill::replay_all` is not day-scoped, and at replay time
+/// the aggregator's watermark is 0 — so the stale-trading-day gate
+/// (`exchange_timestamp / 86_400 < watermark / 86_400`) always passes on the
+/// first replayed frame. A stale frame therefore reaches the SESSION gate as
+/// its only remaining defence. Previously a stale frame stamped in
+/// [09:00, 09:15) was refused there; now it folds and opens a bucket dated on
+/// a closed day. The exposure grows from 22,500 s of the day to 23,400 s —
+/// about 4% wider, on a hole that already existed for the other 22,500. Not
+/// introduced here, not fixed here, and recorded so it is not rediscovered as
+/// new: the real fix is day-scoping the replay or seeding the watermark from
+/// the staged frames, both outside this change.
+///
 /// One more, recorded because it is correct only by arithmetic coincidence:
 /// `tf_consistency_boot::is_on_grid` re-anchors to 09:00 and therefore
 /// re-classifies rows written on the OLD grid. It survives because that
