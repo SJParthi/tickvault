@@ -1029,10 +1029,38 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     //
     // +$0.30/mo. Maximal-month projection ~$121.48 -> ~$121.78 against the
     // automatic STOP_EC2_INSTANCES line at $117.00. Same two levers, unchanged.
+    //
+    // 2026-08-28 (FOURTH): 93 -> 95, tv_depth_rows_spilled_total +
+    // tv_depth_spill_write_errors_total. `tv_depth_rows_dropped_total` is
+    // shipped AND alarmed (leg m3 of market-data-persistence-loss), and it
+    // increments on BOTH branches of `discard_pending`: at
+    // depth_persistence.rs:964 when the buffer was successfully RESCUED to the
+    // spill file, and at :991 when the rescue FAILED and the rows are
+    // permanently gone. Same series, same alarm, opposite meanings.
+    //
+    // So an operator paged by that alarm could not tell a survivable spill
+    // event from real depth data loss -- on the table whose own header
+    // measures 1.5 billion rows a session, 24x the tick volume. The tick side
+    // has exactly the same conflation and is FINE, because both of its
+    // discriminators ship: "gone forever" is `dropped - spilled`, derivable.
+    // Depth's two discriminators shipped nowhere, so the same subtraction was
+    // impossible.
+    //
+    // These two names make it possible. No new alarm: the existing loss alarm
+    // is the pager, and these are what turn its page into a diagnosis.
+    //
+    // +$0.60/mo. Maximal-month projection ~$121.78 -> ~$122.38 against the
+    // automatic STOP_EC2_INSTANCES line at $117.00. Same two levers, unchanged:
+    // the already-approved Quote 10 Elastic IP release (-$3.60/mo, which alone
+    // returns the maximal month to under the line), or an operator decision on
+    // limit_amount.
     assert_eq!(
         names.len(),
-        93,
-        "Z+ L2 VERIFY ratchet: expected exactly 93 names in the MAIN EMF \
+        95,
+        "Z+ L2 VERIFY ratchet: expected exactly 95 names in the MAIN EMF \
+         (2026-08-28 FOURTH: 93 -> 95, the two depth loss discriminators -- \
+         see the block above: without them tv_depth_rows_dropped_total cannot \
+         be read as either survivable or permanent. \
          (2026-08-28 THIRD: 92 -> 93, tv_seal_writer_drain_dropped_total -- the \
          seal-writer-dropped alarm named a metric with zero producers, so the \
          redundant pager it promised for permanent sealed-candle loss was never \
