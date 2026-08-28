@@ -1685,10 +1685,20 @@ impl LiveIngest {
         // old trade time, carrying live open interest and bid/ask. Discarding
         // it would lose the ability to tell "did not trade today" from "did
         // not capture", which is the same false-OK the 2026-08-20 fix removed.
+        // `out_of_band_timestamp` joins the candle-only set on 2026-08-28, and
+        // it is the largest of them: 2,008,916 ticks in one measured session,
+        // 2.41% of every tick decoded, previously HARD-refused with no row at
+        // all. See the arm in `multi_tf_aggregator` for why the row is safe —
+        // in one line, `row_timestamp_ist_nanos` already falls back to the
+        // receipt for an out-of-band LTT and always has, so these rows were
+        // being thrown away by the fold before reaching a writer built to
+        // take them. It is candle-only and not a full acceptance because an
+        // out-of-band second still cannot be placed in a bucket.
         let candle_only_refusal = (stats.out_of_session
             || stats.untraded_sentinel
             || stats.stale_trading_day
-            || stats.untraded_timestamp)
+            || stats.untraded_timestamp
+            || stats.out_of_band_timestamp)
             && !hard_refusal;
 
         if hard_refusal {

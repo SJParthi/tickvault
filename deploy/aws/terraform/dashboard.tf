@@ -835,7 +835,60 @@ resource "aws_cloudwatch_dashboard" "operator" {
           view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_candle_session_high_recovered_total", { label = "minute highs widened", stat = "Sum" }],
-            [local.dash_namespace, "tv_candle_session_low_recovered_total", { label = "minute lows widened", stat = "Sum" }]
+            [local.dash_namespace, "tv_candle_session_low_recovered_total", { label = "minute lows widened", stat = "Sum" }],
+            # ADDED 2026-08-28. The whole refusal family had never been
+            # EMF-selected, so this line is the FIRST time the number is
+            # visible anywhere but a 30-second log line — and the number it
+            # was hiding was 2,008,916 ticks in the measured 2026-08-27
+            # session, 2.41% of all 83,446,729 decoded, hard-refused with no
+            # row written at all.
+            #
+            # It belongs on this row rather than under the flat-at-zero
+            # heading for the same reason as its two neighbours: it is NOT
+            # expected to be zero. Ticks legitimately arrive that cannot be
+            # bucketed — a never-traded contract, a stale snapshot — and the
+            # fix landing with this widget converts the largest such class
+            # from "row thrown away" to "row kept, candle refused". So the
+            # line should be non-zero and STEADY; what matters is a step
+            # change, not the level.
+            #
+            # HONEST LIMIT: the EMF processor folds the `reason` label into
+            # one summed series per host, so this is the TOTAL across all six
+            # refusal reasons. The per-reason split stays in the
+            # AGGREGATOR-DROP-01 log line, which already carries them as
+            # separate fields.
+            [local.dash_namespace, "tv_aggregator_tick_refused_total", { label = "ticks the fold refused (all reasons)", stat = "Sum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 92
+        width  = 12
+        height = 6
+        properties = {
+          # Crash recovery, charted for the first time. All four of these were
+          # emitted and shipped nowhere, which meant a boot that recovered zero
+          # of fifty thousand captured frames looked identical to a clean one.
+          #
+          # Read them as a pair of questions, not as pass/fail lines:
+          #   recovered / refolded  - did recovery actually do anything
+          #   deferred              - is the WAL outgrowing what replay drains
+          #   unreadable segments   - a rollback to a binary that cannot parse
+          #                           the record version the last one wrote.
+          #                           This one SHOULD sit flat at zero forever;
+          #                           any non-zero reading is unrecovered
+          #                           capture, and it also raises a coded error.
+          title  = "WAL crash recovery - did the durable floor give the frames back"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_wal_replay_recovered_total", { label = "frames recovered from disk", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_wal_refolded_total", { label = "frames re-folded into candles", stat = "Sum" }],
+            [local.dash_namespace, "tv_wal_replay_deferred_segments_total", { label = "segments deferred (budget)", stat = "Sum" }],
+            [local.dash_namespace, "tv_wal_replay_unknown_magic_total", { label = "UNREADABLE segments (rollback)", stat = "Sum" }]
           ]
           period = 300
         }
