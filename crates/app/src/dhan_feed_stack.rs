@@ -1036,6 +1036,13 @@ pub struct LiveIngest {
     /// without a join would have re-created that loss one queue further out,
     /// with the batch dying in a detached thread as the process exits.
     writer_thread: Option<std::thread::JoinHandle<()>>,
+    /// The rescue thread's join handle (2026-08-28).
+    ///
+    /// Held for the same reason as `writer_thread` above: a rescue payload
+    /// still in its queue at exit is rows the producer already counted as
+    /// rescued and that never reached the spill file — the WAL-shutdown class,
+    /// one tier out. Joined on the shutdown path.
+    rescue_thread: Option<std::thread::JoinHandle<()>>,
     /// Signalled by the writer thread as its LAST act, so shutdown can wait
     /// with a bounded grace instead of a `join` that has no timeout.
     ///
@@ -1163,6 +1170,7 @@ impl LiveIngest {
             pending_rows: 0,
             writer_offloaded: false,
             writer_thread: None,
+            rescue_thread: None,
             writer_done: None,
         }
     }
@@ -1315,6 +1323,32 @@ impl LiveIngest {
                  with nothing on the other end and every flush will rescue to the spill tier"
             );
         }
+
+        // Rescue thread (2026-08-28). Separate from the writer thread above,
+        // because it exists for the two cases that thread CANNOT serve: its
+        // queue is full, or it is gone.
+        //
+        // What it takes off the drain is not small. The inline rescue did
+        // `create_dir_all`, a `read_dir` + per-entry `metadata()` walk of the
+        // spill directory AND its quarantine subdirectory, a live free-space
+        // probe (which forks `df` on its first call), and then up to 32 MiB of
+        // file write — all on the frame-drain task, and all on the same volume
+        // QuestDB is stalling on.
+        //
+        // And it fires at the worst instant BY CONSTRUCTION: the cut that
+        // calls it only trips after the hand-off queue has been full for
+        // several consecutive flushes, i.e. only when the disk is already
+        // wedged. It ran on 2026-08-28 and rescued 308,818 rows.
+        let (rescue_sink, rescue_rx) = self.writer.split_rescue_offload();
+        let rescue_handle = std::thread::Builder::new()
+            .name("tv-tick-rescue".to_owned())
+            .spawn(move || {
+                while let Ok(batch) = rescue_rx.recv() {
+                    rescue_sink.rescue(&batch);
+                }
+                info!("tick rescue thread exiting — the drain closed its queue");
+            })?;
+        self.rescue_thread = Some(rescue_handle);
         self.writer_thread = Some(handle);
         self.writer_done = Some(done_rx);
         Ok(())
@@ -1387,6 +1421,11 @@ impl LiveIngest {
                  queue was full — rescued to the tick spill tier, see the preceding coded line"
             );
         }
+        // Close the rescue queue too, and AFTER the tail flush that may have
+        // just used it. Leaves the writer in the inline state, so a rescue
+        // after this point still reaches the spill tier rather than being
+        // refused.
+        self.writer.close_rescue_offload();
         if let Some(depth) = self.depth_sink() {
             depth.close_offload_queue();
         }
@@ -1448,6 +1487,53 @@ impl LiveIngest {
         }
     }
 
+    /// Waits for the rescue thread to finish its queue.
+    ///
+    /// Shares the SAME deadline as the writer join for the same reason that
+    /// one does: `main` gives this whole task one budget, and independent
+    /// graces would sum past it. Both queues are closed before either wait, so
+    /// the threads drain in parallel and the total is the MAX, not the sum.
+    ///
+    /// A payload still queued here is rows the producer already counted as
+    /// rescued and that never reached a spill file — a real loss, so it is
+    /// counted and named rather than left to the "writer did not finish" line,
+    /// which is about a different queue.
+    pub fn shutdown_rescue_writer(&mut self, deadline: std::time::Instant) {
+        let Some(handle) = self.rescue_thread.take() else {
+            return;
+        };
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(RESCUE_JOIN_POLL);
+        }
+        if !handle.is_finished() {
+            metrics::counter!(
+                tickvault_storage::tick_persistence::TICK_RESCUE_ABANDONED_COUNTER,
+                "writer" => "tick"
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the tick RESCUE thread did not finish within the shutdown budget — a \
+                 rescued payload may never have reached the spill file. Those rows were \
+                 counted as rescued and are not in QuestDB either."
+            );
+            // Deliberately not joined after the deadline: that is the unbounded
+            // wait the budget exists to avoid.
+            return;
+        }
+        if handle.join().is_err() {
+            metrics::counter!(
+                tickvault_storage::tick_persistence::TICK_RESCUE_ABANDONED_COUNTER,
+                "writer" => "tick"
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the tick rescue thread PANICKED — a rescued payload may never have \
+                 reached the spill file."
+            );
+        }
+    }
     /// Has the blocking flush been moved off the drain task?
     #[must_use]
     // TEST-EXEMPT: accessor, exercised by the offload wiring tests below.
@@ -3371,6 +3457,9 @@ pub const OFFLOAD_SHUTDOWN_GRACE: std::time::Duration =
 /// session.
 pub const OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER: &str = "tv_offload_writer_shutdown_incomplete_total";
 
+/// How often the rescue-thread join re-checks, inside the shared deadline.
+const RESCUE_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
+
 pub const LAST_TICK_AGE_GAUGE: &str = "tv_dhan_feed_last_tick_age_secs";
 
 /// The value [`LAST_TICK_AGE_GAUGE`] publishes.
@@ -4394,6 +4483,7 @@ async fn run_frame_drain(
     ingest.close_offload_queues();
     let offload_deadline = std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE;
     ingest.shutdown_offload_writer(offload_deadline);
+    ingest.shutdown_rescue_writer(offload_deadline);
     // And the depth writer, against the SAME deadline. Its queue is closed at
     // the top of that call, so by the time the tick join above has returned the
     // depth thread has usually already drained — the total is the max of the
