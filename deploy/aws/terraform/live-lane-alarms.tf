@@ -748,8 +748,8 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
 # flip to breaching pages every evening at 17:30 and all weekend. Membership in
 # the market-hours gate's ALARM_NAMES list is what makes it safe.
 resource "aws_cloudwatch_metric_alarm" "depth_steering_stalled" {
-  alarm_name        = "tv-${var.environment}-depth-steering-stalled"
-  alarm_description = <<-EOT
+  alarm_name          = "tv-${var.environment}-depth-steering-stalled"
+  alarm_description   = <<-EOT
     Depth has stopped re-aiming. The 20-level and 200-level connections are
     still up and still delivering, but they are pointed at whatever strikes
     they held when steering stopped — so the deepest book we collect is for
@@ -881,8 +881,8 @@ resource "aws_cloudwatch_metric_alarm" "wal_replay_unknown_magic" {
   # Threshold 1 / eval 1, for the same reason as alarm 9: there is no
   # acceptable number of segments to destroy, and a second confirming window
   # only lets the boot finish destroying the rest of them.
-  period    = 300
-  statistic = "Sum"
+  period     = 300
+  statistic  = "Sum"
   dimensions = local.app_dimensions
   # UNGATED, deliberately, and this differs from most of family (5).
   # WAL replay runs at BOOT. The box boots at 08:30, before the market-hours
