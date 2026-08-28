@@ -1196,6 +1196,29 @@ async fn async_main() -> Result<()> {
     )
     .increment(0);
 
+    // The four seal-escalation counters (2026-08-28), registered for the same
+    // delta-baseline reason and NOT EMF-selected.
+    //
+    // Not selected deliberately: each EMF name costs ~$0.30/mo, and the
+    // maximal-month projection already sits above the budget's automatic
+    // `STOP_EC2_INSTANCES` line (see the COST NOTEs in
+    // dhan-rest-only-noise-lock-2026-07-14.md). Selecting four more is an
+    // operator decision with a price, not an executor's. Registering them
+    // costs nothing, keeps them honest on the local `/metrics` exporter, and
+    // means the delta baseline already exists if any of them is ever selected
+    // — the CloudWatch agent DROPS the first sample of a series it has never
+    // seen, so an unseeded counter publishes nothing on the day it first
+    // fires, which is precisely the day it matters.
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUED_COUNTER)
+        .increment(0);
+    metrics::counter!(
+        tickvault_storage::seal_writer_runner::SEAL_ESCALATION_INLINE_FALLBACK_COUNTER
+    )
+    .increment(0);
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_LOST_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER)
+        .increment(0);
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations
@@ -2983,6 +3006,40 @@ const SEAL_WRITER_SHUTDOWN_BUDGET_SECS: u64 = 75;
 const SEAL_WRITER_SHUTDOWN_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(SEAL_WRITER_SHUTDOWN_BUDGET_SECS);
 
+/// Stop flag for the `tv-seal-escalate` thread, reachable from shutdown.
+///
+/// Held in a static for exactly the reason `SEAL_WRITER_CANCEL` is: a
+/// shutdown signal that the shutdown path cannot reach is not a signal. The
+/// WAL spill writer carried the detached version of this defect until
+/// 2026-08-28 and lost every queued record at exit.
+static SEAL_ESCALATION_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// Join handle for the `tv-seal-escalate` thread.
+static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Budget for draining the seal-escalation queue at shutdown.
+///
+/// DERIVED, not guessed: the queue holds at most
+/// `SEAL_ESCALATION_QUEUE_DEPTH` (4,096) records of ~128 bytes, each costing
+/// one `write(2)`. On a healthy volume that is milliseconds; at a badly
+/// degraded ~1 ms/write it is ~4.1s, so 5s covers the case that actually
+/// fills the queue with a margin rather than a hairline.
+///
+/// Counted into the systemd `TimeoutStopSec` arithmetic by
+/// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs`, which is the
+/// only thing that keeps the four sequential budgets and the unit file from
+/// drifting apart.
+const SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS: u64 = 5;
+
+/// [`SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
+const SEAL_ESCALATION_SHUTDOWN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS);
+
+/// How often the shutdown poll re-checks whether the escalation thread is done.
+const SEAL_ESCALATION_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
+
 fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
@@ -3038,7 +3095,71 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             // sealed candle. Both installs must happen before the runner moves
             // into the spawn below, for the same reason — the handles are
             // unreachable afterwards.
-            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(runner.overflow()) {
+            // The escalation offload is split BEFORE the overflow is
+            // installed, because `set_global_seal_overflow` takes ownership
+            // and the value is unreachable afterwards — the same
+            // install-order constraint the two lines above document.
+            //
+            // What this moves off the frame-drain task (2026-08-28): all
+            // three `escalate_refused_seal` call sites in `dhan_feed_stack`
+            // run on the drain, and each was charging it a spill-writer mutex
+            // acquisition plus a `write(2)` — and, when the spill failed, a
+            // `create_dir_all`, an `open`, a `serde_json::to_string` heap
+            // allocation and four more syscalls. Stalling that thread does
+            // not merely delay a candle: Dhan skips a slow consumer forward
+            // to "the latest available state" with no sequence number, so the
+            // intermediate ticks are discarded at THEIR side, invisibly.
+            let mut overflow = runner.overflow();
+            let sink = overflow.split_escalation_offload();
+            let _ = SEAL_ESCALATION_STOP.set(sink.stop_flag());
+            match std::thread::Builder::new()
+                .name("tv-seal-escalate".to_string())
+                .spawn(move || {
+                    sink.run(|seal| {
+                        // The paging path lives in this crate, above storage,
+                        // which is why the sink takes a callback rather than
+                        // calling it directly. A seal both disk tiers refuse
+                        // still fires AGGREGATOR-DROP-01 — the page is
+                        // deferred to this thread, never dropped.
+                        let timeframe = tickvault_trading::candles::TfIndex::from_ordinal(
+                            seal.tf_ordinal as usize,
+                        )
+                        .map_or("unknown", |tf| tf.display_name());
+                        tickvault_app::seal_loss_alarm::record_lost_seal(
+                            tickvault_app::seal_loss_alarm::SealLossReason::BothDiskTiersFailed,
+                            seal.security_id,
+                            seal.exchange_segment_code,
+                            timeframe,
+                        );
+                    });
+                }) {
+                Ok(handle) => {
+                    if let Ok(mut slot) = SEAL_ESCALATION_THREAD.lock() {
+                        *slot = Some(handle);
+                    }
+                    tracing::info!(
+                        queue_depth =
+                            tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUE_DEPTH,
+                        "seal escalation thread spawned — refused seals no longer write to disk \
+                         on the frame-drain task"
+                    );
+                }
+                Err(err) => {
+                    // The sink (and its receiver) died with the closure, so
+                    // every `try_send` now returns `Disconnected` and falls
+                    // back to the inline cascade. Degraded to the
+                    // pre-2026-08-28 behaviour, never lossy — and loud,
+                    // because a silent fallback is how a fix stops applying
+                    // without anyone noticing.
+                    tracing::error!(
+                        ?err,
+                        "failed to spawn the seal escalation thread — refused seals will write \
+                         to disk INLINE on the frame-drain task (pre-offload behaviour); watch \
+                         tv_seal_escalation_inline_fallback_total"
+                    );
+                }
+            }
+            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(overflow) {
                 tracing::warn!(
                     "global seal overflow already installed (idempotent skip) — first installer wins"
                 );
@@ -4025,6 +4146,56 @@ async fn run_process_runloop(
                 "seal writer: the final drain did NOT finish within budget — exiting anyway so \
                  systemd does not SIGKILL us, but the day's tail is incomplete"
             ),
+        }
+    }
+
+    // 5b-2b. Seal escalation thread drain (2026-08-28).
+    //
+    // AFTER the seal writer, because the writer's own final drain can still
+    // escalate; BEFORE the WAL floor, which must close last. Nothing can
+    // queue here any more — the drain that feeds it stopped at 5b.
+    //
+    // This exists because the offload created a queue, and an undrained
+    // bounded queue at exit is a silent loss no counter reports. That is not
+    // hypothetical in this codebase: it is verbatim the defect 5b-3 below
+    // closes on the WAL writer, found the same day.
+    if let Some(stop) = SEAL_ESCALATION_STOP.get() {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let escalation_handle = SEAL_ESCALATION_THREAD
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(handle) = escalation_handle {
+        // Poll rather than block: `JoinHandle::join` is unbounded, and an
+        // unbounded wait inside a bounded shutdown is how systemd's
+        // TimeoutStopSec turns into a SIGKILL that destroys the very tail
+        // every budget on this path exists to save.
+        let deadline = std::time::Instant::now() + SEAL_ESCALATION_SHUTDOWN_BUDGET;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(SEAL_ESCALATION_JOIN_POLL).await;
+        }
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                error!("seal escalation thread panicked during its final drain");
+            } else {
+                info!("seal escalation: queue drained on shutdown");
+            }
+        } else {
+            // Abandoned, not joined — joining now would wait without bound.
+            // Reported rather than swallowed: whatever is still queued dies
+            // with the process, and a loss nobody counts is the false-OK this
+            // whole shutdown path was rebuilt to stop producing.
+            metrics::counter!(
+                tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
+            )
+            .increment(1);
+            error!(
+                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
+                "seal escalation: the queue did NOT drain within budget — exiting anyway so \
+                 systemd does not SIGKILL us, but seals still queued are lost"
+            );
         }
     }
 

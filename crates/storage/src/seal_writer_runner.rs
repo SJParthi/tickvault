@@ -154,6 +154,118 @@ pub fn global_seal_sender() -> Option<&'static mpsc::Sender<BufferedSeal>> {
 pub struct SealOverflow {
     spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
     dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
+    /// Bounded hand-off to the dedicated escalation thread.
+    ///
+    /// `None` until [`Self::split_escalation_offload`] runs, and `None` is the
+    /// pre-2026-08-28 behaviour: every escalation is a synchronous disk write
+    /// on whatever task called it. Once installed, an escalation costs a
+    /// channel `try_send` and the disk work happens on `tv-seal-escalate`.
+    offload: Option<std::sync::mpsc::SyncSender<SealEscalationItem>>,
+}
+
+/// Bounded depth of the escalation hand-off queue.
+///
+/// 4,096 records of ~128 bytes each is ~512 KiB of shock absorption — enough
+/// to cover a multi-second disk stall at the seal rates this path sees, and
+/// small enough that draining it at shutdown fits inside
+/// `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` even at a degraded ~1 ms/write.
+///
+/// Overflow is NOT a loss: a full queue falls back to the inline cascade,
+/// which is exactly what this path did before the offload existed. The
+/// worst case is therefore "as slow as it used to be", never "lossy".
+pub const SEAL_ESCALATION_QUEUE_DEPTH: usize = 4_096;
+
+/// How often the escalation thread wakes to re-check its stop flag while the
+/// queue is empty.
+const SEAL_ESCALATION_STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100); // APPROVED: this IS the named constant the rule asks for
+
+/// Seals handed to the escalation thread (the happy path once installed).
+pub const SEAL_ESCALATION_QUEUED_COUNTER: &str = "tv_seal_escalation_queued_total";
+
+/// Seals the queue would not take, escalated inline on the caller's task.
+/// Non-zero means the escalation thread is behind — the caller paid the disk
+/// write itself, which is the pre-offload behaviour, not a loss.
+pub const SEAL_ESCALATION_INLINE_FALLBACK_COUNTER: &str =
+    "tv_seal_escalation_inline_fallback_total";
+
+/// Seals BOTH disk tiers refused, on the escalation thread. Every one of
+/// these also fires `AGGREGATOR-DROP-01` through the caller-supplied
+/// `on_lost` hook — this counter exists so the deferred loss is countable
+/// separately from the inline one, since the caller was told `Queued`.
+pub const SEAL_ESCALATION_LOST_COUNTER: &str = "tv_seal_escalation_lost_total";
+
+/// Seals still queued when the shutdown budget expired. The thread was
+/// abandoned and those seals died with the process.
+pub const SEAL_ESCALATION_ABANDONED_COUNTER: &str = "tv_seal_escalation_abandoned_total";
+
+/// One refused seal on its way to the durable tier.
+///
+/// `SerializedSeal` is `Copy` and fixed-size, so moving it into the channel
+/// allocates nothing — the point of serialising on the caller's side rather
+/// than sending the `BufferedSeal` is that the expensive part (the disk
+/// write) is what moves, not the cheap part.
+#[derive(Clone, Copy, Debug)]
+pub struct SealEscalationItem {
+    seal: crate::seal_spill::SerializedSeal,
+    now_unix_secs: i64,
+}
+
+/// Receiving half of the escalation hand-off — owned by the dedicated
+/// `tv-seal-escalate` OS thread.
+pub struct SealEscalationSink {
+    rx: std::sync::mpsc::Receiver<SealEscalationItem>,
+    spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
+    dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SealEscalationSink {
+    /// The flag that asks the thread to drain and exit. Take a clone BEFORE
+    /// moving the sink into the thread — afterwards it is unreachable, which
+    /// is precisely the defect the WAL spill writer carried until 2026-08-28.
+    #[must_use]
+    pub fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stop)
+    }
+
+    /// Drain the queue until the sender is gone, or until the stop flag is set
+    /// AND the queue is empty.
+    ///
+    /// `on_lost` is called for a seal both disk tiers refused. It exists as a
+    /// callback rather than a direct call because the paging path
+    /// (`AGGREGATOR-DROP-01`) lives in the app crate, above this one.
+    pub fn run<F>(self, on_lost: F)
+    where
+        F: Fn(&crate::seal_spill::SerializedSeal),
+    {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::RecvTimeoutError;
+        loop {
+            match self.rx.recv_timeout(SEAL_ESCALATION_STOP_POLL) {
+                Ok(item) => {
+                    if SealOverflow::escalate_inline(
+                        &self.spill,
+                        &self.dlq,
+                        &item.seal,
+                        item.now_unix_secs,
+                    ) == OverflowOutcome::Lost
+                    {
+                        metrics::counter!(SEAL_ESCALATION_LOST_COUNTER).increment(1);
+                        on_lost(&item.seal);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Only exit on an EMPTY queue: a pending item always
+                    // returns `Ok` above, so a stop request can never cut the
+                    // drain short.
+                    if self.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
 }
 
 /// What happened to a seal the writer channel refused.
@@ -163,6 +275,17 @@ pub enum OverflowOutcome {
     Spilled,
     /// Spill failed; written to the NDJSON DLQ as recoverable text.
     DlqWritten,
+    /// Handed to the escalation thread, which owns the disk write from here.
+    ///
+    /// **Honest boundary:** this says the seal reached a bounded, in-memory
+    /// queue drained by a thread whose only job is to write it — NOT that it
+    /// is on disk yet. A seal that both disk tiers later refuse still fires
+    /// `AGGREGATOR-DROP-01` from the thread, so the operator page is not lost;
+    /// what the caller cannot know synchronously is which of its own
+    /// rescued/lost counters the seal belonged in. That split is deliberately
+    /// traded for keeping the disk off the fold path, and
+    /// [`SEAL_ESCALATION_LOST_COUNTER`] is where the deferred losses land.
+    Queued,
     /// Both disk tiers failed. THE SEAL IS LOST — the caller MUST fire
     /// `AGGREGATOR-DROP-01` (Critical, paged). This is the only remaining
     /// path by which a sealed candle can disappear, and it requires the data
@@ -177,11 +300,69 @@ impl SealOverflow {
         spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
         dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
     ) -> Self {
-        Self { spill, dlq }
+        Self {
+            spill,
+            dlq,
+            offload: None,
+        }
     }
 
-    /// Escalate one refused seal to disk. Never blocks on the network, never
-    /// awaits, never panics.
+    /// Move the disk work off the caller's task.
+    ///
+    /// **The defect this closes (found 2026-08-28).** Every one of the three
+    /// `escalate_refused_seal` call sites in `dhan_feed_stack` runs on the
+    /// frame-drain task — the per-tick fold, the 5-second catch-up sweep, and
+    /// the close force-seal. So a refused seal charged the drain a
+    /// `SealSpillWriter` mutex acquisition plus a `write(2)`, and on spill
+    /// failure a `create_dir_all`, an `open`, a `serde_json::to_string` HEAP
+    /// ALLOCATION and four more syscalls — on the one thread that empties the
+    /// socket. Dhan skips a slow consumer forward to "the latest available
+    /// state" with no sequence number, so stalling that thread loses ticks
+    /// UPSTREAM, invisibly.
+    ///
+    /// It is not a rare path either. The mutex this took is the same one the
+    /// seal writer holds on every ring eviction: measured on the prod box
+    /// 2026-08-20, `spilled: 541,519` in a single session with the ring at
+    /// 598,976/600,000. A producer-side escalation queues behind all of that.
+    ///
+    /// Idempotent by construction — a second call replaces the sender, so the
+    /// boot path installs exactly one. Returns the receiving half; the caller
+    /// spawns the thread.
+    pub fn split_escalation_offload(&mut self) -> SealEscalationSink {
+        let (tx, rx) = std::sync::mpsc::sync_channel(SEAL_ESCALATION_QUEUE_DEPTH);
+        self.offload = Some(tx);
+        SealEscalationSink {
+            rx,
+            spill: std::sync::Arc::clone(&self.spill),
+            dlq: std::sync::Arc::clone(&self.dlq),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The two-tier cascade itself: spill first (binary, compact, drained on
+    /// boot), DLQ second (NDJSON, recoverable as text by a human).
+    ///
+    /// Shared verbatim by the caller's fallback arm and the escalation thread
+    /// so the two can never drift into different durability semantics.
+    fn escalate_inline(
+        spill: &crate::seal_spill::SealSpillWriter,
+        dlq: &crate::seal_dlq::SealDlqWriter,
+        serialised: &crate::seal_spill::SerializedSeal,
+        now_unix_secs: i64,
+    ) -> OverflowOutcome {
+        if spill.append_seal(serialised, now_unix_secs).is_ok() {
+            return OverflowOutcome::Spilled;
+        }
+        let record = crate::seal_dlq::SealDlqRecord::from(serialised);
+        if dlq.append_record(&record, now_unix_secs).is_ok() {
+            return OverflowOutcome::DlqWritten;
+        }
+        OverflowOutcome::Lost
+    }
+
+    /// Escalate one refused seal to the durable tier. Never blocks on the
+    /// network, never awaits, never panics, and — once the offload is
+    /// installed — never touches the filesystem on the caller's task.
     ///
     /// `now_unix_secs` is passed in rather than read from the clock for the
     /// same reason the absorption pipeline takes it (locked decision L-H7):
@@ -189,14 +370,34 @@ impl SealOverflow {
     /// hot-path cost the design does not accept.
     pub fn escalate(&self, seal: &BufferedSeal, now_unix_secs: i64) -> OverflowOutcome {
         let serialised = crate::seal_spill::SerializedSeal::from(seal);
-        if self.spill.append_seal(&serialised, now_unix_secs).is_ok() {
-            return OverflowOutcome::Spilled;
+        if let Some(tx) = self.offload.as_ref() {
+            let item = SealEscalationItem {
+                seal: serialised,
+                now_unix_secs,
+            };
+            match tx.try_send(item) {
+                Ok(()) => {
+                    metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER).increment(1);
+                    return OverflowOutcome::Queued;
+                }
+                // Full: the thread is behind. Disconnected: it died. Either
+                // way the seal is still in hand, so it takes the inline route
+                // rather than being dropped — degraded, never lossy.
+                Err(
+                    std::sync::mpsc::TrySendError::Full(item)
+                    | std::sync::mpsc::TrySendError::Disconnected(item),
+                ) => {
+                    metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1);
+                    return Self::escalate_inline(
+                        &self.spill,
+                        &self.dlq,
+                        &item.seal,
+                        item.now_unix_secs,
+                    );
+                }
+            }
         }
-        let record = crate::seal_dlq::SealDlqRecord::from(&serialised);
-        if self.dlq.append_record(&record, now_unix_secs).is_ok() {
-            return OverflowOutcome::DlqWritten;
-        }
-        OverflowOutcome::Lost
+        Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
     }
 }
 
@@ -977,5 +1178,227 @@ mod tests {
              would mean a later install can replace the tier producers already hold"
         );
         cleanup(&spill, &dlq);
+    }
+
+    // ---------------------------------------------------------------
+    // Escalation offload — taking the disk off the frame-drain task
+    // (2026-08-28)
+    //
+    // All three `escalate_refused_seal` call sites in `dhan_feed_stack` run
+    // on the drain: the per-tick fold, the 5-second catch-up sweep, and the
+    // close force-seal. Each was paying a spill-writer mutex plus a
+    // `write(2)` there — and, on spill failure, a `create_dir_all`, an
+    // `open`, a `serde_json::to_string` heap allocation and four more
+    // syscalls. That thread is the only one emptying the socket, and Dhan
+    // skips a slow consumer forward with no sequence number, so stalling it
+    // loses ticks upstream where no counter of ours can see them.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_split_escalation_offload_queues_instead_of_writing_on_the_caller() {
+        let (spill, dlq) = temp_pair("escalate-queues");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        // Hold the sink so the receiver stays alive; do NOT run it, so
+        // nothing can have reached disk by the time we assert.
+        let _sink = overflow.split_escalation_offload();
+
+        let outcome =
+            overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200, 101.5), jan1_noon_utc());
+
+        assert_eq!(
+            outcome,
+            OverflowOutcome::Queued,
+            "with the offload installed the caller must hand the seal over, not write it"
+        );
+        let wrote_something = std::fs::read_dir(&spill)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
+            })
+            .unwrap_or(false);
+        assert!(
+            !wrote_something,
+            "nothing may reach disk on the caller's task — that is the whole point of the \
+             offload, and a file here means the drain is still paying for the write"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_full_queue_falls_back_inline_and_never_drops_the_seal() {
+        // The bounded queue is a shock absorber, not a bin. When it is full
+        // the seal is still in hand, so it takes the old inline route:
+        // degraded to the pre-offload cost, never lossy.
+        let (spill, dlq) = temp_pair("escalate-full");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let _sink = overflow.split_escalation_offload(); // never drained
+
+        let now = jan1_noon_utc();
+        for i in 0..SEAL_ESCALATION_QUEUE_DEPTH {
+            let seal = mk_seal(13, 0, TfIndex::M1, 34_200 + i as u32, 101.5);
+            assert_eq!(
+                overflow.escalate(&seal, now),
+                OverflowOutcome::Queued,
+                "the queue must accept its full declared depth before falling back"
+            );
+        }
+        // One past the cap.
+        let outcome = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 99_999, 101.5), now);
+        assert_eq!(
+            outcome,
+            OverflowOutcome::Spilled,
+            "a full queue must escalate INLINE — a refusal here would be the silent drop the \
+             whole no-drop policy exists to prevent"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_disconnected_sink_falls_back_inline_rather_than_losing_the_seal() {
+        // The thread-spawn-failure shape: the sink (and its receiver) is
+        // dropped, so every `try_send` returns `Disconnected`. Boot logs this
+        // loudly; behaviour must degrade to the inline cascade, not to a
+        // discard.
+        let (spill, dlq) = temp_pair("escalate-disconnected");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        drop(overflow.split_escalation_offload());
+
+        assert_eq!(
+            overflow.escalate(&mk_seal(25, 0, TfIndex::M1, 34_260, 99.0), jan1_noon_utc()),
+            OverflowOutcome::Spilled,
+            "a dead escalation thread must not turn a rescue into a loss"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn the_escalation_thread_writes_every_seal_it_was_handed() {
+        let (spill, dlq) = temp_pair("escalate-thread-writes");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+        let handle = std::thread::spawn(move || sink.run(|_| {}));
+
+        let now = jan1_noon_utc();
+        for i in 0..64u32 {
+            assert_eq!(
+                overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i, 101.5), now),
+                OverflowOutcome::Queued
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("escalation thread must not panic");
+
+        let bytes: u64 = std::fs::read_dir(&spill)
+            .expect("spill dir readable")
+            .filter_map(Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        assert_eq!(
+            bytes,
+            64 * crate::seal_spill::SEAL_SPILL_RECORD_SIZE as u64,
+            "the thread must land exactly the 64 records it was handed — a short file is the \
+             deferred-loss case this offload must never introduce"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_stop_flag_never_cuts_a_pending_drain_short() {
+        // The shutdown contract: stop means "drain and exit", not "exit".
+        // Set the flag BEFORE the thread ever runs, with a full queue behind
+        // it — every record must still land. A `try_recv`-based loop that
+        // checked the flag first would fail this, which is exactly the
+        // detached-writer defect the WAL spill carried until 2026-08-28.
+        let (spill, dlq) = temp_pair("escalate-stop-drains");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+
+        let now = jan1_noon_utc();
+        for i in 0..32u32 {
+            assert_eq!(
+                overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i, 101.5), now),
+                OverflowOutcome::Queued
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        sink.run(|_| {});
+
+        let bytes: u64 = std::fs::read_dir(&spill)
+            .expect("spill dir readable")
+            .filter_map(Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        assert_eq!(
+            bytes,
+            32 * crate::seal_spill::SEAL_SPILL_RECORD_SIZE as u64,
+            "a stop request must drain the queue first — anything less is a silent loss at \
+             every shutdown"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn the_thread_reports_a_seal_both_disk_tiers_refused() {
+        // The caller was told `Queued`, so the AGGREGATOR-DROP-01 page can
+        // only come from here. If this callback stopped firing, a genuinely
+        // lost candle would leave no page at all — strictly worse than the
+        // inline version it replaced.
+        let (spill, dlq) = temp_pair("escalate-thread-lost");
+        // Make BOTH tiers unwritable: a plain file where a directory belongs.
+        cleanup(&spill, &dlq);
+        std::fs::write(&spill, b"not a directory").expect("write blocker");
+        std::fs::write(&dlq, b"not a directory").expect("write blocker");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+
+        assert_eq!(
+            overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200, 101.5), jan1_noon_utc()),
+            OverflowOutcome::Queued
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&lost);
+        sink.run(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert_eq!(
+            lost.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a seal both tiers refused must reach the on_lost hook — that hook IS the page"
+        );
+        let _ = std::fs::remove_file(&spill);
+        let _ = std::fs::remove_file(&dlq);
+    }
+
+    #[test]
+    fn the_queue_depth_is_drainable_inside_the_shutdown_budget() {
+        // Arithmetic pin, not a wall-clock measurement. The shutdown budget
+        // is 5s and each queued record costs one ~128-byte `write(2)`; at a
+        // badly degraded 1ms/write the full queue takes
+        // SEAL_ESCALATION_QUEUE_DEPTH milliseconds. Raising the depth without
+        // raising the budget (which the systemd guard would then catch) makes
+        // the shutdown drain unable to finish, and an undrained bounded queue
+        // at exit is a silent loss.
+        const DEGRADED_WRITE_MICROS: usize = 1_000;
+        const BUDGET_MICROS: usize = 5 * 1_000_000;
+        assert!(
+            SEAL_ESCALATION_QUEUE_DEPTH * DEGRADED_WRITE_MICROS < BUDGET_MICROS,
+            "SEAL_ESCALATION_QUEUE_DEPTH = {SEAL_ESCALATION_QUEUE_DEPTH} cannot drain inside \
+             the 5s SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS at a degraded 1ms/write. Raise the \
+             budget in main.rs (and the systemd TimeoutStopSec the guard derives from it), \
+             or lower the depth."
+        );
     }
 }

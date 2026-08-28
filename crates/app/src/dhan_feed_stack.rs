@@ -5865,7 +5865,16 @@ fn ws_lag_handles() -> &'static WsLagHandles {
 /// What happened to a sealed candle the writer channel would not take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealRefusal {
-    /// Written to the spill or the DLQ. Recovered by the boot drain.
+    /// Handed to the durable tier — written to the spill or the DLQ, or
+    /// queued to the `tv-seal-escalate` thread that owns those writes.
+    ///
+    /// Since 2026-08-28 the queued case is the normal one, so `Rescued` means
+    /// "the seal left the fold path into a bounded queue whose only consumer
+    /// writes it to disk", not "it is on disk". A seal both disk tiers later
+    /// refuse still fires AGGREGATOR-DROP-01 from that thread and lands in
+    /// `tv_seal_escalation_lost_total`; what is genuinely lost is the ability
+    /// to attribute it to THIS call site synchronously. That is the price of
+    /// keeping a `write(2)` off the one thread that empties the socket.
     Rescued,
     /// Neither disk tier accepted it. The candle is gone.
     Lost,
@@ -5930,9 +5939,8 @@ pub fn escalate_refused_seal(seal: &tickvault_trading::candles::BufferedSeal) ->
     };
     match overflow.escalate(seal, now_unix_secs) {
         tickvault_storage::seal_writer_runner::OverflowOutcome::Spilled
-        | tickvault_storage::seal_writer_runner::OverflowOutcome::DlqWritten => {
-            SealRefusal::Rescued
-        }
+        | tickvault_storage::seal_writer_runner::OverflowOutcome::DlqWritten
+        | tickvault_storage::seal_writer_runner::OverflowOutcome::Queued => SealRefusal::Rescued,
         tickvault_storage::seal_writer_runner::OverflowOutcome::Lost => {
             // Both disk tiers refused — the case AGGREGATOR-DROP-01 was
             // written for. The consumer-side triple-failure already pages
