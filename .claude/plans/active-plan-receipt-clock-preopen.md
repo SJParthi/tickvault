@@ -27,16 +27,62 @@ Replay accepts all three magics; `TVW1`/`TVW2` records replay with `0`, which th
 persistence layer already maps to NULL — a missing timestamp, never a false one.
 No data migration. Cost: 8 bytes/frame and one clock read per frame.
 
-### W2 — Bucket every candle on `received_at`
+### W2 — Bucket every candle on `received_at` ✅ SHIPPED 2026-08-28
 
-`AggregatorCell::fold` currently buckets on `tick.exchange_timestamp`. Switch to
-the receipt clock, converted to IST seconds-of-day. This is a single bucketing
-call plus the gates and watermarks that read the same field.
+`AggregatorCell::fold` bucketed on `tick.exchange_timestamp`. It now buckets on
+`fold_clock_ist_secs(exchange_timestamp, received_at_nanos)` — the receipt clock
+with the exchange stamp as fail-soft fallback — and so do the seven other sites
+that must agree with it: the watermark, the stale-trading-day gate, the session
+gate, `last_observed_ts`, `close_ts_ist_secs` at bucket open, the in-bucket close
+guard, and the late-refold close guard.
 
-Receipt is monotone per drain, and replay runs strictly before any socket opens,
-so the late-arrival/refold policy becomes structurally unreachable. It is
-**retained and counted, not deleted** — a policy that flatlines is evidence the
-switch worked; a deleted one leaves no way to detect a violated assumption.
+**The guard is on the DELTA, not on an absolute band, and that is what made W2
+safe to ship BEFORE W1b.** A replayed WAL frame carries a re-stamped `received_at`
+that is a perfectly sane epoch — an absolute plausibility band waves it straight
+through — but its delta against the trade stamp is hours, so it falls back and
+lands in the bar it originally belonged to. That converts W1b from a blocker into
+an accuracy improvement.
+
+**Hot-path shape (O(1), zero-alloc).** `fold_secs` is derived ONCE per tick above
+the timeframe loop and threaded down, exactly like `prices` and
+`cumulative_volume`. An adversarial O(1) audit caught the first draft recomputing
+it 48× per tick — the same hoisting defect this module recorded on 2026-08-10 —
+and the fix is pinned by the module's own stated contract. DHAT re-run with a
+non-zero receipt in the fixture: still zero-alloc.
+
+**⚠ THE HONEST LIMIT, and it is not the one the first draft claimed.** The
+justification originally written into `fold_clock_ist_secs` was the DORMANT
+CONTRACT: a sleepy option's trade stamp is hours old, so bucketing on it files a
+live snapshot into a bar dated hours ago. **That was FALSE.** The delta guard
+refuses any receipt more than `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) past the
+trade, so a stale snapshot falls back and nothing changes for it. The test written
+to demonstrate the claim FAILED, which is how it was caught, and the boundary is
+now pinned as a test rather than asserted in prose
+(`receipt_clock_end_to_end_tests::a_stale_snapshot_still_buckets_on_its_trade_stamp`).
+
+What W2 actually corrects is **delivery lag inside the band** — measured p50 1.4s,
+p99 46s on this feed — which is precisely where a minute boundary gets crossed on
+an ordinary day: a trade printed 09:29:59 and delivered 09:30:01 now files into
+the 09:30 bar a live decision is reading, instead of the 09:29 bar it had already
+left. Widening that scope needs the real receipt carried through the WAL record
+(W1b), because until then a large positive delta is indistinguishable from a
+replay.
+
+**Coverage gap closed in the same change.** Every candle fixture in the workspace
+left `received_at_nanos` at its `Default` 0 — the sentinel — so the whole suite
+had been exercising the FALLBACK and passing "by construction, not by agreement".
+Four end-to-end tests now drive a non-zero receipt through a real fold: the
+minute-boundary case, the stale-snapshot limit, the replay fallback, and close
+ownership by last-received packet.
+
+**One site deliberately NOT moved:** the day-OHLC session gate in
+`day_ohlc_orchestrator.rs`. Moving it admitted pre-open auction prints into day
+HIGH/LOW/CLOSE at the p50 lag — i.e. every trading day — which the 2026-08-25
+scope lock REJECTs explicitly, and dropped genuine 15:29:5x prints at the other
+edge. "Is this a regular-session trade" is a property of the TRADE, so it is
+judged on the trade's clock. Day high/low is a running max/min, which has no clock
+dependence; the ordering that does have one moved to the receipt clock in the
+aggregator, where it belongs.
 
 ### W3 — Candle session opens at 09:00
 
@@ -185,9 +231,48 @@ needs its own dated authorization under the noise lock.
     into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
     callers. Stated plainly because a record format that is present but
     unpopulated reads, from the outside, exactly like a working one.
-  - Files: `crates/app/src/main.rs` (~:893-897),
-    `crates/app/src/dhan_feed_stack.rs` (`FrameSink::accept`,
-    `refold_wal_frames` ~:6982 which re-stamps `Utc::now()`)
+  - Files: `crates/storage/src/ws_frame_spill.rs` (the writer thread),
+    `crates/core/src/websocket/pool_supervisor.rs` (`WalRingSink::accept` —
+    signature only), `crates/app/src/main.rs` (~:893-897),
+    `crates/app/src/dhan_feed_stack.rs` (`refold_wal_frames`, which re-stamps
+    `Utc::now()` on replay)
+
+  - **⚠ THE OBVIOUS IMPLEMENTATION IS FORBIDDEN, and this is the single most
+    important note in this plan.** The natural move — have `WalRingSink::accept`
+    read `Utc::now()` and pass it to `append_with_seq_at` — **breaks a
+    deliberate, tested safety property**. `pool_supervisor.rs` is banned from
+    reading the wall clock at all, enforced by
+    `test_pool_supervisor_source_never_reads_the_wall_clock`, and the ban is
+    load-bearing rather than stylistic: the supervisor's ladder, its token
+    expiry and its backoff are all monotonic **so that an NTP step cannot
+    expire all sixteen sockets at once**. The file's own doc states the ban is
+    blanket on purpose *"so nobody has to re-litigate it per call site"*.
+    `CapturedFrame::received_at` is therefore an `Instant`, not a wall time,
+    and there is no epoch value at that site to write.
+
+  - **The design that satisfies both constraints** — and it is the pattern the
+    supervisor's own doc already prescribes (*"the consumer derives the
+    wall-clock receipt instant by subtracting `elapsed()` from its own clock
+    read"*):
+    1. `WalRingSink::accept` passes the monotonic `Instant` through to the
+       spill channel. It still never reads the wall clock, so the ban and its
+       test are untouched.
+    2. The **WAL writer thread** — which already runs off the hot path and is
+       already permitted a clock — converts at write time:
+       `receipt_nanos = now_wall - instant.elapsed()`.
+    3. `plausible_receipt_nanos` (already shipped) clamps the result, so a
+       clock step between receipt and write degrades to the `0` sentinel
+       rather than to a confident lie.
+    This costs **zero** additional reads on the capture path, keeps the
+    conversion accurate across a clock step landing between receipt and write,
+    and leaves the NTP-safety property exactly as it is.
+
+  - **Rejected alternatives, recorded so they are not re-proposed:** reading
+    the wall clock in `accept` (breaks the ban); anchoring once at boot to a
+    (wall, instant) pair and adding the delta (survives an NTP step but drifts
+    against it, and a long session drifts unboundedly); serialising the raw
+    `Instant` (meaningless across processes, which is the whole point of the
+    replay path).
 
 - [ ] **W2** Candles bucket on `received_at`  *(REMAINING — blocked on W1b)*
   - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
