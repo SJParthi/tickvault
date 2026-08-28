@@ -2417,6 +2417,25 @@ pub struct PartitionRetentionConfig {
     /// instead of exporting in a loop forever.
     #[serde(default = "default_pressure_max_passes")]
     pub pressure_max_passes: u32,
+    /// One trading session's disk burn, in bytes — the runway trigger's only
+    /// input, and `0` (the default) leaves that trigger switched OFF.
+    ///
+    /// Every other threshold in this struct is a PERCENTAGE of the volume, and
+    /// 2026-08-28 proved that is the wrong unit for deciding whether the next
+    /// session survives. That day burned 138 GB and ended at 55% free: a
+    /// healthy-looking disk roughly one session from full, with the shed gate
+    /// (which arms at 15% free) never coming close. Worse, growing the volume
+    /// pushes every percentage threshold FURTHER AWAY in bytes while the daily
+    /// burn is unchanged — so the obvious remedy disarms the safety net.
+    ///
+    /// Set to the MEASURED burn of a real session, never an estimate: the
+    /// number decides what the box stops capturing, and a guess that is too
+    /// large sheds depth on an ordinary afternoon. Leaving it at `0` keeps
+    /// behaviour byte-identical to the percentage-only gate.
+    ///
+    /// See `tickvault_common::ingest_shed::SESSION_BURN_BYTES_DEFAULT`.
+    #[serde(default = "default_ingest_shed_session_burn_bytes")]
+    pub ingest_shed_session_burn_bytes: u64,
 }
 
 impl Default for PartitionRetentionConfig {
@@ -2435,8 +2454,17 @@ impl Default for PartitionRetentionConfig {
             pressure_hot_days: default_pressure_hot_days(),
             pressure_min_interval_secs: default_pressure_min_interval_secs(),
             pressure_max_passes: default_pressure_max_passes(),
+            ingest_shed_session_burn_bytes: default_ingest_shed_session_burn_bytes(),
         }
     }
+}
+
+/// The runway trigger ships INERT: an unmeasured burn must never decide
+/// what the box stops capturing.
+const fn default_ingest_shed_session_burn_bytes() -> u64 {
+    // Re-exported rather than restated, so the config default and the
+    // decision function that reads it can never drift apart.
+    crate::ingest_shed::SESSION_BURN_BYTES_DEFAULT
 }
 
 /// Default retention: 90 days of hot data.
