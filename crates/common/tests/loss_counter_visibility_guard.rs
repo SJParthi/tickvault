@@ -115,10 +115,11 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     //                  plausible-sounding wrong reason is worse than an honest
     //                  "not yet examined", because it stops the next person
     //                  from examining it.
-    (
-        "tv_aggregator_tick_refused_total",
-        "periodic report — the refusal arm is per-tick and cannot log (flood risk under a bad-data burst); the lane counts it and the 30s drain timer reports the delta with a coded error! (wired 2026-08-12)",
-    ),
+    // REMOVED 2026-08-28: `tv_aggregator_tick_refused_total` is now in the EMF
+    // selector and charted, so the "a periodic report is good enough" exemption
+    // no longer applies. The exemption was written when the counter was
+    // unreachable from CloudWatch; it stayed while the counter recorded a
+    // 2.4%-of-every-tick hard refusal that nobody could see. It ships now.
     (
         "tv_chain1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
