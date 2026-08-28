@@ -26,6 +26,7 @@
 
 const MAIN_RS: &str = include_str!("../src/main.rs");
 const LIVE_UNIVERSE_RS: &str = include_str!("../src/dhan_live_universe.rs");
+use tickvault_app::dhan_live_universe::MAPPING_WAIT_DEADLINE_SECS;
 
 /// Strip `//` line comments so a prose mention of a symbol cannot satisfy a
 /// scan that is meant to find real code.
@@ -229,5 +230,66 @@ fn the_wait_budget_is_not_the_stale_nine_second_figure() {
          for the same work; a lane budget far below it means the lane gives up while the \
          build it is waiting for is still healthy and running. If you lower this, re-measure \
          the build first and say so here."
+    );
+}
+
+/// The deploy's readiness gate must accommodate the wait budget above.
+///
+/// Added 2026-08-27, after deploy run 33029989145 reported FAILURE on a
+/// perfectly healthy binary. `deploy-aws.yml` polls `systemctl is-active`
+/// for 300 s and then declares "app likely never sent READY=1"; the app's
+/// documented worst-case boot wait — `MAPPING_WAIT_DEADLINE_SECS`, right
+/// above — is **600 s**. 600 > 300, so the gate can condemn a boot the app
+/// itself considers healthy and still inside its own budget.
+///
+/// It normally does not bite, and that is exactly why it went unnoticed: on
+/// a routine morning the rider writes the artifact in about **2.4 seconds**
+/// (measured 2026-08-26 — armed 08:31:01.46, ready 08:31:03.89, READY=1 at
+/// 08:31:03.89). The full budget is only spent when the rider genuinely
+/// cannot build — deploying at 07:00 IST, before the vendor publishes the
+/// day's master, is one real case, and it is the one that produced a 🆘 page,
+/// a skipped provenance write, and an auto-stopped service on a deploy whose
+/// binary had already swapped in and booted.
+///
+/// This pins the RELATIONSHIP rather than either number, so moving the app's
+/// budget moves the requirement with it.
+#[test]
+fn the_deploy_readiness_gate_outlasts_the_boot_wait_budget() {
+    let workflow = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/deploy-aws.yml"),
+    )
+    .expect("read .github/workflows/deploy-aws.yml");
+
+    // The gate is `for i in $(seq 1 N); do ... sleep S; done` on one line.
+    let gate = workflow
+        .lines()
+        .find(|l| l.contains("READY_OK=no") && l.contains("seq 1 "))
+        .expect(
+            "deploy-aws.yml no longer has the READY_OK readiness poll. If it was renamed, \
+             re-point this guard; if it was removed, the app's boot budget is unguarded.",
+        );
+
+    let polls: u64 = gate
+        .split("seq 1 ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("could not read the poll COUNT out of the READY_OK loop");
+    let sleep_secs: u64 = gate
+        .rsplit("sleep ")
+        .next()
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("could not read the SLEEP interval out of the READY_OK loop");
+
+    let gate_secs = polls * sleep_secs;
+    assert!(
+        gate_secs > MAPPING_WAIT_DEADLINE_SECS,
+        "the deploy readiness gate is {gate_secs}s but the app's documented worst-case boot \
+         wait is {MAPPING_WAIT_DEADLINE_SECS}s. A deploy would report FAILED — 🆘 page, \
+         skipped provenance write, auto-stopped service — on a binary that swapped in \
+         cleanly and is still inside its own budget. Raise the poll count in \
+         deploy-aws.yml, or lower MAPPING_WAIT_DEADLINE_SECS; do not delete this test."
     );
 }

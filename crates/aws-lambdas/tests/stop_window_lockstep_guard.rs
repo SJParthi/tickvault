@@ -1,8 +1,8 @@
 //! Build-failing ratchet pinning the **evening stop-window lockstep**.
 //!
 //! The operator's 9-hour trading window is 08:30–17:30 IST (operator Quote 14,
-//! 2026-08-08 — the stop moved 16:30 → 17:30; the START is unchanged). Four
-//! places encode the evening edge, and **three of them will actively fight the
+//! 2026-08-08 — the stop moved 16:30 → 17:30; the START is unchanged). FIVE
+//! places encode the evening edge, and **four of them will actively fight the
 //! schedule if they disagree** — this is not a cosmetic consistency test:
 //!
 //! | Site | If it stays at the old time |
@@ -11,6 +11,7 @@
 //! | `hard_stop_guard::in_up_window` | runs HOURLY and **force-stops** any box outside its window → kills the box at 17:00, pages, and silently cancels the extra hour |
 //! | `start_watchdog::OPERATING_CLOSE_IST_MINUTES` | the curfew guard **stops** the box 30 min early |
 //! | `start_watchdog::STOP_TRIGGER_UTC_HOUR` + its cron | stop-verify fires 45 min BEFORE the stop → a false "auto-stop FAILED" page every trading day |
+//! | `.github/workflows/deploy-aws.yml` (2 branches) | a deploy that self-started the box **stops it again inside the window**, and a box down during a paid hour is reported as "intentionally stopped" |
 //!
 //! So a partial edit does not merely look inconsistent — it produces either a
 //! prematurely-killed box or a guaranteed daily false page. A comment cannot
@@ -274,4 +275,75 @@ fn operator_facing_stop_times_are_in_lockstep() {
          operator-facing body (operator widened the window to 5:30 PM IST on \
          2026-08-08, Quote 14)."
     );
+}
+
+/// The FIFTH site: `.github/workflows/deploy-aws.yml`.
+///
+/// Added 2026-08-27. The four sites this file was written for all live under
+/// `deploy/aws/terraform/**` or `crates/aws-lambdas/src/**`, and every path this
+/// guard reads is one of those two. The deploy workflow encodes the SAME evening
+/// edge in two live `sh` branches and was never scanned, so it kept the old
+/// 16:30 for nineteen days after operator Quote 14 moved the window.
+///
+/// Both branches decide something real:
+///
+/// | Branch | With the old 16:30 |
+/// |---|---|
+/// | `UP_WINDOW` (stopped-box decision) | a box that is down during a PAID hour is classified "intentionally stopped": the deploy skips GREEN and SILENT — a false-OK |
+/// | the auto-stop guard | a dispatch-deploy that self-started the box **stops it again at e.g. 17:00**, inside the window, under a comment reading "NEVER stop during the trading window" |
+///
+/// The expected boundary is DERIVED from this file's own `STOP_IST_*` constants,
+/// so moving the window moves this assertion with it and cannot drift again.
+#[test]
+fn deploy_workflow_encodes_the_same_evening_edge() {
+    let wf = read(&repo_root().join(".github/workflows/deploy-aws.yml"));
+    let expected = STOP_IST_HOUR * 100 + STOP_IST_MINUTE;
+
+    // Only LIVE shell lines count. A comment carrying an old figure is stale
+    // prose, not a decision, and this guard exists for decisions.
+    let live: Vec<(usize, &str)> = wf
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l))
+        .filter(|(_, l)| !l.trim_start().starts_with('#'))
+        // Select ONLY the up-window branches. The file also carries the
+        // market-hours BLACKOUT guard (`-ge 900 ... -lt 1545`), which is a
+        // different window and must NOT be dragged to the stop edge — an
+        // earlier draft of this filter caught it and would have failed on a
+        // correct line. The up-window's START (08:30) is what distinguishes
+        // them, and Quote 14 left that start unchanged.
+        .filter(|(_, l)| l.contains("$HHMM") && l.contains("-ge 830"))
+        .collect();
+
+    assert!(
+        live.len() >= 2,
+        "expected at least the two window branches in deploy-aws.yml (UP_WINDOW and the \
+         auto-stop guard); found {} — if a branch was removed, remove it here too rather \
+         than weakening the count",
+        live.len()
+    );
+
+    for (lineno, line) in &live {
+        assert!(
+            line.contains(&format!("-le {expected}")),
+            "deploy-aws.yml:{lineno} compares against the wrong evening edge — the window \
+             closes at {STOP_IST_HOUR}:{STOP_IST_MINUTE:02} IST, so this must read \
+             `-le {expected}`. Line: {}",
+            line.trim()
+        );
+    }
+
+    // Belt and braces: no live line anywhere may carry the retired figure.
+    for (i, line) in wf.lines().enumerate() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        assert!(
+            !line.contains("1630"),
+            "deploy-aws.yml:{} still carries the retired 16:30 IST edge on a LIVE line. \
+             Operator Quote 14 (2026-08-08) moved the window to 17:30. Line: {}",
+            i + 1,
+            line.trim()
+        );
+    }
 }
