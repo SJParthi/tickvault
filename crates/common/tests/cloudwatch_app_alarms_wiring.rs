@@ -1113,8 +1113,22 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        99,
-        "Z+ L2 VERIFY ratchet: expected exactly 99 names in the MAIN EMF \
+        104,
+        "Z+ L2 VERIFY ratchet: expected exactly 104 names in the MAIN EMF \
+         (2026-08-29 EIGHTH: 99 -> 104, the five seal-escalation/spill counters. \
+         The producer-side durable tier for sealed candles was moved off the \
+         frame drain on 2026-08-28 and NONE of its counters reached CloudWatch, \
+         so the tier could degrade or fail silently. tv_seal_escalation_inline_\
+         fallback_total is the one that matters most: non-zero means the offload \
+         STOPPED APPLYING and disk writes are back on the drain -- the exact \
+         regression the offload exists to prevent, previously invisible. \
+         +$1.50/mo, maximal month ~$123.48 -> ~$124.98. HONEST: that is ~$8 \
+         ABOVE the automatic STOP_EC2_INSTANCES line at $117 (90%% of the $130 \
+         limit_amount), though still under the operator hard cap of $150 raised \
+         2026-08-25. The live account is far below both (Aug MTD $48.87). The \
+         already-approved Elastic IP release (-$3.60/mo) alone puts the maximal \
+         month back under the stop line; limit_amount is NOT changed here -- \
+         that is a three-site lockstep needing its own dated quote. \
          (2026-08-28 SEVENTH: 98 -> 99, tv_offload_writer_shutdown_incomplete_total -- an abandoned writer-join queue, roughly 50,000 depth rows, moved NO counter; see the block above. (2026-08-28 SIXTH: 96 -> 98, tv_tick_spill_replay_quarantined_total \
          + tv_wal_catchup_budget_exhausted_total. Both reported PERMANENT or \
          soon-permanent tick loss and both reached zero operator surfaces; \
