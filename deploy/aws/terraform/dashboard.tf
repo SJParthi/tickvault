@@ -957,9 +957,21 @@ resource "aws_cloudwatch_dashboard" "operator" {
           title  = "Resource headroom"
           region = local.dash_region
           view   = "timeSeries"
+          # tv_subsystem_memory_estimated_bytes was charted here until
+          # 2026-08-29 and had NEVER emitted a single datapoint: every one of
+          # its six per-component gauges is initialised to f64::NAN and is
+          # overwritten only by a registered source closure, and
+          # SubsystemMemorySampler::register_source has ZERO production call
+          # sites (its last two died with the TickStorage/PrevDayCache sweep on
+          # 2026-07-19). NaN is correctly dropped by the agent, so the line was
+          # structurally incapable of drawing. An always-empty line on a
+          # "Resource headroom" panel reads as "memory is fine", which is worse
+          # than no line at all. Process memory IS charted, live, on the
+          # "Host + process health" panel above (tv_process_rss_bytes).
+          # Re-add this line only together with a real register_source call
+          # site -- subsystem_memory_emf_guard.rs enforces that pairing.
           metrics = [
-            [local.dash_namespace, "tv_open_fds", { label = "open file descriptors", stat = "Maximum" }],
-            [local.dash_namespace, "tv_subsystem_memory_estimated_bytes", { label = "estimated memory by subsystem (bytes)", stat = "Maximum" }]
+            [local.dash_namespace, "tv_open_fds", { label = "open file descriptors", stat = "Maximum" }]
           ]
           period = 300
         }

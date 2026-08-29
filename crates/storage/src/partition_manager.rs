@@ -594,10 +594,28 @@ pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
 /// `table` is the same trusted-constant class as the day builder: it comes
 /// from `ARRIVAL_STAMPED_HOUR_TABLES`, never from external input.
 pub(crate) fn build_detach_list_sql_hours(table: &str, cutoff_hours: u32) -> String {
+    // `now()` is UTC. `minTimestamp` on these tables is IST-SHIFTED — the
+    // stamping sites add IST_UTC_OFFSET_NANOS, which `depth_persistence`'s own
+    // header records as a deliberate 2026-08-19 correction. Comparing the two
+    // frames directly makes the real cutoff N + 5.5 hours.
+    //
+    // At the shipped `depth_hot_hours = 4` that is 9.5 hours, so an hour of
+    // depth written at 09:00 IST first becomes eligible at 18:30 IST — an hour
+    // AFTER the box stops. The mid-session reclaim this function exists for
+    // could never fire once, and a pressure episode at 14:00 selected ZERO
+    // partitions while the disk filled.
+    //
+    // Shifting `now()` into the same IST frame as the data is the whole fix.
+    // The DAY twin above carries the identical bias and absorbs it — 5.5 hours
+    // against a 1-day unit is noise — which is exactly why it went unnoticed
+    // until the unit shrank to hours and the bias became larger than the
+    // window itself.
     format!(
         "SELECT name, active FROM table_partitions('{}') \
-         WHERE minTimestamp < dateadd('h', -{}, now())",
-        table, cutoff_hours
+         WHERE minTimestamp < dateadd('h', -{}, dateadd('s', {}, now()))",
+        table,
+        cutoff_hours,
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS
     )
 }
 

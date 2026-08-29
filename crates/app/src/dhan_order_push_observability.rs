@@ -356,6 +356,18 @@ pub fn spawn_dhan_order_push_consumer(
     first_rx: broadcast::Receiver<OrderUpdate>,
     events_tx: Option<mpsc::Sender<OrderUpdateEventRecord>>,
 ) -> tokio::task::JoinHandle<()> {
+    // Seed the channel-drop and respawn series as the consumer is spawned.
+    // Both fire only on failure, so without this the first drop and the first
+    // respawn are the samples the agent discards as an unseen series — and
+    // "no events dropped" would be indistinguishable from "this consumer was
+    // never spawned", which is the state whenever the order-push channel is
+    // disabled.
+    for reason in ["full", "closed"] {
+        metrics::counter!("tv_order_update_events_dropped_total", "reason" => reason).increment(0);
+    }
+    for reason in ["clean_exit", "panic"] {
+        metrics::counter!("tv_dhan_order_push_respawn_total", "reason" => reason).increment(0);
+    }
     tokio::spawn(async move {
         let mut pending_first_rx = Some(first_rx);
         let mut consecutive_abnormal_exits: u32 = 0;

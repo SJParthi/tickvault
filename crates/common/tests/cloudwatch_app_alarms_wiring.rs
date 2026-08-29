@@ -1113,8 +1113,24 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        104,
-        "Z+ L2 VERIFY ratchet: expected exactly 104 names in the MAIN EMF \
+        103,
+        "Z+ L2 VERIFY ratchet: expected exactly 103 names in the MAIN EMF \
+         (2026-08-29 NINTH: 104 -> 103, a REMOVAL and the first LEVER this \
+         ratchet has been given rather than another cost note. \
+         tv_subsystem_memory_estimated_bytes came off the list because \
+         `cloudwatch list-metrics` returns [] for it: the series has never \
+         existed in the account. Every one of its six per-component gauges is \
+         initialised to f64::NAN by design and is written ONLY by a closure \
+         handed to SubsystemMemorySampler::register_source, which has ZERO \
+         production call sites -- the two it had died with the \
+         TickStorage/PrevDayCache sweep on 2026-07-19. NaN is correctly \
+         dropped by the agent, so the name was structurally incapable of \
+         publishing while still being billed and charted. Process memory is \
+         unaffected and still charted live via tv_process_rss_bytes. \
+         -$0.30/mo: maximal month ~$124.98 -> ~$124.68, still ~$7.68 above \
+         the automatic STOP_EC2_INSTANCES line at $117 and under the $150 \
+         hard cap. Pairing enforced by subsystem_memory_emf_guard.rs -- wire \
+         a real source and the name may return with its own cost note. \
          (2026-08-29 EIGHTH: 99 -> 104, the five seal-escalation/spill counters. \
          The producer-side durable tier for sealed candles was moved off the \
          frame drain on 2026-08-28 and NONE of its counters reached CloudWatch, \
@@ -1206,7 +1222,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          permanently-empty paid series and two flat-zero dashboard lines that read as \
          proof of health. Removed in lockstep with the two dashboard.tf widget rows and \
          the /health runtime-subsystem rows, per the dated authorization in \
-         websocket-connection-scope-lock.md. -$0.60/mo.); \
+         websocket-connection-scope-lock.md. -$0.60/mo.)); \
          found {}: \
          {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
          budget actions STOP the prod box at 90% — update this count deliberately, \
@@ -1215,7 +1231,18 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     );
     for required in [
         "tv_process_rss_bytes",
-        "tv_subsystem_memory_estimated_bytes",
+        // tv_subsystem_memory_estimated_bytes REMOVED from this required list
+        // 2026-08-29. It was required here since the 2K-universe memory
+        // measurement, and a live `cloudwatch list-metrics` returns [] for it:
+        // the series has never existed. Every component gauge is f64::NAN
+        // until SubsystemMemorySampler::register_source is called, and nothing
+        // in production calls it — so the name was billed and charted while
+        // being structurally incapable of publishing. This entry is the reason
+        // it survived the sweeps: the ratchet REQUIRED the name, which reads
+        // as proof the metric matters. Process memory is unaffected and still
+        // required above (tv_process_rss_bytes), live and charted.
+        // Re-add here only alongside a real register_source call site —
+        // crates/app/tests/subsystem_memory_emf_guard.rs pins that pairing.
         // tv_dhan_exchange_lag_p99_seconds + tv_dhan_lag_samples_excluded_total
         // retired 2026-07-17 (dashboard tidy — dead Dhan-lag chain deleted).
         "tv_rest_1m_fire_heartbeat",

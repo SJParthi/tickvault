@@ -221,6 +221,9 @@ impl WsEventAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); disconnected/append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seeded here so an absent discard series can never read as a healthy
+        // zero — see `ilp_overflow::register_overflow_baseline`.
+        crate::ilp_overflow::register_overflow_baseline("ws_event_audit");
         let conf = ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

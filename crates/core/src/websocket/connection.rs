@@ -831,6 +831,60 @@ impl DhanSocketParams {
     /// Params for `endpoint` in the scope-locked [`DEFAULT_MAIN_FEED_MODE`].
     #[must_use]
     pub fn new(endpoint: DhanEndpointType, base_url: String, client_id: String) -> Self {
+        // Seed every subscribe/unsubscribe failure reason for THIS endpoint.
+        //
+        // A silently-failed subscribe is the worst failure this file can
+        // produce: the socket stays open and healthy-looking while carrying
+        // nothing, so absence against a seeded key is the only evidence that
+        // exists. A live sweep on 2026-08-29 found the metric had never
+        // published at all — the CloudWatch agent drops the first sample of a
+        // series it has never seen, so the very first failure was the one
+        // guaranteed to be invisible.
+        for reason in [
+            "payload",
+            "send",
+            "timeout",
+            "not_connected",
+            "unsubscribe_payload",
+            "unsubscribe_send",
+            "unsubscribe_timeout",
+            "unsubscribe_not_connected",
+        ] {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
+        // The two sibling families in this file, seeded here for the same
+        // reason and found by the 2026-08-29 adversarial sweep AFTER the
+        // subscribe family above was already fixed. Both carry LIVE CloudWatch
+        // alarms, so an unseeded first episode is an alarm that cannot fire on
+        // the occurrence that matters.
+        //
+        // dial_failed: the socket never opened at all. On a cold 08:30 boot
+        // this is the FIRST thing that can go wrong and the first sample is
+        // exactly the one the agent discards.
+        for reason in ["bad_url", "connect", "no_token", "timeout", "tls_config"] {
+            metrics::counter!(
+                DIAL_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
+        // frame_refused: the read path rejected a frame. `oversize` means a
+        // frame larger than this endpoint's cap — silent tick loss with the
+        // socket still up.
+        for reason in ["oversize", "transport"] {
+            metrics::counter!(
+                FRAME_REFUSED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
         Self {
             endpoint,
             base_url,

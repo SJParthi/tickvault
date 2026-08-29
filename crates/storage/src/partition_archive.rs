@@ -4510,15 +4510,55 @@ mod hour_granular_eligibility_tests {
         let hours = build_detach_list_sql_hours("market_depth", 6);
         let days = build_detach_list_sql("market_depth", 6);
 
-        assert!(hours.contains("dateadd('h', -6, now())"), "{hours}");
+        assert!(hours.contains("dateadd('h', -6,"), "{hours}");
         assert!(
             !hours.contains("dateadd('d'"),
             "hour query still says days: {hours}"
         );
+        // The day query has no IST shift, so strip the hour query's before
+        // comparing: what must match is the SHAPE, minus unit and frame.
         assert_eq!(
-            hours.replace("dateadd('h'", "dateadd('d'"),
+            hours.replace("dateadd('h'", "dateadd('d'").replace(
+                &format!(
+                    "dateadd('s', {}, now())",
+                    tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+                ),
+                "now()"
+            ),
             days,
-            "the two queries must differ ONLY in the unit"
+            "the two queries must differ ONLY in the unit and the IST shift"
+        );
+    }
+
+    #[test]
+    fn the_hour_cutoff_compares_against_ist_not_utc() {
+        // THE TEST ABOVE PINNED THE BUG IN PLACE, and that is the lesson.
+        //
+        // It asserted `dateadd('h', -6, now())` literally — the correct guard
+        // against a copy-pasted 'd', and simultaneously a hard pin on the UTC
+        // `now()` that made the whole feature inert. Its own comment says "the
+        // failure is otherwise invisible"; it was invisible to this test too.
+        //
+        // `minTimestamp` here is IST-shifted (depth_persistence's 2026-08-19
+        // correction), so an unshifted `now()` makes the effective window
+        // N + 5.5 hours. At the shipped depth_hot_hours = 4 that is 9.5 hours:
+        // depth written at 09:00 IST first qualifies at 18:30 IST, an hour
+        // after the box stops. A 14:00 pressure episode selected ZERO
+        // partitions while the disk filled — the exact reclaim this path
+        // exists to perform, never once performed.
+        let sql = build_detach_list_sql_hours("market_depth", 4);
+        assert!(
+            sql.contains(&format!(
+                "dateadd('s', {}, now())",
+                tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+            )),
+            "the hour cutoff must shift now() into the IST frame the data is \
+             stamped in, or the window is silently 5.5 hours wider than \
+             configured: {sql}"
+        );
+        assert!(
+            !sql.contains("-4, now())"),
+            "a bare UTC now() is the inert form this test exists to refuse: {sql}"
         );
     }
 

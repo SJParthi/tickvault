@@ -317,6 +317,12 @@ impl DhanCadenceExecutor {
         notifier: Option<Arc<NotificationService>>,
         mark_forwarder: Option<crate::order_runtime::MarkForwarder>,
     ) -> Result<Self, String> {
+        // Seed both refusal reasons at zero when the executor is built. A
+        // refused mark is a silent gap in the chain snapshot, so an absent
+        // series and a clean run must never render identically.
+        for reason in ["no_contract_id", "unknown_underlying"] {
+            metrics::counter!("tv_chain_mark_refused_total", "reason" => reason).increment(0);
+        }
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 DHAN_CADENCE_HTTP_TIMEOUT_SECS,

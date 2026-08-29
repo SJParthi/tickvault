@@ -198,6 +198,47 @@ pub const SEAL_ESCALATION_LOST_COUNTER: &str = "tv_seal_escalation_lost_total";
 /// abandoned and those seals died with the process.
 pub const SEAL_ESCALATION_ABANDONED_COUNTER: &str = "tv_seal_escalation_abandoned_total";
 
+/// Put all four escalation series on the wire at zero when the escalation
+/// subsystem is installed.
+///
+/// # Why a built handle is not enough — measured, not assumed
+///
+/// A `cloudwatch list-metrics` sweep on 2026-08-29 compared the EMF selector
+/// against the live account: the selector names 104 metrics, the account held
+/// 86, and all four of these were among the names that had **never published a
+/// single datapoint**. The CloudWatch agent computes a counter as the delta
+/// between consecutive samples and drops the first sample of a series it has
+/// never seen, so a counter that is never incremented is never published.
+///
+/// The consequence is not a missing chart. **An absent series is
+/// indistinguishable from a healthy zero one**, so "no seals were ever lost"
+/// and "the escalation path was never installed" looked identical, and an
+/// alarm placed over one of these would sit in `OK` forever and could never
+/// fire. Seeding separates those two answers permanently.
+///
+/// # Why here, and not at boot for everything at once
+///
+/// Called from [`SealWriterRunner::split_escalation_offload`], which is the
+/// one place the escalation subsystem is installed. A central boot-time
+/// seeder would publish a confident zero for a subsystem that is not running
+/// — positive evidence of health for work nothing is doing, which is a worse
+/// false-OK than the silence it replaces.
+fn register_escalation_baseline() {
+    // Deferred loss: BOTH disk tiers refused on the escalation thread. The
+    // caller was already told `Queued`, so this is the only place that loss
+    // is countable.
+    metrics::counter!(SEAL_ESCALATION_LOST_COUNTER).increment(0);
+    // Seals still queued when the shutdown budget expired — they died with
+    // the process. Emitted from the app's shutdown path, but it belongs to
+    // this subsystem, so it is seeded with it.
+    metrics::counter!(SEAL_ESCALATION_ABANDONED_COUNTER).increment(0);
+    // The two healthy outcomes. Seeded alongside the loss pair on purpose:
+    // `lost` alone cannot be read without knowing whether anything was ever
+    // queued, and an absent denominator makes a zero numerator meaningless.
+    metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER).increment(0);
+    metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(0);
+}
+
 /// One refused seal on its way to the durable tier.
 ///
 /// `SerializedSeal` is `Copy` and fixed-size, so moving it into the channel
@@ -331,6 +372,7 @@ impl SealOverflow {
     pub fn split_escalation_offload(&mut self) -> SealEscalationSink {
         let (tx, rx) = std::sync::mpsc::sync_channel(SEAL_ESCALATION_QUEUE_DEPTH);
         self.offload = Some(tx);
+        register_escalation_baseline();
         SealEscalationSink {
             rx,
             spill: std::sync::Arc::clone(&self.spill),

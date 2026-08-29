@@ -1235,10 +1235,22 @@ fn main() {
 
     let o1 = vec![
         Row::new(
-            "Packet decode (hot path)",
+            "Tick packet decode (hot path)",
             Verdict::Guaranteed,
             "O(1), 0 alloc",
-            "fixed-offset from_le_bytes; DHAT gates below",
+            "fixed-offset from_le_bytes, no loop; DHAT gates below",
+        ),
+        Row::new(
+            // SPLIT OUT 2026-08-29. One row said "Packet decode: GUARANTEED
+            // O(1)" and it was FALSE for depth: parser/depth.rs walks up to
+            // 200 levels. CLAUDE.md carries a correction about that exact
+            // sentence; this binary re-asserted the uncorrected version under
+            // a banner promising measured numbers. Depth is live and carries
+            // ~24x the tick row volume, so it is not the row to round off.
+            "Depth packet decode (hot path)",
+            Verdict::Bounded,
+            "O(levels), 0 alloc",
+            "20 or 200 levels per packet; N levels cannot be read in fewer than N reads. Per LEVEL it is fixed-offset. Zero-alloc, DHAT-gated",
         ),
         Row::new(
             "DHAT zero-alloc gates",
@@ -1805,7 +1817,23 @@ fn main() {
     // instrument have a declared ceiling rather than growing until the host
     // dies, which is the specific failure this repo has recorded five times.
     // ---------------------------------------------------------------
-    let os_conditional = count_substring_scoped(Path::new("crates"), &["#[cfg(target_os"], true);
+    // FOUR needles, not one. This counted `#[cfg(target_os` ALONE until
+    // 2026-08-29 and reported "0 lines / GUARANTEED" while thirteen
+    // production OS branches existed: the `cfg!(target_os = ..)` MACRO form
+    // (an `if`, not an attribute — invisible to an attribute needle) and the
+    // `#[cfg(unix)]` family, which is how portable Rust is actually written.
+    // A one-needle scan reporting a whole-workspace absence is the
+    // vacuous-pass shape this very binary exists to expose.
+    let os_conditional = count_substring_scoped(
+        Path::new("crates"),
+        &[
+            "#[cfg(target_os",
+            "cfg!(target_os",
+            "#[cfg(unix)",
+            "#[cfg(windows)",
+        ],
+        true,
+    );
     let compose_files = files
         .iter()
         .filter(|f| f.ends_with("docker-compose.yml"))
@@ -1836,13 +1864,13 @@ fn main() {
         ),
         Row::new(
             "OS-conditional code under crates/",
-            if os_conditional == 0 {
-                Verdict::Guaranteed
-            } else {
-                Verdict::Bounded
-            },
+            // BOUNDED even at zero. A GUARANTEED verdict derived from a
+            // substring scan finding nothing is indistinguishable from a scan
+            // that looked in the wrong place — which is exactly what happened
+            // here before the needles were widened.
+            Verdict::Bounded,
             format!("{os_conditional} lines"),
-            "PRODUCTION only — test-module OS branches are excluded; a Mac branch and a Linux branch in the runtime are two runtimes",
+            "PRODUCTION only; 4 needles incl. the cfg!() macro + unix family. Most are #[cfg(unix)], true on Mac AND Linux; the macOS Docker branch in infra.rs is dev-only",
         ),
         Row::new(
             "Retunable without a rebuild",

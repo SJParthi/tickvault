@@ -916,6 +916,24 @@ async fn async_main() -> Result<()> {
     // workspace while its own doc said "a replay consumer MUST prefer this
     // over a fresh clock read". `WAL_RECEIPT_UNKNOWN_NANOS` for v1/v2 records,
     // which genuinely predate the field.
+    // Put both unrecovered-frame series on the wire at zero BEFORE the replay
+    // decides anything.
+    //
+    // This one is not housekeeping: `tv-<env>-wal-frames-not-recovered` alarms
+    // on this metric at threshold 1, and a live sweep on 2026-08-29 found the
+    // metric had NEVER published a datapoint — so that alarm has been sitting
+    // at OK since it shipped and could not have fired. A counter only touched
+    // when frames are LOST is born at the loss, and the CloudWatch agent drops
+    // the first sample of a series it has never seen, so the first episode is
+    // exactly the one that goes missing.
+    //
+    // Seeded here, in STAGE-C, because STAGE-C is the WAL replay: the series
+    // appears when the thing it measures actually runs, never from a boot-wide
+    // seeder that would claim health for a subsystem that never started.
+    for ws_type in ["live_feed", "order_update"] {
+        metrics::counter!("tv_ws_frame_wal_reinjected_dropped_total", "ws_type" => ws_type)
+            .increment(0);
+    }
     let mut ws_wal_replay_live_feed: Vec<(u64, i64, bytes::Bytes)> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {

@@ -166,7 +166,25 @@ impl FoldCounters {
 /// the real recorder, never a no-op one.
 pub(crate) fn fold_counters() -> &'static FoldCounters {
     static HANDLES: OnceLock<FoldCounters> = OnceLock::new();
-    HANDLES.get_or_init(FoldCounters::resolve)
+    HANDLES.get_or_init(|| {
+        let resolved = FoldCounters::resolve();
+        // Seed the late-discard series at zero, once, when the fold's handles
+        // are first resolved.
+        //
+        // Resolving a handle is NOT publishing a sample — measured, not
+        // assumed: a live sweep on 2026-08-29 found this metric had never
+        // published a datapoint even though the handle above has been built on
+        // every fold since it existed. The CloudWatch agent drops the first
+        // sample of a series it has never seen, so a counter only touched on a
+        // discard loses its first episode, and until then "nothing arrived
+        // late" is indistinguishable from "the fold never ran".
+        //
+        // The `tv_aggregator_tick_refused_total` handles above are NOT seeded
+        // here: that series already publishes (5,748,026 in the 28 Aug
+        // session), so it has no first-sample problem to solve.
+        resolved.tick_discarded_late.increment(0);
+        resolved
+    })
 }
 
 #[cfg(test)]

@@ -2690,6 +2690,69 @@ pub fn counters() -> &'static DrainCounters {
     })
 }
 
+/// Register the drain's loss series at zero so an ABSENT one can never be
+/// read as a healthy one.
+///
+/// # Why this is not redundant with `counters()`
+///
+/// `counters()` already builds a `metrics::Counter` handle for every one of
+/// these, and that is NOT enough — measured, not assumed.
+/// `DRAIN_ABANDONED_BYTES_COUNTER` has had its handle built on every drain
+/// since the counter existed, and on 2026-08-29 a `list-metrics` sweep found
+/// it had **never published a single datapoint**. Building a handle registers
+/// a key with the recorder; it does not emit a sample. Only an actual
+/// `increment(0)` puts the series on the wire.
+///
+/// # Why that matters more than a missing chart
+///
+/// The CloudWatch agent computes a counter as the delta between consecutive
+/// samples, so a series that never emits is not "zero" — it does not exist,
+/// and **an absent series is indistinguishable from a healthy zero one**. An
+/// alarm over a metric that never publishes sits in `OK` forever and cannot
+/// fire, which is the permanently-green dead monitor this repository has
+/// already retired twice. Seeding turns "we saw nothing" into the two
+/// distinguishable answers it should always have been: "the drain ran and
+/// abandoned nothing" versus "the drain never ran".
+///
+/// # Why here and not at boot
+///
+/// Deliberately called from `run_frame_drain`, not from a central boot-time
+/// seeder. Seeding a subsystem that is not running would publish a confident
+/// zero for work nothing is doing — a NEW false-OK, and a worse one, because
+/// it would read as positive evidence of health. These series appear exactly
+/// when the drain that owns them is alive.
+fn seed_drain_loss_baselines() {
+    let c = counters();
+    // The frame walk gave up on an undecodable packet and abandoned the rest
+    // of the frame. Zero on a healthy lane, so any non-zero reading is the
+    // event itself — and until now it could not be read at all.
+    c.abandoned_bytes.increment(0);
+    // Both writers' shutdown-abandonment episodes. Labelled rather than two
+    // names because the EMF processor folds label values into one summed
+    // series per host, and either writer abandoning its queue calls for the
+    // same operator action: check the spill directory before the next session.
+    metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(0);
+    metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth").increment(0);
+    // ADDED 2026-08-29 by an adversarial sweep of the FIRST pass of this fix.
+    // Both carry LIVE CloudWatch alarms and both were still unseeded, so the
+    // alarm could not fire on the first episode — the one that matters.
+    //
+    // seals_dropped: a sealed candle that no tier accepted. Its two siblings
+    // (emitted, rescued) are seeded elsewhere; seeding the healthy pair while
+    // leaving the LOSS one dark is the worst of the three arrangements.
+    c.seals_dropped.increment(0);
+    // ingest_refused: a decoded tick the aggregator would not fold. ALL FOUR
+    // reasons, because the CloudWatch agent computes its delta per LABEL SET —
+    // seeding one reason leaves the other three exactly as blind as before,
+    // and a partially-seeded family is a partial blind spot wearing the
+    // appearance of a fix. Seeded through the DrainCounters handles the drain
+    // already owns, so the ownership guard sees them as drain-owned.
+    c.refused_price.increment(0);
+    c.refused_timestamp.increment(0);
+    c.refused_slot.increment(0);
+    c.refused_session.increment(0);
+}
+
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
 /// `measured` means the session's captured candles were never checked against
 /// Dhan's own record.
@@ -3776,6 +3839,10 @@ async fn run_frame_drain(
     // the authorized universe had no silence detection at all.
     mut seed_rx: tokio::sync::mpsc::Receiver<Vec<SubscribeInstrument>>,
 ) -> DrainOutcome {
+    // Put the drain's loss series on the wire at zero BEFORE the first frame,
+    // so "nothing was lost" and "the drain never ran" stop looking identical.
+    // See `seed_drain_loss_baselines` for why a built handle is not enough.
+    seed_drain_loss_baselines();
     // Whether this drain has ever seen a frame. Owns the up-gauge's rising
     // edge — see the first-frame arm below and the spawn site's correction.
     let mut lane_up = false;
@@ -4986,10 +5053,28 @@ impl DepthIngest {
                 "depth rows were still held by the producer at shutdown because the writer \
                  queue was full — rescued to the depth spill tier, see the preceding coded line"
             );
-            // Close the rescue queue AFTER the tail rescue above may have used
-            // it. Leaves the writer inline, so a later rescue still reaches disk.
-            self.writer.close_rescue_offload();
         }
+        // Close the rescue queue AFTER the tail rescue above may have used it.
+        // Leaves the writer inline, so a later rescue still reaches disk.
+        //
+        // UNCONDITIONAL, and that is the whole point — it sat inside the
+        // `dropped > 0` arm until 2026-08-29, while the tick twin
+        // (`close_offload_queues`) has always closed unconditionally.
+        //
+        // Dropping the sender is the ONLY thing that turns the rescue thread's
+        // blocking `recv` into a clean exit. On the NORMAL shutdown — nothing
+        // pending, which is every healthy weekday 17:30 — the guard skipped
+        // this call, the `tv-depth-rescue` thread blocked in `recv` forever,
+        // `shutdown_rescue_writer` spun to the shared deadline, and then fired
+        // a coded HOT-PATH-02 error announcing that rescued levels "may never
+        // have reached the depth spill file" and are "not in QuestDB either".
+        //
+        // Nothing had been lost. It was a fabricated loss report, every
+        // trading day, plus the shutdown budget burned waiting for a thread
+        // that could never finish. A false alarm on a loss path is not the
+        // harmless direction: it is what teaches an operator to disbelieve the
+        // one line that will one day be true.
+        self.writer.close_rescue_offload();
     }
 
     /// Waits for the depth rescue thread to finish its queue.
