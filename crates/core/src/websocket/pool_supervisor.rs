@@ -528,6 +528,24 @@ pub struct ConnectionSupervisor {
     phase: ConnPhase,
     /// Consecutive failed attempts so far; also the ladder index for the NEXT
     /// delay. Reset to zero when the connection proves healthy.
+    /// Why the most recent redial was scheduled — AUDIT ONLY.
+    ///
+    /// # Why this is stored rather than passed
+    /// `schedule_redial` already knows the reason and sends it to a counter
+    /// labelled `endpoint` + `reason`. The EMF processor folds label values
+    /// into one summed series per host, so that counter can say a socket
+    /// reconnected 210 times and cannot say why any of them happened.
+    ///
+    /// The audit row was worse: `SleepThenDial` carries only a delay, so the
+    /// emit site had nothing to stamp and wrote the literal `"backoff_redial"`
+    /// for every reconnect — a subscribe failure, an idle-silence teardown, a
+    /// stale token and a plain transport close all rendered identically in
+    /// `ws_event_audit`. "Why did connection 3 reconnect 210 times today" got
+    /// the same four words 210 times.
+    ///
+    /// Read ONLY to stamp the row; the supervisor never branches on it, so
+    /// policy still lives entirely in `on_event`.
+    last_redial_reason: ReconnectReason,
     attempt: u32,
     watchdog: IdleWatchdog,
     /// Whether a frame has arrived since the current socket came up. The
@@ -568,6 +586,7 @@ impl ConnectionSupervisor {
         Self {
             slot,
             phase: ConnPhase::Idle,
+            last_redial_reason: ReconnectReason::Disconnected,
             attempt: 0,
             watchdog: IdleWatchdog::new(now),
             proven_healthy: false,
@@ -898,7 +917,19 @@ impl ConnectionSupervisor {
         }
     }
 
+    /// Why the most recent redial was scheduled — for the AUDIT ROW only.
+    ///
+    /// See `last_redial_reason`. Callers must not branch on this: the
+    /// supervisor has already made every decision this reason informed.
+    #[must_use]
+    pub const fn last_redial_reason(&self) -> ReconnectReason {
+        self.last_redial_reason
+    }
+
     fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
+        // Recorded at the ONE site every redial passes through, so the audit
+        // row cannot disagree with the counter beside it.
+        self.last_redial_reason = reason;
         self.attempt = self.attempt.saturating_add(1);
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
@@ -2712,7 +2743,7 @@ where
                 // moment we got around to re-dialing.
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
-                    "backoff_redial",
+                    supervisor.last_redial_reason().as_str(),
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
@@ -2723,7 +2754,7 @@ where
                 guard.mark_lost();
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
-                    "token_refresh_redial",
+                    supervisor.last_redial_reason().as_str(),
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 refresh_token().await;
@@ -5285,6 +5316,76 @@ mod tests {
             !dial_arm.contains("match socket.last_dial_failure_reason"),
             "the reason is for the audit row, never for a decision:\n{dial_arm}"
         );
+    }
+
+    #[test]
+    fn a_redial_is_audited_with_the_reason_that_caused_it() {
+        // Source pin, same discipline as the two tests above.
+        //
+        // Before 2026-08-29 both redial arms stamped a hardcoded string --
+        // "backoff_redial" and "token_refresh_redial" -- so a subscribe
+        // failure, an idle-silence teardown, a stale token and a plain
+        // transport close all rendered IDENTICALLY in ws_event_audit. The real
+        // reason went only to a counter labelled endpoint + reason, and the EMF
+        // processor folds label values into one summed series per host. "Why
+        // did connection 3 reconnect 210 times today" got the same four words
+        // 210 times.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        for arm in [
+            "SupervisorAction::SleepThenDial",
+            "SupervisorAction::RefreshTokenThenDial",
+        ] {
+            let body = production
+                .split(&format!("{arm} {{ delay_ms }} => {{"))
+                .nth(1)
+                .and_then(|s| s.split("action = supervisor.on_event").next())
+                .unwrap_or_else(|| panic!("the {arm} arm must exist"));
+            assert!(
+                body.contains("last_redial_reason()"),
+                "{arm} must stamp the reason that CAUSED the redial, not a \
+                 hardcoded label — the audit row is the only surface that can \
+                 tell two causes apart:\n{body}"
+            );
+        }
+
+        // And the reason must be recorded at the one site every redial passes
+        // through, or the row could disagree with the counter beside it.
+        let enter = production
+            .split("fn enter_backoff(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("enter_backoff must exist");
+        assert!(
+            enter.contains("self.last_redial_reason = reason;"),
+            "enter_backoff is the single choke point every redial reaches:\n{enter}"
+        );
+    }
+
+    #[test]
+    fn every_reconnect_reason_has_a_distinct_audit_label() {
+        // The label is what an operator groups by. Two reasons sharing one
+        // string would silently merge two different failures into one bucket.
+        let labels: Vec<&str> = [
+            ReconnectReason::DialFailed,
+            ReconnectReason::SubscribeFailed,
+            ReconnectReason::Disconnected,
+            ReconnectReason::TokenStale,
+            ReconnectReason::IdleSilence,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "reason labels must be unique");
+        // And none may collide with the two hardcoded strings they replaced,
+        // or an old row and a new row would read the same.
+        for l in &labels {
+            assert_ne!(*l, "backoff_redial");
+            assert_ne!(*l, "token_refresh_redial");
+        }
     }
 
     #[test]

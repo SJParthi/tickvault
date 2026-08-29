@@ -1026,6 +1026,32 @@ pub async fn load_depth_universe_from_master(
     if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
         return None;
     }
+    // A selection with exactly ONE pool empty is USABLE and is kept — half the
+    // depth coverage beats none, and refusing it would send the caller to the
+    // chain fallback that cannot do better this early. What it must not do is
+    // read as success. The fall-through above needs BOTH pools empty, so until
+    // 2026-08-29 this case skipped `record_depth_failure` entirely and the
+    // `info!` below announced "depth universe resolved" with a `depth_200 = 0`
+    // field: five sockets with nothing to subscribe, reported as a good
+    // morning.
+    let partial = selection.depth_20.is_empty() != selection.depth_200.is_empty();
+    if partial {
+        record_depth_failure("partial_selection");
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "contract_artifact",
+            reason = "partial_selection",
+            depth_20 = selection.depth_20.len(),
+            depth_200 = selection.depth_200.len(),
+            candidates = candidates.len(),
+            "WS-GAP-02: depth universe resolved with ONE pool EMPTY — the \
+             populated pool is kept and subscribed, but every socket of the \
+             empty pool will carry nothing for the session. This is not the \
+             chain-fallback path: a partial artifact selection is accepted as \
+             `Some`, so the fallback never runs. Check which underlyings had a \
+             usable spot price at attach time"
+        );
+    }
     tracing::info!(
         source = "contract_artifact",
         candidates = candidates.len(),
@@ -1123,13 +1149,21 @@ pub const DEPTH_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_depth_universe_failed_t
 /// counter fires at most a handful of times per session — so an
 /// un-pre-registered reason would lose its first increment and, on a session
 /// that failed once, its only one.
-pub const DEPTH_FAILURE_REASONS: [&str; 6] = [
+pub const DEPTH_FAILURE_REASONS: [&str; 7] = [
     "client_build",
     "response_unreadable",
     "non_2xx",
     "request_failed",
     "unparseable",
     "empty_selection",
+    // ADDED 2026-08-29. A selection with ONE of the two pools empty was
+    // returned as `Some` and used, because the fall-through test is
+    // `depth_20.is_empty() && depth_200.is_empty()` — BOTH must be empty. So
+    // a morning that priced enough underlyings for depth-20 and none for
+    // depth-200 left five sockets with nothing to subscribe, skipped
+    // `record_depth_failure` entirely, and logged "depth universe resolved"
+    // at INFO with a `depth_200 = 0` field nobody groups by.
+    "partial_selection",
 ];
 
 /// Publish a 0 for every reason before the first attempt.
@@ -2419,6 +2453,49 @@ mod failure_metric_tests {
         for reason in DEPTH_FAILURE_REASONS {
             record_depth_failure(reason);
         }
+    }
+
+    /// A selection with ONE pool empty must be reported, not celebrated.
+    ///
+    /// The fall-through in `load_depth_universe_from_master` needs BOTH pools
+    /// empty, so a half-empty selection is returned as `Some` and used. That is
+    /// the right BEHAVIOUR — half the depth coverage beats none — and until
+    /// 2026-08-29 it was also indistinguishable from a full success: no
+    /// counter, and an `info!` line reading "depth universe resolved".
+    #[test]
+    fn a_partial_selection_is_detected_by_the_same_predicate_the_guard_uses() {
+        // The predicate itself, pinned. `!=` on two bools is XOR: true when
+        // exactly one is empty, false when both or neither are.
+        for (d20_empty, d200_empty, expect_partial) in [
+            (false, false, false), // both populated — a full success
+            (true, false, true),   // depth-20 empty — five sockets idle
+            (false, true, true),   // depth-200 empty — five sockets idle
+            (true, true, false),   // both empty — the fall-through handles it
+        ] {
+            assert_eq!(
+                d20_empty != d200_empty,
+                expect_partial,
+                "partial detection wrong for ({d20_empty}, {d200_empty}) — an \
+                 `&&` here is the original defect: it only fires when BOTH are \
+                 empty, which is the one case that never reaches this check"
+            );
+        }
+    }
+
+    /// The reason must be in the pre-registered list, or its counter is never
+    /// seeded and an absent CloudWatch series reads as a healthy zero — the
+    /// exact trap this repository recorded on 2026-08-28.
+    #[test]
+    fn the_partial_selection_reason_is_pre_registered() {
+        assert!(
+            DEPTH_FAILURE_REASONS.contains(&"partial_selection"),
+            "a reason that is not pre-registered is not seeded at zero"
+        );
+        assert_eq!(
+            DEPTH_FAILURE_REASONS.len(),
+            7,
+            "count ratchet — a new reason must be a deliberate addition"
+        );
     }
     /// Non-vacuity: the reason list must not contain entries nothing emits.
     /// A pre-registered reason with no emit site is a permanently-flat series
