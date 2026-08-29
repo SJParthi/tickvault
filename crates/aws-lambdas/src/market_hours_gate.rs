@@ -223,7 +223,27 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             // call in this arm that may propagate: if the alarms cannot be
             // armed at all, the invocation must fail loudly so the Lambda's
             // Errors alarm fires.
+            // ARM EACH ALARM AS SOON AS IT IS RESET -- 2026-08-29, closing the
+            // last hole an adversarial review found in the two corrections
+            // above.
+            //
+            // Those corrections handled a failed `SetAlarmState`. Neither
+            // handled the INVOCATION dying: this Lambda has a 30s timeout, and
+            // under CloudWatch throttling the SDK retries each call with
+            // backoff. A timeout part-way through a reset-all-then-enable-all
+            // shape means `enable_alarm_actions` never runs and ALL of the
+            // gated alarms stay unarmed for the whole trading day -- the total
+            // silence the comment above correctly calls the worse trade, just
+            // reached through a door it was not watching.
+            //
+            // Pairing the two calls per alarm removes the trade rather than
+            // choosing a side of it. A death mid-loop now leaves every
+            // ALREADY-PROCESSED alarm armed and only the remainder unarmed,
+            // instead of losing all of them. The reset still happens while
+            // that alarm's actions are disabled, so the spurious-page property
+            // the reorder was made for is unchanged.
             let mut reset_failures = 0usize;
+            let mut arm_failures = 0usize;
             for name in &alarm_names {
                 if let Err(err) = cw
                     .set_alarm_state()
@@ -243,7 +263,20 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                          unarmed alarm for the whole session."
                     );
                 }
+                if let Err(err) = cw.enable_alarm_actions().alarm_names(name).send().await {
+                    arm_failures += 1;
+                    tracing::error!(
+                        alarm = %name,
+                        error = %err,
+                        "could not arm this alarm individually -- the bulk arm below \
+                         is the retry, and a failure there fails the invocation"
+                    );
+                }
             }
+            // Belt, and the only call in this arm that may propagate: it
+            // re-arms anything the per-alarm pass missed (idempotent), and if
+            // the alarms cannot be armed AT ALL the invocation must fail
+            // loudly so the Lambda's Errors alarm fires.
             cw.enable_alarm_actions()
                 .set_alarm_names(Some(alarm_names.clone()))
                 .send()
@@ -251,6 +284,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             info!(
                 alarms = ?alarm_names,
                 reset_failures,
+                arm_failures,
                 "enabled actions"
             );
         }
