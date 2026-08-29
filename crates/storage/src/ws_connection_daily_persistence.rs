@@ -139,6 +139,20 @@ pub struct WsConnectionDailyRow {
     /// `false` = this connection produced NO lifecycle event all day. That is
     /// a finding (it never appeared), never a clean day.
     pub saw_any_event: bool,
+    /// `true` = the lane BEGAN DIALING this connection.
+    ///
+    /// ADDED 2026-08-29, and it is what makes "for ALL the connections"
+    /// answerable. Every other kind presupposes a socket that opened, so a
+    /// connection that failed every dial produced no row at all and was
+    /// indistinguishable from one that was never planned. On 2026-08-12 the
+    /// main feed failed twelve dials with `HTTP 400` and never handshook all
+    /// session; it appeared in this table as nothing.
+    ///
+    /// `dial_started = true` with `connects = 0` is therefore the row an
+    /// operator wants: THIS SOCKET NEVER CAME UP. It is deliberately separate
+    /// from `saw_any_event`, which still means "the socket did something" —
+    /// a dial that failed is precisely the socket doing nothing.
+    pub dial_started: bool,
 }
 
 impl WsConnectionDailyRow {
@@ -150,7 +164,13 @@ impl WsConnectionDailyRow {
     /// is the one reading that must never render as health.
     #[must_use]
     pub fn clean_day(&self) -> bool {
-        self.saw_any_event
+        // A socket the lane dialed and that never connected is the loudest
+        // possible non-clean day, and before `dial_started` existed it had no
+        // row at all to be judged. `saw_any_event` alone cannot express it:
+        // that flag is false for such a socket, which already fails the
+        // check — but only if the row exists, which is the whole point.
+        !(self.dial_started && self.connects == 0)
+            && self.saw_any_event
             && self.disconnect_events == 0
             && self.disconnects_market == 0
             && self.disconnects_off_hours == 0
@@ -200,6 +220,7 @@ pub const WS_CONNECTION_DAILY_COLUMNS: &[(&str, &str)] = &[
     ("total_attempts", "LONG"),
     ("max_attempts", "LONG"),
     ("saw_any_event", "BOOLEAN"),
+    ("dial_started", "BOOLEAN"),
     ("clean_day", "BOOLEAN"),
 ];
 
@@ -442,6 +463,8 @@ impl WsConnectionDailyWriter {
             .context("max_attempts")?
             .column_bool("saw_any_event", r.saw_any_event)
             .context("saw_any_event")?
+            .column_bool("dial_started", r.dial_started)
+            .context("dial_started")?
             .column_bool("clean_day", r.clean_day())
             .context("clean_day")?
             .at(TimestampNanos::new(r.ts_ist_nanos))
@@ -511,7 +534,31 @@ mod tests {
             total_attempts: 4,
             max_attempts: 3,
             saw_any_event: true,
+            dial_started: true,
         }
+    }
+
+    #[test]
+    fn test_dialed_but_never_connected_is_never_a_clean_day() {
+        // The row the whole `dial_started` column exists to make possible.
+        // Every incident counter is zero -- because nothing ever happened to
+        // this socket -- so without the dial flag it would read as a PERFECT
+        // day. That is the false-OK the column closes.
+        let mut r = sample_row();
+        r.connects = 0;
+        r.reconnects = 0;
+        r.disconnect_events = 0;
+        r.disconnects_market = 0;
+        r.disconnects_off_hours = 0;
+        r.stalls = 0;
+        r.restarts = 0;
+        r.saw_any_event = false;
+        r.dial_started = true;
+        assert!(
+            !r.clean_day(),
+            "a socket the lane dialed that never connected is the loudest \
+             possible non-clean day"
+        );
     }
 
     #[test]

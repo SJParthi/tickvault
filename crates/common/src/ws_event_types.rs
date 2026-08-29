@@ -97,6 +97,21 @@ pub enum WsEventKind {
     /// `stall_never_streamed` / `stall_auth_stale` / `stall_entitlement` —
     /// see `crate::feed_blame::STALL_SOURCE_*`), never raw child text.
     StallRestarted,
+    /// The lane began dialing this connection.
+    ///
+    /// ADDED 2026-08-29. Every other kind presupposes a socket that OPENED,
+    /// so a connection that failed every dial produced no row anywhere and
+    /// was absent from the daily per-connection record — indistinguishable
+    /// from a connection that was never planned. On 2026-08-12 the main feed
+    /// failed twelve dials with `HTTP 400` and never handshook all session;
+    /// it appeared in that record as nothing at all.
+    ///
+    /// This is the one kind that fires BEFORE the socket can deliver, so it
+    /// establishes SET MEMBERSHIP and nothing else. It deliberately does NOT
+    /// set `saw_any_event` in the rollup: that flag means "the socket did
+    /// something", and a dial that failed is precisely the socket doing
+    /// nothing.
+    DialStarted,
 }
 
 impl WsEventKind {
@@ -111,6 +126,7 @@ impl WsEventKind {
             Self::SleepEntered => "sleep_entered",
             Self::SleepResumed => "sleep_resumed",
             Self::StallRestarted => "stall_restarted",
+            Self::DialStarted => "dial_started",
         }
     }
 
@@ -213,6 +229,7 @@ mod tests {
                 "sleep_entered",
                 "sleep_resumed",
                 "stall_restarted",
+                "dial_started",
             ]
         );
         let unique: HashSet<&str> = labels.iter().copied().collect();
