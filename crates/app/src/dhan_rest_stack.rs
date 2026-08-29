@@ -857,7 +857,9 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                         // is why this had to be decided rather than defaulted:
                         // a `_ => true` arm would have reported the order-update
                         // socket healthy the instant it started dialing.
-                        | WsEventKind::DialStarted => false,
+                        | WsEventKind::DialStarted
+                        // A dial FAILED — emphatically not connected.
+                        | WsEventKind::DialFailed => false,
                     };
                     // Health first: it is the operator-facing verdict and
                     // must not depend on the forensic write succeeding.

@@ -82,6 +82,25 @@
 //! A partial enumeration reads exactly like a complete one -- this file's own
 //! lesson, applied to this file, one paragraph after it was written.
 //!
+//! CLOSED 2026-08-29 -- the EPISODE-HALF false-OK, which was a fourth path and
+//! a worse one, because it made a row that DID exist lie. Six of this row's
+//! fields (`disconnects_market`, `disconnects_off_hours`, `stalls`, `restarts`
+//! and the three `blame_*`) come from a SECOND query against
+//! `feed_episode_audit`, and that query is allowed to fail: the row is written
+//! anyway with those six at zero, because a partial row beats no row. Whether
+//! it HAD failed lived only in the `info!` line below, so the persisted row was
+//! indistinguishable from a genuinely quiet day and `clean_day` rendered TRUE
+//! off six zeros nobody had measured.
+//!
+//! The sharpest case is an in-market PROCESS DEATH: it is synthesized straight
+//! into `feed_episode_audit` and has NO `ws_event_audit` trace at all, so
+//! `restarts` is the ONLY field carrying it. On a day the process died and the
+//! episode read failed or merely lagged this rollup, every other field was
+//! legitimately zero and nothing contradicted the verdict. `stalls` has the
+//! same shape -- `StallRestarted` sets `saw_any_event` and no counted column.
+//! `episodes_complete` is now a persisted column and a `clean_day` term, so an
+//! unmeasured episode half reads as degraded rather than clean.
+//!
 //! The original reasoning, retained:
 //!
 //! The connection set was OBSERVED, not AUTHORIZED. Both sources were things
@@ -349,12 +368,19 @@ pub fn fold_episode_rows_per_connection(
 pub fn finalize_rows(
     folded: BTreeMap<ConnKey, WsConnectionDailyRow>,
     day_ist_midnight_nanos: i64,
+    episodes_complete: bool,
 ) -> Vec<WsConnectionDailyRow> {
     folded
         .into_values()
         .map(|mut r| {
             r.ts_ist_nanos = day_ist_midnight_nanos;
             r.trading_date_ist_nanos = day_ist_midnight_nanos;
+            // Stamped on EVERY row, including those the episode fold never
+            // touched — a connection with no episodes is exactly the case
+            // the flag is for: its zeros mean something only if the table
+            // they would have come from was actually read. Taken as an
+            // ARGUMENT so no caller can materialise rows without answering.
+            r.episodes_complete = episodes_complete;
             r
         })
         .collect()
@@ -504,7 +530,7 @@ pub async fn run_ws_connection_rollup(
         }
     }
 
-    let rows = finalize_rows(folded, day_ist_midnight_nanos);
+    let rows = finalize_rows(folded, day_ist_midnight_nanos, episodes_complete);
     if rows.is_empty() {
         info!(
             ws_events_folded = ws_folded,
@@ -628,12 +654,48 @@ mod tests {
         let body = ws_body(r#"["dhan","main_feed",0,5,"connected",0,0]"#);
         let mut out = BTreeMap::new();
         assert_eq!(fold_ws_event_rows(&mut out, &body), Some(1));
-        let rows = finalize_rows(out, 1_769_990_400_000_000_000);
+        let rows = finalize_rows(out, 1_769_990_400_000_000_000, true);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].saw_any_event);
         assert!(rows[0].clean_day());
         assert_eq!(rows[0].connects, 1);
         assert_eq!(rows[0].pool_size, 5);
+    }
+
+    /// The 2026-08-29 false-OK: an unmeasured episode half must not render as
+    /// a clean day.
+    ///
+    /// A process death is synthesized straight into `feed_episode_audit` and
+    /// leaves NO `ws_event_audit` trace, so `restarts` is the only field that
+    /// carries it. On a day the process died and the episode read failed, every
+    /// other field in the row is legitimately zero — there is nothing else left
+    /// to contradict a clean verdict.
+    ///
+    /// Delete the `episodes_complete` term from `clean_day` and this fails.
+    #[test]
+    fn an_unmeasured_episode_half_is_never_a_clean_day() {
+        let mut out = BTreeMap::new();
+        let body = ws_body(r#"["dhan","main_feed",0,5,"connected",0,0]"#);
+        assert_eq!(fold_ws_event_rows(&mut out, &body), Some(1));
+
+        let measured = finalize_rows(out.clone(), 0, true);
+        assert!(
+            measured[0].clean_day(),
+            "control: a connected socket with a READ episode half is clean"
+        );
+
+        let unmeasured = finalize_rows(out, 0, false);
+        assert!(
+            !unmeasured[0].clean_day(),
+            "the identical row with the episode half UNREAD must read degraded \
+             — its zeros were never measured, and a process death would live \
+             in exactly the fields that query fills"
+        );
+        assert_eq!(
+            unmeasured[0].restarts, 0,
+            "and the zero is still there — what changed is that it no longer \
+             counts as evidence of a quiet day"
+        );
     }
 
     #[test]
@@ -650,7 +712,7 @@ mod tests {
         let mut out = BTreeMap::new();
         assert_eq!(fold_ws_event_rows(&mut out, &body), Some(5));
         assert_eq!(out.len(), 4, "four distinct connections");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         let conn1 = rows
             .iter()
             .find(|r| r.ws_type == "main_feed" && r.connection_index == 1)
@@ -676,7 +738,7 @@ mod tests {
         );
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &body).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert_eq!(rows[0].reconnects, 2);
         assert_eq!(rows[0].total_down_secs, 52);
         assert_eq!(
@@ -695,7 +757,7 @@ mod tests {
         );
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &body).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert!(rows[0].saw_any_event);
         assert_eq!(rows[0].disconnect_events, 0);
         assert_eq!(rows[0].reconnects, 0);
@@ -710,7 +772,7 @@ mod tests {
         let body = ws_body(r#"["dhan","main_feed",0,5,"disconnected_off_hours",0,0]"#);
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &body).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert_eq!(rows[0].disconnect_events, 1);
         assert!(!rows[0].clean_day());
     }
@@ -755,7 +817,7 @@ mod tests {
         fold_ws_event_rows(&mut out, &ws).expect("ws parse");
         fold_episode_rows_per_connection(&mut out, &ep).expect("ep parse");
         assert_eq!(out.len(), 1, "both sources fold onto ONE row");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert!(rows[0].saw_any_event);
         assert_eq!(rows[0].disconnects_market, 1);
         assert_eq!(rows[0].blame_broker, 1);
@@ -771,7 +833,7 @@ mod tests {
         let ep = ws_body(r#"["dhan","stall_restart","ours",true,"main_feed",4,0]"#);
         let mut out = BTreeMap::new();
         fold_episode_rows_per_connection(&mut out, &ep).expect("ep parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].saw_any_event);
         assert_eq!(rows[0].stalls, 1);
@@ -786,7 +848,7 @@ mod tests {
         let events = ws_body(r#"["dhan","main_feed",3,5,"dial_started",0,0]"#);
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &events).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
 
         assert_eq!(rows.len(), 1, "the socket is now IN the record");
         assert!(rows[0].dial_started, "the lane began dialing it");
@@ -812,7 +874,7 @@ mod tests {
         );
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &events).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].dial_started);
@@ -839,7 +901,7 @@ mod tests {
         let events = ws_body(r#"["dhan","main_feed",0,5,"connected",0,0]"#);
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &events).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
 
         // Connection 0 came up and is here. Connections 1..=4 of the same
         // planned pool never dialled and are invisible.
@@ -915,7 +977,7 @@ mod tests {
         let ep = ws_body(r#"["dhan","disconnect","broker",true,"order_update",0,0]"#);
         let mut out = BTreeMap::new();
         fold_episode_rows_per_connection(&mut out, &ep).expect("ep parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ws_type, "order_update");
         assert_eq!(rows[0].disconnects_market, 1);
@@ -930,7 +992,7 @@ mod tests {
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &body).expect("parse");
         let day = 1_769_990_400_000_000_000_i64;
-        let rows = finalize_rows(out, day);
+        let rows = finalize_rows(out, day, true);
         assert_eq!(rows.len(), 2);
         for r in &rows {
             assert_eq!(r.ts_ist_nanos, day, "re-runs must UPSERT, not duplicate");
@@ -995,7 +1057,7 @@ mod tests {
         );
         let mut out = BTreeMap::new();
         fold_ws_event_rows(&mut out, &body).expect("parse");
-        let rows = finalize_rows(out, 0);
+        let rows = finalize_rows(out, 0, true);
         assert_eq!(rows[0].pool_size, 5);
     }
 }

@@ -528,6 +528,24 @@ pub struct ConnectionSupervisor {
     phase: ConnPhase,
     /// Consecutive failed attempts so far; also the ladder index for the NEXT
     /// delay. Reset to zero when the connection proves healthy.
+    /// Why the most recent redial was scheduled — AUDIT ONLY.
+    ///
+    /// # Why this is stored rather than passed
+    /// `schedule_redial` already knows the reason and sends it to a counter
+    /// labelled `endpoint` + `reason`. The EMF processor folds label values
+    /// into one summed series per host, so that counter can say a socket
+    /// reconnected 210 times and cannot say why any of them happened.
+    ///
+    /// The audit row was worse: `SleepThenDial` carries only a delay, so the
+    /// emit site had nothing to stamp and wrote the literal `"backoff_redial"`
+    /// for every reconnect — a subscribe failure, an idle-silence teardown, a
+    /// stale token and a plain transport close all rendered identically in
+    /// `ws_event_audit`. "Why did connection 3 reconnect 210 times today" got
+    /// the same four words 210 times.
+    ///
+    /// Read ONLY to stamp the row; the supervisor never branches on it, so
+    /// policy still lives entirely in `on_event`.
+    last_redial_reason: ReconnectReason,
     attempt: u32,
     watchdog: IdleWatchdog,
     /// Whether a frame has arrived since the current socket came up. The
@@ -568,6 +586,7 @@ impl ConnectionSupervisor {
         Self {
             slot,
             phase: ConnPhase::Idle,
+            last_redial_reason: ReconnectReason::Disconnected,
             attempt: 0,
             watchdog: IdleWatchdog::new(now),
             proven_healthy: false,
@@ -898,7 +917,19 @@ impl ConnectionSupervisor {
         }
     }
 
+    /// Why the most recent redial was scheduled — for the AUDIT ROW only.
+    ///
+    /// See `last_redial_reason`. Callers must not branch on this: the
+    /// supervisor has already made every decision this reason informed.
+    #[must_use]
+    pub const fn last_redial_reason(&self) -> ReconnectReason {
+        self.last_redial_reason
+    }
+
     fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
+        // Recorded at the ONE site every redial passes through, so the audit
+        // row cannot disagree with the counter beside it.
+        self.last_redial_reason = reason;
         self.attempt = self.attempt.saturating_add(1);
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
@@ -2499,6 +2530,34 @@ pub enum SocketEvent {
 pub trait DhanFeedSocket: Send {
     /// Dial and complete the handshake.
     fn connect(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Why the most recent [`Self::connect`] failed — AUDIT ONLY.
+    ///
+    /// # Why this exists beside an opaque `SocketFailure`
+    /// `SocketFailure` is a unit struct, deliberately: policy lives in the
+    /// supervisor, not the transport, and the supervisor must not branch on
+    /// the error kind. That is right about POLICY and it silently took
+    /// OBSERVABILITY with it. The transport already classifies every dial
+    /// failure into one of five bounded labels — `no_token`, `tls_config`,
+    /// `bad_url`, `timeout`, `connect` — and sends them to a counter whose
+    /// `endpoint` and `reason` labels the EMF processor folds into a single
+    /// summed series per host. So CloudWatch could say twelve dials failed and
+    /// could not say on which socket or why, and no queryable surface held the
+    /// answer at all: on 2026-08-12 the main feed failed twelve dials with
+    /// HTTP 400 and the reason reached no table.
+    ///
+    /// The supervisor reads this ONLY to stamp `ws_event_audit`. It never
+    /// branches on it, so the design intent above is intact.
+    ///
+    /// # Contract
+    /// Returns a `&'static str` from a bounded set — NEVER a formatted error.
+    /// A transport error's `Display` embeds the request URL, and this URL
+    /// carries the JWT in its query string.
+    ///
+    /// The default is `"unknown"` so a transport that does not classify says
+    /// so, rather than a caller inventing a reason it does not have.
+    fn last_dial_failure_reason(&self) -> &'static str {
+        "unknown"
+    }
     /// Send ONE subscribe message for the given batch.
     fn send_subscribe(
         &mut self,
@@ -2684,7 +2743,7 @@ where
                 // moment we got around to re-dialing.
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
-                    "backoff_redial",
+                    supervisor.last_redial_reason().as_str(),
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
@@ -2695,7 +2754,7 @@ where
                 guard.mark_lost();
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
-                    "token_refresh_redial",
+                    supervisor.last_redial_reason().as_str(),
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 refresh_token().await;
@@ -2705,7 +2764,19 @@ where
             SupervisorAction::Dial => {
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
-                    Err(_) => ConnEvent::DialFailed,
+                    Err(_) => {
+                        // The reason is read for the AUDIT ROW only — the
+                        // supervisor's decision below is `DialFailed` either
+                        // way, so policy still does not depend on the kind.
+                        // Without this row a socket that failed every dial
+                        // left `dial_started` and nothing else, and "why did
+                        // connection 3 never come up" had no answer in SQL.
+                        sink.on_lifecycle(
+                            tickvault_common::ws_event_types::WsEventKind::DialFailed,
+                            socket.last_dial_failure_reason(),
+                        );
+                        ConnEvent::DialFailed
+                    }
                 };
                 action = supervisor.on_event(event, Instant::now());
             }
@@ -5205,6 +5276,142 @@ mod tests {
             "every arm that marks the subscription lost is a real disconnect \
              and must be audited — {audited_redials} of {redial_arms} are"
         );
+    }
+
+    #[test]
+    fn a_failed_dial_is_audited_with_its_reason() {
+        // Same source-pin discipline as the test above, and for the same
+        // reason: the emit sits inside an async loop that needs a live socket.
+        //
+        // Before 2026-08-29 this arm was `Err(_) => ConnEvent::DialFailed` --
+        // the error discarded on the spot. The transport had ALREADY
+        // classified it into one of five bounded labels and sent it to a
+        // counter whose `endpoint` and `reason` labels the EMF processor folds
+        // into one summed series per host, so the answer to "which socket, and
+        // why" existed for a microsecond and reached no queryable surface. On
+        // 2026-08-12 the main feed failed twelve dials with HTTP 400 and the
+        // reason is in no table anywhere.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        let dial_arm = production
+            .split("SupervisorAction::Dial => {")
+            .nth(1)
+            .and_then(|s| s.split("SupervisorAction::Subscribe").next())
+            .expect("the dial arm must exist");
+        assert!(
+            dial_arm.contains("WsEventKind::DialFailed"),
+            "a failed dial must reach the audit as its own kind:\n{dial_arm}"
+        );
+        assert!(
+            dial_arm.contains("last_dial_failure_reason()"),
+            "and it must carry the transport's REASON — a DialFailed row \
+             without one answers 'did it fail' and not 'why', which is the \
+             half an operator is actually stuck on:\n{dial_arm}"
+        );
+        // The supervisor must not BRANCH on the reason. Policy stays in the
+        // supervisor; this is the audit stamp only.
+        assert!(
+            !dial_arm.contains("match socket.last_dial_failure_reason"),
+            "the reason is for the audit row, never for a decision:\n{dial_arm}"
+        );
+    }
+
+    #[test]
+    fn a_redial_is_audited_with_the_reason_that_caused_it() {
+        // Source pin, same discipline as the two tests above.
+        //
+        // Before 2026-08-29 both redial arms stamped a hardcoded string --
+        // "backoff_redial" and "token_refresh_redial" -- so a subscribe
+        // failure, an idle-silence teardown, a stale token and a plain
+        // transport close all rendered IDENTICALLY in ws_event_audit. The real
+        // reason went only to a counter labelled endpoint + reason, and the EMF
+        // processor folds label values into one summed series per host. "Why
+        // did connection 3 reconnect 210 times today" got the same four words
+        // 210 times.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        for arm in [
+            "SupervisorAction::SleepThenDial",
+            "SupervisorAction::RefreshTokenThenDial",
+        ] {
+            let body = production
+                .split(&format!("{arm} {{ delay_ms }} => {{"))
+                .nth(1)
+                .and_then(|s| s.split("action = supervisor.on_event").next())
+                .unwrap_or_else(|| panic!("the {arm} arm must exist"));
+            assert!(
+                body.contains("last_redial_reason()"),
+                "{arm} must stamp the reason that CAUSED the redial, not a \
+                 hardcoded label — the audit row is the only surface that can \
+                 tell two causes apart:\n{body}"
+            );
+        }
+
+        // And the reason must be recorded at the one site every redial passes
+        // through, or the row could disagree with the counter beside it.
+        let enter = production
+            .split("fn enter_backoff(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("enter_backoff must exist");
+        assert!(
+            enter.contains("self.last_redial_reason = reason;"),
+            "enter_backoff is the single choke point every redial reaches:\n{enter}"
+        );
+    }
+
+    #[test]
+    fn every_reconnect_reason_has_a_distinct_audit_label() {
+        // The label is what an operator groups by. Two reasons sharing one
+        // string would silently merge two different failures into one bucket.
+        let labels: Vec<&str> = [
+            ReconnectReason::DialFailed,
+            ReconnectReason::SubscribeFailed,
+            ReconnectReason::Disconnected,
+            ReconnectReason::TokenStale,
+            ReconnectReason::IdleSilence,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "reason labels must be unique");
+        // And none may collide with the two hardcoded strings they replaced,
+        // or an old row and a new row would read the same.
+        for l in &labels {
+            assert_ne!(*l, "backoff_redial");
+            assert_ne!(*l, "token_refresh_redial");
+        }
+    }
+
+    #[test]
+    fn the_default_dial_failure_reason_is_honest_about_not_knowing() {
+        // A transport that does not classify says "unknown" rather than
+        // letting a caller invent a reason it does not have.
+        struct Silent;
+        impl DhanFeedSocket for Silent {
+            async fn connect(&mut self) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn send_subscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn send_ping(&mut self) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn recv(&mut self) -> SocketEvent {
+                SocketEvent::Closed { code: None }
+            }
+            async fn close(&mut self) {}
+        }
+        assert_eq!(Silent.last_dial_failure_reason(), "unknown");
     }
 
     #[test]
