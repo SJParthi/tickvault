@@ -3921,6 +3921,23 @@ pub async fn run_feed_scoreboard(
     )
     .await;
 
+    // 8d. Per-TABLE disk footprint (`table_storage_daily`), same operator
+    //     directive: auditing, tracking, analysing, easily accessible.
+    //
+    //     Every disk figure this repository quotes is DERIVED — row width
+    //     times an assumed row count — and the 2026-08-28 disk-burn record
+    //     says so in its own words: "no per-table byte metric exists
+    //     anywhere ... nobody can say from telemetry where the 138 GB went".
+    //     QuestDB has known the answer the whole time; this reads it once a
+    //     day and writes one row per table.
+    //
+    //     Best-effort and additive: its own table, result discarded, cannot
+    //     fail or delay the scoreboard verdict. Written to the DATABASE only
+    //     — no CloudWatch metric, so zero recurring cost against a budget
+    //     already above the automatic stop line.
+    let _ = crate::table_storage_rollup::run_table_storage_rollup(questdb, trading_date_ist_nanos)
+        .await;
+
     metrics::counter!("tv_feed_scoreboard_runs_total", "outcome" => outcome.as_str()).increment(1);
 
     let dhan = feed_numbers

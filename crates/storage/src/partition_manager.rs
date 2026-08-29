@@ -110,6 +110,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
     // do not still hold.
     "ws_connection_daily",
+    // (2026-08-29, per-table disk-footprint measurement): one row per
+    // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
+    // class + DAY partitioning as the scoreboard tables above. Swept with
+    // them: it is a derived daily summary, and an aged-out partition loses a
+    // historical size reading, never data.
+    "table_storage_daily",
     // BRUTEX-XVERIFY-01/02 (2026-07-12, §37): one row per divergent cell /
     // one row per trading-day summary — same SEBI-audit class + DAY
     // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
@@ -284,6 +290,26 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     "option_chain_1m",
     "option_contract_1m_rest",
 ];
+
+/// Every table the retention system knows about, de-duplicated and sorted —
+/// the measurement set for `table_storage_probe`.
+///
+/// Built from the retention lists themselves rather than a second hand-kept
+/// list, so a table added to retention is measured automatically and the two
+/// can never drift. Includes the retention-EXEMPT tables deliberately: they
+/// are exempt from being SWEPT, not from occupying disk, and a current-state
+/// master that quietly grows is exactly the sort of thing nobody notices
+/// until a volume fills.
+#[must_use]
+pub fn all_managed_table_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = HOUR_PARTITIONED_TABLES.to_vec();
+    names.extend_from_slice(DAY_PARTITIONED_TABLES);
+    names.extend_from_slice(&crate::shadow_persistence::candle_table_names());
+    names.extend_from_slice(RETENTION_EXEMPT_TABLES);
+    names.sort_unstable();
+    names.dedup();
+    names
+}
 
 // ---------------------------------------------------------------------------
 // Partition Manager
@@ -1024,5 +1050,48 @@ mod tests {
         use tickvault_common::config::PartitionRetentionConfig;
         let config = PartitionRetentionConfig::default();
         assert_eq!(config.retention_days, 90);
+    }
+
+    #[test]
+    fn test_all_managed_table_names_covers_every_retention_list_without_duplicates() {
+        let names = all_managed_table_names();
+
+        // Every source list must be represented. Building this set FROM the
+        // retention lists is the whole point — a table added to retention is
+        // measured automatically, and the two cannot drift.
+        for t in HOUR_PARTITIONED_TABLES {
+            assert!(names.contains(t), "hour-partitioned `{t}` is not measured");
+        }
+        for t in DAY_PARTITIONED_TABLES {
+            assert!(names.contains(t), "day-partitioned `{t}` is not measured");
+        }
+        for t in RETENTION_EXEMPT_TABLES {
+            assert!(
+                names.contains(t),
+                "retention-EXEMPT `{t}` is not measured — exempt from being \
+                 SWEPT is not exempt from occupying disk"
+            );
+        }
+        for t in crate::shadow_persistence::candle_table_names() {
+            assert!(names.contains(&t), "candle table `{t}` is not measured");
+        }
+
+        // Sorted and deduplicated: a table appearing in two lists must be
+        // probed once, or its bytes are counted twice in any total.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the list must be sorted");
+        let mut deduped = names.clone();
+        deduped.dedup();
+        assert_eq!(names, deduped, "the list must contain no duplicates");
+
+        // Non-vacuity: an empty list would satisfy every "contains" above
+        // only if the source lists were empty too, but assert the floor
+        // anyway — a measurement set of nothing measures nothing.
+        assert!(
+            names.len() > 10,
+            "only {} managed tables — the retention lists look empty",
+            names.len()
+        );
     }
 }
