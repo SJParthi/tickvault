@@ -502,3 +502,411 @@ fn spawn_scanner_extracts_literals_and_ignores_non_literals() {
         "a non-literal spawn yields no literal — this is the documented limit"
     );
 }
+
+// ---------------------------------------------------------------------------
+// JS VOLUME + HANDLER-ATTRIBUTE SCOPE (2026-08-29)
+//
+// `rust-only-forever-lock-2026-07-19.md` §0.3 recorded two holes in the guard
+// above and closed neither, noting only that the tree was clean at the time:
+//
+//   1. It counts `<script` TAGS, not JavaScript. A budget-1 surface can grow
+//      from 20 lines of JS to 20,000 inside one tag with the count unchanged.
+//      "Rust only, except frontend" then has an unbounded exception, and an
+//      unbounded carve-out is not a carve-out.
+//   2. JavaScript carrying no `<script` at all is uncounted ENTIRELY — an
+//      inline `onclick=` attribute, or a route serving
+//      `Content-Type: application/javascript`.
+//
+// Both are the same shape as every prior fix in this family: the hole was in
+// what the guard LOOKED AT, never in its list. "Verified clean today" is a
+// measurement with a date on it, not an enforcement — this repository has
+// been bitten repeatedly by exactly that substitution.
+// ---------------------------------------------------------------------------
+
+/// Lines of JavaScript inside `<script>…</script>` blocks, per surface.
+///
+/// Counted inclusively from the line opening the block to the line closing
+/// it — the same span a reader would call "the script". EXACT values, so any
+/// growth is visible; the table may SHRINK freely.
+///
+/// **Growing a number here means the frontend carve-out got bigger**, and
+/// needs a dated operator note in `rust-only-forever-lock-2026-07-19.md`
+/// first, exactly like adding a path to `SCRIPT_BUDGET`.
+const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
+    ("crates/api/src/handlers/board_page.rs", 263),
+    ("crates/api/src/handlers/dashboard_page.rs", 235),
+    ("crates/api/src/handlers/feeds_page.rs", 226),
+    ("crates/aws-lambdas/src/operator_control_console.html", 339),
+];
+
+/// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
+///
+/// This is JavaScript that carries no `<script` tag, so the tag budget above
+/// is structurally blind to it. EXACT values, shrink-only.
+///
+/// The single occurrence outside the frontend surface is an XSS test fixture
+/// (`"><img src=x onerror=alert(1)>`) fed to a sanitiser — enumerated rather
+/// than pattern-excluded, so a REAL handler added to that file later still
+/// shows up as a count change.
+const INLINE_HANDLER_BUDGET: &[(&str, usize)] = &[
+    ("crates/aws-lambdas/src/operator_control.rs", 1),
+    ("crates/aws-lambdas/src/operator_control_console.html", 21),
+];
+
+/// The handler attributes scanned for. Not exhaustive by construction — no
+/// list of DOM events can be — but it covers every handler that has ever
+/// appeared in this tree plus the ones a new page would reach for first.
+const HANDLER_ATTRS: &[&str] = &[
+    "onblur",
+    "onchange",
+    "onclick",
+    "onerror",
+    "onfocus",
+    "oninput",
+    "onkeydown",
+    "onkeyup",
+    "onload",
+    "onmouseover",
+    "onsubmit",
+];
+
+/// Count lines inside `<script>…</script>` blocks, inclusive of the opening
+/// and closing lines.
+///
+/// An opening tag with NO closer anywhere after it is a fixture string or
+/// malformed markup, never a real block running to end of file — so it
+/// contributes its own line and nothing more. Getting this wrong is not
+/// cosmetic: the first version counted to EOF and reported 2,320 lines of
+/// "JavaScript" in a Rust notification module whose `<script` occurrences are
+/// all XSS test fixtures. A guard that inflates is abandoned as fast as one
+/// that under-reports.
+///
+/// Deliberately line-based rather than byte-based: bytes swing with
+/// formatting and would make the budget noisy enough that the next reader
+/// raises it out of irritation rather than intent. A guard people re-baseline
+/// to silence it is not a guard.
+fn js_line_count(body: &str) -> usize {
+    let mut total = 0_usize;
+    let mut in_block = false;
+    let mut current = 0_usize;
+    for line in body.lines() {
+        if !in_block && line.contains("<script") {
+            in_block = true;
+            current = 0;
+        }
+        if in_block {
+            current += 1;
+        }
+        if in_block && line.contains("</script>") {
+            in_block = false;
+            total += current;
+            current = 0;
+        }
+    }
+    if in_block {
+        total += 1;
+    }
+    total
+}
+
+/// Count inline handler attributes: an `on*` name followed by `=`, allowing
+/// whitespace between. Case-insensitive, because HTML attributes are.
+fn inline_handler_count(body: &str) -> usize {
+    let lower = body.to_ascii_lowercase();
+    let mut total = 0_usize;
+    for attr in HANDLER_ATTRS {
+        let mut from = 0_usize;
+        while let Some(hit) = lower[from..].find(attr) {
+            let at = from + hit;
+            let after = at + attr.len();
+            // The next non-space character must be `=`, or this is a
+            // substring of some longer identifier (`onloaded`, `on_click`)
+            // rather than an attribute.
+            let is_attr = lower[after..]
+                .chars()
+                .find(|c| !c.is_whitespace())
+                .is_some_and(|c| c == '=');
+            if is_attr {
+                total += 1;
+            }
+            from = after;
+        }
+    }
+    total
+}
+
+/// Files this scanner must skip: it has to SPELL the patterns it looks for,
+/// so scanning itself would make it permanently self-tripping. Same carve-out
+/// the tag scanner above takes, for the same reason.
+fn is_the_scanner_itself(path: &str) -> bool {
+    path.ends_with("browser_surface_and_toolchain_guard.rs")
+}
+
+#[test]
+fn javascript_volume_inside_script_tags_only_shrinks() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = JS_VOLUME_BUDGET.iter().copied().collect();
+
+    // SCOPE, and why it is narrow on purpose.
+    //
+    // This budget measures the SIZE of the frontend carve-out, so it scans the
+    // carve-out: the enumerated frontend surfaces, plus every tracked `.html`
+    // (so a NEW html surface is caught here as well as by the html test).
+    //
+    // It deliberately does NOT try to measure "lines of JavaScript" in
+    // arbitrary Rust files. Their `<script` occurrences are XSS fixtures and
+    // sanitiser inputs — string literals, often an opener with no closer on
+    // the same line — and any line-pairing over them produces nonsense: an
+    // early doc-comment mention pairs with an unrelated fixture 1,100 lines
+    // later. Those files are already guarded EXACTLY, by tag count, in
+    // `SCRIPT_BUDGET`; a new `<script` in any of them fails that test.
+    let mut scan: Vec<String> = JS_VOLUME_BUDGET
+        .iter()
+        .map(|(p, _)| (*p).to_string())
+        .collect();
+    for path in scan_paths("*.html") {
+        if !scan.contains(&path) {
+            scan.push(path);
+        }
+    }
+
+    let mut actual: BTreeMap<String, usize> = BTreeMap::new();
+    for path in scan {
+        if is_the_scanner_itself(&path) {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        actual.insert(path, js_line_count(&body));
+    }
+
+    // Non-vacuity: a scanner that silently matches nothing would pass forever.
+    assert!(
+        actual
+            .get("crates/api/src/handlers/dashboard_page.rs")
+            .is_some_and(|n| *n > 100),
+        "JS-volume scan found no substantial script block in a known frontend \
+         surface — the scanner is broken and would pass vacuously"
+    );
+
+    let mut problems = Vec::new();
+    for (path, count) in &actual {
+        match budget.get(path.as_str()) {
+            None if *count > 0 => problems.push(format!(
+                "  UNBUDGETED: {path} contains {count} line(s) of JavaScript and is \
+                 not in JS_VOLUME_BUDGET"
+            )),
+            Some(&allowed) if *count > allowed => problems.push(format!(
+                "  GREW: {path} has {count} line(s) of JavaScript, budget allows {allowed}"
+            )),
+            _ => {}
+        }
+    }
+
+    // A budget entry whose file lost its script is stale and must go, or the
+    // ratchet outlives what it bounds.
+    for (path, _) in JS_VOLUME_BUDGET {
+        assert!(
+            actual.get(*path).is_some_and(|n| *n > 0),
+            "SHRINK THE RATCHET: {path} no longer contains JavaScript. Remove it \
+             from JS_VOLUME_BUDGET in the same PR — a budget entry for a file \
+             with no script silently permits one to reappear."
+        );
+    }
+
+    assert!(
+        problems.is_empty(),
+        "FRONTEND CARVE-OUT GREW:\n{}\n\n\
+         `CLAUDE.md` exempts the FRONTEND from the Rust-only rule. That \
+         exemption is shrink-only by design: counting `<script` TAGS alone \
+         would let one tag hold twenty thousand lines and still read as \
+         budget 1.\n\n\
+         If the growth is genuinely wanted, add a dated note to \
+         `.claude/rules/project/rust-only-forever-lock-2026-07-19.md` FIRST, \
+         then raise the number here.",
+        problems.join("\n")
+    );
+}
+
+/// The two frontend tables must name the same surfaces. A `.rs` page that
+/// gained a script tag but no volume entry would be size-unbounded; a volume
+/// entry with no tag entry would be measuring a file nothing else guards.
+#[test]
+fn the_volume_budget_and_the_tag_budget_name_the_same_surfaces() {
+    let tag_paths: Vec<&str> = SCRIPT_BUDGET.iter().map(|(p, _)| *p).collect();
+    for (path, _) in JS_VOLUME_BUDGET {
+        let known = tag_paths.contains(path) || HTML_ALLOWED_FRONTEND.contains(path);
+        assert!(
+            known,
+            "{path} is in JS_VOLUME_BUDGET but in neither SCRIPT_BUDGET nor \
+             HTML_ALLOWED_FRONTEND — the tables have drifted"
+        );
+    }
+}
+
+#[test]
+fn inline_event_handlers_only_shrink() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = INLINE_HANDLER_BUDGET.iter().copied().collect();
+
+    let mut actual: BTreeMap<String, usize> = BTreeMap::new();
+    for pathspec in ["*.rs", "*.html"] {
+        for path in scan_paths(pathspec) {
+            if is_the_scanner_itself(&path) {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
+                continue;
+            };
+            let n = inline_handler_count(&body);
+            if n > 0 {
+                actual.insert(path, n);
+            }
+        }
+    }
+
+    assert!(
+        !actual.is_empty(),
+        "inline-handler scan found nothing anywhere — the scanner is broken and \
+         would pass vacuously (the frontend console has had handlers throughout)"
+    );
+
+    let mut problems = Vec::new();
+    for (path, count) in &actual {
+        match budget.get(path.as_str()) {
+            None => problems.push(format!(
+                "  UNBUDGETED: {path} has {count} inline event-handler attribute(s) \
+                 and is not in INLINE_HANDLER_BUDGET"
+            )),
+            Some(&allowed) if *count > allowed => problems.push(format!(
+                "  GREW: {path} has {count} inline handler(s), budget allows {allowed}"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    for (path, _) in INLINE_HANDLER_BUDGET {
+        assert!(
+            actual.contains_key(*path),
+            "SHRINK THE RATCHET: {path} no longer has an inline event handler. \
+             Remove it from INLINE_HANDLER_BUDGET in the same PR."
+        );
+    }
+
+    assert!(
+        problems.is_empty(),
+        "INLINE JAVASCRIPT OUTSIDE THE BUDGET:\n{}\n\n\
+         An `onclick=` attribute is JavaScript that carries no `<script` tag, \
+         so the tag budget cannot see it at all. Same rule: the frontend \
+         carve-out is shrink-only, and growing it needs a dated operator note \
+         in `rust-only-forever-lock-2026-07-19.md` first.",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn nothing_serves_a_javascript_content_type() {
+    // The third way JavaScript reaches a browser without a `<script` tag in
+    // our source: a route that answers with a JS media type and a body built
+    // elsewhere. VERIFIED ABSENT 2026-08-29 -- this is enforcement, not a
+    // measurement, so it stays absent.
+    let root = repo_root();
+    let needles = [
+        "application/javascript",
+        "text/javascript",
+        "application/ecmascript",
+    ];
+    let mut hits = Vec::new();
+    for path in scan_paths("*.rs") {
+        if is_the_scanner_itself(&path) {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        let lower = body.to_ascii_lowercase();
+        for n in needles {
+            if lower.contains(n) {
+                hits.push(format!("  {path} mentions `{n}`"));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "A JAVASCRIPT MEDIA TYPE APPEARS IN RUST SOURCE:\n{}\n\n\
+         A route serving `application/javascript` delivers script to a browser \
+         with no `<script` tag anywhere in our source, so both budgets above \
+         are blind to it. If this is a genuine new frontend surface, record it \
+         in `rust-only-forever-lock-2026-07-19.md` first and give it its own \
+         enumerated allowance here.",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn js_scanners_self_test() {
+    // The counters are the whole enforcement. If they mis-count, both budgets
+    // above pass while the carve-out grows, which is worse than no guard --
+    // it reports safety that is not there.
+
+    // Inclusive span, opening line through closing line.
+    assert_eq!(js_line_count("<script>\nlet a=1;\n</script>"), 3);
+    // Content outside the block is not JavaScript.
+    assert_eq!(
+        js_line_count("<p>x</p>\n<script>\nlet a=1;\n</script>\n<p>y</p>"),
+        3
+    );
+    // Two blocks both count.
+    assert_eq!(
+        js_line_count("<script>\na\n</script>\n<script>\nb\n</script>"),
+        6
+    );
+    // No script, no count.
+    assert_eq!(js_line_count("<p>nothing here</p>"), 0);
+    // THE HOLE THIS CLOSES: one tag, many lines. Tag count stays 1; this does not.
+    let fat = format!("<script>\n{}</script>", "x();\n".repeat(500));
+    assert_eq!(
+        fat.matches("<script").count(),
+        1,
+        "tag count is blind to volume"
+    );
+    assert_eq!(js_line_count(&fat), 502);
+
+    // An opener with no closer is a fixture string, not a block running to
+    // EOF. The first version of this counter got that wrong and reported
+    // 2,320 lines of "JavaScript" in a Rust notification module.
+    assert_eq!(
+        js_line_count("<script>alert(1)</script>"),
+        1,
+        "opener and closer on one line"
+    );
+    assert_eq!(
+        js_line_count("let s = \"<script>\";\nlet a = 1;\nlet b = 2;\n"),
+        1,
+        "an unterminated opener contributes its own line and nothing more"
+    );
+    assert_eq!(
+        js_line_count("</script>\nlet a = 1;\n"),
+        0,
+        "a stray closer with no opener opens nothing"
+    );
+
+    // Handler attributes, with and without space before `=`.
+    assert_eq!(inline_handler_count(r#"<b onclick="f()">"#), 1);
+    assert_eq!(inline_handler_count(r#"<b onclick = "f()">"#), 1);
+    assert_eq!(inline_handler_count("<img src=x onerror=alert(1)>"), 1);
+    assert_eq!(
+        inline_handler_count(r#"<b ONCLICK="f()">"#),
+        1,
+        "attributes are case-insensitive"
+    );
+    assert_eq!(
+        inline_handler_count(r#"<b onclick="f()" onchange="g()">"#),
+        2
+    );
+    // NOT handlers: a longer identifier that merely starts the same way.
+    assert_eq!(inline_handler_count("let onloaded = 1;"), 0);
+    assert_eq!(inline_handler_count("fn on_click_handler() {}"), 0);
+    assert_eq!(inline_handler_count("// discusses onclick in prose"), 0);
+}
