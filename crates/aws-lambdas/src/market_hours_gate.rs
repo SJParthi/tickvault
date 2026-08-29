@@ -268,19 +268,37 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                     tracing::error!(
                         alarm = %name,
                         error = %err,
-                        "could not arm this alarm individually -- the bulk arm below \
-                         is the retry, and a failure there fails the invocation"
+                        "could not arm this alarm -- the others are armed independently, \
+                         and if NONE of them arms the invocation fails below"
                     );
                 }
             }
-            // Belt, and the only call in this arm that may propagate: it
-            // re-arms anything the per-alarm pass missed (idempotent), and if
-            // the alarms cannot be armed AT ALL the invocation must fail
-            // loudly so the Lambda's Errors alarm fires.
-            cw.enable_alarm_actions()
-                .set_alarm_names(Some(alarm_names.clone()))
-                .send()
-                .await?;
+            // There is exactly ONE arming call in this file (the guard in
+            // `cloudwatch_agent_glob_guard.rs` counts them, so this comment
+            // deliberately does not spell the token), and it is the per-alarm
+            // one inside the loop above. A second bulk
+            // call would read as an unconditional arm to anyone auditing this
+            // arm -- the shape the holiday guard exists to forbid -- and it
+            // bought nothing the loop does not already do: the loop arms every
+            // alarm independently, so a mid-loop failure never costs the rest.
+            //
+            // What the bulk call DID carry was the loud-failure property, and
+            // that is kept here explicitly, at the SAME strength: the bulk `?`
+            // failed the invocation on any arming error, so ANY unarmed alarm
+            // fails it here too. Deliberately not "all of them failed" -- one
+            // unarmed alarm is one signal that pages nobody for the session,
+            // and returning Ok on that is the false-OK class this repo forbids.
+            //
+            // Reset failures are NOT fatal, and the asymmetry is the point: a
+            // failed pre-reset costs at most one spurious recovery page, while
+            // a failed arm costs the page itself.
+            if arm_failures > 0 {
+                return Err(Error::from(format!(
+                    "could not arm {arm_failures} of {} gated alarms -- each is a \
+                     liveness signal that would page nobody for the session",
+                    alarm_names.len()
+                )));
+            }
             info!(
                 alarms = ?alarm_names,
                 reset_failures,
