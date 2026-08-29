@@ -284,6 +284,45 @@ bite: revert one call to the legacy overload and both segment rows read 0.
    `ratchet_order_runtime_spawned_only_from_rest_stack`.
 4. `order_audit` / `pnl_audit` QuestDB tables — flagged follow-up (this PR
    adds NO tables).
+   **AMENDED 2026-08-29 — both tables now EXIST and are written today, and
+   the follow-up they name is stale in the reassuring direction.** What is
+   open is not the tables; it is what happens when one of them cannot be
+   written. Five order-side writers — `order_audit`,
+   `order_update_events`, `position_update_events`, `order_leg_pnl` and
+   `pnl_audit` — respond to an ILP flush failure with `discard_pending()`:
+   the buffer is cleared, a counter is bumped, and the rows are gone. There
+   is no disk spill and no replay, unlike `ticks` and `market_depth`, which
+   both rescue the failed payload to disk and drain it back in.
+
+   Split honestly, because the five are not equal:
+
+   * `order_audit`, `order_update_events` and `position_update_events` are
+     covered by the `order_audit_chain_loss` composite CloudWatch alarm
+     (`order-side-alarms.tf`, added 2026-08-19). Unrescued, but watched.
+   * `order_leg_pnl` and `pnl_audit` are in NO EMF selector and NO alarm.
+     A first draft of this note called that a *silent* loss; checked rather
+     than repeated, it is not. Both paths log a coded `error!` —
+     `ORDER-PNL-01` from `flush_leg_pnl_writer` and `STORAGE-GAP-03` from
+     the `pnl_audit` OnEod arm — into the same `errors.jsonl` route every
+     other coded error uses, so the loss is queryable and reachable by
+     `tail_errors` and `find_runbook_for_code`. It is UNWATCHED, not
+     silent, and the distinction is the difference between "nobody can find
+     out" and "nobody is told".
+
+   **Not fixed, and the reason is a cost decision rather than an oversight.**
+   Today's order flow is the once-a-day paper self-test: single-digit rows
+   per day across all five tables. Two log-filter alarms would cost ~$0.20/mo
+   — and `dhan-rest-only-noise-lock-2026-07-14.md` §2.3n records the maximal
+   month already sitting ~$6 above the budget's automatic
+   `STOP_EC2_INSTANCES` line and under $2 below the operator's $125 hard cap,
+   with its own instruction that the next addition of any size must arrive
+   with a lever rather than another cost note. Spending it on a 2-6 row/day
+   loss that is already coded-logged is the wrong trade at this volume.
+
+   **What would change that:** live order fire, which multiplies the volume
+   and makes these rows SEBI evidence rather than paper-mode telemetry. The
+   two alarms, or a real rescue tier, belong in the same change as the
+   `dry_run = false` flip — not before it, and not after.
 5. HTTP command endpoints for the runtime — cut (attack surface); the
    heartbeat + metrics are the observability surface.
 6. RiskEngine/OMS composite-key rewrite — §3 (mandatory pre-live).
