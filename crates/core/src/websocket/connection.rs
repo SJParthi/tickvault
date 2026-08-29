@@ -904,6 +904,12 @@ pub struct DhanFeedSocketImpl<T: FeedTokenSource> {
     /// The live socket. `None` before the first dial and after every close, so
     /// a stale stream can never be written to.
     stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    /// Why the last dial failed, as one of the transport's bounded labels.
+    ///
+    /// A `&'static str` from a fixed set, never a formatted error: a
+    /// tungstenite error's `Display` embeds the request URL, and that URL
+    /// carries the JWT in its query string.
+    last_dial_failure_reason: &'static str,
 }
 
 impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
@@ -914,6 +920,7 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
             params,
             token,
             stream: None,
+            last_dial_failure_reason: "unknown",
         }
     }
 
@@ -935,7 +942,13 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         loggable_url(&self.params.base_url)
     }
 
-    fn count_dial_failure(&self, reason: &'static str) {
+    /// Counts a dial failure AND records its reason for the audit row.
+    ///
+    /// One site does both deliberately: a counter incremented without the
+    /// reason recorded is how the reason came to exist only inside a folded
+    /// CloudWatch label in the first place.
+    fn count_dial_failure(&mut self, reason: &'static str) {
+        self.last_dial_failure_reason = reason;
         metrics::counter!(
             DIAL_FAILED_METRIC,
             "endpoint" => self.params.endpoint.as_str(),
@@ -1128,6 +1141,9 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
 }
 
 impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
+    fn last_dial_failure_reason(&self) -> &'static str {
+        self.last_dial_failure_reason
+    }
     async fn connect(&mut self) -> Result<(), SocketFailure> {
         // A previous socket must be gone before a new one is dialed, or the
         // pool budget is silently exceeded and Dhan kills the OLDEST member.

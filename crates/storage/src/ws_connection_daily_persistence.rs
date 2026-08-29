@@ -153,6 +153,30 @@ pub struct WsConnectionDailyRow {
     /// from `saw_any_event`, which still means "the socket did something" —
     /// a dial that failed is precisely the socket doing nothing.
     pub dial_started: bool,
+    /// Whether the `feed_episode_audit` half of this row is TRUSTWORTHY.
+    ///
+    /// # Why a column and not a log line (2026-08-29)
+    /// Six of this row's fields — `disconnects_market`, `disconnects_off_hours`,
+    /// `stalls`, `restarts` and the three `blame_*` — come from a SECOND query
+    /// against `feed_episode_audit`, not from the `ws_event_audit` fold. That
+    /// query is allowed to fail: the rollup writes the row anyway, with those
+    /// six left at their zero defaults, because a partial row beats no row.
+    ///
+    /// Until now the fact that it HAD failed lived only in an `info!` line, so
+    /// the persisted row was indistinguishable from a genuinely quiet day, and
+    /// `clean_day` rendered TRUE off six zeros nobody had actually measured.
+    ///
+    /// The sharpest case is an in-market PROCESS DEATH. It is synthesized
+    /// straight into `feed_episode_audit` and has NO `ws_event_audit` trace at
+    /// all — `restarts` is the only field that carries it. So on a day the
+    /// process died AND the episode read failed or merely lagged behind the
+    /// rollup, every other field in the row was legitimately zero and nothing
+    /// contradicted the false verdict. `stalls` has the same shape:
+    /// `StallRestarted` sets `saw_any_event` and no counted column.
+    ///
+    /// `clean_day` now requires this flag, so an unmeasured episode half reads
+    /// as NOT clean — degraded and queryable, never quietly healthy.
+    pub episodes_complete: bool,
 }
 
 impl WsConnectionDailyRow {
@@ -177,6 +201,11 @@ impl WsConnectionDailyRow {
             && self.stalls == 0
             && self.restarts == 0
             && self.reconnects == 0
+            // The episode half must have been MEASURED, not merely absent. Six
+            // fields above come from a second query that is allowed to fail;
+            // if it did, their zeros are unmeasured rather than quiet, and a
+            // process death leaves no other trace in this row at all.
+            && self.episodes_complete
     }
 
     /// Total incidents of every kind — the one number an operator scans a
@@ -221,6 +250,7 @@ pub const WS_CONNECTION_DAILY_COLUMNS: &[(&str, &str)] = &[
     ("max_attempts", "LONG"),
     ("saw_any_event", "BOOLEAN"),
     ("dial_started", "BOOLEAN"),
+    ("episodes_complete", "BOOLEAN"),
     ("clean_day", "BOOLEAN"),
 ];
 
@@ -465,6 +495,8 @@ impl WsConnectionDailyWriter {
             .context("saw_any_event")?
             .column_bool("dial_started", r.dial_started)
             .context("dial_started")?
+            .column_bool("episodes_complete", r.episodes_complete)
+            .context("episodes_complete")?
             .column_bool("clean_day", r.clean_day())
             .context("clean_day")?
             .at(TimestampNanos::new(r.ts_ist_nanos))
@@ -535,6 +567,7 @@ mod tests {
             max_attempts: 3,
             saw_any_event: true,
             dial_started: true,
+            episodes_complete: true,
         }
     }
 
@@ -646,6 +679,10 @@ mod tests {
         let healthy = WsConnectionDailyRow {
             saw_any_event: true,
             connects: 1,
+            // A healthy day is one where the episode half was actually READ.
+            // `Default` leaves this false on purpose: a row nobody measured
+            // must not render as clean.
+            episodes_complete: true,
             ..WsConnectionDailyRow::default()
         };
         assert!(healthy.clean_day());
@@ -659,11 +696,23 @@ mod tests {
         let base = WsConnectionDailyRow {
             saw_any_event: true,
             connects: 1,
+            episodes_complete: true,
             ..WsConnectionDailyRow::default()
         };
         assert!(base.clean_day(), "control must be clean");
 
         let mut cases: Vec<(&str, WsConnectionDailyRow)> = Vec::new();
+        // The 2026-08-29 term. Not an incident COUNT — an admission that six
+        // of the counts beside it were never measured. A process death lives
+        // ONLY in that half, so without this the row reads clean on exactly
+        // the day the process died.
+        cases.push((
+            "episodes_complete",
+            WsConnectionDailyRow {
+                episodes_complete: false,
+                ..base.clone()
+            },
+        ));
         cases.push((
             "disconnect_events",
             WsConnectionDailyRow {
@@ -766,6 +815,7 @@ mod tests {
         w2.append_row(&WsConnectionDailyRow {
             saw_any_event: true,
             connects: 1,
+            episodes_complete: true,
             ..WsConnectionDailyRow::default()
         })
         .expect("append");

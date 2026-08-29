@@ -112,6 +112,24 @@ pub enum WsEventKind {
     /// something", and a dial that failed is precisely the socket doing
     /// nothing.
     DialStarted,
+    /// A dial attempt FAILED, before any handshake completed.
+    ///
+    /// ADDED 2026-08-29, and it is the reason half of `DialStarted`. That kind
+    /// records that we tried; this one records why we did not get through, and
+    /// the `reason` travels into `ws_event_audit.reason` as one of the
+    /// transport's bounded labels — `no_token`, `tls_config`, `bad_url`,
+    /// `timeout`, `connect`.
+    ///
+    /// The classification already existed. It went to a counter labelled
+    /// `endpoint` + `reason`, and the EMF processor folds label values into one
+    /// summed series per host — so CloudWatch could say twelve dials failed and
+    /// could not say which endpoint or why. The answer to "why did connection 3
+    /// never come up" existed in the process for a microsecond and reached no
+    /// queryable surface at all.
+    ///
+    /// Like `DialStarted` it must NOT set `saw_any_event`: a failed dial is the
+    /// socket doing nothing, which is exactly what makes the day not clean.
+    DialFailed,
 }
 
 impl WsEventKind {
@@ -127,12 +145,13 @@ impl WsEventKind {
             Self::SleepResumed => "sleep_resumed",
             Self::StallRestarted => "stall_restarted",
             Self::DialStarted => "dial_started",
+            Self::DialFailed => "dial_failed",
         }
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness.
     #[must_use]
-    pub const fn all() -> [WsEventKind; 8] {
+    pub const fn all() -> [WsEventKind; 9] {
         [
             Self::Connected,
             Self::Disconnected,
@@ -142,6 +161,7 @@ impl WsEventKind {
             Self::SleepResumed,
             Self::StallRestarted,
             Self::DialStarted,
+            Self::DialFailed,
         ]
     }
 }
@@ -231,6 +251,7 @@ mod tests {
                 "sleep_resumed",
                 "stall_restarted",
                 "dial_started",
+                "dial_failed",
             ]
         );
         let unique: HashSet<&str> = labels.iter().copied().collect();
@@ -246,11 +267,12 @@ mod tests {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
         assert_eq!(WsType::all().len(), 5);
-        // 7 -> 8 on 2026-08-29 with `DialStarted`. This ratchet is why the
-        // addition could not be silent: `all()` drives the persistence
+        // 7 -> 8 -> 9 on 2026-08-29 with `DialStarted` then `DialFailed`.
+        // This ratchet is why either addition could not be silent: the
+        // `all()` array drives the persistence
         // round-trip test, so a kind missing from it would never have had its
         // ILP append exercised.
-        assert_eq!(WsEventKind::all().len(), 8);
+        assert_eq!(WsEventKind::all().len(), 9);
     }
 
     #[test]
@@ -276,6 +298,33 @@ mod tests {
         }
         assert!(
             WsEventKind::all().contains(&WsEventKind::DialStarted),
+            "a kind absent from all() never gets its ILP append exercised"
+        );
+    }
+
+    #[test]
+    fn test_dial_failed_carries_its_own_label_and_is_not_an_up_kind() {
+        let label = WsEventKind::DialFailed.as_str();
+        assert_eq!(label, "dial_failed");
+        // A failed dial is the socket doing NOTHING. Any consumer that reads
+        // it as activity would report a connection healthy on the strength of
+        // it having failed.
+        for reserved in [
+            "connected",
+            "reconnected",
+            "sleep_resumed",
+            "disconnected",
+            "disconnected_off_hours",
+            "stall_restarted",
+            "dial_started",
+        ] {
+            assert_ne!(
+                label, reserved,
+                "dial_failed must not collide with an existing lifecycle label"
+            );
+        }
+        assert!(
+            WsEventKind::all().contains(&WsEventKind::DialFailed),
             "a kind absent from all() never gets its ILP append exercised"
         );
     }

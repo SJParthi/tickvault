@@ -2499,6 +2499,34 @@ pub enum SocketEvent {
 pub trait DhanFeedSocket: Send {
     /// Dial and complete the handshake.
     fn connect(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Why the most recent [`Self::connect`] failed — AUDIT ONLY.
+    ///
+    /// # Why this exists beside an opaque `SocketFailure`
+    /// `SocketFailure` is a unit struct, deliberately: policy lives in the
+    /// supervisor, not the transport, and the supervisor must not branch on
+    /// the error kind. That is right about POLICY and it silently took
+    /// OBSERVABILITY with it. The transport already classifies every dial
+    /// failure into one of five bounded labels — `no_token`, `tls_config`,
+    /// `bad_url`, `timeout`, `connect` — and sends them to a counter whose
+    /// `endpoint` and `reason` labels the EMF processor folds into a single
+    /// summed series per host. So CloudWatch could say twelve dials failed and
+    /// could not say on which socket or why, and no queryable surface held the
+    /// answer at all: on 2026-08-12 the main feed failed twelve dials with
+    /// HTTP 400 and the reason reached no table.
+    ///
+    /// The supervisor reads this ONLY to stamp `ws_event_audit`. It never
+    /// branches on it, so the design intent above is intact.
+    ///
+    /// # Contract
+    /// Returns a `&'static str` from a bounded set — NEVER a formatted error.
+    /// A transport error's `Display` embeds the request URL, and this URL
+    /// carries the JWT in its query string.
+    ///
+    /// The default is `"unknown"` so a transport that does not classify says
+    /// so, rather than a caller inventing a reason it does not have.
+    fn last_dial_failure_reason(&self) -> &'static str {
+        "unknown"
+    }
     /// Send ONE subscribe message for the given batch.
     fn send_subscribe(
         &mut self,
@@ -2705,7 +2733,19 @@ where
             SupervisorAction::Dial => {
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
-                    Err(_) => ConnEvent::DialFailed,
+                    Err(_) => {
+                        // The reason is read for the AUDIT ROW only — the
+                        // supervisor's decision below is `DialFailed` either
+                        // way, so policy still does not depend on the kind.
+                        // Without this row a socket that failed every dial
+                        // left `dial_started` and nothing else, and "why did
+                        // connection 3 never come up" had no answer in SQL.
+                        sink.on_lifecycle(
+                            tickvault_common::ws_event_types::WsEventKind::DialFailed,
+                            socket.last_dial_failure_reason(),
+                        );
+                        ConnEvent::DialFailed
+                    }
                 };
                 action = supervisor.on_event(event, Instant::now());
             }
@@ -5205,6 +5245,72 @@ mod tests {
             "every arm that marks the subscription lost is a real disconnect \
              and must be audited — {audited_redials} of {redial_arms} are"
         );
+    }
+
+    #[test]
+    fn a_failed_dial_is_audited_with_its_reason() {
+        // Same source-pin discipline as the test above, and for the same
+        // reason: the emit sits inside an async loop that needs a live socket.
+        //
+        // Before 2026-08-29 this arm was `Err(_) => ConnEvent::DialFailed` --
+        // the error discarded on the spot. The transport had ALREADY
+        // classified it into one of five bounded labels and sent it to a
+        // counter whose `endpoint` and `reason` labels the EMF processor folds
+        // into one summed series per host, so the answer to "which socket, and
+        // why" existed for a microsecond and reached no queryable surface. On
+        // 2026-08-12 the main feed failed twelve dials with HTTP 400 and the
+        // reason is in no table anywhere.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        let dial_arm = production
+            .split("SupervisorAction::Dial => {")
+            .nth(1)
+            .and_then(|s| s.split("SupervisorAction::Subscribe").next())
+            .expect("the dial arm must exist");
+        assert!(
+            dial_arm.contains("WsEventKind::DialFailed"),
+            "a failed dial must reach the audit as its own kind:\n{dial_arm}"
+        );
+        assert!(
+            dial_arm.contains("last_dial_failure_reason()"),
+            "and it must carry the transport's REASON — a DialFailed row \
+             without one answers 'did it fail' and not 'why', which is the \
+             half an operator is actually stuck on:\n{dial_arm}"
+        );
+        // The supervisor must not BRANCH on the reason. Policy stays in the
+        // supervisor; this is the audit stamp only.
+        assert!(
+            !dial_arm.contains("match socket.last_dial_failure_reason"),
+            "the reason is for the audit row, never for a decision:\n{dial_arm}"
+        );
+    }
+
+    #[test]
+    fn the_default_dial_failure_reason_is_honest_about_not_knowing() {
+        // A transport that does not classify says "unknown" rather than
+        // letting a caller invent a reason it does not have.
+        struct Silent;
+        impl DhanFeedSocket for Silent {
+            async fn connect(&mut self) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn send_subscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn send_ping(&mut self) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn recv(&mut self) -> SocketEvent {
+                SocketEvent::Closed { code: None }
+            }
+            async fn close(&mut self) {}
+        }
+        assert_eq!(Silent.last_dial_failure_reason(), "unknown");
     }
 
     #[test]
