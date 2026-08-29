@@ -1946,10 +1946,14 @@ impl LiveIngest {
         //
         // Reachability is not theoretical: `AGGREGATOR_MAX_SLOTS` is 25,000 and
         // the authorized universe is ~24,600, so the headroom is ~400 -- and
-        // the per-minute ATM re-fit ADDS instruments during the session. Worse,
-        // `tv_aggregator_slot_exhausted_total` is not in the EMF selector, so
-        // crossing that line would have silently discarded every further
-        // instrument's rows with nothing on any dashboard to show it. Keeping
+        // the per-minute ATM re-fit ADDS instruments during the session.
+        //
+        // (CORRECTED 2026-08-29: this said `tv_aggregator_slot_exhausted_total`
+        // "is not in the EMF selector". It IS -- `cloudwatch-agent.json` carries
+        // it. The claim was true when written and the selector moved under it,
+        // which is the same reassuring-direction rot this file keeps recording:
+        // a reader auditing for a blind counter would have gone looking for a
+        // gap that had already been closed.) Keeping
         // the row means an instrument past the cap still has a complete tick
         // record; only its candles are missing, and the counter says so.
         let hard_refusal = stats.refused_price || stats.refused_timestamp;
@@ -4241,10 +4245,11 @@ async fn run_frame_drain(
                         refused_timestamp = d_ts,
                         refused_slot_exhausted = d_slot,
                         "Dhan live feed: the aggregator refused ticks in the last 30s. \
-                         These ticks were NOT folded into any candle and NOT written. \
-                         A price or timestamp refusal means the upstream packet failed \
-                         a sanity check; a slot refusal means the instrument capacity \
-                         is exhausted and NEW instruments are being turned away."
+                         PRICE and TIMESTAMP refusals are HARD -- no candle and no row; \
+                         the upstream packet failed a sanity check. A SLOT refusal is \
+                         candle-only: the instrument capacity is exhausted and NEW \
+                         instruments get no candles, but their rows ARE still written. \
+                         Do not read the total as a tick-loss count."
                     );
                     last_refusals = now;
                 }
