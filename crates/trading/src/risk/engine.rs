@@ -104,6 +104,29 @@ pub struct RiskEngine {
     /// bounded by instruments traded per day, i.e. by the 7,000/day order
     /// GCRA — caller convention, stated plainly rather than claimed as a cap.
     non_flat: HashSet<PositionKey>,
+    /// Net lots summed across EVERY segment for a numeric `security_id` —
+    /// the bare-id view of `positions`.
+    ///
+    /// # Why this index exists (I-P1-11, 2026-08-29)
+    /// `positions` is keyed on the composite `(security_id, segment)`, which
+    /// is correct: two instruments sharing a numeric id in different segments
+    /// are different instruments and must not net. But the order runtime's
+    /// local reconcile compares the risk engine against two inputs that are
+    /// structurally BARE-SID and cannot be made composite:
+    ///   * `BookState.mirror`, a per-sid fold of `FillEvent`s, and
+    ///   * a per-sid fold of `ManagedOrder.traded_qty` — and `ManagedOrder`
+    ///     has NO segment field at all.
+    /// Summing here is therefore not a shortcut; it is the only comparison
+    /// that is apples-to-apples against those two. Per-leg risk decisions
+    /// (position limits, avg entry, realized/unrealized P&L) keep using the
+    /// composite row and are unaffected.
+    ///
+    /// Maintained at the SAME two sites as `non_flat` — the single `net_lots`
+    /// mutation in `record_fill_in_segment` and `reset_daily` — so the three
+    /// structures cannot drift apart. Keys are created in lockstep with
+    /// `positions`, flat rows included (the reconcile's union needs them), so
+    /// it is bounded transitively by `MAX_TRACKED_POSITIONS`.
+    by_sid: HashMap<u64, i64>,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -190,6 +213,7 @@ impl RiskEngine {
             positions: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             non_flat: HashSet::with_capacity(POSITIONS_INITIAL_CAPACITY),
+            by_sid: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             marks_rejected: 0,
             mark_capacity_reported: false,
             total_realized_pnl: 0.0,
@@ -489,11 +513,23 @@ impl RiskEngine {
         // fill without touching `net_lots`, so an index update before them
         // could record a transition that never happened.
         let key = (security_id, segment);
-        if self.positions.get(&key).is_some_and(|p| p.net_lots != 0) {
+        let new_lots = self.positions.get(&key).map_or(0, |p| p.net_lots);
+        if new_lots != 0 {
             self.non_flat.insert(key);
         } else {
             self.non_flat.remove(&key);
         }
+        // Bare-sid net-lots index, maintained from the SAME delta, at the SAME
+        // site, for the SAME reason: it must not record a transition an early
+        // return above rejected.
+        //
+        // The entry is created UNCONDITIONALLY, not only when the delta is
+        // non-zero, so `by_sid`'s key set stays in exact lockstep with
+        // `positions` — a `saturating_add` at `i32::MAX` yields a zero delta
+        // while `positions` has just gained the row, and a conditional insert
+        // would leave that sid invisible to the reconcile's union.
+        let entry = self.by_sid.entry(security_id).or_insert(0);
+        *entry = entry.saturating_add(i64::from(new_lots) - i64::from(old_lots));
     }
 
     /// Updates the mark-to-market price for an instrument (for unrealized P&L).
@@ -681,6 +717,7 @@ impl RiskEngine {
     pub fn reset_daily(&mut self) {
         self.positions.clear();
         self.non_flat.clear();
+        self.by_sid.clear();
         self.market_prices.clear();
         self.total_realized_pnl = 0.0;
         self.halted = false;
@@ -718,6 +755,42 @@ impl RiskEngine {
         self.positions
             .get(&(security_id, segment))
             .map_or(0, |p| p.net_lots)
+    }
+
+    /// Returns the net lots for a numeric `security_id` SUMMED across every
+    /// exchange segment it is tracked in.
+    ///
+    /// # When to use this instead of the composite lookups
+    /// Use this ONLY to compare against something that is itself bare-sid and
+    /// cannot be made composite. Today that is exactly two things, both in the
+    /// order runtime's local reconcile: the `FillEvent` mirror, and the fold of
+    /// `ManagedOrder.traded_qty` — and `ManagedOrder` carries no segment field
+    /// at all, so that fold is bare-sid by construction, not by choice.
+    ///
+    /// For a RISK DECISION — a position limit, an entry price, a P&L figure —
+    /// use [`Self::net_lots_for_in_segment`] or [`Self::position_in_segment`].
+    /// Summing a long in one segment against a short in another is exactly the
+    /// I-P1-11 netting this engine's composite key exists to prevent.
+    ///
+    /// # Performance
+    /// O(1) — one HashMap lookup against the `by_sid` index. NOT a scan of
+    /// `positions`, which is what makes it usable from the reconcile.
+    pub fn net_lots_for_any_segment(&self, security_id: u64) -> i64 {
+        self.by_sid.get(&security_id).copied().unwrap_or(0)
+    }
+
+    /// Iterates each DISTINCT numeric `security_id` the engine tracks a
+    /// position row for (flat rows included).
+    ///
+    /// The de-duplicated companion to [`Self::position_security_ids`], which
+    /// yields the same id once per segment. Pairs with
+    /// [`Self::net_lots_for_any_segment`] to give the reconcile a bare-sid view
+    /// whose key set matches its bare-sid inputs.
+    ///
+    /// # Performance
+    /// O(distinct sids) to iterate; O(1) per item, no allocation.
+    pub fn tracked_security_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.by_sid.keys().copied()
     }
 
     /// Iterates the security ids of every tracked position row (including
@@ -1002,6 +1075,26 @@ mod tests {
         assert_eq!(
             engine.non_flat, derived,
             "non_flat index drifted from positions at: {at}"
+        );
+        // The bare-sid index is re-derived the same way, for the same reason:
+        // it is maintained incrementally from a delta, so a wrong delta would
+        // agree with a hand-listed expectation but not with the map.
+        let mut derived_by_sid: HashMap<u64, i64> = HashMap::new();
+        for (&(security_id, _), pos) in &engine.positions {
+            *derived_by_sid.entry(security_id).or_insert(0) += i64::from(pos.net_lots);
+        }
+        assert_eq!(
+            engine.by_sid, derived_by_sid,
+            "by_sid index drifted from positions at: {at}"
+        );
+        // Key sets must match exactly, flat rows included — the reconcile's
+        // union is built from `tracked_security_ids`, so a missing key there is
+        // a position the reconcile silently stops checking.
+        let sid_keys: HashSet<u64> = engine.positions.keys().map(|&(s, _)| s).collect();
+        let index_keys: HashSet<u64> = engine.by_sid.keys().copied().collect();
+        assert_eq!(
+            index_keys, sid_keys,
+            "by_sid key set drifted from positions at: {at}"
         );
         assert_eq!(
             engine.open_position_count(),
@@ -2374,5 +2467,83 @@ mod tests {
             !engine.mark_capacity_reported,
             "the daily reset re-arms the latch — a new day gets its own line"
         );
+    }
+
+    /// The bare-sid index sums a numeric id across every segment it is held in.
+    ///
+    /// This is the number the order runtime's reconcile compares against its
+    /// two bare-sid inputs. It is deliberately NOT the number any risk decision
+    /// reads — a long and a short in different segments sum to zero here while
+    /// both positions are genuinely open, which is precisely why the position
+    /// limit uses the composite row.
+    #[test]
+    fn test_net_lots_for_any_segment_sums_across_segments() {
+        let mut engine = RiskEngine::new(2.0, 100, 1_000_000.0);
+        engine.record_fill_in_segment(27, ExchangeSegment::IdxI, 3, 100.0, 1);
+        engine.record_fill_in_segment(27, ExchangeSegment::NseEquity, -2, 200.0, 1);
+        assert_eq!(engine.net_lots_for_in_segment(27, ExchangeSegment::IdxI), 3);
+        assert_eq!(
+            engine.net_lots_for_in_segment(27, ExchangeSegment::NseEquity),
+            -2
+        );
+        assert_eq!(engine.net_lots_for_any_segment(27), 1, "3 + (-2)");
+        assert_eq!(
+            engine.net_lots_for_any_segment(999),
+            0,
+            "an untracked id reads 0, never a panic"
+        );
+        assert_index_matches_map(&engine, "after a two-segment fill pair");
+    }
+
+    /// A close brings the composite row back to flat and the bare-sid sum with
+    /// it — the index is a running delta, so a missed decrement would show up
+    /// here as a phantom position the reconcile would then report forever.
+    #[test]
+    fn test_net_lots_for_any_segment_returns_to_zero_on_a_full_close() {
+        let mut engine = RiskEngine::new(2.0, 100, 1_000_000.0);
+        engine.record_fill_in_segment(640, ExchangeSegment::NseFno, 5, 100.0, 25);
+        assert_eq!(engine.net_lots_for_any_segment(640), 5);
+        engine.record_fill_in_segment(640, ExchangeSegment::NseFno, -5, 110.0, 25);
+        assert_eq!(engine.net_lots_for_any_segment(640), 0);
+        assert_index_matches_map(&engine, "after a full close");
+        assert!(
+            engine.tracked_security_ids().any(|s| s == 640),
+            "a flat row is still TRACKED — the reconcile's union needs it, or a \
+             risk-side position that closed to zero stops being compared"
+        );
+    }
+
+    /// De-duplicated, and it keeps flat rows.
+    #[test]
+    fn test_tracked_security_ids_dedups_across_segments() {
+        let mut engine = RiskEngine::new(2.0, 100, 1_000_000.0);
+        engine.record_fill_in_segment(27, ExchangeSegment::IdxI, 1, 100.0, 1);
+        engine.record_fill_in_segment(27, ExchangeSegment::NseEquity, 1, 200.0, 1);
+        engine.record_fill_in_segment(51, ExchangeSegment::BseFno, 1, 300.0, 1);
+        let ids: HashSet<u64> = engine.tracked_security_ids().collect();
+        assert_eq!(ids, HashSet::from([27, 51]));
+        assert_eq!(
+            engine.tracked_security_ids().count(),
+            2,
+            "27 appears ONCE despite two segment rows — position_security_ids \
+             yields it twice by design; this is the de-duplicated companion"
+        );
+        assert_eq!(
+            engine.position_security_ids().count(),
+            3,
+            "the composite view still reports one entry per row"
+        );
+    }
+
+    /// The daily reset clears the bare-sid index with everything else.
+    #[test]
+    fn test_reset_daily_clears_the_bare_sid_index() {
+        let mut engine = RiskEngine::new(2.0, 100, 1_000_000.0);
+        engine.record_fill_in_segment(27, ExchangeSegment::IdxI, 4, 100.0, 1);
+        assert_eq!(engine.net_lots_for_any_segment(27), 4);
+        engine.reset_daily();
+        assert_eq!(engine.net_lots_for_any_segment(27), 0);
+        assert_eq!(engine.tracked_security_ids().count(), 0);
+        assert_index_matches_map(&engine, "after reset_daily");
     }
 }

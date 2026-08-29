@@ -88,8 +88,26 @@ concurrency:
   # about APPLIES, and every event that can reach the apply job (push to main,
   # workflow_dispatch, schedule) still serialises on terraform-apply-prod. A
   # pull_request can never reach that job — see the Job 3 `if:` below.
+  # CORRECTED 2026-08-29 — `cancel-in-progress: true` for PR plans was right
+  # about the plan's OUTPUT and wrong about its SIDE EFFECT.
+  #
+  # A superseded plan's output is indeed worthless. But `terraform plan` takes
+  # a DynamoDB state lock, and a cancelled run is SIGKILLed without releasing
+  # it. An abandoned lock never expires, so it blocks EVERY terraform
+  # operation in this repository — including on main — until a human runs
+  # `force-unlock` against live prod state.
+  #
+  # That is not theoretical. On 2026-08-28 two rapid pushes cancelled runs 945
+  # and 946; lock 6f621e38-9bed-3c51-1c28-d1b7a513ca74 was created at 19:31:08Z
+  # by one of them and was still held hours later, having failed the plan on
+  # two different heads. The saving was a few runner minutes; the cost was a
+  # repo-wide terraform outage needing manual intervention.
+  #
+  # So PR plans now run to completion. They still get their own per-branch
+  # group, so a second push QUEUES behind the first instead of cancelling it —
+  # slower, and it orphans nothing.
   group: ${{ github.event_name == 'pull_request' && format('terraform-plan-{0}', github.ref) || 'terraform-apply-prod' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # a superseded PR plan is worthless; an apply is never interrupted
+  cancel-in-progress: false # never cancel a run holding the state lock — see above
 
 permissions:
   id-token: write   # OIDC for AWS role assumption
@@ -323,7 +341,11 @@ jobs:
         id: plan
         run: |
           set +e
-          terraform -chdir=${{ env.TF_DIR }} plan -detailed-exitcode -no-color -out=tfplan
+          # -lock-timeout: wait for a legitimately-held lock (another branch
+          # planning) instead of failing fast. It does NOT rescue an ORPHANED
+          # lock — nothing releases that — which is why the real fix is the
+          # `cancel-in-progress: false` above. This is the contention half.
+          terraform -chdir=${{ env.TF_DIR }} plan -detailed-exitcode -no-color -lock-timeout=5m -out=tfplan
           EXIT_CODE=$?
           echo "exitcode=${EXIT_CODE}" >> $GITHUB_OUTPUT
           # 0 = no changes, 1 = error, 2 = changes pending

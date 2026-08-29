@@ -162,6 +162,21 @@ impl ChainDayStore {
     /// (cold path — boot only).
     #[must_use]
     pub fn new(chain_row_cap: usize) -> Self {
+        // Seed every drop reason at zero, so an absent series can never be
+        // read as a healthy one.
+        //
+        // A live sweep on 2026-08-29 found this metric had NEVER published a
+        // datapoint despite being EMF-selected. A counter only touched when a
+        // row is DROPPED is born at the drop, and the CloudWatch agent drops
+        // the first sample of a series it has never seen — so the first
+        // episode is exactly the one that goes missing, and until then
+        // "nothing was dropped" and "this store never ran" look identical.
+        //
+        // Seeded in the constructor rather than at boot: the series appears
+        // when this store exists, never claiming health for one that does not.
+        for reason in ["row_cap", "day_drop", "minute_cap"] {
+            metrics::counter!("tv_ram_store_dropped_total", "reason" => reason).increment(0);
+        }
         Self {
             chain_row_cap: chain_row_cap.max(1),
             slots: std::array::from_fn(|_| {

@@ -176,10 +176,6 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
-        "tv_seal_spill_write_errors_total",
-        "propagated — both emit sites bail!/Err out of SealSpillWriter and seal_absorption.rs logs the returned error at its append_seal call site (verified 2026-08-12)",
-    ),
-    (
         "tv_spot1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),

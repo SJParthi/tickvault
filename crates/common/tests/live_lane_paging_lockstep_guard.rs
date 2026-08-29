@@ -136,9 +136,26 @@ fn the_permanent_losses_never_send_a_false_recovery() {
         let Some(pos) = tf.find(&format!("\"{metric}\"")) else {
             panic!("{metric} is not alarmed — the previous test should have caught this");
         };
-        // Look at the remainder of that resource block for its ok_actions.
-        let block_end = tf[pos..].find("\n}\n").map_or(tf.len(), |o| pos + o);
-        let block = &tf[pos..block_end];
+        // Scan the WHOLE resource block, not the remainder after the metric
+        // name (2026-08-28). The old form anchored at the first mention of the
+        // metric and read forward to the next `\n}\n`, which is correct for a
+        // plain alarm — `ok_actions` follows the metric there — and WRONG for a
+        // metric-math alarm, where the metric name lives inside a
+        // `metric_query` block placed AFTER `ok_actions`. When `ticks_dropped`
+        // became metric math on `dropped - spilled` this test failed on an
+        // alarm that did set `ok_actions = []`, and the nested `}` of the
+        // metric_query would have truncated the window anyway.
+        //
+        // The invariant is unchanged and is the point: a permanent-loss alarm
+        // must never send a recovery page. Only the way the block is located
+        // moved, so the guard reads metric-math and plain alarms alike.
+        let block_start = tf[..pos]
+            .rfind("\nresource \"aws_cloudwatch_metric_alarm\"")
+            .unwrap_or_else(|| panic!("{metric} is mentioned outside any alarm resource"));
+        let block_end = tf[block_start + 1..]
+            .find("\nresource ")
+            .map_or(tf.len(), |o| block_start + 1 + o);
+        let block = &tf[block_start..block_end];
         assert!(
             block.contains("ok_actions = []"),
             "the alarm on {metric} does not set `ok_actions = []`. A recovery \

@@ -135,6 +135,21 @@ the page ten minutes for a condition the detector has confirmed.
 `ok_recovery = true`, also unlike that pair: silence is not the permanent
 loss of a specific frame — instruments genuinely start ticking again, and
 "the feed is being heard again" is a real recovery worth telling**)**.
+and **WS-GAP-02 / swap-emptied-socket (added 2026-08-28** — authority
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3m. An at-the-money depth swap
+that UNSUBSCRIBED its old contract and then failed to subscribe the new one
+leaves that socket carrying NOTHING while staying transport-healthy: it keeps
+ponging, the connection gauge counts it alive, and the lane's no-ticks alarm
+reads the WHOLE lane, where fifteen other sockets are still flowing and the
+last tick is always ~1 s old. So the one failure that empties a socket was
+invisible to every alarm in family (5). SCOPED by `$.source =
+"swap_emptied_socket"`, never the bare code: WS-GAP-02 is also emitted by the
+per-minute ATM top-up path, which stops at its wire budget without emptying
+anything, so a bare-code filter would page on routine top-up exhaustion every
+minute — the RISK-GAP-03 noise trap on a hotter path. `ok_recovery = true`,
+unlike the xverify entries: the same arm schedules a redial and the retained
+set already names the NEW contract, so a return to OK is the remediation
+working and is worth telling**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added

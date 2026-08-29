@@ -129,6 +129,8 @@ pub mod tf_consistency_audit_persistence;
 // per SEBI 5y retention (no DDL drop anywhere). The 15:40 IST audit's
 // inputs all died with the live-WS retirements + the stage-2 tick-chain
 // deletion (#1631).
+pub mod table_storage_probe;
+pub mod ws_connection_daily_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
 // `historical_candles` QuestDB table. The module had no live consumers

@@ -3896,6 +3896,48 @@ pub async fn run_feed_scoreboard(
         );
     }
 
+    // 8c. Per-CONNECTION daily rollup (`ws_connection_daily`), operator
+    //     directive 2026-08-29: "is there a websocket disconnect or reconnect
+    //     happened for ALL the connections ... based on every day we need to
+    //     capture this precisely".
+    //
+    //     The scoreboard row above sums all sixteen connections into ONE row
+    //     per feed, so it cannot answer "did connection 7 drop today?". The
+    //     per-connection evidence has existed since 2026-08-20 in
+    //     `ws_event_audit` + `feed_episode_audit`; this step folds both into
+    //     one row per connection per day so that question is a single keyed
+    //     row read (O(1)) instead of a day-scan-and-group.
+    //
+    //     Best-effort and additive: it writes its OWN table and can never
+    //     fail, degrade or delay the scoreboard verdict computed above. It
+    //     reuses `fold_episode_into_tally` — the SINGLE shared tally rule —
+    //     so it can never disagree with the daily scoreboard about what
+    //     counts as an incident.
+    let _ = crate::ws_connection_rollup::run_ws_connection_rollup(
+        questdb,
+        target_ist_day,
+        trading_date_ist_nanos,
+        &build_episode_day_sql(target_ist_day),
+    )
+    .await;
+
+    // 8d. Per-TABLE disk footprint (`table_storage_daily`), same operator
+    //     directive: auditing, tracking, analysing, easily accessible.
+    //
+    //     Every disk figure this repository quotes is DERIVED — row width
+    //     times an assumed row count — and the 2026-08-28 disk-burn record
+    //     says so in its own words: "no per-table byte metric exists
+    //     anywhere ... nobody can say from telemetry where the 138 GB went".
+    //     QuestDB has known the answer the whole time; this reads it once a
+    //     day and writes one row per table.
+    //
+    //     Best-effort and additive: its own table, result discarded, cannot
+    //     fail or delay the scoreboard verdict. Written to the DATABASE only
+    //     — no CloudWatch metric, so zero recurring cost against a budget
+    //     already above the automatic stop line.
+    let _ = crate::table_storage_rollup::run_table_storage_rollup(questdb, trading_date_ist_nanos)
+        .await;
+
     metrics::counter!("tv_feed_scoreboard_runs_total", "outcome" => outcome.as_str()).increment(1);
 
     let dhan = feed_numbers

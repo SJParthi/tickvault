@@ -317,6 +317,14 @@ impl OrderUpdateEventsWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_order_update_events_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seed this writer's failure series — see the module note on why a
+        // built handle is not a published sample.
+        for stage in ["ensure_client_build", "ensure_ddl"] {
+            metrics::counter!("tv_order_update_events_persist_errors_total", "stage" => stage)
+                .increment(0);
+        }
+        metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
+            .increment(0);
         let conf = order_update_events_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

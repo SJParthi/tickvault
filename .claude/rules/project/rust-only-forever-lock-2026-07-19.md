@@ -426,3 +426,82 @@ is never a false positive.
 Both are recorded as known gaps with a clean current state. Closing them is a
 separate change; leaving them undocumented would repeat exactly the mistake this
 section exists to record.
+
+## §0.4. 2026-08-29 — SCOPE FIX #11: both §0.3 residuals CLOSED, and the first
+## attempt at one of them was itself an inflating guard
+
+Operator directive (2026-08-29, typos preserved):
+
+> "Ensure to use one and only RUST O(1) in the entire workspace codebase except frontend alone so check this every nook and corner with assurance and guarantee"
+
+§0.3 ended with two known gaps and the sentence *"Closing them is a separate
+change"*. This is that change. Both were recorded as **"verified clean today"**
+— and that phrase is precisely the substitution this file exists to stop: a
+measurement carries a date, an enforcement does not.
+
+### Residual 2 — embedded interpreters — was ALREADY CLOSED, and §0.3 was stale
+
+`rust_only_guard.rs::embedded_interpreters_are_absent_from_the_locked_graph`
+landed **2026-08-24**, five days before §0.3's own text called it open. It bans
+17 names (`boa_engine`, `deno_core`, `duktape`, `hematita`, `mlua`, `neon`,
+`pyo3`, `quick-js`, `quickjs-rs`, `rhai`, `rlua`, `rquickjs`, `rustpython-vm`,
+`v8`, `wasmer`, `wasmi`, `wasmtime`) from `Cargo.lock`, with an anti-vacuity
+floor so a broken parser cannot report green, and a documented carve-out for
+`wasm-bindgen`/`js-sys`/`web-sys` (present transitively but declared under
+`cfg(target_arch = "wasm32")`, so never compiled for our targets).
+
+Recorded rather than quietly deleted, because it is this file's own recurring
+failure arriving again: **a section describing enforcement went stale in the
+reassuring→alarming direction**, and the cost is a session spent rebuilding
+something that exists. The same lesson the O(1) table records for
+`day_ohlc_tracker` (2026-08-12) and `WAL-SUSPEND-01` (2026-08-25).
+
+### Residual 1 — the browser guard — is NOW closed, by three new tests
+
+`browser_surface_and_toolchain_guard.rs` counted `<script` TAGS. Three holes,
+all now enforced shrink-only rather than measured:
+
+| Hole | New enforcement | Bite-proven |
+|---|---|---|
+| One tag can hold 20,000 lines; the count stays 1 | `JS_VOLUME_BUDGET` — exact JS LINE count per surface (board 263, dashboard 235, feeds 226, console.html 339) | +600 lines inside an existing tag → `GREW: … has 835, budget allows 235` |
+| JS with no `<script` at all: an inline `onclick=` | `INLINE_HANDLER_BUDGET` — exact count per file (console.html 21, `operator_control.rs` 1, the latter an XSS fixture) over 11 handler attributes, case-insensitive, rejecting `onloaded`/`on_click` substrings | one `onclick=` added to `health.rs` → `UNBUDGETED: … has 1 inline event-handler attribute(s)` |
+| A route serving `Content-Type: application/javascript` | `nothing_serves_a_javascript_content_type` — hard ban, not a budget (verified absent, so it stays absent) | the literal added to `health.rs` → `health.rs mentions application/javascript` |
+
+Plus `the_volume_budget_and_the_tag_budget_name_the_same_surfaces`, so the two
+frontend tables cannot drift apart, and stale-entry assertions on both budgets
+so a ratchet cannot outlive the file it bounds.
+
+### ⚠ The first version of the volume counter INFLATED, and that is worth more than the fix
+
+The line counter originally ran from `<script` to end of file when no closing
+tag followed. In Rust source whose `<script` occurrences are XSS fixtures, that
+reported **2,320 lines of "JavaScript" in `notification/events.rs`** and 1,896
+in `operator_control.rs`. A second attempt paired an opener at line 5,960 with
+an unrelated fixture closer at line 7,094 — 1,137 lines of nonsense.
+
+An inflating guard is not the safe direction. It is abandoned or re-baselined
+as fast as one that under-reports, and the re-baseline is what actually removes
+the enforcement. Two fixes: an unterminated opener now contributes **its own
+line and nothing more**, and the volume scan is **scoped to the carve-out
+itself** — the enumerated frontend surfaces plus every tracked `.html`. It does
+not attempt to measure "lines of JavaScript" in arbitrary Rust files, because
+their `<script` occurrences are string literals and any line-pairing over them
+is meaningless. Those files remain guarded EXACTLY, by tag count, in
+`SCRIPT_BUDGET`.
+
+### What is now enforced vs measured
+
+| Question | Before | After |
+|---|---|---|
+| Can a new browser surface appear? | enforced (`SCRIPT_BUDGET`) | unchanged |
+| Can an existing surface's JS grow without limit? | **no enforcement** | enforced, exact, shrink-only |
+| Can JS arrive with no `<script` tag? | **invisible** | enforced (handlers + media type) |
+| Can an embedded interpreter enter the graph? | enforced since 2026-08-24 | unchanged (§0.3 was stale) |
+
+**Still not claimed.** `HANDLER_ATTRS` is a list of 11 attributes, and no list
+of DOM events can be exhaustive — a page using `onpointerdown` would pass. The
+volume budget counts LINES, not semantics: 235 lines of minified JavaScript is
+a great deal more code than 235 lines of formatted JavaScript, and nothing here
+measures that. Both are bounded by the same shrink-only discipline as every
+other budget in this family, and both are stated so the next reader knows where
+the edge is rather than discovering it.

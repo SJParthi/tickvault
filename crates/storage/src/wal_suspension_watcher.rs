@@ -96,6 +96,21 @@ use crate::disk_health_watcher::classify_join_exit;
 /// process-global monitors (disk / OOM / resource) — a suspension pages
 /// within one poll + the ≤5-min alarm evaluation, while one tiny SELECT
 /// per minute burns negligible QuestDB + network budget.
+/// Request timeout for the WAL-suspension probe, overriding the shared
+/// probe client's 2 seconds for this one call.
+///
+/// The shared bound exists so a probe cannot stretch the 5 s pool-watchdog or
+/// 10 s SLO scheduler ticks. This probe is on neither of those clocks -- it
+/// runs once every [`WAL_SUSPENSION_POLL_INTERVAL_SECS`] on a cold path -- and
+/// under that bound it recorded 13 self-inflicted failures in one live session
+/// while the same query answered correctly by hand.
+///
+/// Ten seconds is 6x inside the poll cadence, so a slow probe can never
+/// overlap the next tick, and it cannot mask a real suspension: a query that
+/// genuinely cannot complete still returns a typed failure and is still
+/// counted.
+const WAL_PROBE_REQUEST_TIMEOUT_SECS: u64 = 10;
+
 pub const WAL_SUSPENSION_POLL_INTERVAL_SECS: u64 = 60;
 
 /// Backoff between a watcher death and its respawn (mirrors
@@ -630,7 +645,40 @@ async fn probe_wal_tables(base_url: &str) -> Result<(Vec<WalTableRow>, usize), W
             return Err(WalProbeFailure::Http);
         }
     };
-    let resp = match client.get(base_url).send().await {
+    // PER-REQUEST timeout override, not the shared client's 2 seconds.
+    //
+    // MEASURED on the live box 2026-08-28, mid-session:
+    // `tv_wal_suspension_probe_failed_total{reason="http"} = 13` while the
+    // identical query answered correctly when issued by hand with a longer
+    // allowance, and `tv_questdb_wal_apply_lag_max` read 1,014 -- QuestDB was
+    // busy, not broken.
+    //
+    // The shared client's 2 s is right for what it was sized against, and its
+    // own doc says so: "a single probe must never stretch the 5s
+    // pool-watchdog / 10s SLO scheduler ticks". This probe is neither. It runs
+    // once every 60 seconds on a cold path, so a 2 s bound converts "the
+    // database is under load" into "we do not know whether any table is
+    // suspended" -- and that fires an alarm about OUR impatience rather than
+    // about the database.
+    //
+    // That matters more than an ordinary false page, because of what the
+    // gauge means: a WAL-suspended table keeps ACKing ILP writes and silently
+    // does not apply them, so every writer reports success while the rows are
+    // not there. This probe is the ONLY thing that can see it. A probe that
+    // gives up early does not fail safe -- it goes blind exactly when the
+    // database is loaded, which is precisely when a table is most likely to
+    // suspend.
+    //
+    // Raising the bound hides nothing: the probe still returns a typed
+    // failure and still counts it if the query genuinely cannot complete. It
+    // removes only the failures we caused ourselves. Ten seconds is still 6x
+    // inside the 60 s cadence, so a slow probe can never overlap the next one.
+    let resp = match client
+        .get(base_url)
+        .timeout(Duration::from_secs(WAL_PROBE_REQUEST_TIMEOUT_SECS))
+        .send()
+        .await
+    {
         Ok(resp) => resp,
         Err(err) => {
             // Server down/unreachable — BOOT-01/02 + tv_questdb_connected
@@ -745,6 +793,27 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
             "http://{}:{}/exec?query={}",
             questdb.host, questdb.http_port, WAL_TABLES_QUERY_URLENCODED
         );
+        // Seed every probe-failure reason before the first poll.
+        //
+        // This watcher feeds `tv_questdb_wal_suspended_tables`, which HAS a
+        // live alarm. Rule §2.3h shipped this counter specifically so that
+        // alarm is not "alarming a lie" — a gauge reading a confident 0 while
+        // its producer fails open. A 2026-08-29 sweep found the counter itself
+        // had never published: the agent drops the first sample of an unseen
+        // series, so the first probe failure — the one that makes the gauge
+        // untrustworthy — was guaranteed invisible.
+        //
+        // All five reasons, because the delta is computed per LABEL SET.
+        for reason in [
+            "http",
+            "status",
+            "parse",
+            "missing_column",
+            "all_rows_skipped",
+        ] {
+            metrics::counter!("tv_wal_suspension_probe_failed_total", "reason" => reason)
+                .increment(0);
+        }
         info!(
             interval_secs = WAL_SUSPENSION_POLL_INTERVAL_SECS,
             "WAL-suspension watcher started (per-table wal_tables() probe)"

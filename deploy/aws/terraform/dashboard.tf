@@ -857,7 +857,59 @@ resource "aws_cloudwatch_dashboard" "operator" {
             # refusal reasons. The per-reason split stays in the
             # AGGREGATOR-DROP-01 log line, which already carries them as
             # separate fields.
-            [local.dash_namespace, "tv_aggregator_tick_refused_total", { label = "ticks the fold refused (all reasons)", stat = "Sum" }]
+            [local.dash_namespace, "tv_aggregator_tick_refused_total", { label = "ticks the fold refused (all reasons)", stat = "Sum" }],
+            # ADDED 2026-08-28, measured on the live box the same day. These
+            # three lines are the biggest numbers in the system that nothing
+            # could see:
+            #
+            #   tv_candle_tick_discarded_late_total  51,227,651
+            #   tv_aggregator_slot_exhausted_total            0
+            #   tv_dhan_feed_abandoned_bytes_total            -
+            #
+            # The first is larger than the session's whole ingested tick count
+            # (20,982,560) because it increments once per TIMEFRAME inside the
+            # 24-TF fold loop -- so it is ~10% of all cell-folds, and every one
+            # is a bar that is missing a trade it should have carried. It had
+            # ZERO production readers until 2026-08-26 and no CloudWatch route
+            # until now.
+            #
+            # Slot exhaustion reads 0 today and that is precisely why it is
+            # here: AGGREGATOR_MAX_SLOTS is 25,000 against an authorized
+            # ~24,600, and the per-minute at-the-money re-fit ADDS instruments
+            # without ever reclaiming a slot. The first non-zero reading means
+            # candles have silently stopped for every new instrument past the
+            # line, and 0 is the only baseline that makes that step visible.
+            #
+            # Abandoned bytes are the undecodable remainder of a frame the
+            # walk gave up on. Refusing to resynchronise on a guess is correct
+            # -- fabricating ticks would be worse -- but the bytes are gone,
+            # and until now nothing counted them anywhere an operator looks.
+            #
+            # None is alarmed: the first two have no baseline for what normal
+            # looks like, and inventing a threshold would be the false page
+            # this dashboard exists to avoid. Charted first, thresholded once
+            # there is data to threshold against.
+            [local.dash_namespace, "tv_candle_tick_discarded_late_total", { label = "candle cells that lost a late tick", stat = "Sum" }],
+            [local.dash_namespace, "tv_aggregator_slot_exhausted_total", { label = "instruments refused a candle slot", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_feed_abandoned_bytes_total", { label = "undecodable frame bytes abandoned", stat = "Sum" }],
+            # The two DEPTH loss discriminators, added 2026-08-28.
+            #
+            # tv_depth_rows_dropped_total is shipped AND alarmed, and it
+            # increments on BOTH branches of discard_pending: once when the
+            # buffer was successfully RESCUED to the spill file, once when the
+            # rescue FAILED and the rows are permanently gone. Same series,
+            # same alarm, opposite meanings.
+            #
+            # These two are what let that page be read. "Spilled" is the
+            # survivable half; permanent depth loss is dropped minus spilled,
+            # exactly the subtraction the tick side already supports. The
+            # write-errors line is the rescue tier itself failing, which is
+            # the one that is never recoverable.
+            #
+            # Neither is alarmed on its own: the existing loss alarm is the
+            # pager, and a second alarm for the same event pages twice.
+            [local.dash_namespace, "tv_depth_rows_spilled_total", { label = "depth rows rescued to disk (survivable)", stat = "Sum" }],
+            [local.dash_namespace, "tv_depth_spill_write_errors_total", { label = "depth rescue FAILED (permanent loss)", stat = "Sum" }]
           ]
           period = 300
         }
@@ -905,9 +957,77 @@ resource "aws_cloudwatch_dashboard" "operator" {
           title  = "Resource headroom"
           region = local.dash_region
           view   = "timeSeries"
+          # tv_subsystem_memory_estimated_bytes was charted here until
+          # 2026-08-29 and had NEVER emitted a single datapoint: every one of
+          # its six per-component gauges is initialised to f64::NAN and is
+          # overwritten only by a registered source closure, and
+          # SubsystemMemorySampler::register_source has ZERO production call
+          # sites (its last two died with the TickStorage/PrevDayCache sweep on
+          # 2026-07-19). NaN is correctly dropped by the agent, so the line was
+          # structurally incapable of drawing. An always-empty line on a
+          # "Resource headroom" panel reads as "memory is fine", which is worse
+          # than no line at all. Process memory IS charted, live, on the
+          # "Host + process health" panel above (tv_process_rss_bytes).
+          # Re-add this line only together with a real register_source call
+          # site -- subsystem_memory_emf_guard.rs enforces that pairing.
           metrics = [
-            [local.dash_namespace, "tv_open_fds", { label = "open file descriptors", stat = "Maximum" }],
-            [local.dash_namespace, "tv_subsystem_memory_estimated_bytes", { label = "estimated memory by subsystem (bytes)", stat = "Maximum" }]
+            [local.dash_namespace, "tv_open_fds", { label = "open file descriptors", stat = "Maximum" }]
+          ]
+          period = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 6
+        y      = 92
+        width  = 6
+        height = 6
+        properties = {
+          # ADDED 2026-08-29. The producer-side durable tier for sealed
+          # candles came off the frame drain on 2026-08-28 and not one of its
+          # counters reached CloudWatch, so the tier could degrade or fail in
+          # complete silence.
+          #
+          # Read the lines in this order:
+          #
+          #   "handed to the writer thread"  the healthy path. Non-zero is FINE
+          #                                  and expected under load; it means
+          #                                  overflow is being absorbed off the
+          #                                  drain, which is the whole point.
+          #
+          #   "FELL BACK to writing inline"  the regression line. Non-zero means
+          #                                  the hand-off queue was full or its
+          #                                  thread is gone, so disk writes are
+          #                                  back ON the frame drain -- exactly
+          #                                  what the offload exists to prevent.
+          #                                  Lossless, but the stall it causes is
+          #                                  how Dhan's skip-forward drops ticks
+          #                                  upstream, invisibly.
+          #
+          #   "refused by BOTH disk tiers"   real permanent loss of that candle.
+          #                                  Already pages via AGGREGATOR-DROP-01
+          #                                  (the thread's on_lost callback), so
+          #                                  this line is the trend, not the
+          #                                  alarm.
+          #
+          #   "abandoned at shutdown"        the queue still held records when
+          #                                  the join budget expired. Those are
+          #                                  gone.
+          #
+          #   "spill write errors"           the first disk tier failing.
+          #
+          # NOT alarmed, deliberately: the first line is non-zero on a healthy
+          # busy day, the third already pages, and a family of five pagers for
+          # one subsystem trains an operator to ignore all five.
+          title  = "Sealed-candle overflow: is the off-drain rescue still working"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_seal_escalation_queued_total", { label = "handed to the writer thread (healthy)", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_escalation_inline_fallback_total", { label = "FELL BACK to writing inline on the drain", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_escalation_lost_total", { label = "refused by BOTH disk tiers (permanent)", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_escalation_abandoned_total", { label = "abandoned at shutdown", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_spill_write_errors_total", { label = "spill write errors", stat = "Sum" }]
           ]
           period = 300
         }

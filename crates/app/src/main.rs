@@ -874,12 +874,67 @@ async fn async_main() -> Result<()> {
     // with the 15:40 conservation audit so the two sites can never drift).
     let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
     let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
+    // CLAIM THE WAL DIRECTORY BEFORE ANYTHING TOUCHES IT (2026-08-28).
+    //
+    // `replay_all` below is not a read — it RENAMES live `*.wal` files into
+    // `replaying/`. Until this claim moved up here, a second process started
+    // against a live one would stage the INCUMBENT's currently-open segment out
+    // from under it (the incumbent keeps writing to the moved inode, its fd is
+    // still valid), and only THEN reach the claim inside `WsFrameSpill::new`
+    // ~115 lines later, be refused, and exit. The refusal worked; it arrived
+    // after the damage, and the incumbent's remaining session frames were left
+    // in a file its own `confirm_replayed` would never cover.
+    //
+    // The guard is MOVED into `WsFrameSpill::new_with_guard` below rather than
+    // re-taken there: a second `lock_wal_dir` from this same process is a
+    // different open file description and the kernel refuses it exactly as it
+    // refuses a foreign one.
+    let ws_wal_guard = match tickvault_storage::ws_frame_spill::lock_wal_dir(&ws_wal_path) {
+        Ok(guard) => guard,
+        Err(err) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                dir = %ws_wal_dir,
+                error = %err,
+                "STAGE-C: another live process already owns this WAL directory — refusing \
+                 to start. Two writers mint capture_seq from independent counters, collide \
+                 inside the ticks DEDUP key, and destroy ticks with no counter to show it."
+            );
+            std::process::exit(1);
+        }
+    };
+
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
     // frames reuse the SAME capture sequence as their original live write
     // (replay-stable). v1 records replay with frame_seq=0.
-    let mut ws_wal_replay_live_feed: Vec<(u64, bytes::Bytes)> = Vec::new();
+    // TVW3: the third element is the frame's ORIGINAL arrival instant, read
+    // back from the WAL record. It was persisted on 2026-08-28 precisely so
+    // replay would stop re-deriving it, and until this change NOTHING read it
+    // back -- `ReplayedFrame::received_at_nanos` had zero consumers in the
+    // workspace while its own doc said "a replay consumer MUST prefer this
+    // over a fresh clock read". `WAL_RECEIPT_UNKNOWN_NANOS` for v1/v2 records,
+    // which genuinely predate the field.
+    // Put both unrecovered-frame series on the wire at zero BEFORE the replay
+    // decides anything.
+    //
+    // This one is not housekeeping: `tv-<env>-wal-frames-not-recovered` alarms
+    // on this metric at threshold 1, and a live sweep on 2026-08-29 found the
+    // metric had NEVER published a datapoint — so that alarm has been sitting
+    // at OK since it shipped and could not have fired. A counter only touched
+    // when frames are LOST is born at the loss, and the CloudWatch agent drops
+    // the first sample of a series it has never seen, so the first episode is
+    // exactly the one that goes missing.
+    //
+    // Seeded here, in STAGE-C, because STAGE-C is the WAL replay: the series
+    // appears when the thing it measures actually runs, never from a boot-wide
+    // seeder that would claim health for a subsystem that never started.
+    for ws_type in ["live_feed", "order_update"] {
+        metrics::counter!("tv_ws_frame_wal_reinjected_dropped_total", "ws_type" => ws_type)
+            .increment(0);
+    }
+    let mut ws_wal_replay_live_feed: Vec<(u64, i64, bytes::Bytes)> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
@@ -893,8 +948,11 @@ async fn async_main() -> Result<()> {
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
-                            ws_wal_replay_live_feed
-                                .push((rec.frame_seq, bytes::Bytes::from(rec.frame)));
+                            ws_wal_replay_live_feed.push((
+                                rec.frame_seq,
+                                rec.received_at_nanos,
+                                bytes::Bytes::from(rec.frame),
+                            ));
                         }
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
                             ord += 1;
@@ -984,7 +1042,7 @@ async fn async_main() -> Result<()> {
     // post-install because handles created pre-install resolve to a no-op
     // counter"). It was fixed for those two and missed here.
     //
-    // Nothing between the old and new position touched `_ws_frame_spill` —
+    // Nothing between the old and new position touched `ws_frame_spill` —
     // its only consumer is the stack wiring far below — and the fail-closed
     // halt is strictly better here: it now happens with the exporter UP, so
     // the boot-halt is observable rather than silent.
@@ -993,7 +1051,10 @@ async fn async_main() -> Result<()> {
     // deliberately runs wal_spill=None while dormant — C1 dormancy honesty),
     // but the WAL WRITER + fail-closed init are KEPT: the WAL dir remains the
     // replay/archive floor consumed above and by the 15:40 conservation audit.
-    let _ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
+    let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new_with_guard(
+        &ws_wal_path,
+        ws_wal_guard,
+    ) {
         Ok(spill) => {
             info!(
                 dir = %ws_wal_dir,
@@ -1063,6 +1124,125 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
 
+    // The four live-lane failure counters alarmed on 2026-08-28
+    // (deploy/aws/terraform/live-lane-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md 2.3l). Same first-sample
+    // rationale as every registration above, and these needed it MOST: two of
+    // the four are `metrics::counter!(...).increment(1)` written INLINE at the
+    // failure site, so without this the series is born AT the incident and the
+    // dropped baseline sample IS the incident. All four alarms are
+    // `threshold >= 1, evaluation_periods = 1` on a counter that reads zero on
+    // a healthy lane -- precisely the shape that produces zero datapoints and a
+    // pager that is dead on arrival for the single-episode case, which is the
+    // dominant shape for all four.
+    //
+    // Registered HERE rather than at each emit site because those sites sit
+    // behind runtime gates (the lane, the aggregator, the replay pass); a
+    // counter registered only when its subsystem starts is not dense from boot
+    // on a lane that is off, and this block is the one place provably after the
+    // recorder install and before any scrape.
+    metrics::counter!("tv_dhan_feed_seals_rescued_total").increment(0);
+    metrics::counter!("tv_aggregator_slot_exhausted_total").increment(0);
+    metrics::counter!("tv_tick_spill_replay_quarantined_total").increment(0);
+    metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(0);
+
+    // Four MORE alarmed counters that were never registered (2026-08-28,
+    // found by an adversarial sweep of the loss paths).
+    //
+    // Each of these is EMF-selected AND carries an alarm, and each is emitted
+    // ONLY at its failure site — so the series was born AT the incident and the
+    // CloudWatch agent's dropped-first-sample delta baseline WAS the incident.
+    // Every one of the four alarms was therefore dead on arrival for the
+    // single-episode case, which for all four is the dominant shape:
+    //
+    //   tv_wal_replay_unknown_magic_total   a rolled-back binary meeting a
+    //                                       newer WAL record format. Once-ever
+    //                                       by nature, so the first occurrence
+    //                                       is the ONLY occurrence.
+    //   tv_seal_writer_drain_dropped_total  candle loss with all three
+    //                                       absorption tiers failed. Note the
+    //                                       name: it is NOT the labelled
+    //                                       `tv_seal_writer_drain_total{kind=
+    //                                       "dropped"}` seeded above — that is
+    //                                       a different series, and seeding one
+    //                                       never registered the other.
+    //   tv_ws_frame_spill_write_errors_total  the durable floor's OWN write
+    //                                       failing. The rarest and most severe
+    //                                       event in the process.
+    //   tv_tick_rows_refused_total          a row refused before it is written,
+    //                                       so nothing downstream counts it.
+    //
+    // One label value per name is enough: the EMF processor folds label values
+    // into one summed series per host, so the folded NAME is what the alarm
+    // reads and registering any member registers it. Both `reason` values are
+    // seeded for the refusal counter anyway — there are only two, and a reader
+    // comparing this block against the emit sites should find them all.
+    metrics::counter!("tv_wal_replay_unknown_magic_total").increment(0);
+    metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
+    metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
+        .increment(0);
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width").increment(0);
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite").increment(0);
+
+    // Seven MORE alarmed counters found unregistered by the guard that was
+    // written for the four above (2026-08-28, same sweep).
+    //
+    // Writing the guard turned a four-item finding into a twenty-item one, and
+    // that is the point of writing it: the four were what one agent happened to
+    // look at, and the class was never four. Each of these is read by an alarm
+    // in `deploy/aws/terraform/` and emitted only at a failure site, so each was
+    // dead on arrival for the single-episode case exactly as the four were.
+    //
+    // One label value per name is enough — the EMF processor folds label values
+    // into one summed series per host, so the folded NAME is what an alarm
+    // reads and registering any member registers it. The value chosen is the
+    // one an operator is most likely to see first.
+    metrics::counter!("tv_order_audit_persist_errors_total", "stage" => "append").increment(0);
+    metrics::counter!("tv_order_update_events_persist_errors_total", "stage" => "append")
+        .increment(0);
+    metrics::counter!("tv_order_update_events_dropped_total", "reason" => "channel_full")
+        .increment(0);
+    metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
+        .increment(0);
+    metrics::counter!("tv_partition_archive_failed_total", "stage" => "drop").increment(0);
+    metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(0);
+    metrics::counter!("tv_disk_watcher_respawn_total").increment(0);
+    metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => "live_feed").increment(0);
+    // The seal-spill write-error counter (2026-08-28). Emitted only when the
+    // producer-side durable tier's own append fails, which is the moment the
+    // no-drop policy is leaning hardest on it — and, like the twenty above, it
+    // was dead on arrival for that first episode. Not EMF-selected, for the
+    // same cost reason as the escalation counters below.
+    metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "write").increment(0);
+    metrics::counter!(
+        tickvault_storage::ilp_overflow::PENDING_DISCARDED_COUNTER,
+        "table" => "ticks"
+    )
+    .increment(0);
+
+    // The four seal-escalation counters (2026-08-28), registered for the same
+    // delta-baseline reason and NOT EMF-selected.
+    //
+    // Not selected deliberately: each EMF name costs ~$0.30/mo, and the
+    // maximal-month projection already sits above the budget's automatic
+    // `STOP_EC2_INSTANCES` line (see the COST NOTEs in
+    // dhan-rest-only-noise-lock-2026-07-14.md). Selecting four more is an
+    // operator decision with a price, not an executor's. Registering them
+    // costs nothing, keeps them honest on the local `/metrics` exporter, and
+    // means the delta baseline already exists if any of them is ever selected
+    // — the CloudWatch agent DROPS the first sample of a series it has never
+    // seen, so an unseeded counter publishes nothing on the day it first
+    // fires, which is precisely the day it matters.
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUED_COUNTER)
+        .increment(0);
+    metrics::counter!(
+        tickvault_storage::seal_writer_runner::SEAL_ESCALATION_INLINE_FALLBACK_COUNTER
+    )
+    .increment(0);
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_LOST_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER)
+        .increment(0);
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations
@@ -1792,6 +1972,28 @@ async fn async_main() -> Result<()> {
     // truncates on success. Replay is idempotent because the `ticks` DEDUP key
     // carries `capture_seq`, so a row written twice UPSERTs onto itself — which
     // is what makes a crash between POST and truncate cost nothing.
+    // Trim the quarantine directory BEFORE the drain starts (2026-08-28).
+    //
+    // `quarantine_spill_file` promises quarantine-never-delete, and that
+    // promise is right: a torn line usually leaves the rest of the file
+    // recoverable by hand. But nothing ever removed from `quarantine/`, and its
+    // bytes count toward the spill ceiling — so accumulated quarantine is a
+    // RATCHET that eventually returns StorageFull for every future rescue, on
+    // this boot and every one after it, killing the tier that keeps live ticks.
+    // The promise is therefore kept for a bounded share rather than forever.
+    // Loud: each deletion names the file. See `prune_quarantine`.
+    let quarantine_pruned = tickvault_storage::tick_persistence::prune_quarantine(
+        std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+        tickvault_storage::tick_persistence::tick_spill_max_bytes(),
+    );
+    if quarantine_pruned > 0 {
+        warn!(
+            files = quarantine_pruned,
+            "trimmed the tick quarantine directory to its share of the spill ceiling — \
+             see the preceding coded lines for each file"
+        );
+    }
+
     let _tick_spill_drain_supervisor =
         tickvault_storage::tick_spill_replay::spawn_supervised_tick_spill_replay(
             std::path::PathBuf::from(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
@@ -2531,7 +2733,7 @@ async fn async_main() -> Result<()> {
             // 2026-07-13 (the note there — "there is no frame APPEND site left
             // in this process" — is what this line changes). `None` refuses
             // the lane outright rather than capturing without a durable floor.
-            spill: _ws_frame_spill.clone(),
+            spill: ws_frame_spill.clone(),
             // Both paths seal into the same `candles_<tf>` tables under
             // `feed='dhan'`, and the dedup key has no column that separates
             // them. Passing the fold's real state lets the lane refuse rather
@@ -2585,6 +2787,7 @@ async fn async_main() -> Result<()> {
         trading_calendar.clone(),
         dhan_feed_shutdown,
         dhan_feed_stack_monitor,
+        ws_frame_spill,
     )
     .await
 }
@@ -2827,6 +3030,40 @@ const SEAL_WRITER_SHUTDOWN_BUDGET_SECS: u64 = 75;
 const SEAL_WRITER_SHUTDOWN_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(SEAL_WRITER_SHUTDOWN_BUDGET_SECS);
 
+/// Stop flag for the `tv-seal-escalate` thread, reachable from shutdown.
+///
+/// Held in a static for exactly the reason `SEAL_WRITER_CANCEL` is: a
+/// shutdown signal that the shutdown path cannot reach is not a signal. The
+/// WAL spill writer carried the detached version of this defect until
+/// 2026-08-28 and lost every queued record at exit.
+static SEAL_ESCALATION_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// Join handle for the `tv-seal-escalate` thread.
+static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Budget for draining the seal-escalation queue at shutdown.
+///
+/// DERIVED, not guessed: the queue holds at most
+/// `SEAL_ESCALATION_QUEUE_DEPTH` (4,096) records of ~128 bytes, each costing
+/// one `write(2)`. On a healthy volume that is milliseconds; at a badly
+/// degraded ~1 ms/write it is ~4.1s, so 5s covers the case that actually
+/// fills the queue with a margin rather than a hairline.
+///
+/// Counted into the systemd `TimeoutStopSec` arithmetic by
+/// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs`, which is the
+/// only thing that keeps the four sequential budgets and the unit file from
+/// drifting apart.
+const SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS: u64 = 5;
+
+/// [`SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
+const SEAL_ESCALATION_SHUTDOWN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS);
+
+/// How often the shutdown poll re-checks whether the escalation thread is done.
+const SEAL_ESCALATION_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
+
 fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
@@ -2882,7 +3119,94 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             // sealed candle. Both installs must happen before the runner moves
             // into the spawn below, for the same reason — the handles are
             // unreachable afterwards.
-            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(runner.overflow()) {
+            // The escalation offload is split BEFORE the overflow is
+            // installed, because `set_global_seal_overflow` takes ownership
+            // and the value is unreachable afterwards — the same
+            // install-order constraint the two lines above document.
+            //
+            // What this moves off the frame-drain task (2026-08-28): all
+            // three `escalate_refused_seal` call sites in `dhan_feed_stack`
+            // run on the drain, and each was charging it a spill-writer mutex
+            // acquisition plus a `write(2)` — and, when the spill failed, a
+            // `create_dir_all`, an `open`, a `serde_json::to_string` heap
+            // allocation and four more syscalls. Stalling that thread does
+            // not merely delay a candle: Dhan skips a slow consumer forward
+            // to "the latest available state" with no sequence number, so the
+            // intermediate ticks are discarded at THEIR side, invisibly.
+            let mut overflow = runner.overflow();
+            let sink = overflow.split_escalation_offload();
+            // Gated on the OnceLock, matching the two installs above.
+            //
+            // `spawn_seal_writer_loop` has exactly ONE production call site
+            // today, so a second entry is not reachable — but its two
+            // neighbours are both written to survive one, and this was not,
+            // which is the asymmetry an adversarial re-read of this diff
+            // found. Unguarded, a second entry would spawn a SECOND thread,
+            // overwrite the handle, and leave the FIRST one orphaned: its
+            // stop flag unreachable (the OnceLock already holds the first
+            // one), so shutdown would signal a thread it never joins and
+            // join a thread it never signalled. Dropping the sink instead
+            // disconnects the new sender, so the second overflow escalates
+            // inline — the documented lossless fallback.
+            if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {
+                drop(sink);
+                tracing::warn!(
+                    "seal escalation thread already installed (idempotent skip) — this \
+                     overflow will escalate inline; first installer wins"
+                );
+            } else {
+                match std::thread::Builder::new()
+                    .name("tv-seal-escalate".to_string())
+                    .spawn(move || {
+                        sink.run(|seal| {
+                            // The paging path lives in this crate, above storage,
+                            // which is why the sink takes a callback rather than
+                            // calling it directly. A seal both disk tiers refuse
+                            // still fires AGGREGATOR-DROP-01 — the page is
+                            // deferred to this thread, never dropped.
+                            let timeframe = tickvault_trading::candles::TfIndex::from_ordinal(
+                                seal.tf_ordinal as usize,
+                            )
+                            .map_or("unknown", |tf| tf.display_name());
+                            tickvault_app::seal_loss_alarm::record_lost_seal(
+                                tickvault_app::seal_loss_alarm::SealLossReason::BothDiskTiersFailed,
+                                seal.security_id,
+                                seal.exchange_segment_code,
+                                timeframe,
+                            );
+                        });
+                    }) {
+                    Ok(handle) => {
+                        if let Ok(mut slot) = SEAL_ESCALATION_THREAD.lock() {
+                            *slot = Some(handle);
+                        }
+                        tracing::info!(
+                            queue_depth =
+                                tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUE_DEPTH,
+                            "seal escalation thread spawned — refused seals no longer write to disk \
+                         on the frame-drain task"
+                        );
+                    }
+                    Err(err) => {
+                        // The sink (and its receiver) died with the closure, so
+                        // every `try_send` now returns `Disconnected` and falls
+                        // back to the inline cascade. Degraded to the
+                        // pre-2026-08-28 behaviour, never lossy — and loud,
+                        // because a silent fallback is how a fix stops applying
+                        // without anyone noticing.
+                        tracing::error!(
+                            code =
+                                tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
+                                    .code_str(),
+                            ?err,
+                            "failed to spawn the seal escalation thread — refused seals will write \
+                         to disk INLINE on the frame-drain task (pre-offload behaviour); watch \
+                         tv_seal_escalation_inline_fallback_total"
+                        );
+                    }
+                }
+            }
+            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(overflow) {
                 tracing::warn!(
                     "global seal overflow already installed (idempotent skip) — first installer wins"
                 );
@@ -2911,18 +3235,46 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             //
             // Storing both halves keeps the sender alive for exactly the same
             // reason `forget` did, while making shutdown able to reach it.
-            let _ = SEAL_WRITER_CANCEL.set(cancel_tx);
-            let handle = tokio::spawn(async move {
-                run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
-            });
-            if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
-                *slot = Some(handle);
+            //
+            // Gated on the OnceLock, matching the three installs above.
+            //
+            // `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` reads as a discarded
+            // unit; it is a discarded SENDER. `OnceLock::set` returns
+            // `Err(value)` on a second call, so the `let _` DROPPED the only
+            // sender for the `cancel_rx` about to be moved into the spawn — and
+            // a seal-writer loop with no live sender is the one shape that loop
+            // cannot survive (see the `Err` arm of its cancel branch, fixed in
+            // the same change). Unguarded, a second entry here would have:
+            //   * spawned a loop that can never be cancelled,
+            //   * overwritten SEAL_WRITER_HANDLE, so shutdown joins the NEW
+            //     task and burns the whole 75s budget on it,
+            //   * left the FIRST loop — the one actually draining seals — never
+            //     signalled, so its final drain never runs and the day's tail
+            //     dies with the runtime.
+            //
+            // One added call site, the entire session's closing candles. Skip
+            // instead: first installer wins, and the already-running writer
+            // keeps draining.
+            if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {
+                drop(orphan);
+                drop(cancel_rx);
+                tracing::warn!(
+                    "seal writer loop already installed (idempotent skip) — first installer \
+                     wins; this runner will not be spawned"
+                );
+            } else {
+                let handle = tokio::spawn(async move {
+                    run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
+                });
+                if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
+                    *slot = Some(handle);
+                }
+                tracing::info!(
+                    interval_ms = seal_drain_interval().as_millis(),
+                    max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
+                    "seal writer task spawned — Engine B candle sealing enabled"
+                );
             }
-            tracing::info!(
-                interval_ms = seal_drain_interval().as_millis(),
-                max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
-                "seal writer task spawned — Engine B candle sealing enabled"
-            );
         }
         Err(err) => {
             tracing::error!(
@@ -3467,14 +3819,75 @@ async fn build_shared_infra(
 /// Bounded in both directions on purpose. Unbounded, a hung or unreachable
 /// QuestDB holds the process past systemd's stop timeout, systemd escalates to
 /// SIGKILL, and we lose the exact tail this wait exists to save. Too short and
-/// a healthy-but-busy flush is cut off. 20s sits comfortably inside the
-/// service's stop timeout while being far longer than a flush of one
-/// sub-threshold ILP batch needs.
-const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 20;
+/// a healthy-but-busy flush is cut off.
+///
+/// RAISED 20 -> 30 on 2026-08-28, because 20 was not enough in the one mode
+/// nobody had costed: the SPAWN-FAILURE FALLBACK. Both offload spawns are
+/// allowed to fail and fall back to the synchronous writer, and in that mode
+/// the tail runs the depth flush and the tick flush back to back, each able to
+/// block for one full `ILP_REQUEST_TIMEOUT_SECS`, BEFORE the join deadline
+/// clock even starts. 5 + 5 + 12 = 22, inside a 20 s budget: the outer timer
+/// won and abandoned the lane task mid-join — the precise failure the assert
+/// below was written to prevent, arriving through the door it was not watching.
+///
+/// 30 s still sits far inside the unit's `TimeoutStopSec=120`
+/// (`deploy/systemd/tickvault.service`), so there is no new SIGKILL risk. If
+/// that unit value is ever lowered, this constant has to be re-checked by hand
+/// — a `.service` file is not visible to a compile-time assert, which is the
+/// honest limit of the guard below.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
 
 /// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
+
+/// The inner join must COMPLETE inside the outer budget, not be truncated by it.
+///
+/// `run_frame_drain`'s shutdown tail calls `shutdown_offload_writer`, which
+/// blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS` waiting for the tick writer to
+/// drain its queue. That whole tail runs under
+/// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`]. Until 2026-08-28 the inner wait
+/// (30 s) was LONGER than the outer budget (20 s), so on a slow QuestDB the
+/// outer timer always won: the lane task was abandoned mid-join and the
+/// writer thread died holding queued batches — no spill, no counter, no log.
+///
+/// The margin is not decoration. The tail also seals open buckets, flushes
+/// ticks, flushes depth and publishes counters before it ever reaches the
+/// join, so the join needs room left over, not merely "less than".
+///
+/// A compile-time assert rather than a test: two constants in two files that
+/// must agree are exactly the pair a future edit separates, and a build
+/// failure is the only kind of reminder that cannot be skipped.
+/// The pre-join work the tail must fit BEFORE the offload deadline starts.
+///
+/// DERIVED, not chosen. Until 2026-08-28 this was a hardcoded `5`, which was
+/// correct — and correct by coincidence, because it happened to equal one ILP
+/// request timeout. Two things were wrong with that. The timeout could be
+/// raised and leave the assert passing while the real shutdown ran over. And
+/// the worst case was never ONE timeout: in the spawn-failure fallback the
+/// tail flushes DEPTH synchronously and then TICKS synchronously, so it is
+/// two, back to back, before the join clock starts.
+///
+/// Deriving it from the timeout means raising the timeout moves this in
+/// lockstep and the build tells you if the budget no longer fits, rather than
+/// the box telling you by losing a session tail.
+const SHUTDOWN_GRACE_MARGIN_SECS: u64 =
+    2 * tickvault_storage::depth_persistence::ILP_REQUEST_TIMEOUT_SECS;
+const _: () = assert!(
+    tickvault_app_shutdown_grace() + SHUTDOWN_GRACE_MARGIN_SECS
+        <= DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+    "OFFLOAD_SHUTDOWN_GRACE_SECS + margin must fit inside \
+     DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS, or the offload join is abandoned \
+     mid-flight and the tick tail is lost silently. Lower the grace or raise \
+     the lane budget — and if you raise the lane budget, re-check it against \
+     the systemd stop timeout."
+);
+
+/// Indirection so the assert above reads the live value from the lane module
+/// rather than a copy. A copy is what rots.
+const fn tickvault_app_shutdown_grace() -> u64 {
+    tickvault_app::dhan_feed_stack::OFFLOAD_SHUTDOWN_GRACE_SECS
+}
 
 async fn run_process_runloop(
     api_handle: Option<tokio::task::JoinHandle<()>>,
@@ -3491,6 +3904,12 @@ async fn run_process_runloop(
     // never runs and the day's tail dies with the process.
     dhan_feed_shutdown: std::sync::Arc<tokio::sync::Notify>,
     dhan_feed_stack_monitor: Option<tokio::task::JoinHandle<()>>,
+    // The WAL spill, so the run loop can drain its writer queue before exit
+    // (2026-08-28). Threaded in for the same reason as the two above: this
+    // function owns the only place the drain can run, and until it did the
+    // writer thread was abandoned mid-queue with every record in it already
+    // reported to its caller as `Spilled`.
+    ws_frame_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Result<()> {
     // Truthfulness rider: the runtime is dry-run/paper only — no real-money
     // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
@@ -3805,6 +4224,91 @@ async fn run_process_runloop(
         }
     }
 
+    // 5b-2b. Seal escalation thread drain (2026-08-28).
+    //
+    // AFTER the seal writer, because the writer's own final drain can still
+    // escalate; BEFORE the WAL floor, which must close last. Nothing can
+    // queue here any more — the drain that feeds it stopped at 5b.
+    //
+    // This exists because the offload created a queue, and an undrained
+    // bounded queue at exit is a silent loss no counter reports. That is not
+    // hypothetical in this codebase: it is verbatim the defect 5b-3 below
+    // closes on the WAL writer, found the same day.
+    if let Some(stop) = SEAL_ESCALATION_STOP.get() {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let escalation_handle = SEAL_ESCALATION_THREAD
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(handle) = escalation_handle {
+        // Poll rather than block: `JoinHandle::join` is unbounded, and an
+        // unbounded wait inside a bounded shutdown is how systemd's
+        // TimeoutStopSec turns into a SIGKILL that destroys the very tail
+        // every budget on this path exists to save.
+        let deadline = std::time::Instant::now() + SEAL_ESCALATION_SHUTDOWN_BUDGET;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(SEAL_ESCALATION_JOIN_POLL).await;
+        }
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    "seal escalation thread PANICKED during its final drain — whatever it still held is gone"
+                );
+            } else {
+                info!("seal escalation: queue drained on shutdown");
+            }
+        } else {
+            // Abandoned, not joined — joining now would wait without bound.
+            // Reported rather than swallowed: whatever is still queued dies
+            // with the process, and a loss nobody counts is the false-OK this
+            // whole shutdown path was rebuilt to stop producing.
+            metrics::counter!(
+                tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
+            )
+            .increment(1);
+            error!(
+                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
+                "seal escalation: the queue did NOT drain within budget — exiting anyway so \
+                 systemd does not SIGKILL us, but seals still queued are lost"
+            );
+        }
+    }
+
+    // 5b-3. WAL spill final drain (2026-08-28).
+    //
+    // LAST of the three, and it must be: this is the durable floor every tier
+    // above it falls back onto, so it can only be closed once nothing can still
+    // append to it — the sockets are shut (5b) and the seal writer is done
+    // (5b-2).
+    //
+    // Until now the writer thread was DETACHED. Its `JoinHandle` was discarded
+    // at the spawn, nothing signalled it, and nothing could: the only `Sender`
+    // lives inside `WsFrameSpill`, which the drain paths hold through an `Arc`,
+    // so the channel never closed and the thread stayed parked in `recv()`
+    // while the process exited around it. Up to 524,288 records — every one of
+    // them already reported to its caller as `Spilled` — went with it, counted
+    // by nothing: `persisted_total` counts `write_all` and `drop_critical`
+    // counts only what `try_send` refused outright.
+    //
+    // That is the same class fixed for the tick and depth ILP writers on
+    // 2026-08-28 (`tv_offload_writer_shutdown_incomplete_total`). The WAL, the
+    // one tier whose whole job is to be the thing that does not lose frames,
+    // was the tier still missing it.
+    if let Some(spill) = ws_frame_spill.as_ref() {
+        let abandoned =
+            spill.shutdown(tickvault_storage::ws_frame_spill::WAL_SPILL_SHUTDOWN_BUDGET);
+        if abandoned > 0 {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                abandoned,
+                "WAL spill: {abandoned} captured frames were NEVER written — exiting anyway so \
+                 systemd does not SIGKILL us, but these frames are permanently lost"
+            );
+        }
+    }
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
     // shutdown_flush — a black-holed Telegram can never hang exit).

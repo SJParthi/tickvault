@@ -272,4 +272,6 @@ pub mod trading_pipeline;
 /// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
 /// (which owns the functional-dormant order-update WS per operator ruling
 /// Q4-i) can create its own audit consumer. Pure move, zero behavior change.
+pub mod table_storage_rollup;
 pub mod ws_audit_consumer;
+pub mod ws_connection_rollup;

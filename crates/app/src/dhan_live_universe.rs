@@ -466,6 +466,20 @@ fn record_master_sourcing_fallback(reason: &'static str, fell_back_to: usize) {
     metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(fell_back_to as f64);
 }
 
+/// Every `reason` label `record_master_sourcing_fallback` can emit.
+///
+/// One list so the seed and the emit sites cannot drift. A reason that
+/// exists only at an emit site is a label whose FIRST occurrence the
+/// operator can never see — and for this counter the first occurrence is
+/// the whole event.
+pub const MASTER_SOURCING_FALLBACK_REASONS: &[&str] = &[
+    "artifact_unreadable",
+    "artifact_unparseable",
+    "fno_artifact_unreadable",
+    "fno_artifact_unparseable",
+    "no_usable_widening",
+];
+
 /// Gauge: how many instruments the live lane actually subscribed.
 pub const LIVE_UNIVERSE_SIZE_GAUGE: &str = "tv_dhan_live_universe_instruments";
 
@@ -489,6 +503,25 @@ pub fn resolve_live_universe(
     date_ist: &str,
     capacity: usize,
 ) -> Vec<SubscribeInstrument> {
+    // Seed every fallback reason before the decision is made.
+    //
+    // This counter carries a LIVE CloudWatch alarm, and it is the one that
+    // tells the operator the subscription set COLLAPSED from ~24,600
+    // instruments to the 4 hardcoded index SIDs — a 99.98% loss of market data
+    // that otherwise presents as a completely normal session, because 4
+    // indices still tick and every other gauge stays green.
+    //
+    // The universe is resolved ONCE per boot, so a collapse is a single
+    // increment on a series CloudWatch has never seen — and the agent drops
+    // exactly that first sample. The one event this alarm exists for was the
+    // one it could never report. Found by the 2026-08-29 adversarial sweep.
+    //
+    // All five reasons, because the agent's delta is computed per LABEL SET:
+    // seeding one leaves the other four exactly as blind as before.
+    for reason in MASTER_SOURCING_FALLBACK_REASONS {
+        metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => *reason).increment(0);
+    }
+
     if !cfg.live_subscription_from_master {
         tracing::info!(
             instruments = index_universe.len(),

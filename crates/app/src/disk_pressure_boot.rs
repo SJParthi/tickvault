@@ -34,7 +34,10 @@ use std::time::Duration;
 
 use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::ingest_shed::{INGEST_SHED, decide_shed_level, free_fraction_from_used_pct};
+use tickvault_common::ingest_shed::{
+    INGEST_SHED, decide_shed_level_all_signals, free_fraction_from_used_pct, runway_sessions,
+    seconds_to_disk_full,
+};
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
     PressureAction, PressureProbe, PressureState, apply_action, decide_pressure_action,
@@ -87,6 +90,28 @@ pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConf
     }
 }
 
+/// Free-space GAIN that invalidates the burn anchor.
+///
+/// 8 GiB is well above poll-to-poll jitter and well below a meaningful
+/// archival pass, so it separates "the volume is the one we anchored" from
+/// "something gave space back" without re-anchoring on noise.
+const RE_ANCHOR_ON_GAIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Seconds since IST midnight, right now.
+///
+/// The exhaustion decision needs the CAPTURE window's remaining time, and that
+/// window is defined in seconds-of-day IST (`TICK_PERSIST_*`). Derived here
+/// rather than threaded through the pure decision so the decision stays a
+/// function of numbers only and remains testable without a clock.
+fn secs_of_day_ist() -> u32 {
+    let ist = chrono::Utc::now().timestamp()
+        + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    // `rem_euclid` rather than `%`: a pre-1970 clock would make `%` negative,
+    // and a negative seconds-of-day silently reads as "before the window
+    // opened" — which HOLDS the gate rather than shedding, but only by luck.
+    u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0)
+}
+
 /// Spawn the supervised pressure loop.
 ///
 /// Returns `None` when the feature is off or the thresholds are unusable —
@@ -99,6 +124,7 @@ pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConf
 // covered indirectly: the decision it drives is unit-tested in
 // `tickvault_storage::disk_pressure` (18 tests) and the config derivation by
 // `pressure_config_compresses_market_data_not_audit`.
+// and a negative seconds-of-day silently reads as "before the window
 pub fn spawn_supervised_disk_pressure_loop(
     data_dir: PathBuf,
     questdb: QuestDbConfig,
@@ -173,11 +199,29 @@ async fn run_disk_pressure_loop(
     // decision so the cooldown does not depend on a wall clock that can jump.
     let started = tokio::time::Instant::now();
     let used_gauge = metrics::gauge!("tv_data_disk_used_pct");
+    // The burn anchor: (free_bytes, monotonic_secs) of the first trustworthy
+    // reading. Everything the box knows about its own burn rate is the
+    // difference between this and now, so it is deliberately NOT re-taken on
+    // every poll — a rolling short window measures noise, and the whole point
+    // is the session rate.
+    //
+    // Re-anchored on a large INCREASE in free space, because that is a
+    // different volume than the one anchored: an archival pass reclaimed, the
+    // operator deleted something, or the disk was resized. Continuing to
+    // measure against the old anchor after a 40 GB reclaim would report a
+    // burn that already happened as if it were still ahead of us.
+    let mut burn_anchor: Option<(u64, u64)> = None;
 
     loop {
         ticker.tick().await;
         let now_secs = started.elapsed().as_secs();
 
+        // Carried beside the probe rather than inside it: `PressureProbe` is a
+        // storage-crate type whose only job is the retention decision, and the
+        // runway trigger needs the RAW byte count that the percentage threw
+        // away. Widening that type to serve a second consumer would couple two
+        // decisions that must be able to disagree.
+        let mut free_bytes_seen: Option<u64> = None;
         let probe = match probe_disk_free_bytes(&data_dir) {
             DiskHealthOutcome::Ok {
                 free_bytes,
@@ -185,6 +229,7 @@ async fn run_disk_pressure_loop(
             } => match used_pct_from(free_bytes, total_bytes) {
                 Some(pct) => {
                     used_gauge.set(f64::from(pct));
+                    free_bytes_seen = Some(free_bytes);
                     PressureProbe::used(pct)
                 }
                 None => {
@@ -216,7 +261,7 @@ async fn run_disk_pressure_loop(
         //
         // `Escalate` is exactly that signal: it means every partition old
         // enough to archive already is, so retention is at its floor. On a
-        // poll where it does NOT fire, `decide_shed_level` HOLDS the current
+        // poll where it does NOT fire, the decision HOLDS the current
         // level rather than lifting it — restoring is governed by the free
         // space recovering, not by a quiet poll.
         //
@@ -227,13 +272,67 @@ async fn run_disk_pressure_loop(
         if let Some(pct) = probe.used_pct {
             let free = free_fraction_from_used_pct(pct);
             let retention_at_floor = matches!(action, PressureAction::Escalate);
-            let next = decide_shed_level(INGEST_SHED.level(), free, retention_at_floor);
+            // The runway half, and the fallback is the load-bearing part. A
+            // byte count we did not get is an UNKNOWN runway, never a zero
+            // one: `runway_sessions` is inert on a zero BURN, so standing the
+            // burn down leaves the fractional half deciding alone. Passing a
+            // 0-byte fallback with a real burn would read as no runway at all
+            // and shed everything on a poll that saw nothing — the same class
+            // of blind-reading bug the `Some(pct)` binding above prevents.
+            // Anchor maintenance, before the decision reads it.
+            if let Some(bytes) = free_bytes_seen {
+                match burn_anchor {
+                    None => burn_anchor = Some((bytes, now_secs)),
+                    Some((anchored, _))
+                        if bytes > anchored.saturating_add(RE_ANCHOR_ON_GAIN_BYTES) =>
+                    {
+                        burn_anchor = Some((bytes, now_secs));
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            let (runway_free_bytes, runway_burn) = match free_bytes_seen {
+                Some(bytes) => (bytes, cfg.ingest_shed_session_burn_bytes),
+                None => (0, 0),
+            };
+            let next = decide_shed_level_all_signals(
+                INGEST_SHED.level(),
+                free,
+                runway_free_bytes,
+                runway_burn,
+                retention_at_floor,
+                burn_anchor,
+                now_secs,
+                secs_of_day_ist(),
+            );
+            // Published every poll, not only on a transition: a runway that
+            // is quietly shortening across a session is the signal an
+            // operator wants BEFORE the gate arms, and a gauge that only
+            // moved at transitions could never show the approach.
+            // The box.s own measurement, published so the operator can see the
+            // burn it is acting on rather than only its verdict.
+            let secs_to_full = burn_anchor
+                .and_then(|(af, asec)| seconds_to_disk_full(af, asec, runway_free_bytes, now_secs));
+            if let Some(secs) = secs_to_full {
+                // The gauge is f64 and the value is at most ~86,400 seconds.
+                // APPROVED: seconds within a day, far below 2^53.
+                #[allow(clippy::cast_precision_loss)]
+                metrics::gauge!("tv_disk_seconds_to_full").set(secs as f64);
+            }
+
+            let runway = runway_sessions(runway_free_bytes, runway_burn);
+            if let Some(sessions) = runway {
+                metrics::gauge!("tv_disk_runway_sessions").set(sessions);
+            }
             if INGEST_SHED.set(next) {
                 metrics::counter!("tv_ingest_shed_transitions_total", "level" => next.as_str())
                     .increment(1);
                 warn!(
                     level = next.as_str(),
                     used_pct = pct,
+                    runway_sessions = runway.unwrap_or(f64::NAN),
+                    secs_to_disk_full = secs_to_full.unwrap_or(0),
                     retention_at_floor,
                     "ingest shedding CHANGED — the box is writing less to stay alive on a \
                      full disk. Ticks are never shed at any level; order-book depth is \
@@ -530,7 +629,7 @@ mod tests {
         let blind_used = 0_u8; // what `unwrap_or(0)` produces
         let free = free_fraction_from_used_pct(blind_used);
         assert_eq!(
-            decide_shed_level(
+            tickvault_common::ingest_shed::decide_shed_level(
                 tickvault_common::ingest_shed::ShedLevel::AllDepth,
                 free,
                 true
@@ -539,5 +638,151 @@ mod tests {
             "a blind probe fed through as 0% used restores everything — which \
              is precisely why it must never reach the decision"
         );
+    }
+
+    #[test]
+    fn the_pressure_loop_decides_shedding_on_runway_as_well_as_percentage() {
+        // The 2026-08-28 session ended at 55% free — nowhere near the 15%
+        // fractional bar — and roughly one session of writes from a full
+        // disk. A loop that consults only the percentage cannot see that, so
+        // this pins that it consults both.
+        let src = include_str!("disk_pressure_boot.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("decide_shed_level_all_signals("),
+            "the loop must use the runway-aware decision; the percentage-only \
+             gate never armed on the day this trigger was written for. \
+             Superseded 2026-08-28: the call is now all_signals, which \
+             SUBSUMES the configured runway and adds the box.s own measurement"
+        );
+        assert!(
+            production.contains("cfg.ingest_shed_session_burn_bytes"),
+            "the burn must come from config — a hardcoded number would decide \
+             what a box captures without an operator ever setting it"
+        );
+        assert!(
+            production.contains("tv_disk_runway_sessions"),
+            "the runway must be published every poll, or an operator can only \
+             ever learn about it from the transition that already happened"
+        );
+    }
+
+    #[test]
+    fn a_byte_count_the_probe_never_returned_stands_the_runway_down() {
+        // The blind-reading bug, in its runway form. `free_bytes_seen` is set
+        // in the SAME match arm as `used_pct`, so today they are `Some`
+        // together — but that coupling is implicit, and a future edit that
+        // moved either one would leave `0` bytes flowing into a live burn.
+        // Zero free bytes against a real burn reads as ZERO runway, which
+        // sheds every order-book row on a poll that saw nothing at all.
+        let src = include_str!("disk_pressure_boot.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("None => (0, 0)"),
+            "an absent byte count must stand the BURN down too — passing 0 \
+             bytes with a live burn is the blind-probe restore bug inverted"
+        );
+        assert!(
+            !production.contains("free_bytes_seen.unwrap_or(0)"),
+            "a bare 0-byte fallback is exactly the shape this guard forbids"
+        );
+
+        // And the arithmetic behind it, so the scan above is pinned to a real
+        // failure rather than to a spelling.
+        assert_eq!(
+            tickvault_common::ingest_shed::decide_shed_level_with_runway(
+                tickvault_common::ingest_shed::ShedLevel::None,
+                0.55,            // a healthy-looking disk
+                0,               // the byte count we did NOT get
+                148_000_000_000, // a real measured burn
+                false,
+            ),
+            tickvault_common::ingest_shed::ShedLevel::AllDepth,
+            "0 bytes with a live burn sheds everything — which is precisely \
+             why the burn is stood down when the byte count is missing"
+        );
+        assert_eq!(
+            tickvault_common::ingest_shed::decide_shed_level_with_runway(
+                tickvault_common::ingest_shed::ShedLevel::None,
+                0.55,
+                0, // same blind reading …
+                0, // … with the burn stood down, as production does
+                false,
+            ),
+            tickvault_common::ingest_shed::ShedLevel::None,
+            "with the burn stood down a blind byte count changes nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod self_measured_burn_tests {
+    use super::*;
+
+    #[test]
+    fn the_loop_uses_the_all_signals_decision_and_maintains_an_anchor() {
+        // The whole point of this change: the box measures its own burn rather
+        // than waiting for an operator to type a number in. A refactor back to
+        // the configured-only decision would silently restore the human in the
+        // loop that `ingest_shed`'s founding directive forbids.
+        let src = include_str!("disk_pressure_boot.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("decide_shed_level_all_signals("),
+            "the loop must consult the self-measured signal, not only config"
+        );
+        assert!(
+            production.contains("let mut burn_anchor: Option<(u64, u64)> = None;"),
+            "the burn anchor is what makes the measurement possible"
+        );
+        assert!(
+            production.contains("RE_ANCHOR_ON_GAIN_BYTES"),
+            "free space GROWING means a different volume than the one anchored \
+             — measuring against a stale anchor after a reclaim reports a burn \
+             that already happened as if it were still ahead"
+        );
+        assert!(
+            production.contains("tv_disk_seconds_to_full"),
+            "the measurement must be visible, not only acted on"
+        );
+    }
+
+    #[test]
+    fn the_anchor_is_taken_only_from_a_reading_the_probe_actually_got() {
+        // Same hazard as the percentage path: a blind probe reports no bytes,
+        // and anchoring on a fabricated 0 would make every later poll compute
+        // a colossal burn and shed everything.
+        let src = include_str!("disk_pressure_boot.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        assert!(
+            production.contains("if let Some(bytes) = free_bytes_seen {"),
+            "the anchor must be taken inside a Some(bytes) binding"
+        );
+    }
+
+    #[test]
+    fn seconds_of_day_is_never_negative_even_on_a_pre_epoch_clock() {
+        // `%` on a negative timestamp yields a negative seconds-of-day, which
+        // reads as "before the window opened" — safe by luck rather than by
+        // construction. `rem_euclid` makes it safe by construction.
+        let src = include_str!("disk_pressure_boot.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        assert!(
+            production.contains("rem_euclid(86_400)"),
+            "seconds-of-day must use rem_euclid, not %"
+        );
+
+        // And the live value is in range on this machine's clock.
+        let now = secs_of_day_ist();
+        assert!(now < 86_400, "seconds-of-day out of range: {now}");
     }
 }

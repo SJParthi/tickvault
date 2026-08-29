@@ -410,6 +410,9 @@ impl FeedScoreboardWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seeded here so an absent discard series can never read as a healthy
+        // zero — see `ilp_overflow::register_overflow_baseline`.
+        crate::ilp_overflow::register_overflow_baseline("feed_scoreboard_daily");
         let conf = scoreboard_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

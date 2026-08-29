@@ -719,6 +719,60 @@ locals {
       ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
       desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 live-vs-official comparison errored out, so the day's captured candles are UNVERIFIED - never assume they are clean. Distinct from the vacuous alarm: that one ran and found nothing to compare; this one did not complete. The comparison is the only ground truth the DHAN live feed has. Triage: the same log line carries the underlying error verbatim in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
+
+    # ADDED 2026-08-28 (noise-lock section 2.3k). The two entries above both
+    # mean "we could not tell you". This one is the only verdict that is an
+    # actual FINDING about the feed - it ran, it measured, and the two records
+    # disagree - and it was the one with no source field and no alarm, logging
+    # at info! among forty fields. The check that exists to say whether the
+    # revived feed is trustworthy could answer NO in a form nothing watched.
+    #
+    # Threshold is HALF the compared price fields, and that bar is deliberate:
+    # a non-zero divergence count is EXPECTED (a sampled live stream and the
+    # vendor's full tape legitimately differ - cross-verify-1m-error-codes.md
+    # section 1 says track the trend, not the count), so paging on any
+    # divergence pages every trading day. No baseline exists for a NORMAL rate,
+    # so 1% or 5% would be a number invented and called a measurement. More
+    # than half is the one claim that holds at any baseline: the two records
+    # are not describing the same market. The app-side gate carries the
+    # arithmetic; this filter only matches the line it emits.
+    "ws-gap-03-xverify-diverged" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_diverged\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run agreed
+      desc        = "WS-GAP-03 cross-verify MASS DIVERGENCE: the 15:41 live-vs-official comparison ran and found MORE THAN HALF of the compared price fields disagreeing with Dhan's own record beyond tolerance. That is not sampling noise at any baseline - the captured candles and the vendor tape are not describing the same market, so treat the day's candles as untrustworthy until explained. The other two xverify alarms mean the check could not tell you; this one means it did and the answer is bad. Triage from the same log line: minutes_compared and price_fields_compared are the denominator, cells_diverged the numerator, noise_p95_paise / noise_max_paise say whether it is a small systematic offset (tolerance or rounding) or wholesale (wrong instruments, segment mismatch, clock fault). Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
+
+    # ADDED 2026-08-28 (noise-lock section 2.3m). A depth-200 socket that
+    # UNSUBSCRIBED its old contract and then failed to subscribe the new one is
+    # carrying NOTHING. It stays transport-healthy - it keeps ponging, the
+    # connection gauge counts it alive, the lane-up gauge reads 1 - and it
+    # delivers no data for the rest of the session. Every existing alarm reads
+    # green through it, including the no-ticks one, because fifteen other
+    # sockets are still flowing and the lane's last tick is always ~1s old.
+    #
+    # Scoped by `$.source`, never by the bare code: WS-GAP-02 is emitted by the
+    # top-up path too, which STOPS at its wire budget without emptying anything
+    # and is an ordinary, non-paging outcome. A bare-code filter would page on
+    # routine ATM top-up budget exhaustion - the RISK-GAP-03 noise trap, on a
+    # path that runs every minute.
+    #
+    # ok_recovery = true: unlike the xverify entries above, this condition
+    # genuinely recovers - the redial the same arm schedules brings the socket
+    # back holding the CURRENT contract (the retained set already names it), so
+    # a return to OK means the remediation worked and is worth telling.
+    "ws-gap-02-swap-emptied-socket" = {
+      pattern     = "{ $.code = \"WS-GAP-02\" && $.level = \"ERROR\" && $.source = \"swap_emptied_socket\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "WS-GAP-02 DEPTH SOCKET EMPTIED: an at-the-money swap unsubscribed the old contract and then failed to subscribe the new one, so this socket is now carrying NO instruments. It stays transport-healthy and keeps ponging, which is why no other alarm sees it: the connection gauge counts it alive and the no-ticks alarm reads the whole lane, where fifteen other sockets are still flowing. A redial is scheduled automatically by the same code path and the retained set already names the NEW contract, so the socket should come back holding the right strike within one backoff - this alarm returning to OK is that remediation working. If it does NOT clear, the socket is failing to re-dial: check tv_dhan_ws_park_total and the endpoint field on this log line. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
   }
 }
 

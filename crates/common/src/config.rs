@@ -2417,6 +2417,62 @@ pub struct PartitionRetentionConfig {
     /// instead of exporting in a loop forever.
     #[serde(default = "default_pressure_max_passes")]
     pub pressure_max_passes: u32,
+    /// One trading session's disk burn, in bytes — the runway trigger's only
+    /// input, and `0` (the default) leaves that trigger switched OFF.
+    ///
+    /// Every other threshold in this struct is a PERCENTAGE of the volume, and
+    /// 2026-08-28 proved that is the wrong unit for deciding whether the next
+    /// session survives. That day burned 138 GB and ended at 55% free: a
+    /// healthy-looking disk roughly one session from full, with the shed gate
+    /// (which arms at 15% free) never coming close. Worse, growing the volume
+    /// pushes every percentage threshold FURTHER AWAY in bytes while the daily
+    /// burn is unchanged — so the obvious remedy disarms the safety net.
+    ///
+    /// Set to the MEASURED burn of a real session, never an estimate: the
+    /// number decides what the box stops capturing, and a guess that is too
+    /// large sheds depth on an ordinary afternoon. Leaving it at `0` keeps
+    /// behaviour byte-identical to the percentage-only gate.
+    ///
+    /// See `tickvault_common::ingest_shed::SESSION_BURN_BYTES_DEFAULT`.
+    #[serde(default = "default_ingest_shed_session_burn_bytes")]
+    pub ingest_shed_session_burn_bytes: u64,
+    /// Hours of `market_depth` to keep on local disk during a pressure
+    /// episode. `0` (the default) disables hour-granular archival entirely.
+    ///
+    /// # Why this exists
+    ///
+    /// Every other window in this struct is measured in DAYS, and the pressure
+    /// path floors at 2 of them. `market_depth` writes ~13 GB per HOUR. So a
+    /// mid-session pressure episode has, by construction, nothing it is
+    /// allowed to reclaim: today's partitions are ineligible until tomorrow,
+    /// and if the post-close daily leg already ran, yesterday's are gone. The
+    /// archiver is not failing — it is being asked a question whose answer is
+    /// always "nothing", while the disk fills at 13 GB an hour.
+    ///
+    /// Archiving by the HOUR is what the 2026-08-15 depth authorization
+    /// already describes: *"every row is written, verified in S3, and only
+    /// then dropped from EBS. Nothing is missed, hidden, or wiped — the hot
+    /// window on local disk is simply short."* This is that policy, built.
+    ///
+    /// # Why only depth
+    ///
+    /// `market_depth.ts` is the ARRIVAL instant, so it is monotone and a
+    /// closed hour is genuinely closed. `ticks.ts` is the exchange LAST-TRADE
+    /// time and ~10% of a session's ticks land more than an hour late, into
+    /// partitions that are already closed — hour-archiving `ticks` would race
+    /// live writes against a detach. The allowlist that enforces this is
+    /// `partition_archive::ARRIVAL_STAMPED_HOUR_TABLES`, and `ticks` is not
+    /// on it.
+    ///
+    /// Clamped up to `partition_archive::MIN_HOT_HOURS` (4) when non-zero, for
+    /// WAL replay: a replayed frame carries its ORIGINAL receipt, so a
+    /// mid-session restart is the one writer that can move backwards.
+    ///
+    /// At 6 hours a 09:00-17:30 session can reclaim roughly 78 GB without a
+    /// single row leaving the system — it moves to S3 first and is verified
+    /// there before anything is dropped.
+    #[serde(default = "default_depth_hot_hours")]
+    pub depth_hot_hours: u32,
 }
 
 impl Default for PartitionRetentionConfig {
@@ -2435,8 +2491,24 @@ impl Default for PartitionRetentionConfig {
             pressure_hot_days: default_pressure_hot_days(),
             pressure_min_interval_secs: default_pressure_min_interval_secs(),
             pressure_max_passes: default_pressure_max_passes(),
+            ingest_shed_session_burn_bytes: default_ingest_shed_session_burn_bytes(),
+            depth_hot_hours: default_depth_hot_hours(),
         }
     }
+}
+
+/// Hour-granular depth archival ships OFF: it changes what sits on local
+/// disk, and it cannot be exercised against a real QuestDB from a dev box.
+const fn default_depth_hot_hours() -> u32 {
+    0
+}
+
+/// The runway trigger ships INERT: an unmeasured burn must never decide
+/// what the box stops capturing.
+const fn default_ingest_shed_session_burn_bytes() -> u64 {
+    // Re-exported rather than restated, so the config default and the
+    // decision function that reads it can never drift apart.
+    crate::ingest_shed::SESSION_BURN_BYTES_DEFAULT
 }
 
 /// Default retention: 90 days of hot data.

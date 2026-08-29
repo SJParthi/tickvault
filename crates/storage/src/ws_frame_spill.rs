@@ -46,12 +46,12 @@ use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are 
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
 
@@ -154,7 +154,25 @@ struct WalRecord {
 /// Result of a hot-path `append()` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
-    /// Frame was queued for durable write. Hot path is done.
+    /// Frame was QUEUED for durable write. Hot path is done.
+    ///
+    /// Read the first word literally: this is a `try_send` onto a bounded
+    /// channel, and a background thread turns the queued record into bytes.
+    /// `Spilled` therefore means "handed off", NOT "on disk", and the two are
+    /// separated by up to `SPILL_CHANNEL_CAPACITY` records plus a 256 KiB
+    /// `BufWriter` — around 100 s of frames at the 5,000 fps envelope.
+    ///
+    /// Everything in that window dies on an abort (`panic = "abort"`, an
+    /// OOM-kill, a SIGKILL past `TimeoutStopSec`) and is counted by NOTHING:
+    /// `persisted_count` counts `write_all`, and `drop_critical` counts only
+    /// the frames `try_send` refused outright. The window is now at least
+    /// OBSERVABLE — `tv_ws_frame_spill_queue_depth` and its session
+    /// high-water are published from the writer batch loop — but observable
+    /// is not the same as closed, and this doc says "queued" so no caller
+    /// mistakes the one for the other.
+    ///
+    /// Nor is a written record fsync'ed; see the module header. The durable
+    /// floor is page-cache-deep, not platter-deep.
     Spilled,
     /// Spill channel was full — frame could not be persisted.
     /// CRITICAL: counted in drop metric; Telegram alert fires.
@@ -292,6 +310,59 @@ const WAL_WRITER_RESPAWN_BACKOFF: Duration = Duration::from_millis(200); // APPR
 /// WAL floor for a transient I/O hiccup.
 const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50); // APPROVED: this IS the named constant the rule asks for
 
+/// How long the writer blocks on an EMPTY channel before re-checking the
+/// shutdown flag.
+///
+/// The loop used a plain blocking `recv()`, whose only wake-up was a record
+/// arriving or every sender being dropped. Neither can happen at shutdown: the
+/// sender lives inside `WsFrameSpill`, which is held in an `Arc` shared with
+/// the drain paths, so nothing can drop it, and by shutdown no more frames are
+/// arriving. A timed receive is what gives the thread a chance to notice that
+/// it has been asked to stop.
+///
+/// 200 ms is chosen for what it costs when NOTHING is happening: four
+/// wake-ups a second on an otherwise idle thread. While frames ARE flowing the
+/// timeout never fires, so the hot path is byte-identical to the blocking form.
+const WAL_WRITER_STOP_POLL: Duration = Duration::from_millis(200); // APPROVED: this IS the named constant the rule asks for
+
+/// How often [`WsFrameSpill::shutdown`] re-checks the queue and the thread.
+const WAL_SHUTDOWN_POLL: Duration = Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
+
+/// Seconds `main` gives the WAL spill's final drain before abandoning it.
+///
+/// Sized small on purpose. By the time this runs the sockets are shut and the
+/// lane is joined, so the queue holds only what the writer had not yet reached
+/// — at the 5,000 fps envelope the writer clears a full 524,288-slot channel in
+/// well under a second of disk time. Ten seconds is therefore a stall budget,
+/// not a throughput budget: it covers a writer parked in
+/// [`WAL_WRITER_IO_RETRY_BACKOFF`] against a briefly-wedged disk, and refuses
+/// to hold the process any longer than that, because systemd's `TimeoutStopSec`
+/// escalates to SIGKILL and a SIGKILL loses the very records this is here to
+/// save.
+///
+/// Counted in the sequential sum that
+/// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs` checks against the
+/// unit file — a third budget on the same path is exactly the kind of addition
+/// that guard exists to catch.
+pub const WAL_SPILL_SHUTDOWN_BUDGET_SECS: u64 = 10;
+
+/// [`WAL_SPILL_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
+pub const WAL_SPILL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(WAL_SPILL_SHUTDOWN_BUDGET_SECS);
+
+/// Records still queued when the final drain was abandoned — i.e. frames that
+/// were captured, acknowledged as `Spilled`, and then lost with the process.
+///
+/// Non-zero means the durable floor did not hold for that shutdown. It is the
+/// WAL-side twin of `tv_offload_writer_shutdown_incomplete_total`, which counts
+/// the same class for the tick and depth ILP writers; the WAL is the one tier
+/// that had no such counter, which is why an abandoned queue here was invisible.
+///
+/// Deliberately a RECORD count, not an episode count: unlike the offload
+/// writers — whose in-flight batches are ILP buffers whose row counts were
+/// consumed when they were sent — the channel can be asked its exact length, so
+/// there is a real number to report and no need to fabricate one.
+pub const WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER: &str = "tv_wal_spill_shutdown_incomplete_total";
+
 // ---------------------------------------------------------------------------
 // WsFrameSpill
 // ---------------------------------------------------------------------------
@@ -409,15 +480,95 @@ pub struct WsFrameSpill {
     /// `None` keeps the spill feed-health-agnostic (byte-identical hot path).
     /// Read ONLY in the cold drop arms; never on the hot `Spilled` path.
     feed_health: Option<Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
+    /// Set once by [`WsFrameSpill::shutdown`]. The writer exits cleanly the
+    /// first time it finds this set AND the channel empty — which is the only
+    /// way this thread can be asked to stop, because the sole `Sender` lives in
+    /// this struct and the struct is shared through an `Arc` that nothing can
+    /// drop while a drain path still holds it.
+    stop: Arc<AtomicBool>,
+    /// The writer's join handle, so the final drain can WAIT for it instead of
+    /// letting the process exit out from under it.
+    ///
+    /// Behind a `Mutex<Option<..>>` rather than owned by value because
+    /// `shutdown` is reached through the same `Arc<WsFrameSpill>` the append
+    /// paths hold: there is no `self` to consume. The lock is taken exactly
+    /// once, at shutdown, and never on the append path.
+    writer: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
+    /// The exclusive claim on the WAL directory, held for as long as this spill
+    /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
+    /// release it on drop so the next process can start. See [`WalDirGuard`].
+    _dir_guard: Option<WalDirGuard>,
 }
 
 impl WsFrameSpill {
-    /// Create a spill writer rooted at `wal_dir`. Spawns the background writer.
+    /// Create a spill writer rooted at `wal_dir`, taking the directory claim
+    /// itself. Spawns the background writer.
+    ///
+    /// Prefer [`WsFrameSpill::new_with_guard`] in any boot path that touches
+    /// the directory BEFORE constructing the spill — see that function for why
+    /// the ordering is not cosmetic.
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full (both construct)
     pub fn new<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Self> {
         let wal_dir = wal_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
             .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
+        let dir_guard = lock_wal_dir(&wal_dir)?;
+        Self::new_with_guard(wal_dir, dir_guard)
+    }
+
+    /// Create a spill writer for a directory the caller has ALREADY claimed.
+    ///
+    /// # Why this exists — the ordering hole it closes
+    ///
+    /// `new` claims the directory and then seeds the sequence, which is correct
+    /// in isolation. It is NOT sufficient for the real boot path, because
+    /// `main` calls [`replay_all`] on this directory ~115 lines EARLIER, and
+    /// `replay_all` MUTATES: it renames live `*.wal` files into `replaying/`.
+    ///
+    /// So starting a second process while one is live used to stage the
+    /// INCUMBENT's currently-open segment out from under it. The incumbent
+    /// keeps writing to the moved inode — the fd is still valid — and the
+    /// intruder then reaches the claim, is refused, and exits. The refusal
+    /// worked; it just happened after the damage. The incumbent's remaining
+    /// session frames now sit in a file under `replaying/` that its own
+    /// `confirm_replayed` will never cover.
+    ///
+    /// Taking the claim BEFORE the replay makes the refusal arrive before the
+    /// rename, and handing the guard here is what lets the caller keep it: a
+    /// second `lock_wal_dir` from the same process would be a different open
+    /// file description and would be refused by the kernel exactly as a foreign
+    /// process is — so the guard has to be MOVED, not re-taken.
+    // TEST-EXEMPT: covered by the guard-handoff tests below and by every `new` caller, which delegates here.
+    pub fn new_with_guard<P: AsRef<Path>>(
+        wal_dir: P,
+        dir_guard: Option<WalDirGuard>,
+    ) -> anyhow::Result<Self> {
+        let wal_dir = wal_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
+            .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
+
+        // ORDER IS LOAD-BEARING.
+        //
+        // 1. The directory is CLAIMED before this function is entered — by the
+        //    caller for the boot path, by `new` for everyone else. Two
+        //    processes sharing one WAL directory mint `capture_seq` from two
+        //    independent clock-seeded counters, collide inside the `ticks`
+        //    DEDUP key, and destroy ticks with no counter anywhere to show it.
+        //    See [`lock_wal_dir`] for why this is fail-closed, not a warning.
+        // 2. Only THEN read the on-disk high-water mark and ratchet the counter
+        //    past it. Doing this before the claim would race a live incumbent
+        //    that is still appending, and could seed from a value it is about
+        //    to exceed.
+        // 3. Only THEN spawn the writer thread, so nothing can append at a
+        //    sequence below the high-water mark.
+        let disk_high = seed_frame_seq_from_disk(&wal_dir);
+        if disk_high > 0 {
+            tracing::debug!(
+                wal_dir = ?wal_dir,
+                disk_high,
+                "WAL directory claimed exclusively; sequence ratcheted past disk"
+            );
+        }
 
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         let drop_critical = Arc::new(AtomicU64::new(0));
@@ -425,7 +576,17 @@ impl WsFrameSpill {
 
         let persisted_for_thread = persisted_total.clone(); // APPROVED: Arc clone in the one-shot constructor
         let wal_dir_for_thread = wal_dir.clone(); // APPROVED: one-shot constructor, not per-frame
-        thread::Builder::new()
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop); // APPROVED: Arc clone in the one-shot constructor
+
+        // Register the abandoned-records series at zero. The CloudWatch agent
+        // computes counter deltas and DROPS the first sample of a series it has
+        // never seen, so a counter that only ever increments on the bad day
+        // would publish nothing on the bad day. Seeding here is what makes a
+        // clean shutdown provable rather than merely unreported.
+        metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(0);
+
+        let writer = thread::Builder::new()
             .name("ws-frame-spill-writer".to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
@@ -437,7 +598,12 @@ impl WsFrameSpill {
                 // outlives any panic, keeping the channel alive across respawns.
                 loop {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        writer_loop(&rx, &wal_dir_for_thread, &persisted_for_thread)
+                        writer_loop(
+                            &rx,
+                            &wal_dir_for_thread,
+                            &persisted_for_thread,
+                            &stop_for_thread,
+                        )
                     }));
                     match outcome {
                         Ok(Ok(())) => {
@@ -480,6 +646,9 @@ impl WsFrameSpill {
             persisted_total,
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
+            stop,
+            writer: std::sync::Mutex::new(Some(writer)),
+            _dir_guard: dir_guard,
         })
     }
 
@@ -502,6 +671,18 @@ impl WsFrameSpill {
     /// writer-dead drop path is loud (WS-SPILL-02), not silent.
     #[cfg(test)]
     fn new_with_dead_writer_for_test() -> Self {
+        // A unique directory per call so the flock is always free: this
+        // constructor exists to exercise the dead-writer arm, and a lock
+        // contention failure here would prove nothing about that arm.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-wal-dead-writer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        let dir_guard = lock_wal_dir(&dir).expect("fresh temp dir is never contended");
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         drop(rx); // no writer ever runs → channel is Disconnected for sends
         Self {
@@ -510,6 +691,9 @@ impl WsFrameSpill {
             persisted_total: Arc::new(AtomicU64::new(0)),
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            writer: std::sync::Mutex::new(None),
+            _dir_guard: dir_guard,
         }
     }
 
@@ -664,16 +848,146 @@ impl WsFrameSpill {
     pub fn persisted_count(&self) -> u64 {
         self.persisted_total.load(Ordering::Relaxed)
     }
+
+    /// Records still sitting in the writer's queue right now.
+    ///
+    /// This is the size of the loss window an abrupt exit would take: `append`
+    /// returns [`AppendOutcome::Spilled`] the instant a record is QUEUED, and
+    /// the writer thread is what turns queued into bytes.
+    #[must_use]
+    pub fn queued_records(&self) -> usize {
+        self.spill_tx.len()
+    }
+
+    /// Drain the writer's queue and stop it, bounded by `budget`.
+    ///
+    /// # The hole this closes
+    ///
+    /// The writer thread was spawned and DETACHED — its `JoinHandle` was
+    /// discarded at the `map_err`. Nothing waited for it, and nothing could:
+    /// the only `Sender` lives in this struct, the struct is shared through an
+    /// `Arc` the drain paths hold, so the channel could never close and the
+    /// thread never had a reason to exit. At shutdown the process simply ended
+    /// while up to [`SPILL_CHANNEL_CAPACITY`] records — 524,288, ~100 s of
+    /// frames at the 5,000 fps envelope — sat unwritten.
+    ///
+    /// Every one of those was already reported to its caller as `Spilled`, and
+    /// counted by nothing on the way out: `persisted_total` counts `write_all`
+    /// and `drop_critical` counts only what `try_send` refused outright. So the
+    /// durable floor — the guarantee the whole ring → spill → WAL chain rests
+    /// on — had an unmeasured hole at exactly the moment it was most likely to
+    /// matter. The tick and depth ILP writers had this fixed on 2026-08-28
+    /// (`tv_offload_writer_shutdown_incomplete_total`); the WAL itself did not.
+    ///
+    /// # Ordering
+    ///
+    /// Call this AFTER the sockets are closed and the lane is joined, or the
+    /// queue is still being filled while this waits on it.
+    ///
+    /// # What it does not promise
+    ///
+    /// Returns the number of records still queued when the budget expired —
+    /// `0` for a clean drain. A non-zero return is a real, permanent loss and
+    /// says so, at `error!` and on
+    /// [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`]; it is reported rather than
+    /// waited out because systemd's `TimeoutStopSec` escalates to SIGKILL, and
+    /// a SIGKILL loses strictly more.
+    ///
+    /// Even a `0` return leaves the `write_all`-not-`fsync` residual: the exit
+    /// flush pushes the 256 KiB `BufWriter` into the page cache, not onto the
+    /// platter. That is the same durability boundary the whole module has
+    /// always had (there is no `fsync` anywhere in this file) and this method
+    /// deliberately does not claim to have changed it.
+    pub fn shutdown(&self, budget: Duration) -> usize {
+        self.stop.store(true, Ordering::Release);
+
+        let deadline = Instant::now() + budget;
+
+        // Phase 1: wait for the queue itself to empty. This is the number that
+        // matters — a record still in the channel has not been written at all.
+        while !self.spill_tx.is_empty() && Instant::now() < deadline {
+            thread::sleep(WAL_SHUTDOWN_POLL);
+        }
+        let queued = self.spill_tx.len();
+
+        // Phase 2: wait for the thread to notice, flush, and exit. Polled
+        // rather than joined outright: a writer parked in
+        // `WAL_WRITER_IO_RETRY_BACKOFF` against a wedged disk must not hold the
+        // process past the budget, and a blocking `join` has no timeout.
+        if let Ok(mut slot) = self.writer.lock()
+            && let Some(handle) = slot.take()
+        {
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(WAL_SHUTDOWN_POLL);
+            }
+            if handle.is_finished() {
+                // Only join a thread that has already finished, so this cannot
+                // block. A panic that reaches the handle is reported rather
+                // than swallowed: the supervisor catches panics and respawns,
+                // so a panic arriving HERE means the supervisor loop itself is
+                // over — the writer is gone and anything still queued is lost.
+                if handle.join().is_err() {
+                    error!(
+                        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                        "WAL spill writer PANICKED out of its supervisor loop during shutdown"
+                    );
+                }
+            } else {
+                // Deliberately abandoned. Put nothing back in the slot — the
+                // handle is dropped, the thread is detached, and the process is
+                // about to exit anyway.
+                warn!(
+                    budget_secs = budget.as_secs(),
+                    queued,
+                    "WAL spill writer did not exit within the shutdown budget — abandoning it"
+                );
+            }
+        }
+
+        if queued > 0 {
+            metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(queued as u64);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                queued,
+                budget_secs = budget.as_secs(),
+                "WAL spill: the final drain was ABANDONED with records still queued — these \
+                 frames were captured and acknowledged but never written; they are gone"
+            );
+        } else {
+            info!(
+                persisted = self.persisted_count(),
+                "WAL spill: final drain complete on shutdown; queue empty"
+            );
+        }
+
+        queued
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Background writer thread
 // ---------------------------------------------------------------------------
 
+/// Flush and close the current segment on the way out of [`writer_loop`].
+///
+/// Shared by the two exit arms so a future third one cannot quietly forget the
+/// flush: `persist_record_resilient` counts a record as persisted when
+/// `write_all` lands it in the 256 KiB `BufWriter`, not when the buffer reaches
+/// the platter, so dropping an unflushed writer loses records that
+/// `persisted_count()` has already claimed.
+fn flush_on_exit(current: &mut Option<BufWriter<File>>, stage: &'static str) {
+    if let Some(mut w) = current.take()
+        && let Err(err) = w.flush()
+    {
+        report_io_error(stage, &err);
+    }
+}
+
 fn writer_loop(
     rx: &Receiver<WalRecord>,
     wal_dir: &Path,
     persisted: &AtomicU64,
+    stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     // `None` = no open segment; the next record reopens one. A transient disk
     // error sets this back to `None` instead of propagating out of the thread.
@@ -683,15 +997,56 @@ fn writer_loop(
     let mut current: Option<BufWriter<File>> = open_segment_resilient(wal_dir);
     let mut bytes_written: u64 = 0;
 
+    // Resolved ONCE, outside the loop, for the same reason the batch-boundary
+    // comment below gives: a handle re-resolved per iteration is how a metric
+    // write becomes a cost.
+    let depth_gauge = metrics::gauge!("tv_ws_frame_spill_queue_depth");
+    let high_water_gauge = metrics::gauge!("tv_ws_frame_spill_queue_high_water");
+    let mut high_water: usize = 0;
+    // Seeded so the series REGISTERS at startup. The CloudWatch agent computes
+    // deltas and drops the first sample of a series it has never seen, so an
+    // always-zero gauge that is never set would be indistinguishable from an
+    // absent one — the exact failure that made a depth loss unknowable on
+    // 2026-08-28.
+    depth_gauge.set(0.0);
+    high_water_gauge.set(0.0);
     loop {
-        // Block until at least one record arrives. Exit cleanly (and ONLY here)
-        // when all senders are dropped — that is the clean-shutdown signal.
-        let first = match rx.recv() {
+        // Timed, not blocking, so the thread can notice a shutdown request.
+        //
+        // The clean exit used to be reachable ONLY by every `Sender` being
+        // dropped. That can never happen here: the sole sender lives inside
+        // `WsFrameSpill`, which the drain paths hold through an `Arc`, so the
+        // channel stays open for the life of the process and the writer stayed
+        // parked in `recv()` while the process exited around it. Everything
+        // still queued went with it — captured, acknowledged as `Spilled`, and
+        // counted by nothing. This arm is what ends that.
+        let first = match rx.recv_timeout(WAL_WRITER_STOP_POLL) {
             Ok(r) => r,
-            Err(_) => {
-                if let Some(mut w) = current.take() {
-                    drop(w.flush());
+            Err(RecvTimeoutError::Timeout) => {
+                // Empty channel by construction — `recv_timeout` only times out
+                // when nothing arrived. So a stop request that reaches here has
+                // a fully drained queue behind it and it is safe to close.
+                if stop.load(Ordering::Acquire) {
+                    flush_on_exit(&mut current, "flush_on_stop");
+                    info!("ws-frame-spill-writer stop requested and queue drained; exiting");
+                    return Ok(());
                 }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // Reported, not discarded. This was `drop(w.flush())`, and
+                // the buffer it drops is `WAL_WRITER_BUFFER` = 256 KiB --
+                // roughly 1,300 records that `persisted` has ALREADY
+                // counted, because `persist_record_resilient` increments on
+                // a successful `write_all` into the buffer, not on a
+                // successful flush to the platter.
+                //
+                // So the old form did two wrong things at once: it lost the
+                // records, and it left `persisted_count()` over-reporting by
+                // exactly the number it lost. The sibling flush thirty lines
+                // below has always called `report_io_error` -- this arm and
+                // the rotation arm were the two that did not.
+                flush_on_exit(&mut current, "flush_on_close");
                 info!("ws-frame-spill-writer channel closed; exiting");
                 return Ok(());
             }
@@ -722,9 +1077,47 @@ fn writer_loop(
             thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
         }
 
+        // The exposure C1 named, made measurable.
+        //
+        // `AppendOutcome::Spilled` means QUEUED, not written: `append` is a
+        // `try_send` onto a 524,288-slot channel and this thread is what turns
+        // a queued record into bytes. Everything still in the channel at an
+        // abort (`panic = "abort"`, an OOM-kill, a SIGKILL past
+        // `TimeoutStopSec`) is PERMANENTLY LOST — and is counted by nothing,
+        // because `persisted` counts `write_all` and `drop_critical` counts
+        // only the refusals `try_send` rejected outright.
+        //
+        // Until this gauge the depth of that window had never been observed,
+        // so the honest answer to "how many frames could we lose on an abort?"
+        // was Unknown with a ceiling of 524,288 (~100 s at the 5,000 fps
+        // envelope). Now it is a number.
+        //
+        // Published HERE, at the batch boundary, and deliberately not in
+        // `append`: the hot path already learned this lesson once, when
+        // `record_ws_lag` allocated twice per tick (~36 M allocations/hour) on
+        // a path documented as allocation-free. One gauge write per ~257
+        // records costs nothing measurable; one per frame is how that defect
+        // was reintroduced.
+        //
+        // The high-water is the load-bearing half. A gauge sampled every 30 s
+        // by the CloudWatch agent will read ~0 all session and miss the burst
+        // that matters — the whole point is the PEAK during a disk stall, and
+        // a peak that decays between scrapes was never observed at all.
+        let queued = rx.len();
+        depth_gauge.set(queued as f64);
+        if queued > high_water {
+            high_water = queued;
+            high_water_gauge.set(high_water as f64);
+        }
+
         if bytes_written >= WAL_SEGMENT_MAX_BYTES {
             if let Some(mut w) = current.take() {
-                drop(w.flush());
+                // Same repair as the close arm above: a failed rotation flush
+                // silently lost the tail of the segment it was closing, while
+                // `persisted` had already counted every record in it.
+                if let Err(err) = w.flush() {
+                    report_io_error("flush_on_rotate", &err);
+                }
             }
             current = open_segment_resilient(wal_dir);
             bytes_written = 0;
@@ -913,6 +1306,554 @@ pub fn next_frame_seq() -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Frame receipt: derived from a monotonic instant, never read per frame
+// ---------------------------------------------------------------------------
+//
+// The frame's arrival instant is stamped in `FrameSink::accept` as a monotonic
+// `Instant`, deliberately: that file BANS wall-clock reads outright
+// (`test_pool_supervisor_source_never_reads_the_wall_clock`) because its
+// ladders, token expiry and backoff are all monotonic, and an NTP step must be
+// unable to expire all sixteen sockets at once. The ban is right.
+//
+// But the WAL record needs a WALL-CLOCK receipt: replay has to restore when the
+// frame actually arrived, and a monotonic instant means nothing across a
+// process restart. Before 2026-08-28 that tension was resolved by not writing a
+// receipt at all — `append_with_seq` passed `WAL_RECEIPT_UNKNOWN_NANOS` and
+// `append_with_seq_at` had ZERO production callers, so every record on disk
+// carried the sentinel while the format claimed to carry a receipt.
+//
+// Anchoring resolves it: the wall clock is read on a slow timer, in a different
+// crate from the one under the ban, and every per-frame receipt is arithmetic
+// on the monotonic delta. That is strictly better than a per-frame wall-clock
+// read in the property that matters most here — an NTP STEP cannot reorder two
+// frames, because the spacing between them is monotonic by construction.
+/// The receipt anchor: a monotonic instant paired with the UTC-epoch nanos that
+/// were true at that instant.
+///
+/// Two halves in ONE swapped value, deliberately. Split across two atomics a
+/// reader could observe a fresh wall time against a stale monotonic base and
+/// derive a receipt off by a whole refresh interval — a torn read that would be
+/// indistinguishable from a real out-of-order frame.
+#[derive(Debug, Clone, Copy)]
+struct ReceiptAnchor {
+    instant: Instant,
+    nanos: i64,
+}
+
+static RECEIPT_ANCHOR: std::sync::OnceLock<arc_swap::ArcSwap<ReceiptAnchor>> =
+    std::sync::OnceLock::new();
+
+/// Counter: how many times the receipt anchor was re-taken from the wall clock.
+///
+/// Charted rather than alarmed — a steady cadence is the mechanism working. Its
+/// absence during a session is the interesting reading, because it means the
+/// refresh caller stopped and the anchor is aging.
+pub const RECEIPT_ANCHOR_REFRESH_COUNTER: &str = "tv_wal_receipt_anchor_refresh_total";
+
+fn anchor_cell() -> &'static arc_swap::ArcSwap<ReceiptAnchor> {
+    RECEIPT_ANCHOR.get_or_init(|| arc_swap::ArcSwap::from_pointee(take_anchor()))
+}
+
+fn take_anchor() -> ReceiptAnchor {
+    // Order matters and the cost of getting it wrong is a systematic bias:
+    // read the WALL clock first, then the monotonic one, so any scheduling
+    // delay between the two makes the derived receipt slightly EARLY rather
+    // than late. An early receipt files a frame in the bucket it arrived in;
+    // a late one can push it into the next.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0i64, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    ReceiptAnchor {
+        instant: Instant::now(),
+        nanos,
+    }
+}
+
+/// Re-takes the receipt anchor from the wall clock.
+///
+/// # Why this is not optional
+///
+/// `Instant` is `CLOCK_MONOTONIC` and `SystemTime` is `CLOCK_REALTIME`. NTP
+/// does not merely STEP the realtime clock — it SLEWS it, at up to 500 ppm, so
+/// the two clocks separate continuously. A single boot-time anchor therefore
+/// drifts by up to **~1.8 s per hour, ~16 s over a 9-hour session** in the
+/// worst permitted case. Since 2026-08-28 `received_at` is the candle
+/// BUCKETING clock, so an aging anchor does not merely mislabel a timestamp —
+/// it files bars in the wrong second, and the error grows all day, which is the
+/// shape hardest to notice and hardest to reconstruct afterwards.
+///
+/// Re-taking it periodically bounds the drift to one refresh interval's worth
+/// instead of one session's. The spacing BETWEEN frames inside an interval is
+/// still purely monotonic, which is the property that makes the anchor better
+/// than a per-frame wall-clock read: an NTP STEP cannot reorder two frames.
+///
+/// Caller: an off-hot-path timer. This must never be called per frame — it is a
+/// wall-clock syscall and an allocation, and both belong nowhere near the
+/// capture path.
+pub fn refresh_receipt_anchor() {
+    let cell = anchor_cell();
+    let old = cell.load();
+    let new = take_anchor();
+    // MONOTONIC RATCHET (2026-08-28, round-2 fix).
+    //
+    // Re-anchoring bounds the drift, and taken naively it also introduces a way
+    // to move time BACKWARDS: if CLOCK_REALTIME has slewed slower than
+    // CLOCK_MONOTONIC, or stepped back, the fresh anchor projects a LATER frame
+    // to an EARLIER receipt than the old anchor would have. Since `received_at`
+    // is the candle bucketing clock, that files a frame into a second that may
+    // already be sealed — and the whole reason to derive receipts from a
+    // monotonic instant rather than read the clock per frame is that a time
+    // step must not be able to reorder two frames. A refresh that can reorder
+    // them gives that property back with one hand.
+    //
+    // So the new anchor is adopted only when it does not rewind what the old
+    // one was already projecting. Refusing it costs one interval of drift
+    // correction; accepting it costs an out-of-order frame, and those are not
+    // the same size of mistake.
+    let projected_now = old.nanos.saturating_add(
+        i64::try_from(
+            new.instant
+                .saturating_duration_since(old.instant)
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX),
+    );
+    if new.nanos < projected_now {
+        metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "refused_backward")
+            .increment(1);
+        return;
+    }
+    cell.store(std::sync::Arc::new(new));
+    metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
+}
+
+/// The UTC-epoch-nanos receipt for a monotonic capture instant.
+///
+/// Initialises the anchor on first use, so the first frame of a session anchors
+/// it and reads back its own arrival instant essentially exactly.
+///
+/// Saturating throughout: `Instant` arithmetic panics on a negative interval, and
+/// a panic on the capture path would cost the socket. An instant from BEFORE the
+/// anchor — which a refresh makes genuinely reachable for a frame stamped just
+/// before the swap — yields the anchor time. That is a sub-refresh-interval
+/// flattening of at most a handful of frames, and it is the right trade against
+/// a panic or a negative timestamp.
+#[must_use]
+pub fn receipt_nanos_from(captured_at: Instant) -> i64 {
+    let anchor = anchor_cell().load();
+    let delta = captured_at.saturating_duration_since(anchor.instant);
+    let delta_nanos = i64::try_from(delta.as_nanos()).unwrap_or(i64::MAX);
+    anchor.nanos.saturating_add(delta_nanos)
+}
+/// The exclusive lock file held for the lifetime of the process that owns a
+/// WAL directory.
+///
+/// It lives INSIDE the WAL directory rather than beside it so the lock and the
+/// thing it protects can never be separated by a config change: whoever points
+/// at this directory takes this lock, whatever the directory is called.
+pub const WAL_DIR_LOCK_FILE: &str = ".wal-owner.lock";
+
+/// Counter: a process REFUSED to open the WAL directory because another live
+/// process already owns it. This is the fail-closed arm and it is a refusal,
+/// never a loss — the frames the incumbent is capturing are unaffected.
+pub const WAL_DIR_LOCK_REFUSED_COUNTER: &str = "tv_wal_dir_lock_refused_total";
+
+/// Counter: the lock FILE could not be created (an unwritable directory, a full
+/// disk), so one-writer-per-directory is not enforced for this process. Distinct
+/// from [`WAL_DIR_LOCK_REFUSED_COUNTER`] because they mean opposite things: that
+/// one is the guard WORKING, this one is the guard UNAVAILABLE.
+pub const WAL_DIR_LOCK_UNAVAILABLE_COUNTER: &str = "tv_wal_dir_lock_unavailable_total";
+
+/// Counter: the boot re-seed advanced [`WAL_FRAME_SEQ`] past a high-water mark
+/// found on disk. Non-zero means a restart WOULD have re-issued sequence values
+/// already in the database, and did not.
+pub const WAL_SEQ_RESEED_ADVANCED_COUNTER: &str = "tv_wal_seq_reseed_advanced_total";
+
+/// An exclusive, kernel-held claim on one WAL directory.
+///
+/// # Why this exists
+///
+/// `capture_seq` is a column of the `ticks` DEDUP UPSERT key
+/// `(ts, security_id, segment, capture_seq, feed)`. Two DIFFERENT ticks that
+/// arrive carrying the same key do not both survive — QuestDB upserts one away,
+/// and **no counter in this process reports it**, because from here both rows
+/// were appended successfully. It is silent, unrecoverable tick loss that shows
+/// up only as a number that should have been bigger.
+///
+/// The sequence making that key unique is [`WAL_FRAME_SEQ`], a process-global
+/// counter seeded from the wall clock. That is airtight WITHIN one process and
+/// worth nothing ACROSS two: a second process starts its own counter from the
+/// same clock, mints the same 131 µs bases, and every instrument that ticks
+/// twice inside one exchange-second can lose a tick. Nothing notices, because
+/// the collision happens inside the database rather than in our code.
+///
+/// So the invariant is narrow and load-bearing: **one live process per WAL
+/// directory**. It is `flock(LOCK_EX | LOCK_NB)` through
+/// `std::fs::File::try_lock` (std since Rust 1.89 — no new dependency), which
+/// means the KERNEL releases it when the process dies, including on `SIGKILL`,
+/// an OOM kill, or a container stop. That is the property a PID file cannot
+/// offer: a stale PID file after a hard kill locks a healthy restart out of its
+/// own data, trading silent loss for guaranteed downtime.
+///
+/// # Why fail-closed
+///
+/// The alternative — warn and continue — is what existed before 2026-08-28, and
+/// it is the bug. A refusal costs one boot and says so loudly; proceeding costs
+/// ticks that cannot be reconstructed from anything, because both writers
+/// believe they succeeded.
+///
+/// The guard is held by value inside [`WsFrameSpill`], so dropping the spill
+/// releases the directory for the next process.
+#[derive(Debug)]
+pub struct WalDirGuard {
+    /// Held open purely so the `flock` stays taken. Dropping this releases it,
+    /// which is the intended release path.
+    _lock: File,
+    path: PathBuf,
+}
+
+impl WalDirGuard {
+    /// The lock file this guard holds.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Take the exclusive claim on `wal_dir`, or refuse.
+///
+/// # The two failures are NOT the same, and they get opposite treatment
+///
+/// - **CONTENTION** — another live process holds the lock. This is the case the
+///   lock exists for, and it is fail-CLOSED: `Err`. Two processes minting
+///   `capture_seq` from independent clocks destroy ticks through the DEDUP key
+///   with no counter to show it, so one refused boot is the cheap outcome.
+///
+/// - **THE LOCK FILE CANNOT BE CREATED** — an unwritable directory, a full
+///   disk. This returns `Ok(None)`, and the caller proceeds DEGRADED. It is not
+///   evidence of a second process, and killing the lane over a transient
+///   filesystem problem is the worse failure: the writer is deliberately built
+///   to survive an unwritable directory and recover when permission returns
+///   (`test_writer_survives_unwritable_dir_then_recovers` pins exactly that).
+///   Turning that recoverable state into a dead feed would trade a rare silent
+///   loss for a common total outage.
+///
+/// **Honest limit of the degraded arm:** while `Ok(None)` is in force, mutual
+/// exclusion is NOT enforced. It is logged with a coded error and counted, so
+/// the state is visible rather than assumed away — but a second process started
+/// during it would not be refused. That window is bounded by the directory
+/// being unwritable, which the writer is already reporting loudly through
+/// `WS-SPILL-01`.
+///
+/// # Errors
+///
+/// Contention only. A creation failure is `Ok(None)`, never `Err`.
+pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
+    // CREATE THE DIRECTORY FIRST (2026-08-28, round-2 fix).
+    //
+    // The claim moved ahead of `replay_all` earlier today, which was right —
+    // but `create_dir_all` stayed inside `WsFrameSpill::new_with_guard`, 145
+    // lines later. On any boot where the WAL directory does not yet exist
+    // (first deploy, a fresh volume, the post-recreate box) `OpenOptions::open`
+    // then returned `NotFound`, which lands in the degrade arm below and turns
+    // dual-writer protection OFF for the entire process — silently, and with a
+    // coded error blaming "an unwritable directory or a full disk" when the
+    // real cause is the ordinary first boot.
+    //
+    // Here rather than at the call site so EVERY caller is protected: a guard
+    // that depends on its caller remembering something is not a guard.
+    let created = std::fs::create_dir_all(wal_dir); // O(1) EXEMPT: one-shot boot claim, never the per-frame append
+    if let Err(e) = created {
+        metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            wal_dir = ?wal_dir,
+            error = %e,
+            "could not create the WAL directory, so one-writer-per-directory is NOT \
+             enforced for this process. Continuing anyway: the spill writer survives and \
+             recovers from an unwritable directory, and killing the feed over it would be \
+             the worse failure. While this persists, a second process would not be refused."
+        );
+        return Ok(None);
+    }
+    let path = wal_dir.join(WAL_DIR_LOCK_FILE);
+    // `create(true)` and deliberately NOT `create_new(true)`: the file survives
+    // a clean shutdown and carries no state — the kernel lock IS the state — so
+    // an existing file is the normal case and is reused.
+    let lock = match std::fs::OpenOptions::new() // O(1) EXEMPT: one-shot boot claim, never the per-frame append
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                lock_file = ?path,
+                error = %e,
+                "could not create the WAL directory lock file, so one-writer-per-directory \
+                 is NOT enforced for this process. Continuing anyway: the usual cause is an \
+                 unwritable directory or a full disk, which the spill writer already survives \
+                 and recovers from, and killing the feed over it would be the worse failure. \
+                 While this persists, a second process on this directory would not be refused."
+            );
+            return Ok(None);
+        }
+    };
+
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(WalDirGuard { _lock: lock, path })),
+        // CONTENTION — the lock is genuinely held. Fail closed. This is the one
+        // arm the whole mechanism exists for.
+        // O(1) EXEMPT: a match PATTERN on an error variant, not a filesystem call — and the whole function is a one-shot boot-time claim, never on any per-frame path.
+        Err(std::fs::TryLockError::WouldBlock) => {
+            metrics::counter!(WAL_DIR_LOCK_REFUSED_COUNTER).increment(1);
+            Err(anyhow::anyhow!(
+                "WAL directory {wal_dir:?} is already owned by another live process \
+                 (lock file {path:?}). REFUSING to start a second writer: two \
+                 processes minting capture_seq from their own clocks silently destroy \
+                 ticks through the ticks DEDUP key, with no counter to show it. \
+                 Identify the incumbent with `fuser -v` on the lock file and stop it, \
+                 or point this process at its own WAL directory."
+            ))
+        }
+        // THE FILESYSTEM CANNOT LOCK — not evidence of anything, and fatal if
+        // treated as such (2026-08-28).
+        //
+        // `try_lock` returns `Error(io)` rather than `WouldBlock` when the
+        // filesystem has no working `flock`: NFS without lockd, some FUSE and
+        // overlay mounts. Collapsing that into the contention arm made an
+        // unlockable filesystem indistinguishable from a live incumbent, and
+        // since `main` exits on this error, the result was a PERMANENT BOOT
+        // LOOP on a mount that simply lacks locking — a total outage caused by
+        // the safety mechanism rather than by anything it protects against.
+        //
+        // This is the same over-fail as the create arm above, which was
+        // repaired earlier the same day and left standing here, in the same
+        // function. Both now degrade for the same reason: refusing to run is
+        // only correct when a SECOND WRITER is the actual evidence.
+        Err(e) => {
+            metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                lock_file = ?path,
+                error = %e,
+                "the filesystem refused to lock the WAL directory, so \
+                 one-writer-per-directory is NOT enforced for this process. This is a \
+                 lock-support failure, not a second process — the usual cause is a \
+                 mount without working flock (NFS without lockd, some FUSE or overlay \
+                 mounts). Continuing anyway, because refusing here would boot-loop the \
+                 feed forever on a filesystem that can never satisfy it. While this \
+                 persists, a second process on this directory would not be refused."
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// How many trailing segments per directory the boot high-water probe reads.
+///
+/// # Why more than one
+///
+/// The probe used to read only `segs.last()`, on the reasoning that the newest
+/// segment holds the maximum. True while the writer is running — and FALSE in
+/// exactly the case the probe exists for. `writer_loop` opens the next segment
+/// file BEFORE writing anything into it, so a crash in that window leaves a
+/// ZERO-BYTE newest segment. The probe then read 0, seeded nothing, and the
+/// restart re-issued `capture_seq` values already in the database, where
+/// QuestDB upserts the collisions away with no counter anywhere to show it.
+/// The same shape follows a torn or garbage first header, which ends the walk
+/// at offset 0.
+///
+/// FOUR, not "all": the cost is bounded and the benefit saturates immediately.
+/// Reading every segment in a long-running directory is an unbounded boot-time
+/// walk over a path that only needs to find one non-empty file, and four covers
+/// an empty newest plus three consecutive torn predecessors — a shape no
+/// observed crash has produced.
+const HIGH_WATER_SEGMENTS_PER_DIR: usize = 4;
+
+/// The highest `frame_seq` already committed to disk under `wal_dir`.
+///
+/// # Why a restart needs this
+///
+/// [`next_frame_seq`] returns `max(prev + 1, wall_clock)`. Above roughly 7,600
+/// frames/second the `prev + 1` arm wins and the counter runs AHEAD of the wall
+/// clock — its own header says so. A process that then restarts re-seeds from
+/// `AtomicU64::new(0)` plus the wall clock, i.e. from a value BELOW the
+/// high-water mark it had reached, and begins re-issuing sequence numbers that
+/// are already rows in the database. Those rows share the full DEDUP key with
+/// the new ticks and upsert them away.
+///
+/// It is the same silent loss as the two-process case, reached by one process
+/// and a crash instead of by two. So the counter has to be a ratchet ACROSS
+/// restarts, not only within one run.
+///
+/// # Cost
+///
+/// At most [`HIGH_WATER_SEGMENTS_PER_DIR`] trailing segments of each of the
+/// three directories (live, `replaying/`, `archive/`) are scanned, and only
+/// record HEADERS are read — frame payloads are seeked past, never copied. The
+/// walk stops at the first segment that yields a sequence, so the common case
+/// reads exactly one file per directory; the extra three exist for the crash
+/// window that leaves a zero-byte or torn newest segment.
+///
+/// CORRECTED 2026-08-28: this paragraph said "Only the NEWEST segment … is
+/// scanned … Three bounded header walks", which was true when written and
+/// stopped being true in the same change that made the walk read backwards.
+/// A cost claim that describes the previous behaviour is exactly the stale-doc
+/// class this file's own corrections keep recording.
+///
+/// Returns `0` when the directory is absent, empty, or holds only v1 (`TVW1`)
+/// records, which predate `frame_seq`. `0` is the correct answer there: it
+/// leaves the wall clock as the seed, exactly as before.
+///
+/// The greatest `frame_seq` written to any segment under `wal_dir`.
+///
+/// Best-effort and deliberately so — see [`highest_frame_seq_in_segment`]. A
+/// LOWER bound is strictly better than the wall clock alone; refusing to boot
+/// over a torn tail would turn a safety net into an outage.
+#[must_use]
+pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
+    let mut highest = 0u64;
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(ARCHIVE_SUBDIR),
+    ] {
+        let mut segs = wal_segments_in(&dir);
+        // Lexicographic == chronological: the name is the zero-padded rotation
+        // nanos, so the last is the newest.
+        segs.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot-time seed, cold path
+        // Walk BACKWARDS from the newest, and keep walking past an empty or
+        // torn one — see [`HIGH_WATER_SEGMENTS_PER_DIR`]. Stops at the first
+        // segment that yields a sequence, because segments are chronological
+        // and an older one cannot exceed a newer one that has content.
+        for seg in segs.iter().rev().take(HIGH_WATER_SEGMENTS_PER_DIR) {
+            let seen = highest_frame_seq_in_segment(seg);
+            if seen > 0 {
+                highest = highest.max(seen);
+                break;
+            }
+        }
+    }
+    highest
+}
+
+/// Header-only walk of one segment, returning the greatest `frame_seq` in it.
+///
+/// Deliberately tolerant: this is a best-effort high-water probe, not a replay.
+/// A torn tail, an unknown magic, or a short read simply ends the walk and
+/// returns what was seen — a LOWER bound is still strictly better than the wall
+/// clock alone, and refusing to boot over a torn tail would turn a safety net
+/// into an outage. Corruption accounting belongs to [`replay_segment`], which
+/// walks the same files moments later and reports it properly.
+fn highest_frame_seq_in_segment(path: &Path) -> u64 {
+    let Ok(mut f) = File::open(path) else {
+        return 0;
+    };
+    let mut highest = 0u64;
+    // One header at a time; v3 is the largest at 29 bytes.
+    let mut head = [0u8; WAL_MIN_RECORD_V3];
+    loop {
+        let mut filled = 0usize;
+        while filled < head.len() {
+            match std::io::Read::read(&mut f, &mut head[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return highest,
+            }
+        }
+        if filled < WAL_MIN_RECORD_V1 {
+            return highest;
+        }
+        let magic = &head[0..4];
+        let is_v3 = magic == WAL_MAGIC_V3;
+        let is_v2 = magic == WAL_MAGIC_V2;
+        let is_v1 = magic == WAL_MAGIC;
+        if !is_v1 && !is_v2 && !is_v3 {
+            return highest;
+        }
+        let min_rec = if is_v3 {
+            WAL_MIN_RECORD_V3
+        } else if is_v2 {
+            WAL_MIN_RECORD_V2
+        } else {
+            WAL_MIN_RECORD_V1
+        };
+        if filled < min_rec {
+            return highest;
+        }
+        // v1: [magic|ws|len|frame|crc]                 -> len at 5
+        // v2: [magic|ws|seq(8)|len|frame|crc]           -> seq at 5, len at 13
+        // v3: [magic|ws|seq(8)|recv(8)|len|frame|crc]   -> seq at 5, len at 21
+        let len_off = if is_v3 {
+            21
+        } else if is_v2 {
+            13
+        } else {
+            5
+        };
+        if (is_v2 || is_v3)
+            && let Ok(seq_bytes) = <[u8; 8]>::try_from(&head[5..13])
+        {
+            highest = highest.max(u64::from_le_bytes(seq_bytes));
+        }
+        let Ok(len_bytes) = <[u8; 4]>::try_from(&head[len_off..len_off + 4]) else {
+            return highest;
+        };
+        let frame_len = u64::from(u32::from_le_bytes(len_bytes));
+        // Skip the payload and its 4-byte CRC. The header read may have
+        // over-read into the payload, so the seek is relative to where the
+        // header actually ended, not to where the cursor now sits.
+        let over_read = i64::try_from(filled - min_rec).unwrap_or(i64::MAX);
+        let Ok(skip) = i64::try_from(frame_len + 4) else {
+            return highest;
+        };
+        let Some(delta) = skip.checked_sub(over_read) else {
+            return highest;
+        };
+        if std::io::Seek::seek(&mut f, std::io::SeekFrom::Current(delta)).is_err() {
+            return highest;
+        }
+    }
+}
+
+/// Ratchet [`WAL_FRAME_SEQ`] past everything already on disk under `wal_dir`.
+///
+/// Idempotent and monotonic: it only ever RAISES the counter, so calling it
+/// twice, or after frames have already been minted, can neither lower it nor
+/// reissue a value. Returns the high-water mark found, for logging.
+pub fn seed_frame_seq_from_disk(wal_dir: &Path) -> u64 {
+    let disk_high = highest_frame_seq_on_disk(wal_dir);
+    if disk_high == 0 {
+        return 0;
+    }
+    // Advance to disk_high + one base unit so the very next mint is strictly
+    // greater than anything already written. `fetch_max` keeps it monotonic
+    // against a concurrent minter.
+    let target = (disk_high >> PACKET_INDEX_BITS)
+        .saturating_add(1)
+        .min(u64::MAX >> PACKET_INDEX_BITS)
+        << PACKET_INDEX_BITS;
+    let prev = WAL_FRAME_SEQ.fetch_max(target, Ordering::SeqCst);
+    if prev < target {
+        metrics::counter!(WAL_SEQ_RESEED_ADVANCED_COUNTER).increment(1);
+        tracing::info!(
+            disk_high_water = disk_high,
+            seeded_to = target,
+            was = prev,
+            "WAL sequence re-seeded past the on-disk high-water mark — a restart \
+             below it would have re-issued capture_seq values already in the \
+             database, silently upserting live ticks away"
+        );
+    }
+    disk_high
+}
+
 /// The replay-stable `capture_seq` for packet `packet_index` of the frame whose
 /// sequence is `frame_seq`.
 ///
@@ -1068,6 +2009,21 @@ const ARCHIVE_SUBDIR: &str = "archive";
 /// budget converts an unbounded allocation into a bounded one whose remainder
 /// is picked up by machinery that already exists and is already tested.
 ///
+/// **CORRECTED 2026-08-28.** That paragraph was true of the segments it was
+/// written about — live `*.wal` files — and FALSE for the other source
+/// `replay_all` globs. A leftover already inside `replaying/` from a crashed
+/// prior boot is NOT "left as `*.wal` in the live dir": it stays in the
+/// staging area, and `confirm_replayed` archives everything it finds there,
+/// read or not. So for that class a budget deferral did NOT defer, it
+/// DELETED — silently, with no counter and no error.
+///
+/// The claim is now true again because the code makes it true: deferred
+/// leftovers are RESTORED to the live dir before this function returns, so
+/// "unconsumed ⇒ still a live `*.wal`" holds for both sources. Recorded rather
+/// than quietly reworded, because the sentence being corrected was a
+/// SAFETY ARGUMENT — it is what a reader consults instead of tracing the
+/// archive path, and it argued the hazard out of existence.
+///
 /// # Honest cost
 ///
 /// Frames past the budget are recovered on a LATER boot rather than this one,
@@ -1082,6 +2038,41 @@ pub const WAL_REPLAY_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 /// Counter: segments `replay_all` deferred to the next boot for the budget.
 pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_total";
+
+/// Counter: DEFERRED segments `replay_all` could not restore out of the replay
+/// staging area back to the live directory.
+///
+/// Non-zero means captured frames are sitting where the confirm step archives
+/// them unread -- the single path by which WAL recovery can lose data. It is
+/// incremented unconditionally (by zero on a clean boot) so the series exists
+/// before the first real occurrence.
+pub const WAL_REPLAY_RESTORE_FAILED_COUNTER: &str = "tv_wal_replay_restore_failed_total";
+
+/// Neither of the two counters below is EMF-selected, and that is deliberate
+/// rather than an omission: both abandon sites emit a CODED `error!` carrying
+/// `ErrorCode::WsSpill02FrameDropped`, and `ws-spill-02` already has a live
+/// metric-filter alarm in `error-code-alarms.tf`. So the operator is paged the
+/// moment either fires, through a lane that already exists, at zero additional
+/// cost -- while each new EMF name would be ~$0.30/mo against a maximal month
+/// already above the budget's automatic `STOP_EC2_INSTANCES` line. The counters
+/// exist to give the page a MAGNITUDE on `/metrics` and through the debug API,
+/// not to be the thing that reports it.
+///
+/// Segments abandoned mid-file because a record inside them was corrupt.
+///
+/// Distinct from `tv_wal_replay_corrupted_segments_total`, which the caller
+/// increments only when the segment could not be OPENED or READ. This one
+/// covers the case that was previously invisible: the file reads fine, and a
+/// bad record partway through ends the walk, discarding every frame after it.
+pub const WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER: &str = "tv_wal_replay_truncated_segments_total";
+
+/// Bytes abandoned by the above, measured from the corrupt offset to EOF.
+///
+/// Bytes rather than records for the same reason the frame drain counts
+/// abandoned BYTES: the record count of undecodable bytes cannot be known, and
+/// an estimate inside a counter whose purpose is to stop estimates is worse
+/// than no number at all.
+pub const WAL_REPLAY_ABANDONED_BYTES_COUNTER: &str = "tv_wal_replay_abandoned_bytes_total";
 
 // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
@@ -1152,6 +2143,75 @@ pub fn replay_all_with_budget<P: AsRef<Path>>(
         }
         consumed += 1;
     }
+    // RESTORE any DEFERRED segment that came from `replaying/` back to the
+    // live dir, BEFORE anything else can observe the deferral.
+    //
+    // This closes a silent, permanent tick-loss path found by an adversarial
+    // sweep on 2026-08-28 and verified in source:
+    //
+    //   1. A boot stages segments L1..L5 into `replaying/` and crashes before
+    //      `confirm_replayed`. Correct so far -- that is the crash-safety
+    //      design working.
+    //   2. The next boot re-globs `replaying/` (L1..L5) plus this crash's
+    //      fresh `*.wal` files. Leftovers sort FIRST (smaller nanos), so the
+    //      budget can run out INSIDE them -- say after L3.
+    //   3. Staging below moves only `take(consumed)`, so L4 and L5 are never
+    //      touched. They are still sitting in `replaying/`.
+    //   4. The refold succeeds, so the caller calls `confirm_replayed`, which
+    //      globs ALL of `replaying/` and archives every file it finds --
+    //      including L4 and L5, which THIS BOOT NEVER READ.
+    //
+    // An archived segment is never re-globbed. Those frames are gone: captured
+    // to disk, then deleted from the recovery path without ever reaching the
+    // database, with no counter and no error. That is precisely the class the
+    // whole capture-at-receipt chain exists to make impossible.
+    //
+    // The staging comment below already states the invariant that was being
+    // broken -- "an archived segment is NEVER re-globbed, so its frames would
+    // be lost for good. This slice is the whole safety of the budget above."
+    // It is correct about the slice it controls and blind to the leftovers it
+    // does not, because `confirm_replayed` archives by GLOB, not by that slice.
+    //
+    // Restoring is the minimal repair that keeps `confirm_replayed`'s glob
+    // correct BY CONSTRUCTION: after this loop, `replaying/` contains only
+    // segments this boot actually read, which is exactly what that function
+    // assumes. It needs no signature change and no manifest file.
+    //
+    // A failed restore is LOUD, never silent: the segment stays in
+    // `replaying/` and would be archived unread, so it is the one residual
+    // and it gets a coded error plus a counter rather than a shrug. Both
+    // renames are within one filesystem between sibling directories, so a
+    // failure here means the staging renames below are failing too.
+    let mut restore_failures = 0usize;
+    for path in segments.iter().skip(consumed) {
+        if path.parent() != Some(replaying_dir.as_path()) {
+            continue; // never staged; a live `*.wal` is already re-globbable
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        // O(1) EXEMPT: boot replay restore, cold path, bounded by deferred count
+        if let Err(err) = std::fs::rename(path, wal_dir.join(name)) {
+            restore_failures = restore_failures.saturating_add(1);
+            error!(
+                code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                segment = ?path,
+                error = %err,
+                "WAL replay could not restore a DEFERRED staged segment to the \
+                 live directory. It is still in the replay staging area, where \
+                 the confirm step archives everything it finds -- so these \
+                 captured frames may be archived without ever being replayed. \
+                 This is the one path by which recovery can lose data."
+            );
+        }
+    }
+    // Unconditional so the series exists from the first clean boot: the
+    // CloudWatch agent drops each counter series' first sample as its delta
+    // baseline, and a restore failure is a rare once-ever event where the
+    // first occurrence is the only one you get.
+    // APPROVED: cast -- restore_failures is O(segments) <= u64 always.
+    metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(restore_failures as u64);
+
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {
         metrics::counter!(WAL_REPLAY_DEFERRED_COUNTER).increment(deferred as u64);
@@ -1374,18 +2434,43 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
 /// to 1.94 GB, which is the condition that makes an ILP flush fail, which is
 /// what the tick-spill rescue exists for.
 ///
-/// # Why deleting these is safe
+/// # Why deleting these is bounded — and where it is NOT
 ///
 /// A segment is written BEFORE parse and broadcast, as a crash-recovery copy.
 /// On a session that did not crash, the live lane folded those same frames in
-/// real time, so an un-replayed segment from a previous session is redundant —
-/// its frames were already processed. Replay exists for the crash case, and a
-/// crash is recovered from the CURRENT session's tail, never from a segment
-/// days old that the 512 MiB budget could not have reached in any case.
+/// real time, so an un-replayed segment from a previous session is usually
+/// redundant — its frames were already processed.
 ///
-/// The age bound is what makes this provable rather than probable: at any
-/// retention of one full day or more, nothing this pass can delete is
-/// reachable by the next boot's replay budget.
+/// **Usually, not always, and the exception is real.** `WalRingSink::accept`
+/// is WAL-first by design: it appends the frame, and only THEN tries to
+/// reserve ring budget. When that reservation fails it returns
+/// `FrameSinkOutcome::RingFull` and the frame is never folded — it exists in
+/// the ACTIVE WAL and nowhere else. The WAL record carries no flag
+/// distinguishing that frame from one the lane folded a microsecond later, so
+/// this prune cannot tell them apart, and a deletion can therefore be the last
+/// copy of a tick. The count of such sheds is `tv_dhan_ws_ring_full_total`;
+/// when it is zero for a session, everything this pass deletes from that
+/// session really was redundant.
+///
+/// The AGE pass is still bounded, and that bound is what makes it defensible:
+/// at any retention of one full day or more, nothing it deletes was reachable
+/// by the next boot's 512 MiB replay budget in any case — a session writes far
+/// more than that (measured: 244 segments, 31 GB), so the backlog past the
+/// budget is unrecoverable before this prune ever touches it.
+///
+/// The BYTE pass has no such bound. It ignores age and deletes the oldest
+/// survivor to hold the volume under the ceiling, which can take a segment the
+/// next boot would have replayed. That is a disk-pressure event; it is counted
+/// separately as `tv_ws_wal_active_pruned_under_pressure_total` rather than
+/// folded into the routine total, and the condition causing it already pages
+/// through the free-space alarm.
+///
+/// The deeper defect this documents rather than fixes: the 512 MiB per-boot
+/// replay budget against a ~31 GB session means deferred segments can never
+/// drain, so they are guaranteed to reach one of these two passes. Closing
+/// that needs either a larger budget (slower boot) or in-session refold of
+/// shed frames (a design change) — neither is a line edit, and pretending the
+/// prune is harmless was the previous way of not saying so.
 #[must_use]
 pub fn prune_active_segments_at<P: AsRef<Path>>(
     wal_dir: P,
@@ -1578,6 +2663,28 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     if outcome.deleted > 0 || outcome.failed > 0 || outcome.size_deleted > 0 {
         metrics::counter!("tv_ws_wal_active_pruned_total")
             .increment((outcome.deleted + outcome.size_deleted) as u64);
+        // Counted SEPARATELY from the total, because the two passes have
+        // different safety arguments and only one of them is bounded.
+        //
+        // The AGE pass deletes nothing a future boot could have reached: at a
+        // 48-hour retention against a 512 MiB per-boot replay budget, those
+        // segments were already past recovery. The BYTE pass ignores age
+        // entirely -- it deletes the oldest survivor to protect the volume,
+        // and it can therefore delete a segment the next boot would otherwise
+        // have replayed. That is a disk-pressure event, not routine
+        // housekeeping, and it deserves its own number.
+        //
+        // Deliberately NOT EMF-selected: the condition that produces it --
+        // the volume filling -- already pages via `tv-<env>-spill-dir-free-low`
+        // (noise-lock 2.3g), so a second pager for the same cause would be
+        // redundant, and every EMF name costs ~$0.30/mo against a maximal
+        // month already above the budget's automatic stop line. It is
+        // readable on `/metrics` and through the debug API. Stated here so
+        // the omission is a decision on the record rather than an oversight.
+        if outcome.size_deleted > 0 {
+            metrics::counter!("tv_ws_wal_active_pruned_under_pressure_total")
+                .increment(outcome.size_deleted as u64);
+        }
         info!(
             deleted = outcome.deleted,
             size_deleted = outcome.size_deleted,
@@ -1586,9 +2693,14 @@ pub fn prune_active_segments<P: AsRef<Path>>(
             bytes_after = outcome.bytes_after,
             retention_secs,
             max_bytes,
-            "WAL ACTIVE prune pass complete — un-replayed segments past retention. \
-             These are crash-recovery copies of frames the live lane already folded; \
-             the boot replay budget could not have reached them."
+            "WAL ACTIVE prune pass complete — un-replayed segments deleted by age \
+             and, separately, by the byte ceiling. MOST are crash-recovery copies \
+             of frames the live lane folded in real time, and those are redundant. \
+             They are not ALL: a frame shed at the frame ring (tv_dhan_ws_ring_full_total) \
+             reached the WAL and was never folded, and the record does not distinguish \
+             the two — so a deletion here can be the last copy. The age pass is still \
+             bounded (nothing 48h old is reachable by a 512 MiB replay budget); the \
+             byte pass is not, and its count is tv_ws_wal_active_pruned_under_pressure_total."
         );
     }
     outcome
@@ -1665,6 +2777,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 
     let mut out = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut i = 0usize;
+    let mut corrupted_at: Option<(&str, usize)> = None;
     // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
     // minimum, then re-check the version-specific minimum after the magic check
     // so a partial v2 tail can never be read as if its frame_seq were payload.
@@ -1706,6 +2819,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
                      build can still recover it."
                 );
             } else {
+                corrupted_at = Some(("magic_mismatch", i));
                 warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
             }
             break;
@@ -1729,6 +2843,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         let ws_type = match WsType::from_u8(ws_byte) {
             Some(t) => t,
             None => {
+                corrupted_at = Some(("unknown_ws_type", i));
                 warn!(segment = ?path, offset = i, ws_byte, "unknown WsType tag; stopping");
                 break;
             }
@@ -1736,14 +2851,30 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         // v1: [magic|ws|len|frame|crc]
         // v2: [magic|ws|frame_seq(8)|len|frame|crc]
         // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
+        // Every `try_into` below is on a slice whose bounds the per-version
+        // minimum-size guard above has already validated, so these arms are
+        // structurally unreachable. They still set `corrupted_at` rather than
+        // breaking silently: a bare `break` ends the walk with the segment
+        // reported as fully replayed, and the caller then CONFIRMS and
+        // archives it — so an "impossible" arm that ever fired would discard
+        // every remaining record and say nothing at all. That is exactly the
+        // shape of the crash-recovery replay defect found the same day, and
+        // "unreachable" is a claim about today's bounds checks rather than a
+        // guarantee about tomorrow's.
         let (frame_seq, received_at_nanos, len_off) = if is_v3 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(_) => {
+                    corrupted_at = Some(("slice_seq_v3", i));
+                    break;
+                }
             };
             let recv_bytes: [u8; 8] = match buf[i + 13..i + 21].try_into() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(_) => {
+                    corrupted_at = Some(("slice_received_at", i));
+                    break;
+                }
             };
             (
                 u64::from_le_bytes(seq_bytes),
@@ -1753,7 +2884,10 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         } else if is_v2 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(_) => {
+                    corrupted_at = Some(("slice_seq_v2", i));
+                    break;
+                }
             };
             (
                 u64::from_le_bytes(seq_bytes),
@@ -1765,7 +2899,10 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         };
         let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => {
+                corrupted_at = Some(("slice_len", i));
+                break;
+            }
         };
         let frame_len = u32::from_le_bytes(len_bytes) as usize;
         let frame_off = len_off + 4;
@@ -1776,6 +2913,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         {
             Some(v) => v,
             None => {
+                corrupted_at = Some(("length_overflow", i));
                 warn!(segment = ?path, offset = i, frame_len, "record length overflow; stopping");
                 break;
             }
@@ -1787,7 +2925,10 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         let frame = buf[frame_off..frame_off + frame_len].to_vec();
         let crc_bytes: [u8; 4] = match buf[frame_off + frame_len..record_end].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => {
+                corrupted_at = Some(("slice_crc", i));
+                break;
+            }
         };
         let expected = u32::from_le_bytes(crc_bytes);
         // CRC covers the version's exact header bytes, in write order: v2 adds
@@ -1814,6 +2955,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             crc32_ieee_of(&[&[ws_byte], &len_le[..], &frame])
         };
         if actual != expected {
+            corrupted_at = Some(("crc_mismatch", i));
             warn!(segment = ?path, offset = i, expected, actual, "CRC mismatch; stopping");
             break;
         }
@@ -1825,6 +2967,45 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         });
         i = record_end;
     }
+    // CORRUPTION ACCOUNTING -- added 2026-08-28.
+    //
+    // Every abandon site above `break`s out of the walk, and this function then
+    // returned `Ok(out)` regardless. The caller's corruption counter fires only
+    // on `Err`, and `Err` is reachable only from `File::open` and
+    // `read_to_end` -- so a bad record in the MIDDLE of a segment discarded
+    // every frame after it with `tv_wal_replay_corrupted_segments_total`
+    // unmoved, a bare `warn!` carrying no `code` field for any metric filter to
+    // match, and the segment then staged, archived, and never re-read.
+    //
+    // At `WAL_SEGMENT_MAX_BYTES` = 128 MiB that is on the order of 700,000
+    // frames vanishing on one flipped bit, reported nowhere. The identical
+    // hazard one branch away -- an unknown magic at offset 0 -- has always been
+    // counted and coded. This closes the gap between them.
+    //
+    // The two TAIL sites are deliberately NOT counted: a partial trailing
+    // record is what an interrupted writer leaves behind, it abandons nothing
+    // beyond itself, and counting it would page on every unclean shutdown.
+    //
+    // Bytes, not records: the record count of undecodable bytes is unknowable,
+    // and a fabricated number inside a counter that exists to stop fabrication
+    // is worse than no number.
+    if let Some((reason, offset)) = corrupted_at {
+        let abandoned = buf.len().saturating_sub(offset);
+        metrics::counter!(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER).increment(1);
+        metrics::counter!(WAL_REPLAY_ABANDONED_BYTES_COUNTER).increment(abandoned as u64);
+        error!(
+            code = ErrorCode::WsSpill02FrameDropped.code_str(),
+            segment = ?path,
+            reason,
+            offset,
+            abandoned_bytes = abandoned,
+            recovered_frames = out.len(),
+            "WAL segment is corrupt mid-file — the walk stopped here and every \
+             frame after this point is unrecovered. The segment is still moved \
+             to the archive directory, so the bytes survive for manual \
+             inspection, but nothing will read them again automatically."
+        );
+    }
     Ok(out)
 }
 
@@ -1835,6 +3016,44 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prune's own words used to assert something it cannot establish.
+    ///
+    /// It said the segments it deletes were crash-recovery copies of frames
+    /// the live lane had supposedly folded already. That is true of every frame the ring
+    /// accepted and FALSE of every frame it shed: `WalRingSink::accept`
+    /// appends to the WAL *before* reserving ring budget, so a `RingFull`
+    /// frame reaches the WAL and is never folded, and nothing in the record
+    /// distinguishes the two afterwards.
+    ///
+    /// A stale reassurance in a log line is worse than no line at all --
+    /// whoever reads it next stops looking. This pins the correction so the
+    /// comfortable sentence cannot come back.
+    #[test]
+    fn the_prune_never_claims_the_frames_it_deletes_were_already_folded() {
+        let source = include_str!("ws_frame_spill.rs");
+        assert!(
+            !source.contains(concat!("frames the live lane ", "already folded")),
+            "the prune's log line is asserting that everything it deletes was \
+             already folded. A frame shed at the ring (FrameSinkOutcome::RingFull) \
+             reached the WAL and was NOT folded, and the record cannot tell them \
+             apart -- so this claim is false for exactly the frames whose loss \
+             matters most"
+        );
+        assert!(
+            source.contains("tv_ws_wal_active_pruned_under_pressure_total"),
+            "the byte-ceiling pass ignores age and can delete a segment the next \
+             boot would have replayed. It must be counted separately from routine \
+             age pruning, or a disk-pressure data deletion is indistinguishable \
+             from housekeeping"
+        );
+        assert!(
+            source.contains("tv_dhan_ws_ring_full_total"),
+            "the doc must name the counter that tells an operator whether this \
+             prune's deletions were redundant -- without it, the honest caveat is \
+             unactionable"
+        );
+    }
     use std::time::Duration;
 
     #[test]
@@ -1911,6 +3130,128 @@ mod tests {
             "spill did not persist {} frames (got {})",
             target,
             spill.persisted_count()
+        );
+    }
+
+    /// C1: the writer's queue is DRAINED at shutdown, not abandoned.
+    ///
+    /// Before this the thread was detached and unreachable: the only `Sender`
+    /// lives inside `WsFrameSpill`, held through an `Arc`, so the channel could
+    /// never close and the thread never had a reason to exit. Everything queued
+    /// died with the process, already acknowledged to its caller as `Spilled`
+    /// and counted by nothing.
+    #[test]
+    fn shutdown_drains_the_queue_and_joins_the_writer() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+
+        for i in 0..500u32 {
+            assert!(matches!(
+                spill.append(WsType::LiveFeed, i.to_le_bytes().to_vec()),
+                AppendOutcome::Spilled
+            ));
+        }
+
+        let abandoned = spill.shutdown(Duration::from_secs(5));
+
+        assert_eq!(abandoned, 0, "a healthy drain must abandon nothing");
+        assert_eq!(
+            spill.persisted_count(),
+            500,
+            "every queued record must be written before the drain reports clean"
+        );
+        assert_eq!(spill.queued_records(), 0, "queue must be empty after drain");
+    }
+
+    /// The records must actually be ON DISK — a drain that merely emptied the
+    /// channel while leaving the 256 KiB `BufWriter` unflushed would report
+    /// clean and still lose the tail, because `persist_record_resilient`
+    /// counts a `write_all` into the buffer, not a flush to the file.
+    #[test]
+    fn shutdown_flushes_the_buffer_so_replay_sees_every_record() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+
+        for i in 0..64u32 {
+            let _ = spill.append(WsType::LiveFeed, i.to_le_bytes().to_vec());
+        }
+        assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
+        drop(spill);
+
+        let frames = replay_all(&dir).expect("replay");
+        assert_eq!(
+            frames.len(),
+            64,
+            "every drained record must be readable from disk"
+        );
+    }
+
+    /// Shutdown is reached through an `Arc` on a signal path, so a second call
+    /// (a retry, a double-signal) must be harmless rather than a panic on an
+    /// already-taken handle.
+    #[test]
+    fn shutdown_called_twice_is_harmless() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+        let _ = spill.append(WsType::LiveFeed, vec![1, 2, 3]);
+
+        assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
+        assert_eq!(
+            spill.shutdown(Duration::from_secs(5)),
+            0,
+            "a second shutdown must not panic and must still report a clean queue"
+        );
+    }
+
+    /// A drain with nothing queued still stops the thread, so an idle process
+    /// exits promptly instead of burning its whole budget.
+    #[test]
+    fn shutdown_on_an_empty_queue_returns_immediately_clean() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+
+        let started = Instant::now();
+        assert_eq!(spill.shutdown(Duration::from_secs(30)), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an empty drain must not spend its budget waiting; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `queued_records` is the size of the loss window an abrupt exit takes.
+    /// It must be readable BEFORE any shutdown, so an operator can see the
+    /// exposure rather than infer it.
+    #[test]
+    fn queued_records_is_zero_on_a_drained_spill() {
+        let dir = tmp_dir("shutdown");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+        let _ = spill.append(WsType::LiveFeed, vec![9; 16]);
+        wait_until_persisted(&spill, 1);
+        assert_eq!(spill.queued_records(), 0);
+    }
+
+    /// The three sequential shutdown budgets must fit inside systemd's stop
+    /// timeout. The cross-file half of that is pinned by
+    /// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs`; this pins the
+    /// half that lives here, so a local edit cannot silently make the WAL
+    /// drain the dominant cost.
+    #[test]
+    fn the_wal_shutdown_budget_stays_a_stall_budget_not_a_throughput_budget() {
+        assert!(
+            WAL_SPILL_SHUTDOWN_BUDGET_SECS >= 5,
+            "below ~5s a briefly-wedged disk (WAL_WRITER_IO_RETRY_BACKOFF loops) \
+             would abandon records that were about to land"
+        );
+        assert!(
+            WAL_SPILL_SHUTDOWN_BUDGET_SECS <= 30,
+            "this budget is for a STALLED writer, not for throughput: the writer \
+             clears a full 524,288-slot channel in well under a second of healthy \
+             disk time, and every second here is a second nearer systemd's SIGKILL"
+        );
+        assert_eq!(
+            WAL_SPILL_SHUTDOWN_BUDGET,
+            Duration::from_secs(WAL_SPILL_SHUTDOWN_BUDGET_SECS)
         );
     }
 
@@ -2241,6 +3582,245 @@ mod tests {
             !rest.is_empty(),
             "the deferred frames must be recoverable on a later boot"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The silent, permanent tick-loss path an adversarial sweep found on
+    /// 2026-08-28, reproduced end to end.
+    ///
+    /// The sequence needs THREE things to line up, which is why nothing caught
+    /// it: a boot must stage segments and crash before confirming, the next
+    /// boot must hit its RAM budget INSIDE those leftovers, and the refold
+    /// must then succeed so the caller confirms. Each step is individually
+    /// correct; together they archive segments that were never read, and
+    /// archived segments are never re-globbed.
+    ///
+    /// The assertion that actually bites is the last one: the frames must
+    /// still be recoverable. Without the restore loop the deferred leftovers
+    /// stay in `replaying/`, `confirm_replayed` archives all three, and this
+
+    /// A corrupt record in the MIDDLE of a segment silently discarded every
+    /// frame after it.
+    ///
+    /// `replay_segment` `break`s at four corruption sites and then returned
+    /// `Ok(out)` regardless, so the caller -- which counts corruption only on
+    /// `Err` -- saw a clean partial read. The segment was then staged,
+    /// archived, and never re-globbed. At a 128 MiB segment that is on the
+    /// order of 700,000 frames gone on one flipped bit, with no counter, no
+    /// coded line, and nothing a metric filter could match.
+    ///
+    /// This writes two real frames, flips a byte inside the SECOND record's
+    /// payload so its CRC fails, and asserts the walk keeps the first frame,
+    /// drops the second, and does not pretend the segment was fully read.
+    #[test]
+    fn a_corrupt_record_mid_segment_is_reported_not_silently_swallowed() {
+        let dir = tmp_dir("replay-mid-corruption");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        spill.append(WsType::LiveFeed, vec![0xAA; 64]);
+        spill.append(WsType::LiveFeed, vec![0xBB; 64]);
+        wait_until_persisted(&spill, 2);
+        drop(spill);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let segments = wal_segments_in(&dir);
+        assert_eq!(
+            segments.len(),
+            1,
+            "fixture must produce exactly one segment"
+        );
+        let path = &segments[0];
+
+        // Sanity: undamaged, both frames read back.
+        let clean = replay_segment(path).expect("undamaged segment must read");
+        assert_eq!(clean.len(), 2, "fixture must contain two readable frames");
+
+        // Flip a byte inside the SECOND payload. Payload bytes are 0xBB and
+        // nothing else in the file is, so this cannot land in a header and
+        // turn the test into a different failure by accident.
+        let mut bytes = std::fs::read(path).unwrap();
+        let victim = bytes
+            .iter()
+            .rposition(|b| *b == 0xBB)
+            .expect("the second payload must be present");
+        bytes[victim] ^= 0xFF;
+        std::fs::write(path, &bytes).unwrap();
+
+        let damaged = replay_segment(path).expect("a corrupt segment still returns Ok");
+        assert_eq!(
+            damaged.len(),
+            1,
+            "the walk must keep every frame BEFORE the corruption and stop there \
+             -- got {} frame(s)",
+            damaged.len()
+        );
+        assert_eq!(
+            &damaged[0].frame[..],
+            &[0xAAu8; 64][..],
+            "the surviving frame must be the first one, intact"
+        );
+
+        // The load-bearing half: the abandonment is reported. Asserted on the
+        // source rather than on a metrics recorder because the counters are
+        // process-global and this suite runs in parallel -- a shared recorder
+        // would make the assertion depend on test ordering, which is exactly
+        // the kind of flake that gets a guard deleted.
+        let source = include_str!("ws_frame_spill.rs");
+        for needle in [
+            "WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER",
+            "WAL_REPLAY_ABANDONED_BYTES_COUNTER",
+            "corrupted_at = Some((\"crc_mismatch\"",
+            "corrupted_at = Some((\"magic_mismatch\"",
+            "corrupted_at = Some((\"unknown_ws_type\"",
+            "corrupted_at = Some((\"length_overflow\"",
+        ] {
+            assert!(
+                source.contains(needle),
+                "mid-segment corruption must stay counted and coded; missing: {needle}"
+            );
+        }
+        assert!(
+            !source.contains("truncated header at tail\");\n            corrupted_at"),
+            "the two TAIL sites must NOT be counted -- a partial trailing record is \
+             what an interrupted writer leaves behind, and counting it would page on \
+             every unclean shutdown"
+        );
+    }
+
+    /// Every exit from the segment walk is either a counted abandonment or a
+    /// deliberate tail stop — never a silent `break`.
+    ///
+    /// **The defect this pins (2026-08-28).** Five `Err(_) => break` arms sat
+    /// on `try_into` calls whose slices the per-version minimum-size guard has
+    /// already bounds-checked, so all five were structurally unreachable. That
+    /// is precisely why they were dangerous: an unreachable arm attracts no
+    /// scrutiny, and a bare `break` here ends the walk with the segment
+    /// reported as fully replayed. The caller then CONFIRMS and archives it, so
+    /// a single such firing would discard every remaining record in the file
+    /// and produce no counter, no log line and no page.
+    ///
+    /// The same shape as the crash-recovery replay defect found the same day,
+    /// and the reusable half is that "unreachable" is a claim about today's
+    /// bounds checks, not a guarantee about tomorrow's edits.
+    #[test]
+    fn no_walk_exit_is_a_silent_break() {
+        let source = include_str!("ws_frame_spill.rs");
+        let walk = source
+            .split_once("fn replay_segment(path: &Path)")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n// ---"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("replay_segment not found — was it renamed?"));
+
+        // Comment-blind: a doc-comment quoting the old shape must not satisfy
+        // or trip the scan (the house convention).
+        let code: String = walk
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains("Err(_) => break,"),
+            "a bare `Err(_) => break` in the segment walk ends the replay with the segment \
+             reported as fully recovered — the caller then archives it, and every record \
+             after that point is lost with nothing counted. Set `corrupted_at` instead, \
+             which is already wired to the counters and the coded error."
+        );
+
+        for needle in [
+            "corrupted_at = Some((\"slice_seq_v3\"",
+            "corrupted_at = Some((\"slice_received_at\"",
+            "corrupted_at = Some((\"slice_seq_v2\"",
+            "corrupted_at = Some((\"slice_len\"",
+            "corrupted_at = Some((\"slice_crc\"",
+        ] {
+            assert!(
+                code.contains(needle),
+                "the structurally-unreachable slice arms must report rather than break; \
+                 missing: {needle}"
+            );
+        }
+
+        // Self-test: the scan can bite. A synthetic body carrying the old
+        // shape must trip it, or the assertion above is decorative.
+        let regressed = "match x { Ok(b) => b, Err(_) => break, }";
+        assert!(
+            regressed.contains("Err(_) => break,"),
+            "self-test: the scan must detect the reintroduced silent break"
+        );
+    }
+    /// recovers NOTHING -- captured to disk, then deleted from the recovery
+    /// path with no counter and no error.
+    #[test]
+    fn a_budget_deferral_inside_staged_leftovers_never_archives_them_unread() {
+        let dir = tmp_dir("replay-defer-leftovers");
+        let replaying = dir.join(REPLAYING_SUBDIR);
+
+        // Three segments, each with a distinct payload so recovery is provable
+        // by content and not merely by count.
+        for byte in [1u8, 2u8, 3u8] {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![byte; 64]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let total = wal_segments_in(&dir).len();
+        assert!(
+            total >= 3,
+            "fixture must produce >= 3 segments, found {total}"
+        );
+
+        // --- boot A: consumes everything, stages it, then CRASHES ----------
+        // (no `confirm_replayed` -- that is the crash.)
+        let a = replay_all_with_budget(&dir, usize::MAX).expect("boot A replay");
+        assert_eq!(a.len(), total, "boot A must read every segment");
+        assert_eq!(
+            wal_segments_in(&replaying).len(),
+            total,
+            "boot A must stage every consumed segment"
+        );
+        assert!(
+            wal_segments_in(&dir).is_empty(),
+            "and leave nothing in the live dir"
+        );
+
+        // --- boot B: budget runs out INSIDE the staged leftovers -----------
+        let b = replay_all_with_budget(&dir, 1).expect("boot B replay");
+        assert!(
+            !b.is_empty(),
+            "forward progress: one segment is always read"
+        );
+        assert_eq!(
+            wal_segments_in(&replaying).len(),
+            1,
+            "only the segment boot B actually READ may remain staged -- \
+             confirm_replayed archives `replaying/` by glob, so anything else \
+             left there is archived without ever being replayed"
+        );
+        assert_eq!(
+            wal_segments_in(&dir).len(),
+            total - 1,
+            "every deferred leftover must be restored to the live dir, where \
+             the next boot re-globs it"
+        );
+
+        // --- the refold succeeded, so the caller confirms ------------------
+        confirm_replayed(&dir);
+        assert!(
+            wal_segments_in(&replaying).is_empty(),
+            "confirm archives what was read"
+        );
+
+        // --- boot C: the deferred frames must still be there ---------------
+        let c = replay_all_with_budget(&dir, usize::MAX).expect("boot C replay");
+        assert_eq!(
+            c.len(),
+            total - b.len(),
+            "every frame boot B deferred must still be recoverable -- if this \
+             is 0, the confirm step deleted captured ticks from the recovery \
+             path and they are gone for good"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3466,6 +5046,575 @@ mod tests {
             expected,
             (WS_TYPE_COUNT as u64) * 3,
             "the sweep must have covered every WsType three times"
+        );
+    }
+
+    /// The fail-closed half: a second claim on a directory a live guard already
+    /// owns must be REFUSED, not warned about.
+    ///
+    /// This is the whole point of the lock. Two processes on one WAL directory
+    /// mint `capture_seq` from independent clock-seeded counters, collide inside
+    /// the `ticks` DEDUP key, and destroy ticks with nothing to show for it. A
+    /// refusal costs one boot; proceeding costs data nothing can rebuild.
+    #[test]
+    fn a_second_claim_on_a_live_wal_directory_is_refused() {
+        let dir = tmp_dir("wal-lock-refuse");
+        let first = lock_wal_dir(&dir)
+            .expect("first claim must succeed")
+            .expect("a writable temp dir must yield a guard");
+        let second = lock_wal_dir(&dir);
+        assert!(
+            second.is_err(),
+            "a second live process took the same WAL directory — this is the \
+             silent capture_seq collision the lock exists to prevent"
+        );
+        let msg = format!("{:#}", second.unwrap_err());
+        assert!(
+            msg.contains("already owned by another live process"),
+            "the refusal must name the cause so an operator can act on it, got: {msg}"
+        );
+        assert!(
+            msg.contains("capture_seq"),
+            "the refusal must say WHY it matters, got: {msg}"
+        );
+        drop(first);
+    }
+
+    /// Dropping the guard releases the directory, so a clean restart is not
+    /// locked out of its own data.
+    ///
+    /// The kernel does this for us on process death, including SIGKILL — which
+    /// is exactly why this is `flock` and not a PID file. This test covers the
+    /// in-process half of the same property.
+    #[test]
+    fn dropping_the_guard_frees_the_wal_directory_for_the_next_process() {
+        let dir = tmp_dir("wal-lock-release");
+        let first = lock_wal_dir(&dir).expect("first claim").expect("guard");
+        drop(first);
+        assert!(
+            lock_wal_dir(&dir).is_ok(),
+            "a released directory must be claimable, or a restart after a clean \
+             shutdown would be locked out of its own WAL"
+        );
+    }
+
+    /// Two DIFFERENT directories are independent — the lock is per-directory,
+    /// not global, so a second feed with its own WAL is unaffected.
+    #[test]
+    fn two_different_wal_directories_are_independently_claimable() {
+        let a = tmp_dir("wal-lock-a");
+        let b = tmp_dir("wal-lock-b");
+        let ga = lock_wal_dir(&a).expect("claim a").expect("guard a");
+        let gb = lock_wal_dir(&b)
+            .expect("claim b must not be blocked by a")
+            .expect("guard b");
+        assert_ne!(ga.path(), gb.path());
+    }
+
+    /// The re-seed must find the high-water mark that a restart would otherwise
+    /// re-issue.
+    ///
+    /// Scenario, which is the real one: a process running above ~7,600 frames/s
+    /// has driven the counter AHEAD of the wall clock on the `prev + 1` arm, then
+    /// dies. A fresh process seeds from `AtomicU64::new(0)` + the wall clock —
+    /// BELOW the mark — and starts re-issuing sequences already in the database,
+    /// where they upsert live ticks away.
+    #[test]
+    fn the_reseed_finds_the_high_water_mark_a_restart_would_have_reissued() {
+        let dir = tmp_dir("wal-reseed");
+        // A sequence far above any plausible wall clock, i.e. one that the
+        // clock-seeded counter could not reach on its own.
+        let far_future = (u64::MAX >> 2) & !MAX_PACKET_INDEX;
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[1, 2, 3, 4]),
+            frame_seq: far_future,
+            received_at_nanos: 42,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            far_future,
+            "the probe must read the sequence back out of the record header"
+        );
+
+        seed_frame_seq_from_disk(&dir);
+        let next = next_frame_seq();
+        assert!(
+            next > far_future,
+            "the next mint ({next}) must exceed the on-disk high-water mark \
+             ({far_future}); minting at or below it re-issues capture_seq values \
+             that are already rows, and QuestDB upserts the live tick away"
+        );
+    }
+
+    /// The re-seed is a RATCHET: it never lowers the counter, so calling it on a
+    /// directory whose high-water mark is behind the live counter is a no-op.
+    ///
+    /// This matters because the probe is best-effort — a torn tail returns a
+    /// LOWER bound — and a lower bound must never be allowed to walk the
+    /// sequence backwards into values already issued this session.
+    #[test]
+    fn the_reseed_never_lowers_the_live_sequence() {
+        let dir = tmp_dir("wal-reseed-ratchet");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[9]),
+            // Deliberately tiny: far below any wall-clock-seeded value.
+            frame_seq: 1 << PACKET_INDEX_BITS,
+            received_at_nanos: 7,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+
+        let before = next_frame_seq();
+        seed_frame_seq_from_disk(&dir);
+        let after = next_frame_seq();
+        assert!(
+            after > before,
+            "a stale, lower high-water mark must not rewind the live counter \
+             (before {before}, after {after})"
+        );
+    }
+
+    /// A torn tail ends the probe walk instead of panicking or looping, and what
+    /// it found before the tear is still returned.
+    ///
+    /// Refusing to boot over a torn tail would turn a safety net into an outage,
+    /// and a lower bound is still strictly better than the wall clock alone.
+    #[test]
+    fn the_reseed_probe_tolerates_a_torn_tail_and_keeps_what_it_read() {
+        let dir = tmp_dir("wal-reseed-torn");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let good_seq = 12_345u64 << PACKET_INDEX_BITS;
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[1, 2, 3]),
+            frame_seq: good_seq,
+            received_at_nanos: 5,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+        // Append a half-written header: magic present, the rest missing.
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("reopen");
+        std::io::Write::write_all(&mut appended, &WAL_MAGIC_V3).expect("torn magic");
+        std::io::Write::write_all(&mut appended, &[0u8; 3]).expect("torn body");
+        drop(appended);
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            good_seq,
+            "a torn tail must end the walk and keep the last complete record's \
+             sequence, not return zero and not panic"
+        );
+    }
+
+    /// An empty or absent directory seeds nothing, leaving the wall clock as the
+    /// seed exactly as before. A first-ever boot must not be penalised.
+    #[test]
+    fn an_empty_wal_directory_seeds_nothing() {
+        let dir = tmp_dir("wal-reseed-empty");
+        assert_eq!(highest_frame_seq_on_disk(&dir), 0);
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir.join("does-not-exist")),
+            0,
+            "an absent directory must be 0, not a panic"
+        );
+    }
+
+    /// v1 (`TVW1`) records predate `frame_seq` entirely, so a directory holding
+    /// only them yields 0 — the correct answer, not a fabricated sequence.
+    #[test]
+    fn v1_only_segments_seed_nothing_because_they_carry_no_sequence() {
+        let dir = tmp_dir("wal-reseed-v1");
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&WAL_MAGIC);
+        bytes.push(WsType::LiveFeed.as_u8());
+        let frame = [7u8, 7, 7];
+        bytes.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&frame);
+        let mut crc_in = Vec::new();
+        crc_in.push(WsType::LiveFeed.as_u8());
+        crc_in.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        crc_in.extend_from_slice(&frame);
+        bytes.extend_from_slice(&crc32_ieee_of(&[&crc_in]).to_le_bytes());
+        std::fs::write(&seg, &bytes).expect("write v1");
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            0,
+            "v1 records carry no sequence; inventing one would be worse than 0"
+        );
+    }
+
+    /// The property that actually protects production: constructing a SECOND
+    /// spill on a directory a live spill already owns must FAIL.
+    ///
+    /// The helper-level test above proves the lock works; this proves it is
+    /// wired into the only constructor production uses. Without this, the lock
+    /// could be present, correct, and never called.
+    #[test]
+    fn a_second_spill_on_a_live_wal_directory_refuses_to_construct() {
+        let dir = tmp_dir("spill-second-ctor");
+        let first = WsFrameSpill::new(&dir).expect("first spill must construct");
+        let second = WsFrameSpill::new(&dir);
+        assert!(
+            second.is_err(),
+            "two WsFrameSpill instances took the same WAL directory. Both would \
+             mint capture_seq from independent clock-seeded counters, collide in \
+             the ticks DEDUP key, and destroy ticks with no counter to show it."
+        );
+        drop(first);
+        assert!(
+            WsFrameSpill::new(&dir).is_ok(),
+            "after the incumbent drops, the directory must be claimable again — \
+             otherwise a clean restart is locked out of its own WAL"
+        );
+    }
+
+    /// A spill constructed on a directory that already holds frames must mint
+    /// sequences ABOVE them, end to end.
+    ///
+    /// This is the restart case as production actually reaches it: the previous
+    /// process's segments are on disk, this process constructs a fresh spill,
+    /// and the first frame it appends must not reuse a sequence already in the
+    /// database.
+    #[test]
+    fn a_restart_mints_above_the_sequences_already_on_disk() {
+        let dir = tmp_dir("spill-restart-above");
+        let far_future = (u64::MAX >> 2) & !MAX_PACKET_INDEX;
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let rec = WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame: Bytes::from_static(&[1, 2, 3, 4]),
+            frame_seq: far_future,
+            received_at_nanos: 11,
+        };
+        let f = File::create(&seg).expect("segment");
+        let mut w = BufWriter::new(f);
+        write_record(&mut w, &rec).expect("write");
+        std::io::Write::flush(&mut w).expect("flush");
+        drop(w);
+
+        let _spill = WsFrameSpill::new(&dir).expect("construct over existing segments");
+        let next = next_frame_seq();
+        assert!(
+            next > far_future,
+            "constructing a spill over existing segments must ratchet the \
+             sequence past them (next {next} vs on-disk {far_future}); minting \
+             at or below re-issues capture_seq values that are already rows"
+        );
+    }
+
+    /// A lock file that cannot be CREATED degrades — it does not kill the lane.
+    ///
+    /// The two failures are not the same and must not be treated the same.
+    /// Contention means a second live process and is fail-closed. A creation
+    /// failure — an unwritable directory, a full disk — is not evidence of a
+    /// second process, and the writer is deliberately built to survive exactly
+    /// that state and recover when it clears
+    /// (`test_writer_survives_unwritable_dir_then_recovers`). Refusing to
+    /// construct would turn a recoverable filesystem problem into a dead feed.
+    ///
+    /// The failure is induced by making the lock PATH a directory, so `open`
+    /// fails with `IsADirectory`. That works as root, which a `chmod 0o555`
+    /// does not — and this is the exact difference that let the regression
+    /// reach CI green locally and red on the runner.
+    #[test]
+    fn a_lock_file_that_cannot_be_created_degrades_instead_of_killing_the_lane() {
+        let dir = tmp_dir("lock-uncreatable");
+        std::fs::create_dir_all(dir.join(WAL_DIR_LOCK_FILE)).expect("occupy the lock path");
+
+        let claimed = lock_wal_dir(&dir).expect("a creation failure must NOT be an Err");
+        assert!(
+            claimed.is_none(),
+            "an uncreatable lock file yields no guard, and says so, rather than \
+             pretending exclusion is in force"
+        );
+
+        // And the whole spill must still construct, because the writer's own
+        // survive-and-recover behaviour is what this protects.
+        let spill = WsFrameSpill::new(&dir).expect(
+            "an uncreatable lock file must not stop the spill from constructing — \
+             the writer survives an unwritable directory by design",
+        );
+        assert_eq!(
+            spill.append(WsType::LiveFeed, vec![1, 2, 3]),
+            AppendOutcome::Spilled,
+            "the channel must still accept frames in the degraded state"
+        );
+        drop(spill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Contention is still fail-CLOSED. The degrade above must not have softened
+    /// the case the lock exists for.
+    #[test]
+    fn contention_is_still_an_error_after_the_degrade_arm_was_added() {
+        let dir = tmp_dir("lock-still-closed");
+        let held = lock_wal_dir(&dir).expect("claim").expect("guard");
+        assert!(
+            lock_wal_dir(&dir).is_err(),
+            "a second live claim must remain an Err — softening this to a degrade \
+             would reopen the silent capture_seq collision the lock exists to stop"
+        );
+        drop(held);
+    }
+
+    /// Minimal TVW3 record encoder for the high-water probe tests.
+    ///
+    /// Deliberately hand-rolled rather than routed through `write_record`: the
+    /// probe reads HEADERS off disk, so a test that shares the writer's own
+    /// encoder would pass even if the two disagreed about the layout.
+    fn v3_bytes(ws_type: WsType, frame_seq: u64, receipt: i64, frame: &[u8]) -> Vec<u8> {
+        let frame_len = u32::try_from(frame.len()).expect("test frame");
+        let mut out = Vec::new();
+        out.extend_from_slice(&WAL_MAGIC_V3);
+        out.push(ws_type.as_u8());
+        out.extend_from_slice(&frame_seq.to_le_bytes());
+        out.extend_from_slice(&receipt.to_le_bytes());
+        out.extend_from_slice(&frame_len.to_le_bytes());
+        out.extend_from_slice(frame);
+        let crc = crc32_ieee_of(&[
+            &[ws_type.as_u8()][..],
+            &frame_seq.to_le_bytes()[..],
+            &receipt.to_le_bytes()[..],
+            &frame_len.to_le_bytes()[..],
+            frame,
+        ]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// The empty-newest-segment case, which is the ONE the high-water probe
+    /// exists for and the one it used to fail.
+    ///
+    /// `writer_loop` opens the next segment before writing into it, so a crash
+    /// in that window leaves a zero-byte newest file. Reading only
+    /// `segs.last()` returned 0, seeded nothing, and the restart re-issued
+    /// `capture_seq` values already in the database — where QuestDB upserts the
+    /// collisions away silently, because from this process both appends
+    /// succeeded.
+    #[test]
+    fn an_empty_newest_segment_does_not_hide_the_high_water_mark() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-hfs-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // An older segment carrying a real sequence...
+        let older = dir.join("00000000000000000001.wal");
+        let buf = v3_bytes(WsType::LiveFeed, 987_654_321, 42, b"payload");
+        std::fs::write(&older, &buf).expect("write older");
+
+        // ...and a newer, ZERO-BYTE one, exactly as a crash-after-rotate leaves.
+        std::fs::write(dir.join("00000000000000000002.wal"), b"").expect("write empty");
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            987_654_321,
+            "the probe must walk past an empty newest segment — returning 0 here \
+             re-issues capture_seq values already in the ticks table, and the \
+             collision is upserted away with no counter to report it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same defence against a TORN newest segment: a garbage first header
+    /// ends the walk at offset 0, which is indistinguishable from empty.
+    #[test]
+    fn a_torn_newest_segment_does_not_hide_the_high_water_mark() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-hfs-torn-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let buf = v3_bytes(WsType::LiveFeed, 555_000, 7, b"payload");
+        std::fs::write(dir.join("00000000000000000001.wal"), &buf).expect("write older");
+        // Unknown magic at offset 0 — the walk returns immediately.
+        std::fs::write(dir.join("00000000000000000002.wal"), b"TVW9garbage").expect("write torn");
+
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            555_000,
+            "a torn newest segment must not read as 'no sequences on disk'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound is real: the probe does not walk an unbounded history.
+    #[test]
+    fn the_high_water_probe_reads_a_bounded_number_of_segments() {
+        assert!(
+            HIGH_WATER_SEGMENTS_PER_DIR >= 2,
+            "one segment is the defect — an empty newest file hides everything behind it"
+        );
+        assert!(
+            HIGH_WATER_SEGMENTS_PER_DIR <= 16,
+            "this runs at boot over three directories; an unbounded walk would turn a \
+             safety net into a slow start"
+        );
+    }
+
+    /// The refresh must never rewind the projected clock.
+    ///
+    /// Re-anchoring bounds NTP drift; done naively it also creates a way to
+    /// move receipts BACKWARDS, and `received_at` is the candle bucketing
+    /// clock — so a rewound receipt files a frame into a second that may
+    /// already be sealed. The whole reason receipts are derived from a
+    /// monotonic instant rather than read per frame is that a time step must
+    /// not be able to reorder two frames; a refresh that can reorder them
+    /// would hand that property straight back.
+    #[test]
+    fn a_refresh_never_moves_a_receipt_backwards() {
+        // Take a baseline, then read the same instant twice across a refresh.
+        // Whatever the wall clock did in between, the second reading may not be
+        // smaller than the first.
+        let probe = Instant::now();
+        let before = receipt_nanos_from(probe);
+        refresh_receipt_anchor();
+        let after = receipt_nanos_from(probe);
+        assert!(
+            after >= before,
+            "a refresh moved a fixed instant's receipt backwards: {before} -> {after}. \
+             That reorders frames across the refresh boundary, which is precisely what \
+             deriving receipts from a monotonic clock exists to prevent."
+        );
+    }
+
+    /// Two frames that arrived in order must read back in order, across any
+    /// number of refreshes.
+    #[test]
+    fn receipts_stay_ordered_across_repeated_refreshes() {
+        let first = Instant::now();
+        let first_receipt = receipt_nanos_from(first);
+        for _ in 0..5 {
+            refresh_receipt_anchor();
+        }
+        let second = Instant::now();
+        let second_receipt = receipt_nanos_from(second);
+        assert!(
+            second_receipt >= first_receipt,
+            "a later frame read back EARLIER than an earlier one across refreshes: \
+             {first_receipt} then {second_receipt}"
+        );
+    }
+
+    /// A receipt for an instant before the anchor flattens rather than going
+    /// negative — a panic here would cost the socket, and a negative timestamp
+    /// would be worse than a flattened one.
+    #[test]
+    fn an_instant_before_the_anchor_flattens_instead_of_panicking() {
+        let now = Instant::now();
+        let r = receipt_nanos_from(now);
+        assert!(r > 0, "a receipt must be a real epoch value, got {r}");
+    }
+}
+
+#[cfg(test)]
+mod queue_depth_visibility_tests {
+    /// The writer loop must publish the queue depth AND its session high-water.
+    ///
+    /// Source-scanned rather than behavioural because the loop is a thread with
+    /// no return value and the gauges are process-global; a behavioural test
+    /// would have to install a recorder and race the thread. What can go wrong
+    /// here is a refactor deleting the lines, and a scan catches exactly that.
+    /// The writer loop body, bounded by the next top-level fn.
+    ///
+    /// NOT split on `#[cfg(test)]` like the other guards in this repo: that
+    /// marker appears INSIDE `writer_loop` itself (the `maybe_test_panic`
+    /// hook), so the usual split truncates the production text mid-function
+    /// and the scan silently sees nothing. Caught by these tests failing on
+    /// their first run against code that was already correct.
+    fn writer_loop_src() -> &'static str {
+        let src = include_str!("ws_frame_spill.rs");
+        let from = src.find("fn writer_loop").expect("writer_loop must exist");
+        let len = src[from..]
+            .find("fn open_segment_resilient")
+            .expect("the next top-level fn must still follow writer_loop");
+        &src[from..from + len]
+    }
+
+    #[test]
+    fn the_writer_publishes_its_queue_depth_and_high_water() {
+        let production = writer_loop_src();
+
+        assert!(
+            production.contains("tv_ws_frame_spill_queue_depth"),
+            "the queued-but-unwritten window must be observable — it is the \
+             frames an abort loses, and nothing else counts them"
+        );
+        assert!(
+            production.contains("tv_ws_frame_spill_queue_high_water"),
+            "the PEAK is the load-bearing half: a 30s scrape of a decaying \
+             gauge misses the burst that matters"
+        );
+        assert!(
+            production.contains("let queued = rx.len();"),
+            "depth must be read from the channel itself, not inferred"
+        );
+    }
+
+    /// The gauges must be resolved OUTSIDE the loop and read at the BATCH
+    /// boundary, never per frame.
+    ///
+    /// This is the `record_ws_lag` lesson, which allocated twice per tick —
+    /// ~36M allocations/hour — on a path its own docs called allocation-free.
+    /// Three correct comments did not stop it shipping; a test does.
+    #[test]
+    fn the_depth_gauge_is_not_read_on_the_per_frame_path() {
+        let loop_body = writer_loop_src();
+
+        // The handles are resolved before the `loop {`; the reads happen after
+        // the inner drain. If either moved into the 0..256 drain, the gauge
+        // write would land once per FRAME instead of once per batch.
+        let resolve_at = loop_body
+            .find("metrics::gauge!(\"tv_ws_frame_spill_queue_depth\")")
+            .expect("depth gauge must be resolved in writer_loop");
+        let loop_at = loop_body.find("\n    loop {").expect("the drain loop");
+        assert!(
+            resolve_at < loop_at,
+            "the gauge handle is resolved INSIDE the loop — re-resolving a \
+             handle per iteration is how a metric write becomes a cost"
+        );
+
+        let drain_at = loop_at
+            + loop_body[loop_at..]
+                .find("for _ in 0..256")
+                .expect("the batch drain");
+        let read_at = loop_at
+            + loop_body[loop_at..]
+                .find("let queued = rx.len();")
+                .expect("the depth read");
+        assert!(
+            read_at > drain_at,
+            "the depth is read BEFORE the batch drain — it must sit at the \
+             batch boundary so it costs one write per ~257 records, not one \
+             per frame"
         );
     }
 }

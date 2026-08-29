@@ -287,3 +287,225 @@ fn every_lost_seal_path_fires_aggregator_drop_01() {
          event when thousands were lost"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The escalation offload (2026-08-28)
+//
+// The escalation itself was already correct — a refused seal reached disk
+// instead of a counter. What it did NOT do was reach disk somewhere other
+// than the frame-drain task. All three `escalate_refused_seal` call sites run
+// on the drain (the per-tick fold, the 5-second catch-up sweep, and the close
+// force-seal), so every escalation charged that thread a spill-writer mutex
+// plus a `write(2)` — and on spill failure a `create_dir_all`, an `open`, a
+// `serde_json::to_string` HEAP ALLOCATION and four more syscalls.
+//
+// The drain is the only thread emptying the socket, and Dhan skips a slow
+// consumer forward to "the latest available state" with no sequence number.
+// So a stalled drain does not merely delay a candle: it loses ticks UPSTREAM,
+// where no counter of ours can see them.
+//
+// The behaviour lives in `seal_writer_runner`'s unit tests, which drive a real
+// thread over real tempdirs. These scans cover the half those cannot: that
+// boot actually splits the offload, spawns a thread for it, and that shutdown
+// can still reach that thread. A refactor that dropped any one of the three
+// would leave every behavioural test green while the drain quietly went back
+// to writing to disk itself.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn boot_splits_the_escalation_offload_and_spawns_its_thread() {
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    assert!(
+        main.contains("split_escalation_offload()"),
+        "boot must split the escalation offload — without it `SealOverflow::escalate` writes \
+         to disk INLINE on whatever task called it, which for all three call sites is the \
+         frame drain"
+    );
+    assert!(
+        main.contains("tv-seal-escalate"),
+        "the escalation thread must be NAMED — an unnamed thread is invisible in a `top -H` \
+         when the operator is trying to find what is stalling the drain"
+    );
+    assert!(
+        squash(&main).contains("sink.run("),
+        "the split sink must actually be driven by a thread; splitting it and never running \
+         it fills a bounded queue and then falls back inline forever"
+    );
+}
+
+#[test]
+fn the_escalation_thread_is_reachable_from_shutdown() {
+    // The exact defect the WAL spill writer carried until the same day: a
+    // spawned thread whose handle is discarded and whose stop flag nothing
+    // holds cannot be drained at exit, so the queue dies with the process and
+    // no counter reports it.
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    for needle in [
+        "SEAL_ESCALATION_STOP",
+        "SEAL_ESCALATION_THREAD",
+        "SEAL_ESCALATION_SHUTDOWN_BUDGET",
+        "stop_flag()",
+    ] {
+        assert!(
+            main.contains(needle),
+            "{needle} missing — the escalation thread's shutdown drain is unreachable, so \
+             every seal still queued at exit is lost silently"
+        );
+    }
+    assert!(
+        main.contains("SEAL_ESCALATION_ABANDONED_COUNTER"),
+        "a drain that runs out of budget must COUNT what it abandoned; an unreported \
+         abandonment is the false-OK this whole shutdown path was rebuilt to stop producing"
+    );
+}
+
+#[test]
+fn a_refused_handoff_falls_back_inline_rather_than_dropping() {
+    // `Full` and `Disconnected` both still hold the seal, so both must take
+    // the old inline route. A `_ =>` arm that discarded here would reintroduce
+    // the 2026-08-19 defect one layer further in, where the source scans above
+    // (which watch `dhan_feed_stack`) cannot see it.
+    let runner = strip_line_comments(&read("crates/storage/src/seal_writer_runner.rs"));
+    let code = squash(&runner);
+    assert!(
+        code.contains(
+            "TrySendError::Full(item) | std::sync::mpsc::TrySendError::Disconnected(item)"
+        ) || code.contains(
+            "TrySendError::Full(item)| std::sync::mpsc::TrySendError::Disconnected(item)"
+        ),
+        "both refusal arms must be handled together and must keep the item — a discard here \
+         is a silent seal loss that no `dhan_feed_stack` scan can reach"
+    );
+    assert!(
+        code.contains("SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1)"),
+        "the inline fallback must be counted, or a permanently-behind escalation thread looks \
+         identical to a healthy one"
+    );
+}
+
+#[test]
+fn the_deferred_loss_still_pages() {
+    // The caller is told `Queued`, so the AGGREGATOR-DROP-01 page for a seal
+    // both disk tiers refuse can ONLY come from the escalation thread. If the
+    // callback were dropped, a genuinely lost candle would page nobody —
+    // strictly worse than the inline version this replaced.
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    let code = squash(&main);
+    assert!(
+        code.contains("sink.run(|seal| {") || code.contains("sink.run(|seal|{"),
+        "the escalation thread must pass an on_lost hook, not one that ignores the seal"
+    );
+    assert!(
+        main.contains("SealLossReason::BothDiskTiersFailed"),
+        "the on_lost hook must fire the both-tiers-failed page from the thread"
+    );
+    let stack = strip_line_comments(&read("crates/app/src/dhan_feed_stack.rs"));
+    assert!(
+        stack.contains("OverflowOutcome::Queued"),
+        "the caller must handle the Queued outcome explicitly — a wildcard arm would let a \
+         future outcome variant silently classify as a loss, or as a rescue"
+    );
+}
+
+#[test]
+fn guard_self_test_offload_scans_can_bite() {
+    // Every assertion above is a substring scan, so each is worthless if the
+    // needle it looks for could never be absent. Prove the shapes on synthetic
+    // sources rather than trusting the real ones.
+    let without = "let overflow = runner.overflow();";
+    assert!(
+        !without.contains("split_escalation_offload()"),
+        "self-test: a boot that does NOT split the offload must fail the scan"
+    );
+    let discarding = squash("Err(_) => { dropped += 1; }");
+    assert!(
+        !discarding.contains("SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1)"),
+        "self-test: a discarding refusal arm must fail the fallback scan"
+    );
+    let silent = squash("sink.run(|_| {});");
+    assert!(
+        !silent.contains("sink.run(|seal| {"),
+        "self-test: an on_lost hook that ignores the seal must fail the paging scan"
+    );
+}
+
+#[test]
+fn the_escalation_spawn_is_idempotent_like_its_two_neighbours() {
+    // `spawn_seal_writer_loop` installs three things in sequence — the seal
+    // sender, the overflow escalator, and (since 2026-08-28) the escalation
+    // thread. The first two are each written to survive a second entry with
+    // an "idempotent skip" warn. The third was not, and that asymmetry is the
+    // defect: unguarded, a second entry spawns a SECOND thread, overwrites
+    // SEAL_ESCALATION_THREAD, and orphans the FIRST — whose stop flag is
+    // unreachable, because the OnceLock already holds the first one. Shutdown
+    // would then signal a thread it never joins and join a thread it never
+    // signalled, and whatever the orphan still held would die with the
+    // process, uncounted.
+    //
+    // Not reachable today (one production call site), which is exactly why it
+    // needs a guard rather than a comment: the thing that makes it
+    // unreachable is a fact about a caller, not about this code.
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    let code = squash(&main);
+    assert!(
+        code.contains("if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {"),
+        "the escalation spawn must be gated on the OnceLock set succeeding — an ignored \
+         `let _ = ...set(...)` spawns an unstoppable orphan on a second entry"
+    );
+    assert!(
+        code.contains("drop(sink);"),
+        "the already-installed arm must DROP the sink, which disconnects the new sender so \
+         that overflow escalates inline — the documented lossless fallback. Leaving the sink \
+         alive would queue into a channel no thread is draining."
+    );
+
+    // Self-test: the scan can bite.
+    let ignored = squash("let _ = SEAL_ESCALATION_STOP.set(sink.stop_flag());");
+    assert!(
+        !ignored.contains("if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {"),
+        "self-test: an ignored set() must fail the scan"
+    );
+}
+
+/// The cancel install is the FOURTH thing `spawn_seal_writer_loop` installs,
+/// and it was the one still ignoring its result — three days after the guard
+/// above was written about exactly this asymmetry.
+///
+/// `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` looks like a discarded unit. It
+/// is a discarded SENDER: `OnceLock::set` hands the value back in `Err`, so on
+/// a second entry the `let _` dropped the only sender for the `cancel_rx` that
+/// was about to be moved into the spawn. A seal-writer loop whose cancel
+/// channel is closed is the one shape that loop cannot survive — pre-fix it
+/// spun a core forever and drained nothing (see
+/// `seal_writer_loop::a_dropped_cancel_sender_ends_the_loop_instead_of_spinning`).
+///
+/// Compounding it: the spawn also overwrote `SEAL_WRITER_HANDLE`, so shutdown
+/// would join the new task and leave the REAL writer unsignalled — no final
+/// drain, and the session's closing candles die with the runtime.
+#[test]
+fn the_cancel_install_is_gated_like_its_three_neighbours() {
+    let main = strip_line_comments(&read("crates/app/src/main.rs"));
+    let code = squash(&main);
+    assert!(
+        code.contains("if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {"),
+        "the cancel install must be gated on set() succeeding — an ignored \
+         `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` drops the sender and spawns a loop \
+         that can never be cancelled"
+    );
+    assert!(
+        !code.contains("let _ = SEAL_WRITER_CANCEL.set("),
+        "the ignoring form must not come back"
+    );
+    assert!(
+        code.contains("drop(cancel_rx);"),
+        "the already-installed arm must drop the receiver and NOT spawn — a second loop \
+         sharing one runner's work is not the fallback, skipping is"
+    );
+
+    // Self-test: the scan can bite.
+    let ignored = squash("let _ = SEAL_WRITER_CANCEL.set(cancel_tx);");
+    assert!(
+        !ignored.contains("if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {"),
+        "self-test: an ignored set() must fail the scan"
+    );
+}

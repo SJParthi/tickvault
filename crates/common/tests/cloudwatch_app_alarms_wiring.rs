@@ -949,11 +949,199 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // (Aug MTD $48.87), but the gap is now the widest it has been. Full
     // reasoning and the two levers: dhan-rest-only-noise-lock-2026-07-14.md
     // section 2.3j.
+    // 2026-08-28 (SECOND, same day): 89 -> 92. Three more loss counters, all
+    // named by a full drop-path trace and all MEASURED on the live box the
+    // same afternoon:
+    //
+    //   tv_candle_tick_discarded_late_total   51,227,651
+    //   tv_aggregator_slot_exhausted_total             0
+    //   tv_dhan_feed_abandoned_bytes_total             -
+    //
+    // The first is LARGER than the session's entire ingested tick count
+    // (20,982,560), because it increments once per TIMEFRAME inside the 24-TF
+    // fold loop -- roughly 10% of all cell-folds, each one a bar missing a
+    // trade it should have carried. Its own emit-site comment records that it
+    // had ZERO production readers until 2026-08-26; it had no CloudWatch route
+    // until now.
+    //
+    // Slot exhaustion reads 0 today, and that is exactly why it ships:
+    // AGGREGATOR_MAX_SLOTS is 25,000 against an authorized ~24,600, and the
+    // per-minute at-the-money re-fit ADDS instruments while nothing ever
+    // reclaims a slot. The first non-zero reading means candles have silently
+    // stopped for every new instrument past the line -- and 0 is the only
+    // baseline that makes that step visible.
+    //
+    // Abandoned bytes are the undecodable remainder of a frame the walk gave
+    // up on. Refusing to resynchronise on a guess is right (fabricating ticks
+    // is worse), but the bytes are gone and nothing counted them where an
+    // operator looks.
+    //
+    // All three are CHARTED and NONE is alarmed. Two have no baseline for what
+    // normal looks like, and inventing a threshold would be the false page
+    // this file keeps retiring. Charted first; thresholded once there is data
+    // to threshold against.
+    //
+    // +$0.90/mo, no user-data byte. Maximal-month projection ~$120.58 ->
+    // ~$121.48 against the automatic STOP_EC2_INSTANCES line at $117.00. The
+    // live account is far below it (Aug MTD $48.87), and the gap is the widest
+    // it has been -- stated rather than absorbed. Levers unchanged: the
+    // already-approved Elastic IP release (-$3.60/mo) alone puts the maximal
+    // month back under the line.
+    // 2026-08-28 (THIRD, same day): 92 -> 93, tv_seal_writer_drain_dropped_total.
+    //
+    // `tv-<env>-seal-writer-dropped` exists to be the METRIC-side pager for a
+    // sealed candle lost after ring + spill + DLQ all failed -- redundant with
+    // the errcode-aggregator-drop-01 log-filter alarm precisely so the loss
+    // still pages when one shipping leg is degraded (the 2026-07-06 class).
+    // Its `metric_name` field named `tv_seal_writer_drain_dropped_total`, a
+    // name with ZERO producers anywhere in the workspace, while its own
+    // alarm_description said it read `tv_seal_writer_drain_total kind=dropped`.
+    // The description and the field disagreed; AWS reads the field. So the
+    // redundancy it promised was never wired, and the alarm has been
+    // permanently green since it shipped.
+    //
+    // Repointing the alarm at the labelled counter would have been WORSE than
+    // leaving it dead: EMF folds label values into one summed series, so
+    // `tv_seal_writer_drain_total` is submitted + flushed_rows + rescued_spill
+    // + rescued_dlq + dropped -- dominated by successes, and a `>= 1` threshold
+    // on it would fire every healthy cycle. The drop needed its own unlabelled
+    // name to be visible at all, and now has one.
+    //
+    // ⚠ WHY THIS GUARD DID NOT CATCH IT, recorded because the hole outlives the
+    // fix. `test_every_alarm_metric_has_a_rust_emit_site` reads exactly TWO
+    // terraform files -- app-alarms.tf and silent-feed-alarms.tf -- while
+    // alarms live across roughly twenty. `seal-drop-alarm.tf` was never
+    // scanned. That is the same one-file/one-prefix scope hole the dashboard
+    // visibility guard was widened for days earlier: a guard that checks a
+    // SUBSET reads exactly like a guard that checks everything.
+    //
+    // Widening it to glob every `*.tf` was ATTEMPTED in this change and backed
+    // out, because it surfaces a genuine second-order problem rather than a
+    // list of real defects: many alarm metrics correctly have no Rust emit site
+    // (terraform mints them from log metric filters via
+    // `metric_transformation`), and `is_metric_emitted` additionally matches
+    // only STRING LITERALS inside a `counter!` call, so any metric emitted
+    // through a `const &str` reads as missing. Deriving the first is clean;
+    // resolving the second needs constant resolution, not a string scan. Both
+    // belong in a change of their own -- wedging them in here would have meant
+    // shipping either a red build or a broad allowlist, and an allowlist is how
+    // a guard stops guarding.
+    //
+    // +$0.30/mo. Maximal-month projection ~$121.48 -> ~$121.78 against the
+    // automatic STOP_EC2_INSTANCES line at $117.00. Same two levers, unchanged.
+    //
+    // 2026-08-28 (FOURTH): 93 -> 95, tv_depth_rows_spilled_total +
+    // tv_depth_spill_write_errors_total. `tv_depth_rows_dropped_total` is
+    // shipped AND alarmed (leg m3 of market-data-persistence-loss), and it
+    // increments on BOTH branches of `discard_pending`: at
+    // depth_persistence.rs:964 when the buffer was successfully RESCUED to the
+    // spill file, and at :991 when the rescue FAILED and the rows are
+    // permanently gone. Same series, same alarm, opposite meanings.
+    //
+    // So an operator paged by that alarm could not tell a survivable spill
+    // event from real depth data loss -- on the table whose own header
+    // measures 1.5 billion rows a session, 24x the tick volume. The tick side
+    // has exactly the same conflation and is FINE, because both of its
+    // discriminators ship: "gone forever" is `dropped - spilled`, derivable.
+    // Depth's two discriminators shipped nowhere, so the same subtraction was
+    // impossible.
+    //
+    // These two names make it possible. No new alarm: the existing loss alarm
+    // is the pager, and these are what turn its page into a diagnosis.
+    //
+    // +$0.60/mo. Maximal-month projection ~$121.78 -> ~$122.38 against the
+    // automatic STOP_EC2_INSTANCES line at $117.00. Same two levers, unchanged:
+    // the already-approved Quote 10 Elastic IP release (-$3.60/mo, which alone
+    // returns the maximal month to under the line), or an operator decision on
+    // limit_amount.
+    //
+    // 2026-08-28 (SEVENTH): 98 -> 99, tv_offload_writer_shutdown_incomplete_total.
+    //
+    // The lane joins TWO writer threads at shutdown. Either join can time out,
+    // and when it does the thread is deliberately detached rather than joined
+    // -- joining after a timeout is the unbounded wait the grace exists to
+    // avoid. The batches that thread held then die with the process: up to the
+    // queue depth plus the one in flight, which at the depth writer's row
+    // threshold is roughly 50,000 rows.
+    //
+    // No counter moved. tv_ticks_dropped_total and tv_depth_rows_dropped_total
+    // are incremented by the WRITER THREAD on rows it actually refused, and a
+    // thread that never ran its drain increments neither. So the largest single
+    // loss the shutdown path can produce was reported by free text in a log and
+    // by nothing an alarm could read.
+    //
+    // An EPISODE counter, deliberately not a row count: the queue belongs to a
+    // thread we have just given up on and the batch row counts were consumed
+    // when they were sent, so any number here would be invented -- a fabricated
+    // figure inside the one class of metric whose purpose is to stop
+    // fabrication.
+    //
+    // Authorized by dhan-rest-only-noise-lock-2026-07-14.md §2.3n.
+    // +$0.30/mo + 1 alarm $0.10 = +$0.40. Maximal month ~$123.48 -> ~$123.88
+    // against the automatic STOP_EC2_INSTANCES line at $117.00 and the
+    // operator's $125 hard cap (Quote 18) -- now under $1.20 of room. The next
+    // addition of any size must come with a LEVER, not just a cost note. Same
+    // two levers, unchanged: the already-approved Quote 10 Elastic IP release
+    // (-$3.60/mo, which alone returns the maximal month to under both lines),
+    // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        89,
-        "Z+ L2 VERIFY ratchet: expected exactly 89 names in the MAIN EMF \
-         (2026-08-28: 88 -> 89, tv_aggregator_tick_refused_total. The whole \
+        103,
+        "Z+ L2 VERIFY ratchet: expected exactly 103 names in the MAIN EMF \
+         (2026-08-29 NINTH: 104 -> 103, a REMOVAL and the first LEVER this \
+         ratchet has been given rather than another cost note. \
+         tv_subsystem_memory_estimated_bytes came off the list because \
+         `cloudwatch list-metrics` returns [] for it: the series has never \
+         existed in the account. Every one of its six per-component gauges is \
+         initialised to f64::NAN by design and is written ONLY by a closure \
+         handed to SubsystemMemorySampler::register_source, which has ZERO \
+         production call sites -- the two it had died with the \
+         TickStorage/PrevDayCache sweep on 2026-07-19. NaN is correctly \
+         dropped by the agent, so the name was structurally incapable of \
+         publishing while still being billed and charted. Process memory is \
+         unaffected and still charted live via tv_process_rss_bytes. \
+         -$0.30/mo: maximal month ~$124.98 -> ~$124.68, still ~$7.68 above \
+         the automatic STOP_EC2_INSTANCES line at $117 and under the $150 \
+         hard cap. Pairing enforced by subsystem_memory_emf_guard.rs -- wire \
+         a real source and the name may return with its own cost note. \
+         (2026-08-29 EIGHTH: 99 -> 104, the five seal-escalation/spill counters. \
+         The producer-side durable tier for sealed candles was moved off the \
+         frame drain on 2026-08-28 and NONE of its counters reached CloudWatch, \
+         so the tier could degrade or fail silently. tv_seal_escalation_inline_\
+         fallback_total is the one that matters most: non-zero means the offload \
+         STOPPED APPLYING and disk writes are back on the drain -- the exact \
+         regression the offload exists to prevent, previously invisible. \
+         +$1.50/mo, maximal month ~$123.48 -> ~$124.98. HONEST: that is ~$8 \
+         ABOVE the automatic STOP_EC2_INSTANCES line at $117 (90%% of the $130 \
+         limit_amount), though still under the operator hard cap of $150 raised \
+         2026-08-25. The live account is far below both (Aug MTD $48.87). The \
+         already-approved Elastic IP release (-$3.60/mo) alone puts the maximal \
+         month back under the stop line; limit_amount is NOT changed here -- \
+         that is a three-site lockstep needing its own dated quote. \
+         (2026-08-28 SEVENTH: 98 -> 99, tv_offload_writer_shutdown_incomplete_total -- an abandoned writer-join queue, roughly 50,000 depth rows, moved NO counter; see the block above. (2026-08-28 SIXTH: 96 -> 98, tv_tick_spill_replay_quarantined_total \
+         + tv_wal_catchup_budget_exhausted_total. Both reported PERMANENT or \
+         soon-permanent tick loss and both reached zero operator surfaces; \
+         the quarantine one also counted toward no size ceiling, so it grew \
+         unbounded on the volume that filled on 2026-08-25. +$0.60/mo, \
+         maximal month ~$122.68 -> ~$123.28 (+2 alarms $0.20 = ~$123.48). \
+         (2026-08-28 FIFTH: 95 -> 96, tv_dhan_feed_seals_rescued_total -- the \
+         alarm that was supposed to cover seal-writer death publishes from \
+         INSIDE the writer loop, so a dead writer reads a healthy zero; this \
+         counter is incremented by the still-running producer instead. \
+         +$0.30/mo, maximal month ~$122.38 -> ~$122.68. \
+         (2026-08-28 FOURTH: 93 -> 95, the two depth loss discriminators -- \
+         see the block above: without them tv_depth_rows_dropped_total cannot \
+         be read as either survivable or permanent. \
+         (2026-08-28 THIRD: 92 -> 93, tv_seal_writer_drain_dropped_total -- the \
+         seal-writer-dropped alarm named a metric with zero producers, so the \
+         redundant pager it promised for permanent sealed-candle loss was never \
+         wired; see the block above, incl. why this guard missed it. \
+         (2026-08-28 SECOND: 89 -> 92, tv_candle_tick_discarded_late_total + \
+         tv_aggregator_slot_exhausted_total + tv_dhan_feed_abandoned_bytes_total \
+         -- see the block above; the late-discard counter alone read 51,227,651 \
+         on the live box, more than the session's whole ingested tick count, \
+         and reached no operator surface at all. \
+         2026-08-28: 88 -> 89, tv_aggregator_tick_refused_total. The whole \
          refusal family had NEVER been EMF-selected, which is why the box \
          could hard-refuse 2,008,916 ticks in the measured 2026-08-27 session \
          -- 2.41% of all 83,446,729 decoded, with NO row written -- and the \
@@ -1007,7 +1195,7 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
          permanently-empty paid series and two flat-zero dashboard lines that read as \
          proof of health. Removed in lockstep with the two dashboard.tf widget rows and \
          the /health runtime-subsystem rows, per the dated authorization in \
-         websocket-connection-scope-lock.md. -$0.60/mo.); \
+         websocket-connection-scope-lock.md. -$0.60/mo.)); \
          found {}: \
          {names:?}. Adding a name costs ~$0.30/mo against a $100 kill-ceiling whose \
          budget actions STOP the prod box at 90% — update this count deliberately, \
@@ -1016,7 +1204,18 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     );
     for required in [
         "tv_process_rss_bytes",
-        "tv_subsystem_memory_estimated_bytes",
+        // tv_subsystem_memory_estimated_bytes REMOVED from this required list
+        // 2026-08-29. It was required here since the 2K-universe memory
+        // measurement, and a live `cloudwatch list-metrics` returns [] for it:
+        // the series has never existed. Every component gauge is f64::NAN
+        // until SubsystemMemorySampler::register_source is called, and nothing
+        // in production calls it — so the name was billed and charted while
+        // being structurally incapable of publishing. This entry is the reason
+        // it survived the sweeps: the ratchet REQUIRED the name, which reads
+        // as proof the metric matters. Process memory is unaffected and still
+        // required above (tv_process_rss_bytes), live and charted.
+        // Re-add here only alongside a real register_source call site —
+        // crates/app/tests/subsystem_memory_emf_guard.rs pins that pairing.
         // tv_dhan_exchange_lag_p99_seconds + tv_dhan_lag_samples_excluded_total
         // retired 2026-07-17 (dashboard tidy — dead Dhan-lag chain deleted).
         "tv_rest_1m_fire_heartbeat",

@@ -359,6 +359,36 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # WS spawn (operator Dhan noise lock; the 4 Dhan-lane alarms left the
         # list 2026-07-13).
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
+        # 2026-08-29 -- hot_path_02 was ADDED HERE AND REVERTED BEFORE SHIPPING.
+        # The finding is real; the obvious fix is wrong, and both are recorded
+        # so the next session does not re-make the mistake.
+        #
+        # THE FINDING (real): one block in `tick_persistence.rs` increments
+        # `tv_ticks_dropped_total` AND `tv_ticks_spilled_total` AND emits
+        # `error!(code = HOT-PATH-02)`. The noise lock gated `ticks_spilling`
+        # expressly so the 17:30 shutdown-flush rescue stops paging every
+        # evening -- but `hot_path_02` fires on the IDENTICAL event and is NOT
+        # gated. So the nightly false page survives the gate added to stop it,
+        # and every in-session rescue pages TWICE.
+        #
+        # WHY GATING THE CODE IS THE WRONG FIX: HOT-PATH-02 has **33 emit
+        # sites across four files** -- dhan_feed_stack (12), depth_persistence
+        # (11), tick_persistence (9) and seal_writer_loop (1). The seal writer
+        # is a different subsystem from the tick spill entirely. Adding this
+        # alarm to the gate silences all 33 overnight to quiet one, which is
+        # strictly worse than the double page it fixes.
+        #
+        # (An earlier draft of this very entry asserted "HOT-PATH-02 has one
+        # emit site". It does not. The claim was checked with one grep and
+        # reverted before it shipped -- recorded because a confident false
+        # premise attached to an alarm-silencing change is the exact failure
+        # this file keeps finding elsewhere.)
+        #
+        # THE RIGHT FIX, not taken here: scope the filter by `$.source` the way
+        # the WS-GAP-03 alarms do, so only the spill-rescue emit is gated and
+        # the other 32 sites keep paging. That needs a `source` field on that
+        # one emit site plus its own filter -- a code change, its own unit of
+        # work, and its own dated row in the noise lock.
         # 2026-08-18: dhan_live_lane_down JOINS the gate. It is not an
         # off-hours false-pager like the others here — it is the opposite
         # problem. Its treat_missing_data flipped notBreaching -> breaching in

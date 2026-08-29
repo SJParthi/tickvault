@@ -50,6 +50,33 @@
 //! load — O(1), no allocation, no lock, no contention (the writer touches it
 //! once a minute at most). The decision function is pure arithmetic over two
 //! numbers.
+//!
+//! # 2026-08-28 — the trigger was measuring the wrong thing
+//!
+//! Operator directive, on the session that filled the disk and stalled the
+//! drain: *"whyt eh fuckign abckpressure is happenign i dont evenw ant to face
+//! this fuckign backpressure ... not to lose any single ticks espeicllay to
+//! chieve O(1)"*.
+//!
+//! Everything above this line was already the right SHAPE — it sheds depth and
+//! never ticks, which is exactly the priority that directive states. What was
+//! wrong is the UNIT. Every threshold above is a fraction of the volume, and
+//! that session ended at **55% free** having burned **138 GB**: a
+//! healthy-looking disk roughly one session of writes from full, with the 15%
+//! shed bar never coming close while the frame ring refused 508,598 times.
+//!
+//! The failure compounds. Grow the volume and every fractional bar moves
+//! FURTHER AWAY in bytes while the daily burn is unchanged, so the most
+//! obvious remedy — a bigger disk — disarms the safety net.
+//!
+//! So a second trigger measured in SESSIONS OF RUNWAY joins the first, and the
+//! two combine as a `max`: the more protective of the two, never the less.
+//! See [`SESSION_BURN_BYTES_DEFAULT`], which also records why it ships INERT.
+//!
+//! **What this does NOT do.** It does not stop the disk burning 138 GB a
+//! session — depth is 80% of that and untouched here. It does not make the ILP
+//! flush faster, and it does not remove backpressure; it arms the existing
+//! relief valve early enough to matter instead of after the volume is full.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -266,6 +293,335 @@ pub fn decide_shed_level(
         return current.max(ShedLevel::InlineDepth);
     }
     current
+}
+
+// ---------------------------------------------------------------------------
+// Runway trigger — the same decision measured in SESSIONS, not percentages
+// ---------------------------------------------------------------------------
+
+/// One session's disk burn, in bytes, or `0` to leave the runway trigger inert.
+///
+/// # Why a fraction is the wrong unit for this
+///
+/// Every threshold above is a fraction of the volume, and that is a trap this
+/// system walked into on 2026-08-28. Measured that session:
+///
+/// | | |
+/// |---|---:|
+/// | free at open | 314 GB |
+/// | free at close | 176 GB |
+/// | burned | **138 GB** |
+/// | free at close, as a fraction | **55%** |
+/// | `SHED_INLINE_DEPTH_BELOW_FREE` | 15% |
+///
+/// So the box spent the day at 55% free and the shed gate never armed — while
+/// the frame ring refused 508,598 times and the drain stalled behind ILP
+/// timeouts. The gate was not wrong; it was measuring the wrong thing. Free
+/// space as a FRACTION says how full the disk is. What decides whether the
+/// next session survives is free space divided by what a session BURNS, and
+/// those two numbers move independently.
+///
+/// The consequence is worse than a missed trigger. Grow the volume and every
+/// fractional threshold moves FURTHER AWAY in bytes while the daily burn is
+/// unchanged — so buying a bigger disk makes the safety net arm LATER. A net
+/// that is disarmed by the most obvious remedy is not a net.
+///
+/// # Why it defaults to inert
+///
+/// `0` disables the runway trigger entirely, and that is the shipped default.
+/// Turning it on changes what the box CAPTURES — depth would be shed on an
+/// ordinary busy afternoon rather than only on a nearly-full disk — and that
+/// is an operator decision about data, not a bug fix. The mechanism ships
+/// ready; the number that arms it is config.
+///
+/// Set it to the MEASURED burn of a real session, not to an estimate. The
+/// 2026-08-28 figure is 138 GB.
+pub const SESSION_BURN_BYTES_DEFAULT: u64 = 0;
+
+/// Sessions of runway below which inline depth stops being captured.
+///
+/// 1.5 rather than 1.0: at exactly one session of runway the disk fills at
+/// close, which is too late to help. On 2026-08-28 a 1.5 bar sits at
+/// ~207 GB free, which the box crossed at roughly 14:00 IST — the hour the
+/// ring-full count first became significant (35,982, rising to 189,332 in the
+/// hour after). Arming there trades the afternoon's inline depth for the
+/// afternoon's ticks, which is the trade this module's doctrine already makes:
+/// ticks are never shed, depth is.
+pub const SHED_INLINE_DEPTH_BELOW_RUNWAY: f64 = 1.5;
+
+/// Sessions of runway below which ALL depth stops being captured.
+pub const SHED_ALL_DEPTH_BELOW_RUNWAY: f64 = 1.0;
+
+/// Sessions of runway above which inline depth resumes.
+///
+/// Clear of the shed bar by a wide margin for the same reason the fractional
+/// thresholds are: a single bar toggles every poll while the measurement
+/// hovers, producing holes at both edges of every oscillation.
+pub const RESTORE_INLINE_DEPTH_ABOVE_RUNWAY: f64 = 2.0;
+
+/// Sessions of runway above which dedicated depth resumes.
+pub const RESTORE_ALL_DEPTH_ABOVE_RUNWAY: f64 = 1.75;
+
+/// How many more sessions this much free space can absorb.
+///
+/// `None` when the burn is unknown (`0`) or the arithmetic cannot be trusted,
+/// which is the same thing as "do not act on this" — an unknown runway must
+/// never shed and must never restore.
+#[must_use]
+pub fn runway_sessions(free_bytes: u64, session_burn_bytes: u64) -> Option<f64> {
+    if session_burn_bytes == 0 {
+        return None;
+    }
+    // Precision: an f64 holds every integer below 2^53, i.e. 9 PB of bytes.
+    // A volume that large would break far more than this function.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: see the note above.
+    let runway = free_bytes as f64 / session_burn_bytes as f64;
+    if runway.is_finite() {
+        Some(runway)
+    } else {
+        None
+    }
+}
+
+/// [`decide_shed_level`], plus the runway trigger.
+///
+/// The two triggers are combined so the result is the MORE protective of the
+/// two, never the less. That ordering is the whole safety argument: adding a
+/// second trigger must not be able to make the gate quieter than it was, or a
+/// change meant to catch more would silently catch less.
+///
+/// With `session_burn_bytes == 0` the runway half is inert and this returns
+/// exactly what [`decide_shed_level`] returns — which is why enabling the
+/// feature is a config change and not a code change.
+///
+/// # Restoring needs BOTH halves
+///
+/// Because the combination is a `max`, a restore only lands when the fraction
+/// AND the runway both permit it. That is not a side effect worth tidying: a
+/// comfortable percentage on a volume with half a session of runway left is
+/// not comfortable, and restoring on the fraction alone would undo the runway
+/// trigger on its very next poll.
+#[must_use]
+pub fn decide_shed_level_with_runway(
+    current: ShedLevel,
+    free_fraction: f64,
+    free_bytes: u64,
+    session_burn_bytes: u64,
+    retention_at_floor: bool,
+) -> ShedLevel {
+    let by_fraction = decide_shed_level(current, free_fraction, retention_at_floor);
+
+    let Some(runway) = runway_sessions(free_bytes, session_burn_bytes) else {
+        return by_fraction;
+    };
+
+    by_fraction.max(decide_shed_level_by_runway(current, runway))
+}
+
+/// The runway half of [`decide_shed_level_with_runway`], in isolation.
+///
+/// Deliberately the same SHAPE as [`decide_shed_level`] — restore first, then
+/// shed, with `max` on the middle rung so a call at that threshold can never
+/// de-escalate a gate already at [`ShedLevel::AllDepth`]. Two triggers that
+/// decided differently would be two bugs to be found separately; one shape,
+/// reviewed once, is the point.
+///
+/// Two deliberate differences from the fractional path, each load-bearing:
+///
+/// 1. **No retention gate.** Retention cannot help here by construction: its
+///    floor is one day, and one day IS one session's writes — so waiting for
+///    retention to give up first would mean waiting for the disk to be full.
+/// 2. **No escape hatch.** [`SHED_REGARDLESS_BELOW_FREE`] exists because a
+///    fraction can fall faster than the retention ladder is walked. A runway
+///    is already expressed in the unit that matters, so there is nothing for
+///    an escape hatch to escape.
+fn decide_shed_level_by_runway(current: ShedLevel, runway: f64) -> ShedLevel {
+    // Restore first, so a recovered runway cannot be re-shed in the same call
+    // by a threshold it no longer meets.
+    if runway >= RESTORE_INLINE_DEPTH_ABOVE_RUNWAY {
+        return ShedLevel::None;
+    }
+    if runway >= RESTORE_ALL_DEPTH_ABOVE_RUNWAY && current == ShedLevel::AllDepth {
+        return ShedLevel::InlineDepth;
+    }
+
+    if runway < SHED_ALL_DEPTH_BELOW_RUNWAY {
+        return ShedLevel::AllDepth;
+    }
+    if runway < SHED_INLINE_DEPTH_BELOW_RUNWAY {
+        return current.max(ShedLevel::InlineDepth);
+    }
+    current
+}
+
+// ---------------------------------------------------------------------------
+// Self-measured exhaustion — the box answers the question itself
+// ---------------------------------------------------------------------------
+
+/// Minimum observation window before a burn RATE is trusted.
+///
+/// Two hours, and the reason is that the early session is not representative:
+/// the box boots at 08:30 and burns almost nothing until the feed opens at
+/// 09:00, so a projection taken at 09:15 divides a real burn by a mostly-idle
+/// elapsed time and reads far too slow. By 11:00 the rate is the session's
+/// actual rate.
+///
+/// Erring long is the safe direction here: too short gives a wrong number,
+/// too long merely delays the trigger to a point where the fractional gate is
+/// still nowhere near arming anyway.
+pub const MIN_BURN_OBSERVATION_SECS: u64 = 7_200;
+
+/// A burn measurement is discarded above this rate.
+///
+/// 200 MB/s sustained is roughly 4.8 TB across a session — two orders of
+/// magnitude above the measured 138 GB. A reading that large is not a fast
+/// day, it is a bad measurement: a volume swap, a resize, a `df` on the wrong
+/// mount, or a probe that read a different filesystem. Acting on it would shed
+/// every order-book row on the strength of a number nobody could produce.
+pub const MAX_PLAUSIBLE_BURN_BYTES_PER_SEC: u64 = 200_000_000;
+
+/// Seconds until the volume is full at the observed burn rate, or `None` when
+/// there is nothing trustworthy to say.
+///
+/// `None` — never a guess, and never a zero — for every one of:
+///
+/// * the observation window is too short ([`MIN_BURN_OBSERVATION_SECS`]);
+/// * free space did NOT fall, so there is no burn to measure. This is the
+///   normal case right after an archival pass reclaims space, and it must read
+///   as "no measurement", never as "burning zero, infinite runway";
+/// * the clock went backwards or stood still (an NTP step, a suspend);
+/// * the rate exceeds [`MAX_PLAUSIBLE_BURN_BYTES_PER_SEC`].
+///
+/// O(1): two subtractions, a divide, three comparisons. No allocation.
+#[must_use]
+pub fn seconds_to_disk_full(
+    anchor_free_bytes: u64,
+    anchor_secs: u64,
+    free_bytes_now: u64,
+    secs_now: u64,
+) -> Option<u64> {
+    let elapsed = secs_now.checked_sub(anchor_secs)?;
+    if elapsed < MIN_BURN_OBSERVATION_SECS {
+        return None;
+    }
+    // `checked_sub` rather than `saturating_sub`: free space GROWING is a
+    // different event from free space holding steady, and only the second is
+    // "no burn". Both return None, but the distinction is why this is not a
+    // saturating subtract that would silently call a 40 GB reclaim "zero
+    // burn" and then divide by it.
+    let burned = anchor_free_bytes.checked_sub(free_bytes_now)?;
+    if burned == 0 {
+        return None;
+    }
+    let rate = burned / elapsed;
+    if rate == 0 || rate > MAX_PLAUSIBLE_BURN_BYTES_PER_SEC {
+        return None;
+    }
+    Some(free_bytes_now / rate)
+}
+
+/// Seconds left in the capture window, or `None` once it has closed.
+///
+/// The window is the one the writers actually use — `TICK_PERSIST_*` — not the
+/// box's uptime. Burn happens while the feed is up; after 15:40 the volume
+/// stops filling and there is nothing to protect against.
+#[must_use]
+pub fn seconds_left_in_capture_window(secs_of_day_ist: u32) -> Option<u32> {
+    crate::constants::TICK_PERSIST_END_SECS_OF_DAY_IST.checked_sub(secs_of_day_ist)
+}
+
+/// Will the disk outlast the session? The whole decision, in one comparison.
+///
+/// Reuses the [`SHED_INLINE_DEPTH_BELOW_RUNWAY`] family verbatim rather than
+/// introducing a second set of ratios: "1.5 sessions of runway" and "1.5x the
+/// time left in this session" are the same statement, and two sets of numbers
+/// meaning the same thing is how they drift apart.
+///
+/// Same SHAPE as [`decide_shed_level`] — restore first, then shed, `max` on
+/// the middle rung so a call at that threshold can never de-escalate a gate
+/// already at [`ShedLevel::AllDepth`].
+#[must_use]
+pub fn decide_shed_level_by_exhaustion(
+    current: ShedLevel,
+    secs_to_full: u64,
+    secs_left_in_window: u32,
+) -> ShedLevel {
+    let left = f64::from(secs_left_in_window);
+    if left <= 0.0 {
+        // The window is closed; nothing is burning. Hold — restoring belongs
+        // to the free-space measurement, which is evidence about the disk
+        // rather than about the clock.
+        return current;
+    }
+    // Precision: both values are seconds within a day, far below 2^53.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: see above.
+    let ratio = secs_to_full as f64 / left;
+
+    if ratio >= RESTORE_INLINE_DEPTH_ABOVE_RUNWAY {
+        return ShedLevel::None;
+    }
+    if ratio >= RESTORE_ALL_DEPTH_ABOVE_RUNWAY && current == ShedLevel::AllDepth {
+        return ShedLevel::InlineDepth;
+    }
+    if ratio < SHED_ALL_DEPTH_BELOW_RUNWAY {
+        return ShedLevel::AllDepth;
+    }
+    if ratio < SHED_INLINE_DEPTH_BELOW_RUNWAY {
+        return current.max(ShedLevel::InlineDepth);
+    }
+    current
+}
+
+/// The full decision: fractional gate, configured runway, and the box's own
+/// measurement, combined as the MOST protective of the three.
+///
+/// # Why this needs no number from an operator
+///
+/// `ingest_shed`'s founding directive (2026-08-19) is that the box must manage
+/// itself *"on a fixed instance, with no human in the loop"*. A trigger that
+/// requires someone to measure a session and type the figure in is a human in
+/// the loop, and it goes stale the moment the subscribed universe changes.
+/// Measuring its own burn is the version of this feature that actually honours
+/// that directive.
+///
+/// # The asymmetry, stated because it is the whole justification
+///
+/// A false shed costs order-book depth for a while, reversibly, on data that
+/// has no live reader. A false NON-shed costs ticks — permanently, upstream,
+/// where no counter of ours can even see them. Those are not comparable, so
+/// this errs toward shedding.
+#[must_use]
+#[allow(clippy::too_many_arguments)] // APPROVED: three independent measurements
+pub fn decide_shed_level_all_signals(
+    current: ShedLevel,
+    free_fraction: f64,
+    free_bytes: u64,
+    session_burn_bytes: u64,
+    retention_at_floor: bool,
+    anchor: Option<(u64, u64)>,
+    secs_now: u64,
+    secs_of_day_ist: u32,
+) -> ShedLevel {
+    let by_configured = decide_shed_level_with_runway(
+        current,
+        free_fraction,
+        free_bytes,
+        session_burn_bytes,
+        retention_at_floor,
+    );
+
+    let Some((anchor_free, anchor_secs)) = anchor else {
+        return by_configured;
+    };
+    let Some(secs_to_full) = seconds_to_disk_full(anchor_free, anchor_secs, free_bytes, secs_now)
+    else {
+        return by_configured;
+    };
+    let Some(left) = seconds_left_in_capture_window(secs_of_day_ist) else {
+        return by_configured;
+    };
+
+    by_configured.max(decide_shed_level_by_exhaustion(current, secs_to_full, left))
 }
 
 #[cfg(test)]
@@ -552,5 +908,434 @@ mod tests {
         // leaving it shed would be a cross-test dependency.
         INGEST_SHED.set(ShedLevel::None);
         assert!(INGEST_SHED.allows_inline_depth());
+    }
+
+    // -----------------------------------------------------------------------
+    // Runway trigger
+    // -----------------------------------------------------------------------
+
+    /// The measured 2026-08-28 session: 138 GB burned between open and close.
+    const BURN_2026_08_28: u64 = 148_000_000_000;
+
+    #[test]
+    fn runway_is_none_when_the_burn_is_unknown() {
+        // Zero is the shipped default and it means "nobody has measured this
+        // box yet". An unmeasured burn must never shed and must never
+        // restore — acting on a number nobody supplied is how a safety net
+        // becomes a data-loss mechanism.
+        assert_eq!(runway_sessions(200_000_000_000, 0), None);
+    }
+
+    #[test]
+    fn runway_divides_free_space_by_one_session_of_writes() {
+        // 296 GB of free space against a 148 GB session is exactly 2.
+        let runway = runway_sessions(296_000_000_000, BURN_2026_08_28)
+            .expect("a measured burn has a runway");
+        assert!(
+            (runway - 2.0).abs() < 1e-9,
+            "expected 2 sessions of runway, got {runway}"
+        );
+    }
+
+    #[test]
+    fn a_zero_burn_makes_the_runway_path_byte_identical_to_the_fraction_path() {
+        // This is the shipped configuration, so it is the case that must be
+        // provably inert: turning the feature ON is an operator decision, and
+        // until they take it the new code path may not change one verdict.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            for &free_fraction in &[0.0, 0.03, 0.05, 0.10, 0.15, 0.20, 0.28, 0.55, 1.0] {
+                for &at_floor in &[false, true] {
+                    // Free bytes deliberately varied too: with a zero burn it
+                    // must not matter what they are.
+                    for &free_bytes in &[0_u64, 1, 200_000_000_000] {
+                        assert_eq!(
+                            decide_shed_level_with_runway(
+                                current,
+                                free_fraction,
+                                free_bytes,
+                                0,
+                                at_floor,
+                            ),
+                            decide_shed_level(current, free_fraction, at_floor),
+                            "runway path drifted from the fraction path at \
+                             current={current:?} free_fraction={free_fraction} \
+                             free_bytes={free_bytes} at_floor={at_floor}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_2026_08_28_session_sheds_on_runway_where_the_fraction_never_armed() {
+        // The whole reason this trigger exists. That session closed at 176 GB
+        // free — 55% of the volume, nowhere near the 15% fractional bar — yet
+        // barely one session of writes from a full disk.
+        let free_at_close = 176_000_000_000;
+        let fraction_at_close = 0.55;
+
+        assert_eq!(
+            decide_shed_level(ShedLevel::None, fraction_at_close, true),
+            ShedLevel::None,
+            "the fractional gate did not arm that day; if this ever changes, \
+             the premise of the runway trigger has changed with it"
+        );
+
+        assert_eq!(
+            decide_shed_level_with_runway(
+                ShedLevel::None,
+                fraction_at_close,
+                free_at_close,
+                BURN_2026_08_28,
+                true,
+            ),
+            ShedLevel::InlineDepth,
+            "1.19 sessions of runway must shed inline depth"
+        );
+    }
+
+    #[test]
+    fn under_one_session_of_runway_sheds_every_order_book_row() {
+        // 74 GB against a 148 GB session: half a session left. Ticks still
+        // survive — there is no level that stops them, which is the doctrine
+        // this module opens with.
+        let level = decide_shed_level_with_runway(
+            ShedLevel::None,
+            0.30,
+            74_000_000_000,
+            BURN_2026_08_28,
+            false,
+        );
+        assert_eq!(level, ShedLevel::AllDepth);
+        assert!(level.allows_ticks(), "ticks are never shed, at any level");
+    }
+
+    #[test]
+    fn runway_sheds_without_waiting_for_retention_to_give_up() {
+        // The fractional path is gated on `retention_at_floor` — reclaim
+        // first, shed second. The runway path deliberately is not: retention's
+        // floor is one day, and one day IS one session's writes, so waiting
+        // for it would mean waiting for the disk to be full.
+        assert_eq!(
+            decide_shed_level_with_runway(
+                ShedLevel::None,
+                0.40,
+                74_000_000_000,
+                BURN_2026_08_28,
+                false, // retention has NOT bottomed out
+            ),
+            ShedLevel::AllDepth
+        );
+    }
+
+    #[test]
+    fn a_comfortable_percentage_cannot_restore_while_the_runway_is_short() {
+        // 55% free reads as a healthy disk to the fractional path, which would
+        // restore all the way to None. Half a session of runway says otherwise,
+        // and the more protective of the two wins.
+        assert_eq!(
+            decide_shed_level_with_runway(
+                ShedLevel::AllDepth,
+                0.55,
+                74_000_000_000,
+                BURN_2026_08_28,
+                true,
+            ),
+            ShedLevel::AllDepth
+        );
+    }
+
+    #[test]
+    fn runway_restores_in_reverse_order_with_a_gap() {
+        // 1.8 sessions: past the 1.75 bar that returns dedicated depth, short
+        // of the 2.0 bar that returns inline depth. A partial restore.
+        assert_eq!(
+            decide_shed_level_with_runway(
+                ShedLevel::AllDepth,
+                0.55,
+                266_400_000_000, // 1.8 sessions
+                BURN_2026_08_28,
+                true,
+            ),
+            ShedLevel::InlineDepth
+        );
+
+        // 2.1 sessions clears both bars, so everything comes back.
+        assert_eq!(
+            decide_shed_level_with_runway(
+                ShedLevel::InlineDepth,
+                0.55,
+                310_800_000_000,
+                BURN_2026_08_28,
+                true,
+            ),
+            ShedLevel::None
+        );
+    }
+
+    #[test]
+    fn a_short_runway_cannot_be_dragged_down_by_a_healthy_fraction() {
+        // The `max` combination, stated as a property: adding the runway
+        // trigger may only ever make the gate MORE protective. If this can
+        // fail, a change meant to catch more is silently catching less.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            for &free_fraction in &[0.0, 0.05, 0.10, 0.20, 0.55, 1.0] {
+                for &at_floor in &[false, true] {
+                    for &free_bytes in &[0_u64, 74_000_000_000, 296_000_000_000] {
+                        let with = decide_shed_level_with_runway(
+                            current,
+                            free_fraction,
+                            free_bytes,
+                            BURN_2026_08_28,
+                            at_floor,
+                        );
+                        let without = decide_shed_level(current, free_fraction, at_floor);
+                        assert!(
+                            with >= without,
+                            "runway made the gate QUIETER at current={current:?} \
+                             free_fraction={free_fraction} free_bytes={free_bytes} \
+                             at_floor={at_floor}: {with:?} < {without:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_volume_with_a_measured_burn_restores_everything() {
+        // The far end: nothing shed, nothing to shed, and the runway trigger
+        // must not invent a reason to act.
+        assert_eq!(
+            decide_shed_level_with_runway(ShedLevel::None, 1.0, u64::MAX, BURN_2026_08_28, false),
+            ShedLevel::None
+        );
+    }
+
+    #[test]
+    fn a_garbage_fraction_still_holds_even_with_a_healthy_runway() {
+        // `decide_shed_level` refuses to act on a non-finite measurement. The
+        // runway half must not launder that refusal into a restore.
+        assert_eq!(
+            decide_shed_level_with_runway(
+                ShedLevel::AllDepth,
+                f64::NAN,
+                296_000_000_000,
+                BURN_2026_08_28,
+                true,
+            ),
+            ShedLevel::AllDepth,
+            "a NaN fraction must not restore a shed gate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-measured exhaustion — every way the measurement can be wrong
+    // -----------------------------------------------------------------------
+
+    const H: u64 = 3_600;
+    /// 138 GB across the 24,000 s capture window = 5.75 MB/s.
+    const RATE_2026_08_28: u64 = 5_750_000;
+
+    #[test]
+    fn a_short_observation_window_is_not_a_measurement() {
+        // The box boots at 08:30 and burns almost nothing until the feed opens
+        // at 09:00. A projection taken early divides a real burn by a mostly
+        // idle elapsed time and reads far too slow.
+        for elapsed in [0, 1, 60, MIN_BURN_OBSERVATION_SECS - 1] {
+            assert_eq!(
+                seconds_to_disk_full(300_000_000_000, 0, 200_000_000_000, elapsed),
+                None,
+                "trusted a {elapsed}s window"
+            );
+        }
+        // At the boundary it becomes a measurement.
+        assert!(
+            seconds_to_disk_full(
+                300_000_000_000,
+                0,
+                200_000_000_000,
+                MIN_BURN_OBSERVATION_SECS
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn free_space_growing_is_no_measurement_never_infinite_runway() {
+        // The normal state right after an archival pass reclaims space. The
+        // dangerous reading is "burned 0 bytes, therefore the disk lasts
+        // forever" — which would RESTORE every depth feed at the exact moment
+        // the archiver proved the disk was under pressure.
+        assert_eq!(
+            seconds_to_disk_full(200_000_000_000, 0, 260_000_000_000, 4 * H),
+            None,
+            "a 60 GB reclaim must read as no-measurement, not as zero burn"
+        );
+        // Dead flat is also no measurement.
+        assert_eq!(
+            seconds_to_disk_full(200_000_000_000, 0, 200_000_000_000, 4 * H),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clock_that_moves_backward_or_stands_still_yields_nothing() {
+        // An NTP step, a VM suspend/resume, a container clock skew.
+        assert_eq!(
+            seconds_to_disk_full(300_000_000_000, 10 * H, 200_000_000_000, 4 * H),
+            None,
+            "negative elapsed must not underflow into a huge window"
+        );
+        assert_eq!(
+            seconds_to_disk_full(300_000_000_000, 4 * H, 200_000_000_000, 4 * H),
+            None
+        );
+    }
+
+    #[test]
+    fn an_impossible_burn_rate_is_discarded_not_acted_on() {
+        // A volume swap, a resize, a probe that read a different mount. 500 GB
+        // vanishing in two hours is ~69 MB/s... plausible. 5 PB is not.
+        assert_eq!(
+            seconds_to_disk_full(u64::MAX, 0, 1_000, 2 * H),
+            None,
+            "an absurd rate must be refused — acting on it sheds everything"
+        );
+        // Just under the ceiling still measures.
+        let just_under = MAX_PLAUSIBLE_BURN_BYTES_PER_SEC * 2 * H - 1;
+        assert!(seconds_to_disk_full(just_under + 1_000, 0, 1_000, 2 * H).is_some());
+    }
+
+    #[test]
+    fn the_2026_08_28_session_is_caught_before_the_disk_fills() {
+        // Two hours in: 314 GB at open, so ~273 GB left, burning 5.75 MB/s.
+        // 47,478 s to full against 16,800 s of capture window remaining — the
+        // disk comfortably outlasts the session, so nothing sheds. Correct.
+        let free_at_11 = 314_000_000_000 - (RATE_2026_08_28 * 2 * H);
+        let to_full = seconds_to_disk_full(314_000_000_000, 0, free_at_11, 2 * H)
+            .expect("a two-hour window is a measurement");
+        let left = seconds_left_in_capture_window(39_600).expect("11:00 is inside the window");
+        assert_eq!(
+            decide_shed_level_by_exhaustion(ShedLevel::None, to_full, left),
+            ShedLevel::None,
+            "a disk that outlasts the session must not shed"
+        );
+
+        // Now the case that matters: same rate, but the volume started the day
+        // far fuller — 60 GB free at 11:00. 10,434 s to full against 16,800 s
+        // of session left. It does NOT survive the day.
+        let to_full_tight = seconds_to_disk_full(
+            60_000_000_000 + RATE_2026_08_28 * 2 * H,
+            0,
+            60_000_000_000,
+            2 * H,
+        )
+        .expect("measurement");
+        assert_eq!(
+            decide_shed_level_by_exhaustion(ShedLevel::None, to_full_tight, left),
+            ShedLevel::AllDepth,
+            "a disk that runs out before the close must shed every depth row"
+        );
+    }
+
+    #[test]
+    fn ticks_survive_every_exhaustion_verdict() {
+        // The one invariant that must hold at every level, under every input.
+        for secs_to_full in [0_u64, 1, 1_000, 100_000, u64::MAX] {
+            for left in [1_u32, 600, 16_800, 24_000] {
+                for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+                    let level = decide_shed_level_by_exhaustion(current, secs_to_full, left);
+                    assert!(
+                        level.allows_ticks(),
+                        "a tick was shed at secs_to_full={secs_to_full} left={left}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_capture_window_holds_rather_than_restoring() {
+        // After 15:40 nothing is burning, so the clock is not evidence about
+        // the disk. Restoring belongs to the free-space measurement.
+        assert_eq!(seconds_left_in_capture_window(56_400), Some(0));
+        assert_eq!(seconds_left_in_capture_window(56_401), None);
+        assert_eq!(
+            decide_shed_level_by_exhaustion(ShedLevel::AllDepth, u64::MAX, 0),
+            ShedLevel::AllDepth,
+            "an idle window must not hand back a gate the disk earned"
+        );
+    }
+
+    #[test]
+    fn the_combined_decision_is_never_quieter_than_any_single_signal() {
+        // The property that makes adding a third signal safe: it may only ever
+        // make the gate MORE protective. If this can fail, a change meant to
+        // catch more is silently catching less.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            for &free_fraction in &[0.0, 0.10, 0.55, 1.0] {
+                for &free_bytes in &[1_000_u64, 60_000_000_000, 300_000_000_000] {
+                    for &burn in &[0_u64, 148_000_000_000] {
+                        for &at_floor in &[false, true] {
+                            for anchor in [None, Some((314_000_000_000_u64, 0_u64))] {
+                                let all = decide_shed_level_all_signals(
+                                    current,
+                                    free_fraction,
+                                    free_bytes,
+                                    burn,
+                                    at_floor,
+                                    anchor,
+                                    4 * H,
+                                    39_600,
+                                );
+                                let fraction_only =
+                                    decide_shed_level(current, free_fraction, at_floor);
+                                let configured = decide_shed_level_with_runway(
+                                    current,
+                                    free_fraction,
+                                    free_bytes,
+                                    burn,
+                                    at_floor,
+                                );
+                                assert!(
+                                    all >= fraction_only && all >= configured,
+                                    "combining signals made the gate QUIETER: \
+                                     current={current:?} frac={free_fraction} \
+                                     bytes={free_bytes} burn={burn} \
+                                     floor={at_floor} anchor={anchor:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_anchor_the_measurement_changes_nothing() {
+        // A restart clears the anchor. Until two hours of fresh observation
+        // exist the box must behave exactly as it did before this feature.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            for &free_fraction in &[0.03, 0.20, 0.55] {
+                for &at_floor in &[false, true] {
+                    assert_eq!(
+                        decide_shed_level_all_signals(
+                            current,
+                            free_fraction,
+                            60_000_000_000,
+                            0,
+                            at_floor,
+                            None,
+                            4 * H,
+                            39_600,
+                        ),
+                        decide_shed_level(current, free_fraction, at_floor),
+                    );
+                }
+            }
+        }
     }
 }

@@ -1393,6 +1393,116 @@ the bill.
 - Bumps the EMF name count without a dated cost note — the ratchet's own
   instruction, and the reason this section exists.
 
+### §2.3k — 2026-08-28: the cross-verification can say "these two records disagree" and page nobody
+
+**The verbatim operator authorization (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude snure to fix and resoleve evryhtyehing entilrey whaevr you have highlighted dude okay?"
+
+Given in DIRECT response to a ranked list in which this item appeared as a CRITICAL row
+reading *"A failed cross-verification pages nobody — the revived feed's only ground truth
+can report mass divergence and nothing alerts. Only 'didn't run' and 'ran on nothing'
+page."* That list is the scope this quote authorizes; it is the same general-go-ahead
+shape `daily-universe-scope-expansion-2026-05-27.md` §28.2 and §28.3 already accept, where
+a broad instruction selects the work the preceding message enumerated. Recorded HERE
+before the terraform, per the rule-file-first law.
+
+Earlier the same session the operator asked what the cross-verification writes and whether
+it notifies — *"where will you save those results ... telegram notification"* — which is
+the question this row answers: it wrote three tables and told nobody when the answer was
+bad.
+
+#### The gap
+
+Three verdicts can end the 15:41 run. Until now only two were reachable by an alarm:
+
+| Verdict | Meaning | Carried a `source` field | Paged |
+|---|---|---|---|
+| `xverify_failed` | the check could not run | yes | yes |
+| `xverify_vacuous` | it ran and compared ZERO minutes | yes | yes |
+| **diverged** | **it ran, it measured, and the two records disagree** | **no** | **no** |
+
+The third is the only one that is an actual finding about the feed. It logged at `info!`
+among forty other fields on the same line. So the single check that exists to say whether
+the revived Dhan feed is trustworthy could answer **"no"** in a form nothing was listening
+for — while the two "we couldn't tell you" outcomes both paged.
+
+#### Family (5) gains a FIFTEENTH signal
+
+`tv-<env>-errcode-ws-gap-03-xverify-diverged`, a **log-filter** alarm on the same
+three-condition shape §2.3f settled on:
+
+```
+{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_diverged" }
+```
+
+Three conditions, not one: `WS-GAP-03` has ~50 emit sites — every dial failure and
+reconnect carries it — so a bare-code filter pages on ordinary connection churn. That is
+the trap §2.3d-i records being approved and then caught, and the `source` field is what
+makes this filter possible at all.
+
+`ok_recovery = false`: the comparison runs ONCE per session, so an auto-OK an hour later
+means the datapoint aged out, never that the next run agreed.
+
+#### ⚠ Why the threshold is HALF, and why that is not a number picked out of the air
+
+A non-zero divergence count is **EXPECTED and is not a defect**.
+`cross-verify-1m-error-codes.md` §1 records that a sampled live stream and the vendor's
+full tape legitimately differ, and says to *"track the trend, not the absolute count"*.
+Paging on any divergence would page every trading day, which this file repeatedly names as
+the fastest way to teach an operator to ignore an alarm.
+
+**No baseline exists for what a normal rate looks like.** So a 1% or 5% threshold would be
+a number invented and then presented as a measurement — the exact class this file's own
+corrections keep retiring. What CAN be asserted with no baseline is narrower and holds at
+any baseline: if **more than half** the compared price fields disagree beyond the
+configured tolerance, the two records are not describing the same market. No sampling-noise
+argument survives that.
+
+So the bar sits where it is *defensible today* rather than where it might be *optimal after
+a month of data*. The `outcome="diverged"` counter added beside it is what will eventually
+supply that data, and tightening the threshold later needs its own dated row.
+
+#### ⚠ Honest cost, and it moves further past the automatic action line
+
+One log-filter alarm ≈ **$0.10/mo**. No new EMF name, no user-data byte.
+
+§2.3j put a maximal month at **~$120.58** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`). This takes it to
+**~$120.68 — about $3.68 above the line that switches the trading box off** in a maximal
+month. The live account is nowhere near it (August MTD $48.87, forecast $61.51, measured
+2026-08-25), so nothing fires today, but the gap widens with every addition and is now the
+largest it has been. The levers are unchanged and neither is taken here: the
+already-approved Quote 10 Elastic IP release (−$3.60/mo, which alone would put the maximal
+month back under the line), or an operator decision on `limit_amount`.
+
+#### ⚠ A stale claim corrected in the same change (Rule 11)
+
+The comment at the vacuous emit site asserted the metric route was *"blocked by ONE BYTE"*,
+because the EMF selector lived in a user-data template rendering 15,841 of a 15,872-byte
+budget. That was true when measured on **2026-08-25** and stopped being true the **same
+day** — #1815 moved the selector into `deploy/aws/cloudwatch-agent.json`. Re-measured
+2026-08-28 by running the guard: the template renders **13,823 bytes, 2,049 free**, and
+`tv_dhan_feed` appears **zero** times in it. The byte blocker is gone; what remains is the
+cost decision above. Recorded because a stale measurement quoted as a live blocker is how
+this repository has manufactured false findings before, and a byte count carries a date
+like any other claim.
+
+#### What a PR that violates §2.3k looks like (REJECT)
+
+- Filters the alarm on `WS-GAP-03` alone, or drops the `source` condition (pages on every
+  reconnect — the trap this shape exists to avoid).
+- Sets `ok_recovery = true` on a once-per-session emitter.
+- Lowers the divergence threshold below half without a MEASURED baseline and its own dated
+  row — an unbaselined tightening is the false page this section refused to ship.
+- Pages on any non-zero `cells_diverged` (fires every trading day).
+- Adds a per-INSTRUMENT dimension (the §2.3 cardinality rule stands).
+- Claims the feed is verified on the strength of this alarm being quiet: a quiet alarm here
+  means "not catastrophically diverged", never "correct". A non-zero `compared` remains the
+  only evidence that the check ran at all.
+
+
 ## COST NOTE 2026-08-28 — the refusal family had never been visible, and it was hiding 2.4% tick loss (+~$0.30/mo)
 
 **Authorization:** operator, 2026-08-28, verbatim: *"Always ensure saving into db
@@ -1447,3 +1557,632 @@ $61.51, measured 2026-08-25), so nothing fires today — but the maximal-month
 arithmetic crosses the line and widens with each addition. Unchanged levers,
 neither taken here: the already-approved Quote 10 Elastic IP release
 (−$3.60/mo), or an operator decision on `limit_amount`.
+
+### §2.3k — 2026-08-28: the gates paged five "recovered" messages every trading morning, for alarms that were never broken
+
+**The operator demand this answers (2026-08-27/28, typed directly in-session —
+preserve EXACTLY, expletives and typos included):**
+
+> "why and how the fuck this fuckign issues or rerros rot elgram issues telegram ntoifications occurign always"
+
+Repeated the following day. This dated row records a change that REMOVES
+pages; §3's REJECT list governs ADDING them, so no new authorization is
+claimed — but an alerting-behaviour change gets recorded either way, because
+the next reader needs to know why a "recovered" message they used to see every
+morning stopped arriving.
+
+#### The mechanism, verified in source
+
+Both window gates do the same two things in the same wrong order.
+`market_hours_gate.rs` (`OpenDecision::Enable`) and `alarm_gate.rs`
+(`GateMode::Open`) each call:
+
+1. `enable_alarm_actions()`
+2. `set_alarm_state(OK)` — "so a stale ALARM from a prior window does not
+   immediately re-fire on the first enabled evaluation"
+
+AWS executes an alarm's actions on `SetAlarmState` **when the new state
+differs from the previous one**. So the sequence every trading day is:
+
+| When | What | Result |
+|---|---|---|
+| 17:30 | box stops; no data all night | — |
+| overnight | `treat_missing_data = "breaching"` → alarm enters ALARM | no page (actions disabled — correct) |
+| 09:20 | gate ENABLES actions | stale ALARM now has live actions |
+| 09:20 | gate resets to OK — state DIFFERS | **`ok_actions` fires → Telegram** |
+
+Five gated alarms are both `breaching` and carry `ok_actions`, verified per
+alarm: `dhan_live_lane_down`, `dhan_no_ticks_flowing`, `depth_steering_stalled`
+(all `live-lane-alarms.tf`), `market_hours_liveness_missing`
+(`market-hours-liveness-alarm.tf`), `app_log_ingestion_silent`
+(`log-retention.tf`). That is **five "✅ recovered" messages at the same minute
+every trading morning** — roughly 110 a month — reporting recovery from a
+condition that was the box being switched off overnight, exactly as scheduled.
+
+#### The fix, and why it is the ordering rather than the `ok_actions`
+
+The obvious fix is to drop `ok_actions` on those five. It is the WRONG fix: it
+would also silence the genuine case, where one of these alarms fires
+mid-session and then really does recover — which is a signal the operator
+wants.
+
+The gates now **reset to OK first, then enable actions**. The state change
+happens while actions are still disabled, so it pages nobody, and the alarm
+begins its enabled life already in OK — which is what the original comment
+says it wanted. Every alarm keeps its `ok_actions` and every real in-session
+recovery still pages.
+
+This also closes a second, quieter hole in the same two statements: enabling
+first leaves a window in which a stale ALARM has LIVE actions, so the old
+order could fire a spurious ALARM page as well as the spurious OK. Resetting
+first removes both.
+
+#### What this does NOT do (Rule 11)
+
+- It does not reduce the page count of a REAL incident. The five alarms above
+  still fire, and still send their recovery.
+- It does not touch the larger finding from the same sweep: **ALARM records are
+  never deduplicated anywhere between CloudWatch and Telegram.** The Lambda's
+  `should_suppress_ok` cache covers OK only, by an explicit never-drop law, so
+  one flapping alarm still pages once per flap — `risk-gap-03` produced 25
+  pages in a single session, recorded verbatim in `error-code-alarms.tf`.
+  Changing that means editing a law written in capitals and belongs in its own
+  change with its own row.
+- It does not remove the four dead monitors found by the same sweep
+  (`seal_writer_dropped`, `order_fill_lag_high`, `orders_placed_storm`,
+  `api_auth_failed` — each alarms a metric with no producer or no EMF entry, so
+  none can ever fire). They cost no pages; they cost false confidence.
+
+**What a PR that violates §2.3k looks like (REJECT):** restores
+`enable_alarm_actions` before `set_alarm_state` in either gate; drops
+`ok_actions` from the five alarms above as an alternative fix (it silences the
+real recovery too); or removes the guard pinning the order.
+
+### §2.3l — 2026-08-28: two counters that report permanent loss, one of them from inside the task whose death it reports
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "hwo will youa cheiev always O(1) alogn with nto even a signel ticks loss across the entire codebase and workspace even Especially cover all kinds of extreme permuations combiantions of excpeitons errors situations conditions bugs scenarios ideas etc etc etc inclduign out of box also dude okay?"
+
+> "esnire to fix and reosleve evrythgin entirley dude okay?"
+
+Given while an adversarial permutation sweep of the aggregator and seal path was
+running. Both findings below came out of that sweep and neither was known when
+the session started. This dated row is the rule-file edit §3 requires before any
+new Dhan-scoped page, recorded BEFORE the terraform.
+
+#### Finding 1 — the seal-writer death signal is published from inside the dead task
+
+`tv_dhan_feed_seals_rescued_total` has **zero occurrences anywhere under
+`deploy/`**: not EMF-selected, not charted, not alarmed. It is the counter that
+increments when a seal cannot be handed to the seal writer and is escalated to
+disk instead — which is precisely what happens when that writer is dead or its
+channel is saturated.
+
+What *is* alarmed is `tv_seal_writer_drain_total{kind="dropped"}`
+(`seal-drop-alarm.tf`). That counter is incremented **inside the seal writer's
+own drain loop**. So if the loop exits, the alarm's input stops moving and the
+alarm reads a flat, healthy zero — the failure silences its own detector. A
+whole session running on disk-spill instead of the writer is invisible.
+
+A panic is loud (`panic = "abort"`), so the dangerous case is the quiet one: a
+clean exit of the task, or a persistently full channel. Neither aborts, and
+neither moves the alarmed counter.
+
+#### Finding 2 — slot exhaustion is permanent, latched, and unalarmed
+
+`AGGREGATOR_MAX_SLOTS` is 25,000 against an authorized universe of ~24,600, and
+slots are **never released** — a workspace scan for `remove` / `swap_remove` /
+`release` / `reclaim` across the aggregator returns zero. The per-minute ATM
+re-fit is additive by design, so the count only climbs through the session.
+
+Past the cap, `slot_index` returns `None` and that instrument **derives no
+candles for the process lifetime**. Ticks are still persisted — only the candle
+is lost — so nothing else reports it.
+
+Detection today is one latched log line (`exhausted_logged` means only the FIRST
+instrument ever logs, so instruments 2..N are silent) plus
+`tv_aggregator_slot_exhausted_total`, which is EMF-selected and on the dashboard
+but in **no alarm**. There is also no gauge of slots-in-use, so the approach to
+the cap is unobservable: an operator can see the crash after it happened, on a
+chart, and never see it coming.
+
+#### What this authorizes — family (5) gains a SIXTEENTH and SEVENTEENTH signal
+
+| Alarm | Metric | Fires when | Why it is not noise |
+|---|---|---|---|
+| `tv-<env>-seal-writer-rescued` | `tv_dhan_feed_seals_rescued_total` | `Sum >= 1` in a period | A seal that could not reach the writer went to disk. On a healthy lane this is exactly zero; non-zero means the writer is dead, saturated, or the disk tier is carrying the session. |
+| `tv-<env>-aggregator-slots-exhausted` | `tv_aggregator_slot_exhausted_total` | `Sum >= 1` in a period | An instrument was permanently refused a candle slot. Zero on a healthy lane by construction — the cap is above the authorized universe, so any non-zero means the universe outgrew it. |
+
+Both `treat_missing_data = notBreaching` and ungated: the box is stopped
+overnight so no-data is the normal off-hours state, and each reports a DEFECT
+rather than silence. The dark-lane case is already owned by
+`dhan-no-ticks-flowing` (§2.3b-i). Neither takes `ok_actions` — a counter aging
+out of its window is not a repair, and in both cases the loss already happened.
+
+**Threshold 1, not a rate.** Both are zero-on-a-healthy-lane by construction,
+so there is no baseline to calibrate against and any non-zero reading is the
+event itself. A rate threshold here would be a number invented and then
+presented as a measurement.
+
+#### Honest cost
+
+`tv_aggregator_slot_exhausted_total` is already EMF-selected, so it is +1 alarm
+≈ $0.10/mo. `tv_dhan_feed_seals_rescued_total` is +1 EMF name ≈ $0.30 and +1
+alarm ≈ $0.10. **~$0.50/mo total.**
+
+§2.3k put a maximal month at ~$120.68 and the depth-discriminator change earlier
+today took it to ~$122.38; this takes it to **~$122.88** against the automatic
+`STOP_EC2_INSTANCES` line at **$117.00**. The live account is far below it
+(August MTD $48.87, forecast $61.51, measured 2026-08-25), so nothing fires
+today, but the maximal-month arithmetic is now ~$5.88 past that line and widens
+with each addition. Unchanged levers, neither taken here: the already-approved
+Quote 10 Elastic IP release (−$3.60/mo), or an operator decision on
+`limit_amount`.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on slot exhaustion does not create slots, and an alarm on rescued seals
+does not restart the writer. Neither changes the ~400 slots of headroom, and
+neither adds the slots-in-use gauge that would let an operator see the cap
+approaching rather than being told it was crossed. Both convert a permanent loss
+visible only on a chart into one that reaches the operator — that is the entire
+claim.
+
+The seal writer still has **no respawn**. This makes its death detectable; it
+does not make it survivable.
+
+#### What a PR that violates §2.3l looks like (REJECT)
+
+- Alarms either counter on a RATE rather than `>= 1` — both are zero on a
+  healthy lane, so a rate threshold invents a baseline that does not exist.
+- Gives either `ok_actions` (the loss already happened; a counter aging out is
+  not a repair).
+- Makes either `breaching` on missing data (pages every night and weekend).
+- Adds a per-INSTRUMENT dimension to either (the §2.3 cardinality rule stands).
+- Claims the seal writer is now resilient — it is detectable, not respawned.
+
+### §2.3m — 2026-08-28: the socket that carries nothing, and the flush that stalls the drain
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "see aagin why this amrket depth stuck and why the fuck it failed see ebcasue of all tehse issues evenw e will face websocket disocennct wbesocket reocnenct right mtoehrfucekr am i irght how will you provid eme the rela tiem rpoven gauarnteed assured solution mtoehrfucke rokay?"
+
+> "I dont need any hallucination or illusion I just need the working guaranteed assurance solution"
+
+This dated row is written BEFORE the terraform, per the rule-file-first law.
+
+#### The operator is right about the mechanism, and the source says so in its own words
+
+He asserted that the depth stall is what produces the WebSocket disconnects and
+reconnects. Traced end to end, that is exactly what the code does — and
+`dhan_feed_stack.rs` had already written the sentence down:
+
+> "Called bare on this task it pins a tokio worker; on a 2-worker host that is
+> HALF the runtime, and the worker it pins is shared with the WS read loops —
+> which stop pumping pongs and get the socket dropped. Worse, the drain stops
+> draining, so the 65,536-frame ring fills in ~13 s at 5,000 fps and every frame
+> after that is refused."
+
+`tick_persistence.rs` carries the other half:
+
+> "A slow database therefore stalled the fold, filled the receive buffer, and
+> Dhan — which skips a slow consumer forward to 'the latest available state'
+> with no sequence number — discarded the intermediate ticks at THEIR side,
+> invisibly."
+
+**The tick writer was taken off the drain on 2026-08-25. The depth writer was
+not** — verified by source scan: `DepthWriter` had no `offload` field and
+`split_for_offload` returned zero occurrences in that file. And depth is the
+writer that needed it more:
+
+| | ticks | depth |
+|---|---:|---:|
+| rows per session (MEASURED 2026-08-24) | 64,349,753 | **1,530,651,649** |
+| modelled rows/sec | — | **~63,800** |
+| ILP `request_timeout` | 5,000 ms | 5,000 ms |
+| flush on the frame-drain task | no, since 2026-08-25 | **yes, until today** |
+
+So the largest payload in the process ran a synchronous 5-second-timeout flush
+on the tick fold's own task, up to ~5 times a second. That is the coupling, and
+no amount of provisioned disk throughput removes it, because it is structural
+rather than a matter of speed.
+
+#### What was done about it
+
+`DepthWriter::split_for_offload` — the same split, applied to the bigger writer,
+with the same bounds and the same names so the two paths cannot drift into
+different failure semantics: a `DEPTH_FLUSH_QUEUE_DEPTH` of 4, a
+`MAX_DEPTH_RETAINED_FLUSH_SPANS` of 2, a `MAX_DEPTH_PRODUCER_BUFFER_BYTES`
+const-asserted at or below half the questdb-rs wedge, and a `QueueFull` arm that
+reports `Ok` because the rows are still held. Nine tests pin the semantics; the
+one that matters most is that backpressure is never reported as loss.
+
+#### The alarm this section authorizes — family (5) gains a SIXTEENTH signal
+
+`tv-<env>-errcode-ws-gap-02-swap-emptied-socket`. An at-the-money depth swap
+that unsubscribed the old contract and then failed to subscribe the new one
+leaves that socket **carrying nothing** — and it stays transport-healthy: it
+keeps ponging, `tv_dhan_ws_alive_connections` counts it, and
+`dhan-no-ticks-flowing` reads the WHOLE lane, where fifteen other sockets are
+flowing and the last tick is always ~1 s old. Every alarm in family (5) reads
+green through it.
+
+**Scoped by `$.source`, never by the bare code**, and that is the load-bearing
+detail: `WS-GAP-02` is also emitted by the per-minute ATM top-up path, which
+stops at its wire budget without emptying anything and is an ordinary,
+non-paging outcome. A bare-code filter would page on routine top-up exhaustion
+every minute — the RISK-GAP-03 noise trap, on a hotter path. Two conditions plus
+the level, matching the shape §2.3f settled on after finding that filter-pattern
+syntax is validated only by the real `PutMetricFilter` call at apply time.
+
+`ok_recovery = true`, unlike the xverify entries: the same code arm schedules a
+redial and the retained set already names the NEW contract, so a return to OK is
+the remediation working and is worth telling.
+
+**A second, quieter fix in the same arm.** The emptied-socket condition was
+computed as `unsubscribe_succeeded && subscribe.is_some()` — which misses the
+case where the unsubscribe **timed out**. A budget elapsing does not mean the
+frame was never written; a slow flush that lands afterwards leaves Dhan holding
+nothing, which is precisely the case the remediation exists for. Worse, the new
+counter would have read **zero while a socket was empty** — a false-OK on the
+very signal added to make this visible. A timed-out unsubscribe is now treated
+as possibly-landed, because the two errors are not symmetric: a redial is
+idempotent and costs a backoff, while an empty socket delivers nothing for the
+rest of the session.
+
+#### ⚠ Honest cost, and it crosses the automatic action line further
+
+One log-filter alarm on an existing metric-filter lane ≈ **$0.10/mo**. No new
+EMF name, no user-data byte — the two other new safety counters were
+deliberately NOT shipped as EMF names, because their emit sites already carry
+`WS-SPILL-01` and `HOT-PATH-02`, both of which are already filtered and alarmed.
+Three names' worth of coverage for one name's cost.
+
+§2.3k put a maximal month at **~$120.68** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`). This
+takes it to **~$120.78 — about $3.78 above the line that switches the trading
+box off** in a maximal month. The live account is nowhere near it (August MTD
+$48.87, forecast $61.51, measured 2026-08-25), so nothing fires today, but the
+gap widens with every addition. The levers are unchanged and neither is taken
+here: the already-approved Quote 10 Elastic IP release (−$3.60/mo, which alone
+would put the maximal month back under the line), or an operator decision on
+`limit_amount`.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **Taking the depth flush off the drain does not make QuestDB faster.** It
+  removes the drain from the flush's critical path, so a database stall stops
+  becoming upstream tick loss. The stall itself is untouched, and the 24×
+  row volume that causes it is untouched.
+- **The bounded queue is a shock absorber, not storage.** Four batches absorb
+  roughly 600 ms of stall at the modelled depth flush cadence. A longer stall
+  surfaces as backpressure, and past two retained spans the producer rescues to
+  the depth spill tier — durable and re-ingestable, but not in QuestDB.
+- **The alarm reports an emptied socket; it does not prevent one.** Detection
+  latency is the CloudWatch window.
+- **None of this has run against a live market open.** The depth lane has never
+  faced one, and that residual stands from §2.3b.
+
+#### What a PR that violates §2.3m looks like (REJECT)
+
+- Filters the emptied-socket alarm on `WS-GAP-02` alone, or drops the `$.source`
+  condition — it pages on every routine top-up budget exhaustion.
+- Re-couples the depth flush to the frame-drain task, or removes
+  `split_for_offload` from either writer.
+- Makes the depth `QueueFull` arm report a failure — backpressure is not loss,
+  and reporting it as loss decays feed health for rows that are still held.
+- Removes either producer bound (`MAX_DEPTH_RETAINED_FLUSH_SPANS`,
+  `MAX_DEPTH_PRODUCER_BUFFER_BYTES`) — "keep appending while the writer is
+  behind" without a bound is an unbounded memory path in a costume.
+- Uses a blocking `send` on the hand-off queue, which re-creates the exact
+  coupling one queue further out.
+
+### §2.3n — 2026-08-28: the shutdown that abandons a writer's queue was reported by a log line and nothing else
+
+**The verbatim operator demand (2026-08-28, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "hwo will youa cheiev always O(1) alogn with nto even a signel ticks loss across the entire codebase and workspace"
+
+> "Always ensure auditing logging dashboard vislualisign extremeims analyzing easil yaccessibel eveyrhtign also"
+
+> "I dont need any hallucination or illusion I just need the working guaranteed assurance solution"
+
+Given while an adversarial sweep of the writer-offload path was running. The
+finding below came out of that sweep and was not known when the session
+started. This dated row is the rule-file edit §3 requires before any new
+Dhan-scoped page, recorded BEFORE the terraform.
+
+#### The gap
+
+The lane joins two writer threads at shutdown — ticks and depth. Either join
+can time out, and when it does the thread is deliberately detached rather than
+joined (joining after a timeout is the unbounded wait the grace exists to
+avoid). The batches that thread was holding — up to `FLUSH_QUEUE_DEPTH` plus
+the one in flight, at the depth writer's 10,000-row threshold roughly **50,000
+rows** — then die with the process.
+
+**No counter moved.** `tv_ticks_dropped_total` and `tv_depth_rows_dropped_total`
+are the only alarmed loss series on this path, and both are incremented by the
+WRITER THREAD on rows it actually refused. A thread that never got to run its
+drain increments neither. So the single largest loss the shutdown path can
+produce was reported by free text in a log and by nothing an alarm can read.
+
+The depth side was worse in a second way: its join arm ended in `drop(handle)`,
+which detaches unconditionally, so a depth writer that finished-but-PANICKED
+looked identical to a clean one. The tick path has always joined and checked.
+Depth carries 24x the row volume and had the weaker check.
+
+#### What this authorizes — family (5) gains an EIGHTEENTH signal
+
+`tv-<env>-offload-writer-shutdown-incomplete` on
+`tv_offload_writer_shutdown_incomplete_total`, `Sum >= 1` in a period,
+`treat_missing_data = notBreaching`, `ok_actions = []`.
+
+**An EPISODE counter, not a row count, and that is deliberate.** When the join
+times out we do not know how many rows were in flight: the queue belongs to a
+thread we have just given up on, and the batches are ILP buffers whose row
+counts were consumed when they were sent. Publishing a guessed number into a
+loss counter would be a fabricated figure inside the one metric whose purpose
+is to stop fabrication. So it counts EPISODES — "a writer shutdown was
+abandoned" — once, per writer.
+
+`notBreaching` because the box is stopped overnight and no-data is the normal
+off-hours state; the dark-lane case is already owned by `dhan-no-ticks-flowing`
+(§2.3b-i). `ok_actions = []` because this fires once at process exit — a return
+to OK is the datapoint aging out, never a repair. The rows do not come back.
+
+The `writer` label separates ticks from depth. The EMF processor folds label
+values into one summed series per host, so the alarm sees the total — the right
+shape here, because either writer abandoning its queue calls for the same
+operator action: check the spill directory before the next session.
+
+#### Also fixed in the same change, and not alarmed
+
+- **The lane shutdown budget was arithmetically wrong in the spawn-failure
+  fallback.** Both offload spawns are allowed to fail and fall back to the
+  synchronous writer. In that mode the tail flushes depth and then ticks, each
+  able to block one full ILP request timeout, BEFORE the join deadline starts:
+  5 + 5 + 12 = 22 inside a 20 s budget, so the outer timer won and abandoned the
+  lane task mid-join — the exact failure the compile-time assert exists to
+  prevent, arriving through the door it was not watching. The budget is now 30 s
+  (still far inside the unit's `TimeoutStopSec=120`) and the margin is DERIVED
+  from `ILP_REQUEST_TIMEOUT_SECS` rather than being a hardcoded 5 that happened
+  to equal it.
+- **A false loss claim in the depth-flush log.** It read "those depth rows are
+  lost" on every error. Under the offload writer the only errors reachable are
+  the two that RESCUED the rows to the depth spill tier. An operator triaging
+  that line was told data was gone while a re-ingestable file existed.
+
+#### ⚠ Honest cost, and it moves further past the automatic action line
+
++1 EMF name ≈ $0.30/mo, +1 alarm ≈ $0.10/mo ⇒ **~$0.40/mo**, no user-data byte.
+
+§2.3l put a maximal month at **~$122.88** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`). This
+takes it to **~$123.28 — about $6.28 above the line that switches the trading
+box off** in a maximal month, and against the operator's $125 hard cap
+(Quote 18) it now has under $2 of room. The live account is far below it
+(August MTD $48.87, forecast $61.51, measured 2026-08-25), so nothing fires
+today, but the maximal-month arithmetic is now the tightest it has been and
+**the next addition of any size must come with a lever, not just a cost note.**
+The levers are unchanged and neither is taken here: the already-approved
+Quote 10 Elastic IP release (−$3.60/mo, which alone would put the maximal month
+back under both lines), or an operator decision on `limit_amount`.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on an abandoned shutdown does not save the queue. It converts the
+largest silent loss on the shutdown path into one the operator is told about —
+that is the entire claim. It does not shorten the drain, does not add a respawn,
+and does not make the rows recoverable: an abandoned queue is gone, and the
+alarm's job is only to stop that being invisible.
+
+It also does not address the finding that `discard_pending` performs a
+synchronous spill write of up to 32 MiB ON the frame-drain task in the
+`WidthCapped` and `SinkGone` arms. Moving the ILP flush off the drain removed a
+5 s network round trip and left a filesystem write in its place, on the same
+volume QuestDB is stalling. Smaller constant, same mechanism. Recorded here as
+a known open item rather than quietly fixed, because the safe shape for it is a
+design decision, not an edit.
+
+#### What a PR that violates §2.3n looks like (REJECT)
+
+- Turns the episode counter into a guessed ROW count (a fabricated figure in a
+  loss metric is the thing the counter exists to avoid).
+- Gives the alarm `ok_actions` (the rows do not come back; an aged-out
+  datapoint is not a repair).
+- Makes it `breaching` on missing data (pages every night and weekend).
+- Restores `drop(handle)` on the depth join, hiding a panicking depth writer.
+- Re-hardcodes `SHUTDOWN_GRACE_MARGIN_SECS` instead of deriving it from the ILP
+  timeout.
+- Raises `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` without re-checking it against
+  the unit's `TimeoutStopSec` by hand — a `.service` file is invisible to the
+  compile-time assert, which is that guard's honest limit.
+
+### §2.3o — 2026-08-28 INCIDENT: five pagers, one cascade, and a discriminator that could not discriminate
+
+**The operator's report (2026-08-28, a Telegram screenshot, typed verbatim):**
+
+> "See why these Many errors bro can you fix and resolev all of these dude okay?"
+
+The screenshot shows the same five alerts repeating on a ~7-minute cycle from
+15:23 IST: *Market data persistence loss · Ticks dropped · Questdb wal probe
+failed · Ticks spilling · Ws ring full.*
+
+#### What actually happened — MEASURED from CloudWatch, not inferred
+
+| Series | Session total (09:00–17:30 IST) |
+|---|---:|
+| `tv_dhan_feed_ingest_ticks_total` | **82,254,468** |
+| `tv_ticks_dropped_total` | 308,818 |
+| `tv_ticks_spilled_total` | **308,818 — identical** |
+| `tv_dhan_ws_wal_dropped_total` | **0** |
+| `tv_dhan_ws_ring_full_total` | 508,598 |
+| `tv_questdb_wal_suspended_tables` | 0 (max) |
+| `tv_wal_suspension_probe_failed_total` | 44 |
+| `tv_depth_rows_dropped_total` | 104,540 |
+| `tv_depth_rows_spilled_total` | **no series at all** |
+| `tv_aggregator_tick_refused_total` | **5,748,026 (7.0% of ingest)** |
+| `tv_spill_dir_free_bytes` | 314 GB → **176 GB** (−138 GB in one session) |
+
+**On the TICK path nothing was permanently lost.** `dropped` and `spilled` are
+equal to the row, which is the documented proof that every dropped tick was
+rescued to the spill tier and is re-ingestable. `tv_dhan_ws_wal_dropped_total`
+= 0 means the durable floor held for the entire session: no frame was ever
+un-captured. So five alarms fired repeatedly, and the tick loss they implied
+was **zero**.
+
+#### The real defect the incident exposed
+
+**`tv_depth_rows_spilled_total` published NO SERIES while its sibling counted
+104,540 drops.** The CloudWatch agent computes a counter as the delta between
+consecutive samples and drops the first sample of a series it has never seen,
+so a counter that is never incremented is never registered — and an ABSENT
+series is indistinguishable from a healthy zero one.
+
+The tick side seeds both names at construction, which is exactly why the tick
+verdict above is provable. The depth side seeded only `dropped`. So for depth
+the answer is **Unknown**: 104,540 rows either all rescued or all permanently
+gone, and the instrument built to tell those apart was silent in the one case
+it exists for. That is the false-OK class, arriving inside the fix that was
+supposed to end it — the discriminators were ADDED on 2026-08-28 (the FOURTH
+count bump in `cloudwatch_app_alarms_wiring`) and shipped unseeded.
+
+**FIXED the same day:** `register_depth_drop_baseline` now seeds
+`tv_depth_rows_spilled_total`, both `stage` values of
+`tv_depth_spill_write_errors_total`, and both of
+`tv_depth_persist_errors_total`; `register_drop_baseline` gains
+`tv_tick_persist_errors_total`. Pinned by
+`crates/storage/tests/loss_series_seeding_guard.rs` (4 tests), including one
+that asserts a drop counter is never seeded without its rescue discriminator,
+and one that bite-proves the extractor cannot mistake a real `increment(n)`
+for a seed. Verified by reverting the fix: 2 tests fail, restored: 4 pass.
+
+#### ⚠ What is NOT fixed, and is the actual cause of the storm
+
+1. **Disk burn.** 138 GB consumed in one session. That is the engine of the
+   whole cascade: as free space falls, QuestDB's merges slow, ILP flushes reach
+   their timeout, the frame ring fills (508,598 times today), rows spill — and
+   spilling writes MORE to the same disk. It is a positive feedback loop, and
+   no alarm added here slows it.
+2. **Five pagers for one cascade, on a ~7-minute repeat.** Each alarm is
+   individually correct and they describe one event. This file already records
+   that ALARM records are never deduplicated between CloudWatch and Telegram
+   (only OK is), so a repeating condition pages once per evaluation. Fixing it
+   means editing a law written in capitals in the Lambda and belongs in its own
+   change with its own row.
+3. **`tv_aggregator_tick_refused_total` = 5,748,026 — 7.0% of the session.**
+   The 2026-08-28 note recording this family's first EMF selection measured
+   2.41% on 2026-08-27 and reported the out-of-band class fixed. It is now
+   roughly three times higher. Unexplained, and recorded rather than guessed at.
+4. **`tv_wal_suspension_probe_failed_total` = 44.** The gauge the
+   `questdb-wal-suspended` alarm reads showed 0 all session while its producer
+   failed 44 times. §2.3g states the principle: alarming a gauge whose producer
+   can fail is alarming a lie. The probe now fails loud rather than open, so
+   the 44 are visible — but a zero on that gauge today is worth less than it
+   looks.
+
+#### What a PR that violates §2.3o looks like (REJECT)
+
+- Ships a drop counter without seeding its rescue discriminator in the same
+  change (the guard fails the build; do not weaken it to pass).
+- Reads an absent CloudWatch series as a zero anywhere — in an alarm, a
+  dashboard, a runbook or a report.
+- Reports the 104,540 depth rows of 2026-08-28 as either lost or rescued. The
+  data to decide does not exist for that session and never will; the fix makes
+  the NEXT session answerable, not this one.
+- Claims the tick path lost data on 2026-08-28. It did not: dropped equals
+  spilled, and the WAL drop count is zero.
+
+#### §2.3o-i — 2026-08-28, SAME DAY: two claims in §2.3o above are WRONG, and both were mine
+
+Written hours after §2.3o, from three parallel adversarial investigations that
+were commissioned to check it. Recorded as corrections rather than edits,
+because in both cases the reasoning that produced the wrong claim is the
+reusable part.
+
+**CORRECTION 1 — "the aggregator refusal rate is now roughly three times
+higher" is FALSE. It is not a regression; it is a first reading.**
+
+§2.3o records `tv_aggregator_tick_refused_total` = 5,748,026 (7.0% of ingest)
+and compares it to "2.41% measured yesterday". Those are **two different
+metrics**. The 2.41% figure comes from this file's own COST NOTE of
+2026-08-28, which states in the same breath that
+`list-metrics --metric-name tv_aggregator_tick_refused_total` returned
+`{"Metrics": []}` — the family had NEVER reached CloudWatch — and reports
+2,008,916 as ticks hard-refused **on timestamp**, read from a log line. That
+is one reason of a DIFFERENT counter (`tv_dhan_feed_ingest_refused_total`).
+
+The family was EMF-selected in that same change, so **6.99% is its
+first-ever CloudWatch reading — a baseline, not a jump.** The arithmetic
+agrees: `untraded_timestamp` (825,783, measured 2026-08-26) plus
+`out_of_band_timestamp` (2,008,916, measured 2026-08-27) is already 3.4% of
+the prior session, above 2.41%, and both predate today.
+
+The lesson is specific: **a first measurement is not a trend.** Comparing a
+new series' opening value against a differently-scoped number from a log line
+manufactures a regression out of nothing, and that is what §2.3o did.
+
+**CORRECTION 2 — the feedback loop in §2.3o has a false leg. Spilling does
+NOT meaningfully accelerate the disk fill.**
+
+§2.3o says rows spill to disk "which writes MORE to the same disk — a positive
+feedback loop". Measured: the tick spill for the whole session is
+308,818 rows × ~140 B ≈ **43 MB**, against a 138 GB fill. Three orders of
+magnitude apart. The rescue tier is not the problem; it is the part that
+worked, cheaply.
+
+**Where the 138 GB actually goes** (derived from the DDL row widths and the
+module headers; the depth row count is Assumed at the 2026-08-24 measured
+order):
+
+| Writer | Bytes/session | Share |
+|---|---:|---:|
+| `market_depth` (1.53 e9 rows × 72 B) | ~110 GB | ~80% |
+| 24 candle tables (112 B/row) | ~35–55 GB upper-bounded | — |
+| `ticks` (82.25 M × 144 B) | ~11.8 GB | ~9% |
+| raw frame WAL | bounded ~40 GB active / 50 GB archive | — |
+| tick + depth spill | ~43 MB + capped | ~0.03% |
+
+**Depth is 80% of the burn, one row per level per snapshot.** No complexity
+change and no alarm touches it.
+
+**Three structural findings from the same investigation, none of them fixed:**
+
+1. **The archiver cannot win, by construction.** `retention_class` puts
+   `market_depth` and `ticks` in classes whose floor is ONE DAY, and the SQL is
+   `minTimestamp < dateadd('d', -1, now())` — so today's partitions are
+   unreachable while today is being written. `pressure_config` only ever
+   `min()`s windows DOWN and cannot go below that floor. The maximum a
+   mid-session pressure episode can reclaim is yesterday's data, which the
+   post-market daily leg already dropped. On any day whose predecessor was
+   archived, a pressure episode reclaims **zero**, burns its passes and fires
+   `STORAGE-GAP-05`. The floor is one session; the inflow is one session. The
+   partitions are already `PARTITION BY HOUR`, so an hour-granular floor would
+   turn "never wins" into "runs six times a session".
+2. **There is no backpressure from disk pressure to the subscription set.**
+   `ShedLevel::allows_ticks()` is `const { true }` — no shed level reduces
+   ticks, and nothing reduces the subscribed universe. Both safety nets are
+   FRACTIONAL (`SHED_INLINE_DEPTH_BELOW_FREE = 0.15`, `pressure_high_water_pct
+   = 75`), i.e. 48 GB and 81 GB free on this volume. The session closed at
+   **176 GB free — 55%** — so neither armed, and neither can arm for about
+   another 0.9 of a session. Growing the disk moves both further away in GB at
+   a constant burn rate: **runway measured in sessions is free ÷ 138 GB, and it
+   is 1.3.** A fractional threshold on a growing disk is a threshold that
+   quietly stops meaning anything.
+3. **No per-table byte metric exists anywhere.** A scan for a QuestDB
+   `diskSize`/partition-size gauge returns nothing, so every attribution above
+   is derived rather than observed. Nobody can say from telemetry where the
+   138 GB went.
+
+**What a PR that violates §2.3o-i looks like (REJECT):** compares a metric's
+first CloudWatch reading against a differently-scoped figure and calls the
+difference a regression; describes the tick spill tier as a driver of disk
+growth; raises the volume size as a fix for the burn without also making the
+shed thresholds absolute (a bigger disk makes a fractional net arm later, not
+sooner); or claims the pressure archiver protects a session while its floor
+remains one day.

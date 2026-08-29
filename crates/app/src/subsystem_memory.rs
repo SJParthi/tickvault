@@ -24,6 +24,26 @@
 //!
 //! at a glance, with the alert pointing at the offending component.
 //!
+//! # NOT on the paid CloudWatch surface (2026-08-29)
+//!
+//! `tv_subsystem_memory_estimated_bytes` was EMF-selected (~$0.30/mo) and
+//! charted on the operator dashboard until 2026-08-29, and a live
+//! `cloudwatch list-metrics` returned `[]` for it — the series has never
+//! existed in the account. The cause is right above: every component gauge is
+//! `f64::NAN` until a [`SubsystemMemorySampler::register_source`] closure is
+//! wired, `register_source` has ZERO production call sites (its last two died
+//! with the TickStorage/PrevDayCache sweep on 2026-07-19, the same day the
+//! sourceless `tick_storage` label was dropped), and NaN is correctly dropped
+//! by the CloudWatch agent. It was structurally incapable of publishing.
+//!
+//! The scaffolding stays — the contract is worth keeping and the sampler's
+//! heartbeat and market-hours gauges carry real values on the local exporter.
+//! What is gone is paying for, and drawing an always-empty line for, a
+//! measurement nothing takes. Re-add the name to the EMF selector and the
+//! dashboard together with a real `register_source` call site;
+//! `crates/app/tests/subsystem_memory_emf_guard.rs` enforces that pairing in
+//! both directions.
+//!
 //! # Honest measurement caveat (L121)
 //!
 //! Per-component values are `len() × size_of` *estimates*, not raw
@@ -688,11 +708,19 @@ mod tests {
 
     /// The sampler must be SUPERVISED, because a dead one is invisible.
     ///
-    /// `SUBSYSTEM_MEMORY_GAUGE_NAME` is EMF-shipped and charted. A `metrics`
-    /// gauge with no idle timeout renders its LAST value on every scrape, so
-    /// a dead sampler does not leave a gap in the panel — it leaves a flat,
+    /// A `metrics` gauge with no idle timeout renders its LAST value on every
+    /// scrape, so a dead sampler does not leave a gap — it leaves a flat,
     /// dense line that never moves again, indistinguishable from a process
     /// whose memory is simply stable.
+    ///
+    /// CORRECTED 2026-08-29: this said `SUBSYSTEM_MEMORY_GAUGE_NAME` "is
+    /// EMF-shipped and charted". It was shipped and charted, and it had never
+    /// once published — a live `list-metrics` returned `[]` for it, because
+    /// every component gauge is NaN until [`SubsystemMemorySampler::
+    /// register_source`] is called and nothing in production calls it. The
+    /// name is off the paid surface now; the reasoning above still holds and
+    /// now rests on the two gauges that DO carry real values, the sampler
+    /// heartbeat and the market-hours flag, which are local-exporter-only.
     ///
     /// Found on 2026-08-26 by sweeping every long-lived `tokio::spawn`
     /// against the twenty-one `tv_*_respawn_total` counters that already

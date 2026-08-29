@@ -182,25 +182,71 @@ resource "aws_cloudwatch_metric_alarm" "dhan_socket_parked" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
   alarm_name        = "tv-${var.environment}-ticks-dropped"
-  alarm_description = "Live ticks were DROPPED before reaching QuestDB. This repo's own EMF notes call tv_ticks_dropped_total the single largest tick-loss window, and until 2026-08-14 it was published to CloudWatch with no alarm consuming it — paid for and unwatched. A drop here is real data loss: the frame is in the write-ahead log, but nothing re-folds from the WAL, so the row never appears in the ticks table. The usual cause is backpressure, not a bug: a QuestDB stall blocks the drain, the ring fills, and the sink drops the NEWEST frames. Triage: check QuestDB health and ILP flush latency first, then the ring-full counters (tv_dhan_ws_ring_full_total / tv_dhan_ws_ring_bytes_full_total) to confirm the ring was the choke point."
+  alarm_description = "Live ticks were PERMANENTLY lost before reaching QuestDB. This fires on dropped MINUS spilled, so it is silent when the rescue tier caught the rows and loud only when it did not. The usual cause is backpressure, not a bug: a QuestDB stall blocks the drain, the ring fills, and the sink drops the newest frames; the rescue path normally saves them to the tick spill tier, where they are re-ingestable by the curl command the HOT-PATH-02 log line prints. A non-zero value here means that rescue also failed - disk full, spill cap reached, or no permission. Triage: (1) check disk free and tv_ticks_spilled_total, which is charted beside this; (2) check QuestDB health and ILP flush latency; (3) tv_dhan_ws_ring_full_total confirms whether the ring was the choke point. Rows counted here are gone: nothing re-folds live-feed frames from the write-ahead log."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
+  # Eval 1 with datapoints_to_alarm 1: permanent loss must page on the first
+  # window. This alarm does NOT get the M-of-N treatment its siblings do,
+  # because it is already rare by construction - it fires only when the rescue
+  # tier failed too.
   evaluation_periods  = 1
-  metric_name         = "tv_ticks_dropped_total"
-  namespace           = local.app_namespace
-  # Threshold 1 / eval 1: a dropped tick is unrecoverable. There is no
-  # "acceptable" number of them, and waiting for a second window to confirm
-  # only delays the page while more are lost.
-  period             = 300
-  statistic          = "Sum"
-  dimensions         = local.app_dimensions
-  treat_missing_data = "notBreaching"
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
 
   alarm_actions = local.app_alarm_actions
   # NO ok_actions: the loss is permanent. Deltas returning to zero can never
   # mean the dropped ticks came back.
   ok_actions = []
+
+  # METRIC MATH, since 2026-08-28. This alarmed on `tv_ticks_dropped_total`
+  # alone, and the live session of 2026-08-28 showed what that costs: dropped
+  # and spilled were EQUAL to the row - 308,818 each - which is the documented
+  # arithmetic proof that every dropped tick was rescued to disk and nothing
+  # was permanently lost. The operator was paged anyway, repeatedly, and the
+  # alarm text told him the rows were gone.
+  #
+  # The discriminator existed as data the whole time. `discard_pending` and
+  # `rescue` increment BOTH names on the rescue-succeeded arm and only
+  # `dropped` when the rescue itself fails, so `dropped - spilled` IS the
+  # count of permanently lost rows. Nothing anywhere computed it: a scan of
+  # the terraform found `tv_ticks_spilled_total` in one alarm and two
+  # comments, and no expression subtracting the two.
+  #
+  # FILL(m,0) on both legs is load-bearing: an expression over two series
+  # evaluates to no-data if EITHER is missing, and a counter that legitimately
+  # did not increment in a window has no sample. Without FILL, a window where
+  # nothing was rescued would silence the very loss this alarm exists for.
+  metric_query {
+    id          = "permanently_lost_ticks"
+    expression  = "FILL(m_dropped,0)-FILL(m_spilled,0)"
+    label       = "ticks dropped AND not rescued (permanent loss)"
+    return_data = true
+  }
+
+  metric_query {
+    id          = "m_dropped"
+    return_data = false
+    metric {
+      metric_name = "tv_ticks_dropped_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m_spilled"
+    return_data = false
+    metric {
+      metric_name = "tv_ticks_spilled_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -228,7 +274,14 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_full" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_dhan_ws_ring_full_total"
   namespace           = local.app_namespace
   period              = 300
@@ -247,7 +300,14 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_dhan_ws_ring_bytes_full_total"
   namespace           = local.app_namespace
   period              = 300
@@ -701,7 +761,14 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # M-of-N since 2026-08-28. Was evaluation_periods = 1, which re-entered
+  # ALARM on every window with a non-zero delta: a flapping condition paged the
+  # operator once per period all session (five alarms on a ~7-minute loop on
+  # 2026-08-28). With 1-of-3 the FIRST breach still pages immediately - so
+  # detection is not delayed by a single second - but the alarm stays in ALARM
+  # through interleaved zero windows instead of resolving and re-firing.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   metric_name         = "tv_ticks_spilled_total"
   namespace           = local.app_namespace
   period              = 300
@@ -748,8 +815,8 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
 # flip to breaching pages every evening at 17:30 and all weekend. Membership in
 # the market-hours gate's ALARM_NAMES list is what makes it safe.
 resource "aws_cloudwatch_metric_alarm" "depth_steering_stalled" {
-  alarm_name        = "tv-${var.environment}-depth-steering-stalled"
-  alarm_description = <<-EOT
+  alarm_name          = "tv-${var.environment}-depth-steering-stalled"
+  alarm_description   = <<-EOT
     Depth has stopped re-aiming. The 20-level and 200-level connections are
     still up and still delivering, but they are pointed at whatever strikes
     they held when steering stopped — so the deepest book we collect is for
@@ -881,8 +948,8 @@ resource "aws_cloudwatch_metric_alarm" "wal_replay_unknown_magic" {
   # Threshold 1 / eval 1, for the same reason as alarm 9: there is no
   # acceptable number of segments to destroy, and a second confirming window
   # only lets the boot finish destroying the rest of them.
-  period    = 300
-  statistic = "Sum"
+  period     = 300
+  statistic  = "Sum"
   dimensions = local.app_dimensions
   # UNGATED, deliberately, and this differs from most of family (5).
   # WAL replay runs at BOOT. The box boots at 08:30, before the market-hours
@@ -896,5 +963,199 @@ resource "aws_cloudwatch_metric_alarm" "wal_replay_unknown_magic" {
   # NO ok_actions. The counter returning to zero means no ADDITIONAL segments
   # were destroyed — never that the destroyed ones came back. An OK page here
   # would be a false recovery of data that does not exist.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# Family (5) alarm 16 — the seal writer is dead or saturated.
+#
+# Authorized 2026-08-28 by dhan-rest-only-noise-lock-2026-07-14.md §2.3l.
+#
+# This one exists because the alarm that was SUPPOSED to cover it publishes
+# from inside the task whose death it reports: tv_seal_writer_drain_total
+# {kind="dropped"} is incremented in the seal writer's own drain loop, so if
+# that loop exits the input stops moving and the alarm reads a flat, healthy
+# zero. The failure silences its own detector.
+#
+# This counter is incremented by the PRODUCER instead — the drain, which is
+# still running — when a seal cannot be handed to the writer and is escalated
+# to disk. On a healthy lane it is exactly zero.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "seal_writer_rescued" {
+  alarm_name        = "tv-${var.environment}-seal-writer-rescued"
+  alarm_description = "Sealed candles could not reach the seal writer and were escalated to disk. On a healthy lane this is exactly zero, so any reading means the writer is dead, its channel is saturated, or the whole session is running on the disk tier. This is the ONLY signal for that: the seal-writer drain alarm publishes from inside the writer's own loop, so a dead writer stops moving it and it reads a healthy zero. Triage: (1) check whether the seal writer task is alive at all - a panic aborts the process, so a quiet exit or a persistently full channel is the case this catches; (2) check the spill and DLQ directories for the escalated seals, which are recoverable text; (3) a restart respawns the writer, since it has none of its own. Candles already escalated are on disk, not lost - but they are not in the database until they are replayed."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_feed_seals_rescued_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+
+  # notBreaching: the box is stopped overnight, so no-data is the normal
+  # off-hours state. This alarm reports a DEFECT, never silence — the dark-lane
+  # case belongs to dhan-no-ticks-flowing.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. The counter falling back to zero means no ADDITIONAL seals
+  # were escalated; it does not mean the writer recovered or that the escalated
+  # seals reached the database.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# Family (5) alarm 17 — an instrument was permanently refused a candle slot.
+#
+# Authorized 2026-08-28 by dhan-rest-only-noise-lock-2026-07-14.md §2.3l.
+#
+# AGGREGATOR_MAX_SLOTS is 25,000 against an authorized universe of ~24,600, and
+# slots are never released — the per-minute ATM re-fit is additive, so the count
+# only climbs through the session. Past the cap an instrument derives NO candles
+# for the process lifetime. Its ticks are still persisted, so nothing else
+# reports it.
+#
+# Until now the only detection was a LATCHED log line (only the first refused
+# instrument ever logs) plus a dashboard chart. The metric was already
+# EMF-selected; it was simply never alarmed.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "aggregator_slots_exhausted" {
+  alarm_name        = "tv-${var.environment}-aggregator-slots-exhausted"
+  alarm_description = "An instrument was refused a candle slot and will produce NO candles for the rest of this process. The slot table holds 25,000 and is never released, while the per-minute at-the-money re-fit keeps adding instruments, so the count only climbs through a session. Its ticks are still being persisted - only the candles are missing - so no other signal reports it, and the log line latches after the first instrument, meaning instruments two onward are silent. Triage: (1) compare the subscribed universe against the slot ceiling; (2) a restart clears the table but will refill it the same way, so this is a sizing question, not a transient; (3) candles for the refused instruments cannot be backfilled from ticks after the session. Any non-zero reading means the universe outgrew the ceiling."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_aggregator_slot_exhausted_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+
+  # notBreaching, same reasoning as the alarm above.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. The candles for a refused instrument do not arrive later.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# Family (5) alarm 18 — tick rows set aside as permanently refused.
+#
+# Authorized 2026-08-28 by dhan-rest-only-noise-lock-2026-07-14.md §2.3l.
+#
+# A 4xx from QuestDB means the PAYLOAD is wrong and no retry can fix it, so the
+# replay moves the whole file aside to let the rest of the backlog drain. That
+# is correct behaviour, and it strands real ticks: one malformed row quarantines
+# the entire file. The quarantine docstring records 1,292 of 1,293 rows in one
+# such file being perfectly good.
+#
+# Those files are NEVER retried and, until this change, counted toward no size
+# ceiling at all — they accumulated with no bound on the same volume that filled
+# completely on 2026-08-25. They are now inside the spill ceiling, so this alarm
+# is what says they exist while there is still room to act.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "tick_spill_quarantined" {
+  alarm_name        = "tv-${var.environment}-tick-spill-quarantined"
+  alarm_description = "A rescued tick file was QUARANTINED: QuestDB refused it with a 4xx, meaning the payload is wrong and no retry can fix it, so the file was set aside to let the rest of the backlog drain. Those rows are not in the database and will never be replayed automatically. One malformed row quarantines a whole file, so the loss is usually far larger than the defect - a recorded case had 1,292 good rows out of 1,293. Triage: (1) look in the quarantine subdirectory of the tick spill dir; the files are readable text; (2) find the malformed line, which is the actual bug, and fix the writer; (3) the remaining rows can be replayed by hand once the payload issue is understood. Quarantined bytes now count toward the spill ceiling, so leaving them there eventually refuses new rescues."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_tick_spill_replay_quarantined_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. A quarantined file does not un-quarantine itself; the counter
+  # settling means no NEW file was set aside, not that the old one was recovered.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# Family (5) alarm 19 — the boot catch-up drain ran out of budget.
+#
+# Authorized 2026-08-28 by dhan-rest-only-noise-lock-2026-07-14.md §2.3l.
+#
+# The catch-up drain replays WAL segments left over from a previous process,
+# bounded by WAL_CATCHUP_BUDGET_SECS / WAL_CATCHUP_MAX_ROUNDS so a large backlog
+# cannot hold the boot open forever. Exhausting it is SAFE for the segments
+# themselves — they stay on disk and survive to the next boot.
+#
+# What it is not safe for is TIME: those leftovers are then subject to the
+# age-and-byte prune, which the prune's own comment admits can delete the last
+# copy of a shed frame. A backlog that never drains eventually gets pruned
+# instead of replayed, and nothing said so.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "wal_catchup_budget_exhausted" {
+  alarm_name        = "tv-${var.environment}-wal-catchup-budget-exhausted"
+  alarm_description = "The boot catch-up drain ran out of its time or round budget with write-ahead log segments still unreplayed. Those segments are NOT lost right now - they stay on disk and the next boot will try again - but they are now racing the age-and-byte prune, which deletes old segments and can take the last copy of a frame that was never folded. A backlog that never drains is eventually pruned instead of replayed. Triage: (1) measure the spill directory size against the replay budget - if the backlog is larger than one pass can carry, it will never catch up on its own; (2) the usual cause is a long outage or a slow database, so check whether the write path is keeping up now; (3) a manual replay is possible while the segments still exist. This fires at boot, so it is normal to see it once after a long outage and alarming to see it every morning."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_wal_catchup_budget_exhausted_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+
+  # UNGATED and notBreaching, like the WAL-replay alarms: the catch-up drain
+  # runs at BOOT, and the box boots at 08:30 - before the market-hours gate
+  # opens - so gating it would make it structurally unable to fire.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}
+
+# ---------------------------------------------------------------------------
+# Family (5) alarm 19 — a writer shutdown that abandoned its queue.
+#
+# Authorized 2026-08-28 by dhan-rest-only-noise-lock-2026-07-14.md §2.3n.
+#
+# The lane joins two writer threads at shutdown. Either join can time out, and
+# when it does the thread is deliberately detached rather than joined - joining
+# after a timeout is the unbounded wait the grace exists to avoid. The batches
+# that thread held then die with the process: up to the queue depth plus the one
+# in flight, which at the depth writer's row threshold is roughly 50,000 rows.
+#
+# Until this alarm, no counter moved. The two alarmed loss series on this path
+# are incremented by the writer thread on rows it actually refused, and a thread
+# that never ran its drain increments neither - so the largest loss the shutdown
+# path can produce was reported by free text in a log and by nothing else.
+#
+# An EPISODE counter, not a row count: the queue belongs to a thread we have
+# just given up on and the batch row counts were consumed when they were sent,
+# so any number here would be invented. It counts "a writer shutdown was
+# abandoned", once, per writer.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "offload_writer_shutdown_incomplete" {
+  alarm_name        = "tv-${var.environment}-offload-writer-shutdown-incomplete"
+  alarm_description = "A persistence writer did NOT finish its shutdown: it either ran past the join grace or panicked, and the batches it was still holding died with the process. At the depth writer's row threshold that is roughly 50,000 rows, and they are not recoverable - the queue is in memory, not on disk. This counts episodes, not rows, because the row counts are gone with the thread. Triage: (1) check the tick and depth spill directories - rows the writer REFUSED were rescued there and are re-ingestable, rows still queued were not; (2) look for a preceding QuestDB stall, which is what makes a drain overrun its grace; (3) if this repeats, the grace is too short for the observed flush latency, or the writer is panicking - the accompanying log line says which. Fires once at process exit, so a return to OK means the datapoint aged out, never that the rows arrived."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  metric_name         = "tv_offload_writer_shutdown_incomplete_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+
+  # notBreaching: the box is stopped overnight, so no-data is the normal
+  # off-hours state. The dark-lane case is owned by dhan-no-ticks-flowing.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. This fires once, at process exit. A return to OK is the
+  # datapoint aging out of its window - the abandoned queue does not come back.
   ok_actions = []
 }

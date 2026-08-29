@@ -650,7 +650,23 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
     // `&["python3", …]` string literal has no legitimate purpose anywhere in
     // this workspace, so failing on it regardless of the surrounding call is
     // the stronger and simpler guarantee.
-    for marker in [".args([", "(&["] {
+    // HOLE EIGHT, closed 2026-08-29, and it is the same shape one step out.
+    //
+    // `.args(vec!["python3", "-c", "print(1)"])` matched NOTHING: `vec!` sits
+    // between the `(` and the `[`, so neither `.args([` nor `(&[` fires, the
+    // program literal is the benign `"env"` so `Command::new("` sees nothing
+    // wrong, and an inline `-c` payload means no banned file extension and no
+    // shebang ever exist. Zero backstops. It was found by PLANTING the form in
+    // a tracked file and watching all twenty tests pass green, with a positive
+    // control in the same directory failing — the only way to tell a scanner
+    // that is clean from one that is blind.
+    //
+    // Adding `vec![` rather than `.args(vec![` on purpose: the narrow form
+    // would leave `.args(&vec![`, `let a = vec![…]; .args(a)`, and every other
+    // arrangement open, which is exactly the enumerate-one-more-shape habit
+    // that has now been wrong six times. A bare `vec!["python3", …]` has no
+    // legitimate purpose anywhere in this workspace.
+    for marker in [".args([", "(&[", "vec!["] {
         let mut rest = content;
         while let Some(i) = rest.find(marker) {
             let after = &rest[i + marker.len()..];
@@ -1766,6 +1782,30 @@ fn guard_self_test() {
         rust_spawn_violations(&format!("/// We used to call {t} here, but no longer.\n"))
             .is_empty(),
         "self-test: doc-comment prose must never false-positive (narrow-scan design)"
+    );
+
+    // ---- SCOPE FIX #8 (2026-08-29): `vec![]` argument groups.
+    //
+    // The evading form, bite-proven by planting it in a tracked file and
+    // watching every test pass. Both directions asserted: the banned name must
+    // fire in each `vec!` arrangement, and an ordinary `vec!` of harmless
+    // strings must stay silent — a marker that shouted at every vector in the
+    // workspace would be deleted within a week and the hole would reopen.
+    assert_eq!(
+        rust_spawn_violations(&format!(
+            "Command::new(\"env\").args(vec![\"{t}3\", \"-c\", \"print(1)\"]);"
+        )),
+        vec![format!("{t}3")],
+        "self-test: .args(vec![…]) must be detected -- HOLE EIGHT"
+    );
+    assert_eq!(
+        rust_spawn_violations(&format!("let a = &vec![\"{t}3\", \"-c\"];")),
+        vec![format!("{t}3")],
+        "self-test: &vec![…] must be detected too -- the narrow fix would miss it"
+    );
+    assert!(
+        rust_spawn_violations("let names = vec![\"alpha\", \"beta\"];").is_empty(),
+        "self-test: an ordinary vec! of harmless strings must stay silent"
     );
 
     // ---- SCOPE FIX (2026-08-18): spawn routed through a WRAPPER function.

@@ -175,7 +175,26 @@ fn record_cycle_observability(outcome: &CycleOutcome, dropped_this_cycle: u64) {
     if dropped_this_cycle > 0 {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped")
             .increment(dropped_this_cycle);
-        // The CycleOutcome contract: truly-dropped seals (ring + spill +
+        // A SECOND, UNLABELLED counter for the same event -- added 2026-08-28,
+        // and it is not duplication.
+        //
+        // `tv-<env>-seal-writer-dropped` is meant to be the redundant
+        // metric-side pager for this exact loss, so a sealed candle still pages
+        // when the log-filter leg is degraded (the 2026-07-06 class). Its
+        // `metric_name` was `tv_seal_writer_drain_dropped_total` -- a name with
+        // ZERO producers anywhere in the workspace -- while its own description
+        // said it read `tv_seal_writer_drain_total kind=dropped`. The field and
+        // the description disagreed, and the field is the half AWS reads, so the
+        // redundancy it promised never existed and the alarm has been
+        // permanently green since it shipped.
+        //
+        // Pointing the alarm at the labelled counter instead would be WORSE than
+        // leaving it dead: the EMF processor folds label values into one summed
+        // series per host, so `tv_seal_writer_drain_total` in CloudWatch is
+        // submitted + flushed_rows + rescued_spill + rescued_dlq + dropped --
+        // dominated by successes, and a `>= 1` threshold on it would fire on
+        // every healthy cycle. A drop needs its own name to be visible at all.
+        metrics::counter!("tv_seal_writer_drain_dropped_total").increment(dropped_this_cycle);
         // DLQ all failed) MUST fire AGGREGATOR-DROP-01 — silent data loss
         // for a sealed candle is the ONLY thing this code path can mean.
         error!(
@@ -450,15 +469,59 @@ pub async fn run_seal_writer_loop(
         tokio::select! {
             biased; // Prefer the cancel branch so a pending shutdown
                     // is not held up by an extra tick.
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    info!("seal writer loop cancelled — performing final drain");
-                    let final_outcome = final_drain(&mut runner, &mut progress);
-                    return final_outcome;
+            changed = cancel_rx.changed() => {
+                match changed {
+                    Ok(()) => {
+                        if *cancel_rx.borrow() {
+                            info!("seal writer loop cancelled — performing final drain");
+                            let final_outcome = final_drain(&mut runner, &mut progress);
+                            return final_outcome;
+                        }
+                        // A `false → false` change never happens; keep draining.
+                    }
+                    Err(_) => {
+                        // CORRECTED 2026-08-28 — the comment this replaces named
+                        // the exact hazard and got its consequence backwards. It
+                        // read "and on sender drop; ignore", but ignoring a
+                        // dropped sender is not a no-op: `changed()` on a closed
+                        // watch channel resolves `Err` IMMEDIATELY and does so
+                        // forever, and this `select!` is `biased`, so the cancel
+                        // branch is polled first and is permanently ready.
+                        //
+                        // The loop therefore spins at 100% of a core, and the
+                        // ticker arm — which is the ONLY thing that drains the
+                        // mpsc, flushes to QuestDB, and emits the 60s progress
+                        // report — never runs again. That last part is the worst
+                        // of it: this module's own header says the report exists
+                        // so "silence can never again mean unknown", and this
+                        // path silences it. On a 4-vCPU box the pinned core is
+                        // also stolen from the frame drain, and a stalled drain
+                        // is how Dhan's skip-forward loses ticks upstream.
+                        //
+                        // A closed channel means no shutdown signal can ever
+                        // arrive, so there is nothing left to wait for. Drain
+                        // what we hold and exit loudly: strictly better on data
+                        // (the final drain persists the buffer instead of
+                        // stranding it), on CPU, and on visibility.
+                        //
+                        // Not reachable today — `SEAL_WRITER_CANCEL` holds the
+                        // sender for the process lifetime — but "guarded by a
+                        // comment in another crate" is not a guarantee, and the
+                        // main.rs gate landing with this closes the one entry
+                        // that could open it.
+                        error!(
+                            code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                            "seal writer loop: every cancel sender dropped — no shutdown \
+                             signal can arrive and re-polling would spin forever. Draining \
+                             what is buffered and exiting. Sealed candles are NOT lost: \
+                             further seals fall through to the overflow tier (spill/DLQ) \
+                             and replay at the next boot, but candles_* will stop gaining \
+                             rows this session. Restart the process."
+                        );
+                        let final_outcome = final_drain(&mut runner, &mut progress);
+                        return final_outcome;
+                    }
                 }
-                // The watch receiver's `.changed()` future also
-                // resolves on the initial `false → false` change
-                // (which doesn't happen) and on sender drop; ignore.
             }
             _ = ticker.tick() => {
                 let now = utc_now_secs();
@@ -825,6 +888,56 @@ mod tests {
         assert_eq!(
             outcome.drain.rescued_to_spill, 2,
             "final-drain MUST rescue both via spill (writer disconnected)"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// A dropped cancel sender must END the loop, not spin it forever.
+    ///
+    /// `watch::Receiver::changed()` on a closed channel resolves `Err`
+    /// immediately and keeps doing so, and this loop's `select!` is `biased`
+    /// — so the pre-fix `_ = cancel_rx.changed() => { ... ignore }` made the
+    /// cancel arm permanently ready and starved the ticker arm outright: no
+    /// drain, no flush, and no 60s progress report, on a pinned core, with no
+    /// log line to say any of it was happening.
+    ///
+    /// `multi_thread` is deliberate. Under the pre-fix code this test must
+    /// FAIL on the timeout rather than hang the suite, and a busy loop with no
+    /// yield point would starve a current-thread runtime's timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_cancel_sender_ends_the_loop_instead_of_spinning() {
+        let (spill, dlq) = temp_pair("cancel-sender-dropped");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let tx = runner.sender();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        // A seal is buffered BEFORE the sender dies, so the assertion covers
+        // both halves of the contract: the loop must exit, and it must take
+        // the buffer with it rather than stranding it.
+        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+            .expect("submit before the sender dies");
+        drop(cancel_tx);
+
+        let task = tokio::spawn(run_seal_writer_loop(
+            runner,
+            // Long interval: if the loop only exits because a tick fired, the
+            // test would be proving the wrong thing.
+            Duration::from_secs(30),
+            cancel_rx,
+        ));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop must RETURN on a closed cancel channel — a timeout here is the spin")
+            .expect("no panic");
+
+        assert_eq!(
+            outcome.submitted_from_mpsc, 1,
+            "the exit must carry a final drain, or the buffered seal is stranded"
+        );
+        assert_eq!(
+            outcome.drain.ring_seals_popped, 1,
+            "final drain must pop the buffered seal from the ring"
         );
         cleanup(&spill, &dlq);
     }

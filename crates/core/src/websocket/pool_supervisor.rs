@@ -528,6 +528,24 @@ pub struct ConnectionSupervisor {
     phase: ConnPhase,
     /// Consecutive failed attempts so far; also the ladder index for the NEXT
     /// delay. Reset to zero when the connection proves healthy.
+    /// Why the most recent redial was scheduled — AUDIT ONLY.
+    ///
+    /// # Why this is stored rather than passed
+    /// `schedule_redial` already knows the reason and sends it to a counter
+    /// labelled `endpoint` + `reason`. The EMF processor folds label values
+    /// into one summed series per host, so that counter can say a socket
+    /// reconnected 210 times and cannot say why any of them happened.
+    ///
+    /// The audit row was worse: `SleepThenDial` carries only a delay, so the
+    /// emit site had nothing to stamp and wrote the literal `"backoff_redial"`
+    /// for every reconnect — a subscribe failure, an idle-silence teardown, a
+    /// stale token and a plain transport close all rendered identically in
+    /// `ws_event_audit`. "Why did connection 3 reconnect 210 times today" got
+    /// the same four words 210 times.
+    ///
+    /// Read ONLY to stamp the row; the supervisor never branches on it, so
+    /// policy still lives entirely in `on_event`.
+    last_redial_reason: ReconnectReason,
     attempt: u32,
     watchdog: IdleWatchdog,
     /// Whether a frame has arrived since the current socket came up. The
@@ -568,6 +586,7 @@ impl ConnectionSupervisor {
         Self {
             slot,
             phase: ConnPhase::Idle,
+            last_redial_reason: ReconnectReason::Disconnected,
             attempt: 0,
             watchdog: IdleWatchdog::new(now),
             proven_healthy: false,
@@ -898,7 +917,19 @@ impl ConnectionSupervisor {
         }
     }
 
+    /// Why the most recent redial was scheduled — for the AUDIT ROW only.
+    ///
+    /// See `last_redial_reason`. Callers must not branch on this: the
+    /// supervisor has already made every decision this reason informed.
+    #[must_use]
+    pub const fn last_redial_reason(&self) -> ReconnectReason {
+        self.last_redial_reason
+    }
+
     fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
+        // Recorded at the ONE site every redial passes through, so the audit
+        // row cannot disagree with the counter beside it.
+        self.last_redial_reason = reason;
         self.attempt = self.attempt.saturating_add(1);
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
@@ -1319,6 +1350,26 @@ impl SubscribeGuard {
     /// This is the number the contract attach needs in order to stop stranding
     /// capacity: without it, room on a partially-filled connection is invisible
     /// and the attach asks only for whole free connections.
+    /// Shrinks the tracked set back to `len`, dropping the tail.
+    ///
+    /// The ONLY sanctioned use is a top-up that stopped part-way on its wire
+    /// budget: the guard must then describe what the socket actually received,
+    /// because the guard's set IS the reconnect replay. A guard naming
+    /// instruments that never reached the wire makes every later reconnect
+    /// replay a subscription the socket never had -- and if that pushes the
+    /// replay over the endpoint cap, Dhan answers 804 and drops the socket.
+    ///
+    /// Growing is not possible here by construction: a `len` at or past the
+    /// current length is a no-op, so this can only ever shrink.
+    ///
+    /// # Complexity
+    /// O(dropped) -- truncation of a `Vec`, no allocation.
+    pub fn truncate_to(&mut self, len: usize) {
+        if len < self.instruments.len() {
+            self.instruments.truncate(len);
+        }
+    }
+
     #[must_use]
     pub fn spare_capacity(&self) -> usize {
         let max =
@@ -1535,6 +1586,40 @@ impl SubscribeSwap {
 /// minute costs zero wire calls and zero stall.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
 pub const SWAP_WIRE_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long a WHOLE live top-up may occupy the drain task.
+///
+/// `SWAP_WIRE_BUDGET` above bounds ONE wire call and its doc opens with "THIS
+/// BOUND IS THE POINT, and without it the swap is dangerous" -- because two
+/// unbounded calls would be twenty seconds of drain occupancy. Every word of
+/// that applies to the top-up with far more force, and the top-up shipped with
+/// no bound at all.
+///
+/// The arithmetic it was missing: `try_extend` admits up to the endpoint's
+/// 5,000-instrument cap, so a connection holding ~850 spot instruments can be
+/// topped up by ~4,150 -- **42 subscribe messages**, each bounded only by the
+/// transport's own 10-second `SUBSCRIBE_SEND_TIMEOUT`. That is a worst case of
+/// **420 seconds** of not polling `recv()`. Dhan closes a silent socket after
+/// [`DHAN_SERVER_CLOSE_AFTER_SILENCE_SECS`] = 40, and the automatic pong is
+/// only emitted while `recv()` is polling -- so **four slow sends already
+/// exceed the close**, and the mechanism that exists to widen coverage takes
+/// the socket down instead.
+///
+/// Five seconds, because a healthy top-up costs ~1.1: 42 messages spaced by
+/// [`SUBSCRIBE_BATCH_INTERVAL`] (25 ms) is 1.05 s of deliberate pacing, and a
+/// few-hundred-byte write on a healthy socket is sub-millisecond. So this is
+/// ~4.5x the real cost and ~8x under the server close. A top-up that cannot
+/// finish inside it is on a sick socket, and the right answer to a sick socket
+/// is the reconnect ladder -- not four hundred more seconds on the drain.
+///
+/// On exhaustion the guard is TRUNCATED to what actually reached the wire, so
+/// it never claims instruments the socket does not hold. That differs from the
+/// send-failure arm, which deliberately leaves the guard wide because a dying
+/// socket is about to replay its whole set anyway. A budget stop is the
+/// opposite case: the socket is alive and staying alive, so the guard must
+/// stay truthful or a later reconnect replays a subscription Dhan rejects.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const TOPUP_WIRE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A change to what a LIVE socket is subscribed to, sent while it is up.
 ///
@@ -1759,10 +1844,43 @@ pub struct CapturedFrame {
 /// Refusal here is the SAME event as a count-full ring, not a new failure mode:
 /// the frame is already durable in the WAL by the time this is consulted, so a
 /// refusal is a lag signal and the outcome is `RingFull`.
+/// Which ceiling refused a ring reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingReserve {
+    /// Both dimensions had room; the frame may enter the ring.
+    Granted,
+    /// The class is carrying too many BYTES.
+    BytesFull,
+    /// The class is carrying too many FRAMES.
+    SlotsFull,
+}
+
 #[derive(Debug)]
 pub struct RingByteBudget {
     resident: std::sync::atomic::AtomicUsize,
     cap: usize,
+    /// Frames currently reserved by this class. See `slot_cap`.
+    slots: std::sync::atomic::AtomicUsize,
+    /// Per-class ceiling on the NUMBER of frames resident in the shared ring.
+    ///
+    /// ADDED 2026-08-29, and it closes a real hole rather than adding belt to
+    /// a brace. The ring is ONE `mpsc::channel(FRAME_RING_CAPACITY)` whose
+    /// sender is cloned into all sixteen sockets. The BYTE budget was split
+    /// per class; the SLOT count was not, so the only dimension with no
+    /// isolation was the one every socket competed on.
+    ///
+    /// The 2026-08-28 session is the proof, not a hypothesis:
+    /// `tv_dhan_ws_ring_full_total` = 508,598 while
+    /// `tv_dhan_ws_ring_bytes_full_total` = **0**. Every one of those half a
+    /// million sheds came from the shared slot pool and not one from the
+    /// per-class byte budget — the isolation that existed never engaged, and
+    /// the bound that bit had none. A depth burst could therefore evict
+    /// main-feed frames from the ring, which is tick loss on the lane that
+    /// carries the prices.
+    ///
+    /// `usize::MAX` means "unbounded", which is exactly the pre-2026-08-29
+    /// behaviour, so `new` is unchanged for every existing caller.
+    slot_cap: usize,
 }
 
 impl RingByteBudget {
@@ -1772,7 +1890,38 @@ impl RingByteBudget {
         Self {
             resident: std::sync::atomic::AtomicUsize::new(0),
             cap,
+            slots: std::sync::atomic::AtomicUsize::new(0),
+            slot_cap: usize::MAX,
         }
+    }
+
+    /// A budget capped at `cap` resident bytes AND `slot_cap` resident frames.
+    ///
+    /// The two production budgets must be built with this, and their
+    /// `slot_cap`s must SUM to the ring's channel capacity. That sum is what
+    /// makes the shared-pool refusal unreachable: if every admitted frame
+    /// held a per-class slot and the class caps add up to the channel size,
+    /// the channel can never be full when a reservation succeeded.
+    #[must_use]
+    pub const fn with_slot_cap(cap: usize, slot_cap: usize) -> Self {
+        Self {
+            resident: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+            slots: std::sync::atomic::AtomicUsize::new(0),
+            slot_cap,
+        }
+    }
+
+    /// The configured slot ceiling.
+    #[must_use]
+    pub const fn slot_cap(&self) -> usize {
+        self.slot_cap
+    }
+
+    /// Frames currently reserved by this class.
+    #[must_use]
+    pub fn slots_resident(&self) -> usize {
+        self.slots.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The configured ceiling.
@@ -1799,7 +1948,38 @@ impl RingByteBudget {
     /// magnitude above real traffic, so such a frame is already outside the
     /// envelope, and admitting it would mean the budget does not bound.
     pub fn try_reserve(&self, len: usize) -> bool {
-        self.resident
+        matches!(self.try_reserve_detailed(len), RingReserve::Granted)
+    }
+
+    /// `try_reserve`, reporting WHICH ceiling refused.
+    ///
+    /// The caller needs the distinction because the two refusals mean
+    /// different things to an operator and are counted separately: bytes-full
+    /// says the class is carrying too much VOLUME, slots-full says it is
+    /// carrying too many FRAMES. Collapsing them was survivable while slots
+    /// were unbounded; it is not now that both can bind.
+    ///
+    /// Order is slot-first, then bytes, and the slot is given back if the byte
+    /// reservation fails. Either order works; what matters is that no path
+    /// leaves one dimension reserved and the other not, because the release
+    /// side returns both together.
+    pub fn try_reserve_detailed(&self, len: usize) -> RingReserve {
+        if self
+            .slots
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |cur| {
+                    let next = cur.checked_add(1)?;
+                    (next <= self.slot_cap).then_some(next)
+                },
+            )
+            .is_err()
+        {
+            return RingReserve::SlotsFull;
+        }
+        if self
+            .resident
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
@@ -1808,7 +1988,34 @@ impl RingByteBudget {
                     (next <= self.cap).then_some(next)
                 },
             )
-            .is_ok()
+            .is_err()
+        {
+            // Hand the slot back. Leaking it here would ratchet the class's
+            // slot budget down on every oversized frame until it refused
+            // everything — the same slow strangulation the byte-side release
+            // below exists to prevent.
+            self.release_slot();
+            return RingReserve::BytesFull;
+        }
+        RingReserve::Granted
+    }
+
+    /// Returns one slot without touching the byte budget. Saturating, for the
+    /// same reason `release` is.
+    fn release_slot(&self) {
+        let mut cur = self.slots.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self.slots.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Returns `len` bytes to the budget as a frame leaves the ring.
@@ -1820,6 +2027,10 @@ impl RingByteBudget {
     /// which is the same state as not having it, and stays visible through
     /// `resident()`.
     pub fn release(&self, len: usize) {
+        // Both dimensions, always together — a frame leaving the ring frees
+        // its bytes AND its slot. Splitting these into two public calls would
+        // create a shape where a caller can return one and forget the other.
+        self.release_slot();
         // An explicit CAS loop rather than `fetch_update`, because the closure
         // form can only ever return `Some` here and its `Result` would then have
         // to be discarded — and `let _ =` on a `#[must_use]` value is exactly
@@ -1983,11 +2194,32 @@ impl FrameSink for WalRingSink {
         // Minted ONCE, here, at the read instant — see `CapturedFrame`.
         let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
+        //
+        // `append_with_seq_at`, never `append_with_seq`: the receipt is the
+        // whole point of the TVW3 record and it is DERIVED from `received_at`
+        // above, not read from a clock here — this file bans wall-clock reads
+        // (`test_pool_supervisor_source_never_reads_the_wall_clock`) and that
+        // ban is right, because an NTP step must not be able to expire all
+        // sixteen sockets at once.
+        //
+        // Before this was wired, `append_with_seq` passed the UNKNOWN sentinel
+        // and `append_with_seq_at` had zero production callers, so every record
+        // on disk carried 0 while the format claimed to carry a receipt — and
+        // replay re-stamped `now()`, which is the moment of REPLAY, not of
+        // arrival. A shape that advertises a guarantee it never delivers is
+        // worse than one that does not advertise it.
+        //
         // `append_with_seq`, never `append`: `append` would mint a SECOND
         // sequence internally and the WAL record would then disagree with the
         // one the consumer stamps.
-        // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
-        if self.spill.append_with_seq(self.ws_type, frame.clone(), seq) == AppendOutcome::Dropped {
+        if self.spill.append_with_seq_at(
+            self.ws_type,
+            // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
+            frame.clone(),
+            seq,
+            tickvault_storage::ws_frame_spill::receipt_nanos_from(received_at),
+        ) == AppendOutcome::Dropped
+        {
             self.wal_dropped.increment(1);
             return FrameSinkOutcome::WalDropped;
         }
@@ -1997,10 +2229,23 @@ impl FrameSink for WalRingSink {
         // release on failure: the only ordering with no window in which the
         // budget and the ring disagree.
         let len = frame.len();
-        if !self.budget.try_reserve(len) {
-            self.ring_full.increment(1);
-            self.ring_bytes_full.increment(1);
-            return FrameSinkOutcome::RingFull;
+        match self.budget.try_reserve_detailed(len) {
+            RingReserve::Granted => {}
+            RingReserve::BytesFull => {
+                self.ring_full.increment(1);
+                self.ring_bytes_full.increment(1);
+                return FrameSinkOutcome::RingFull;
+            }
+            // Counted on `ring_full` ONLY, deliberately. That is exactly what
+            // a ring_full-without-ring_bytes_full reading meant before this
+            // change, so the two counters keep their meaning across the fix
+            // and Friday's numbers stay comparable to Monday's. What changed
+            // is that the refusal is now scoped to the class that caused it
+            // instead of to whoever happened to reach the shared pool first.
+            RingReserve::SlotsFull => {
+                self.ring_full.increment(1);
+                return FrameSinkOutcome::RingFull;
+            }
         }
         // Step 3 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
@@ -2024,6 +2269,12 @@ impl FrameSink for WalRingSink {
             self.ring_full.increment(1);
             return FrameSinkOutcome::RingFull;
         }
+        // Reaching here with the class slot caps summing to the channel's
+        // capacity means the `try_send` above can only fail on a CLOSED
+        // channel, never on a full one — a reservation was granted, and a
+        // granted reservation is a held slot. The arm stays because a closed
+        // channel is a real (if terminal) condition, not because capacity can
+        // still refuse.
         FrameSinkOutcome::Captured
     }
 }
@@ -2279,6 +2530,34 @@ pub enum SocketEvent {
 pub trait DhanFeedSocket: Send {
     /// Dial and complete the handshake.
     fn connect(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// Why the most recent [`Self::connect`] failed — AUDIT ONLY.
+    ///
+    /// # Why this exists beside an opaque `SocketFailure`
+    /// `SocketFailure` is a unit struct, deliberately: policy lives in the
+    /// supervisor, not the transport, and the supervisor must not branch on
+    /// the error kind. That is right about POLICY and it silently took
+    /// OBSERVABILITY with it. The transport already classifies every dial
+    /// failure into one of five bounded labels — `no_token`, `tls_config`,
+    /// `bad_url`, `timeout`, `connect` — and sends them to a counter whose
+    /// `endpoint` and `reason` labels the EMF processor folds into a single
+    /// summed series per host. So CloudWatch could say twelve dials failed and
+    /// could not say on which socket or why, and no queryable surface held the
+    /// answer at all: on 2026-08-12 the main feed failed twelve dials with
+    /// HTTP 400 and the reason reached no table.
+    ///
+    /// The supervisor reads this ONLY to stamp `ws_event_audit`. It never
+    /// branches on it, so the design intent above is intact.
+    ///
+    /// # Contract
+    /// Returns a `&'static str` from a bounded set — NEVER a formatted error.
+    /// A transport error's `Display` embeds the request URL, and this URL
+    /// carries the JWT in its query string.
+    ///
+    /// The default is `"unknown"` so a transport that does not classify says
+    /// so, rather than a caller inventing a reason it does not have.
+    fn last_dial_failure_reason(&self) -> &'static str {
+        "unknown"
+    }
     /// Send ONE subscribe message for the given batch.
     fn send_subscribe(
         &mut self,
@@ -2398,6 +2677,22 @@ where
 {
     let endpoint = supervisor.slot().endpoint.as_str();
     let pool_index = supervisor.slot().pool_index;
+    // Recorded BEFORE the first dial, and that is the whole point.
+    //
+    // Every other lifecycle kind presupposes a socket that opened, so a
+    // connection that failed every dial produced no row anywhere and was
+    // absent from the daily per-connection record — indistinguishable from a
+    // connection that was never planned. The 2026-08-12 blackout is the case:
+    // twelve dials, `HTTP 400` every time, no handshake all session, and
+    // nothing in the record to say that socket had ever been asked to run.
+    //
+    // Best-effort by construction: `on_lifecycle` is fire-and-forget, so a
+    // failure to record the intent can never delay or prevent the dial that
+    // follows. Recording the intent must never cost the connection.
+    sink.on_lifecycle(
+        tickvault_common::ws_event_types::WsEventKind::DialStarted,
+        "begin_dial",
+    );
     let mut action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
 
     loop {
@@ -2448,7 +2743,7 @@ where
                 // moment we got around to re-dialing.
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
-                    "backoff_redial",
+                    supervisor.last_redial_reason().as_str(),
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
@@ -2459,7 +2754,7 @@ where
                 guard.mark_lost();
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
-                    "token_refresh_redial",
+                    supervisor.last_redial_reason().as_str(),
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 refresh_token().await;
@@ -2469,7 +2764,19 @@ where
             SupervisorAction::Dial => {
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
-                    Err(_) => ConnEvent::DialFailed,
+                    Err(_) => {
+                        // The reason is read for the AUDIT ROW only — the
+                        // supervisor's decision below is `DialFailed` either
+                        // way, so policy still does not depend on the kind.
+                        // Without this row a socket that failed every dial
+                        // left `dial_started` and nothing else, and "why did
+                        // connection 3 never come up" had no answer in SQL.
+                        sink.on_lifecycle(
+                            tickvault_common::ws_event_types::WsEventKind::DialFailed,
+                            socket.last_dial_failure_reason(),
+                        );
+                        ConnEvent::DialFailed
+                    }
                 };
                 action = supervisor.on_event(event, Instant::now());
             }
@@ -2735,16 +3042,83 @@ where
                     let added = more.len();
                     match guard.try_extend(more) {
                         Ok(start) => {
+                            // BOUNDED and PACED. Both were missing, and the
+                            // `SWAP_WIRE_BUDGET` doc two hundred lines up
+                            // already explains why that is dangerous: these
+                            // sends run ON the drain task, the automatic pong
+                            // is only emitted while `recv()` is polling, and
+                            // Dhan closes a silent socket after 40 seconds.
+                            // Unbounded, this loop's worst case is 42 messages
+                            // x the transport's 10-second send timeout = 420
+                            // seconds. The swap path one branch below was given
+                            // a budget for a TWENTY-second exposure; this one
+                            // had twenty times that and no budget.
+                            //
+                            // Pacing is the same 25 ms the initial dispatch
+                            // uses, and for the same reason: 42 messages fired
+                            // back to back is a burst against a broker that
+                            // answers an over-rate subscribe by dropping the
+                            // socket.
+                            // `tokio::time::Instant`, not `std::time::Instant`.
+                            // Both are monotonic, so this is NOT the NTP
+                            // reasoning that governs the watchdog -- it is
+                            // that a bound the test harness cannot advance is
+                            // a bound nothing can prove. Under
+                            // `start_paused` the std clock stands still while
+                            // the runtime's advances, so a std deadline here
+                            // would pass every test and only ever fire in
+                            // production, which is the worst of both.
+                            let deadline = tokio::time::Instant::now() + TOPUP_WIRE_BUDGET;
                             let mut sent = 0usize;
                             let mut failed = false;
+                            let mut budget_exhausted = false;
                             for batch in guard.batches_from(start) {
-                                if socket.send_subscribe(batch).await.is_err() {
-                                    failed = true;
+                                if tokio::time::Instant::now() >= deadline {
+                                    budget_exhausted = true;
                                     break;
                                 }
-                                sent += batch.len();
+                                match tokio::time::timeout(
+                                    SWAP_WIRE_BUDGET,
+                                    socket.send_subscribe(batch),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => sent += batch.len(),
+                                    // A per-message timeout is a SICK SOCKET,
+                                    // not a failed send: treating it as the
+                                    // budget case keeps the guard truthful and
+                                    // lets the reconnect ladder do its job.
+                                    Err(_) => {
+                                        budget_exhausted = true;
+                                        break;
+                                    }
+                                    Ok(Err(_)) => {
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                tokio::time::sleep(SUBSCRIBE_BATCH_INTERVAL).await;
                             }
-                            if failed {
+                            if budget_exhausted {
+                                // Keep the guard honest: it is the reconnect
+                                // replay, so it must name only what the socket
+                                // actually holds.
+                                guard.truncate_to(start + sent);
+                                error!(
+                                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    added,
+                                    sent,
+                                    budget_secs = TOPUP_WIRE_BUDGET.as_secs(),
+                                    "live subscription top-up hit its wire budget and STOPPED - \
+                                     the socket stayed up and is carrying what did reach it. \
+                                     The remainder is not subscribed this session unless a later \
+                                     top-up offers it again."
+                                );
+                                metrics::counter!("tv_dhan_ws_topup_budget_exhausted_total")
+                                    .increment(1);
+                            } else if failed {
                                 // Do NOT mark the guard lost here — the
                                 // supervisor owns that transition and will see
                                 // the disconnect itself. The guard now names
@@ -2826,6 +3200,13 @@ where
                             // swap exists to keep useful.
                             let mut wire_failed = false;
                             let mut wire_timed_out = false;
+                            // Tracked separately from `wire_failed` because the two
+                            // halves leave the socket in OPPOSITE states. A failed
+                            // unsubscribe means the socket still holds its OLD
+                            // instrument and is still delivering; a failed subscribe
+                            // AFTER a successful unsubscribe means it holds nothing.
+                            // Only the second is worth tearing the socket down for.
+                            let mut unsubscribe_succeeded = false;
                             if let Some(drop_this) = swap.unsubscribe {
                                 match tokio::time::timeout(
                                     SWAP_WIRE_BUDGET,
@@ -2833,7 +3214,7 @@ where
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(())) => unsubscribe_succeeded = true,
                                     Ok(Err(_)) => wire_failed = true,
                                     Err(_elapsed) => {
                                         wire_failed = true;
@@ -2857,6 +3238,127 @@ where
                                 }
                             }
                             if wire_failed {
+                                // FORCE A REDIAL when the swap left the socket
+                                // holding LESS than it should — added
+                                // 2026-08-28.
+                                //
+                                // The order of the two wire calls is a safety
+                                // property (see the comment above), and it has
+                                // a consequence this arm used to ignore: when
+                                // the unsubscribe SUCCEEDS and the subscribe
+                                // then fails, a depth-200 socket — which holds
+                                // exactly one instrument — is left holding
+                                // NOTHING.
+                                //
+                                // The error line below has always claimed "the
+                                // reconnect replay lands it. One stale minute,
+                                // not a lost strike." The first half was true
+                                // and the second was an assumption: nothing
+                                // scheduled a reconnect. Only two things do —
+                                // a `Disconnected` event from the read half,
+                                // and the idle watchdog. Neither fires here.
+                                // The socket is transport-healthy (that is why
+                                // the write did not error), and depth-200 is
+                                // client-pinged by us with Dhan ponging back,
+                                // so `KeepAliveReceived` keeps resetting the
+                                // watchdog on a socket carrying no data at all.
+                                //
+                                // It is not permanent — the next ATM move
+                                // issues a fresh swap, and `depth200_atm`
+                                // skips only while the strike is UNCHANGED —
+                                // and the 600s deaf-socket alarm does page. So
+                                // this was detected and simply never
+                                // remediated: an empty socket for as long as
+                                // the strike holds still, which on a flat
+                                // afternoon is the rest of the session.
+                                //
+                                // `ConnEvent::SubscribeFailed` is the right
+                                // event and already exists: the initial
+                                // subscribe path fires it for the same shape
+                                // (a set the wire did not carry), and it
+                                // schedules a redial through the normal
+                                // backoff ladder rather than a bare reconnect
+                                // — so a socket failing this repeatedly backs
+                                // off and parks instead of spinning.
+                                //
+                                // Gated on `lost_instruments` rather than on
+                                // `wire_failed` alone, because a swap whose
+                                // UNSUBSCRIBE failed never sent the subscribe:
+                                // that socket still holds its old instrument
+                                // and is still delivering, so tearing it down
+                                // would trade a stale strike for a real gap.
+                                // The socket is EMPTY when the unsubscribe left
+                                // the wire and the subscribe did not follow it.
+                                //
+                                // TWO ways that happens, and the second was
+                                // missed until 2026-08-28:
+                                //
+                                // 1. The unsubscribe was ACKNOWLEDGED and the
+                                //    subscribe then failed. Unambiguous.
+                                // 2. The unsubscribe TIMED OUT. `wire_failed`
+                                //    is set, `unsubscribe_succeeded` is not —
+                                //    but a budget elapsing does not mean the
+                                //    frame was never written. A slow flush that
+                                //    lands afterwards leaves Dhan holding
+                                //    NOTHING on this socket, which is exactly
+                                //    the case this remediation exists for, and
+                                //    the old condition read it as "still
+                                //    holding its old instrument" and did
+                                //    nothing. Worse, the emptied-socket counter
+                                //    then read zero while a socket was empty —
+                                //    a false-OK on the very signal added to
+                                //    make this visible.
+                                //
+                                // Treated as lost, not as safe, because the two
+                                // errors are not symmetric: a redial is
+                                // idempotent and costs a backoff, while an
+                                // empty socket keeps ponging and delivers
+                                // nothing for the rest of the session.
+                                //
+                                // A failed unsubscribe that ANSWERED (`Ok(Err)`)
+                                // is still not lost: the wire returned an
+                                // error, the subscribe was never sent, and that
+                                // socket is still delivering its old strike.
+                                // TWO facts, deliberately kept apart
+                                // (RE-NARROWED 2026-08-28 after this widening
+                                // hung CI).
+                                //
+                                // `lost_instruments` is the REMEDIATION
+                                // trigger: it returns `SubscribeFailed`, which
+                                // makes the outer loop redial. It stays gated
+                                // on an unsubscribe that ANSWERED `Ok`.
+                                //
+                                // `possibly_emptied` is the VISIBILITY fact: a
+                                // timed-out unsubscribe may still have reached
+                                // the wire, so the socket may be empty even
+                                // though nothing here can know it. That is the
+                                // blindness worth counting, and counting it
+                                // costs nothing.
+                                //
+                                // Why they are not the same bool: making a
+                                // TIMEOUT trigger the redial turned a bounded
+                                // failure into an unbounded one. The redial
+                                // re-enters `send_subscribe`, and this code
+                                // path has no timeout of its own around that
+                                // call — so a socket that never answers took
+                                // the redial, hung on the replayed subscribe,
+                                // and held the drain forever. CI caught it as
+                                // a 180-second test timeout on
+                                // `a_socket_that_never_answers_costs_the_drain_two_seconds_not_twenty`,
+                                // which passes on main and hung here: proof
+                                // that the widening, not the test, was wrong.
+                                //
+                                // The reasoning that produced the widening was
+                                // still right — a timed-out unsubscribe really
+                                // may have landed — so the FACT is kept and
+                                // only the ACTION is withheld. Acting on it
+                                // safely needs a bounded redial, which is its
+                                // own change.
+                                let lost_instruments =
+                                    unsubscribe_succeeded && swap.subscribe.is_some();
+                                let possibly_emptied = wire_timed_out
+                                    && swap.unsubscribe.is_some()
+                                    && swap.subscribe.is_some();
                                 // The guard already carries the NEW instrument
                                 // — see `try_swap` for why it is recorded
                                 // before the wire moves. That is what makes
@@ -2864,13 +3366,56 @@ where
                                 // revert: the reconnect replays the CURRENT
                                 // intent, so the socket comes back holding the
                                 // strike that was chosen, not the one it had.
+                                // The `source` field below is the CloudWatch
+                                // filter's discriminator, and a string rather
+                                // than the `lost_instruments` bool because
+                                // filter PATTERN syntax is validated only by
+                                // the real PutMetricFilter call at apply time:
+                                // a malformed pattern passes every PR check and
+                                // breaks the post-merge apply lane. This reuses
+                                // the exact three-condition shape already
+                                // proven live by the ws-gap-03 filters.
+                                // THREE `source` values, not two, and the
+                                // reasoning is kept HERE rather than inside the
+                                // macro on purpose: `loss_counter_visibility_guard`
+                                // requires the counter below to sit near its
+                                // log line, and a comment block inside the
+                                // macro pushes it out of that window. That is
+                                // not a hypothetical — it broke this exact
+                                // counter twice today.
+                                //
+                                // The alarm keys on `swap_emptied_socket` only,
+                                // because that is the case a redial is
+                                // scheduled for. `swap_maybe_emptied` is the
+                                // honest third state: the unsubscribe did not
+                                // answer, so whether the socket is empty is
+                                // UNKNOWN here. Folding it into either of the
+                                // other two would be a claim this code cannot
+                                // make — one direction hides an empty socket,
+                                // the other pages for one that is fine.
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                    source = if lost_instruments {
+                                        "swap_emptied_socket"
+                                    } else if possibly_emptied {
+                                        "swap_maybe_emptied"
+                                    } else {
+                                        "swap_wire_failed"
+                                    },
                                     endpoint = supervisor.slot().endpoint.as_str(),
                                     pool_index = supervisor.slot().pool_index,
-                                    "live subscription swap failed on the wire — the retained \
-                                     set already names the new instrument, so the reconnect \
-                                     replay lands it. One stale minute, not a lost strike."
+                                    lost_instruments,
+                                    possibly_emptied,
+                                    wire_timed_out,
+                                    "live subscription swap failed on the wire. The retained set \
+                                     already names the new instrument, so a reconnect replay lands \
+                                     the right strike. When the unsubscribe had already succeeded \
+                                     the socket is now carrying NOTHING, and a redial is scheduled \
+                                     here to recover it — without one, a transport-healthy socket \
+                                     keeps ponging while delivering no data. When the unsubscribe \
+                                     TIMED OUT instead, whether the socket is empty is unknown \
+                                     from here: no redial is scheduled, and this line is the only \
+                                     record that the question exists."
                                 );
                                 metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
                                 if wire_timed_out {
@@ -2881,6 +3426,18 @@ where
                                     // and the second is the one that also
                                     // cost the drain a full second.
                                     metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(1);
+                                }
+                                if lost_instruments {
+                                    metrics::counter!("tv_dhan_ws_swap_emptied_socket_total")
+                                        .increment(1);
+                                    action = supervisor
+                                        .on_event(ConnEvent::SubscribeFailed, Instant::now());
+                                    // Leave the drain so the outer loop can act
+                                    // on the scheduled redial. Returning the
+                                    // action rather than continuing is what
+                                    // makes this a remediation instead of
+                                    // another log line.
+                                    return action;
                                 }
                             } else {
                                 info!(
@@ -4722,6 +5279,142 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_dial_is_audited_with_its_reason() {
+        // Same source-pin discipline as the test above, and for the same
+        // reason: the emit sits inside an async loop that needs a live socket.
+        //
+        // Before 2026-08-29 this arm was `Err(_) => ConnEvent::DialFailed` --
+        // the error discarded on the spot. The transport had ALREADY
+        // classified it into one of five bounded labels and sent it to a
+        // counter whose `endpoint` and `reason` labels the EMF processor folds
+        // into one summed series per host, so the answer to "which socket, and
+        // why" existed for a microsecond and reached no queryable surface. On
+        // 2026-08-12 the main feed failed twelve dials with HTTP 400 and the
+        // reason is in no table anywhere.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        let dial_arm = production
+            .split("SupervisorAction::Dial => {")
+            .nth(1)
+            .and_then(|s| s.split("SupervisorAction::Subscribe").next())
+            .expect("the dial arm must exist");
+        assert!(
+            dial_arm.contains("WsEventKind::DialFailed"),
+            "a failed dial must reach the audit as its own kind:\n{dial_arm}"
+        );
+        assert!(
+            dial_arm.contains("last_dial_failure_reason()"),
+            "and it must carry the transport's REASON — a DialFailed row \
+             without one answers 'did it fail' and not 'why', which is the \
+             half an operator is actually stuck on:\n{dial_arm}"
+        );
+        // The supervisor must not BRANCH on the reason. Policy stays in the
+        // supervisor; this is the audit stamp only.
+        assert!(
+            !dial_arm.contains("match socket.last_dial_failure_reason"),
+            "the reason is for the audit row, never for a decision:\n{dial_arm}"
+        );
+    }
+
+    #[test]
+    fn a_redial_is_audited_with_the_reason_that_caused_it() {
+        // Source pin, same discipline as the two tests above.
+        //
+        // Before 2026-08-29 both redial arms stamped a hardcoded string --
+        // "backoff_redial" and "token_refresh_redial" -- so a subscribe
+        // failure, an idle-silence teardown, a stale token and a plain
+        // transport close all rendered IDENTICALLY in ws_event_audit. The real
+        // reason went only to a counter labelled endpoint + reason, and the EMF
+        // processor folds label values into one summed series per host. "Why
+        // did connection 3 reconnect 210 times today" got the same four words
+        // 210 times.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        for arm in [
+            "SupervisorAction::SleepThenDial",
+            "SupervisorAction::RefreshTokenThenDial",
+        ] {
+            let body = production
+                .split(&format!("{arm} {{ delay_ms }} => {{"))
+                .nth(1)
+                .and_then(|s| s.split("action = supervisor.on_event").next())
+                .unwrap_or_else(|| panic!("the {arm} arm must exist"));
+            assert!(
+                body.contains("last_redial_reason()"),
+                "{arm} must stamp the reason that CAUSED the redial, not a \
+                 hardcoded label — the audit row is the only surface that can \
+                 tell two causes apart:\n{body}"
+            );
+        }
+
+        // And the reason must be recorded at the one site every redial passes
+        // through, or the row could disagree with the counter beside it.
+        let enter = production
+            .split("fn enter_backoff(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("enter_backoff must exist");
+        assert!(
+            enter.contains("self.last_redial_reason = reason;"),
+            "enter_backoff is the single choke point every redial reaches:\n{enter}"
+        );
+    }
+
+    #[test]
+    fn every_reconnect_reason_has_a_distinct_audit_label() {
+        // The label is what an operator groups by. Two reasons sharing one
+        // string would silently merge two different failures into one bucket.
+        let labels: Vec<&str> = [
+            ReconnectReason::DialFailed,
+            ReconnectReason::SubscribeFailed,
+            ReconnectReason::Disconnected,
+            ReconnectReason::TokenStale,
+            ReconnectReason::IdleSilence,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len(), "reason labels must be unique");
+        // And none may collide with the two hardcoded strings they replaced,
+        // or an old row and a new row would read the same.
+        for l in &labels {
+            assert_ne!(*l, "backoff_redial");
+            assert_ne!(*l, "token_refresh_redial");
+        }
+    }
+
+    #[test]
+    fn the_default_dial_failure_reason_is_honest_about_not_knowing() {
+        // A transport that does not classify says "unknown" rather than
+        // letting a caller invent a reason it does not have.
+        struct Silent;
+        impl DhanFeedSocket for Silent {
+            async fn connect(&mut self) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn send_subscribe(
+                &mut self,
+                _batch: &[SubscribeInstrument],
+            ) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn send_ping(&mut self) -> Result<(), SocketFailure> {
+                Err(SocketFailure)
+            }
+            async fn recv(&mut self) -> SocketEvent {
+                SocketEvent::Closed { code: None }
+            }
+            async fn close(&mut self) {}
+        }
+        assert_eq!(Silent.last_dial_failure_reason(), "unknown");
+    }
+
+    #[test]
     fn test_wal_ring_sink_stamps_receipt_time_in_the_read_task() {
         // The published frame must carry a receipt stamp taken INSIDE
         // `accept` — i.e. on the read task — not left for the drain to
@@ -4799,6 +5492,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_try_reserve_detailed_refuses_on_slot_cap_when_bytes_are_free() {
+        // The dimension that actually bit on 2026-08-28. Bytes wide open,
+        // slots exhausted -> refused, and refused as SlotsFull so the two
+        // counters stay distinguishable.
+        let b = RingByteBudget::with_slot_cap(usize::MAX, 2);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        assert_eq!(
+            b.try_reserve_detailed(1),
+            RingReserve::SlotsFull,
+            "a third frame must be refused on SLOTS even with unlimited bytes"
+        );
+        assert_eq!(b.slots_resident(), 2);
+    }
+
+    #[test]
+    fn test_try_reserve_detailed_still_refuses_on_bytes_when_slots_are_free() {
+        // The pre-existing dimension must be unchanged by the addition.
+        let b = RingByteBudget::with_slot_cap(10, usize::MAX);
+        assert_eq!(b.try_reserve_detailed(10), RingReserve::Granted);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::BytesFull);
+    }
+
+    #[test]
+    fn test_release_slot_returns_the_slot_when_the_byte_reservation_refuses() {
+        // Order is slot-then-bytes, so a byte refusal must not leak the slot.
+        // Leaking would ratchet the class's slot budget down on every
+        // oversized frame until it refused everything -- a slow strangulation
+        // that reads as the feed dying for no reason.
+        let b = RingByteBudget::with_slot_cap(10, 4);
+        assert_eq!(b.try_reserve_detailed(99), RingReserve::BytesFull);
+        assert_eq!(b.slots_resident(), 0, "the slot must be returned");
+        for _ in 0..4 {
+            assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        }
+    }
+
+    #[test]
+    fn test_release_clears_bytes_and_slots_resident_together() {
+        let b = RingByteBudget::with_slot_cap(100, 1);
+        assert_eq!(b.try_reserve_detailed(50), RingReserve::Granted);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::SlotsFull);
+        b.release(50);
+        assert_eq!(b.resident(), 0);
+        assert_eq!(b.slots_resident(), 0);
+        assert_eq!(b.try_reserve_detailed(50), RingReserve::Granted);
+    }
+
+    #[test]
+    fn test_with_slot_cap_stops_a_depth_flood_consuming_main_feed_slots() {
+        // THE regression this whole change exists to prevent. Two classes
+        // sharing one channel: depth exhausts its own share and the main feed
+        // is still admitted. Before the slot split, depth could take every
+        // slot in the shared pool and main-feed frames were shed -- which is
+        // tick loss on the lane that carries the prices.
+        let main = RingByteBudget::with_slot_cap(usize::MAX, 3);
+        let depth = RingByteBudget::with_slot_cap(usize::MAX, 3);
+
+        for _ in 0..3 {
+            assert_eq!(depth.try_reserve_detailed(1), RingReserve::Granted);
+        }
+        assert_eq!(
+            depth.try_reserve_detailed(1),
+            RingReserve::SlotsFull,
+            "depth must exhaust its OWN share"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                main.try_reserve_detailed(1),
+                RingReserve::Granted,
+                "the main feed keeps its full share while depth is saturated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_leaves_slot_cap_unbounded_exactly_as_before() {
+        // Every existing caller uses `new`, and none of them should change
+        // behaviour. Unbounded slots is exactly what they had before.
+        let b = RingByteBudget::new(usize::MAX);
+        assert_eq!(b.slot_cap(), usize::MAX);
+        for _ in 0..10_000 {
+            assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        }
     }
 
     #[test]
@@ -5184,6 +5964,13 @@ mod tests {
         /// so the ORDER is the property under test, not the counts.
         wire_calls: Vec<&'static str>,
         pings: usize,
+        /// How long each `send_subscribe` takes on the wire.
+        ///
+        /// Exists so a test can reach the top-up's wire budget. Under
+        /// `start_paused = true` tokio auto-advances, so a "slow" socket costs
+        /// no real wall time -- which is the only reason a 40-message top-up
+        /// against a 900 ms socket is testable at all.
+        subscribe_delay: Option<Duration>,
     }
 
     struct FakeSocket {
@@ -5243,14 +6030,20 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
             let state = std::sync::Arc::clone(&self.state);
             async move {
-                let ok = match state.lock() {
+                let (ok, delay) = match state.lock() {
                     Ok(mut s) => {
                         s.subscribes += 1;
                         s.wire_calls.push("subscribe");
-                        s.subscribe_results.pop_front().unwrap_or(true)
+                        (
+                            s.subscribe_results.pop_front().unwrap_or(true),
+                            s.subscribe_delay,
+                        )
                     }
-                    Err(_) => true,
+                    Err(_) => (true, None),
                 };
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
                 if ok { Ok(()) } else { Err(SocketFailure) }
             }
         }
@@ -5688,6 +6481,86 @@ mod tests {
         );
     }
 
+    /// A swap whose unsubscribe LANDS and whose subscribe FAILS leaves the
+    /// socket carrying nothing — and must force a redial.
+    ///
+    /// The order of the two wire calls is a safety property (subscribing first
+    /// on a one-instrument depth socket asks for two and earns a Fatal 804), and
+    /// this is its consequence: when the first call succeeds and the second does
+    /// not, a depth-200 connection holds ZERO instruments.
+    ///
+    /// Until 2026-08-28 that arm only logged, under a line claiming "the
+    /// reconnect replay lands it. One stale minute, not a lost strike." The
+    /// first half was true — the guard already names the new instrument, so any
+    /// reconnect restores the right strike — and the second half was an
+    /// assumption. Nothing scheduled a reconnect. Only a `Disconnected` event
+    /// and the idle watchdog do, and neither fires here: the socket is
+    /// transport-healthy, and depth-200 is client-pinged with Dhan ponging back,
+    /// so the watchdog keeps being reset on a socket carrying no data at all.
+    ///
+    /// It was not permanent — the next ATM move issues a fresh swap — but on a
+    /// flat afternoon the strike does not move, and the socket stays empty for
+    /// the rest of the session.
+    #[tokio::test]
+    async fn a_swap_that_empties_the_socket_forces_a_redial() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            // The initial subscribe succeeds; the swap's subscribe fails.
+            subscribe_results: VecDeque::from(vec![true, false]),
+            // The swap's unsubscribe LANDS — this is what empties the socket.
+            unsubscribe_results: VecDeque::from(vec![true]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            &s.wire_calls[..3],
+            &["subscribe", "unsubscribe", "subscribe"],
+            "the swap must unsubscribe before it subscribes — that ordering is \
+             what makes the empty-socket case possible in the first place"
+        );
+        // The FOURTH call is the point: it is the redial re-subscribing the
+        // guard's retained set, which already names the NEW instrument. Before
+        // this fix the sequence stopped at three and the socket kept draining
+        // while holding nothing.
+        assert_eq!(
+            s.wire_calls.len(),
+            4,
+            "the redial must replay the retained set; got {:?}",
+            s.wire_calls
+        );
+        // The redial is the point. Without it the drain keeps running on a
+        // socket that holds nothing, answers pings, and delivers no data.
+        assert!(
+            s.connects > 1,
+            "a swap that emptied the socket must force a redial so the guard's \
+             retained set is replayed; got {} dial(s), meaning the drain stayed \
+             on a connection carrying zero instruments",
+            s.connects
+        );
+    }
+
     /// A socket that never answers must not hold the drain. Unbounded, the
     /// transport's own 10-second timeout would make one swap a TWENTY-second
     /// stall on the socket the swap exists to keep useful — and during a
@@ -5897,6 +6770,105 @@ mod tests {
             2,
             "frames still reach the sink — the top-up arm does not eat them"
         );
+    }
+
+    /// The top-up must STOP at its wire budget instead of stalling the reader.
+    ///
+    /// # The defect
+    ///
+    /// These sends run ON the drain task, and the automatic pong is only
+    /// emitted while `recv()` is polling. `try_extend` admits up to the
+    /// endpoint's 5,000 cap, so a top-up can be ~42 messages, each bounded
+    /// only by the transport's 10-second `SUBSCRIBE_SEND_TIMEOUT` -- a worst
+    /// case of 420 seconds of silence against Dhan's 40-second close. Four
+    /// slow sends already exceed it. The mechanism that exists to widen
+    /// coverage was able to take the socket down.
+    ///
+    /// The swap arm one branch below was given `SWAP_WIRE_BUDGET` for a
+    /// TWENTY-second exposure, with a doc opening "THIS BOUND IS THE POINT".
+    /// The top-up had twenty times that exposure and no bound at all.
+    ///
+    /// # What this asserts
+    ///
+    /// A 4,000-instrument top-up is 40 messages. On a 900 ms socket that is
+    /// ~37 seconds unbounded -- past the close. Bounded at 5 seconds it must
+    /// send only a handful and stop. The number is deliberately asserted as a
+    /// RANGE, not a constant: pinning an exact count would break on any
+    /// reasonable retiming and teach the next reader to delete the test.
+    #[tokio::test(start_paused = true)]
+    async fn a_top_up_stops_at_its_wire_budget_instead_of_stalling_the_reader() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa"))]),
+            // Slow but NOT slow enough to trip the per-message timeout, so
+            // what bites is the whole-top-up budget rather than one bad send.
+            subscribe_delay: Some(Duration::from_millis(900)),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Extend(instruments_from(
+            250, 4_000,
+        )))
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let exit = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        let initial = 3; // 250 instruments / 100 per message
+        let topup_sent = s.subscribes - initial;
+        assert!(
+            topup_sent >= 1,
+            "the budget must still permit forward progress -- a top-up that \
+             sends nothing is a permanent hole, not a bound"
+        );
+        assert!(
+            topup_sent < 40,
+            "the top-up must STOP at its budget; it sent {topup_sent} of 40 \
+             messages, which means the bound is not being applied and the \
+             drain can be held past Dhan's 40-second close"
+        );
+        assert_eq!(s.connects, 1, "a bounded top-up must never re-dial");
+    }
+
+    /// A guard may only ever SHRINK, and shrinking is what keeps a
+    /// budget-stopped top-up honest.
+    ///
+    /// The guard's set IS the reconnect replay. If it names instruments the
+    /// socket never received, every later reconnect replays a subscription the
+    /// socket never had — and if that pushes the replay past the endpoint cap,
+    /// Dhan answers 804 and drops the socket. So the budget path truncates and
+    /// the send-FAILURE path deliberately does not: a dying socket is about to
+    /// replay everything anyway.
+    #[test]
+    fn truncate_to_shrinks_the_guard_and_can_never_grow_it() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        assert_eq!(g.len(), 250);
+
+        g.truncate_to(1_000);
+        assert_eq!(g.len(), 250, "a length past the end must be a no-op");
+
+        g.truncate_to(100);
+        assert_eq!(g.len(), 100, "and must otherwise shrink to exactly that");
+
+        g.truncate_to(100);
+        assert_eq!(g.len(), 100, "truncating twice is a no-op");
+
+        g.truncate_to(0);
+        assert!(g.is_empty(), "shrinking to nothing is legal");
     }
 
     /// A connection given NO channel must behave byte-identically to before.
@@ -6143,6 +7115,82 @@ mod tests {
         assert!(
             !trait_body.contains("async") && !trait_body.contains("Future"),
             "FrameSink::accept must stay synchronous"
+        );
+    }
+
+    /// The WAL receipt must be WRITTEN, not merely representable.
+    ///
+    /// # The defect this pins
+    ///
+    /// TVW3 added an 8-byte `received_at_nanos` to the WAL record on
+    /// 2026-08-28, and `append_with_seq_at` was written to persist it. It then
+    /// had ZERO production callers: both real append sites went through
+    /// `append_with_seq`, which passes `WAL_RECEIPT_UNKNOWN_NANOS`. So every
+    /// record on the box carried the sentinel while the format claimed to carry
+    /// a receipt, and boot replay re-stamped `now()` — the moment of REPLAY,
+    /// not of arrival. Since `received_at` is the candle BUCKETING clock, that
+    /// silently re-buckets every recovered frame into the minute the process
+    /// happened to restart in.
+    ///
+    /// A format that advertises a field nothing fills is worse than one that
+    /// does not advertise it, because the reader has no way to tell.
+    #[test]
+    fn the_capture_path_persists_the_frame_receipt() {
+        let source = include_str!("pool_supervisor.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        assert!(
+            production_half.contains("append_with_seq_at("),
+            "FrameSink::accept must call append_with_seq_at, not append_with_seq. \
+             append_with_seq records the UNKNOWN sentinel, so the TVW3 receipt field \
+             would be written as 0 on every frame and replay would re-stamp now() — the \
+             moment of REPLAY rather than of arrival, on the clock that buckets candles."
+        );
+        assert!(
+            production_half.contains("receipt_nanos_from(received_at)"),
+            "the receipt must be DERIVED from the `received_at` instant already stamped \
+             at the top of accept, never read from a clock here: this file bans \
+             wall-clock reads so an NTP step cannot expire all sixteen sockets at once, \
+             and that ban is right."
+        );
+        assert!(
+            !production_half.contains("append_with_seq(self.ws_type"),
+            "no production append may go through append_with_seq — it hardcodes the \
+             unknown-receipt sentinel"
+        );
+    }
+
+    /// The anchor the receipt is derived from must be RE-TAKEN, not boot-only.
+    ///
+    /// `Instant` is CLOCK_MONOTONIC and `SystemTime` is CLOCK_REALTIME; NTP
+    /// SLEWS the latter at up to 500 ppm, so a single boot anchor drifts ~1.8 s
+    /// per hour — ~16 s over a session. On the candle bucketing clock that
+    /// files bars in the wrong second by a margin that GROWS all day, which is
+    /// the error shape hardest to notice and hardest to reconstruct afterwards.
+    #[test]
+    fn the_receipt_anchor_is_refreshed_off_the_hot_path() {
+        let lane = include_str!("../../../app/src/dhan_feed_stack.rs");
+        let production_half = lane
+            .split_once("#[cfg(test)]")
+            .map_or(lane, |(prod, _)| prod);
+        assert!(
+            production_half.contains("refresh_receipt_anchor()"),
+            "some off-hot-path timer must re-take the receipt anchor; a boot-only anchor \
+             drifts against the wall clock under NTP slew for the whole session"
+        );
+        let refresh = production_half
+            .rfind("refresh_receipt_anchor()")
+            .expect("checked above");
+        let silence_arm = production_half
+            .rfind("silence_timer.tick()")
+            .expect("the lane must still have its 30s silence timer");
+        assert!(
+            silence_arm < refresh,
+            "the refresh must sit on the 30s silence arm, never the 500 ms flush arm: it \
+             is a wall-clock syscall plus an allocation, and 30 s already bounds the drift \
+             to ~15 ms at the worst permitted slew — three orders of magnitude inside a \
+             one-second bucket."
         );
     }
 }

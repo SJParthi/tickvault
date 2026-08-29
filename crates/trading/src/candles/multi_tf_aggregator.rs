@@ -392,6 +392,46 @@ impl MultiTfAggregator {
         self.watermark_secs = 0;
     }
 
+    /// Raises the event-time watermark to at least `secs`, never lowering it.
+    ///
+    /// # Why this exists
+    ///
+    /// The stale-trading-day gate compares a tick's IST day against the
+    /// watermark's -- but `consume_tick` ADVANCES the watermark before that
+    /// comparison, so on a fresh aggregator (watermark 0) the FIRST tick sets
+    /// the very value it is then checked against and always passes. For live
+    /// ticks that is harmless: the first tick of a session genuinely is the
+    /// newest thing seen.
+    ///
+    /// It is not harmless for BOOT REPLAY. `ws_frame_spill::replay_all` is not
+    /// day-scoped, and a segment left unconfirmed at yesterday's shutdown --
+    /// which happens whenever the replay RAM budget defers segments, measured
+    /// live as 13 deferred on 2026-08-28 -- replays the next morning into a
+    /// fresh aggregator. Its first frame sets the watermark to YESTERDAY, the
+    /// gate then compares yesterday against yesterday, and the frame folds
+    /// into a bucket on a day that closed hours ago. Because the re-fold seals
+    /// through the normal path and `candles_*` dedups on
+    /// `(ts, security_id, segment, feed)` with no completeness discriminator,
+    /// the PARTIAL bar rebuilt from only the deferred subset upserts over the
+    /// COMPLETE bar written live the previous session.
+    ///
+    /// Seeding the watermark to the current trading day before replay closes
+    /// that hole using machinery that already exists: a prior-day frame is
+    /// then refused as `stale_trading_day`, which is a CANDLE-ONLY refusal, so
+    /// its row is still written to `ticks` and only the bogus bar is skipped.
+    /// Recovery keeps everything it could legitimately keep.
+    ///
+    /// Monotonic by construction: seeding can only ever raise the watermark,
+    /// so it can never re-open a day the aggregator has already moved past,
+    /// and calling it twice is harmless.
+    ///
+    /// # Complexity
+    ///
+    /// O(1) -- one compare and one store, no allocation.
+    pub fn seed_watermark_at_least(&mut self, secs: u32) {
+        self.watermark_secs = self.watermark_secs.max(secs);
+    }
+
     /// Snapshot of one instrument's open bucket for one timeframe, or `None`
     /// when the instrument has no slot.
     ///
@@ -1744,6 +1784,122 @@ mod tests {
         assert!(agg.watermark_secs() > 0);
         agg.reset_watermark();
         assert_eq!(agg.watermark_secs(), 0);
+    }
+
+    /// A seed may only ever RAISE the watermark.
+    ///
+    /// The monotonic half is what makes seeding safe to call unconditionally:
+    /// if it could lower the watermark, seeding after a day had already
+    /// advanced would re-open a closed day -- the exact hole it exists to shut.
+    #[test]
+    fn seeding_the_watermark_raises_it_but_never_lowers_it() {
+        let mut agg = MultiTfAggregator::default();
+        assert_eq!(agg.watermark_secs(), 0);
+
+        agg.seed_watermark_at_least(DAY);
+        assert_eq!(agg.watermark_secs(), DAY, "a seed above 0 must raise it");
+
+        agg.seed_watermark_at_least(DAY - 86_400);
+        assert_eq!(
+            agg.watermark_secs(),
+            DAY,
+            "a seed BELOW the current watermark must be ignored, not applied"
+        );
+
+        agg.seed_watermark_at_least(DAY);
+        assert_eq!(agg.watermark_secs(), DAY, "seeding twice is a no-op");
+    }
+
+    /// The defect this whole mechanism exists for, reproduced end to end.
+    ///
+    /// Boot replay is not day-scoped, so a segment deferred at yesterday's
+    /// shutdown reaches a FRESH aggregator the next morning. `consume_tick`
+    /// advances the watermark before it checks the stale-day gate, so the
+    /// first prior-day frame sets the value it is compared against and folds
+    /// into a bucket on a day that closed hours ago -- rebuilt from only the
+    /// deferred subset, then upserted over the complete bar by a candle dedup
+    /// key with no completeness column.
+    ///
+    /// Both halves are asserted, because either alone would be a false pass:
+    /// unseeded MUST fold (proving the defect is real and the test can see
+    /// it), seeded MUST refuse (proving the seed closes it).
+    #[test]
+    fn a_prior_day_replay_frame_folds_unseeded_and_is_refused_once_seeded() {
+        let yesterday_in_session = DAY - 86_400 + 33_300 + 60;
+        let today_start = DAY;
+
+        // --- unseeded: the defect ---------------------------------------
+        let mut unseeded = MultiTfAggregator::default();
+        let stats = unseeded.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, yesterday_in_session, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(
+            !stats.stale_trading_day,
+            "without a seed the first prior-day frame sets the very watermark \
+             it is checked against, so it passes -- this is the defect"
+        );
+        assert!(
+            unseeded.lookup(Feed::Dhan, 13, SEG_IDX).is_some(),
+            "and it takes a slot and opens a bucket on a day that already closed"
+        );
+        assert_eq!(
+            unseeded
+                .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
+                .expect("slot exists")
+                .bucket_start_ist_secs,
+            yesterday_in_session - (yesterday_in_session % 60),
+            "the bucket is dated on the closed day, which is what would upsert \
+             over that day's complete bar"
+        );
+
+        // --- seeded: the fix ---------------------------------------------
+        let mut seeded = MultiTfAggregator::default();
+        seeded.seed_watermark_at_least(today_start);
+        let stats = seeded.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, yesterday_in_session, 100.0, 1),
+            None,
+            |_, _, _, _, _| panic!("a prior-day replay frame must never seal a bar"),
+        );
+        assert!(
+            stats.stale_trading_day,
+            "seeded, the same frame must be refused as stale_trading_day"
+        );
+        assert!(
+            seeded.lookup(Feed::Dhan, 13, SEG_IDX).is_none(),
+            "and must not even take a slot -- the stale-day gate runs before \
+             slot allocation, so a prior-day replay cannot burn capacity"
+        );
+    }
+
+    /// The seed must not break the case boot replay is actually used for.
+    ///
+    /// The ordinary crash-restart replays SAME-DAY frames, and those must
+    /// still fold -- otherwise the fix would trade a rare corruption for a
+    /// daily loss of recovered bars, which is a worse bargain.
+    #[test]
+    fn a_same_day_replay_frame_still_folds_after_seeding() {
+        let mut agg = MultiTfAggregator::default();
+        agg.seed_watermark_at_least(DAY);
+
+        let stats = agg.consume_tick(
+            Feed::Dhan,
+            &tick(13, SEG_IDX, DAY + 33_300 + 60, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(
+            !stats.stale_trading_day,
+            "a same-day frame must pass the seeded gate"
+        );
+        assert!(
+            stats.folded(),
+            "and must fold normally -- the fix must not cost the ordinary \
+             crash-restart its recovered bars"
+        );
     }
 
     // -- the load-bearing behaviours ----------------------------------------

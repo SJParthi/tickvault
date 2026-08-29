@@ -125,3 +125,112 @@ fn the_flush_failure_message_does_not_tell_the_operator_to_avoid_restarting() {
     // will not run — where that is exactly true. Banning the phrase globally
     // would force a correct message to become a vague one.
 }
+
+/// The re-folded rows must be FLUSHED before their segments are archived.
+///
+/// # What this exists to stop
+///
+/// `confirm_replayed` moves the staged segments into `archive/`, which the
+/// next boot does not glob. Its own contract is to run "ONLY after the frames
+/// returned by `replay_all` have been durably re-captured into the live
+/// pipeline".
+///
+/// Moving the call next to the refold (2026-08-21) shrank that window from
+/// several thousand lines to one -- and left it OPEN, because folding writes
+/// into an in-memory ILP buffer and the drain that flushes it is not spawned
+/// until well below. "Durably re-captured" still meant "buffered", and the
+/// segments were archived on the strength of it. Die before the drain's first
+/// flush and those rows never reached the database while their raw bytes were
+/// filed where nothing looks again. Silent and permanent.
+///
+/// Ordering is the whole property, so this asserts POSITION, not presence: a
+/// flush that runs after the confirm closes nothing.
+#[test]
+fn the_refolded_rows_are_flushed_before_their_segments_are_archived() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_feed_stack.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+
+    // Comment-stripped so the long rationale above the call -- which names
+    // both symbols -- cannot satisfy an assertion about the CODE.
+    let code: String = src
+        .lines()
+        .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let refold_at = code
+        .find("refold_wal_frames(&mut ingest")
+        .expect("the boot refold call site must exist");
+    let tail = &code[refold_at..];
+
+    let flush_at = tail.find("ingest.flush()").expect(
+        "the re-folded rows must be flushed after the refold -- without \
+                 it `confirm_replayed` archives segments whose rows are still \
+                 only in the ILP buffer",
+    );
+    let confirm_at = tail
+        .find("confirm_replayed(")
+        .expect("the confirm must follow the refold");
+
+    assert!(
+        flush_at < confirm_at,
+        "the flush must run BEFORE confirm_replayed. Flushing afterwards \
+         closes nothing: the segments are already in `archive/`, where the \
+         next boot does not look, by the time the rows reach the database."
+    );
+}
+
+/// The refold must not fold into a void when the seal writer is absent.
+///
+/// Boot ordering here holds today only TRANSITIVELY: `run_dhan_feed_stack`
+/// parks in the token-manager wait, which cannot complete until an SSM read, a
+/// TOTP computation and an HTTPS round trip have finished, by which time
+/// `main` is long past `spawn_seal_writer_loop`. That is a race won by a wide
+/// margin, not an ordering — and a race won by a margin is exactly the shape
+/// that breaks silently when either side moves.
+///
+/// What makes the silent version unrecoverable is the pairing: a seal produced
+/// with no sender installed has no absorption tier to fall into (the ring
+/// lives inside `SealWriterRunner`), so it is recorded lost — AND the refold
+/// then confirms the segments, archiving the only copy of the frames that
+/// produced it. Refusing instead leaves the segments in `replaying/`, so the
+/// next boot re-stages them.
+#[test]
+fn the_refold_refuses_to_fold_when_the_seal_writer_is_not_installed() {
+    let source = include_str!("../src/dhan_feed_stack.rs");
+    let refold_at = source
+        .find("let outcome = refold_wal_frames(")
+        .expect("the WAL refold call site must exist");
+    let head = &source[..refold_at];
+    let check_at = head.rfind("global_seal_sender().is_some()").expect(
+        "the refold must check that the seal writer is installed BEFORE it folds — \
+             without it, a boot that reaches the refold early loses every recovered \
+             candle AND archives the frames that produced them",
+    );
+    let refuse_at = head.rfind("seal_writer_missing").expect(
+        "the not-ready branch must report the frames as unfolded, so the segments stay \
+         unconfirmed and the next boot re-stages them",
+    );
+    assert!(
+        check_at < refuse_at,
+        "the readiness check must precede the refusal it guards"
+    );
+    assert!(
+        source.contains(
+            "report_unfolded_wal_frames(&params.wal_replay_live_feed, \"seal_writer_missing\")"
+        ),
+        "the refusal must route through report_unfolded_wal_frames — silently skipping \
+         the refold would leave the operator with no record that recovery was deferred"
+    );
+    // The refusal must not also confirm: confirming archives the segments,
+    // which is the half that makes the loss permanent.
+    let confirm_at = source
+        .find("ws_frame_spill::confirm_replayed")
+        .expect("the confirm call must exist");
+    assert!(
+        refuse_at < confirm_at,
+        "the refusal branch must sit ABOVE the confirm, so a refused refold cannot \
+         archive the segments it declined to read"
+    );
+}
