@@ -793,6 +793,27 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
             "http://{}:{}/exec?query={}",
             questdb.host, questdb.http_port, WAL_TABLES_QUERY_URLENCODED
         );
+        // Seed every probe-failure reason before the first poll.
+        //
+        // This watcher feeds `tv_questdb_wal_suspended_tables`, which HAS a
+        // live alarm. Rule §2.3h shipped this counter specifically so that
+        // alarm is not "alarming a lie" — a gauge reading a confident 0 while
+        // its producer fails open. A 2026-08-29 sweep found the counter itself
+        // had never published: the agent drops the first sample of an unseen
+        // series, so the first probe failure — the one that makes the gauge
+        // untrustworthy — was guaranteed invisible.
+        //
+        // All five reasons, because the delta is computed per LABEL SET.
+        for reason in [
+            "http",
+            "status",
+            "parse",
+            "missing_column",
+            "all_rows_skipped",
+        ] {
+            metrics::counter!("tv_wal_suspension_probe_failed_total", "reason" => reason)
+                .increment(0);
+        }
         info!(
             interval_secs = WAL_SUSPENSION_POLL_INTERVAL_SECS,
             "WAL-suspension watcher started (per-table wal_tables() probe)"

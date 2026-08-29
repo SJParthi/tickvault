@@ -857,6 +857,34 @@ impl DhanSocketParams {
             )
             .increment(0);
         }
+        // The two sibling families in this file, seeded here for the same
+        // reason and found by the 2026-08-29 adversarial sweep AFTER the
+        // subscribe family above was already fixed. Both carry LIVE CloudWatch
+        // alarms, so an unseeded first episode is an alarm that cannot fire on
+        // the occurrence that matters.
+        //
+        // dial_failed: the socket never opened at all. On a cold 08:30 boot
+        // this is the FIRST thing that can go wrong and the first sample is
+        // exactly the one the agent discards.
+        for reason in ["bad_url", "connect", "no_token", "timeout", "tls_config"] {
+            metrics::counter!(
+                DIAL_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
+        // frame_refused: the read path rejected a frame. `oversize` means a
+        // frame larger than this endpoint's cap — silent tick loss with the
+        // socket still up.
+        for reason in ["oversize", "transport"] {
+            metrics::counter!(
+                FRAME_REFUSED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
         Self {
             endpoint,
             base_url,

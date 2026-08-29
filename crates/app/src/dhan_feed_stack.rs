@@ -2733,6 +2733,24 @@ fn seed_drain_loss_baselines() {
     // same operator action: check the spill directory before the next session.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(0);
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth").increment(0);
+    // ADDED 2026-08-29 by an adversarial sweep of the FIRST pass of this fix.
+    // Both carry LIVE CloudWatch alarms and both were still unseeded, so the
+    // alarm could not fire on the first episode — the one that matters.
+    //
+    // seals_dropped: a sealed candle that no tier accepted. Its two siblings
+    // (emitted, rescued) are seeded elsewhere; seeding the healthy pair while
+    // leaving the LOSS one dark is the worst of the three arrangements.
+    c.seals_dropped.increment(0);
+    // ingest_refused: a decoded tick the aggregator would not fold. ALL FOUR
+    // reasons, because the CloudWatch agent computes its delta per LABEL SET —
+    // seeding one reason leaves the other three exactly as blind as before,
+    // and a partially-seeded family is a partial blind spot wearing the
+    // appearance of a fix. Seeded through the DrainCounters handles the drain
+    // already owns, so the ownership guard sees them as drain-owned.
+    c.refused_price.increment(0);
+    c.refused_timestamp.increment(0);
+    c.refused_slot.increment(0);
+    c.refused_session.increment(0);
 }
 
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
@@ -5035,10 +5053,28 @@ impl DepthIngest {
                 "depth rows were still held by the producer at shutdown because the writer \
                  queue was full — rescued to the depth spill tier, see the preceding coded line"
             );
-            // Close the rescue queue AFTER the tail rescue above may have used
-            // it. Leaves the writer inline, so a later rescue still reaches disk.
-            self.writer.close_rescue_offload();
         }
+        // Close the rescue queue AFTER the tail rescue above may have used it.
+        // Leaves the writer inline, so a later rescue still reaches disk.
+        //
+        // UNCONDITIONAL, and that is the whole point — it sat inside the
+        // `dropped > 0` arm until 2026-08-29, while the tick twin
+        // (`close_offload_queues`) has always closed unconditionally.
+        //
+        // Dropping the sender is the ONLY thing that turns the rescue thread's
+        // blocking `recv` into a clean exit. On the NORMAL shutdown — nothing
+        // pending, which is every healthy weekday 17:30 — the guard skipped
+        // this call, the `tv-depth-rescue` thread blocked in `recv` forever,
+        // `shutdown_rescue_writer` spun to the shared deadline, and then fired
+        // a coded HOT-PATH-02 error announcing that rescued levels "may never
+        // have reached the depth spill file" and are "not in QuestDB either".
+        //
+        // Nothing had been lost. It was a fabricated loss report, every
+        // trading day, plus the shutdown budget burned waiting for a thread
+        // that could never finish. A false alarm on a loss path is not the
+        // harmless direction: it is what teaches an operator to disbelieve the
+        // one line that will one day be true.
+        self.writer.close_rescue_offload();
     }
 
     /// Waits for the depth rescue thread to finish its queue.

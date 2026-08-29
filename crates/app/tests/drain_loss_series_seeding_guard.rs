@@ -96,11 +96,41 @@ fn the_seed_is_not_hoisted_into_a_boot_wide_seeder() {
     let body = function_body(STACK, "fn seed_drain_loss_baselines()");
     let seeds = body.matches("increment(0)").count();
     assert!(
-        (1..=8).contains(&seeds),
-        "seed_drain_loss_baselines() seeds {seeds} series. It is scoped to counters \
-         the DRAIN owns; a large count means unrelated subsystems were folded in, \
-         which publishes health for components that may not be running."
+        seeds >= 1,
+        "seed_drain_loss_baselines() seeds nothing — the drain's loss series are \
+         back to being indistinguishable from a drain that never ran"
     );
+
+    // Test OWNERSHIP, not COUNT.
+    //
+    // This assertion was `(1..=8).contains(&seeds)` until 2026-08-29, and an
+    // adversarial audit was right to call it an anti-ratchet: the intent was to
+    // stop unrelated subsystems being folded in, but the mechanism it chose
+    // punished the CORRECT fix. Seeding more of the drain's own alarmed
+    // counters — exactly what this file argues for — would have failed the very
+    // guard that argues for it, and the cheapest way out would have been to
+    // raise the number, which is how a guard stops meaning anything.
+    //
+    // A cap is a proxy for ownership. Ownership is directly checkable, so
+    // check it: every seeded series must be a `DrainCounters` field or a
+    // constant declared in this same file. A counter belonging to another
+    // subsystem is neither, and folding one in still fails — while the drain
+    // may seed as many of its own as it owns.
+    for line in body.lines().filter(|l| l.contains("increment(0)")) {
+        let owned_field = line.contains("c.");
+        let owned_const = line
+            .split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .filter(|tok| tok.len() > 8 && tok.contains('_'))
+            .any(|tok| STACK.contains(&format!("const {tok}:")));
+        assert!(
+            owned_field || owned_const,
+            "seed_drain_loss_baselines() seeds a series the drain does not own:\n  \
+             {}\nEvery seed must name a DrainCounters field or a constant declared \
+             in dhan_feed_stack.rs. Seeding another subsystem's counter here \
+             publishes a confident zero for work this drain does not do.",
+            line.trim()
+        );
+    }
 }
 
 #[test]
