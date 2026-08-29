@@ -171,3 +171,82 @@ fn guard_self_test_comment_stripping_actually_bites() {
     assert!(!stripped.contains("run_ws_connection_rollup"));
     assert!(stripped.contains("let x = 1;"));
 }
+
+// ---------------------------------------------------------------------------
+// The per-TABLE storage measurement shares this guard file, because it shares
+// the failure mode: it writes its own table, nothing else reads it, and every
+// other test in the workspace would stay green if its one call site vanished.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_daily_scoreboard_actually_measures_per_table_storage() {
+    let src = strip_line_comments(&read("crates/app/src/feed_scoreboard_boot.rs"));
+    assert!(
+        src.contains("table_storage_rollup::run_table_storage_rollup"),
+        "run_feed_scoreboard no longer calls run_table_storage_rollup — per-table \
+         disk attribution silently returns to being DERIVED from row widths, and \
+         nothing else would fail: no other code reads that table."
+    );
+}
+
+#[test]
+fn the_storage_rollup_is_registered_as_a_module() {
+    let src = read("crates/app/src/lib.rs");
+    assert!(
+        src.contains("pub mod table_storage_rollup;"),
+        "the storage rollup module is not declared — it would not compile in"
+    );
+}
+
+#[test]
+fn the_storage_rollup_can_never_fail_the_scoreboard() {
+    let src = strip_line_comments(&read("crates/app/src/feed_scoreboard_boot.rs"));
+    let before: String = src
+        .split("table_storage_rollup::run_table_storage_rollup")
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .rev()
+        .take(80)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    assert!(
+        before.contains("let _ ="),
+        "the storage rollup's result must be discarded at the call site so it can \
+         never short-circuit run_feed_scoreboard; found instead: ...{before}"
+    );
+    // Window-bounded for the same reason as the connection rollup's check: an
+    // end-of-file scan sweeps in the crate's own test module and fails on prose.
+    let call: String = src
+        .split("table_storage_rollup::run_table_storage_rollup")
+        .nth(1)
+        .expect("call site")
+        .chars()
+        .take(300)
+        .collect();
+    assert!(
+        !call.contains('?'),
+        "the storage rollup call must not propagate with `?` — a measurement \
+         failure would abort the verdict it only annotates"
+    );
+}
+
+#[test]
+fn an_unreadable_table_is_recorded_unmeasured_never_as_zero_bytes() {
+    // The discipline the whole module exists for: "we could not read it" and
+    // "it takes no space" are different facts, and only one of them is safe to
+    // infer from silence.
+    let src = strip_line_comments(&read("crates/app/src/table_storage_rollup.rs"));
+    assert!(
+        src.contains("storage_row(table, probe, day_ist_midnight_nanos)"),
+        "every table must go through storage_row, which turns an unreadable \
+         probe into an unmeasured row with sentinels rather than a zero"
+    );
+    assert!(
+        src.contains("table_storage_no_disk_size_column"),
+        "a response carrying no `diskSize` column must be reported — otherwise \
+         every future measurement is blind and nothing says so"
+    );
+}

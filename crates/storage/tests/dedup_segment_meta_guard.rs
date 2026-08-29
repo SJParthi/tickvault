@@ -386,7 +386,19 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
 // lane (`dhan`/`groww`), so a Dhan and a Groww event for the same minute are
 // already DISTINCT rows via `lane` (which is in the key). Adding a redundant
 // `feed` column would duplicate `lane` under a second name.
-const FEED_NOT_APPLICABLE_KEYS: &[&str] = &["DEDUP_KEY_CROSS_FILL_AUDIT"];
+// 2026-08-29 (per-table disk-footprint measurement): `table_storage_daily` is
+// exempt because its measured ENTITY is a QuestDB table, not a feed. One row
+// records how many bytes `market_depth` occupies on disk — and `market_depth`
+// holds rows from every feed at once, so its footprint is not divisible by
+// feed and never will be. The obvious "fix" of adding a `feed` column would
+// mean either writing the SAME byte count once per feed (a total that
+// multiplies when summed — worse than no column) or inventing a per-feed
+// attribution QuestDB does not expose. `table_name` IS the identity here, and
+// it is in the key.
+const FEED_NOT_APPLICABLE_KEYS: &[&str] = &[
+    "DEDUP_KEY_CROSS_FILL_AUDIT",
+    "DEDUP_KEY_TABLE_STORAGE_DAILY",
+];
 
 #[test]
 fn every_persisted_table_dedup_key_must_include_feed() {
