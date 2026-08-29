@@ -74,6 +74,10 @@ on:
         description: 'Plan only, skip apply even on main. Type "yes" to skip.'
         required: false
         default: 'no'
+      force_unlock_lock_id:
+        description: 'DANGER: terraform force-unlock this state lock ID before planning. Leave EMPTY unless an ORPHANED lock from a killed run is blocking every terraform operation. Never use while an apply is genuinely running.'
+        required: false
+        default: ''
 
 concurrency:
   # PRs get their OWN per-branch group; every apply-capable event keeps the
@@ -333,6 +337,40 @@ jobs:
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=tv-terraform-locks" \
             -backend-config="encrypt=true"
+
+      # ------------------------------------------------------------------
+      # Stale-lock escape hatch (added 2026-08-29).
+      #
+      # A run killed mid-plan never releases its DynamoDB state lock, and
+      # nothing expires it, so ONE orphan blocks EVERY terraform operation in
+      # this repository. That is not hypothetical: lock
+      # 6f621e38-9bed-3c51-1c28-d1b7a513ca74 was created 2026-08-28 19:31:08Z
+      # by a cancelled run and blocked five consecutive runs across two days.
+      # The only documented remedy was "a human runs force-unlock manually",
+      # which is exactly why it stayed stuck through a weekend.
+      #
+      # The CAUSE is already fixed by `cancel-in-progress: false` above. This
+      # is the REMEDY for a lock that is already orphaned.
+      #
+      # Deliberately narrow, so it can never fire by accident:
+      #   * workflow_dispatch ONLY — never a push, a PR or a schedule
+      #   * empty by default — doing nothing is the default behaviour
+      #   * the exact lock ID must be typed in; terraform itself refuses a
+      #     mismatched id, so this cannot release a lock it was not aimed at
+      # Applies already serialise on the terraform-apply-prod concurrency
+      # group, so this cannot race a real apply.
+      # ------------------------------------------------------------------
+      - name: Force-unlock an orphaned state lock (opt-in, dispatch only)
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.force_unlock_lock_id != ''
+        env:
+          LOCK_ID: ${{ github.event.inputs.force_unlock_lock_id }}
+        run: |
+          set -euo pipefail
+          echo "::warning::force-unlock requested for state lock ${LOCK_ID}"
+          terraform -chdir=${{ env.TF_DIR }} force-unlock -force "${LOCK_ID}"
+          echo "state lock ${LOCK_ID} released; plan will now acquire its own"
 
       - name: terraform validate
         run: terraform -chdir=${{ env.TF_DIR }} validate
