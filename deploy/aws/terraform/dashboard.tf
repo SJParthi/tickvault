@@ -963,6 +963,62 @@ resource "aws_cloudwatch_dashboard" "operator" {
           ]
           period = 300
         }
+      },
+      {
+        type   = "metric"
+        x      = 6
+        y      = 92
+        width  = 6
+        height = 6
+        properties = {
+          # ADDED 2026-08-29. The producer-side durable tier for sealed
+          # candles came off the frame drain on 2026-08-28 and not one of its
+          # counters reached CloudWatch, so the tier could degrade or fail in
+          # complete silence.
+          #
+          # Read the lines in this order:
+          #
+          #   "handed to the writer thread"  the healthy path. Non-zero is FINE
+          #                                  and expected under load; it means
+          #                                  overflow is being absorbed off the
+          #                                  drain, which is the whole point.
+          #
+          #   "FELL BACK to writing inline"  the regression line. Non-zero means
+          #                                  the hand-off queue was full or its
+          #                                  thread is gone, so disk writes are
+          #                                  back ON the frame drain -- exactly
+          #                                  what the offload exists to prevent.
+          #                                  Lossless, but the stall it causes is
+          #                                  how Dhan's skip-forward drops ticks
+          #                                  upstream, invisibly.
+          #
+          #   "refused by BOTH disk tiers"   real permanent loss of that candle.
+          #                                  Already pages via AGGREGATOR-DROP-01
+          #                                  (the thread's on_lost callback), so
+          #                                  this line is the trend, not the
+          #                                  alarm.
+          #
+          #   "abandoned at shutdown"        the queue still held records when
+          #                                  the join budget expired. Those are
+          #                                  gone.
+          #
+          #   "spill write errors"           the first disk tier failing.
+          #
+          # NOT alarmed, deliberately: the first line is non-zero on a healthy
+          # busy day, the third already pages, and a family of five pagers for
+          # one subsystem trains an operator to ignore all five.
+          title  = "Sealed-candle overflow: is the off-drain rescue still working"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_seal_escalation_queued_total", { label = "handed to the writer thread (healthy)", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_escalation_inline_fallback_total", { label = "FELL BACK to writing inline on the drain", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_escalation_lost_total", { label = "refused by BOTH disk tiers (permanent)", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_escalation_abandoned_total", { label = "abandoned at shutdown", stat = "Sum" }],
+            [local.dash_namespace, "tv_seal_spill_write_errors_total", { label = "spill write errors", stat = "Sum" }]
+          ]
+          period = 300
+        }
       }
     ]
   })
