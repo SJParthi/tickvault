@@ -61,6 +61,40 @@ pub const MAX_PENDING_ROWS: usize = 100_000;
 /// entries to say the same thing.
 pub const PENDING_DISCARDED_COUNTER: &str = "tv_ilp_rows_discarded_total";
 
+/// Put this writer's discard series on the wire at zero, from its constructor.
+///
+/// # Why a call is needed at all — measured, not assumed
+///
+/// A `cloudwatch list-metrics` sweep on 2026-08-29 compared the EMF selector
+/// against the live account: the selector names 104 metrics, the account held
+/// 86, and `tv_ilp_rows_discarded_total` was among the names that had **never
+/// published a single datapoint** — despite being selected, and therefore paid
+/// for, the whole time.
+///
+/// The mechanism is worth stating exactly. The CloudWatch agent computes a
+/// counter as the delta between consecutive samples and drops the first sample
+/// of a series it has never seen, so a counter that is only touched when
+/// something breaks is *born at the breakage* and its first — and possibly
+/// only — episode is the sample that gets discarded. Worse, **an absent series
+/// is indistinguishable from a healthy zero one**: "no audit rows were ever
+/// discarded" and "this writer never ran" render identically, and an alarm
+/// over the metric would sit in `OK` forever without ever being able to fire.
+///
+/// # Why each writer calls it, when the label folds anyway
+///
+/// The EMF processor folds label values into one summed series per host, so
+/// any single call would make the NAME visible. Each writer still seeds its
+/// own label, because the label survives in the log line where triage reads
+/// it, and because seeding from a writer's own constructor is what keeps the
+/// series honest: it appears when that writer exists and not before. A central
+/// boot-time seeder would publish a confident zero for a writer that is not
+/// running, which is a worse false-OK than the silence it replaces.
+/// `pub(crate)`, not `pub`: every caller is a writer inside this crate, so this
+/// is internal plumbing rather than public API surface.
+pub(crate) fn register_overflow_baseline(table: &'static str) {
+    metrics::counter!(PENDING_DISCARDED_COUNTER, "table" => table).increment(0);
+}
+
 /// Call from a writer's flush-failure arm. Returns the number of rows
 /// discarded — `0` in the normal case, where the rows are retained for the
 /// next attempt.
@@ -198,5 +232,47 @@ mod tests {
         let mut pending = 0usize;
         assert_eq!(discard_if_overflowing(&mut buffer, &mut pending, "t"), 0);
         assert_eq!(pending, 0);
+    }
+
+    /// The seeder must be safe to call repeatedly and from several writers.
+    ///
+    /// This is a real property, not a formality: five writers call it from
+    /// their own constructors, a process can build more than one of them, and
+    /// nothing coordinates the order. It must therefore never panic and never
+    /// depend on being the first caller. With no recorder installed — the
+    /// state under `cargo test` — `metrics::counter!` resolves to a no-op
+    /// recorder, so this also pins that seeding cannot fault a test binary or
+    /// a boot that runs before the exporter is installed.
+    #[test]
+    fn register_overflow_baseline_is_repeatable_and_never_panics() {
+        register_overflow_baseline("ws_event_audit");
+        register_overflow_baseline("ws_event_audit");
+        for table in [
+            "ws_connection_daily",
+            "feed_scoreboard_daily",
+            "table_storage_daily",
+            "feed_episode_audit",
+        ] {
+            register_overflow_baseline(table);
+        }
+    }
+
+    /// A seed is an `increment(0)`, and it must stay one.
+    ///
+    /// An `increment(1)` here would publish a fabricated discard on every
+    /// writer construction — turning the instrument that reports row loss into
+    /// a source of it. Cheap to assert, and the failure it prevents is silent.
+    #[test]
+    fn the_baseline_seeds_with_zero_not_a_fabricated_count() {
+        let source = include_str!("ilp_overflow.rs");
+        let start = source
+            .find("pub(crate) fn register_overflow_baseline(")
+            .expect("the seeder must exist");
+        let body = &source[start..(start + 260).min(source.len())];
+        assert!(
+            body.contains(".increment(0)"),
+            "register_overflow_baseline must seed with increment(0); anything else \
+             publishes a discard that never happened"
+        );
     }
 }

@@ -334,6 +334,9 @@ impl WsConnectionDailyWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seeded here so an absent discard series can never read as a healthy
+        // zero — see `ilp_overflow::register_overflow_baseline`.
+        crate::ilp_overflow::register_overflow_baseline("ws_connection_daily");
         let conf = ws_connection_daily_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

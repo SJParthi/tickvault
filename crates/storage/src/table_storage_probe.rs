@@ -356,6 +356,9 @@ impl TableStorageDailyWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); append/flush covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seeded here so an absent discard series can never read as a healthy
+        // zero — see `ilp_overflow::register_overflow_baseline`.
+        crate::ilp_overflow::register_overflow_baseline(TABLE_STORAGE_DAILY_TABLE);
         let conf = format!("http::addr={}:{};", config.host, config.http_port);
         match Sender::from_conf(&conf) {
             Ok(s) => {

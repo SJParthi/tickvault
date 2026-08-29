@@ -160,3 +160,115 @@ fn register_fake_baseline(feed: Feed) {
          function that never seeds pass this guard"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08-29 — the same fault, found one level up by a live sweep.
+//
+// `cloudwatch list-metrics` against the account, compared with the EMF
+// selector: the selector names 104 metrics, the account held 86, and 34
+// selected names had NEVER published a single datapoint. They are selected,
+// therefore paid for, and invisible.
+//
+// The mechanism is the one this file already documents, so the tests below are
+// the same rule applied to the subsystems the original pass missed: a counter
+// only touched when something breaks is born at the breakage, the agent drops
+// the first sample of a series it has never seen, and an ABSENT series reads
+// exactly like a healthy zero one.
+// ---------------------------------------------------------------------------
+
+/// Every seal-escalation series must be seeded when the escalation subsystem
+/// is installed. All four had never published before this landed.
+#[test]
+fn every_seal_escalation_series_is_seeded_when_the_subsystem_is_installed() {
+    let source = include_str!("../src/seal_writer_runner.rs");
+    let seeded = seeded_series_in(source, "fn register_escalation_baseline()");
+
+    for required in [
+        "tv_seal_escalation_lost_total",
+        "tv_seal_escalation_abandoned_total",
+        "tv_seal_escalation_queued_total",
+        "tv_seal_escalation_inline_fallback_total",
+    ] {
+        // The consts are referenced by NAME in the seeder, so assert on the
+        // const identifier the seeder actually uses, not the string literal.
+        let konst = match required {
+            "tv_seal_escalation_lost_total" => "SEAL_ESCALATION_LOST_COUNTER",
+            "tv_seal_escalation_abandoned_total" => "SEAL_ESCALATION_ABANDONED_COUNTER",
+            "tv_seal_escalation_queued_total" => "SEAL_ESCALATION_QUEUED_COUNTER",
+            _ => "SEAL_ESCALATION_INLINE_FALLBACK_COUNTER",
+        };
+        assert!(
+            seeded.contains(konst) || source.contains(&format!("counter!({konst}).increment(0)")),
+            "{required} ({konst}) is not seeded in register_escalation_baseline. An \
+             unseeded loss series is indistinguishable from a healthy zero one, and an \
+             alarm over it can never fire."
+        );
+    }
+}
+
+/// The seeder existing is worth nothing if nothing calls it — that is the
+/// shape of the defect itself, one level up.
+#[test]
+fn the_escalation_seeder_is_called_where_the_subsystem_is_installed() {
+    let source = include_str!("../src/seal_writer_runner.rs");
+    let start = source
+        .find("pub fn split_escalation_offload(")
+        .expect("split_escalation_offload must exist");
+    let body = &source[start..(start + 700).min(source.len())];
+    assert!(
+        body.contains("register_escalation_baseline()"),
+        "split_escalation_offload does not seed. It is the ONE place the escalation \
+         subsystem is installed, so it is the only place the seed belongs: seeding at \
+         boot instead would publish a confident zero for a subsystem that is not \
+         running, which is a worse false-OK than silence."
+    );
+}
+
+/// Generalizable: any writer that can DISCARD rows must also seed its discard
+/// series. This is the durable half — it fails the build for a writer that
+/// does not exist yet.
+#[test]
+fn every_ilp_writer_that_can_discard_also_seeds_its_discard_series() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut unseeded = Vec::new();
+    let mut checked = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("storage/src must be readable") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("source must be readable");
+        // The definition and its own unit tests live in ilp_overflow.rs; it is
+        // the provider, not a consumer.
+        if path.file_name().and_then(|n| n.to_str()) == Some("ilp_overflow.rs") {
+            continue;
+        }
+        if !source.contains("discard_if_overflowing(") {
+            continue;
+        }
+        checked += 1;
+        if !source.contains("register_overflow_baseline(") {
+            unseeded.push(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+    }
+
+    assert!(
+        checked >= 5,
+        "only {checked} ILP writers were scanned — the discovery scan is broken and \
+         this test would pass vacuously"
+    );
+    assert!(
+        unseeded.is_empty(),
+        "these writers can discard rows but never seed their discard series, so an \
+         absent reading is indistinguishable from a clean one: {unseeded:?}. Call \
+         ilp_overflow::register_overflow_baseline(<table>) from the writer's own \
+         constructor — not from a boot-wide seeder, which would publish a confident \
+         zero for a writer that is not running."
+    );
+}
