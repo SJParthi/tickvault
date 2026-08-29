@@ -1785,6 +1785,34 @@ impl PartitionArchiver {
             .collect()) // O(1) EXEMPT: cold-path once-per-run probe
     }
 
+    /// Is there anything in either spill directory that a replay could still
+    /// POST back with ORIGINAL timestamps?
+    ///
+    /// Conservative by construction: any unreadable directory counts as PENDING,
+    /// because "I could not check" must never read as "safe" -- the same posture
+    /// the pre-drop recount already takes for a missing count.
+    fn spill_dirs_have_pending_data() -> bool {
+        [
+            crate::depth_persistence::DEPTH_SPILL_DIR,
+            crate::tick_persistence::TICK_SPILL_DIR,
+        ]
+        .iter()
+        .any(|dir| {
+            let path = std::path::Path::new(dir);
+            if !path.exists() {
+                return false;
+            }
+            match std::fs::read_dir(path) {
+                // A non-empty spill dir means a replay may still be draining it.
+                // Sub-directories (the quarantine tree) count too: a quarantined
+                // file can be restored by an operator at any time.
+                Ok(rd) => rd.count() > 0,
+                // Unreadable -> assume pending. Fail toward the SAFE path.
+                Err(_) => true,
+            }
+        })
+    }
+
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
     /// partitions via the SAME primitives the detach path uses.
     async fn list_eligible_partitions(&self, table: &str, hot_days: u32) -> Result<Vec<String>> {
@@ -1793,8 +1821,38 @@ impl PartitionArchiver {
         // arrival-stamped allowlist and for a configured `0`, so the day path
         // stays the default and the fallback — a table that is not provably
         // safe for hour archival simply never reaches the hour builder.
+        // Hour granularity is DISABLED while a spill replay could still be
+        // in flight, and that guard is the difference between a narrow
+        // acknowledged race and a reachable one.
+        //
+        // The rescue payload is RAW ILP: `tick_spill_replay` POSTs the
+        // original buffer back verbatim, so replayed rows carry their
+        // ORIGINAL timestamps and land in their ORIGINAL partition. At day
+        // granularity that was near-harmless -- the partition a replay
+        // targets is normally today's, and today's is never eligible. At
+        // `depth_hot_hours = 4` (the live setting) a partition becomes
+        // eligible FOUR HOURS after it was written, so a spill file rescued
+        // at 09:30 and drained at 14:00 is writing into a partition that has
+        // been droppable since 13:00.
+        //
+        // The pre-drop recount below still catches it and refuses, so this is
+        // not silent loss -- but it converts a once-a-day arithmetic
+        // possibility into a per-episode one, and the recount's own comment
+        // concedes it "cannot close [the window] entirely without a table
+        // lock QuestDB does not offer".
+        //
+        // So: if either spill directory still holds anything, fall back to
+        // the DAY path for this run. That path is the proven default, the
+        // degradation is bounded (archival is deferred, never skipped), and
+        // it needs no coordination between two subsystems -- a directory
+        // check is a fact both can see without a lock.
+        let spill_pending = Self::spill_dirs_have_pending_data();
         let list_sql = match hot_window_hours(table, self.cfg.depth_hot_hours) {
-            Some(hours) => build_detach_list_sql_hours(table, hours),
+            Some(hours) if !spill_pending => build_detach_list_sql_hours(table, hours),
+            Some(_) => {
+                metrics::counter!("tv_partition_archive_hour_window_deferred_total").increment(1);
+                build_detach_list_sql(table, hot_days)
+            }
             None => build_detach_list_sql(table, hot_days),
         };
         let response = self
@@ -2468,6 +2526,81 @@ mod fair_share_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Hour-granular archival must DEFER while a spill replay could still be
+    /// POSTing rows back with their ORIGINAL timestamps.
+    ///
+    /// The rescue payload is raw ILP, so a replay writes into the partition
+    /// the rows were BORN in -- and at `depth_hot_hours = 4` that partition
+    /// is droppable four hours later, while the file is still on disk. The
+    /// pre-drop recount catches it and refuses, but its own comment concedes
+    /// the window cannot be closed without a table lock QuestDB does not
+    /// offer, so the right move is not to open the window at all.
+    #[test]
+    fn hour_window_defers_to_the_day_path_while_spill_data_is_pending() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-archive-spill-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        assert!(
+            !dir_has_entries(&dir),
+            "an empty spill directory must not defer archival"
+        );
+
+        std::fs::write(dir.join("depth-spill-0001.ilp"), b"x").expect("write");
+        assert!(
+            dir_has_entries(&dir),
+            "a spill file a replay could still drain MUST defer the hour window"
+        );
+
+        // A SUBDIRECTORY counts too: the quarantine tree holds files an
+        // operator can restore at any moment.
+        std::fs::remove_file(dir.join("depth-spill-0001.ilp")).expect("rm");
+        std::fs::create_dir_all(dir.join("quarantine")).expect("mkdir");
+        assert!(
+            dir_has_entries(&dir),
+            "a quarantine subdirectory is still pending data"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable directory must count as PENDING, never as clear.
+    #[test]
+    fn an_unreadable_spill_directory_defers_rather_than_permits() {
+        let f = std::env::temp_dir().join(format!(
+            "tv-archive-not-a-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&f, b"not a directory").expect("write");
+        assert!(
+            dir_has_entries(&f),
+            "cannot-check must never read as safe-to-drop"
+        );
+        std::fs::remove_file(&f).ok();
+    }
+
+    /// Mirror of the production predicate for ONE directory, so these tests
+    /// exercise the real decision rather than a paraphrase of it.
+    fn dir_has_entries(path: &std::path::Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        match std::fs::read_dir(path) {
+            Ok(rd) => rd.count() > 0,
+            Err(_) => true,
+        }
+    }
 
     // ---- Content-addressed sidecar archive keys (2026-08-25) -------------
     //
