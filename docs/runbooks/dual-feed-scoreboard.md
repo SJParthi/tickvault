@@ -77,6 +77,94 @@ persisted in `feed_episode_audit` with their `ws_type` for forensics but
 are EXCLUDED from the Dhan-vs-Groww comparison (a dead-token day once put
 39+ order-update drops on Dhan's card while its market feed was perfect).
 
+
+`ws_connection_daily` — DEDUP
+`(ts, trading_date_ist, feed, ws_type, connection_index)`; `ts` is the
+DETERMINISTIC trading-date IST-midnight stamp, so re-runs UPSERT in place.
+**Added 2026-08-29** on the operator directive to monitor disconnects and
+reconnects *per connection, per day*.
+
+This is the row that answers **"did connection 7 drop today?"** in ONE keyed
+read. `feed_scoreboard_daily` above cannot: it sums all sixteen sockets into
+one row per feed, so a single bad connection is invisible in a healthy total.
+The evidence always existed per connection in `ws_event_audit` and
+`feed_episode_audit` — what did not exist was a daily verdict at that grain,
+so the question meant scanning a day of events and grouping by hand.
+
+| Column group | Columns | Notes |
+|---|---|---|
+| Identity | `feed`, `ws_type`, `connection_index`, `pool_size` | The I-P1-11 composite connection key, identical to `ws_event_audit` / `feed_episode_audit`, so the three join without translation. `pool_size` is the largest seen that day — a truncated row can never shrink it below the real pool |
+| Raw events (from `ws_event_audit`) | `connects`, `reconnects`, `disconnect_events` | Counted from lifecycle rows. `disconnect_events` includes off-hours disconnects. `sleep_entered` / `sleep_resumed` set `saw_any_event` but count as NO disconnect — the scheduled post-close sleep is not an incident |
+| Classified incidents (from `feed_episode_audit`) | `disconnects_market`, `disconnects_off_hours`, `stalls`, `restarts`, `blame_broker`, `blame_ours`, `blame_indeterminate` | Folded through the SAME `fold_episode_into_tally` the daily scoreboard uses, so the two can never disagree about what counts as an incident |
+| Downtime | `total_down_secs`, `max_down_secs`, `total_attempts`, `max_attempts` | From `reconnected` rows. `max_*` is the WORST single episode, not the last one — a reconnect storm shows up in `max_attempts` |
+| Honesty | `saw_any_event`, `clean_day` | See below — these two are the point |
+
+**`saw_any_event` vs `clean_day` — read them together, never separately.**
+A connection that ran all day without incident MUST still get a row, or "no
+row" would be ambiguous between *healthy*, *never started*, and *the rollup
+did not run*. So:
+
+- `saw_any_event = true, clean_day = true` → the connection was up and had a
+  clean day. This is the good state.
+- `saw_any_event = true, clean_day = false` → it had at least one incident;
+  the incident columns say which.
+- `saw_any_event = false` → **the connection produced no lifecycle event at
+  all.** `clean_day` is FALSE by construction here even though every count is
+  zero. This is a finding, not health: it means classified incidents exist for
+  a socket that never appeared in the event table, i.e. the two tables
+  disagree about whether it existed. The daily run also raises a coded
+  `SCOREBOARD-01` line naming the count.
+
+`clean_day` is DERIVED at the write boundary from the counts beside it, never
+supplied by the caller, so a persisted row can never claim a clean day while
+carrying incidents.
+
+**Scope difference from the scoreboard, deliberate:** this table does NOT
+exclude the order-update channel. The scoreboard drops non-market-data
+`ws_type`s from its headline (a dead-token day once put 39+ order-update drops
+on Dhan's card while its market feed was perfect) — correct for a feed-vs-feed
+comparison, wrong here, because the order-update socket is one of the sixteen
+connections the operator asked about. Filter by `ws_type` at read time if you
+want market-data only.
+
+**Operator queries.**
+
+```sql
+-- Did ANY connection drop today?
+SELECT ws_type, connection_index, disconnect_events, disconnects_market,
+       reconnects, stalls, max_down_secs, clean_day, saw_any_event
+FROM ws_connection_daily
+WHERE trading_date_ist IN '2026-08-29'
+ORDER BY ws_type, connection_index;
+
+-- The one-line answer.
+SELECT count(*) AS connections,
+       sum(CASE WHEN clean_day THEN 1 ELSE 0 END) AS clean,
+       sum(CASE WHEN saw_any_event THEN 0 ELSE 1 END) AS never_appeared,
+       sum(disconnects_market + disconnects_off_hours + stalls + restarts) AS incidents
+FROM ws_connection_daily
+WHERE trading_date_ist IN '2026-08-29';
+
+-- Which connection is the repeat offender this month?
+SELECT ws_type, connection_index,
+       sum(disconnects_market) AS drops,
+       sum(reconnects) AS reconnects,
+       max(max_down_secs) AS worst_outage_secs
+FROM ws_connection_daily
+WHERE trading_date_ist >= '2026-08-01'
+GROUP BY ws_type, connection_index
+ORDER BY drops DESC;
+```
+
+**Honest limits.** The rollup is written once, post-close, by the same job as
+the scoreboard — it is not live during the session (the live signals are the
+`dhan-worst-socket-deaf` alarm and the lane gauges). If the day's
+`ws_event_audit` read fails or is unparsable, the rollup writes NOTHING and
+says so with a coded error, rather than writing zeros that would read as a
+clean day. And per-connection totals are still not broken out on a CloudWatch
+chart: the metrics pipeline folds the per-socket label, so the chart shows
+feed totals and this table is the per-connection surface.
+
 ## 2. Month-end cumulative verdict SQL
 
 Run via `mcp__tickvault-logs__questdb_sql` (or the QuestDB console).

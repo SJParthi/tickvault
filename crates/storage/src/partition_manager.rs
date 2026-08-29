@@ -100,6 +100,16 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "feed_scoreboard_daily",
     "feed_coverage_daily",
     "feed_episode_audit",
+    // (2026-08-29, operator directive on daily per-connection WebSocket
+    // monitoring): one row per (trading day, feed, ws_type, connection_index)
+    // — the per-CONNECTION daily verdict that `feed_scoreboard_daily` cannot
+    // give because it sums all sixteen sockets into one row per feed. Same
+    // SEBI-audit class + DAY partitioning as the scoreboard tables above;
+    // `feed` is in the DEDUP key. Swept with them, never exempt: it is a
+    // derived daily summary of two retained audit tables, so an aged-out
+    // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
+    // do not still hold.
+    "ws_connection_daily",
     // BRUTEX-XVERIFY-01/02 (2026-07-12, §37): one row per divergent cell /
     // one row per trading-day summary — same SEBI-audit class + DAY
     // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.

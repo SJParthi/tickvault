@@ -3896,6 +3896,31 @@ pub async fn run_feed_scoreboard(
         );
     }
 
+    // 8c. Per-CONNECTION daily rollup (`ws_connection_daily`), operator
+    //     directive 2026-08-29: "is there a websocket disconnect or reconnect
+    //     happened for ALL the connections ... based on every day we need to
+    //     capture this precisely".
+    //
+    //     The scoreboard row above sums all sixteen connections into ONE row
+    //     per feed, so it cannot answer "did connection 7 drop today?". The
+    //     per-connection evidence has existed since 2026-08-20 in
+    //     `ws_event_audit` + `feed_episode_audit`; this step folds both into
+    //     one row per connection per day so that question is a single keyed
+    //     row read (O(1)) instead of a day-scan-and-group.
+    //
+    //     Best-effort and additive: it writes its OWN table and can never
+    //     fail, degrade or delay the scoreboard verdict computed above. It
+    //     reuses `fold_episode_into_tally` — the SINGLE shared tally rule —
+    //     so it can never disagree with the daily scoreboard about what
+    //     counts as an incident.
+    let _ = crate::ws_connection_rollup::run_ws_connection_rollup(
+        questdb,
+        target_ist_day,
+        trading_date_ist_nanos,
+        &build_episode_day_sql(target_ist_day),
+    )
+    .await;
+
     metrics::counter!("tv_feed_scoreboard_runs_total", "outcome" => outcome.as_str()).increment(1);
 
     let dhan = feed_numbers

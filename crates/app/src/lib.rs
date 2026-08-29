@@ -273,3 +273,4 @@ pub mod trading_pipeline;
 /// (which owns the functional-dormant order-update WS per operator ruling
 /// Q4-i) can create its own audit consumer. Pure move, zero behavior change.
 pub mod ws_audit_consumer;
+pub mod ws_connection_rollup;
