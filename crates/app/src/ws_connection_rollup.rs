@@ -49,16 +49,36 @@
 //! The connection set is OBSERVED, not AUTHORIZED. Both sources are things
 //! that HAPPENED: a lifecycle event, or a classified episode. A connection
 //! the lane planned and then failed to dial produces NEITHER, because there
-//! is no `WsEventKind` for a failed dial — the kinds are connected /
+//! is no `WsEventKind` for a failed dial — the seven kinds are connected /
 //! disconnected / disconnected_off_hours / reconnected / sleep_entered /
-//! sleep_resumed, and every one of them presupposes a socket that opened at
-//! least once.
+//! sleep_resumed / stall_restarted, and every one presupposes a socket the
+//! supervisor had something to act on.
 //!
-//! So a connection that never opened is ABSENT from this table, and an
-//! absent row reads exactly like a connection that was never planned. This
-//! is not hypothetical: on 2026-08-12 the main feed failed twelve dial
-//! attempts in a row with `HTTP 400` and never completed a handshake all
-//! session. That socket would appear in this table as nothing at all.
+//! ⚠ CORRECTED 2026-08-29, hours after this section was written, and the
+//! error is worth keeping rather than quietly editing away: the first
+//! version of this paragraph enumerated SIX kinds and omitted
+//! `StallRestarted`. A section written specifically to stop a claim rotting
+//! shipped a false enumeration on its first day — and this very file already
+//! names the seventh kind further down, so it contradicted its own module.
+//! That is the `day_ohlc_tracker` class exactly: the rot is not in the old
+//! text, it is in the moment of writing.
+//!
+//! The narrower honesty that omission cost: `StallRestarted` maps to the
+//! episode kind `never_streamed_restart`, whose own doc describes killing
+//! and relaunching an *"alive-but-silent (or never-streamed)"* child. So a
+//! socket that connected but never delivered a byte CAN produce an episode
+//! row and IS visible here. The blind spot is narrower than the first draft
+//! implied and is stated precisely below.
+//!
+//! So the blind spot is precisely this: a connection that never completed a
+//! TCP/TLS handshake at all. It is absent from this table, and an absent row
+//! reads exactly like a connection that was never planned. A socket that
+//! connected and then went silent is NOT in the blind spot — the stall
+//! supervisor acts on it and that action is recorded.
+//!
+//! The blind spot is not hypothetical: on 2026-08-12 the main feed failed
+//! twelve dial attempts in a row with `HTTP 400` and never completed a
+//! handshake all session. That socket would appear here as nothing at all.
 //!
 //! It is stated here rather than papered over because the question this
 //! module was built to answer is *"for ALL the connections"*, and on this
@@ -763,6 +783,10 @@ mod tests {
             "What this CANNOT answer",
             "The connection set is OBSERVED, not AUTHORIZED",
             "would manufacture eight false",
+            // The seventh kind. The first draft of the section above listed
+            // six and omitted it; pin the corrected count so the same slip
+            // cannot land twice.
+            "stall_restarted",
         ] {
             assert!(
                 src.contains(pin),
