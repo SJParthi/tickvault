@@ -831,6 +831,32 @@ impl DhanSocketParams {
     /// Params for `endpoint` in the scope-locked [`DEFAULT_MAIN_FEED_MODE`].
     #[must_use]
     pub fn new(endpoint: DhanEndpointType, base_url: String, client_id: String) -> Self {
+        // Seed every subscribe/unsubscribe failure reason for THIS endpoint.
+        //
+        // A silently-failed subscribe is the worst failure this file can
+        // produce: the socket stays open and healthy-looking while carrying
+        // nothing, so absence against a seeded key is the only evidence that
+        // exists. A live sweep on 2026-08-29 found the metric had never
+        // published at all — the CloudWatch agent drops the first sample of a
+        // series it has never seen, so the very first failure was the one
+        // guaranteed to be invisible.
+        for reason in [
+            "payload",
+            "send",
+            "timeout",
+            "not_connected",
+            "unsubscribe_payload",
+            "unsubscribe_send",
+            "unsubscribe_timeout",
+            "unsubscribe_not_connected",
+        ] {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
         Self {
             endpoint,
             base_url,

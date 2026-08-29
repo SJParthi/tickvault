@@ -312,6 +312,21 @@ where
     C: CadenceClock,
     D: CadenceExecutor + 'static,
 {
+    // Seed the cadence loop's own failure series at zero, once, as the loop
+    // starts — so an absent reading can never pass for a clean run.
+    //
+    // A live sweep on 2026-08-29 found all three had NEVER published a
+    // datapoint despite being EMF-selected. A skipped boundary and a runner
+    // respawn are both born at the failure, and the CloudWatch agent drops the
+    // first sample of a series it has never seen, so the first occurrence of
+    // each was structurally invisible. Seeded here, in the loop itself, rather
+    // than at boot: these describe the cadence runner, and a confident zero
+    // for a runner that never started would be a worse lie than silence.
+    metrics::counter!("tv_cadence_boundary_skipped_total").increment(0);
+    metrics::counter!("tv_cadence_gate_denials_total").increment(0);
+    for reason in ["clean_exit", "panic", "cancelled", "unknown"] {
+        metrics::counter!("tv_cadence_runner_respawn_total", "reason" => reason).increment(0);
+    }
     let cfg = deps.config.clone();
     // ONE pinned shutdown future for the WHOLE loop (created before any
     // await): `Notify::notify_waiters` carries no permit, so a fresh
