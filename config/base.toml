@@ -390,7 +390,7 @@ ingest_shed_session_burn_bytes = 0
 # Values below 4 are clamped up to 4: a WAL replay after a mid-session restart
 # re-writes frames at their ORIGINAL arrival time, so replay is the one writer
 # that can move backwards into a closed hour.
-depth_hot_hours = 0
+depth_hot_hours = 4
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
