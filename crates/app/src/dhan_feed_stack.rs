@@ -2842,31 +2842,51 @@ pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
 /// time `try_send` is attempted (`WalRingSink`).
 pub const FRAME_RING_CAPACITY: usize = 65_536;
 
-/// Main-feed share of the frame ring's SLOT count, as a ratio numerator.
+/// Frame-ring share denominator. Sixteenths.
 ///
-/// The ring is one channel shared by all sixteen sockets. Its BYTE budget was
-/// split per class from the start; its SLOT count was not split at all until
-/// 2026-08-29 -- and the measured 2026-08-28 session shed 508,598 frames on
-/// the slot dimension against ZERO on the byte dimension, so the only
-/// dimension with isolation was the one that never bound.
-///
-/// Declared as an explicit ratio rather than as `main = X; depth = CAP - X`
-/// because the derived form makes the sum-to-capacity assert a tautology --
-/// which it was, through two attempted fixes. See the boot site.
-pub const MAIN_FEED_RING_SLOT_SHARE: usize = 3;
+/// Sixteen, not four, because the ring must be split THREE ways and 65,536 is
+/// a power of two: any denominator that is not itself a power of two loses
+/// slots to integer division, and a lost slot breaks the invariant that a
+/// granted reservation implies a free channel slot.
+pub const RING_SHARE_TOTAL: usize = 16;
 
-/// Depth share of the frame ring's SLOT count, as a ratio numerator.
-///
-/// depth-20 and depth-200 SHARE this one class. That is a known residual, not
-/// an oversight: a depth-200 burst can still exhaust the class and starve
-/// depth-20, one level below the split this pair introduces.
-pub const DEPTH_RING_SLOT_SHARE: usize = 1;
+/// Main-feed SLOT share (12/16 = 49,152).
+pub const MAIN_FEED_RING_SLOT_SHARE: usize = 12;
+/// depth-20 SLOT share (3/16 = 12,288).
+pub const DEPTH20_RING_SLOT_SHARE: usize = 3;
+/// depth-200 SLOT share (1/16 = 4,096).
+pub const DEPTH200_RING_SLOT_SHARE: usize = 1;
 
-/// Ratio denominator. The two shares must divide `FRAME_RING_CAPACITY`
-/// EXACTLY -- integer division that loses even one slot breaks the invariant
-/// that a granted reservation implies a free channel slot, which is the whole
-/// reason the caps are split rather than shared.
-pub const RING_SLOT_SHARE_TOTAL: usize = MAIN_FEED_RING_SLOT_SHARE + DEPTH_RING_SLOT_SHARE;
+/// Main-feed BYTE share (12/16).
+pub const MAIN_FEED_RING_BYTE_SHARE: usize = 12;
+/// depth-20 BYTE share (1/16).
+pub const DEPTH20_RING_BYTE_SHARE: usize = 1;
+/// depth-200 BYTE share (3/16).
+pub const DEPTH200_RING_BYTE_SHARE: usize = 3;
+
+// The slot and byte shares for the two depth classes are DELIBERATELY
+// INVERTED (3:1 slots, 1:3 bytes), and that inversion is the whole design.
+//
+// Splitting main-feed from depth on 2026-08-29 left depth-20 and depth-200
+// sharing ONE class, so the eviction the split was built to stop simply moved
+// one level down: a depth-200 frame is up to 512 KiB, so roughly 128 of them
+// exhaust the entire depth byte budget, and depth-20 -- 250 instruments
+// against depth-200's 5 -- is then refused by a stream it does not compete
+// with for anything.
+//
+// The two are not the same shape and must not get the same ratio:
+//
+//   depth-20  : MANY small frames  -> needs SLOTS, few bytes
+//   depth-200 : FEW huge frames    -> needs BYTES, few slots
+//
+// Giving each the other's scarce dimension is what a copied 1:1 split would
+// have done. Headroom at the modelled rates: depth-20 12,288 slots at
+// ~1,375 f/s = ~8.9 s; depth-200 4,096 slots at ~21 f/s = ~195 s.
+//
+// HONEST: the modelled frame rates are derived from the 2026-08-24 session's
+// row counts, not from a per-endpoint frame counter, because no such counter
+// exists. The ISOLATION is the guarantee; the ratio is a considered estimate
+// and is the thing to revisit once per-endpoint series exist.
 
 /// How many times the lane re-checks for the token manager before refusing.
 ///
@@ -3855,6 +3875,7 @@ async fn run_frame_drain(
     mut ingest: LiveIngest,
     main_feed_budget: Arc<RingByteBudget>,
     depth_budget: Arc<RingByteBudget>,
+    depth200_budget: Arc<RingByteBudget>,
     shutdown: Arc<tokio::sync::Notify>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     // Instruments that attach AFTER boot — the ~20,000 futures and option
@@ -3965,6 +3986,7 @@ async fn run_frame_drain(
                 // had head-room for and admit frames it did not.
                 match frame.endpoint {
                     DhanEndpointType::MainFeed => main_feed_budget.release(frame.bytes.len()),
+                    DhanEndpointType::Depth200 => depth200_budget.release(frame.bytes.len()),
                     _ => depth_budget.release(frame.bytes.len()),
                 }
                 seen = seen.saturating_add(1);
@@ -6912,6 +6934,11 @@ async fn attach_depth_when_available(
     // sockets, so passing the main feed's share here would silently undo the
     // split it exists to enforce.
     depth_budget: Arc<RingByteBudget>,
+    // depth-200's OWN budget. Separate since 2026-08-29: sharing one class
+    // with depth-20 let ~128 frames of 512 KiB exhaust the whole depth byte
+    // cap and refuse 250 depth-20 instruments -- starved by a stream of 5
+    // they do not compete with for anything.
+    depth200_budget: Arc<RingByteBudget>,
     // Since 2026-08-19 this path CAN produce main-feed connections — the
     // contract universe attaches here too, because locating at-the-money needs
     // live prices that do not exist at boot.
@@ -7485,6 +7512,7 @@ async fn attach_depth_when_available(
                                 frame_tx: &frame_tx,
                                 main_feed_budget: &main_feed_budget,
                                 depth_budget: &depth_budget,
+                                depth200_budget: &depth200_budget,
                                 ws_audit_tx: Some(&ws_audit_tx),
                                 // Retained since 2026-08-22. These connections
                                 // are NOT dialed with their final set: eight
@@ -7578,6 +7606,7 @@ async fn attach_depth_when_available(
                                 frame_tx: &frame_tx,
                                 main_feed_budget: &main_feed_budget,
                                 depth_budget: &depth_budget,
+                                depth200_budget: &depth200_budget,
                                 ws_audit_tx: Some(&ws_audit_tx),
                                 out_topups: None,
                                 out_depth_commands: Some(&mut depth_commands),
@@ -7916,6 +7945,7 @@ struct DialContext<'a> {
     frame_tx: &'a tokio::sync::mpsc::Sender<CapturedFrame>,
     main_feed_budget: &'a Arc<RingByteBudget>,
     depth_budget: &'a Arc<RingByteBudget>,
+    depth200_budget: &'a Arc<RingByteBudget>,
     ws_audit_tx: Option<
         &'a tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent>,
     >,
@@ -7953,6 +7983,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         frame_tx,
         main_feed_budget,
         depth_budget,
+        depth200_budget,
         ws_audit_tx,
         mut out_topups,
         mut out_depth_commands,
@@ -7991,8 +8022,13 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         );
         // Endpoint decides the budget. Depth may exhaust depth; it may not
         // evict the feed that actually carries ticks.
+        // Three classes, not two. depth-20 and depth-200 shared one budget
+        // until 2026-08-29, so a depth-200 burst (~128 frames of 512 KiB
+        // exhaust the whole depth byte cap) could refuse depth-20 -- 250
+        // instruments starved by a stream of 5 they do not compete with.
         let budget = match endpoint {
             DhanEndpointType::MainFeed => main_feed_budget,
+            DhanEndpointType::Depth200 => depth200_budget,
             _ => depth_budget,
         };
         let sink = WalRingSink::new(
@@ -9198,7 +9234,6 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // the source and know the value.
     metrics::gauge!("tv_dhan_feed_ring_max_bytes").set(ring_max_bytes as f64);
     metrics::gauge!("tv_host_total_ram_bytes").set(host_total_ram_bytes().unwrap_or(0) as f64);
-    let main_feed_share = ring_max_bytes / 4 * 3;
     // The SLOT split, added 2026-08-29, in the same 3:1 proportion as the
     // bytes and summing EXACTLY to the channel's capacity.
     //
@@ -9255,23 +9290,39 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Pinned by `ring_slot_shares_sum_exactly_to_capacity`, which also
     // bite-proves that a lossy ratio (5:1 over 65,536) does NOT sum -- i.e.
     // that this assert is capable of failing.
-    let main_feed_slots = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * MAIN_FEED_RING_SLOT_SHARE;
-    let depth_slots = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * DEPTH_RING_SLOT_SHARE;
+    let unit_slots = FRAME_RING_CAPACITY / RING_SHARE_TOTAL;
+    let main_feed_slots = unit_slots * MAIN_FEED_RING_SLOT_SHARE;
+    let depth20_slots = unit_slots * DEPTH20_RING_SLOT_SHARE;
+    let depth200_slots = unit_slots * DEPTH200_RING_SLOT_SHARE;
     assert_eq!(
-        main_feed_slots + depth_slots,
+        main_feed_slots + depth20_slots + depth200_slots,
         FRAME_RING_CAPACITY,
-        "the per-class slot caps must sum to the channel capacity, or a granted          reservation stops implying a free slot and the shared-pool refusal returns"
+        "the per-class slot caps must sum to the channel capacity, or a granted \
+         reservation stops implying a free slot and the shared-pool refusal returns"
     );
-    metrics::gauge!("tv_dhan_feed_ring_slot_cap", "class" => "main_feed")
-        .set(main_feed_slots as f64);
-    metrics::gauge!("tv_dhan_feed_ring_slot_cap", "class" => "depth").set(depth_slots as f64);
+    let unit_bytes = ring_max_bytes / RING_SHARE_TOTAL;
+    let main_feed_share = unit_bytes * MAIN_FEED_RING_BYTE_SHARE;
+    let depth20_bytes = unit_bytes * DEPTH20_RING_BYTE_SHARE;
+    // The remainder, not a computed share: `ring_max_bytes` is host-derived
+    // and need not divide by 16, so giving the leftover to the largest-frame
+    // class is the only assignment that cannot silently strand bytes.
+    let depth200_bytes = ring_max_bytes - main_feed_share - depth20_bytes;
+    for (class, slots, bytes) in [
+        ("main_feed", main_feed_slots, main_feed_share),
+        ("depth_20", depth20_slots, depth20_bytes),
+        ("depth_200", depth200_slots, depth200_bytes),
+    ] {
+        metrics::gauge!("tv_dhan_feed_ring_slot_cap", "class" => class).set(slots as f64);
+        metrics::gauge!("tv_dhan_feed_ring_byte_cap", "class" => class).set(bytes as f64);
+    }
     let main_feed_budget = Arc::new(RingByteBudget::with_slot_cap(
         main_feed_share,
         main_feed_slots,
     ));
-    let depth_budget = Arc::new(RingByteBudget::with_slot_cap(
-        ring_max_bytes - main_feed_share,
-        depth_slots,
+    let depth_budget = Arc::new(RingByteBudget::with_slot_cap(depth20_bytes, depth20_slots));
+    let depth200_budget = Arc::new(RingByteBudget::with_slot_cap(
+        depth200_bytes,
+        depth200_slots,
     ));
     // ALWAYS built, and that is load-bearing rather than lazy.
     //
@@ -9303,6 +9354,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         ingest,
         Arc::clone(&main_feed_budget),
         Arc::clone(&depth_budget),
+        Arc::clone(&depth200_budget),
         Arc::clone(&params.shutdown),
         Arc::clone(&params.feed_health),
         seed_rx,
@@ -9343,6 +9395,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             frame_tx: &frame_tx,
             main_feed_budget: &main_feed_budget,
             depth_budget: &depth_budget,
+            depth200_budget: &depth200_budget,
             ws_audit_tx: Some(&ws_audit_tx),
             out_topups: Some(&mut main_feed_topups),
             out_depth_commands: None,
@@ -9384,6 +9437,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             Arc::clone(&spill),
             frame_tx.downgrade(),
             Arc::clone(&depth_budget),
+            Arc::clone(&depth200_budget),
             Arc::clone(&main_feed_budget),
             main_feed_connections_for(
                 params.main_feed_instruments.len(),
@@ -10347,16 +10401,49 @@ mod tests {
     /// matters and bite-proves the assert can fail.
     #[test]
     fn ring_slot_shares_sum_exactly_to_capacity() {
-        let main = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * MAIN_FEED_RING_SLOT_SHARE;
-        let depth = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * DEPTH_RING_SLOT_SHARE;
+        let unit = FRAME_RING_CAPACITY / RING_SHARE_TOTAL;
+        let main = unit * MAIN_FEED_RING_SLOT_SHARE;
+        let d20 = unit * DEPTH20_RING_SLOT_SHARE;
+        let d200 = unit * DEPTH200_RING_SLOT_SHARE;
 
         assert_eq!(
-            main + depth,
+            main + d20 + d200,
             FRAME_RING_CAPACITY,
-            "the shipped 3:1 split must divide {FRAME_RING_CAPACITY} exactly"
+            "the three slot shares must divide {FRAME_RING_CAPACITY} exactly"
         );
-        assert_eq!(main, 49_152, "main feed keeps three quarters of the ring");
-        assert_eq!(depth, 16_384, "depth keeps one quarter");
+        assert_eq!(main, 49_152, "main feed keeps twelve sixteenths");
+        assert_eq!(
+            d20, 12_288,
+            "depth-20 carries 250 instruments -- it needs SLOTS"
+        );
+        assert_eq!(
+            d200, 4_096,
+            "depth-200 carries 5 -- it needs bytes, not slots"
+        );
+
+        // THE INVERSION, and it is the whole design. depth-20 is many small
+        // frames; depth-200 is few huge ones. Giving them the same ratio in
+        // both dimensions -- or worse, one shared budget, which is what
+        // shipped until now -- lets ~128 frames of 512 KiB refuse 250
+        // instruments they do not compete with.
+        assert!(
+            DEPTH20_RING_SLOT_SHARE > DEPTH200_RING_SLOT_SHARE,
+            "depth-20 must hold MORE slots than depth-200"
+        );
+        assert!(
+            DEPTH200_RING_BYTE_SHARE > DEPTH20_RING_BYTE_SHARE,
+            "depth-200 must hold MORE bytes than depth-20"
+        );
+        assert_eq!(
+            MAIN_FEED_RING_SLOT_SHARE + DEPTH20_RING_SLOT_SHARE + DEPTH200_RING_SLOT_SHARE,
+            RING_SHARE_TOTAL,
+            "slot shares must be a complete partition"
+        );
+        assert_eq!(
+            MAIN_FEED_RING_BYTE_SHARE + DEPTH20_RING_BYTE_SHARE + DEPTH200_RING_BYTE_SHARE,
+            RING_SHARE_TOTAL,
+            "byte shares must be a complete partition"
+        );
 
         // THE BITE. A ratio whose integer division loses slots must NOT sum
         // to capacity -- otherwise the boot assert is decoration. 5:1 over
@@ -14402,6 +14489,7 @@ mod tests {
                 ingest,
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
                 tokio::sync::mpsc::channel(1).1,
@@ -14466,6 +14554,7 @@ mod tests {
             rx,
             ingest,
             Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
             Arc::clone(&shutdown),
             Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
@@ -14565,6 +14654,7 @@ mod tests {
                 rx,
                 ingest,
                 Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+                Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
