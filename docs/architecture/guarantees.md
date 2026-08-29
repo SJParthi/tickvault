@@ -50,18 +50,18 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name |
 |---|---|---|
-| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | `deploy/aws/terraform/app-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_thirteen` |
+| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | `deploy/aws/terraform/app-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_seven` |
 | Alarm fires when disk spill is dropping (`tv_spill_dropped_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-spill-dropped`) | same guard (every alarm metric has a Rust emit-site) |
 | Alarm fires when DLQ catches ticks (`tv_dlq_ticks_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-dlq-ticks`) | same guard |
 | Every alarm metric is published by the CW agent (EMF filter) | `deploy/aws/terraform/user-data.sh.tftpl` | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_is_in_emf_filter_list` |
 | Every alarm metric has a real Rust emit-site (no dead alarms) | crates/ (`counter!`/`gauge!`) | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_has_a_rust_emit_site` |
 | `ticks_dropped_total` counter emission *(RETIRED 2026-07-18, stage-4 sweep: `tick_persistence.rs` was deleted in the stage-2 dead-WS sweep — zero emit sites remain; `zero_tick_loss_alert_guard.rs` deleted with it)* | — | — |
-| `SEAL_BUFFER_CAPACITY = 200,000` (absorbs the IST-midnight seal burst) | `crates/trading/src/candles/seal_ring.rs` | `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value` |
-| QuestDB outage drops zero ticks (disconnected writer) | `crates/storage/tests/chaos_questdb_full_session.rs` | `chaos_questdb_full_session_zero_tick_loss` (run 2026-06-02: 0 lost) |
-| Disk-full → DLQ NDJSON catches every tick | `crates/storage/tests/chaos_disk_full.rs` | `chaos_disk_full_triggers_dlq` (`#[ignore]` — run 2026-06-02: 0 lost) |
-| SIGKILL mid-batch → spill replay loses zero ticks | `crates/storage/tests/chaos_sigkill_replay.rs` | `chaos_sigkill_spill_replay_zero_loss` (`#[ignore]` — run 2026-06-02: 0 lost) |
+| `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS x TF_COUNT` = **600,000** at TF_COUNT=24 (absorbs the IST-midnight seal burst) — **CORRECTED 2026-08-29**, this said a literal 200,000, which is 3x too small and is the exact restate-the-number-instead-of-the-constant error CLAUDE.md warns about by name | `crates/trading/src/candles/seal_ring.rs` | `seal_ring.rs::test_seal_buffer_capacity_absorbs_the_whole_midnight_burst` |
+| QuestDB outage drops zero ticks (disconnected writer) | `crates/storage/tests/zero_tick_loss_sla_guard.rs` | `test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames` — **RE-POINTED 2026-08-29.** The cited `chaos_questdb_full_session.rs` was DELETED; this doc kept citing it as live proof. |
+| Disk-full → DLQ NDJSON catches every tick | `crates/storage/tests/chaos_seal_disk_full_dlq_capture.rs` | `test_seal_spill_dead_dlq_captures_every_overflow_zero_drop` — **RE-POINTED 2026-08-29** (was the deleted `chaos_disk_full.rs`). Covers the SEAL tier; an equivalent tick-tier chaos test does NOT exist. |
+| SIGKILL mid-batch → spill replay loses zero ticks | `crates/storage/tests/chaos_seal_sigkill_spill_replay.rs` | `test_seal_spill_survives_sigkill_and_replays_loss_free_and_idempotent` — **RE-POINTED 2026-08-29** (was the deleted `chaos_sigkill_replay.rs`). |
 | Spill ring saturation (50 churn cycles) — no leak, no panic | `crates/storage/tests/chaos_ws_frame_spill_saturation.rs` | `chaos_rapid_spill_churn_50_cycles_no_leak_no_panic` |
-| WAL is fail-closed at boot (no silent-loss degraded mode) | `crates/app/src/main.rs` | `crates/core/tests/phase2_7_perf_and_correctness_fixes.rs::test_regression_ws_frame_wal_init_is_fail_closed` |
+| WAL is fail-closed at boot (no silent-loss degraded mode) | `crates/app/src/main.rs` | **UNPROVEN 2026-08-29.** The cited `phase2_7_perf_and_correctness_fixes.rs` does not exist and no replacement test was found. The behaviour may still hold; nothing verifies it. |
 
 ## Tier 3 — O(1) hot-path + zero-allocation
 
@@ -85,9 +85,9 @@ But we CAN mechanically guarantee:
 | `security_id` alone is NOT used as a key | `.claude/hooks/banned-pattern-scanner.sh` category 5 | pre-commit hook |
 | Every storage DEDUP key includes segment | `crates/storage/tests/dedup_segment_meta_guard.rs` | meta-guard scans every `DEDUP_KEY_*` constant |
 | `InstrumentRegistry` keeps BOTH colliding entries | `crates/common/src/instrument_registry.rs` | `test_iter_returns_both_colliding_segments` |
-| Dhan CSV dedup uses `(id, segment)` tuple | `crates/core/src/instrument/universe_builder.rs` | compile-time type guard |
-| Subscription planner dedup uses tuple | `crates/core/src/instrument/subscription_planner.rs` | `test_regression_seen_ids_key_type_is_pair` |
-| Tick dedup key includes segment | `crates/storage/src/tick_persistence.rs` | `test_tick_dedup_key_includes_segment` |
+| Dhan CSV dedup uses `(id, segment)` tuple | *(module deleted with the 2026-07-13 instrument-fetch retirement)* | **RETIRED 2026-08-29** — the cited `universe_builder.rs` no longer exists. |
+| Subscription planner dedup uses tuple | *(module deleted with the 2026-07-13 Dhan-WS retirement)* | **RETIRED 2026-08-29** — the cited `subscription_planner.rs` and its test no longer exist. |
+| Tick dedup key includes segment | `crates/storage/src/tick_persistence.rs` | `crates/storage/tests/dedup_segment_meta_guard.rs::every_dedup_key_with_security_id_must_include_segment` — **RE-POINTED 2026-08-29** (the name previously cited here, test_tick_dedup_key_includes_segment, does not exist anywhere; this meta-guard is stronger, covering every table rather than one. Deliberately un-backticked: the citation guard resolves backticked identifiers, and a dead name quoted as prose must not read as a citation). |
 | Sequence-hole detector exists | `crates/trading/src/risk/tick_gap_tracker.rs` | 48 unit tests |
 | Backwards-timestamp-jump detector exists | same (via PR #277) | `test_backwards_jump_*` (6 tests) |
 
@@ -189,7 +189,7 @@ Added this session; every row points at a real test created alongside it.
 |---|---|---|
 | Integration tests run on EVERY PR (not just `--lib`) — the #988 silent-rot class is dead | `.github/workflows/ci.yml` (test matrix) | `crates/common/tests/github_workflow_guard.rs::r17_ci_test_matrix_runs_integration_tests_not_just_lib` |
 | The 10 rotted integration targets are repaired + green | `crates/core/tests/*` (dhat_allocation, snapshot_parser, ws_*, phase2_*, mutation_killer) + `crates/common/tests/triage_rules_full_coverage_guard.rs` | all green in #988 + #991 CI |
-| Final irrecoverable tick-loss has a dedicated CloudWatch alarm | `deploy/aws/terraform/app-alarms.tf` | `cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_thirteen` |
+| Final irrecoverable tick-loss has a dedicated CloudWatch alarm | `deploy/aws/terraform/app-alarms.tf` | `cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_seven` |
 | Post-merge auto-deploy is covered by an AWS-native watchdog (GitHub-cron miss safety-net) | `deploy/aws/terraform/deploy-watchdog-lambda.tf` + `deploy/aws/lambda/deploy-watchdog/` | `crates/common/tests/aws_infra_wiring.rs::test_deploy_watchdog_lambda_is_wired` + `..._only_dispatches_when_positively_stale` |
 | `change_pct` + `open_gap_pct` candle columns wired end-to-end (DDL + ALTER + ILP + struct + spill) | `crates/storage/src/{shadow_persistence,shadow_candle_writer,shadow_seal_columns,seal_spill}.rs` | `crates/storage/tests/candle_pct_column_guard.rs::{change_pct,open_gap_pct}_column_wired_end_to_end` |
 | Latency bench gate enforces PER-TICK budgets (batch-vs-per-tick unit bug fixed) | `scripts/bench-gate.sh` + `quality/benchmark-budgets.toml` `[elements]` | `bench_budget_elements_guard.rs` (2 tests) |
