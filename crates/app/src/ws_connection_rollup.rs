@@ -44,12 +44,31 @@
 //! table but absent from the event table still gets a row, with
 //! `saw_any_event = false`, because that combination is itself a finding.
 //!
-//! ## ⚠ What this CANNOT answer — a socket that never came up at all
+//! ## ✅ RESOLVED 2026-08-29 — a socket that never came up IS now visible
 //!
-//! The connection set is OBSERVED, not AUTHORIZED. Both sources are things
+//! **This section described an OPEN gap for a few hours on 2026-08-29 and the
+//! gap is now CLOSED. The history is kept because the reasoning is what makes
+//! the fix legible, and because a section that silently flips from "cannot" to
+//! "can" teaches the next reader nothing.**
+//!
+//! WHAT CHANGED: `WsEventKind::DialStarted` is emitted once per connection at
+//! the top of `run_connection_with_commands`, BEFORE the first dial. The fold
+//! sets `dial_started` from it and deliberately does NOT set `saw_any_event`,
+//! because a dial that failed is precisely the socket doing nothing. So
+//! `dial_started = true` with `connects = 0` is now a keyed row meaning THIS
+//! SOCKET NEVER CAME UP, and `clean_day()` refuses it.
+//!
+//! WHAT REMAINS, precisely: a connection the planner skipped BEFORE spawning
+//! its task still produces no row. There are two such paths and both already
+//! log a coded `WS-GAP-03` error, so neither is silent — but neither is in
+//! this table either.
+//!
+//! The original reasoning, retained:
+//!
+//! The connection set was OBSERVED, not AUTHORIZED. Both sources were things
 //! that HAPPENED: a lifecycle event, or a classified episode. A connection
-//! the lane planned and then failed to dial produces NEITHER, because there
-//! is no `WsEventKind` for a failed dial — the seven kinds are connected /
+//! the lane planned and then failed to dial produced NEITHER, because there
+//! was no `WsEventKind` for a failed dial — the seven kinds are connected /
 //! disconnected / disconnected_off_hours / reconnected / sleep_entered /
 //! sleep_resumed / stall_restarted, and every one presupposes a socket the
 //! supervisor had something to act on.
@@ -120,6 +139,11 @@ pub const EVENT_KIND_DISCONNECTED: &str = "disconnected";
 pub const EVENT_KIND_DISCONNECTED_OFF_HOURS: &str = "disconnected_off_hours";
 /// Wire label for a successful `reconnected` lifecycle event.
 pub const EVENT_KIND_RECONNECTED: &str = "reconnected";
+/// Wire label for the lane BEGINNING to dial a connection.
+///
+/// The only kind that fires before a socket can deliver, and the one that
+/// makes a never-opened connection visible instead of absent.
+pub const EVENT_KIND_DIAL_STARTED: &str = "dial_started";
 
 /// The day's `ws_event_audit` rows, reduced to what the rollup folds.
 ///
@@ -186,10 +210,18 @@ pub fn fold_ws_event_rows(
                 ..WsConnectionDailyRow::default()
             });
 
-        // The connection produced a lifecycle event, whatever kind it was.
-        // This is the flag that separates "healthy all day" from "never
-        // appeared" — see the module header.
-        entry.saw_any_event = true;
+        // `dial_started` is the ONE kind that must not set `saw_any_event`.
+        //
+        // That flag means "the socket DID something", and it is what separates
+        // healthy-all-day from never-appeared. A dial that failed is precisely
+        // the socket doing nothing, so letting it set the flag would make a
+        // dead connection read as a live one — turning the row added to make
+        // the failure visible into the thing that hides it.
+        if kind == EVENT_KIND_DIAL_STARTED {
+            entry.dial_started = true;
+        } else {
+            entry.saw_any_event = true;
+        }
         // pool_size is a configured value, identical on every row of a given
         // ws_type; take the largest seen so a truncated/zero row cannot
         // shrink it below the real pool.
@@ -728,6 +760,49 @@ mod tests {
     }
 
     #[test]
+    fn test_dial_started_makes_a_never_opened_socket_visible() {
+        // THE row the operator asked for, four times: "did any connection
+        // fail to come up today?" Before `dial_started` this socket produced
+        // nothing at all and its absence read like it was never planned.
+        let events = ws_body(r#"["dhan","main_feed",3,5,"dial_started",0,0]"#);
+        let mut out = BTreeMap::new();
+        fold_ws_event_rows(&mut out, &events).expect("parse");
+        let rows = finalize_rows(out, 0);
+
+        assert_eq!(rows.len(), 1, "the socket is now IN the record");
+        assert!(rows[0].dial_started, "the lane began dialing it");
+        assert_eq!(rows[0].connects, 0, "and it never connected");
+        assert!(
+            !rows[0].saw_any_event,
+            "a failed dial is the socket doing NOTHING — letting it set this \
+             flag would make the row added to expose the failure hide it"
+        );
+        assert!(
+            !rows[0].clean_day(),
+            "dialed-and-never-connected can never be a clean day"
+        );
+    }
+
+    #[test]
+    fn test_dial_started_then_connected_is_an_ordinary_healthy_socket() {
+        // The other half, and the one that stops the new field becoming a
+        // daily false alarm: a socket that dialed AND connected is clean.
+        let events = ws_body(
+            r#"["dhan","main_feed",0,5,"dial_started",0,0],
+               ["dhan","main_feed",0,5,"connected",0,0]"#,
+        );
+        let mut out = BTreeMap::new();
+        fold_ws_event_rows(&mut out, &events).expect("parse");
+        let rows = finalize_rows(out, 0);
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].dial_started);
+        assert_eq!(rows[0].connects, 1);
+        assert!(rows[0].saw_any_event, "connecting IS doing something");
+        assert!(rows[0].clean_day(), "dialed and connected is a clean day");
+    }
+
+    #[test]
     fn test_a_connection_that_never_opened_produces_no_row() {
         // PASSES BY DESIGN — this pins the limitation, it does not assert a
         // feature. Both sources are things that HAPPENED, and a socket that
@@ -749,7 +824,17 @@ mod tests {
 
         // Connection 0 came up and is here. Connections 1..=4 of the same
         // planned pool never dialled and are invisible.
-        assert_eq!(rows.len(), 1, "only the socket that OPENED is represented");
+        // NOTE 2026-08-29: this still passes, and its MEANING narrowed. With
+        // `dial_started` wired, a planned socket IS represented — but only
+        // once the lane actually begins dialing it. This input carries no
+        // dial event for connections 1..=4, so they remain absent, which is
+        // now the correct answer rather than a blind spot: no dial was ever
+        // attempted for them in this data.
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the socket with an event is represented"
+        );
         assert_eq!(rows[0].connection_index, 0);
         assert!(
             !rows.iter().any(|r| r.connection_index == 1),
@@ -780,8 +865,12 @@ mod tests {
              reads its own pin array and passes vacuously"
         );
         for pin in [
-            "What this CANNOT answer",
-            "The connection set is OBSERVED, not AUTHORIZED",
+            // Updated 2026-08-29 when the gap closed. The pin follows the
+            // claim: it now holds the RESOLVED wording and the residual, so
+            // neither the fix nor the honest remainder can be dropped from
+            // the docs while the code still behaves this way.
+            "RESOLVED 2026-08-29",
+            "WHAT REMAINS, precisely",
             "would manufacture eight false",
             // The seventh kind. The first draft of the section above listed
             // six and omitted it; pin the corrected count so the same slip

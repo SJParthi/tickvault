@@ -4339,9 +4339,27 @@ async fn run_frame_drain(
                 // CloudWatch dimension each, so the pair that answers "is the
                 // ring filling?" ships and the pair that answers "which one?"
                 // stays local, where whoever is triaging is already looking.
-                let main_pct =
-                    budget_fill_pct(main_feed_budget.resident(), main_feed_budget.cap());
-                let depth_pct = budget_fill_pct(depth_budget.resident(), depth_budget.cap());
+                // CORRECTED 2026-08-29. This read the BYTE dimension only —
+                // the dimension measured at `ring_bytes_full = 0`, i.e. the
+                // one that has never bound. The dimension that DID bind, and
+                // shed 508,598 frames, was slots, and it was published
+                // nowhere. So the fill gauge reported healthy through a total
+                // class shed: exactly the blind spot the slot split was added
+                // to close, left open in the instrument that reports it.
+                //
+                // Each class now reports whichever of its two ceilings it is
+                // closest to, which is the question an operator is actually
+                // asking — "how close is this pool to shedding?" — and it
+                // needs no new metric name, so it costs nothing against a
+                // budget already past its automatic stop line.
+                let main_pct = budget_fill_pct(main_feed_budget.resident(), main_feed_budget.cap())
+                    .max(budget_fill_pct(
+                        main_feed_budget.slots_resident(),
+                        main_feed_budget.slot_cap(),
+                    ));
+                let depth_pct = budget_fill_pct(depth_budget.resident(), depth_budget.cap()).max(
+                    budget_fill_pct(depth_budget.slots_resident(), depth_budget.slot_cap()),
+                );
                 metrics::gauge!(RING_RESIDENT_PCT_GAUGE).set(main_pct.max(depth_pct));
                 metrics::gauge!("tv_dhan_feed_ring_resident_pct_by_pool", "pool" => "main_feed")
                     .set(main_pct);
@@ -9150,18 +9168,41 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // sixteen sockets; before this, the byte budget was per class and the
     // slot count was a free-for-all. The 2026-08-28 session measured
     // `ring_full` = 508,598 against `ring_bytes_full` = 0 — every shed came
-    // from the shared pool and none from the isolation that existed. A depth
-    // burst could evict main-feed frames, which is tick loss on the lane
-    // carrying the prices.
+    // from the shared pool and none from the isolation that existed.
+    //
+    // HONEST LIMIT on that number, corrected 2026-08-29 after review: it
+    // proves the refusals were SLOT-dimension. It does NOT prove WHO suffered
+    // them. `RING_FULL_METRIC` carries an `endpoint` label, but the EMF
+    // processor folds label values into one summed series per host, so the
+    // per-endpoint split is not retrievable from CloudWatch. "A depth burst
+    // evicted main-feed frames" is therefore the plausible mechanism, not an
+    // established fact, and the earlier wording claimed more than the data
+    // carries.
+    //
+    // What IS established: with one shared pool, ANY class could shed ANY
+    // other, and 508,598 frames were shed that way. Isolation is correct
+    // whichever class was the victim.
+    //
+    // The tradeoff, stated because it is real and was not chosen by
+    // measurement: depth's ceiling falls 65,536 -> 16,384 (4x) and the main
+    // feed's 65,536 -> 49,152 (1.33x). Depth may now shed where it did not
+    // before. The 3:1 ratio mirrors the byte split, which was itself chosen
+    // before this data existed; a measured ratio needs the per-endpoint
+    // series that does not exist yet.
     //
     // With the caps summing to capacity, a granted reservation IS a held
     // channel slot, so the shared pool can no longer refuse anyone and a
     // class can only ever exhaust its own share.
     let main_feed_slots = FRAME_RING_CAPACITY / 4 * 3;
     let depth_slots = FRAME_RING_CAPACITY - main_feed_slots;
-    const _: () = assert!(
-        FRAME_RING_CAPACITY / 4 * 3 + (FRAME_RING_CAPACITY - FRAME_RING_CAPACITY / 4 * 3)
-            == FRAME_RING_CAPACITY,
+    // CORRECTED 2026-08-29: the first version re-derived both terms
+    // (`CAP/4*3 + (CAP - CAP/4*3) == CAP`), which is a tautology for every
+    // CAP. It read as protecting the load-bearing invariant and protected
+    // nothing — changing `depth_slots` to any value at all left it green.
+    // Asserting on the BINDINGS is the whole difference.
+    assert_eq!(
+        main_feed_slots + depth_slots,
+        FRAME_RING_CAPACITY,
         "the per-class slot caps must sum to the channel capacity, or a granted          reservation stops implying a free slot and the shared-pool refusal returns"
     );
     metrics::gauge!("tv_dhan_feed_ring_slot_cap", "class" => "main_feed")

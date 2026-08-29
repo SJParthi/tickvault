@@ -2618,6 +2618,22 @@ where
 {
     let endpoint = supervisor.slot().endpoint.as_str();
     let pool_index = supervisor.slot().pool_index;
+    // Recorded BEFORE the first dial, and that is the whole point.
+    //
+    // Every other lifecycle kind presupposes a socket that opened, so a
+    // connection that failed every dial produced no row anywhere and was
+    // absent from the daily per-connection record — indistinguishable from a
+    // connection that was never planned. The 2026-08-12 blackout is the case:
+    // twelve dials, `HTTP 400` every time, no handshake all session, and
+    // nothing in the record to say that socket had ever been asked to run.
+    //
+    // Best-effort by construction: `on_lifecycle` is fire-and-forget, so a
+    // failure to record the intent can never delay or prevent the dial that
+    // follows. Recording the intent must never cost the connection.
+    sink.on_lifecycle(
+        tickvault_common::ws_event_types::WsEventKind::DialStarted,
+        "begin_dial",
+    );
     let mut action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
 
     loop {
