@@ -188,6 +188,24 @@ impl FoldCounters {
 /// `DrainCounters`/`WsLagHandles`, and because the recorder is installed at
 /// boot Step 3 — long before the first tick — so the resolve happens against
 /// the real recorder, never a no-op one.
+/// Publish every fold counter's zero baseline, at BOOT.
+///
+/// ADDED 2026-08-29 after review. The seeding below lives inside
+/// `fold_counters()`'s `OnceLock` initializer, which fires on the FIRST FOLD
+/// -- not at boot. Its own comment claims the seed exists so that "nothing
+/// arrived late" is distinguishable from "the fold never ran", and that is
+/// precisely the case it could not deliver: if the fold never runs,
+/// `fold_counters()` is never called and not one of the seven series
+/// publishes. The distinction it was written to make was the one it missed.
+///
+/// This is the established shape -- `seed_drain_loss_baselines()` is called
+/// explicitly at drain start for exactly this reason. Calling it is enough:
+/// resolving the handles runs the initializer, and `OnceLock` makes a second
+/// call free.
+pub fn seed_fold_counter_baselines() {
+    let _ = fold_counters();
+}
+
 pub(crate) fn fold_counters() -> &'static FoldCounters {
     static HANDLES: OnceLock<FoldCounters> = OnceLock::new();
     HANDLES.get_or_init(|| {
@@ -232,7 +250,22 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
 
 #[cfg(test)]
 mod seeding_tests {
-    use super::*;
+    #[test]
+    fn test_seed_fold_counter_baselines_is_idempotent_and_shares_the_handles() {
+        // Called at drain start. It must be safe to call more than once (a
+        // respawned drain calls it again) and it must resolve the SAME
+        // handles the fold itself uses -- seeding a different set would
+        // publish zeros for series nobody increments while leaving the real
+        // ones unseeded, which is worse than not seeding at all.
+        super::seed_fold_counter_baselines();
+        let first = super::fold_counters() as *const _;
+        super::seed_fold_counter_baselines();
+        let second = super::fold_counters() as *const _;
+        assert_eq!(
+            first, second,
+            "the boot seed must resolve the same OnceLock the fold uses"
+        );
+    }
 
     #[test]
     fn every_tick_refused_reason_is_seeded_at_resolve() {

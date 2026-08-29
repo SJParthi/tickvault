@@ -2842,6 +2842,32 @@ pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
 /// time `try_send` is attempted (`WalRingSink`).
 pub const FRAME_RING_CAPACITY: usize = 65_536;
 
+/// Main-feed share of the frame ring's SLOT count, as a ratio numerator.
+///
+/// The ring is one channel shared by all sixteen sockets. Its BYTE budget was
+/// split per class from the start; its SLOT count was not split at all until
+/// 2026-08-29 -- and the measured 2026-08-28 session shed 508,598 frames on
+/// the slot dimension against ZERO on the byte dimension, so the only
+/// dimension with isolation was the one that never bound.
+///
+/// Declared as an explicit ratio rather than as `main = X; depth = CAP - X`
+/// because the derived form makes the sum-to-capacity assert a tautology --
+/// which it was, through two attempted fixes. See the boot site.
+pub const MAIN_FEED_RING_SLOT_SHARE: usize = 3;
+
+/// Depth share of the frame ring's SLOT count, as a ratio numerator.
+///
+/// depth-20 and depth-200 SHARE this one class. That is a known residual, not
+/// an oversight: a depth-200 burst can still exhaust the class and starve
+/// depth-20, one level below the split this pair introduces.
+pub const DEPTH_RING_SLOT_SHARE: usize = 1;
+
+/// Ratio denominator. The two shares must divide `FRAME_RING_CAPACITY`
+/// EXACTLY -- integer division that loses even one slot breaks the invariant
+/// that a granted reservation implies a free channel slot, which is the whole
+/// reason the caps are split rather than shared.
+pub const RING_SLOT_SHARE_TOTAL: usize = MAIN_FEED_RING_SLOT_SHARE + DEPTH_RING_SLOT_SHARE;
+
 /// How many times the lane re-checks for the token manager before refusing.
 ///
 /// Sized against what it is actually waiting for: `TokenManager::initialize`
@@ -3847,6 +3873,14 @@ async fn run_frame_drain(
     // so "nothing was lost" and "the drain never ran" stop looking identical.
     // See `seed_drain_loss_baselines` for why a built handle is not enough.
     seed_drain_loss_baselines();
+    // The FOLD's baselines, seeded here for the same reason as the drain's.
+    //
+    // Without this the seven fold series first publish on the first fold, so
+    // a session where the fold never runs -- the exact case
+    // `dhan-no-ticks-flowing` exists for -- publishes none of them, and
+    // "nothing was refused" stays indistinguishable from "the fold never
+    // ran". Seeding at drain start makes the zero the baseline sample.
+    tickvault_trading::candles::seed_fold_counter_baselines();
     // Whether this drain has ever seen a frame. Owns the up-gauge's rising
     // edge — see the first-frame arm below and the spawn site's correction.
     let mut lane_up = false;
@@ -9198,13 +9232,31 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // With the caps summing to capacity, a granted reservation IS a held
     // channel slot, so the shared pool can no longer refuse anyone and a
     // class can only ever exhaust its own share.
-    let main_feed_slots = FRAME_RING_CAPACITY / 4 * 3;
-    let depth_slots = FRAME_RING_CAPACITY - main_feed_slots;
-    // CORRECTED 2026-08-29: the first version re-derived both terms
-    // (`CAP/4*3 + (CAP - CAP/4*3) == CAP`), which is a tautology for every
-    // CAP. It read as protecting the load-bearing invariant and protected
-    // nothing — changing `depth_slots` to any value at all left it green.
-    // Asserting on the BINDINGS is the whole difference.
+    // CORRECTED TWICE on 2026-08-29, and the second correction is the one
+    // that works. Recorded in full because a confident wrong fix is worse
+    // than the defect it claims to close.
+    //
+    //   v1: `assert!(CAP/4*3 + (CAP - CAP/4*3) == CAP)` -- re-derived both
+    //       terms inline. A tautology for every CAP.
+    //   v2: bound the two terms, then `assert_eq!(main + depth, CAP)`, with a
+    //       comment asserting that "asserting on the BINDINGS is the whole
+    //       difference". IT WAS NOT. `depth_slots` was defined AS
+    //       `CAP - main_feed_slots`, so the sum still collapsed to CAP for
+    //       any `main_feed_slots` whatsoever. Naming a value does not make a
+    //       claim about it -- and the comment now asserted a protection that
+    //       still did not exist, which is the false-OK class this file's own
+    //       rules forbid.
+    //   v3 (this): derive each share INDEPENDENTLY from the ratio. Now the
+    //       sum is a real question with a real answer, and a ratio whose
+    //       integer division loses a slot fails the build instead of
+    //       silently breaking the invariant that a granted reservation
+    //       implies a free channel slot.
+    //
+    // Pinned by `ring_slot_shares_sum_exactly_to_capacity`, which also
+    // bite-proves that a lossy ratio (5:1 over 65,536) does NOT sum -- i.e.
+    // that this assert is capable of failing.
+    let main_feed_slots = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * MAIN_FEED_RING_SLOT_SHARE;
+    let depth_slots = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * DEPTH_RING_SLOT_SHARE;
     assert_eq!(
         main_feed_slots + depth_slots,
         FRAME_RING_CAPACITY,
@@ -10259,6 +10311,68 @@ pub fn now_ist_secs_of_day() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The fold's baselines must be seeded at DRAIN START, not on first fold.
+    ///
+    /// Seeding inside the `OnceLock` initializer fires on the first fold, so
+    /// a session where the fold never runs publishes none of the seven
+    /// series -- the exact case `dhan-no-ticks-flowing` exists for, and the
+    /// exact distinction the seeding comment claims to make.
+    #[test]
+    fn test_seed_fold_counter_baselines_is_called_at_drain_start() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("fn run_frame_drain")
+            .map_or("", |(_, rest)| rest);
+        let drain_seed = drain
+            .find("seed_drain_loss_baselines();")
+            .expect("the drain must seed its own loss baselines");
+        let fold_seed = drain.find("seed_fold_counter_baselines();").expect(
+            "the drain must ALSO seed the fold baselines -- otherwise \
+                    a session with no fold publishes no refusal series at all",
+        );
+        assert!(
+            fold_seed.saturating_sub(drain_seed) < 2_000,
+            "the two seeds belong together at drain start; drifting them apart \
+             is how one of them gets dropped in a later edit"
+        );
+    }
+
+    /// The boot assert on the ring slot shares must be CAPABLE OF FAILING.
+    ///
+    /// It was a tautology twice. v1 re-derived both terms inline; v2 bound
+    /// them but defined `depth = CAP - main`, so the sum still collapsed for
+    /// any value -- while the comment claimed the opposite, which is worse
+    /// than the original defect. This pins the property that actually
+    /// matters and bite-proves the assert can fail.
+    #[test]
+    fn ring_slot_shares_sum_exactly_to_capacity() {
+        let main = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * MAIN_FEED_RING_SLOT_SHARE;
+        let depth = FRAME_RING_CAPACITY / RING_SLOT_SHARE_TOTAL * DEPTH_RING_SLOT_SHARE;
+
+        assert_eq!(
+            main + depth,
+            FRAME_RING_CAPACITY,
+            "the shipped 3:1 split must divide {FRAME_RING_CAPACITY} exactly"
+        );
+        assert_eq!(main, 49_152, "main feed keeps three quarters of the ring");
+        assert_eq!(depth, 16_384, "depth keeps one quarter");
+
+        // THE BITE. A ratio whose integer division loses slots must NOT sum
+        // to capacity -- otherwise the boot assert is decoration. 5:1 over
+        // 65,536 loses 4 slots, and those 4 are exactly the gap through
+        // which the shared-pool refusal would return: a granted reservation
+        // would stop implying a free channel slot.
+        let lossy_total = 6_usize;
+        let lossy_main = FRAME_RING_CAPACITY / lossy_total * 5;
+        let lossy_depth = FRAME_RING_CAPACITY / lossy_total;
+        assert_ne!(
+            lossy_main + lossy_depth,
+            FRAME_RING_CAPACITY,
+            "if a lossy ratio still summed to capacity the boot assert could \
+             never fail, which is what the first two versions got wrong"
+        );
+    }
 
     /// Both queues must be closed BEFORE either join begins.
     ///

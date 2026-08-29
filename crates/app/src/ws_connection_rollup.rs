@@ -58,10 +58,29 @@
 //! `dial_started = true` with `connects = 0` is now a keyed row meaning THIS
 //! SOCKET NEVER CAME UP, and `clean_day()` refuses it.
 //!
-//! WHAT REMAINS, precisely: a connection the planner skipped BEFORE spawning
-//! its task still produces no row. There are two such paths and both already
-//! log a coded `WS-GAP-03` error, so neither is silent — but neither is in
-//! this table either.
+//! WHAT REMAINS, precisely -- CORRECTED 2026-08-29, because the first
+//! version of this paragraph said "two such paths" and there are THREE, and
+//! the one it omitted is the largest:
+//!
+//! 1. The planner refuses a non-market-data endpoint (`continue`, coded
+//!    `WS-GAP-03`).
+//! 2. The planner finds no registered supervisor (`continue`, coded
+//!    `WS-GAP-03`).
+//! 3. **The connection is never PLANNED at all** -- e.g. a depth pool whose
+//!    instrument set never resolves, so it never enters `plan.connections`
+//!    and `dial_planned_connections` is never called for it. This is the
+//!    recorded 2026-08-21 ten-dark-sockets shape, and it is precisely the
+//!    case the operator keeps asking about.
+//!
+//! Paths 1 and 2 are logged and not silent. Path 3 is NOT in this table, and
+//! its absence still reads like "never scheduled" -- which for an unplanned
+//! connection is literally true, and is exactly why it is unsatisfying: the
+//! set this table can describe is the set that got a TASK, not the set the
+//! operator AUTHORIZED. Closing it needs the authorized set recorded at boot,
+//! which is a separate change.
+//!
+//! A partial enumeration reads exactly like a complete one -- this file's own
+//! lesson, applied to this file, one paragraph after it was written.
 //!
 //! The original reasoning, retained:
 //!
