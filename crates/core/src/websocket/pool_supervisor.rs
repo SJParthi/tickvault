@@ -1813,10 +1813,43 @@ pub struct CapturedFrame {
 /// Refusal here is the SAME event as a count-full ring, not a new failure mode:
 /// the frame is already durable in the WAL by the time this is consulted, so a
 /// refusal is a lag signal and the outcome is `RingFull`.
+/// Which ceiling refused a ring reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingReserve {
+    /// Both dimensions had room; the frame may enter the ring.
+    Granted,
+    /// The class is carrying too many BYTES.
+    BytesFull,
+    /// The class is carrying too many FRAMES.
+    SlotsFull,
+}
+
 #[derive(Debug)]
 pub struct RingByteBudget {
     resident: std::sync::atomic::AtomicUsize,
     cap: usize,
+    /// Frames currently reserved by this class. See `slot_cap`.
+    slots: std::sync::atomic::AtomicUsize,
+    /// Per-class ceiling on the NUMBER of frames resident in the shared ring.
+    ///
+    /// ADDED 2026-08-29, and it closes a real hole rather than adding belt to
+    /// a brace. The ring is ONE `mpsc::channel(FRAME_RING_CAPACITY)` whose
+    /// sender is cloned into all sixteen sockets. The BYTE budget was split
+    /// per class; the SLOT count was not, so the only dimension with no
+    /// isolation was the one every socket competed on.
+    ///
+    /// The 2026-08-28 session is the proof, not a hypothesis:
+    /// `tv_dhan_ws_ring_full_total` = 508,598 while
+    /// `tv_dhan_ws_ring_bytes_full_total` = **0**. Every one of those half a
+    /// million sheds came from the shared slot pool and not one from the
+    /// per-class byte budget — the isolation that existed never engaged, and
+    /// the bound that bit had none. A depth burst could therefore evict
+    /// main-feed frames from the ring, which is tick loss on the lane that
+    /// carries the prices.
+    ///
+    /// `usize::MAX` means "unbounded", which is exactly the pre-2026-08-29
+    /// behaviour, so `new` is unchanged for every existing caller.
+    slot_cap: usize,
 }
 
 impl RingByteBudget {
@@ -1826,7 +1859,38 @@ impl RingByteBudget {
         Self {
             resident: std::sync::atomic::AtomicUsize::new(0),
             cap,
+            slots: std::sync::atomic::AtomicUsize::new(0),
+            slot_cap: usize::MAX,
         }
+    }
+
+    /// A budget capped at `cap` resident bytes AND `slot_cap` resident frames.
+    ///
+    /// The two production budgets must be built with this, and their
+    /// `slot_cap`s must SUM to the ring's channel capacity. That sum is what
+    /// makes the shared-pool refusal unreachable: if every admitted frame
+    /// held a per-class slot and the class caps add up to the channel size,
+    /// the channel can never be full when a reservation succeeded.
+    #[must_use]
+    pub const fn with_slot_cap(cap: usize, slot_cap: usize) -> Self {
+        Self {
+            resident: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+            slots: std::sync::atomic::AtomicUsize::new(0),
+            slot_cap,
+        }
+    }
+
+    /// The configured slot ceiling.
+    #[must_use]
+    pub const fn slot_cap(&self) -> usize {
+        self.slot_cap
+    }
+
+    /// Frames currently reserved by this class.
+    #[must_use]
+    pub fn slots_resident(&self) -> usize {
+        self.slots.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The configured ceiling.
@@ -1853,7 +1917,38 @@ impl RingByteBudget {
     /// magnitude above real traffic, so such a frame is already outside the
     /// envelope, and admitting it would mean the budget does not bound.
     pub fn try_reserve(&self, len: usize) -> bool {
-        self.resident
+        matches!(self.try_reserve_detailed(len), RingReserve::Granted)
+    }
+
+    /// `try_reserve`, reporting WHICH ceiling refused.
+    ///
+    /// The caller needs the distinction because the two refusals mean
+    /// different things to an operator and are counted separately: bytes-full
+    /// says the class is carrying too much VOLUME, slots-full says it is
+    /// carrying too many FRAMES. Collapsing them was survivable while slots
+    /// were unbounded; it is not now that both can bind.
+    ///
+    /// Order is slot-first, then bytes, and the slot is given back if the byte
+    /// reservation fails. Either order works; what matters is that no path
+    /// leaves one dimension reserved and the other not, because the release
+    /// side returns both together.
+    pub fn try_reserve_detailed(&self, len: usize) -> RingReserve {
+        if self
+            .slots
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |cur| {
+                    let next = cur.checked_add(1)?;
+                    (next <= self.slot_cap).then_some(next)
+                },
+            )
+            .is_err()
+        {
+            return RingReserve::SlotsFull;
+        }
+        if self
+            .resident
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
@@ -1862,7 +1957,34 @@ impl RingByteBudget {
                     (next <= self.cap).then_some(next)
                 },
             )
-            .is_ok()
+            .is_err()
+        {
+            // Hand the slot back. Leaking it here would ratchet the class's
+            // slot budget down on every oversized frame until it refused
+            // everything — the same slow strangulation the byte-side release
+            // below exists to prevent.
+            self.release_slot();
+            return RingReserve::BytesFull;
+        }
+        RingReserve::Granted
+    }
+
+    /// Returns one slot without touching the byte budget. Saturating, for the
+    /// same reason `release` is.
+    fn release_slot(&self) {
+        let mut cur = self.slots.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self.slots.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Returns `len` bytes to the budget as a frame leaves the ring.
@@ -1874,6 +1996,10 @@ impl RingByteBudget {
     /// which is the same state as not having it, and stays visible through
     /// `resident()`.
     pub fn release(&self, len: usize) {
+        // Both dimensions, always together — a frame leaving the ring frees
+        // its bytes AND its slot. Splitting these into two public calls would
+        // create a shape where a caller can return one and forget the other.
+        self.release_slot();
         // An explicit CAS loop rather than `fetch_update`, because the closure
         // form can only ever return `Some` here and its `Result` would then have
         // to be discarded — and `let _ =` on a `#[must_use]` value is exactly
@@ -2072,10 +2198,23 @@ impl FrameSink for WalRingSink {
         // release on failure: the only ordering with no window in which the
         // budget and the ring disagree.
         let len = frame.len();
-        if !self.budget.try_reserve(len) {
-            self.ring_full.increment(1);
-            self.ring_bytes_full.increment(1);
-            return FrameSinkOutcome::RingFull;
+        match self.budget.try_reserve_detailed(len) {
+            RingReserve::Granted => {}
+            RingReserve::BytesFull => {
+                self.ring_full.increment(1);
+                self.ring_bytes_full.increment(1);
+                return FrameSinkOutcome::RingFull;
+            }
+            // Counted on `ring_full` ONLY, deliberately. That is exactly what
+            // a ring_full-without-ring_bytes_full reading meant before this
+            // change, so the two counters keep their meaning across the fix
+            // and Friday's numbers stay comparable to Monday's. What changed
+            // is that the refusal is now scoped to the class that caused it
+            // instead of to whoever happened to reach the shared pool first.
+            RingReserve::SlotsFull => {
+                self.ring_full.increment(1);
+                return FrameSinkOutcome::RingFull;
+            }
         }
         // Step 3 — visibility. `try_send` never awaits; a full ring returns
         // immediately so the reader keeps polling (and therefore keeps ponging).
@@ -2099,6 +2238,12 @@ impl FrameSink for WalRingSink {
             self.ring_full.increment(1);
             return FrameSinkOutcome::RingFull;
         }
+        // Reaching here with the class slot caps summing to the channel's
+        // capacity means the `try_send` above can only fail on a CLOSED
+        // channel, never on a full one — a reservation was granted, and a
+        // granted reservation is a held slot. The arm stays because a closed
+        // channel is a real (if terminal) condition, not because capacity can
+        // still refuse.
         FrameSinkOutcome::Captured
     }
 }
@@ -5124,6 +5269,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_try_reserve_detailed_refuses_on_slot_cap_when_bytes_are_free() {
+        // The dimension that actually bit on 2026-08-28. Bytes wide open,
+        // slots exhausted -> refused, and refused as SlotsFull so the two
+        // counters stay distinguishable.
+        let b = RingByteBudget::with_slot_cap(usize::MAX, 2);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        assert_eq!(
+            b.try_reserve_detailed(1),
+            RingReserve::SlotsFull,
+            "a third frame must be refused on SLOTS even with unlimited bytes"
+        );
+        assert_eq!(b.slots_resident(), 2);
+    }
+
+    #[test]
+    fn test_try_reserve_detailed_still_refuses_on_bytes_when_slots_are_free() {
+        // The pre-existing dimension must be unchanged by the addition.
+        let b = RingByteBudget::with_slot_cap(10, usize::MAX);
+        assert_eq!(b.try_reserve_detailed(10), RingReserve::Granted);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::BytesFull);
+    }
+
+    #[test]
+    fn test_release_slot_returns_the_slot_when_the_byte_reservation_refuses() {
+        // Order is slot-then-bytes, so a byte refusal must not leak the slot.
+        // Leaking would ratchet the class's slot budget down on every
+        // oversized frame until it refused everything -- a slow strangulation
+        // that reads as the feed dying for no reason.
+        let b = RingByteBudget::with_slot_cap(10, 4);
+        assert_eq!(b.try_reserve_detailed(99), RingReserve::BytesFull);
+        assert_eq!(b.slots_resident(), 0, "the slot must be returned");
+        for _ in 0..4 {
+            assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        }
+    }
+
+    #[test]
+    fn test_release_clears_bytes_and_slots_resident_together() {
+        let b = RingByteBudget::with_slot_cap(100, 1);
+        assert_eq!(b.try_reserve_detailed(50), RingReserve::Granted);
+        assert_eq!(b.try_reserve_detailed(1), RingReserve::SlotsFull);
+        b.release(50);
+        assert_eq!(b.resident(), 0);
+        assert_eq!(b.slots_resident(), 0);
+        assert_eq!(b.try_reserve_detailed(50), RingReserve::Granted);
+    }
+
+    #[test]
+    fn test_with_slot_cap_stops_a_depth_flood_consuming_main_feed_slots() {
+        // THE regression this whole change exists to prevent. Two classes
+        // sharing one channel: depth exhausts its own share and the main feed
+        // is still admitted. Before the slot split, depth could take every
+        // slot in the shared pool and main-feed frames were shed -- which is
+        // tick loss on the lane that carries the prices.
+        let main = RingByteBudget::with_slot_cap(usize::MAX, 3);
+        let depth = RingByteBudget::with_slot_cap(usize::MAX, 3);
+
+        for _ in 0..3 {
+            assert_eq!(depth.try_reserve_detailed(1), RingReserve::Granted);
+        }
+        assert_eq!(
+            depth.try_reserve_detailed(1),
+            RingReserve::SlotsFull,
+            "depth must exhaust its OWN share"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                main.try_reserve_detailed(1),
+                RingReserve::Granted,
+                "the main feed keeps its full share while depth is saturated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_leaves_slot_cap_unbounded_exactly_as_before() {
+        // Every existing caller uses `new`, and none of them should change
+        // behaviour. Unbounded slots is exactly what they had before.
+        let b = RingByteBudget::new(usize::MAX);
+        assert_eq!(b.slot_cap(), usize::MAX);
+        for _ in 0..10_000 {
+            assert_eq!(b.try_reserve_detailed(1), RingReserve::Granted);
+        }
     }
 
     #[test]

@@ -1235,10 +1235,19 @@ fn main() {
 
     let o1 = vec![
         Row::new(
+            // CORRECTED 2026-08-29. The proof text read "fixed-offset
+            // from_le_bytes, NO LOOP". That is false for the packet type
+            // actually in production: DEFAULT_MAIN_FEED_MODE is Full
+            // (connection.rs), and parse_full_packet walks 5 depth levels
+            // (full_packet.rs). The VERDICT is unaffected -- 5 is a protocol
+            // constant, the levels land in a stack array, zero heap -- but
+            // "no loop" is the same reassuring-direction wording error
+            // CLAUDE.md records against its own headline O(1) sentence, and
+            // it would send an auditor looking for loops away empty-handed.
             "Tick packet decode (hot path)",
             Verdict::Guaranteed,
             "O(1), 0 alloc",
-            "fixed-offset from_le_bytes, no loop; DHAT gates below",
+            "fixed offsets; Full also reads 5 depth levels into a stack array -- a protocol constant, zero heap",
         ),
         Row::new(
             // SPLIT OUT 2026-08-29. One row said "Packet decode: GUARANTEED
@@ -1288,11 +1297,29 @@ fn main() {
             },
             "11 measured; buffer growth, not per-tick allocation",
         ),
+        // CORRECTED 2026-08-29, and wrong in BOTH halves.
+        //
+        // Mechanism: `papaya` has ZERO occurrences in instrument_registry.rs;
+        // the field is `by_composite: HashMap<(SecurityId, ExchangeSegment),
+        // _>`. That is the THIRD papaya type-claim in this repo to be false --
+        // CLAUDE.md corrected the same class on 2026-08-07 and 2026-08-25.
+        //
+        // Subject: worse. `InstrumentRegistry` appears in exactly ONE file
+        // workspace-wide, its own -- zero production consumers. So the row
+        // certified a lookup that no live path performs. The lookup the tick
+        // path ACTUALLY does is MultiTfAggregator::slot_index, a plain
+        // HashMap into a dense Vec, whose module header carries a section
+        // titled "Why std::collections::HashMap and not papaya" explaining
+        // that it REJECTED papaya deliberately.
+        //
+        // O(1)-average was never the wrong part. Naming the wrong structure
+        // was, and a reader "fixing" the aggregator to match this row would
+        // have undone a documented decision.
         Row::new(
-            "Instrument lookup",
+            "Instrument lookup (live tick path)",
             Verdict::Guaranteed,
             "O(1) avg",
-            "papaya composite-key hash",
+            "MultiTfAggregator::slot_index -- composite-key HashMap into a dense Vec",
         ),
         Row::new(
             "Uniqueness + dedup",

@@ -9142,8 +9142,39 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     metrics::gauge!("tv_dhan_feed_ring_max_bytes").set(ring_max_bytes as f64);
     metrics::gauge!("tv_host_total_ram_bytes").set(host_total_ram_bytes().unwrap_or(0) as f64);
     let main_feed_share = ring_max_bytes / 4 * 3;
-    let main_feed_budget = Arc::new(RingByteBudget::new(main_feed_share));
-    let depth_budget = Arc::new(RingByteBudget::new(ring_max_bytes - main_feed_share));
+    // The SLOT split, added 2026-08-29, in the same 3:1 proportion as the
+    // bytes and summing EXACTLY to the channel's capacity.
+    //
+    // Summing exactly is the load-bearing part. The ring is one
+    // `mpsc::channel(FRAME_RING_CAPACITY)` whose sender is cloned into all
+    // sixteen sockets; before this, the byte budget was per class and the
+    // slot count was a free-for-all. The 2026-08-28 session measured
+    // `ring_full` = 508,598 against `ring_bytes_full` = 0 — every shed came
+    // from the shared pool and none from the isolation that existed. A depth
+    // burst could evict main-feed frames, which is tick loss on the lane
+    // carrying the prices.
+    //
+    // With the caps summing to capacity, a granted reservation IS a held
+    // channel slot, so the shared pool can no longer refuse anyone and a
+    // class can only ever exhaust its own share.
+    let main_feed_slots = FRAME_RING_CAPACITY / 4 * 3;
+    let depth_slots = FRAME_RING_CAPACITY - main_feed_slots;
+    const _: () = assert!(
+        FRAME_RING_CAPACITY / 4 * 3 + (FRAME_RING_CAPACITY - FRAME_RING_CAPACITY / 4 * 3)
+            == FRAME_RING_CAPACITY,
+        "the per-class slot caps must sum to the channel capacity, or a granted          reservation stops implying a free slot and the shared-pool refusal returns"
+    );
+    metrics::gauge!("tv_dhan_feed_ring_slot_cap", "class" => "main_feed")
+        .set(main_feed_slots as f64);
+    metrics::gauge!("tv_dhan_feed_ring_slot_cap", "class" => "depth").set(depth_slots as f64);
+    let main_feed_budget = Arc::new(RingByteBudget::with_slot_cap(
+        main_feed_share,
+        main_feed_slots,
+    ));
+    let depth_budget = Arc::new(RingByteBudget::with_slot_cap(
+        ring_max_bytes - main_feed_share,
+        depth_slots,
+    ));
     // ALWAYS built, and that is load-bearing rather than lazy.
     //
     // The obvious shape — build it only when the boot-time depth sets are
