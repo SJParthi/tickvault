@@ -73,6 +73,7 @@ use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
 use tickvault_common::trading_calendar::TradingCalendar;
+use tickvault_common::types::ExchangeSegment;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_trading::oms::engine::{OmsAlert, OmsAlertSink};
@@ -638,6 +639,21 @@ struct LocalReconcileReport {
 /// re-index, so `all_orders()` holds one entry per order); the live-mode
 /// correlation re-index keeps a stale clone under the old order_no and
 /// would double-count — the caller only runs this in dry-run.
+///
+/// # I-P1-11 coverage, stated honestly (2026-08-29)
+/// Both legs compare BARE-SID SUMS, via `net_lots_for_any_segment`. That is
+/// forced, not chosen: the mirror folds `FillEvent`s per sid, and leg 2 folds
+/// `ManagedOrder.traded_qty` — and `ManagedOrder` has no segment field at all.
+/// Summing the engine's composite rows back down to a bare sid is the only
+/// comparison that is apples-to-apples against either input.
+///
+/// The consequence is worth naming rather than leaving to be discovered: this
+/// reconcile CANNOT detect a cross-segment mis-booking. If a fill for
+/// `(27, NseEquity)` were booked to `(27, IdxI)`, both legs would still balance,
+/// because the sum over segments is unchanged. What catches that is
+/// `observe_segment`'s collision counter and the fact that the fill path now
+/// carries the segment through to the engine — not this check. This reconcile
+/// answers "did every fill reach the engine", which is a different question.
 fn local_reconcile(
     oms: &OrderManagementSystem,
     risk: &RiskEngine,
@@ -647,11 +663,11 @@ fn local_reconcile(
     // Leg 1: mirror vs risk over the UNION of keys (C7 — a risk-side
     // position absent from the mirror is a divergence too).
     let mut sids: HashSet<u64> = mirror.keys().copied().collect();
-    sids.extend(risk.position_security_ids());
+    sids.extend(risk.tracked_security_ids());
     for &sid in &sids {
         report.sids_checked += 1;
         let mirror_lots = mirror.get(&sid).copied().unwrap_or(0);
-        if i64::from(risk.net_lots_for(sid)) != mirror_lots {
+        if risk.net_lots_for_any_segment(sid) != mirror_lots {
             report.divergences += 1;
         }
     }
@@ -668,10 +684,10 @@ fn local_reconcile(
         *folded.entry(order.security_id).or_insert(0) += signed;
     }
     let mut fold_sids: HashSet<u64> = folded.keys().copied().collect();
-    fold_sids.extend(risk.position_security_ids());
+    fold_sids.extend(risk.tracked_security_ids());
     for &sid in &fold_sids {
         let fold_lots = folded.get(&sid).copied().unwrap_or(0);
-        if i64::from(risk.net_lots_for(sid)) != fold_lots {
+        if risk.net_lots_for_any_segment(sid) != fold_lots {
             report.order_fold_divergences += 1;
         }
     }
@@ -868,26 +884,53 @@ impl BookState {
         self.pending_paper.contains_key(&sid)
     }
 
-    /// Tripwire check: `true` = segment consistent (or unknown), proceed.
-    /// A DIVERGENT segment for a known sid → RISK-GAP-02 (edge-latched
-    /// `error!` once per sid per episode; counter per event) + `false`.
-    fn tripwire_ok(&mut self, sid: u64, segment_code: u8) -> bool {
+    /// Records the segment this numeric `security_id` was seen in, and reports
+    /// a cross-segment collision. ALWAYS returns — it never refuses an event.
+    ///
+    /// # What changed on 2026-08-29, and why the refusal is gone
+    /// This was `tripwire_ok`, and it returned `false` on a divergent segment
+    /// so the caller would DROP the fill. That was the correct call while the
+    /// risk engine was reached through its segment-less overloads: every fill
+    /// landed on `(sid, IdxI)` whatever its real segment, so admitting a second
+    /// segment meant a long in one and a short in another NETTING to zero in
+    /// one row — a position-limit check that approves an order actually in
+    /// breach, and a daily-loss halt measuring a fabricated number.
+    ///
+    /// Dropping the fill bought that safety at a price the risk engine's own
+    /// `MAX_TRACKED_POSITIONS` doc forbids paying: *"refusing a fill would hide
+    /// a leg we actually hold"*. And it hid it thoroughly — the OMS had already
+    /// advanced the order to PART_TRADED/TRADED before the drop, so the order
+    /// book believed the fill while the risk engine and the mirror never learned
+    /// it, and the caller discarded the `false` without a word.
+    ///
+    /// The callers now pass the segment through to `*_in_segment`, so the engine
+    /// keys the composite `(security_id, segment)` row the collision needed all
+    /// along. Two segments no longer net, so there is nothing left to refuse:
+    /// both legs are recorded, and this stays as the OBSERVABILITY of a real
+    /// data-quality signal — the same counter, the same edge-latched line.
+    ///
+    /// # Performance
+    /// O(1) — one hash lookup, plus one insert on a sid's first sighting.
+    fn observe_segment(&mut self, sid: u64, segment_code: u8) {
         if segment_code == SEGMENT_CODE_UNKNOWN {
-            return true;
+            return;
         }
         match self.tripwire.get(&sid) {
             None => {
                 // 2026-08-22: refuse a NEW sid once the book is full. Counted
-                // and logged in `can_admit_sid`, never silent. Returning
-                // `true` keeps the caller processing the event; what is
-                // refused is the permanent per-sid slot, not the tick.
-                if !self.can_admit_sid(sid) {
-                    return true;
+                // and logged in `can_admit_sid`, never silent. What is refused
+                // is the permanent per-sid observability slot, never the event
+                // — and since 2026-08-29 never the fill either, because the
+                // engine's composite key no longer depends on this map being
+                // complete. Before that it did, and a full book therefore
+                // turned this into a permanent blind spot for every new sid:
+                // an un-inserted sid re-entered this same arm on every later
+                // event, so its cross-segment fills netted unchecked.
+                if self.can_admit_sid(sid) {
+                    self.tripwire.insert(sid, segment_code);
                 }
-                self.tripwire.insert(sid, segment_code);
-                true
             }
-            Some(&first) if first == segment_code => true,
+            Some(&first) if first == segment_code => {}
             Some(&first) => {
                 // HP-3/E3: counter EVERY event; error! on the RISING EDGE
                 // only — a colliding sid ticking 1-4/s for hours must never
@@ -900,15 +943,45 @@ impl BookState {
                         first_seen_segment = first,
                         conflicting_segment = segment_code,
                         reason = "sid_segment_collision",
-                        "RISK-GAP-02: cross-segment security_id collision — skipping \
-                         this and every further divergent event for this sid today \
-                         (counted per event; logged once per episode). I-P1-11; the \
-                         composite-key rewrite is the mandatory pre-live follow-up"
+                        "RISK-GAP-02: cross-segment security_id collision — BOTH legs \
+                         are recorded against their own composite (security_id, \
+                         segment) row and do NOT net (counted per event; logged once \
+                         per episode). I-P1-11. Until 2026-08-29 the divergent leg was \
+                         dropped here instead; it no longer is"
                     );
                 }
-                false
             }
         }
+    }
+
+    /// Does this event's segment match the one this numeric sid was FIRST seen
+    /// in? Unknown sid, or an unmappable code, answers `true`.
+    ///
+    /// # Why this survived the tripwire's disarming (2026-08-29)
+    /// `observe_segment` stopped refusing events because the risk engine now
+    /// keys the composite `(security_id, segment)` row, so two segments no
+    /// longer net. That reasoning covers the ENGINE. It does not cover
+    /// `pending_paper`, which is keyed on the bare `security_id` because
+    /// `ManagedOrder` carries no segment at all — so `has_pending_paper` cannot
+    /// tell an IdxI order from an NseEquity one on the same numeric id.
+    ///
+    /// Without this gate, disarming the tripwire would OPEN a path that has
+    /// never been reachable: a mark arriving on segment B would fill a pending
+    /// paper order actually placed on segment A, and `synthesize_paper_fill`
+    /// stamps the fill with the MARK's segment — booking the position to the
+    /// wrong composite row at the very moment the composite row started
+    /// mattering. The old refusal was load-bearing for exactly this one path
+    /// and for nothing else, so it is kept here and only here.
+    ///
+    /// # Performance
+    /// O(1) — one hash lookup.
+    fn segment_matches_first_seen(&self, sid: u64, segment_code: u8) -> bool {
+        if segment_code == SEGMENT_CODE_UNKNOWN {
+            return true;
+        }
+        self.tripwire
+            .get(&sid)
+            .is_none_or(|&first| first == segment_code)
     }
 }
 
@@ -990,7 +1063,16 @@ fn emit_leg_pnl(
     if !LEG_PNL_FNO_SEGMENT_CODES.contains(&segment_code) {
         return;
     }
-    let Some(pos) = risk.position(security_id) else {
+    // Read the position from the leg's OWN composite row. Until 2026-08-29
+    // this was `risk.position(security_id)`, which resolves to `(sid, IdxI)` —
+    // so an NSE_FNO leg's P&L row was stamped `segment_code = 2` while its
+    // numbers came from an IdxI row. Those two agreed only because the fill
+    // side was equally segment-blind; the moment fills became composite this
+    // read had to move with them, or every FNO leg would silently emit nothing.
+    let Some(leg_segment) = ExchangeSegment::from_byte(segment_code) else {
+        return;
+    };
+    let Some(pos) = risk.position_in_segment(security_id, leg_segment) else {
         return;
     };
     let event = LegPnlEvent {
@@ -1042,26 +1124,32 @@ fn apply_fill(
     leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
 ) -> bool {
     // S2 (fix-round 2026-07-14): a fill whose segment chars were UNMAPPABLE
-    // cannot be partition-checked — treating UNKNOWN as compatible-with-
-    // everything was the exact tripwire bypass. Refuse the fill (loud);
-    // every legitimate dry-run fill round-trips a known segment.
-    if fill.segment_code == SEGMENT_CODE_UNKNOWN {
+    // was refused here because it could not be partition-checked. The reason
+    // has changed, the refusal has not — see below.
+    // The segment is resolved ONCE here and carried into the engine, so the
+    // position lands on its real composite `(security_id, segment)` row.
+    //
+    // `from_byte` rather than a `!= SEGMENT_CODE_UNKNOWN` compare: the sentinel
+    // is `u8::MAX`, and the Dhan annexure has a GAP at code 6 — so a `6` passed
+    // the old inequality and was then keyed as if it were a real segment. There
+    // is exactly one definition of "mappable", and this is it.
+    let Some(fill_segment) = ExchangeSegment::from_byte(fill.segment_code) else {
         error!(
             code = ErrorCode::RiskGapPositionPnl.code_str(),
             security_id = fill.security_id,
             order_id = %log_safe_id(&fill.order_id),
+            segment_code = fill.segment_code,
             reason = "unknown_segment_fill",
             "RISK-GAP-02: fill with an UNMAPPABLE exchange/segment refused — \
-             it would bypass the I-P1-11 tripwire partition check"
+             it cannot be keyed on the I-P1-11 composite (security_id, segment)"
         );
         metrics::counter!("tv_oms_unknown_segment_fills_refused_total").increment(1);
         return false;
-    }
-    if !book.tripwire_ok(fill.security_id, fill.segment_code) {
-        return false;
-    }
-    risk.record_fill(
+    };
+    book.observe_segment(fill.security_id, fill.segment_code);
+    risk.record_fill_in_segment(
         fill.security_id,
+        fill_segment,
         fill.fill_lots,
         fill.avg_price,
         fill.lot_size,
@@ -1455,9 +1543,15 @@ async fn process_mark(
     paper_fill: bool,
     leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
 ) {
-    if !book.tripwire_ok(mark.security_id, mark.segment_code) {
+    // A mark whose segment is unmappable cannot address a composite position
+    // row, so it is dropped here rather than silently marking `(sid, IdxI)` —
+    // which is what the segment-less overload did for EVERY mark until
+    // 2026-08-29, whatever segment the mark actually carried.
+    let Some(mark_segment) = ExchangeSegment::from_byte(mark.segment_code) else {
+        metrics::counter!("tv_order_runtime_unmappable_segment_marks_total").increment(1);
         return;
-    }
+    };
+    book.observe_segment(mark.security_id, mark.segment_code);
     // No widening step: the mark is `f64` end to end. Until 2026-08-23 this
     // read `f32_to_f64_clean(mark.price)` — correct for an f32 field (plain
     // `f64::from` carries the IEEE 754 artifact, 10.2f32 → 10.19999980926514,
@@ -1485,12 +1579,12 @@ async fn process_mark(
     // order reach the risk engine's market_prices map (keeps it small).
     // HP-2: both checks are O(1) lookups — NO per-mark scan/alloc over the
     // whole order book (the pending index is rebuilt on order events).
-    let has_position = risk.net_lots_for(mark.security_id) != 0;
+    let has_position = risk.net_lots_for_any_segment(mark.security_id) != 0;
     let has_pending_paper = book.has_pending_paper(mark.security_id);
     if !(has_position || has_pending_paper) {
         return;
     }
-    risk.update_market_price(mark.security_id, price);
+    risk.update_market_price_in_segment(mark.security_id, mark_segment, price);
     emit_leg_pnl(
         leg_pnl_tx,
         risk,
@@ -1503,7 +1597,16 @@ async fn process_mark(
     // Next-mark paper filler (F12 fill-once: the pending index holds
     // non-terminal PAPER orders only, and a filled order goes terminal
     // Traded + drops out on the rebuild).
-    if paper_fill && oms.is_dry_run() && has_pending_paper {
+    // `pending_paper` is bare-sid (ManagedOrder has no segment), so a mark on
+    // a DIFFERENT segment of the same numeric id must not fill this order —
+    // `synthesize_paper_fill` would stamp the fill with the mark's segment and
+    // book the position to the wrong composite row. See
+    // `segment_matches_first_seen`.
+    if paper_fill
+        && oms.is_dry_run()
+        && has_pending_paper
+        && book.segment_matches_first_seen(mark.security_id, mark.segment_code)
+    {
         // Cold branch by construction (only reached when THIS sid has a
         // pending paper order); the id Vec clone is bounded by that sid's
         // pending count (1-2 in practice — self-test legs).
@@ -1742,7 +1845,12 @@ fn perform_daily_reset(
 /// all day for the ghost). Report it loudly — the position still shows in
 /// every reconcile heartbeat and is cleared by the 16:00 reset.
 fn report_dangling_self_test_position(risk: &RiskEngine, sid: u64, stage: &'static str) {
-    let net = risk.net_lots_for(sid);
+    // The self-test places and closes on an IDX_I mark only (see the E4 gate in
+    // `process_mark`), so the composite row it touches is `(sid, IdxI)`. Naming
+    // that segment explicitly is what makes this correct rather than merely
+    // lucky: the legacy `net_lots_for` read the same row, but only because its
+    // hardcoded default happened to be the one the self-test uses.
+    let net = risk.net_lots_for_in_segment(sid, ExchangeSegment::IdxI);
     if net != 0 {
         error!(
             code = ErrorCode::OmsGapDryRunSafety.code_str(),
@@ -1861,7 +1969,8 @@ async fn advance_self_test_on_fill(
     match &self_test.phase {
         SelfTestPhase::AwaitingEntryFill { order_id, sid } if order_id == filled_order_id => {
             let sid = *sid;
-            if risk.net_lots_for(sid) == 0 {
+            // IDX_I by the E4 self-test gate — see `report_dangling_self_test_position`.
+            if risk.net_lots_for_in_segment(sid, ExchangeSegment::IdxI) == 0 {
                 self_test.fail(today, "entry_fill_net_lots_zero");
                 return;
             }
@@ -1904,7 +2013,8 @@ async fn advance_self_test_on_fill(
         }
         SelfTestPhase::AwaitingCloseFill { order_id, sid } if order_id == filled_order_id => {
             let sid = *sid;
-            let flat = risk.net_lots_for(sid) == 0;
+            // IDX_I by the E4 self-test gate — see `report_dangling_self_test_position`.
+            let flat = risk.net_lots_for_in_segment(sid, ExchangeSegment::IdxI) == 0;
             let pnl_finite = risk.total_realized_pnl().is_finite();
             if flat && pnl_finite {
                 info!(
@@ -2186,9 +2296,20 @@ mod tests {
         assert_eq!(risk.net_lots_for(13), 2, "fill must reach the risk engine");
         assert_eq!(book.mirror.get(&13), Some(&2));
     }
-
+    /// I-P1-11 BITE TEST (2026-08-29): a long in one segment and a short in
+    /// another, on the SAME numeric id, must not net.
+    ///
+    /// Until 2026-08-29 the second fill was DROPPED here — the position we
+    /// actually held simply never reached the engine, which the engine's own
+    /// `MAX_TRACKED_POSITIONS` doc forbids. It was dropped because both fills
+    /// would otherwise have landed on `(27, IdxI)` and cancelled out. Now they
+    /// land on their own composite rows, so both are recorded AND neither
+    /// cancels the other.
+    ///
+    /// Revert `record_fill_in_segment` to `record_fill` here and this test
+    /// fails on the `net_lots_for_in_segment` assertions: both rows read 0.
     #[test]
-    fn test_sid_segment_collision_skips_and_errors() {
+    fn a_long_and_a_short_on_one_id_in_two_segments_do_not_net() {
         let mut risk = make_risk();
         let mut book = BookState::new();
         let fill_a = FillEvent {
@@ -2202,27 +2323,153 @@ mod tests {
         let fill_b = FillEvent {
             security_id: 27,
             segment_code: 1, // NSE_EQ — the FINNIFTY id=27 collision class
-            fill_lots: 1,
+            fill_lots: -1,   // SHORT — nets to zero against fill_a if both share a row
             avg_price: 200.0,
             lot_size: 1,
             order_id: "PAPER-2".to_string(),
         };
         assert!(apply_fill(&mut risk, &mut book, &fill_a, None));
         assert!(
-            !apply_fill(&mut risk, &mut book, &fill_b, None),
-            "a divergent segment for a known sid must be SKIPPED (loud), \
-             never silently merged into the same position"
+            apply_fill(&mut risk, &mut book, &fill_b, None),
+            "the divergent-segment leg is a position we ACTUALLY HOLD — it must \
+             be recorded, not dropped"
         );
-        assert_eq!(risk.net_lots_for(27), 1, "second fill must not apply");
+        assert_eq!(
+            risk.net_lots_for_in_segment(27, ExchangeSegment::IdxI),
+            1,
+            "the IDX_I leg keeps its own long"
+        );
+        assert_eq!(
+            risk.net_lots_for_in_segment(27, ExchangeSegment::NseEquity),
+            -1,
+            "the NSE_EQ leg keeps its own short — this reads 0 if the fills \
+             collapse into one row"
+        );
+        assert_eq!(
+            risk.net_lots_for_any_segment(27),
+            0,
+            "the BARE-SID sum is 0 — which is exactly why the reconcile's \
+             bare-sid legs cannot see a cross-segment mis-booking, and why the \
+             position limit must never be checked on this number"
+        );
+        assert!(
+            book.tripwire_reported.contains(&27),
+            "the collision is still REPORTED — disarming the refusal did not \
+             disarm the signal"
+        );
+    }
+
+    /// BITE TEST for the paper-filler segment gate (2026-08-29).
+    ///
+    /// `pending_paper` is keyed on the bare `security_id` because
+    /// `ManagedOrder` has no segment field. Disarming the old tripwire removed
+    /// the accident that kept this path shut, so the gate is what keeps it shut
+    /// deliberately: a mark on segment B must not fill an order placed on
+    /// segment A, because `synthesize_paper_fill` stamps the fill with the
+    /// MARK's segment and would book the position to the wrong composite row.
+    ///
+    /// Delete the `segment_matches_first_seen` clause in `process_mark` and
+    /// this test fails: the NSE_EQ mark fills the IDX_I order.
+    #[tokio::test]
+    async fn a_mark_on_another_segment_must_not_fill_a_pending_paper_order() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+
+        // The sid is first seen on IDX_I — as it would be from its own mark.
+        book.observe_segment(27, 0);
+
+        let order_id = oms
+            .place_order(PlaceOrderRequest {
+                security_id: 27,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Market,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 1,
+                price: 0.0,
+                trigger_price: 0.0,
+                lot_size: 1,
+                expiry_date: None,
+            })
+            .await
+            .expect("paper placement never fails"); // APPROVED: test
+        book.rebuild_pending_paper(&oms);
+        assert!(book.has_pending_paper(27));
+
+        // A mark for the SAME numeric id on a DIFFERENT segment.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 27,
+                segment_code: 1, // NSE_EQ — the documented id=27 collision class
+                price: 500.0,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            oms.order(&order_id).map(|o| o.traded_qty),
+            Some(0),
+            "an NSE_EQ mark must NOT fill an IDX_I order"
+        );
+        assert_eq!(
+            risk.net_lots_for_any_segment(27),
+            0,
+            "and no position may be booked on any segment"
+        );
+
+        // The order's OWN segment still fills it — the gate blocks the wrong
+        // segment, it does not break the right one.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 27,
+                segment_code: 0,
+                price: 500.0,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            risk.net_lots_for_in_segment(27, ExchangeSegment::IdxI),
+            1,
+            "the matching segment fills normally"
+        );
     }
 
     #[test]
-    fn test_tripwire_unknown_segment_is_compatible() {
+    fn test_unknown_segment_never_poisons_first_seen() {
         let mut book = BookState::new();
-        assert!(book.tripwire_ok(13, SEGMENT_CODE_UNKNOWN));
-        assert!(book.tripwire_ok(13, 0), "unknown never poisons first-seen");
-        assert!(book.tripwire_ok(13, SEGMENT_CODE_UNKNOWN));
-        assert!(!book.tripwire_ok(13, 2), "real divergence still trips");
+        book.observe_segment(13, SEGMENT_CODE_UNKNOWN);
+        assert!(
+            book.tripwire.get(&13).is_none(),
+            "an unknown code must not become the first-seen segment"
+        );
+        book.observe_segment(13, 0);
+        assert_eq!(book.tripwire.get(&13), Some(&0));
+        assert!(book.segment_matches_first_seen(13, 0));
+        assert!(
+            book.segment_matches_first_seen(13, SEGMENT_CODE_UNKNOWN),
+            "unknown is compatible with anything"
+        );
+        assert!(
+            !book.segment_matches_first_seen(13, 2),
+            "a real divergence must still be reported as a mismatch — this is \
+             what stops a segment-2 mark filling a segment-0 pending order"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -2923,13 +3170,13 @@ mod tests {
     #[test]
     fn test_tripwire_divergence_error_latched_per_sid() {
         let mut book = BookState::new();
-        assert!(book.tripwire_ok(27, 0));
-        assert!(!book.tripwire_ok(27, 2), "first divergence skips");
+        book.observe_segment(27, 0);
+        book.observe_segment(27, 2);
         assert!(
             book.tripwire_reported.contains(&27),
             "first divergence must latch the reported set (error! fired)"
         );
-        assert!(!book.tripwire_ok(27, 2), "later divergences still skip");
+        book.observe_segment(27, 2);
         assert_eq!(
             book.tripwire_reported.len(),
             1,
@@ -3123,7 +3370,13 @@ mod tests {
             order_id: "PAPER-OFF".to_string(),
         };
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
-        assert_eq!(risk.net_lots_for(888), 3);
+        // The fill was booked on segment 2, so it must be READ on segment 2.
+        // Before 2026-08-29 this asserted `net_lots_for(888)` — the IdxI row —
+        // and passed only because the fill had been booked there too.
+        assert_eq!(
+            risk.net_lots_for_in_segment(888, ExchangeSegment::NseFno),
+            3
+        );
     }
 
     #[tokio::test]
@@ -3134,8 +3387,11 @@ mod tests {
         let mut book = BookState::new();
         let mut self_test = SelfTestState::new();
         let (tx, mut rx) = make_leg_pnl_channel();
-        risk.record_fill(901, 2, 100.0, 25);
-        risk.record_fill(13, 1, 22_000.0, 1);
+        // Seed on the SAME segment the mark below carries. The legacy overload
+        // booked this to IdxI while the mark claimed NSE_FNO — an inconsistent
+        // world that only "worked" because emit_leg_pnl read IdxI too.
+        risk.record_fill_in_segment(901, ExchangeSegment::NseFno, 2, 100.0, 25);
+        risk.record_fill_in_segment(13, ExchangeSegment::IdxI, 1, 22_000.0, 1);
         process_mark(
             &mut oms,
             &mut risk,
@@ -3217,15 +3473,12 @@ mod tests {
     fn paper_book_refuses_a_new_sid_at_the_ceiling() {
         let mut book = BookState::new();
         for sid in 0..BookState::MAX_TRACKED_SIDS as u64 {
-            assert!(book.tripwire_ok(sid, 2));
+            book.observe_segment(sid, 2);
         }
         assert_eq!(book.tripwire.len(), BookState::MAX_TRACKED_SIDS);
 
         let beyond = BookState::MAX_TRACKED_SIDS as u64;
-        assert!(
-            book.tripwire_ok(beyond, 2),
-            "a refused sid must not block the event"
-        );
+        book.observe_segment(beyond, 2);
         assert!(
             !book.tripwire.contains_key(&beyond),
             "but it must not take a permanent slot either"
@@ -3239,11 +3492,12 @@ mod tests {
         // must keep watching every sid it already holds.
         let mut book = BookState::new();
         for sid in 0..BookState::MAX_TRACKED_SIDS as u64 {
-            assert!(book.tripwire_ok(sid, 2));
+            book.observe_segment(sid, 2);
         }
         // sid 0 is tracked at segment 2; a DIVERGENT segment must still fire.
+        book.observe_segment(0, 8);
         assert!(
-            !book.tripwire_ok(0, 8),
+            book.tripwire_reported.contains(&0),
             "a tracked sid's collision must still be detected at the ceiling"
         );
     }

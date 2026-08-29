@@ -200,6 +200,75 @@ downward copy remains the documented B1 contract (pinned by
 `live_mode_reconcile_terminal_applies_fill_but_never_status`) — out of
 this guard's scope.
 
+
+### §3.1 — 2026-08-29: the RISK-ENGINE half of the composite rewrite LANDED; the OMS half did NOT
+
+The §3 deferral above is **partially closed**. Recorded as a split rather than
+a tick, because ticking it whole would be exactly the false-OK this file's own
+envelope forbids.
+
+**What landed.** `order_runtime.rs` no longer calls the RiskEngine's
+segment-less overloads. It resolves `ExchangeSegment::from_byte(segment_code)`
+once per fill and per mark and carries it into `record_fill_in_segment` /
+`update_market_price_in_segment` / `position_in_segment`, so a position is
+booked and marked on the composite `(security_id, segment)` row the engine has
+always keyed internally. The first-seen-segment mirror stops REFUSING events:
+its refusal existed only because the engine could not tell two segments apart,
+and it bought that safety by dropping a fill for a position we actually hold —
+which `RiskEngine::MAX_TRACKED_POSITIONS` states plainly must never be done, and
+which hid the leg thoroughly, since the OMS had already advanced the order to
+PART_TRADED/TRADED before the drop. It survives as `observe_segment`, keeping
+the same counter and the same edge-latched RISK-GAP-02 line.
+
+**Two things the migration itself forced, both non-obvious:**
+
+* **`emit_leg_pnl` had to move in the same change.** It is FNO-only yet read
+  `risk.position(security_id)` — the IdxI row. That agreed with the fill side
+  only because both were equally segment-blind; migrating fills alone would have
+  made every FNO leg's `position_in_segment` lookup miss, and the
+  `order_leg_pnl` table would have gone silently empty.
+* **The paper filler needed a NEW gate.** `pending_paper` is keyed on the bare
+  `security_id` because `ManagedOrder` has no segment field, so disarming the
+  refusal opened a path that had never been reachable: a mark on segment B
+  filling a pending order placed on segment A, with `synthesize_paper_fill`
+  stamping the MARK's segment onto the fill. `segment_matches_first_seen` keeps
+  that one path shut — bite-proven by
+  `a_mark_on_another_segment_must_not_fill_a_pending_paper_order`, which fails
+  (`traded_qty` 1, expected 0) with the gate removed.
+
+**What did NOT land, and cannot without a bigger change.** `ManagedOrder`
+(`crates/trading/src/oms/types.rs`) carries `security_id` and **no segment
+field at all**. So the OMS order map, and the local reconcile's leg-2 fold of
+`traded_qty`, remain bare-sid by construction. The reconcile therefore compares
+bare-sid SUMS on both legs, via the new O(1) `net_lots_for_any_segment` index —
+the only comparison that is apples-to-apples against its own inputs — and the
+honest consequence is stated at the function: **the reconcile cannot detect a
+cross-segment mis-booking**, because summing over segments is unchanged by one.
+What catches that is the collision counter and the fact that the fill path now
+carries the segment; not this check.
+
+**So the §3 pre-live bar is not cleared.** Adding a segment to `ManagedOrder`
+cascades through the state machine, `order_audit` persistence, the API client
+and the exit-order layer, and is its own unit of work. Landmine 2 (the E9
+cross-feed id-space mapping) is untouched. **No `dry_run = false` flip on the
+strength of this change.**
+
+**Reachability, so the severity is not overstated either.** The paper self-test
+is gated to IDX_I marks (the E4 gate in `process_mark`), so no cross-segment
+fill is produced today and the netting was not firing in production. It was
+reachable in two ways: once live trading widens past IDX_I, and — already today
+— past the 25,000-sid ceiling, where `can_admit_sid` returned `true` WITHOUT
+inserting the sid, so every later event for it re-entered the same unseen-sid
+arm and the check was permanently skipped for that id.
+
+**Ratchets.** `crates/app/tests/risk_segment_aware_call_guard.rs` (4 tests) pins
+the remaining legacy call sites shrink-only — `trading_pipeline.rs` (dead:
+`spawn_trading_pipeline` has zero call sites) and `exit_execution.rs` (behind
+the four-gate exit lockout) — and fails the build on a new one anywhere, or on
+any legacy call reappearing in `order_runtime.rs`. Bite-proven both directions.
+`a_long_and_a_short_on_one_id_in_two_segments_do_not_net` is the behavioural
+bite: revert one call to the legacy overload and both segment rows read 0.
+
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
 1. Strategy/indicator activation — §28 boundary; the runtime never
