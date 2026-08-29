@@ -43,6 +43,42 @@
 //! counts come from `feed_episode_audit`. A connection present in the episode
 //! table but absent from the event table still gets a row, with
 //! `saw_any_event = false`, because that combination is itself a finding.
+//!
+//! ## ⚠ What this CANNOT answer — a socket that never came up at all
+//!
+//! The connection set is OBSERVED, not AUTHORIZED. Both sources are things
+//! that HAPPENED: a lifecycle event, or a classified episode. A connection
+//! the lane planned and then failed to dial produces NEITHER, because there
+//! is no `WsEventKind` for a failed dial — the kinds are connected /
+//! disconnected / disconnected_off_hours / reconnected / sleep_entered /
+//! sleep_resumed, and every one of them presupposes a socket that opened at
+//! least once.
+//!
+//! So a connection that never opened is ABSENT from this table, and an
+//! absent row reads exactly like a connection that was never planned. This
+//! is not hypothetical: on 2026-08-12 the main feed failed twelve dial
+//! attempts in a row with `HTTP 400` and never completed a handshake all
+//! session. That socket would appear in this table as nothing at all.
+//!
+//! It is stated here rather than papered over because the question this
+//! module was built to answer is *"for ALL the connections"*, and on this
+//! one case the honest answer is that it does not know. The signals that DO
+//! see it today are `tv_dhan_ws_dial_failed_total{endpoint,reason}` and the
+//! `WS-GAP-03` coded error — both CloudWatch-side, neither in this table.
+//!
+//! Closing it properly means recording the PLANNED connection set at attach
+//! (a new kind, written once per connection before the first dial) so that
+//! planned-minus-observed becomes a keyed row rather than an inference.
+//! That is a change to the live lane's boot path and a new SYMBOL value in a
+//! DEDUP-keyed table, so it is deliberately NOT smuggled in beside a fold —
+//! it is its own change with its own review.
+//!
+//! Deriving the expected set from the 16-socket authorization instead would
+//! be WORSE, and the reason is worth recording: the pool plans sockets from
+//! instrument counts (the main feed packs, depth spreads one instrument per
+//! connection), so the planned count moves day to day. Asserting sixteen
+//! would manufacture eight false "never came up" rows on an ordinary day —
+//! a fabricated finding, which is worse than a missing one.
 
 use std::collections::BTreeMap;
 
@@ -669,6 +705,74 @@ mod tests {
         assert!(!rows[0].saw_any_event);
         assert_eq!(rows[0].stalls, 1);
         assert!(!rows[0].clean_day());
+    }
+
+    #[test]
+    fn test_a_connection_that_never_opened_produces_no_row() {
+        // PASSES BY DESIGN — this pins the limitation, it does not assert a
+        // feature. Both sources are things that HAPPENED, and a socket that
+        // failed every dial produces neither a lifecycle event nor a
+        // classified episode, so it is absent from the fold entirely.
+        //
+        // The 2026-08-12 main feed is the real instance: twelve dial failures,
+        // `HTTP 400`, zero handshakes all session. Here that connection is
+        // simply not in the input, and the output is empty rather than a row
+        // saying it never came up.
+        //
+        // If a future change records the PLANNED set at attach, THIS test is
+        // the one that must flip — and the module header section it mirrors
+        // must be rewritten in the same change.
+        let events = ws_body(r#"["dhan","main_feed",0,5,"connected",0,0]"#);
+        let mut out = BTreeMap::new();
+        fold_ws_event_rows(&mut out, &events).expect("parse");
+        let rows = finalize_rows(out, 0);
+
+        // Connection 0 came up and is here. Connections 1..=4 of the same
+        // planned pool never dialled and are invisible.
+        assert_eq!(rows.len(), 1, "only the socket that OPENED is represented");
+        assert_eq!(rows[0].connection_index, 0);
+        assert!(
+            !rows.iter().any(|r| r.connection_index == 1),
+            "a planned-but-never-dialled connection is absent, NOT reported \
+             as down — the documented blind spot"
+        );
+    }
+
+    #[test]
+    fn test_the_never_opened_blind_spot_stays_documented() {
+        // A limitation that lives only in prose rots (this repository has the
+        // receipts). Pin the header section so the gap cannot be quietly
+        // dropped from the docs while it is still real in the code.
+        //
+        // Scan the PRODUCTION region only — split at the first column-0
+        // `#[cfg(test)]`, the house pattern. The first draft of this test
+        // scanned the whole file and was therefore VACUOUS: the pin strings
+        // live in the array below, so `include_str!` found them in the test's
+        // own source and the assertion could never fail. Bite-proven after
+        // the split (deleting the header section turns it red).
+        let whole = include_str!("ws_connection_rollup.rs");
+        let src = whole
+            .split_once("\n#[cfg(test)]")
+            .map_or(whole, |(production, _)| production);
+        assert!(
+            src.len() < whole.len(),
+            "the production/test split marker vanished — without it this test \
+             reads its own pin array and passes vacuously"
+        );
+        for pin in [
+            "What this CANNOT answer",
+            "The connection set is OBSERVED, not AUTHORIZED",
+            "would manufacture eight false",
+        ] {
+            assert!(
+                src.contains(pin),
+                "the never-opened blind spot lost its header pin `{pin}` — either \
+                 the limitation was fixed (then rewrite the section and flip \
+                 test_a_connection_that_never_opened_produces_no_row) or the \
+                 warning was deleted while the gap remains, which is the \
+                 false-completeness class this module exists to avoid"
+            );
+        }
     }
 
     #[test]
