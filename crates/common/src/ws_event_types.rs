@@ -132,7 +132,7 @@ impl WsEventKind {
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness.
     #[must_use]
-    pub const fn all() -> [WsEventKind; 7] {
+    pub const fn all() -> [WsEventKind; 8] {
         [
             Self::Connected,
             Self::Disconnected,
@@ -141,6 +141,7 @@ impl WsEventKind {
             Self::SleepEntered,
             Self::SleepResumed,
             Self::StallRestarted,
+            Self::DialStarted,
         ]
     }
 }
@@ -245,7 +246,38 @@ mod tests {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
         assert_eq!(WsType::all().len(), 5);
-        assert_eq!(WsEventKind::all().len(), 7);
+        // 7 -> 8 on 2026-08-29 with `DialStarted`. This ratchet is why the
+        // addition could not be silent: `all()` drives the persistence
+        // round-trip test, so a kind missing from it would never have had its
+        // ILP append exercised.
+        assert_eq!(WsEventKind::all().len(), 8);
+    }
+
+    #[test]
+    fn test_dial_started_is_not_an_up_kind_and_has_its_own_label() {
+        // `dial_started` fires BEFORE the socket can deliver anything. Any
+        // consumer that string-matches it as a connection-up signal would
+        // report a socket healthy the instant it began dialing -- which is
+        // the exact failure the kind was added to expose, inverted.
+        let label = WsEventKind::DialStarted.as_str();
+        assert_eq!(label, "dial_started");
+        for reserved in [
+            "connected",
+            "reconnected",
+            "sleep_resumed",
+            "disconnected",
+            "disconnected_off_hours",
+            "stall_restarted",
+        ] {
+            assert_ne!(
+                label, reserved,
+                "dial_started must not collide with an existing lifecycle label"
+            );
+        }
+        assert!(
+            WsEventKind::all().contains(&WsEventKind::DialStarted),
+            "a kind absent from all() never gets its ILP append exercised"
+        );
     }
 
     #[test]
