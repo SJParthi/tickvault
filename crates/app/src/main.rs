@@ -1864,31 +1864,74 @@ async fn async_main() -> Result<()> {
     // `spawn_heartbeat_watchdog` twins are DELETED with the lane — this
     // process-global pinger is now the SOLE WATCHDOG=1 source. No-op
     // outside systemd (`notify_systemd_watchdog` requires NOTIFY_SOCKET).
-    let _process_global_watchdog_pinger = tokio::spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS,
-        ));
-        // DELAY, not the default BURST — 2026-08-20.
-        //
-        // Under Burst a stalled runtime pays back every missed tick the
-        // instant it recovers: the pinger fires N times back to back and the
-        // watchdog is satisfied as though nothing happened. That makes a
-        // runtime stall shorter than `WatchdogSec` invisible to the ONE
-        // mechanism whose entire job is to notice it — the beacon reports
-        // health it did not have, which is the false-OK class this repo's own
-        // rules forbid.
-        //
-        // Delay re-bases the schedule from the late tick, so a stall shows up
-        // as a genuine gap between pings. 24 of the other 28 intervals in this
-        // binary already set this explicitly; the liveness beacon was the one
-        // that most needed it and did not.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await; // skip the immediate first tick
-        loop {
-            interval.tick().await;
-            infra::notify_systemd_watchdog();
-        }
-    });
+    // A DEDICATED OS THREAD, not a tokio task — 2026-09-01.
+    //
+    // MEASURED IN PRODUCTION that morning: TWELVE watchdog timeouts and TEN
+    // restarts in 24h, each one a simultaneous 14-socket disconnect plus a
+    // cold resubscribe of ~21,730 instruments. The journal said "Failed to
+    // START" — READY=1 never arrived — and the process consumed 13.175s of
+    // CPU across a 101-second boot. It was BLOCKED, not busy.
+    //
+    // Mechanism: this runtime has TWO workers (`TICKVAULT_TOKIO_WORKER_THREADS=2`)
+    // on two pinned cores (`AllowedCPUs=1-2`). During boot the lane waits on
+    // the daily mapping artifact while the universe rider builds it — and that
+    // rider makes synchronous `std::fs` calls with no `spawn_blocking`, writing
+    // a 111,362-contract artifact and a 134,227-row lifecycle pass. Two
+    // concurrent blocking tasks occupy BOTH workers, which stalls the timer
+    // wheel driving `tokio::time::interval`. This pinger then never runs,
+    // systemd sees no WATCHDOG=1 for 60s, and SIGABRTs the process. The rider
+    // dies mid-build, so the next boot waits for the same missing artifact: a
+    // self-sustaining kill loop.
+    //
+    // `block_in_place` was RULED OUT as the cause — it migrates pending tasks
+    // to a replacement worker. Plain synchronous `std::fs` on a worker does not.
+    //
+    // A liveness beacon must not depend on the health of the thing it reports
+    // on. On its own OS thread with `std::thread::sleep`, this pinger is immune
+    // to runtime starvation: it keeps its schedule whether the runtime is idle,
+    // saturated, or wedged.
+    //
+    // The 2026-08-20 `MissedTickBehavior::Delay` reasoning is PRESERVED and is
+    // now structural rather than configured. That comment recorded why Burst is
+    // wrong: a stalled runtime pays back every missed tick at once, so a stall
+    // shorter than `WatchdogSec` becomes invisible to the one mechanism whose
+    // job is to notice it. `sleep` re-bases from the actual wake, so a late
+    // wake is a real gap and can never be repaid in a burst. The property is
+    // now a consequence of the primitive instead of a setting that can be
+    // dropped in a refactor.
+    //
+    // Widening the runtime to 3 workers was REJECTED as the fix: it contends
+    // with QuestDB's pinned core and treats the symptom. The rider's blocking
+    // I/O is the true cause and is a separate change; this one makes the beacon
+    // truthful whether or not that lands.
+    let _process_global_watchdog_pinger = std::thread::Builder::new()
+        .name("tv-watchdog-ping".to_string())
+        .spawn(|| {
+            let period =
+                std::time::Duration::from_secs(tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS);
+            // Skip the immediate first tick, matching the previous behaviour.
+            std::thread::sleep(period);
+            loop {
+                infra::notify_systemd_watchdog();
+                std::thread::sleep(period);
+            }
+        })
+        .inspect_err(|err| {
+            // Not a panic and not silent. If this thread cannot start there is
+            // no WATCHDOG=1 heartbeat, so systemd SIGKILLs the process inside
+            // `WatchdogSec` whatever we do here — the only useful act is to
+            // make the reason legible in the log the operator will read after
+            // the restart, instead of leaving an unexplained kill.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+                error = ?err,
+                "the systemd watchdog beacon thread FAILED TO SPAWN. No \
+                 WATCHDOG=1 will be sent, so systemd will kill this process \
+                 within WatchdogSec and restart it. This is a host resource \
+                 failure (thread limit or memory), not a feed fault."
+            );
+        })
+        .ok();
 
     // =====================================================================
     // BOOT (single path since PR-C2, 2026-07-13 — the Dhan FAST
