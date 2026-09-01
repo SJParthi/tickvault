@@ -2498,3 +2498,80 @@ fn scope_fix_2026_08_19_self_test() {
          the scanner and hide the literal after it"
     );
 }
+
+/// Markers that RENAME `std::process::Command`, defeating the spawn scan.
+///
+/// The spawn scan is marker-driven on the literal `Command::new("`. A single
+/// renamed import makes every spawn in that file invisible to it.
+const COMMAND_ALIAS_MARKERS: &[&str] = &[
+    ", Command as ",
+    "= std::process::Command;",
+    "process::Command as ",
+    "{Command as ",
+];
+
+/// SCOPE FIX #14 (2026-09-01) — the thirteenth hole, PROVEN BY PLANTING.
+///
+/// The Rust spawn scan looks for the literal `Command::new("`. Renaming the
+/// type at the import site defeats it completely, and `.rs` is excluded from
+/// the token scan, has no shebang, and is not a banned extension — so there is
+/// no backstop whatsoever.
+///
+/// Measured on this checkout by planting four tracked `.rs` files:
+///
+/// | payload | result |
+/// |---|---|
+/// | `std::process::Command::new("python3")` (control) | FAILED, correctly |
+/// | `use ...Command as Runner; Runner::new("python3")` | **20 passed — green** |
+/// | `type Sh = std::process::Command; Sh::new("python3")` | **20 passed — green** |
+/// | `use ...Command as C; C::new("node")` | **20 passed — green** |
+///
+/// Only the import line differs between row 1 and row 2. Reachable from any
+/// compiled crate including `build.rs`, which executes on every `cargo build`,
+/// and an inline `-c` payload means no interpreted-language FILE ever lands.
+///
+/// This bans the RENAME rather than enumerating one more alias name, because
+/// enumerating the next name is the approach that has now been wrong fourteen
+/// times. Zero legitimate aliased imports existed when this landed, so the ban
+/// costs nothing; if one is ever genuinely needed, the canonical unaliased
+/// form is always available and is the form the spawn scan can see.
+#[test]
+fn command_is_never_aliased_past_the_spawn_scan() {
+    assert_sorted_unique(COMMAND_ALIAS_MARKERS, "COMMAND_ALIAS_MARKERS");
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for path in git_ls_files(&["*.rs"]) {
+        // This guard names the markers it bans; scanning itself is
+        // self-referential, exactly as the sibling spawn scan documents.
+        if path.ends_with("crates/common/tests/rust_only_guard.rs") {
+            continue;
+        }
+        let content = std::fs::read_to_string(root.join(&path))
+            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        scanned += 1;
+        for marker in COMMAND_ALIAS_MARKERS {
+            if content.contains(marker) {
+                violations.push(format!("{path}: renames Command via `{marker}`"));
+            }
+        }
+    }
+
+    // Anti-vacuity: a glob that matches nothing, or a read that fails open,
+    // would make this assertion trivially true — the exact false-OK class this
+    // file exists to prevent.
+    assert!(
+        scanned > 100,
+        "RUST-ONLY GUARD IS BLIND: scanned only {scanned} .rs file(s). The \
+         enumeration broke and this guard is enforcing nothing."
+    );
+
+    assert!(
+        violations.is_empty(),
+        "RUST-ONLY VIOLATION: `std::process::Command` is renamed, which makes \
+         every spawn in that file invisible to the `Command::new(\"` spawn \
+         scan: {violations:?}. Use the canonical unaliased form so the scan \
+         can see it. See SCOPE FIX #14 above — this exact shape was planted \
+         and passed 20/20 green before this guard existed."
+    );
+}
