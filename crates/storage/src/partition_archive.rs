@@ -4777,6 +4777,34 @@ mod hour_granular_eligibility_tests {
     // deferred to a 2-day one that protects every partition the box wrote
     // that session.
 
+    /// Exhaustive truth table for `hour_window_decision`.
+    ///
+    /// Every (hours, spill_pending, under_pressure) combination, so a future
+    /// edit cannot change one arm silently. The four arms are the whole rule:
+    /// off-allowlist stays on days; no spill takes hours; a spill under
+    /// pressure FORCES hours and is counted; a spill without pressure defers.
+    #[test]
+    fn hour_window_decision_truth_table_is_exhaustive() {
+        use HourWindowDecision as D;
+        let cases = [
+            (None, false, false, D::DaysByClass),
+            (None, false, true, D::DaysByClass),
+            (None, true, false, D::DaysByClass),
+            (None, true, true, D::DaysByClass),
+            (Some(4), false, false, D::Hours(4)),
+            (Some(4), false, true, D::Hours(4)),
+            (Some(4), true, false, D::DeferredToDays),
+            (Some(4), true, true, D::ForcedHours(4)),
+        ];
+        for (hours, spill, pressure, want) in cases {
+            assert_eq!(
+                hour_window_decision(hours, spill, pressure),
+                want,
+                "hours={hours:?} spill_pending={spill} under_pressure={pressure}"
+            );
+        }
+    }
+
     #[test]
     fn pressure_keeps_the_hour_window_when_a_spill_is_pending() {
         // The exact incident shape: hour-capable table, spill pending,
