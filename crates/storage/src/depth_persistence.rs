@@ -783,27 +783,68 @@ fn spill_failed_depth_ilp(
     // Not memoised, deliberately: free space is a moving quantity and a
     // cached answer describes a disk that no longer exists. One probe per
     // rescue is free -- a rescue only happens when a flush already failed.
-    if let crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } =
-        crate::disk_health_watcher::probe_disk_free_bytes(dir)
-    {
-        let floor = min_free_headroom_bytes;
-        let needed = (payload.len() as u64).saturating_add(floor);
-        if free_bytes < needed {
+    // FAIL CLOSED when the probe fails -- deliberately NOT the tick twin's
+    // fail-open (2026-09-01, second adversarial round, hours after the reserve
+    // split this defeats was shipped).
+    //
+    // The tick tier fails OPEN here and its comment gives a good reason: one
+    // broken `df` must not disable the whole rescue tier. Copying that
+    // reasoning to depth reintroduced the exact inversion the two-reserve
+    // split exists to prevent. Both tiers refuse on a failed probe INSIDE
+    // their ceiling arm, and that arm engages only once the tier's own spill
+    // directory is past its rail -- and the directories are INDEPENDENT:
+    //
+    //     `df` broken, tick dir over its ceiling, depth dir under its cap
+    //       ticks -> OverCeilingProbeFailed  -> REFUSE
+    //       depth -> ceiling arm skipped     -> fail-open -> WRITE
+    //
+    // Decision-critical ticks discarded while record-only depth is written.
+    // Reachable, not theoretical: a single-table WAL suspension grows one
+    // directory and not the other, which is what happened on 2026-08-25 when
+    // fourteen tables suspended individually.
+    //
+    // The reserves' `const _` assert cannot see this. It compares byte values;
+    // the probe-failure path carries none -- it is the whole `None` domain.
+    //
+    // Depth is record-only and carries ~24x the tick row volume, so a blind
+    // `df` now costs depth rows and never tick rows. That is the ordering the
+    // operator set. The refusal is counted by the same blind counter, so the
+    // event stays visible either way.
+    let free_now = crate::tick_persistence::spill_free_bytes(dir);
+    match crate::tick_persistence::classify_spill_floor(
+        free_now,
+        payload.len() as u64,
+        min_free_headroom_bytes,
+        crate::tick_persistence::BlindWritePolicy::FailClosed,
+    ) {
+        crate::tick_persistence::SpillFloorVerdict::Allow => {}
+        crate::tick_persistence::SpillFloorVerdict::AllowProbeFailed => {
+            // Only reachable with the floor DISABLED (`0`), which is the value
+            // tests inject to exercise the allow arm without depending on the
+            // build machine's free space.
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
+        }
+        crate::tick_persistence::SpillFloorVerdict::RefuseProbeFailed => {
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "refusing a depth spill: the free-space probe failed and depth is \
+                 record-only -- it must not write blind while decision-critical ticks \
+                 may need the room",
+            ));
+        }
+        crate::tick_persistence::SpillFloorVerdict::RefuseNoRoom => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
-                    "refusing a {}-byte depth spill: only {free_bytes} bytes free, and the \
-                     write must leave {floor} bytes of headroom -- depth is record-only and \
-                     must not consume the room decision-critical ticks need",
-                    payload.len()
+                    "refusing a {}-byte depth spill: only {} bytes free, and the write \
+                     must leave {min_free_headroom_bytes} bytes of headroom -- depth is \
+                     record-only and must not consume the room decision-critical ticks need",
+                    payload.len(),
+                    free_now.unwrap_or(0)
                 ),
             ));
         }
-    } else {
-        // Fail-open, counted rather than silent -- see the tick twin for why
-        // a per-write floor must not fail closed (one broken `df` would
-        // disable the whole rescue tier).
-        metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
     }
 
     // One file per feed per hour: bounded file count, and an operator replaying
