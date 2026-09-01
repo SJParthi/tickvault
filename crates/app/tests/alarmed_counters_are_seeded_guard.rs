@@ -261,6 +261,80 @@ fn zero_registered_names() -> std::collections::BTreeSet<String> {
     out
 }
 
+/// Remove Rust comments before scanning for registrations.
+///
+/// # Why this exists (2026-09-01, found by adversarial review)
+///
+/// Without it this guard had a CRITICAL false-OK: the terraform side already
+/// stripped `#` comments, but the Rust side split raw source on
+/// `metrics::counter!(`, so a registration that had been COMMENTED OUT still
+/// counted as present. Bite-proven — prefixing a real seeding line with `//`
+/// left the guard fully green while the counter lost its baseline and its
+/// alarm went dead on the first episode. That is precisely the failure this
+/// guard exists to prevent, hiding inside the guard itself.
+///
+/// String-literal aware: a `//` inside a metric name or message must not be
+/// treated as the start of a comment, or stripping would corrupt the very
+/// literals the scan is looking for.
+fn strip_rust_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                // Escaped char: copy it verbatim so `\"` never ends the string.
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            // Line comment: drop through end of line, keep the newline so
+            // line-oriented context in panic messages stays meaningful.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            // Block comment. Rust nests these; track depth so an inner `*/`
+            // cannot terminate an outer comment early.
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
 fn collect_zero_registrations(
     dir: &Path,
     consts: &std::collections::BTreeMap<String, String>,
@@ -278,9 +352,11 @@ fn collect_zero_registrations(
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
+        // Comments FIRST: a commented-out registration must not count.
+        let src = strip_rust_comments(&raw);
         // A registration may wrap across lines, so join the file and scan for
         // each `counter!(..)` span that ends in `.increment(0)`.
         for span in src.split("metrics::counter!(").skip(1) {
@@ -429,6 +505,48 @@ fn the_terraform_scanner_is_not_vacuous() {
     );
 }
 
+/// Attributes an empty Rust scan correctly — 2026-09-01.
+///
+/// An adversarial audit reported the two Rust scanners as a false-OK:
+/// `collect_const_literals` and `collect_zero_registrations` both open with
+/// `let Ok(entries) = read_dir(dir) else { return; }`, so a moved source root
+/// yields an empty scan, which the audit read as "the guard then passes having
+/// compared nothing."
+///
+/// CHECKED, and it is the OPPOSITE. `every_alarmed_counter_is_registered_at_boot`
+/// treats every alarmed name absent from `registered` as MISSING — so an empty
+/// scan makes *all* of them missing and the assertion fires. The guard already
+/// fails CLOSED on this axis; there was no vacuity to close. Recorded here
+/// because the direction is the whole point: a finding that is wrong in the
+/// reassuring direction hides a bug, and one wrong in the alarming direction —
+/// this one — sends the next reader to fix something that is not broken.
+///
+/// What IS worth fixing is the DIAGNOSIS. With the root moved, the failure
+/// arrives as a wall of ~49 "ALARMED COUNTER NEVER REGISTERED" lines, which
+/// reads exactly like a real regression in boot-time seeding. This test fires
+/// first with the actual cause named, turning a misleading failure into a
+/// one-line one. That is the same false-RED class as the seal suite's disk
+/// coupling: not a missing assertion, a misattributed one.
+#[test]
+fn an_empty_rust_scan_is_reported_as_a_moved_root_not_a_seeding_regression() {
+    let consts = const_metric_literals();
+    assert!(
+        !consts.is_empty(),
+        "const_metric_literals() found ZERO `const NAME: &str = \"tv_...\"` \
+         declarations. The source root has moved or the scanner is broken — \
+         this is NOT a boot-time seeding regression, which is what the other \
+         assertions in this file are about to look like."
+    );
+
+    let zeroed = zero_registered_names();
+    assert!(
+        !zeroed.is_empty(),
+        "zero_registered_names() found ZERO boot-time counter registrations. \
+         Same cause, same warning: the failures below are a broken scan, not \
+         missing seeding sites."
+    );
+}
+
 /// Bite-proof: the four names this guard was written for must be present.
 ///
 /// Without this the guard could pass by never having matched them at all.
@@ -484,6 +602,20 @@ fn the_handle_seeded_exemptions_still_have_their_seeding_sites() {
          _ring_bytes_full_total assume it seeds all three:\n{pre_register}"
     );
 
+    // A function that seeds is worth nothing if nobody calls it. Adversarial
+    // review (2026-09-01) bite-proved that replacing the `sink.pre_register()`
+    // call with a comment left this guard fully green while all three counters
+    // silently lost their baseline. The seeding SITE and the seeding CALL are
+    // two different claims, and only one of them was being checked.
+    let pool_no_comments = strip_rust_comments(&pool);
+    assert!(
+        pool_no_comments.contains("pre_register()"),
+        "WalRingSink::pre_register exists but is never CALLED (comments \
+         stripped, so a commented-out call does not count). The three \
+         exempted counters are unseeded and their alarms are dead on the \
+         first episode."
+    );
+
     // SpillDropCounters::new — a loop over every (source x ws_type) handle.
     let spill = read("crates/storage/src/ws_frame_spill.rs");
     assert!(
@@ -493,5 +625,60 @@ fn the_handle_seeded_exemptions_still_have_their_seeding_sites() {
          sources over every ws_type. That counter's alarm is the tick-loss \
          pager, and an unseeded series means its FIRST episode — the one that \
          matters — publishes nothing."
+    );
+}
+
+/// Self-test for the comment stripper.
+///
+/// A scanner is only as trustworthy as its own parsing. This pins the three
+/// cases that matter: a commented-out registration must disappear, a real one
+/// must survive, and a `//` inside a string literal must NOT be mistaken for
+/// the start of a comment (which would corrupt the metric names the scan is
+/// looking for and produce false FAILURES instead of false passes).
+#[test]
+fn the_comment_stripper_hides_commented_out_code_and_keeps_real_code() {
+    // 1. Line comment: the registration must be gone.
+    let commented = r#"// metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        !strip_rust_comments(commented).contains("metrics::counter!"),
+        "a commented-out registration survived stripping — the guard would \
+         count it as present"
+    );
+
+    // 2. Block comment, including a nested one.
+    let blocked = r#"/* outer /* inner */ metrics::counter!("tv_probe_total"); */ let x = 1;"#;
+    let stripped = strip_rust_comments(blocked);
+    assert!(
+        !stripped.contains("metrics::counter!"),
+        "a block-commented registration survived stripping: {stripped}"
+    );
+    assert!(
+        stripped.contains("let x = 1;"),
+        "the stripper ate code after a nested block comment: {stripped}"
+    );
+
+    // 3. Real code survives untouched.
+    let real = r#"metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        strip_rust_comments(real).contains(r#"metrics::counter!("tv_probe_total")"#),
+        "the stripper removed a REAL registration"
+    );
+
+    // 4. `//` inside a string literal is not a comment. Getting this wrong
+    //    would truncate URLs and messages and could hide a following
+    //    registration on the same line.
+    let in_string = r#"let u = "https://x/y"; metrics::counter!("tv_probe_total").increment(0);"#;
+    let out = strip_rust_comments(in_string);
+    assert!(
+        out.contains("tv_probe_total"),
+        "a `//` inside a string literal was treated as a comment, hiding the \
+         registration that followed it: {out}"
+    );
+
+    // 5. An escaped quote must not end the string early.
+    let escaped = r#"let s = "a\"// b"; metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        strip_rust_comments(escaped).contains("tv_probe_total"),
+        "an escaped quote ended the string early and swallowed real code"
     );
 }

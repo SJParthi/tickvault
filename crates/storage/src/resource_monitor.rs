@@ -58,6 +58,11 @@ pub const DEFAULT_PROC_SELF_STATUS_PATH: &str = "/proc/self/status";
 /// Default cgroup-v2 memory limit file.
 pub const DEFAULT_CGROUP_V2_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
 
+/// `/proc/meminfo` — the machine's own RAM. The RESOURCE-02 ceiling when no
+/// cgroup limit is set, which is the production case: the systemd unit sets
+/// no `MemoryMax=`.
+pub const DEFAULT_PROC_MEMINFO_PATH: &str = "/proc/meminfo";
+
 // ---------------------------------------------------------------------------
 // PURE classifiers (truth tables)
 // ---------------------------------------------------------------------------
@@ -139,6 +144,107 @@ pub fn parse_cgroup_memory_max_bytes(memory_max_body: &str) -> Option<u64> {
     token.parse::<u64>().ok()
 }
 
+/// Parses `MemTotal:` out of `/proc/meminfo`, returning BYTES.
+///
+/// The line is `MemTotal:       32827080 kB` — a decimal count in KIBIBYTES,
+/// whatever the unit says. A missing or malformed line yields `None` rather
+/// than a guess.
+#[must_use]
+pub fn parse_meminfo_total_bytes(meminfo_body: &str) -> Option<u64> {
+    meminfo_body
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse::<u64>().ok())
+        .map(|kib| kib.saturating_mul(1024))
+}
+
+/// Where the ceiling RESOURCE-02 measures against came from.
+///
+/// Carrying the SOURCE rather than a bare `Option<u64>` is the point: an
+/// operator reading a memory page needs to know whether 80% means 80% of a
+/// container limit or 80% of the whole machine, and a caller needs to be able
+/// to tell "no ceiling" apart from "ceiling of zero".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCeiling {
+    /// A real cgroup limit. The OOM killer enforces exactly this.
+    Cgroup(u64),
+    /// No cgroup limit — the MACHINE's own RAM is what binds.
+    HostTotal(u64),
+    /// Neither could be read. Nothing can be concluded about memory.
+    Unknown,
+}
+
+impl MemoryCeiling {
+    /// The ceiling in bytes, if one was resolved at all.
+    #[must_use]
+    pub const fn bytes(self) -> Option<u64> {
+        match self {
+            Self::Cgroup(b) | Self::HostTotal(b) => Some(b),
+            Self::Unknown => None,
+        }
+    }
+
+    /// A short label for the log line, so a page says which ceiling it means.
+    #[must_use]
+    pub const fn source(self) -> &'static str {
+        match self {
+            Self::Cgroup(_) => "cgroup",
+            Self::HostTotal(_) => "host_total",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Resolves the memory ceiling, preferring a cgroup limit and falling back to
+/// the machine's own RAM.
+///
+/// # The defect this closes (2026-09-01)
+///
+/// RESOURCE-02 is the process's memory early warning — the one signal that is
+/// supposed to fire BEFORE the OOM killer. It was gated on a cgroup limit
+/// alone:
+///
+/// ```text
+/// if let Some(limit) = probe_cgroup_memory_max_bytes(..) && at_or_above(rss, limit) { page }
+/// else { debug!("resource monitor: RSS ok") }
+/// ```
+///
+/// `deploy/systemd/tickvault.service` sets `LimitNOFILE` and `LimitNPROC` and
+/// **no `MemoryMax=`** — a tree-wide grep for `Memory(Max|Limit|High)` in that
+/// unit returns nothing. So on the production box the probe returns `None`,
+/// the condition is never evaluated, and the monitor takes the `else` branch:
+/// it logs **"RSS ok"** having compared the process against nothing at all.
+///
+/// That is a false OK on the one alarm whose whole job is to fire before a
+/// memory kill, on a host whose entire sizing argument is memory. The residual
+/// signals are `mem_used_high` (host-level, 80%, three 300-second periods — so
+/// fifteen minutes) and then the kernel, which selects the largest RSS: this
+/// process. `oom_monitor.rs` then reports the kill about sixty seconds after
+/// it happens, which is attribution, never prevention.
+///
+/// The machine's RAM is a genuine ceiling: with no cgroup limit the OOM killer
+/// bounds the process at the host total, so measuring against it is measuring
+/// against the real thing rather than skipping the check. On a container both
+/// bind and the cgroup is smaller, so it stays preferred.
+#[must_use]
+pub fn resolve_memory_ceiling(
+    cgroup_memory_max_path: &Path,
+    proc_meminfo_path: &Path,
+) -> MemoryCeiling {
+    if let Some(limit) = probe_cgroup_memory_max_bytes(cgroup_memory_max_path) {
+        return MemoryCeiling::Cgroup(limit);
+    }
+    match std::fs::read_to_string(proc_meminfo_path)
+        .ok()
+        .as_deref()
+        .and_then(parse_meminfo_total_bytes)
+    {
+        Some(total) => MemoryCeiling::HostTotal(total),
+        None => MemoryCeiling::Unknown,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Probes (thin fs-read wrappers)
 // ---------------------------------------------------------------------------
@@ -194,6 +300,10 @@ pub struct ResourceMonitorPaths {
     pub proc_self_status: PathBuf,
     /// cgroup-v2 `memory.max` — process memory ceiling.
     pub cgroup_memory_max: PathBuf,
+    /// `/proc/meminfo` — the machine's own RAM, used as the RESOURCE-02
+    /// ceiling when no cgroup limit exists. Without this the check silently
+    /// does nothing on a bare systemd host; see [`resolve_memory_ceiling`].
+    pub proc_meminfo: PathBuf,
     /// spill directory (free-percent probe reuses the disk-health `df` probe).
     pub spill_dir: PathBuf,
 }
@@ -207,6 +317,7 @@ impl ResourceMonitorPaths {
             proc_self_limits: PathBuf::from(DEFAULT_PROC_SELF_LIMITS_PATH),
             proc_self_status: PathBuf::from(DEFAULT_PROC_SELF_STATUS_PATH),
             cgroup_memory_max: PathBuf::from(DEFAULT_CGROUP_V2_MEMORY_MAX_PATH),
+            proc_meminfo: PathBuf::from(DEFAULT_PROC_MEMINFO_PATH),
             spill_dir,
         }
     }
@@ -234,6 +345,14 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
         let m_rss = metrics::gauge!("tv_process_rss_bytes");
         let m_spill_free_pct = metrics::gauge!("tv_spill_free_pct");
         let m_probe_failed = metrics::counter!("tv_resource_monitor_probe_failed_total");
+        // Consecutive cycles with no readable memory ceiling. Used to throttle
+        // the UNCHECKED warning to powers of two: the condition is persistent
+        // by nature (an unreadable /proc/meminfo does not heal itself), so at a
+        // 60s cadence an unthrottled line would be ~1,440 identical warnings a
+        // day — which is how a real signal gets filtered out and ignored.
+        // Powers of two give ~11 lines a day instead, and the FIRST one is
+        // immediate.
+        let mut ceiling_unreadable_streak: u64 = 0;
 
         info!(
             interval_secs = RESOURCE_MONITOR_POLL_INTERVAL_SECS,
@@ -295,22 +414,61 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
             match probe_vmrss_bytes(&paths.proc_self_status) {
                 Some(rss) => {
                     m_rss.set(rss as f64);
-                    if let Some(limit) = probe_cgroup_memory_max_bytes(&paths.cgroup_memory_max)
-                        && is_at_or_above_pct(rss, limit, RSS_HIGH_PCT_THRESHOLD)
-                    {
-                        error!(
-                            code =
-                                tickvault_common::error_code::ErrorCode::Resource02ResidentMemoryHigh
-                                    .code_str(),
-                            rss_bytes = rss,
-                            limit_bytes = limit,
-                            pct_threshold = RSS_HIGH_PCT_THRESHOLD,
-                            "RESOURCE-02: process resident memory at/above \
-                             {RSS_HIGH_PCT_THRESHOLD}% of the cgroup limit — the OOM \
-                             killer (PROC-01) is imminent; right-size the workload"
-                        );
-                    } else {
-                        debug!(rss_bytes = rss, "resource monitor: RSS ok");
+                    // Ceiling, not "cgroup limit": with no cgroup limit the
+                    // MACHINE's RAM is what the OOM killer enforces, so that
+                    // is what RSS is measured against. Gating on the cgroup
+                    // alone made this whole arm inert on the production box
+                    // and then logged "RSS ok" — see `resolve_memory_ceiling`.
+                    let ceiling =
+                        resolve_memory_ceiling(&paths.cgroup_memory_max, &paths.proc_meminfo);
+                    match ceiling.bytes() {
+                        Some(limit) if is_at_or_above_pct(rss, limit, RSS_HIGH_PCT_THRESHOLD) => {
+                            error!(
+                                code =
+                                    tickvault_common::error_code::ErrorCode::Resource02ResidentMemoryHigh
+                                        .code_str(),
+                                rss_bytes = rss,
+                                limit_bytes = limit,
+                                ceiling_source = ceiling.source(),
+                                pct_threshold = RSS_HIGH_PCT_THRESHOLD,
+                                "RESOURCE-02: process resident memory at/above \
+                                 {RSS_HIGH_PCT_THRESHOLD}% of the {} ceiling — the OOM \
+                                 killer (PROC-01) is imminent; right-size the workload",
+                                ceiling.source()
+                            );
+                        }
+                        Some(_) => {
+                            ceiling_unreadable_streak = 0;
+                            debug!(rss_bytes = rss, ceiling = ceiling.source(), "RSS ok");
+                        }
+                        // NOT "RSS ok". Nothing was compared, so nothing is
+                        // known — saying otherwise is the false-OK this arm
+                        // was just repaired for. Counted like every other
+                        // failed probe in this monitor.
+                        None => {
+                            m_probe_failed.increment(1);
+                            ceiling_unreadable_streak = ceiling_unreadable_streak.saturating_add(1);
+                            // WARN, not DEBUG (2026-09-01, adversarial review).
+                            //
+                            // The arm below — an unreadable RSS — already warns,
+                            // and this is the same class: nothing was compared,
+                            // so the RSS alarm is not merely quiet, it is
+                            // STRUCTURALLY unable to fire. At `debug!` that state
+                            // was honest in the code and invisible in production,
+                            // which is most of the way back to the false-OK this
+                            // arm was repaired for. The counter it increments has
+                            // no alarm either, so the log line is the only
+                            // operator-reachable signal that exists.
+                            if ceiling_unreadable_streak.is_power_of_two() {
+                                warn!(
+                                    rss_bytes = rss,
+                                    consecutive_cycles = ceiling_unreadable_streak,
+                                    "resource monitor: no memory ceiling readable — RSS \
+                                     recorded but UNCHECKED, so the RSS threshold cannot \
+                                     fire at all (throttled to powers of two)"
+                                );
+                            }
+                        }
                     }
                 }
                 None => {
@@ -404,6 +562,32 @@ pub fn spawn_supervised_resource_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unique scratch directory per test, the same shape the sibling
+    /// persistence tests use. Deliberately not a new dev-dependency: adding a
+    /// crate needs operator approval (CLAUDE.md CARGO), and the ceiling tests
+    /// need nothing a nanosecond-tagged path cannot give them.
+    /// A probe directory that is unique WITHOUT depending on the clock.
+    ///
+    /// Adversarial review (2026-09-01) found two problems with the previous
+    /// nanos-only version, and the second is the one that bites:
+    ///
+    ///   1. `map_or(0, ..)` collapsed the tag to a CONSTANT `0` on any
+    ///      `SystemTime` error, so every caller would share one directory.
+    ///   2. Two call sites already passed the same tag (`"ceiling"`), so on
+    ///      that collapse they would race writing DIFFERENT contents to the
+    ///      same `memory.max` and the assertion outcome would depend on
+    ///      thread scheduling.
+    ///
+    /// A monotonic per-process counter plus the pid makes uniqueness a
+    /// property of the program rather than of the clock, so neither failure
+    /// mode survives even if `SystemTime` returns an error every time.
+    fn unique_probe_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("tv-resource-monitor-{tag}-{pid}-{seq}"))
+    }
 
     // -- thresholds sanity --
 
@@ -550,6 +734,102 @@ mod tests {
     fn test_parse_cgroup_memory_max_bytes_garbage_is_none() {
         assert_eq!(parse_cgroup_memory_max_bytes("not-a-number\n"), None);
         assert_eq!(parse_cgroup_memory_max_bytes(""), None);
+    }
+
+    // -- memory ceiling resolution (RESOURCE-02) --
+
+    #[test]
+    fn test_parse_meminfo_total_bytes_reads_kib_and_returns_bytes() {
+        // Real shape, including the lines either side that must be skipped.
+        let body = "MemFree:         1234 kB\nMemTotal:       32827080 kB\nBuffers: 1 kB\n";
+        assert_eq!(
+            parse_meminfo_total_bytes(body),
+            Some(32_827_080 * 1024),
+            "MemTotal is a KIBIBYTE count and must be widened to bytes"
+        );
+        assert_eq!(parse_meminfo_total_bytes("MemFree: 12 kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: garbage\n"), None);
+        assert_eq!(parse_meminfo_total_bytes(""), None);
+    }
+
+    /// The exact production shape, and the reason this fix exists.
+    ///
+    /// `deploy/systemd/tickvault.service` sets no `MemoryMax=`, so the cgroup
+    /// file reads `max` (or is absent). Before this change that made the whole
+    /// RESOURCE-02 arm inert and it then logged "RSS ok" — a false OK on the
+    /// one alarm meant to fire before an OOM kill.
+    #[test]
+    fn resolve_memory_ceiling_falls_back_to_the_machine_when_no_cgroup_limit() {
+        let dir = unique_probe_dir("ceiling");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cgroup = dir.join("memory.max");
+        let meminfo = dir.join("meminfo");
+        std::fs::write(&cgroup, "max\n").expect("write cgroup");
+        std::fs::write(&meminfo, "MemTotal:       32827080 kB\n").expect("write meminfo");
+
+        let ceiling = resolve_memory_ceiling(&cgroup, &meminfo);
+        assert_eq!(
+            ceiling,
+            MemoryCeiling::HostTotal(32_827_080 * 1024),
+            "with no cgroup limit the machine's own RAM is the real ceiling — \
+             the OOM killer enforces it, so RESOURCE-02 must measure against it"
+        );
+        assert!(
+            ceiling.bytes().is_some(),
+            "a resolved ceiling is what makes the check run at all"
+        );
+        assert_eq!(ceiling.source(), "host_total");
+    }
+
+    #[test]
+    fn resolve_memory_ceiling_prefers_the_cgroup_because_it_is_the_smaller_bound() {
+        let dir = unique_probe_dir("ceiling-cgroup-max");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cgroup = dir.join("memory.max");
+        let meminfo = dir.join("meminfo");
+        // Container limit far below the machine total.
+        std::fs::write(&cgroup, "2147483648\n").expect("write cgroup");
+        std::fs::write(&meminfo, "MemTotal:       32827080 kB\n").expect("write meminfo");
+        assert_eq!(
+            resolve_memory_ceiling(&cgroup, &meminfo),
+            MemoryCeiling::Cgroup(2_147_483_648),
+            "both bind and the cgroup is smaller; it is what the OOM killer uses"
+        );
+    }
+
+    #[test]
+    fn resolve_memory_ceiling_unknown_carries_no_number_and_never_reads_as_ok() {
+        let dir = unique_probe_dir("absent");
+        let ceiling =
+            resolve_memory_ceiling(&dir.join("absent-cgroup"), &dir.join("absent-meminfo"));
+        assert_eq!(ceiling, MemoryCeiling::Unknown);
+        assert_eq!(
+            ceiling.bytes(),
+            None,
+            "Unknown must carry no number — a caller that unwrapped a default \
+             here would compare RSS against a fabricated ceiling"
+        );
+        assert_eq!(ceiling.source(), "unknown");
+    }
+
+    /// The threshold still bites once a ceiling exists — otherwise the fix
+    /// would resolve a ceiling and still never page.
+    #[test]
+    fn the_host_total_ceiling_actually_triggers_the_threshold() {
+        let host = 32_827_080_u64 * 1024;
+        let ceiling = MemoryCeiling::HostTotal(host);
+        let limit = ceiling.bytes().expect("host ceiling resolves");
+        // 85% of the machine — over the 80% rail.
+        let rss_high = host / 100 * 85;
+        assert!(
+            is_at_or_above_pct(rss_high, limit, RSS_HIGH_PCT_THRESHOLD),
+            "RESOURCE-02 must fire at 85% of the machine when no cgroup exists"
+        );
+        // Half the machine — comfortably under.
+        assert!(
+            !is_at_or_above_pct(host / 2, limit, RSS_HIGH_PCT_THRESHOLD),
+            "and must stay quiet at 50%, or it pages every day"
+        );
     }
 
     // -- probe fd count (None branch) --

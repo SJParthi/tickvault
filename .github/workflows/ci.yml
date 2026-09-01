@@ -762,6 +762,7 @@ jobs:
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
           crates/trading/tests/dhat_risk_engine.rs
+          crates/trading/tests/dhat_tick_ram_arena.rs
           EOF
           )
           # Defensive de-indent: YAML block scalars normally de-dent the
@@ -899,17 +900,23 @@ jobs:
           # 2026-08-11: dhat_multi_tf_fold added with the rebuilt aggregator
           # fold path — 1 → 2. It had been landing on disk with no CI lane
           # running it; the drift check above is what surfaced that.
+          # 2026-09-01: dhat_tick_ram_arena added — 2 → 3. The raw-tick RAM
+          # arena's header claims "zero heap allocation after construction",
+          # and the only thing checking that read ONE of its four
+          # collections. The drift check above caught this target too, on the
+          # first push, exactly as it caught dhat_multi_tf_fold.
           cargo test -p tickvault-trading \
             --test dhat_multi_tf_fold \
             --test dhat_risk_engine \
+            --test dhat_tick_ram_arena \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
             echo "::error::a trading dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 3 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
             exit 1
           fi
 

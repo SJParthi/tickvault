@@ -2724,6 +2724,43 @@ pub fn prune_active_segments<P: AsRef<Path>>(
 /// active set can no longer be what fills the disk — it reached 31 GB before
 /// this bound existed.
 ///
+/// # HONEST LIMITS of this bound (recorded 2026-09-01, adversarial review)
+///
+/// Two gaps, both real, both deliberately NOT closed here — because the only
+/// way to close them is to DELETE already-captured frames, and that is a
+/// decision that deserves its own change rather than a drive-by.
+///
+/// 1. **Enforcement lags by up to six hours.** This ceiling is applied at
+///    PRUNE time, inside the `WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS` loop —
+///    never at write time. Between passes the active set grows freely, and
+///    it never consults FREE SPACE at all. So while the tick tier reserves
+///    its floor and the depth tier reserves a larger one, this writer can
+///    consume the space both of them are reserving, and nothing checks.
+///
+/// 2. **`replaying/` is bounded on no axis.** `prune_wal_dir_at` is
+///    non-recursive by construction, so segments moved there for replay have
+///    no byte cap, no age cap and no free-space check. A replay that never
+///    confirms leaves them permanently.
+///
+/// # Why a fail-closed floor here would be WRONG
+///
+/// This is capture-at-receipt: the WAL is written BEFORE parse and
+/// broadcast, so a refusal drops a frame that exists nowhere else. That
+/// converts a bounded DISK problem into unrecoverable UPSTREAM loss — the
+/// opposite of the tick tier, where a refused rescue loses rows the database
+/// already rejected and which the vendor can still be asked for. It is also
+/// why the tick floor itself fails OPEN on a blind probe.
+///
+/// The correct shape is EVICTION, not refusal: at rotation — where
+/// `writer_loop` already tests `bytes_written >= WAL_SEGMENT_MAX_BYTES` —
+/// drop the OLDEST already-captured segment when the directory is over this
+/// ceiling. Deleting the oldest captured frame to make room for the newest
+/// uncaptured one is strictly better than dropping the newest, and it removes
+/// the six-hour lag without ever refusing a capture. It is not done here
+/// because deleting a segment that has not been confirmed replayed is itself
+/// a loss path, and choosing which of those two losses to take needs the
+/// replay-confirmation state in hand.
+///
 /// # Complexity
 /// O(1) after the first call.
 #[must_use]

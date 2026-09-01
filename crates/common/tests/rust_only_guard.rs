@@ -795,6 +795,20 @@ const COMMAND_INTRODUCERS: &[&str] = &[
     "CMD",
     "ENTRYPOINT",
     "SHELL",
+    // Shell KEYWORDS — 2026-09-01 (hole twelve). `if ...; then node app.js`
+    // and `for f in *; do node app.js; done` are the dominant shapes across
+    // this repo's 100 tracked shell scripts, and both were invisible: the
+    // separator split leaves `then` / `do` as the whole segment, and neither
+    // was a separator nor an introducer.
+    "then",
+    "else",
+    "do",
+    // Wrapper BINARIES. Safe only because the loop must consume the ENTIRE
+    // prefix to return true: `echo --version node` still yields false, since
+    // `echo` is deliberately not an introducer and nothing can consume it.
+    "bash",
+    "sh",
+    "timeout",
 ];
 
 /// Does `token` start a COMMAND at byte offset `at` within `line`?
@@ -845,7 +859,11 @@ fn is_command_position(line: &str, at: usize) -> bool {
     // words would make `managed node` a hit. A miss here is a false negative;
     // accepting it would be a false-positive engine, and this guard survives
     // only while its first act is never a false positive.
-    let sep_end = ["|", "&&", "||", ";", "$(", "(", "`", "=", "\n"]
+    // `{` and a bare `&` joined this list 2026-09-01 (hole twelve): a command
+    // inside a brace group (`{ node app.js; }`) or after a background job
+    // (`a & node app.js`) is in command position, and neither character ended
+    // a segment before.
+    let sep_end = ["|", "&&", "||", ";", "$(", "(", "`", "=", "{", "&", "\n"]
         .iter()
         .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
         .max()
@@ -872,6 +890,36 @@ fn is_command_position(line: &str, at: usize) -> bool {
         } else if seg.ends_with('/') && seg.starts_with(['/', '.', '~']) {
             // A path to a binary: `/usr/bin/`, `./node_modules/.bin/`.
             ""
+        } else if seg
+            .split_once(' ')
+            .map_or(seg, |(h, _)| h)
+            .strip_prefix('-')
+            .is_some_and(|f| !f.is_empty() && !f.contains(' '))
+        {
+            // A short flag: `bash -c "node app.js"` leaves `-c` after the
+            // quote and the introducer are consumed — 2026-09-01.
+            //
+            // Safe for the same reason every other arm is: consuming a flag
+            // only helps when the REST of the prefix is also consumable, so
+            // `echo --version node` still returns false.
+            let rest = seg.split_once(' ').map_or("", |(_, t)| t);
+            rest
+        } else if {
+            let head = seg.split_once(' ').map_or(seg, |(h, _)| h);
+            !head.is_empty()
+                && head.starts_with(|c: char| c.is_ascii_digit())
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, 's' | 'm' | 'h'))
+        } {
+            // A NUMERIC argument: `timeout 30 node app.js`, `timeout 5m node`.
+            //
+            // Deliberately numeric-only. Accepting an arbitrary bare word here
+            // would make `managed node` a hit — the false positive the honest
+            // limit above says this guard cannot survive. A duration cannot be
+            // confused with English prose, so it is the one bare-word shape
+            // that is safe to consume.
+            seg.split_once(' ').map_or("", |(_, t)| t)
         } else if let Some(word) = COMMAND_INTRODUCERS
             .iter()
             // `r.is_empty()` matters: `before` is trim_end()'d, so a wrapper
@@ -1022,6 +1070,70 @@ fn assert_sorted_unique(allowlist: &[&str], name: &str) {
 }
 
 // ============================ THIN SHELL ============================
+
+/// Strip Rust comments, string-literal aware.
+///
+/// Used by the `Command::new` spelling scan so a comment placed INSIDE the
+/// path (`Command::/*x*/new(`) cannot hide a spawn. String-aware because a
+/// `//` inside a literal is not a comment, and treating it as one would
+/// truncate real code and produce false FAILURES.
+fn strip_rs_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // A space, so `Command::/*x*/new(` does NOT silently become the
+            // canonical spelling here — normalisation removes whitespace
+            // afterwards, and the count comparison is what flags it.
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
 
 fn repo_root() -> PathBuf {
     // crates/common -> repo root
@@ -2577,6 +2689,36 @@ fn command_new_is_never_written_in_a_spelling_the_spawn_scan_cannot_see() {
                 violations.push(format!("{path}: contains `{marker}`"));
             }
         }
+
+        // SCOPE FIX #16 (2026-09-01) — close the CLASS, not a sixth literal.
+        //
+        // Adversarial review defeated the list above with two spellings it
+        // does not enumerate and never could, because the set is infinite:
+        //
+        //     std::process::Command::\n        new("python3")   // NEWLINE
+        //     std::process::Command::/*x*/new("python3")      // COMMENT
+        //
+        // Both compile; both passed 22/22 green. Enumerating a seventh
+        // literal would lose the same race again — the lesson this file
+        // records sixteen times is that a class nobody enumerated is
+        // invisible, and invisibility reads as green.
+        //
+        // So: strip comments, delete ALL whitespace, and compare COUNTS. A
+        // call that only becomes visible AFTER normalisation is, by
+        // definition, one the raw substring scan cannot see. Counts rather
+        // than presence, so a file holding one canonical call and one
+        // evasive call is still caught.
+        let decommented = strip_rs_comments(&content);
+        let normalised: String = decommented.chars().filter(|c| !c.is_whitespace()).collect();
+        let visible = decommented.matches("Command::new(").count();
+        let actual = normalised.matches("Command::new(").count();
+        if actual > visible {
+            violations.push(format!(
+                "{path}: {} `Command::new(` call(s) written with whitespace or a \
+                 comment inside the path, so the spawn scan cannot see them",
+                actual - visible
+            ));
+        }
     }
     assert!(
         scanned > 100,
@@ -2656,4 +2798,84 @@ fn command_is_never_aliased_past_the_spawn_scan() {
          can see it. See SCOPE FIX #14 above — this exact shape was planted \
          and passed 20/20 green before this guard existed."
     );
+}
+
+/// Hole TWELVE — shell keywords and wrappers (2026-09-01).
+///
+/// `is_command_position` is the ONLY detector for all eleven `NODE_FAMILY`
+/// runtimes: they are deliberately absent from `banned_tokens()` so that the
+/// three real "SSM managed node" prose lines in `scripts/aws-autopilot.sh`
+/// stay clean. That makes every gap in it a total blind spot for those
+/// eleven.
+///
+/// The gap: the function split on a 9-entry separator list and then matched an
+/// 11-entry introducer list. Shell KEYWORDS (`then`, `else`, `do`) and brace /
+/// background operators (`{`, `&`) were in neither — so an invocation inside
+/// `if …; then`, inside a `for … do` body, in a brace group, or after a
+/// background job was invisible. Those are the dominant shapes across this
+/// repository's 100 tracked shell scripts.
+///
+/// Nothing in the tree exploited it; this is a latent hole, closed before it
+/// was used.
+#[test]
+fn scope_fix_2026_09_01_self_test() {
+    // (1) MUST COUNT — the shapes that were invisible.
+    for shape in [
+        "if [ -f x ]; then node app.js; fi",
+        "if [ -f x ]; then npx -y pkg; fi",
+        "for f in *; do node app.js; done",
+        "while read l; do npm ci; done",
+        "{ node app.js; }",
+        "sleep 1 & node app.js",
+        "timeout 30 node app.js",
+        "timeout 5m npx -y pkg",
+        r#"bash -c "node app.js""#,
+        r#"sh -c "npm ci""#,
+    ] {
+        assert!(
+            count_node_invocations(shape) > 0,
+            "self-test: {shape:?} is a node-family invocation in command \
+             position and MUST be counted — it was invisible until 2026-09-01"
+        );
+    }
+
+    // (2) MUST NOT COUNT — the false-positive half, which is the half that
+    // matters. A guard whose first act is a false positive gets allowlisted,
+    // and then it enforces nothing. The first three are REAL lines from
+    // `scripts/aws-autopilot.sh`.
+    for prose in [
+        "# the SSM managed node is registered",
+        "echo 'SSM managed node ready'",
+        "  managed node instances are listed below",
+        "echo --version node",
+        "the do not disturb node was renamed",
+        "# then node was mentioned in a comment",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: {prose:?} is PROSE, not an invocation — counting it \
+             would be the false positive this guard cannot survive"
+        );
+    }
+
+    // (3) The residual, pinned so it is not mistaken for covered.
+    //
+    // `docker run IMAGE node app.js` and `ssh HOST node app.js` remain
+    // UNCOUNTED, and deliberately: consuming them needs an arbitrary bare word
+    // (the image name, the hostname), and accepting bare words is exactly what
+    // would make `managed node` a hit. The numeric arm exists because a
+    // DURATION cannot be confused with English prose; an image name can.
+    //
+    // Asserted rather than described, so that if someone later widens the
+    // detector this test tells them the trade-off they are making.
+    for uncovered in ["docker run img node app.js", "ssh host node app.js"] {
+        assert_eq!(
+            count_node_invocations(uncovered),
+            0,
+            "self-test: {uncovered:?} is a KNOWN residual. If you have made it \
+             count, confirm the must-not-count list above still passes — the \
+             bare-word acceptance that covers this also covers `managed node`."
+        );
+    }
 }

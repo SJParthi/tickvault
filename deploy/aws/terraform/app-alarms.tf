@@ -508,16 +508,31 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 # Auto-DETECT, not auto-spend: this alarm tells the operator WHEN the box is
 # running hot, so they can decide to run scripts/aws-upgrade-instance.sh to a
 # bigger type AFTER the dated-quote + 4-file lock flip — it never resizes
-# anything itself. 2026-07-15 note (Quote 8 downsize): the box is now
-# t4g.medium 4 GiB (was r8g.large 16 GiB) — this signal is MORE load-bearing
-# post-downsize (§7 Rule 2 headroom is ~0.9–1.7 GB budgeted, Assumed until
-# live-measured; t4g.large 8 GiB is the rip-cord). Mirrors disk_used_high:
+# anything itself.
+#
+# 2026-09-01 CORRECTION. This block described the box as "t4g.medium 4 GiB
+# (2026-07-15 downsize lock)" with "t4g.large 8 GiB is the rip-cord". Both were
+# stale by three weeks: the instance was recreated as r8g.xlarge (4 vCPU,
+# 32 GiB) on 2026-08-12 and VERIFIED live by `describe-instances` that day
+# (daily-universe-scope-expansion-2026-05-27.md, Quote 15 resolution).
+#
+# The staleness was not cosmetic. An operator woken by this alarm read that
+# they were on a 4 GiB box and that the fix was to move to 8 GiB — while
+# standing on 32 GiB. That is triage advice pointing at the wrong machine and
+# at an upgrade that would be a DOWNGRADE. The threshold itself was always
+# correct; only the advice attached to it was wrong.
+#
+# Per §7 Rule 2 the real rip-cord above r8g.xlarge is r8g.2xlarge (64 GiB), and
+# that rule's own FLAG still stands: the tick-volume figure it sizes against is
+# Assumed, so the first live session at scale is the measurement.
+#
+# Mirrors disk_used_high:
 # a CloudWatch Metrics Insights query so we do NOT pin CWAgent mem dimensions.
 # CWAgent already publishes mem_used_percent (user-data.sh.tftpl metrics block).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
   alarm_name          = "tv-${var.environment}-mem-used-high"
-  alarm_description   = "Host memory > 80% on t4g.medium (4 GiB — 2026-07-15 downsize lock). Capacity signal — time to consider an instance upgrade (t4g.large 8 GiB is the rip-cord). Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (daily-universe-scope-expansion-2026-05-27.md §7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
+  alarm_description   = "Host memory > 80% on r8g.xlarge (4 vCPU / 32 GiB — verified live 2026-08-12). Capacity signal — time to consider an instance upgrade (r8g.2xlarge 64 GiB is the rip-cord per daily-universe-scope-expansion-2026-05-27.md §7 Rule 2). NOTE: RESOURCE-02 is the PROCESS-level memory signal and fires earlier; this one is the whole HOST, including QuestDB's 12 GiB limit, so check which is actually growing before resizing. Run scripts/aws-upgrade-instance.sh --to <bigger-type> --ebs-size <GB> --qdb-mem <N>g AFTER the dated-quote + 4-file lock flip (§7 Mechanical Rule 1). Auto-detect only — never auto-upgrades. See docs/runbooks/instance-upgrade.md."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   threshold           = 80

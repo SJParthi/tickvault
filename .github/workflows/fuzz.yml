@@ -32,13 +32,63 @@ env:
   NIGHTLY_VERSION: nightly-2026-03-15
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Target drift check — added 2026-09-01
+  # ---------------------------------------------------------------------------
+  # fuzz/Cargo.toml declared FIVE [[bin]] targets while the matrix below listed
+  # THREE, so `dhan_depth_packet` and `truedata_frame_decoder` compiled but were
+  # executed by nothing. That is the same silent-drop class the DHAT lane's
+  # drift check exists to catch (it has caught it three times), reproduced in
+  # the one lane that lacked the guard. A new fuzz target must now appear in
+  # BOTH fuzz/Cargo.toml and the matrix, or this job fails the run.
+  fuzz-target-drift:
+    name: "Fuzz Target Drift"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Every declared fuzz target is actually run by the matrix
+        run: |
+          set -euo pipefail
+          declared=$(grep -A2 '^\[\[bin\]\]' fuzz/Cargo.toml \
+            | grep '^name' | sed 's/.*= *//' | tr -d '"' | LC_ALL=C sort)
+          count=$(printf '%s\n' "$declared" | grep -c . || true)
+          # Anti-vacuity floor: an empty scan must FAIL, never pass quietly.
+          # A guard that reports green because it found nothing is the exact
+          # false-OK this repository has retired repeatedly.
+          if [ "$count" -eq 0 ]; then
+            echo "::error::found ZERO [[bin]] targets in fuzz/Cargo.toml — the scanner is broken or the file moved; refusing to pass vacuously."
+            exit 1
+          fi
+          # The 8-space anchor matches only the real matrix line, never the
+          # grep pattern on this very line (which is indented further).
+          matrix_line=$(grep -m1 -E '^ {8}target: \[' .github/workflows/fuzz.yml || true)
+          if [ -z "$matrix_line" ]; then
+            echo "::error::could not locate the fuzz matrix target list in .github/workflows/fuzz.yml — refusing to pass vacuously."
+            exit 1
+          fi
+          missing=""
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            case "$matrix_line" in
+              *"$t"*) ;;
+              *) missing="$missing $t" ;;
+            esac
+          done <<< "$declared"
+          if [ -n "$missing" ]; then
+            echo "::error::fuzz/Cargo.toml declares target(s) the matrix never runs:$missing — add them to the matrix, or delete the [[bin]]. A declared-but-unrun fuzz target gates nothing while looking like coverage."
+            exit 1
+          fi
+          echo "Fuzz matrix matches fuzz/Cargo.toml ($count targets)."
+
   fuzz:
+    needs: fuzz-target-drift
     name: "Fuzz Targets (${{ matrix.target }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [tick_parser, config_parser, ws_frame_wal_replay]
+        target: [tick_parser, config_parser, ws_frame_wal_replay, dhan_depth_packet, truedata_frame_decoder]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
