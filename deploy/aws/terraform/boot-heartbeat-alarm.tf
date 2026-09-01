@@ -296,7 +296,7 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
   dimensions = {
     FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
   }
-  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
   # NO ok_actions (the round-14 precedent): these run on a schedule, so the
   # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
   # lookback — never that anything was fixed. The telegram-webhook Lambda
