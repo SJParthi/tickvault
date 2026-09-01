@@ -813,7 +813,40 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // Disk first, then the table. The artifact is the cheaper, more reliable
     // record; writing it before the network call means a QuestDB outage
     // cannot cost us the day's mapping.
-    write_mapping_atomic(date, &master, &index, &outcome)?;
+    //
+    // WRAPPED IN `block_in_place` 2026-09-01 — this call is synchronous and
+    // heavy, and it was running directly on a tokio worker.
+    //
+    // What it does: `serde_json::to_vec_pretty` over the whole mapping
+    // artifact plus two more artifacts, then `create_dir_all` + `write` +
+    // `rename` for each — multi-megabyte serialisation followed by blocking
+    // file I/O, three times.
+    //
+    // Why that mattered: the runtime has TWO workers (`main.rs`
+    // `host_cpu_allowance`, cpuset 1-2). A plain synchronous block holds a
+    // worker so it cannot poll ANYTHING else — including the WebSocket read
+    // loops. That is the documented mechanism by which a stall becomes a
+    // dropped socket: the reader stops pumping pongs, the peer closes, and on
+    // reconnect the whole instrument set is re-subscribed cold. An infra
+    // audit measured ten watchdog restarts in 24h, each a simultaneous
+    // 14-socket disconnect.
+    //
+    // `block_in_place` tells tokio the current worker is about to block, so it
+    // migrates the remaining work to another thread and the runtime keeps
+    // making progress. It is the same primitive already used for the
+    // equivalent hazard in `cadence_escalation`, `seal_writer_loop` and the
+    // ILP flush path.
+    //
+    // HONEST LIMIT: `spawn_blocking` would be better still — it would leave
+    // BOTH workers free instead of consuming one and its replacement. It is
+    // not used here because `master`, `index` and `outcome` are borrowed and
+    // all three are still needed by the lifecycle-record write below, so
+    // moving them into a `'static` closure means an ownership refactor of
+    // `build_once` (wrapping them in `Arc`s). That is a larger change than
+    // this fix, and doing it badly would risk the correctness of a daily
+    // artifact for a second-order scheduling gain. Recorded rather than
+    // silently settled for.
+    tokio::task::block_in_place(|| write_mapping_atomic(date, &master, &index, &outcome))?;
 
     // The never-delete lifecycle record.
     //
