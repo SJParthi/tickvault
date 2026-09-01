@@ -176,6 +176,7 @@ pub mod movers;
 /// timeframes via the shared seal-writer channel + boot catch-up over the
 /// stored month. FOLD-01 runbook:
 /// `.claude/rules/project/rest-candle-fold-error-codes.md`.
+pub mod reclaim_signal;
 pub mod rest_candle_fold;
 /// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
 /// signal kind × runtime source × IST clock × trading calendar →

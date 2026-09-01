@@ -382,6 +382,24 @@ async fn run_disk_pressure_loop(
                          eligible)"
                     );
                 }
+                // Wake the spill/WAL reclaim sweep NOW rather than letting it
+                // wait out its 6-hourly timer (2026-09-01).
+                //
+                // This is the deadlock breaker. QuestDB tables suspend when
+                // the volume fills, and `partition_archive` correctly refuses
+                // to archive a suspended table — so the archival pass below
+                // can reclaim NOTHING once the dominant table is suspended.
+                // Our own capture segments are the one thing on this volume
+                // that QuestDB does not own, so pruning them is the only
+                // reclaim that still works in that state, and it is what lets
+                // `wal_auto_resume` reach its free-space threshold.
+                //
+                // Requested BEFORE the pass, not after: the pass is the slow
+                // part, and on a suspended table it is also the useless part.
+                // Rate-floored inside the sweep, so a long episode cannot turn
+                // a cold path into a hot loop.
+                crate::reclaim_signal::request_reclaim();
+
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
                 let dropped = run_one_pass(&questdb, &cfg).await;
                 if let Some(n) = dropped {
@@ -390,6 +408,13 @@ async fn run_disk_pressure_loop(
                 apply_action(&mut state, action, now_secs, dropped);
             }
             PressureAction::Escalate => {
+                // Escalation is the state where this matters MOST: the
+                // archival pass reclaimed nothing, which on a full volume is
+                // the signature of suspended tables. The spill sweep is then
+                // the only reclaim left, so ask for it here too — the pass
+                // arm above is not reached on an escalated poll.
+                crate::reclaim_signal::request_reclaim();
+
                 metrics::counter!("tv_disk_pressure_unrelievable_total").increment(1);
                 error!(
                     code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
