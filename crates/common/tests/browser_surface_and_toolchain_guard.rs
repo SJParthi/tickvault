@@ -242,22 +242,51 @@ fn strip_toml_comments(body: &str) -> String {
 #[test]
 fn cargo_config_declares_no_external_runner_or_linker() {
     let root = repo_root();
-    let path = root.join(".cargo/config.toml");
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        // No cargo config at all is trivially safe.
-        return;
-    };
 
-    let code = strip_toml_comments(&body);
+    // EVERY cargo config, not just the root one — SCOPE FIX #16 (2026-09-01,
+    // hole SIXTEEN). Cargo reads `.cargo/config.toml` from the package
+    // directory and every ancestor, so `crates/app/.cargo/config.toml` sets
+    // the runner/linker for that package's builds and this test never opened
+    // it. Root-only is the enumerate-one-location failure this repo's
+    // rust-only lock has now recorded several times in a row.
+    //
+    // `scan_paths` covers tracked AND untracked files, so a config added but
+    // not yet committed is caught too — the SCOPE FIX C1 lesson.
+    let mut configs = scan_paths(".cargo/config.toml");
+    configs.extend(scan_paths("**/.cargo/config.toml"));
+    configs.extend(scan_paths(".cargo/config"));
+    configs.extend(scan_paths("**/.cargo/config"));
+    configs.sort();
+    configs.dedup();
 
     let mut found = Vec::new();
-    for (lineno, line) in code.lines().enumerate() {
-        let t = line.trim_start();
-        // Match the KEY, not a substring: `runner = ...` / `linker = ...`,
-        // including the dotted and quoted forms cargo accepts.
-        let is_key = |key: &str| t.starts_with(key) && t[key.len()..].trim_start().starts_with('=');
-        if is_key("runner") || is_key("linker") {
-            found.push(format!("  .cargo/config.toml:{}: {}", lineno + 1, t.trim()));
+    for rel in &configs {
+        let path = root.join(rel);
+        // FAIL CLOSED — SCOPE FIX #16. The previous version returned early on
+        // any read error, so an unreadable config passed as "trivially safe".
+        // A file cargo WILL read but this guard CANNOT is the one case that
+        // most needs to fail, not the one case that is waved through.
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "CARGO CONFIG UNREADABLE: {rel} exists in the tree but could not be \
+                 read ({e}).\n\n\
+                 This guard now fails CLOSED here. Cargo reads this file on every \
+                 build; a config the toolchain honours and the guard cannot inspect \
+                 is exactly the blind spot `runner`/`linker` enforcement exists to \
+                 prevent."
+            )
+        });
+
+        let code = strip_toml_comments(&body);
+        for (lineno, line) in code.lines().enumerate() {
+            let t = line.trim_start();
+            // Match the KEY, not a substring: `runner = ...` / `linker = ...`,
+            // including the dotted and quoted forms cargo accepts.
+            let is_key =
+                |key: &str| t.starts_with(key) && t[key.len()..].trim_start().starts_with('=');
+            if is_key("runner") || is_key("linker") {
+                found.push(format!("  {rel}:{}: {}", lineno + 1, t.trim()));
+            }
         }
     }
 

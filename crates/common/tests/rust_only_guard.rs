@@ -725,7 +725,7 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
 /// scanner, because it reports clean.
 fn literals_in_group(after: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = after.char_indices();
+    let chars = after.char_indices();
     let mut in_string = false;
     let mut lit_start = 0_usize;
     let mut escaped = false;
@@ -880,7 +880,35 @@ const COMMAND_INTRODUCERS: &[&str] = &[
     "bash",
     "sh",
     "timeout",
+    // More wrapper BINARIES — 2026-09-01 (hole TWELVE). Each takes the command
+    // as its immediate next argument, so the runtime lands in command position
+    // behind a name that was simply not on the list. The enumerate-the-names
+    // approach has now been wrong here more than once; these close the shapes
+    // that actually appear in shell scripts and unit files.
+    "watch",
+    "setsid",
+    "stdbuf",
+    "parallel",
+    "nice",
+    "ionice",
+    "doas",
 ];
+
+/// HONEST LIMIT — two wrapper shapes remain UNCOVERED, recorded rather than
+/// silently missed.
+///
+/// `ssh host "node app.js"` and `find . -type f -exec node {} \;` both place a
+/// BARE WORD (`host`, `.`) between the wrapper and the runtime. The parser
+/// consumes left to right and must consume the ENTIRE prefix, so a bare word
+/// stops it — and accepting bare words is exactly what would turn
+/// `SSM managed node` into a build failure. `-exec` is handled as a separator
+/// above, which covers the common `find` form; `ssh` is not.
+///
+/// A miss here is a false NEGATIVE. Accepting bare words would make this a
+/// false-positive engine, and a guard whose first act is a false positive gets
+/// allowlisted within a week — which is how three anchors in this file were
+/// weakened before.
+const _WRAPPER_SHAPES_NOT_COVERED: &[&str] = &["ssh <host> \"<runtime> …\""];
 
 /// Does `token` start a COMMAND at byte offset `at` within `line`?
 ///
@@ -934,11 +962,42 @@ fn is_command_position(line: &str, at: usize) -> bool {
     // inside a brace group (`{ node app.js; }`) or after a background job
     // (`a & node app.js`) is in command position, and neither character ended
     // a segment before.
-    let sep_end = ["|", "&&", "||", ";", "$(", "(", "`", "=", "{", "&", "\n"]
-        .iter()
-        .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
-        .max()
-        .unwrap_or(0);
+    // `[` joined 2026-09-01 (hole TEN): an argv ARRAY puts the runtime in
+    // command position with no shell separator anywhere —
+    // `"args": ["node", "app.js"]` (the shape `.mcp.json` itself uses),
+    // terraform `command = ["node"]`, compose `command: [node, s.js]`.
+    // `[` was not a separator, so every one of them read as a mention.
+    let mut sep_end = [
+        "|", "&&", "||", ";", "$(", "(", "`", "=", "{", "&", "[", "\n",
+    ]
+    .iter()
+    .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
+    .max()
+    .unwrap_or(0);
+
+    // `-exec` is a separator, not an introducer, because the parser consumes
+    // LEFT to right and `find . -exec node` puts an unconsumable bare word
+    // (`.`) ahead of it. Treating it as a separator skips the argument list
+    // the way a pipe does. `find`'s own predicates never follow `-exec`.
+    if let Some(i) = before.rfind("-exec") {
+        sep_end = sep_end.max(i + "-exec".len());
+    }
+
+    // `,` is a separator ONLY inside a bracketed list — the second and later
+    // elements of an argv array (`["sh", "-c", "node app.js"]`).
+    //
+    // Deliberately NOT a general separator: prose in a scanned .json/.yml
+    // string ("the box, node counts") would otherwise land in command
+    // position and fail the build on a sentence. Requiring an OPEN bracket
+    // earlier in the line is what keeps the false-positive rate at zero,
+    // and this guard survives only while its first act is never a false
+    // positive.
+    if before.contains('[') {
+        if let Some(i) = before.rfind(',') {
+            sep_end = sep_end.max(i + 1);
+        }
+    }
+
     let mut seg = before[sep_end..].trim();
 
     // Bounded: every arm strictly shortens `seg`, and the loop returns the
@@ -949,6 +1008,22 @@ fn is_command_position(line: &str, at: usize) -> bool {
         }
         let next = if let Some(rest) = seg.strip_prefix("- ") {
             rest
+        } else if matches!(seg, "-" | "@" | "@-" | "-@" | "+") {
+            // Whole-segment MARKERS, 2026-09-01 (holes ELEVEN and TWELVE).
+            //
+            // `-` alone: a bare YAML sequence item (`  - node`). `before` is
+            // trim_end()'d, so the `- ` arm above never fires on it — the
+            // trailing space it needs has already been trimmed. Only the
+            // QUOTED form (`- "node"`) was caught, which is the rarer one.
+            //
+            // `@`, `@-`, `-@`, `+`: make recipe-line prefixes (`@node x.js`
+            // silences the echo). Recipe lines carry no shell separator, so
+            // the prefix was the whole segment and nothing consumed it.
+            //
+            // Safe because each is the ENTIRE segment: a lone marker cannot
+            // appear in prose, and anything else on the line leaves a
+            // remainder these arms do not match.
+            ""
         } else if seg.ends_with('"') || seg.ends_with('\'') {
             // The token's OWN opening quote: `"command": "` before `npx`.
             &seg[..seg.len() - 1]
@@ -1958,6 +2033,62 @@ fn guard_self_test() {
             0,
             "self-test: `{prose}` MENTIONS a node-family word without invoking \
              one — the parser must not widen into prose"
+        );
+    }
+
+    // SCOPE FIX #16 (2026-09-01) — holes TEN, ELEVEN and TWELVE.
+    //
+    // Every form below counted 0 before this fix. The argv-array shapes are
+    // the sharpest: `.mcp.json` in this very repo uses one, so the file that
+    // motivated the node-family ban was itself written in a shape the ban
+    // could not read.
+    for invocation in [
+        // TEN — argv arrays. No shell separator anywhere on the line.
+        r#"    "args": ["node", "app.js"],"#,
+        r#"  command = ["node", "server.js"]"#,
+        "  command: [node, server.js]",
+        r#"    "args": ["sh", "-c", "node app.js"],"#,
+        // ELEVEN — a BARE YAML sequence item. The quoted form was caught;
+        // the unquoted one, which is the commoner style, was not.
+        "  - node",
+        "      - npx",
+        // TWELVE — make recipe prefixes and more wrapper binaries.
+        "\t@node build.js",
+        "\t-node optional.js",
+        "\t@-npm run build",
+        "watch node status.js",
+        "setsid node daemon.js",
+        "stdbuf -oL node stream.js",
+        "nice -n 10 node batch.js",
+        "find . -type f -exec node {} ;",
+    ] {
+        assert_eq!(
+            count_node_invocations(invocation),
+            1,
+            "self-test: `{invocation}` is a node-family INVOCATION and must be \
+             counted — SCOPE FIX #16 (holes 10/11/12)"
+        );
+    }
+
+    // The false-POSITIVE half of SCOPE FIX #16, and the reason `,` is a
+    // separator ONLY inside a bracketed list. Every line below contains a
+    // comma or a dash next to a node-family word in ORDINARY PROSE; a general
+    // comma separator would fail the build on all of them.
+    for prose in [
+        "  \"description\": \"restarts the box, node counts stay flat\",",
+        "  # after the reboot, node registration is checked",
+        "  summary: on failure, npm cache is cleared by hand",
+        "echo \"drained, node left the pool\"",
+        "  # the managed-node fleet, node by node, is drained",
+        "  see docs/architecture, node roles are listed there",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: `{prose}` is PROSE containing a comma — a general comma \
+             separator would put the runtime word in command position and fail \
+             the build on a sentence. The bracket requirement is what keeps \
+             this guard's false-positive rate at zero."
         );
     }
 

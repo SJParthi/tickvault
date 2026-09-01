@@ -671,3 +671,86 @@ H12 is the one that matters most conceptually: it is the same enumeration
 failure as 8a, one level out. Closing it properly means asking what a token is
 in the LINE's grammar rather than listing the words that may precede it — the
 same move made twice now, and not yet made a third time.
+
+## §0.7. 2026-09-01 — SCOPE FIX #16: four of the seven open holes CLOSED
+
+Same operator directive as §0.5/§0.6, same day. The §0.6 table above says
+"None is fixed here" — this section fixes **H10, H11, H12 (partly) and H16**.
+The live tree was and remains CLEAN of all four, so these close LATENT holes.
+
+### H10 — argv arrays (HIGH)
+
+`[` was not a separator, so an argv array put the runtime in command position
+with no shell separator anywhere on the line and every form read as a mention:
+
+| form | where it is the dominant shape |
+|---|---|
+| `"args": ["node", "app.js"]` | **`.mcp.json` in this repo** |
+| `command = ["node", "server.js"]` | terraform |
+| `command: [node, server.js]` | docker-compose |
+
+The file that motivated the node-family ban was itself written in a shape the
+ban could not read.
+
+**Fixed** by adding `[` to the separator set. `,` is a separator too, but
+**only when an open bracket appears earlier in the line** — a general comma
+separator would put the runtime word in command position for any prose
+containing `", node"` and fail the build on a sentence. Six prose fixtures
+pin that (`"restarts the box, node counts stay flat"` and five siblings).
+
+### H11 — bare YAML sequence item (HIGH)
+
+`  - node`. The `- ` arm could never fire on it: `before` is `trim_end()`'d,
+so the trailing space the arm needs is already gone by the time it runs. Only
+the QUOTED form `- "node"` was caught, which is the rarer style.
+
+**Fixed** by a whole-segment marker arm.
+
+### H12 — wrapper prefixes (HIGH) — PARTLY closed, and the residual is stated
+
+**Closed:** make recipe prefixes (`@`, `-`, `@-`, `-@`, `+`) as whole-segment
+markers; `-exec` as a separator, which covers `find . -exec node`; and
+`watch`, `setsid`, `stdbuf`, `parallel`, `nice`, `ionice`, `doas` added as
+introducers.
+
+**NOT closed, deliberately:** `ssh host "node app.js"`. It places a BARE WORD
+(`host`) between the wrapper and the runtime, and the parser must consume the
+ENTIRE prefix to return true. Accepting bare words is exactly what would turn
+`SSM managed node` into a build failure — the false positive this guard cannot
+survive. Recorded at the site as `_WRAPPER_SHAPES_NOT_COVERED` rather than left
+to be rediscovered. A miss here is a false NEGATIVE; the alternative is a
+false-positive engine, and a guard whose first act is a false positive gets
+allowlisted within a week.
+
+### H16 — cargo config: root-only AND fails open (MED)
+
+Two defects in one test. It read only `.cargo/config.toml` at the repo root —
+but cargo reads the file from the package directory and every ancestor, so
+`crates/app/.cargo/config.toml` sets the runner/linker for that package and was
+never opened. And `let Ok(body) = … else { return }` meant an unreadable config
+**passed as trivially safe** — the one case that most needs to fail was the one
+case waved through.
+
+**Fixed:** enumerates every `.cargo/config.toml` and `.cargo/config` via
+`scan_paths` (tracked AND untracked, the SCOPE FIX C1 lesson), and panics on an
+unreadable one. This matters because §0's own record has an interpreter package
+ACTUALLY being the arm64 linker of every production lambda while reading green.
+
+### Bite-proofs (both directions, planted then removed)
+
+| planted | before | after |
+|---|---|---|
+| `scripts/planted-argv.json` with `"args": ["-c", "node /opt/evil.js"]` | **passes green** | **FAILS** — `("scripts/planted-argv.json", 1, 0)` |
+| `crates/app/.cargo/config.toml` with `runner = "node-emulator"` | never opened | **FAILS** — names the per-package path |
+
+The first was verified by reverting the parser to HEAD with the plant still in
+the tree and watching it pass — the fix, not the fixture, is what catches it.
+
+### Still open after this section
+
+**H13** (`.wasm`/`.wat`), **H14** (the browser guard opens only `*.rs` and
+`*.html`), **H15** (`.md` excluded, so a `SKILL.md` with fenced interpreter
+code is invisible) and the `ssh` half of H12. H15 is the awkward one: scanning
+`.md` naively would flag this repository's own rule files, which discuss the
+banned runtimes at length — the honest shape is to scan only FENCED CODE BLOCKS
+carrying an interpreter language tag, which is a parser, not a predicate.
