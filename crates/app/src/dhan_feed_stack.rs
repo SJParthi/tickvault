@@ -4355,8 +4355,23 @@ async fn run_frame_drain(
                 // 30s window, latching that alarm in ALARM for the whole
                 // session — and because `ok_recovery = false` it never sends
                 // an OK, so it would stay latched and bury the permanent-loss
-                // signal the pager exists for. All 23 metric filters require
-                // `$.level = "ERROR"`, so `warn!` informs without paging.
+                // signal the pager exists for.
+                //
+                // The warn! beneath does not page — but the reason is NARROWER
+                // than "warn never pages", and the narrow version is the one
+                // that must be written down. MEASURED: deploy/aws/terraform
+                // carries 32 filter patterns, of which 23 require
+                // `$.level = "ERROR"`. NINE DO NOT. `error-code-alarms.tf:184`
+                // is `pattern = "\"DH-906\""` — a bare TERM filter with no
+                // level predicate at all, so a WARN or INFO line containing
+                // that string pages. Others match on `$.tv_*` metric fields.
+                //
+                // So the rule for anything added here is: a warn! is safe only
+                // while its text and fields carry no filtered token. This one
+                // carries none. Do not generalise it into "warn cannot page" —
+                // an earlier draft of this comment did exactly that, and it
+                // was false in the reassuring direction, which is the rot this
+                // file's own history keeps recording.
                 if d_price > 0 || d_ts > 0 || d_slot > 0 {
                     error!(
                         code = ErrorCode::AggregatorDrop01.code_str(),
