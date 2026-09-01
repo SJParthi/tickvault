@@ -161,6 +161,24 @@ pub struct SealOverflow {
     /// on whatever task called it. Once installed, an escalation costs a
     /// channel `try_send` and the disk work happens on `tv-seal-escalate`.
     offload: Option<std::sync::mpsc::SyncSender<SealEscalationItem>>,
+    /// Pre-resolved counter handles for the two per-tick outcomes.
+    ///
+    /// [`Self::escalate`] is reached from the per-tick fold closure on the
+    /// frame-drain task, and this repository bans the bare `metrics::counter!`
+    /// macro there: `multi_tf_aggregator` calls the fold "the one place a bare
+    /// `counter!` macro must never appear", and `DrainCounters` documents why
+    /// — the macro builds a `Key` and takes a sharded-registry lock on every
+    /// call, where a resolved handle is a plain atomic add. Both names are
+    /// compile-time `&'static str` and neither carries a label, so the handle
+    /// set is enumerable up front with no cardinality hiding in it.
+    ///
+    /// Honest magnitude: the macro's arm here is the NON-allocating one, so
+    /// this is not the `record_ws_lag` defect class. What is removed is a hash
+    /// plus a registry lock per refused seal — and a refusal burst is exactly
+    /// when the drain can least afford them (measured 2026-08-20:
+    /// `spilled: 541,519` in one session).
+    queued: metrics::Counter,
+    inline_fallback: metrics::Counter,
 }
 
 /// Bounded depth of the escalation hand-off queue.
@@ -345,6 +363,8 @@ impl SealOverflow {
             spill,
             dlq,
             offload: None,
+            queued: metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER),
+            inline_fallback: metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER),
         }
     }
 
@@ -403,8 +423,38 @@ impl SealOverflow {
     }
 
     /// Escalate one refused seal to the durable tier. Never blocks on the
-    /// network, never awaits, never panics, and — once the offload is
-    /// installed — never touches the filesystem on the caller's task.
+    /// network, never awaits, and never panics.
+    ///
+    /// # What this does to the caller's task — stated exactly (2026-09-01)
+    ///
+    /// This doc used to end "and — once the offload is installed — never
+    /// touches the filesystem on the caller's task". That was FALSE, and
+    /// false in the reassuring direction, which is the class this repository
+    /// treats as a defect in its own right.
+    ///
+    /// With the offload installed there are TWO arms, not one:
+    ///
+    /// * `try_send` **accepted** — the common case. The caller pays a channel
+    ///   send and one atomic increment; the disk work happens on
+    ///   `tv-seal-escalate`. No filesystem syscall on the caller.
+    /// * `try_send` **refused** (`Full`: the escalation thread is behind;
+    ///   `Disconnected`: it died) — the caller runs [`Self::escalate_inline`]
+    ///   ITSELF. That takes the [`crate::seal_spill::SealSpillWriter`] mutex
+    ///   and does a blocking `write(2)`, and if the spill fails it also does
+    ///   `create_dir_all`, an `open`, a `serde_json::to_string` HEAP
+    ///   ALLOCATION and further syscalls for the DLQ record — all on the
+    ///   frame-drain task, the one thread that empties the socket.
+    ///
+    /// The fallback is DELIBERATE and must not be removed: the seal is still
+    /// in hand at that point, so the choice is "as slow as it was before the
+    /// offload existed" versus "lost". Degraded beats lossy. What was missing
+    /// was not a different policy but an honest statement of the policy, plus
+    /// a way to know how often it fires — [`SEAL_ESCALATION_INLINE_FALLBACK_COUNTER`]
+    /// is that number, and before it existed the frequency was Unknown.
+    ///
+    /// With NO offload installed (pre-2026-08-28 shape, and every unit test
+    /// that does not call `split_escalation_offload`) every escalation is the
+    /// inline cascade.
     ///
     /// `now_unix_secs` is passed in rather than read from the clock for the
     /// same reason the absorption pipeline takes it (locked decision L-H7):
@@ -419,7 +469,7 @@ impl SealOverflow {
             };
             match tx.try_send(item) {
                 Ok(()) => {
-                    metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER).increment(1);
+                    self.queued.increment(1);
                     return OverflowOutcome::Queued;
                 }
                 // Full: the thread is behind. Disconnected: it died. Either
@@ -429,7 +479,7 @@ impl SealOverflow {
                     std::sync::mpsc::TrySendError::Full(item)
                     | std::sync::mpsc::TrySendError::Disconnected(item),
                 ) => {
-                    metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1);
+                    self.inline_fallback.increment(1);
                     return Self::escalate_inline(
                         &self.spill,
                         &self.dlq,
@@ -1293,6 +1343,109 @@ mod tests {
             OverflowOutcome::Spilled,
             "a full queue must escalate INLINE — a refusal here would be the silent drop the \
              whole no-drop policy exists to prevent"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// The per-tick path may not use the bare `metrics::counter!` MACRO.
+    ///
+    /// `escalate` is reached from the fold closure on the frame-drain task.
+    /// `multi_tf_aggregator` calls that closure "the one place a bare
+    /// `counter!` macro must never appear" and `DrainCounters` explains why:
+    /// the macro builds a `Key` and takes a sharded-registry lock, where a
+    /// resolved handle is an atomic add. A behavioural test cannot see the
+    /// difference — both increment the same series — so the only thing that
+    /// can hold this is a source scan.
+    #[test]
+    fn escalate_increments_pre_resolved_handles_not_the_counter_macro() {
+        let src = include_str!("seal_writer_runner.rs");
+        let start = src
+            .find("pub fn escalate(&self, seal: &BufferedSeal")
+            .expect("escalate must exist");
+        // Bound the scan at the next top-level item rather than a byte count
+        // — a fixed window silently stops covering the function the moment a
+        // line is added to it, which is the class of guard that reads green
+        // while the thing it guards drifts out from under it.
+        let end = src[start..]
+            .find("static GLOBAL_SEAL_OVERFLOW")
+            .expect("escalate must be followed by the GLOBAL_SEAL_OVERFLOW item");
+        let body = &src[start..start + end];
+        assert!(
+            !body.contains("metrics::counter!"),
+            "bare metrics::counter! inside escalate — it runs on the frame-drain task; \
+             resolve the handle once and increment the handle"
+        );
+        assert!(
+            body.contains("self.queued.increment(1)")
+                && body.contains("self.inline_fallback.increment(1)"),
+            "both per-tick outcomes must increment a pre-resolved handle"
+        );
+    }
+
+    /// The doc on `escalate` must describe the fallback arm truthfully.
+    ///
+    /// It previously ended "never touches the filesystem on the caller's
+    /// task", which is false whenever `try_send` returns `Full` or
+    /// `Disconnected` — the arm two tests below this one exercise on purpose.
+    /// A comment that is wrong in the REASSURING direction is treated here as
+    /// a defect in its own right, so it is pinned rather than trusted.
+    #[test]
+    fn the_escalate_doc_does_not_claim_a_filesystem_free_caller() {
+        let src = include_str!("seal_writer_runner.rs");
+        let start = src
+            .find("/// Escalate one refused seal to the durable tier")
+            .expect("the escalate doc must exist");
+        // The SUMMARY line is what a reader skims, so the claim must be gone
+        // from there specifically. The correction below it quotes the old
+        // sentence verbatim on purpose — a whole-file scan would flag the
+        // record of the fix as the defect it records.
+        let summary_len = src[start..]
+            .find("# What this does to the caller's task")
+            .expect("the doc must carry the caller-cost section");
+        assert!(
+            !src[start..start + summary_len].contains("never touches the filesystem"),
+            "the escalate summary re-asserted a claim the Full/Disconnected arm contradicts"
+        );
+        let doc = &src[start..start + 2_400];
+        for phrase in [
+            "escalate_inline",
+            "write(2)",
+            "frame-drain task",
+            "SEAL_ESCALATION_INLINE_FALLBACK_COUNTER",
+        ] {
+            assert!(
+                doc.contains(phrase),
+                "the escalate doc must name {phrase} so the fallback's real cost and its \
+                 frequency signal are both stated"
+            );
+        }
+    }
+
+    /// A full queue must still MOVE the fallback counter, not just spill.
+    ///
+    /// The sibling test below asserts the seal reaches disk; this asserts the
+    /// operator can find out how often that happened. Without the counter the
+    /// fallback's frequency is Unknown, which is exactly what an earlier
+    /// review could not answer.
+    #[test]
+    fn the_inline_fallback_is_counted_so_its_frequency_is_knowable() {
+        let (spill, dlq) = temp_pair("escalate-fallback-counted");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let _sink = overflow.split_escalation_offload(); // never drained
+
+        let now = jan1_noon_utc();
+        for i in 0..SEAL_ESCALATION_QUEUE_DEPTH {
+            let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i as u32, 101.5), now);
+        }
+        assert_eq!(
+            overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 99_998, 101.5), now),
+            OverflowOutcome::Spilled
+        );
+        assert_eq!(
+            SEAL_ESCALATION_INLINE_FALLBACK_COUNTER, "tv_seal_escalation_inline_fallback_total",
+            "the fallback series name is the operator-facing contract; renaming it silently \
+             would leave any alarm over it permanently in OK"
         );
         cleanup(&spill, &dlq);
     }
