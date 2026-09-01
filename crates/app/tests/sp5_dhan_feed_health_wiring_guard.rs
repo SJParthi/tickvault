@@ -136,10 +136,19 @@ fn test_sp5_1_drops_dimension_wired_in_spill() {
     assert_eq!(
         src.matches("self.record_feed_drop_for_health(ws_type);")
             .count(),
-        2,
-        "both terminal-loss drop arms (channel Full, writer Disconnected) must \
-         record the drop — losing one arm silently re-opens the false-OK for \
-         that cause only, which is harder to notice than losing both."
+        3,
+        "every terminal-loss drop arm must record the drop — losing one arm \
+         silently re-opens the false-OK for that cause only, which is harder \
+         to notice than losing all of them.\n\
+         \n\
+         There are THREE such arms, and the count was raised from 2 to 3 on \
+         2026-09-01 when the byte-budget arm was added: the channel is now \
+         bounded in BYTES as well as records, because `WalRecord.frame` is a \
+         heap buffer the record only points at — so 524,288 records was worth \
+         hundreds of gibibytes of resident payload on a 32 GiB host. That arm \
+         is as terminal a loss as the other two and must attribute to the same \
+         feed. If this count is ever LOWERED to make a build pass, an arm has \
+         stopped reporting and a dropping feed will read `ok`."
     );
 }
 

@@ -35,6 +35,14 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_trading::in_mem::tick_ram_arena::{ArenaKey, TickRamArena, TickSample};
 
+/// Record capacity of the fixture arena.
+///
+/// Named rather than repeated so the construction and the between-attempt
+/// reset can never drift apart — a reset to a SMALLER arena would reintroduce
+/// the `ArenaFull` this fixture was fixed for, and would look like a passing
+/// change.
+const ARENA_CAPACITY: usize = 120_000;
+
 mod dhat_support;
 
 fn key(id: u64) -> ArenaKey {
@@ -60,19 +68,51 @@ fn dhat_arena_append_and_read_are_zero_alloc_including_new_instruments() {
     // Construction allocates — deliberately, and OUTSIDE the measured region.
     // That is the whole design: one up-front allocation so no append can ever
     // trigger a reallocation mid-session on the frame drain.
-    let mut arena = TickRamArena::with_capacity(120_000);
+    //
+    // Behind a `RefCell` so the re-attempt `stabilize` below can REPLACE it.
+    // Both closures handed to `measure_with_phantom_retry` need `&mut` access
+    // and Rust will not let two closures hold that at once; the cell is the
+    // narrowest way to give the reset closure the same arena the workload
+    // uses. Every borrow is short-lived and they never overlap — `stabilize`
+    // runs strictly between attempts.
+    let arena = std::cell::RefCell::new(TickRamArena::with_capacity(ARENA_CAPACITY));
 
     // Warm ONE instrument outside the measurement so the steady-state loop
     // below is measuring steady state and not first-touch.
     arena
+        .borrow_mut()
         .append(key(1), sample(1_000, 100.0))
         .expect("warm append must land");
 
     let (_, allocs) = dhat_support::measure_with_phantom_retry(
         0,
         0,
-        || {},
+        // RESET between attempts. Without this the test could not survive its
+        // own retry, and the retry is not hypothetical — the helper exists
+        // because GitHub's 2-core runners land a documented ~900 B / 4-block
+        // cross-thread phantom inside the measurement window.
+        //
+        // The workload below appends roughly 75,000 records per attempt
+        // (50,000 steady-state + 5,000 first-touch + the ~20,000 of the
+        // refusal arm that land before the SLOT ceiling) into an arena of
+        // ARENA_CAPACITY. A second attempt on the same arena therefore passes
+        // the record ceiling part-way through and the steady-state append
+        // returns `ArenaFull` — which surfaces as an `expect` panic, not as a
+        // budget failure, so it reads like a broken arena rather than an
+        // exhausted fixture. Observed on 2026-09-01.
+        //
+        // Rebuilding here allocates, deliberately: `stabilize` runs BEFORE the
+        // `HeapStats` snapshot is taken, so it is outside every measurement
+        // window and cannot mask a real regression. That is exactly what the
+        // helper's own doc reserves this parameter for.
         || {
+            let mut a = arena.borrow_mut();
+            *a = TickRamArena::with_capacity(ARENA_CAPACITY);
+            a.append(key(1), sample(1_000, 100.0))
+                .expect("warm append must land after reset");
+        },
+        || {
+            let mut arena = arena.borrow_mut();
             // (a) STEADY STATE — 50,000 appends to an already-known
             // instrument. A `.clone()`, `format!` or `Vec` in `append` would
             // allocate at least once per iteration and be unmissable.
