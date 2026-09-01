@@ -1796,8 +1796,44 @@ impl TickWriter {
     /// # Errors
     /// [`TickRow::from_parsed_tick`] refusals and ILP buffer errors.
     pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
-        let row = TickRow::from_parsed_tick(tick, capture_seq)?;
-        self.append_row(&row)
+        let outcome = match TickRow::from_parsed_tick(tick, capture_seq) {
+            Ok(row) => self.append_row(&row),
+            Err(err) => Err(err.into()),
+        };
+        if let Err(err) = &outcome {
+            // A LOSS, counted on the ALARMED metric — found 2026-09-01.
+            //
+            // Until this line the only record of an append failure was the
+            // drain's `tv_dhan_feed_drain_frames_total{outcome="write_failed"}`
+            // label. The EMF processor folds every label value of one metric
+            // into a single summed series per host, so that failure was added
+            // to the ~83M `folded` frames of a session and vanished: no alarm
+            // reads the label, no dashboard line separates it, and the coded
+            // ERROR line carried no `source` a log filter could key on. A
+            // poisoned buffer could have refused every tick of a session with
+            // every loss pager green.
+            //
+            // `tv_ticks_dropped_total` is the right home, not a new name: it
+            // means "rows left the fold without reaching QuestDB", which is
+            // exactly this, and `dhan_ticks_dropped` (`live-lane-alarms.tf`)
+            // pages on `dropped - spilled >= 1`. An append failure never
+            // spills — there is no row to rescue — so it lands on the
+            // permanent-loss side of that subtraction, which is where it
+            // belongs. Same `feed` label as the seeded baseline so the series
+            // exists from boot rather than registering on the first failure.
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                security_id = tick.security_id,
+                capture_seq,
+                source = "ilp_append_failed",
+                error = %err,
+                "tick row could not be appended to the ILP buffer — LOST, counted on \
+                 tv_ticks_dropped_total (the row never existed, so nothing spills)"
+            );
+            metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str()).increment(1);
+        }
+        outcome
     }
 
     /// Appends one prepared [`TickRow`] to the ILP buffer (no flush).

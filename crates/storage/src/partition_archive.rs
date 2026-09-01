@@ -949,6 +949,40 @@ pub fn sidecar_archive_key(table: &str, partition: &str, gzip_sha256_hex: &str) 
     format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.sha-{gzip_sha256_hex}.csv.gz")
 }
 
+/// The boot-time self-heal for `partition_archive_audit` (2026-09-01).
+///
+/// One `ALTER TABLE … ADD COLUMN IF NOT EXISTS` per non-designated column,
+/// then the DEDUP key re-applied — the same shape every other audit table in
+/// this crate already uses. Idempotent: on a table that already has every
+/// column each statement is a no-op. Pure so the test can assert every column
+/// in the CREATE has a matching heal line.
+pub fn partition_archive_audit_self_heal_ddl() -> Vec<String> {
+    const COLUMNS: &[(&str, &str)] = &[
+        ("table_name", "SYMBOL"),
+        ("partition_name", "SYMBOL"),
+        ("outcome", "SYMBOL"),
+        ("feed", "SYMBOL"),
+        ("rows_archived", "LONG"),
+        ("csv_bytes", "LONG"),
+        ("gzip_bytes", "LONG"),
+        ("gzip_sha256", "STRING"),
+        ("s3_key", "STRING"),
+        ("detail", "STRING"),
+    ];
+    let mut out: Vec<String> = COLUMNS
+        .iter()
+        .map(|(name, ty)| {
+            format!(
+                "ALTER TABLE {PARTITION_ARCHIVE_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS {name} {ty};"
+            )
+        })
+        .collect();
+    out.push(format!(
+        "ALTER TABLE {PARTITION_ARCHIVE_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_PARTITION_ARCHIVE_AUDIT});"
+    ));
+    out
+}
+
 /// The idempotent `CREATE TABLE` DDL for the archive-audit chain. Pure
 /// (unit-testable without QuestDB).
 #[must_use]
@@ -2486,30 +2520,39 @@ impl PartitionArchiver {
 
     /// Ensures the audit table exists (idempotent, once per run).
     async fn ensure_audit_table(&self) {
-        let ddl = partition_archive_audit_create_ddl();
-        match self
-            .ddl_client
-            .get(&self.exec_url)
-            .query(&[("query", ddl.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                let status = resp.status();
-                error!(
-                    %status,
-                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-                    "partition_archive_audit: CREATE TABLE returned non-2xx (audit rows \
-                     for this run may be lost; archive flow continues fail-closed)"
-                );
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-                    "partition_archive_audit: CREATE TABLE request failed"
-                );
+        let create = partition_archive_audit_create_ddl();
+        // CREATE first, then the self-heal statements. Every other audit table
+        // in this crate re-applies `ADD COLUMN IF NOT EXISTS` + the DEDUP key
+        // at boot; this one did not (2026-09-01 audit), so a column added to
+        // the DDL would have broken the writer on any box whose table
+        // pre-dated it — silently, since audit rows fail soft.
+        let mut statements = vec![create];
+        statements.extend(partition_archive_audit_self_heal_ddl());
+        for ddl in statements {
+            match self
+                .ddl_client
+                .get(&self.exec_url)
+                .query(&[("query", ddl.as_str())])
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    let status = resp.status();
+                    error!(
+                        %status,
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        "partition_archive_audit: DDL returned non-2xx (audit rows \
+                         for this run may be lost; archive flow continues fail-closed)"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        "partition_archive_audit: DDL request failed"
+                    );
+                }
             }
         }
     }
@@ -3743,6 +3786,49 @@ mod tests {
     }
 
     // ---- audit table contract -----------------------------------------------
+
+    /// Every non-designated column in the CREATE has a heal line, and the
+    /// DEDUP key is re-applied last — a column added to the CREATE without
+    /// a matching ALTER would break the writer on any pre-existing table.
+    #[test]
+    fn partition_archive_audit_self_heal_ddl_covers_every_create_column() {
+        let create = partition_archive_audit_create_ddl();
+        let heal = partition_archive_audit_self_heal_ddl();
+        // Columns are the `name TYPE,` pairs between the parens of the CREATE.
+        let body = create
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(") timestamp("))
+            .map(|(cols, _)| cols)
+            .expect("CREATE DDL has a column list");
+        let mut checked = 0usize;
+        for spec in body.split(',') {
+            let mut parts = spec.split_whitespace();
+            let (Some(name), Some(ty)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if name == "ts" {
+                continue; // the designated timestamp is never ALTERed in
+            }
+            let expect = format!("ADD COLUMN IF NOT EXISTS {name} {ty};");
+            assert!(
+                heal.iter().any(|s| s.contains(&expect)),
+                "no self-heal line for column {name} {ty}: {heal:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 10, "the CREATE has ten non-designated columns");
+        let last = heal.last().expect("non-empty");
+        assert!(
+            last.contains(&format!(
+                "DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_PARTITION_ARCHIVE_AUDIT})"
+            )),
+            "the DEDUP key must be re-applied last: {last}"
+        );
+        assert!(
+            heal.iter()
+                .all(|s| s.starts_with("ALTER TABLE partition_archive_audit "))
+        );
+    }
 
     #[test]
     fn test_archive_audit_ddl_contains_expected_columns() {

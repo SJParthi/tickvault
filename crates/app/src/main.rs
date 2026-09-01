@@ -2206,10 +2206,17 @@ async fn async_main() -> Result<()> {
     // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
     // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
     // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
-    let _oom_monitor_supervisor =
-        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
-            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
-        ));
+    //
+    // 2026-09-01: the path is RESOLVED from `/proc/self/cgroup`, not the
+    // hardcoded root. As a bare systemd unit this process lives in
+    // `system.slice/tickvault.service`, and the cgroup ROOT has no
+    // `memory.events` at all — so the monitor had been failing its probe
+    // softly every 60 s since it shipped, and PROC-01 could never fire on the
+    // one host it exists for. The root constant remains the fallback for the
+    // in-container case, where the root really is our cgroup.
+    let _oom_monitor_supervisor = tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(
+        tickvault_storage::oom_monitor::resolve_memory_events_path(),
+    );
 
     // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
     // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),

@@ -47,11 +47,71 @@ pub const OOM_MONITOR_POLL_INTERVAL_SECS: u64 = 60;
 /// operator via CloudWatch. Mirrors [`crate::disk_health_watcher::DISK_WATCHER_RESPAWN_BACKOFF_SECS`].
 pub const OOM_MONITOR_RESPAWN_BACKOFF_SECS: u64 = 5;
 
-/// Canonical cgroup-v2 memory-events path. On a cgroup-v2 host the app's own
-/// cgroup exposes `memory.events` here (systemd typically bind-mounts the unit's
-/// cgroup at the fs root inside the container/unit view). If this path does not
-/// exist (cgroup-v1, macOS dev box), the probe fails softly.
+/// FALLBACK cgroup-v2 memory-events path — the unified-hierarchy ROOT.
+///
+/// **This is only right inside a cgroup NAMESPACE** (a Docker container, where
+/// the container's own cgroup is mounted at `/sys/fs/cgroup`). For a bare
+/// systemd unit — which is how `tickvault.service` runs on the prod box — the
+/// root cgroup has NO `memory.events` at all (the kernel exposes it only on
+/// non-root cgroups), so a probe against this path fails softly on every poll
+/// forever and PROC-01 can never fire. Found by the 2026-09-01 audit: the OOM
+/// detector was structurally dead on the one host it exists for.
+///
+/// Production resolves the REAL path from `/proc/self/cgroup` via
+/// [`resolve_memory_events_path`] and uses this constant only when that
+/// resolution is impossible (cgroup-v1, macOS dev box, an unreadable
+/// `/proc`), which is exactly the case the soft failure was written for.
 pub const DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH: &str = "/sys/fs/cgroup/memory.events";
+
+/// Where the kernel reports the calling process's cgroup membership.
+pub const PROC_SELF_CGROUP_PATH: &str = "/proc/self/cgroup";
+
+/// The cgroup-v2 unified hierarchy mount point.
+pub const CGROUP_V2_MOUNT: &str = "/sys/fs/cgroup";
+
+/// PURE: the `memory.events` path of OUR cgroup, from `/proc/self/cgroup`.
+///
+/// On cgroup v2 the file holds one unified line, `0::<path>`, e.g.
+/// `0::/system.slice/tickvault.service`. The `memory.events` we want is that
+/// path under [`CGROUP_V2_MOUNT`]. Returns `None` — meaning "use the fallback"
+/// — when the line is absent (cgroup v1 lists numbered controllers instead)
+/// or names the root (`0::/`, the inside-a-namespace shape, where the root IS
+/// our cgroup and the fallback constant is correct).
+///
+/// O(lines) over a file of a handful of lines, once at boot.
+#[must_use]
+pub fn memory_events_path_from_proc_cgroup(proc_cgroup: &str) -> Option<PathBuf> {
+    let unified = proc_cgroup
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let relative = unified.trim();
+    if relative.is_empty() || relative == "/" || !relative.starts_with('/') {
+        return None;
+    }
+    let mut path = PathBuf::from(CGROUP_V2_MOUNT);
+    // `relative` starts with `/`; `Path::push` of an absolute path would
+    // REPLACE the mount, so join the trimmed remainder.
+    path.push(relative.trim_start_matches('/'));
+    path.push("memory.events");
+    Some(path)
+}
+
+/// The `memory.events` path the monitor should watch on THIS host.
+///
+/// Reads `/proc/self/cgroup` and delegates to
+/// [`memory_events_path_from_proc_cgroup`]; any failure falls back to
+/// [`DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH`], never to a panic — the monitor
+/// is best-effort by design and its probe reports its own failure.
+// TEST-EXEMPT: thin fs-read wrapper over the fully-tested pure resolver; the
+// fallback arm is `resolve_memory_events_path_always_ends_in_memory_events`.
+#[must_use]
+pub fn resolve_memory_events_path() -> PathBuf {
+    std::fs::read_to_string(PROC_SELF_CGROUP_PATH)
+        .ok()
+        .and_then(|body| memory_events_path_from_proc_cgroup(&body))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH))
+}
 
 /// Outcome of reading + parsing `memory.events`, exposed for unit testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +316,63 @@ pub fn spawn_supervised_oom_monitor(memory_events_path: PathBuf) -> tokio::task:
             tokio::time::sleep(Duration::from_secs(OOM_MONITOR_RESPAWN_BACKOFF_SECS)).await;
         }
     })
+}
+
+#[cfg(test)]
+mod cgroup_path_tests {
+    use super::*;
+
+    #[test]
+    fn memory_events_path_from_proc_cgroup_resolves_a_systemd_unit() {
+        // The prod-box shape: a bare unit under system.slice.
+        let body = "0::/system.slice/tickvault.service\n";
+        assert_eq!(
+            memory_events_path_from_proc_cgroup(body),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/system.slice/tickvault.service/memory.events"
+            ))
+        );
+    }
+
+    #[test]
+    fn memory_events_path_from_proc_cgroup_root_means_use_the_fallback() {
+        // Inside a cgroup namespace (Docker) the process sees itself at the
+        // root, and the root IS its cgroup — the fallback constant is right.
+        assert_eq!(memory_events_path_from_proc_cgroup("0::/\n"), None);
+        assert_eq!(memory_events_path_from_proc_cgroup("0::"), None);
+        assert_eq!(memory_events_path_from_proc_cgroup(""), None);
+    }
+
+    #[test]
+    fn memory_events_path_from_proc_cgroup_ignores_v1_controller_lines() {
+        // cgroup v1 lists numbered controllers and no unified `0::` line.
+        let body = "12:memory:/user.slice\n11:cpu,cpuacct:/user.slice\n";
+        assert_eq!(memory_events_path_from_proc_cgroup(body), None);
+        // A v1 host that ALSO has the unified line (hybrid) still resolves it.
+        let hybrid = "12:memory:/user.slice\n0::/system.slice/tickvault.service\n";
+        assert!(
+            memory_events_path_from_proc_cgroup(hybrid)
+                .is_some_and(|p| p.ends_with("tickvault.service/memory.events"))
+        );
+    }
+
+    #[test]
+    fn memory_events_path_from_proc_cgroup_refuses_a_relative_path() {
+        // A malformed line must never produce a path outside the mount.
+        assert_eq!(
+            memory_events_path_from_proc_cgroup("0::system.slice/x.service"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_memory_events_path_always_ends_in_memory_events() {
+        // Whatever this host is (CI container, dev box, prod), the resolver
+        // must hand the monitor a `memory.events` path and never panic.
+        let path = resolve_memory_events_path();
+        assert!(path.ends_with("memory.events"), "{}", path.display());
+        assert!(path.starts_with(CGROUP_V2_MOUNT), "{}", path.display());
+    }
 }
 
 #[cfg(test)]
