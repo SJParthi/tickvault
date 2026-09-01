@@ -6934,6 +6934,102 @@ fn outstanding_halves(
     )
 }
 
+/// Counter: a plan that dialed FEWER connections than it planned, labelled by
+/// which half of the stack asked.
+///
+/// # Why this did not exist until 2026-09-01
+///
+/// `dial_planned_connections` returns how many connections it actually spawned,
+/// and every call site logged that number — while `plan.connections.len()`
+/// appeared NOWHERE in this file. So a plan that skipped a connection (an
+/// unregistered supervisor, a non-market-data endpoint) reported the smaller
+/// number under a success message, and nothing anywhere said what was asked
+/// for. A dial is only complete when the two agree; that is now stated rather
+/// than assumed.
+///
+/// NOT EMF-selected today, so it is countable on the box and not yet pageable
+/// from CloudWatch. Selecting it costs ~$0.30/mo and needs its own dated cost
+/// note in `dhan-rest-only-noise-lock-2026-07-14.md` — deliberately not taken
+/// here rather than taken silently.
+pub const DIAL_INCOMPLETE_COUNTER: &str = "tv_dhan_dial_incomplete_total";
+
+/// `half` label for the main-feed dial (boot spots and the contract attach).
+pub const DIAL_HALF_MAIN_FEED: &str = "main_feed";
+
+/// `half` label for the depth dial (depth-20 + depth-200).
+pub const DIAL_HALF_DEPTH: &str = "depth";
+
+/// Reports a plan that reached the wire with fewer connections than it planned.
+///
+/// Silent on a complete dial, so the counter's steady state is a flat zero and
+/// any non-zero reading is the event itself — there is no baseline to
+/// calibrate against and none is invented.
+fn report_dial_shortfall(half: &'static str, planned: usize, dialed: usize, attempts: u32) {
+    if dialed >= planned {
+        return;
+    }
+    let missing = planned.saturating_sub(dialed);
+    error!(
+        code = ErrorCode::WsGapConnectionState.code_str(),
+        half,
+        planned,
+        dialed,
+        missing,
+        attempts,
+        "the dial spawned FEWER connections than were planned — {missing} planned socket(s) \
+         carry no data this session and their pool slots are already spent, so they cannot be \
+         re-planned. Look for a planned connection whose supervisor was not registered."
+    );
+    metrics::counter!(
+        DIAL_INCOMPLETE_COUNTER,
+        "half" => half,
+        "stage" => "spawn_skipped",
+    )
+    .increment(u64::try_from(missing).unwrap_or(u64::MAX));
+}
+
+/// The depth-200 instruments a retry may still plan.
+///
+/// Two filters, and BOTH are load-bearing:
+///
+/// 1. **Not already on the wire**, by the I-P1-11 composite key. A connection
+///    slot is consumed by `PoolBudget::try_open` at PLAN time and never
+///    returned, so re-submitting an instrument that already has one burns a
+///    second slot for the same book.
+/// 2. **Never more than the budget can still open.** `plan_pool` is
+///    all-or-nothing per endpoint: ask for two connections when one is free and
+///    `try_open` refuses the SECOND, which fails the whole depth plan — so a
+///    retry that over-asks dials nothing at all, forever.
+///
+/// When the delta is longer than the free budget the **tail** is kept, not the
+/// head. `top_mover_pick` appends the fifth socket last and `try_open` hands
+/// out `pool_index` from the current open count, so the last free depth-200
+/// connection IS `DEPTH_200_TOP_MOVER_SOCKET` — the socket the per-minute
+/// rebalance treats as the mover's. Trimming from the head is what keeps the
+/// mover on the socket that expects it.
+#[must_use]
+fn depth_200_delta(
+    selection: &[SubscribeInstrument],
+    on_wire: &std::collections::HashSet<(u64, u8)>,
+    pool: &PoolSupervisor,
+) -> Vec<SubscribeInstrument> {
+    let endpoint = DhanEndpointType::Depth200;
+    let free = usize::from(endpoint.max_connections())
+        .saturating_sub(usize::from(pool.open_count(endpoint)));
+    if free == 0 {
+        return Vec::new();
+    }
+    let mut delta: Vec<SubscribeInstrument> = selection
+        .iter()
+        .copied()
+        .filter(|instrument| !on_wire.contains(&contract_identity(instrument)))
+        .collect();
+    if delta.len() > free {
+        delta.drain(..delta.len().saturating_sub(free));
+    }
+    delta
+}
+
 #[must_use]
 fn remaining_main_feed_capacity(connections_used: usize) -> usize {
     let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
@@ -7125,6 +7221,50 @@ async fn attach_depth_when_available(
     // STATEFUL, so re-planning an already-dialed half consumes a second set of
     // connection slots.
     let mut contracts_done = false;
+    // ---- depth completeness, tracked instead of latched -------------------
+    //
+    // # The 2026-09-01 defect these four replace
+    //
+    // `depth_done` used to be set to `true` UNCONDITIONALLY on any successful
+    // depth plan, and the selection block above short-circuits to
+    // `DepthSelection::default()` the moment it is. So the FIRST plan closed
+    // depth forever, however few sockets it actually held.
+    //
+    // That is deterministic, not occasional: `PREOPEN_READY_DEADLINE_IST_SECS`
+    // (09:12) forces the attach, and the FIFTH depth-200 socket is the day's
+    // biggest mover — which needs traded prices and therefore cannot exist
+    // before 09:15. Every session dialed four depth-200 sockets, latched, and
+    // left the fifth dark. 14 of 15 gauge-countable sockets, every trading day.
+    //
+    // # Why four values and not one un-latched boolean
+    //
+    // `pool.admit` -> `PoolBudget::try_open` is STATEFUL: a slot is consumed at
+    // PLAN time and never returned. So simply re-planning the whole selection
+    // on the next attempt asks for five more depth-20 connections when five are
+    // already open, `try_open` refuses, `plan_pool` fails the WHOLE endpoint,
+    // and depth would retry into a guaranteed refusal until the deadline. The
+    // retry must therefore plan the DELTA — what is not already on the wire —
+    // and never more than the budget can still open.
+    //
+    // `depth_20_dialed`: the depth-20 shard set reached the wire; it is never
+    //   re-planned (it spreads across ALL five authorized connections, so there
+    //   is nothing left to add to it anyway).
+    // `depth_200_on_wire`: the I-P1-11 composite key of every depth-200
+    //   instrument whose CONNECTION SLOT has been consumed. Keyed on the slot,
+    //   not on a successful dial, because the budget is spent either way and
+    //   re-planning it would burn a second slot for the same instrument.
+    // `depth_ready`: the first successful depth plan. This is what
+    //   `depth_done` used to mean, and the readiness gauge keeps using it, so
+    //   the 09:12 pre-open verdict is published on exactly the iteration it
+    //   always was. Gating readiness on the fifth socket instead would fail the
+    //   09:12 deadline every single morning by construction.
+    // `depth_done`: COMPLETE — depth-20 on the wire and all five depth-200
+    //   sockets accounted for. This is the terminal gate: the success return
+    //   and `spawn_depth_rebalance` wait for it.
+    let mut depth_20_dialed = false;
+    let mut depth_200_on_wire: std::collections::HashSet<(u64, u8)> =
+        std::collections::HashSet::new();
+    let mut depth_ready = false;
     let mut depth_done = false;
     // The contract overflow may be handed to the live spot connection exactly
     // once. `SubscribeGuard::try_extend` refuses only PAST the per-connection
@@ -7604,6 +7744,8 @@ async fn attach_depth_when_available(
                 // so the split costs nothing.
                 match build_feed_stack_plan(&mut pool, Instant::now(), pool_contracts, &[], &[]) {
                     Ok(plan) => {
+                        // Captured BEFORE the move — see `report_dial_shortfall`.
+                        let planned = plan.connections.len();
                         let dialed = dial_planned_connections(
                             plan,
                             DialContext {
@@ -7632,6 +7774,7 @@ async fn attach_depth_when_available(
                         // once at the moment it reaches the wire. Never per
                         // retry: `no_ladders` before 09:16 is normal, so a
                         // per-attempt emit would page every healthy morning.
+                        report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
                         crate::dhan_contract_universe::record_contract_verdict(&contracts);
                         contracts_done = true;
                         // Only what the POOL carried. The overflow records
@@ -7667,6 +7810,7 @@ async fn attach_depth_when_available(
                             main_feed_connections_used.saturating_add(dialed);
                         info!(
                             dialed,
+                            planned,
                             attempts,
                             contracts = contracts.instruments.len(),
                             stock_options = contracts.stock_options,
@@ -7690,67 +7834,126 @@ async fn attach_depth_when_available(
 
             // ---- half 2: DEPTH ----
             if dial_depth {
-                match build_feed_stack_plan(
-                    &mut pool,
-                    Instant::now(),
-                    &[],
-                    &selection.depth_20,
-                    &selection.depth_200,
-                ) {
-                    Ok(plan) => {
-                        let dialed = dial_planned_connections(
-                            plan,
-                            DialContext {
-                                pool: &mut pool,
-                                client_id: &client_id,
-                                spill: &spill,
-                                frame_tx: &frame_tx,
-                                main_feed_budget: &main_feed_budget,
-                                depth_budget: &depth_budget,
-                                depth200_budget: &depth200_budget,
-                                ws_audit_tx: Some(&ws_audit_tx),
-                                out_topups: None,
-                                out_depth_commands: Some(&mut depth_commands),
-                            },
-                        );
-                        depth_done = true;
-                        // Same as the contract half: depth legs are real
-                        // subscriptions and a silently-dead one has no other
-                        // evidence.
-                        let mut depth_seed = selection.depth_20.clone();
-                        depth_seed.extend(selection.depth_200.iter().copied());
-                        if let Err(err) = seed_tx.try_send(depth_seed) {
-                            warn!(
-                                %err,
-                                "depth legs dialed but could not be seeded into the silence \
-                                 detector"
+                // What is NOT already on the wire, bounded by what the budget
+                // can still open. See the `depth_200_on_wire` doc above: the
+                // slot is consumed at PLAN time, so re-submitting an
+                // already-planned instrument burns a second connection and
+                // `try_open` then refuses the whole endpoint.
+                let depth_20_plan: &[SubscribeInstrument] = if depth_20_dialed {
+                    &[]
+                } else {
+                    selection.depth_20.as_slice()
+                };
+                let depth_200_plan =
+                    depth_200_delta(&selection.depth_200, &depth_200_on_wire, &pool);
+
+                if depth_20_plan.is_empty() && depth_200_plan.is_empty() {
+                    // Normal before the open: depth-20 and the four ATM
+                    // depth-200 sockets are already up and the day's biggest
+                    // mover has not appeared yet. Nothing to plan this
+                    // attempt; the loop asks again.
+                    tracing::debug!(
+                        attempts,
+                        depth_200_on_wire = depth_200_on_wire.len(),
+                        "depth: nothing new to add this attempt — waiting for the outstanding \
+                         socket(s) to resolve"
+                    );
+                } else {
+                    match build_feed_stack_plan(
+                        &mut pool,
+                        Instant::now(),
+                        &[],
+                        depth_20_plan,
+                        &depth_200_plan,
+                    ) {
+                        Ok(plan) => {
+                            // Captured BEFORE the plan is moved. `dialed`
+                            // counts what reached a spawn; `planned` is what
+                            // was asked for, and until 2026-09-01 nothing
+                            // compared them, so a plan that dialed fewer
+                            // sockets than it planned logged a success line.
+                            let planned = plan.connections.len();
+                            let dialed = dial_planned_connections(
+                                plan,
+                                DialContext {
+                                    pool: &mut pool,
+                                    client_id: &client_id,
+                                    spill: &spill,
+                                    frame_tx: &frame_tx,
+                                    main_feed_budget: &main_feed_budget,
+                                    depth_budget: &depth_budget,
+                                    depth200_budget: &depth200_budget,
+                                    ws_audit_tx: Some(&ws_audit_tx),
+                                    out_topups: None,
+                                    out_depth_commands: Some(&mut depth_commands),
+                                },
+                            );
+                            report_dial_shortfall(DIAL_HALF_DEPTH, planned, dialed, attempts);
+                            // Recorded on the PLAN, not on the dial: the
+                            // connection slot is spent either way, so an
+                            // instrument whose spawn was skipped must never be
+                            // re-planned into a second slot.
+                            if !depth_20_plan.is_empty() {
+                                depth_20_dialed = true;
+                            }
+                            for instrument in &depth_200_plan {
+                                depth_200_on_wire.insert(contract_identity(instrument));
+                            }
+                            depth_ready = true;
+                            depth_done = depth_20_dialed
+                                && depth_200_on_wire.len()
+                                    >= crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS;
+                            // Same as the contract half: depth legs are real
+                            // subscriptions and a silently-dead one has no other
+                            // evidence. Seeds only what THIS plan carried — the
+                            // earlier sockets were seeded on their own attempt.
+                            let mut depth_seed = depth_20_plan.to_vec();
+                            depth_seed.extend(depth_200_plan.iter().copied());
+                            if let Err(err) = seed_tx.try_send(depth_seed) {
+                                warn!(
+                                    %err,
+                                    "depth legs dialed but could not be seeded into the silence \
+                                     detector"
+                                );
+                            }
+                            info!(
+                                dialed,
+                                planned,
+                                attempts,
+                                depth_20 = depth_20_plan.len(),
+                                depth_200 = depth_200_plan.len(),
+                                depth_200_on_wire = depth_200_on_wire.len(),
+                                depth_200_authorized =
+                                    crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS,
+                                depth_done,
+                                contracts_done,
+                                "late-attach dialed DEPTH sockets"
                             );
                         }
-                        info!(
-                            dialed,
-                            attempts,
-                            depth_20 = selection.depth_20.len(),
-                            depth_200 = selection.depth_200.len(),
-                            contracts_done,
-                            "late-attach dialed the DEPTH sockets"
-                        );
+                        Err(err) => error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            ?err,
+                            depth_20 = depth_20_plan.len(),
+                            depth_200 = depth_200_plan.len(),
+                            "depth planning refused its instruments. RETRYING until the \
+                             deadline — a refusal can be transient (a connection budget that \
+                             frees up), and giving up on the first one would cost the whole \
+                             session's depth."
+                        ),
                     }
-                    Err(err) => error!(
-                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                        ?err,
-                        depth_20 = selection.depth_20.len(),
-                        depth_200 = selection.depth_200.len(),
-                        "depth planning refused its instruments. RETRYING until the deadline \
-                         — a refusal can be transient (a connection budget that frees up), \
-                         and giving up on the first one would cost the whole session's depth."
-                    ),
                 }
             }
 
-            // The ONLY success return. Both halves, or keep waiting — the
-            // single `return` that used to sit in one shared Ok arm is exactly
-            // what left depth dark once contracts won the race.
-            if contracts_done && depth_done && !readiness_published {
+            // The readiness verdict rides `depth_ready`, NOT `depth_done`.
+            //
+            // `depth_ready` is what `depth_done` meant before 2026-09-01: the
+            // first successful depth plan. The fifth depth-200 socket is the
+            // day's biggest mover and needs traded prices, so it cannot exist
+            // before 09:15 — gating this on the COMPLETE set would miss the
+            // 09:12 pre-open deadline every trading morning by construction and
+            // page for it. The completeness verdict is reported separately, on
+            // the terminal return below.
+            if contracts_done && depth_ready && !readiness_published {
                 // The readiness SECOND, not the attempt count. Published here
                 // and nowhere else: this is the only point at which both
                 // halves are provably on the wire, and it is reached at most
@@ -7845,6 +8048,49 @@ async fn attach_depth_when_available(
                     newly_priced.saturating_mul(MAX_CONTRACTS_PER_LATE_UNDERLYING),
                 ));
             }
+        }
+
+        // ---- the BOUND on chasing an outstanding depth socket --------------
+        //
+        // Un-latching `depth_done` (2026-09-01) means the loop keeps asking
+        // until every authorized depth-200 socket is on the wire. On a flat
+        // morning the day's biggest mover may never resolve, and without a
+        // bound this task would poll two QuestDB reads a minute until the
+        // 15:30 hard stop — and, far worse, never reach the terminal return
+        // that hands the depth-200 channels to `spawn_depth_rebalance`. The
+        // per-minute at-the-money re-fit would silently never start.
+        //
+        // So at the SAME deadline the give-up arms already use, an incomplete
+        // depth set is accepted as final: loudly, naming exactly how many
+        // sockets carry nothing, and letting the rebalance take the ones that
+        // do. Never silently — a socket that was authorized and never dialed
+        // is the false-OK this whole file exists to stop.
+        if depth_ready && !depth_done && out_of_time {
+            let authorized = crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS;
+            let on_wire = depth_200_on_wire.len();
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                attempts,
+                depth_200_on_wire = on_wire,
+                depth_200_authorized = authorized,
+                depth_20_dialed,
+                ist_second_of_day = now_ist,
+                "depth attach is giving up on the outstanding depth-200 socket(s): {} of {} \
+                 authorized 200-level sockets reached the wire and the rest carry NO data for \
+                 the remainder of this session. The fifth socket is the day's biggest mover \
+                 and needs traded prices — on a flat morning it can legitimately never \
+                 resolve. Proceeding so the per-minute at-the-money rebalance can start on \
+                 the sockets that DID dial.",
+                on_wire,
+                authorized
+            );
+            metrics::counter!(
+                DIAL_INCOMPLETE_COUNTER,
+                "half" => DIAL_HALF_DEPTH,
+                "stage" => "gave_up_outstanding_sockets",
+            )
+            .increment(1);
+            depth_done = true;
         }
 
         // The ONLY success return.
@@ -8753,8 +8999,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             .set(planned_f64);
     }
 
+    // Captured before the plan is moved into the dial below, so the dial can be
+    // checked against what it was ASKED for rather than only reporting itself.
+    let planned_connections = plan.len();
     info!(
-        planned_connections = plan.len(),
+        planned_connections,
         main_feed = plan.count_for(DhanEndpointType::MainFeed),
         depth_20 = plan.count_for(DhanEndpointType::Depth20),
         depth_200 = plan.count_for(DhanEndpointType::Depth200),
@@ -9502,6 +9751,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             out_depth_commands: None,
         },
     );
+    // `attempts = 0`: the boot dial happens once and has no retry loop behind
+    // it. Reported for the same reason the attach half is — a boot that spawned
+    // fewer sockets than it planned used to log only the smaller number.
+    report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned_connections, dialed, 0);
 
     // The connection with the MOST room is the one worth topping up. With a
     // single spot connection that is trivially the only one; picking by
@@ -15790,6 +16043,198 @@ mod tests {
         );
     }
 
+    // ---- the 14-of-15-sockets defect (2026-09-01) -------------------------
+    //
+    // `PREOPEN_READY_DEADLINE_IST_SECS` (09:12) forces the depth attach, and
+    // the FIFTH depth-200 socket is the day's biggest mover — which needs
+    // traded prices and cannot exist before 09:15. `depth_done` was set
+    // UNCONDITIONALLY on the first successful plan and the selection block
+    // short-circuits on it, so the fifth socket was dark every trading day,
+    // deterministically, while every gauge read healthy.
+
+    fn depth_instrument(security_id: u64) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id,
+            segment: ExchangeSegment::NseFno,
+        }
+    }
+
+    fn wire_set(ids: &[u64]) -> std::collections::HashSet<(u64, u8)> {
+        ids.iter()
+            .map(|id| contract_identity(&depth_instrument(*id)))
+            .collect()
+    }
+
+    fn pool_with_depth_200_open(open: usize) -> PoolSupervisor {
+        let mut pool = PoolSupervisor::new();
+        for _ in 0..open {
+            pool.admit(DhanEndpointType::Depth200, std::time::Instant::now())
+                .expect("the depth-200 budget must admit within its authorized count");
+        }
+        pool
+    }
+
+    /// The whole point: after a four-socket dial, the fifth is still plannable.
+    ///
+    /// Under the old latch this could not arise — `depth_done` was true, the
+    /// selection collapsed to `DepthSelection::default()`, and no fifth socket
+    /// was ever asked for again.
+    #[test]
+    fn the_fifth_depth_200_socket_is_still_plannable_after_a_partial_dial() {
+        let pool = pool_with_depth_200_open(4);
+        let selection: Vec<SubscribeInstrument> = [11, 12, 13, 14, 99]
+            .iter()
+            .map(|id| depth_instrument(*id))
+            .collect();
+        let delta = depth_200_delta(&selection, &wire_set(&[11, 12, 13, 14]), &pool);
+        assert_eq!(
+            delta,
+            vec![depth_instrument(99)],
+            "only the outstanding mover socket may be re-planned"
+        );
+    }
+
+    /// A complete set asks for nothing, so the loop stops rather than spinning.
+    #[test]
+    fn a_complete_depth_200_set_yields_an_empty_delta() {
+        let pool = pool_with_depth_200_open(5);
+        let selection: Vec<SubscribeInstrument> = [11, 12, 13, 14, 99]
+            .iter()
+            .map(|id| depth_instrument(*id))
+            .collect();
+        assert!(
+            depth_200_delta(&selection, &wire_set(&[11, 12, 13, 14, 99]), &pool).is_empty(),
+            "nothing outstanding means nothing to plan"
+        );
+    }
+
+    /// The delta must never over-ask the STATEFUL budget.
+    ///
+    /// `plan_pool` is all-or-nothing per endpoint: ask for two connections when
+    /// one is free and `try_open` refuses the second, failing the WHOLE depth
+    /// plan. A retry that over-asks therefore dials nothing at all, forever —
+    /// which would have turned the un-latch into a permanent refusal loop.
+    #[test]
+    fn the_delta_never_asks_for_more_connections_than_the_budget_can_open() {
+        let pool = pool_with_depth_200_open(4);
+        // Every strike moved, so nothing in the new selection is on the wire.
+        let selection: Vec<SubscribeInstrument> = [21, 22, 23, 24, 99]
+            .iter()
+            .map(|id| depth_instrument(*id))
+            .collect();
+        let delta = depth_200_delta(&selection, &wire_set(&[11, 12, 13, 14]), &pool);
+        assert_eq!(delta.len(), 1, "exactly one depth-200 connection is free");
+        assert_eq!(
+            delta,
+            vec![depth_instrument(99)],
+            "the TAIL is kept: the last free connection is DEPTH_200_TOP_MOVER_SOCKET, and \
+             the mover is what the rebalance expects to find on it"
+        );
+    }
+
+    /// An exhausted budget plans nothing, whatever the selection says.
+    #[test]
+    fn an_exhausted_depth_200_budget_plans_nothing() {
+        let pool =
+            pool_with_depth_200_open(usize::from(DhanEndpointType::Depth200.max_connections()));
+        let selection: Vec<SubscribeInstrument> =
+            [31, 32].iter().map(|id| depth_instrument(*id)).collect();
+        assert!(
+            depth_200_delta(&selection, &std::collections::HashSet::new(), &pool).is_empty(),
+            "no free connection means no plan, never a refusal-guaranteed one"
+        );
+    }
+
+    /// The arithmetic the completeness gate rests on.
+    #[test]
+    fn the_fifth_socket_is_the_one_beyond_the_atm_pair_budget() {
+        assert_eq!(
+            crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS,
+            crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS + 1,
+            "four ATM pair sockets plus the day's biggest mover"
+        );
+    }
+
+    /// The latch itself. `depth_done` must be COMPUTED, never asserted.
+    #[test]
+    fn depth_done_is_never_latched_on_a_successful_plan() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let depth_arm = production
+            .split_once("// ---- half 2: DEPTH ----")
+            .expect("the depth dial arm must exist")
+            .1
+            .split_once("// The readiness verdict rides")
+            .expect("the readiness gate must follow the depth arm")
+            .0;
+        assert!(
+            !depth_arm.contains("depth_done = true"),
+            "the depth dial must not LATCH completeness — that is the defect: a four-socket \
+             plan set it, the selection then short-circuited to default(), and the fifth \
+             depth-200 socket was never asked for again"
+        );
+        assert!(
+            depth_arm.contains("depth_done = depth_20_dialed")
+                && depth_arm.contains("DEPTH_200_TOTAL_SOCKETS"),
+            "completeness must be derived from what is actually on the wire"
+        );
+        assert!(
+            depth_arm.contains("depth_200_delta("),
+            "the retry must plan the DELTA — `pool.admit` is stateful, so re-submitting the \
+             whole selection burns a second set of slots and `try_open` then refuses"
+        );
+    }
+
+    /// Readiness must NOT wait for a socket that cannot exist before 09:15.
+    ///
+    /// Gating the 09:12 pre-open verdict on the complete depth set would fail
+    /// that deadline every trading morning by construction and page for it.
+    #[test]
+    fn the_preopen_readiness_verdict_does_not_wait_for_the_mover_socket() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(
+            production.contains("if contracts_done && depth_ready && !readiness_published {"),
+            "the readiness verdict rides depth_ready (the first successful plan), never \
+             depth_done (the complete set)"
+        );
+        assert!(
+            production.contains("if depth_ready && !depth_done && out_of_time {"),
+            "an outstanding depth socket must be given up at the SAME deadline the other \
+             give-up arms use — otherwise the terminal return never fires and \
+             spawn_depth_rebalance never starts"
+        );
+    }
+
+    /// Both dial sites must compare what was DIALED against what was PLANNED.
+    ///
+    /// `plan.connections.len()` appeared nowhere in this file before
+    /// 2026-09-01: every site logged the smaller number under a success line.
+    #[test]
+    fn every_dial_site_compares_planned_against_dialed() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let dial_sites = production.matches("dial_planned_connections(\n").count()
+            + production.matches("= dial_planned_connections(").count();
+        assert!(
+            dial_sites >= 3,
+            "the file must still have all three dial sites"
+        );
+        assert_eq!(
+            production.matches("report_dial_shortfall(").count(),
+            4,
+            "one definition plus one check at each of the three dial sites — boot, the \
+             contract half, and depth"
+        );
+        assert!(
+            production.contains(DIAL_INCOMPLETE_COUNTER),
+            "the shortfall must be countable, not only loggable"
+        );
+    }
+
     /// The depth task must hold a WEAK sender.
     ///
     /// A held `Sender` clone keeps the frame ring OPEN for the whole wait, so
@@ -16858,8 +17303,16 @@ mod contract_attach_tests {
         // condition is deliberate — anchoring on the prefix would silently
         // match the terminal return block further down and invert this
         // assertion, which is exactly how this test first failed.
+        // RE-ANCHORED 2026-09-01: `depth_done` → `depth_ready`. The gate did
+        // not move; what `depth_done` MEANS did. It now means the COMPLETE
+        // depth set, and the fifth depth-200 socket is the day's biggest mover
+        // — which needs traded prices and cannot exist before 09:15, so gating
+        // the 09:12 pre-open verdict on it would miss that deadline every
+        // trading morning by construction. `depth_ready` is the first
+        // successful depth plan, i.e. exactly what `depth_done` used to mean
+        // here, so this arm fires on the same iteration it always did.
         let arm = src
-            .find("if contracts_done && depth_done && !readiness_published {")
+            .find("if contracts_done && depth_ready && !readiness_published {")
             .expect("success arm");
         assert!(emit > arm, "the gauge is published outside the success arm");
         assert_eq!(
