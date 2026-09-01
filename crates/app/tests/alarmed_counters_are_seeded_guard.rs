@@ -56,8 +56,21 @@ const KNOWN_INDIRECT: &[&str] = &[
     // Built from a `for_each` map of error codes; the metric is a log METRIC
     // FILTER, not a counter this process emits, so there is nothing to seed.
     "error-code-alarms.tf",
-    // Same: log metric filters over coded ERROR lines.
-    "live-lane-alarms.tf",
+    // ⚠ REMOVED 2026-09-01 (adversarial review). This file was exempted with
+    // the reason "Same: log metric filters over coded ERROR lines." That is
+    // FALSE and measurably so: `live-lane-alarms.tf` contains TWENTY-THREE
+    // alarms on `namespace = local.app_namespace` and ZERO
+    // `aws_cloudwatch_log_metric_filter` resources. Among them are
+    // `tv_ticks_lost_total`, `tv_dhan_ws_wal_dropped_total`,
+    // `tv_ws_frame_wal_reinjected_dropped_total` and
+    // `tv_aggregator_slot_exhausted_total` — the loss counters this guard
+    // exists for.
+    //
+    // Every one happens to be seeded today, so nothing was broken. What was
+    // broken is the GUARD: a new loss alarm added to that file was unchecked
+    // BY CONSTRUCTION, and the exemption's own wording made it look
+    // deliberate. An exemption that is written down can be argued with — but
+    // only if what it says is true.
 ];
 
 /// Metric names that are GAUGES, which have no dropped-first-sample hazard.
@@ -72,24 +85,96 @@ const KNOWN_INDIRECT: &[&str] = &[
 /// permanently healthy. Fixing them means either adding the producer or
 /// deleting the alarm — a decision, not a seeding.
 const KNOWN_NO_PRODUCER: &[&str] = &[
+    // ⚠ CORRECTED 2026-09-01 (adversarial review). This list previously
+    // carried THREE names under the heading "DEAD MONITORS", with the claim:
+    // "Verified 2026-08-28: no `counter!`, `gauge!` or `histogram!` anywhere
+    // in `crates/*/src` emits these names, so their alarms are permanently
+    // green and always will be."
+    //
+    // That was FALSE for two of the three, and it was written as a dated,
+    // VERIFIED claim — the most trusted shape a comment can take:
+    //
+    //   tv_telegram_dropped_total          seeded on all three `reason`
+    //                                      labels at `main.rs` and
+    //                                      incremented at
+    //                                      `notification/coalescer.rs`. It is
+    //                                      ALSO produced by a log metric
+    //                                      filter in telegram-drop-alarm.tf,
+    //                                      so it is alive in both lanes.
+    //   tv_wal_suspension_probe_failed_total
+    //                                      emitted twice in
+    //                                      `storage/src/wal_suspension_watcher.rs`.
+    //
+    // Both are removed, so the guard now REQUIRES them to stay seeded. The
+    // cost of the stale entry was not a broken alarm — both were fine — but a
+    // comment that told the next reader two live counters were dead. That is
+    // the manufactures-a-false-finding class this repository keeps paying
+    // for, and it cost a session: an audit run today reported one of them as
+    // a CRITICAL blind spot on the strength of exactly this reasoning.
+    //
     // Emitted by a Lambda (`crates/aws-lambdas/src/deploy_watchdog.rs`), not
     // by this process. Correctly unseeded here.
     "tv_binary_main_sha_mismatch",
     // A DERIVED metric: the alarm reads a log metric filter, not a counter we
     // emit. Nothing to register.
     "tv_orders_placed_delta_total",
-    // ⚠ DEAD MONITORS. Verified 2026-08-28: no `counter!`, `gauge!` or
-    // `histogram!` anywhere in `crates/*/src` emits these names, so their
-    // alarms are permanently green and always will be. Left listed rather than
-    // fixed because the fix is a design call — add the producer, or retire the
-    // alarm — and the same class is already recorded in
-    // `dhan-rest-only-noise-lock-2026-07-14.md`.
-    "tv_telegram_dropped_total",
+    // The one genuinely producerless name of the original three. Re-verified
+    // 2026-09-01: zero `counter!`/`gauge!`/`histogram!` sites anywhere in
+    // `crates/*/src`. Its alarm is permanently green and always will be, so
+    // this stays a real open finding — add the producer or retire the alarm.
     "tv_order_fill_lag_seconds",
-    "tv_wal_suspension_probe_failed_total",
+];
+
+/// Counters seeded through a PRE-RESOLVED HANDLE rather than a named literal,
+/// with the verified seeding site for each.
+///
+/// # Why this list has to exist (2026-09-01)
+///
+/// The extractor reads `increment(0)` calls and resolves the metric NAME from
+/// the adjacent literal or constant. That works for
+/// `counter!("tv_x").increment(0)` and cannot work for
+/// `self.wal_dropped.increment(0)`, where the name was bound to a struct field
+/// somewhere else entirely. Following a field back to its metric name needs
+/// dataflow analysis, which a source scan does not have.
+///
+/// These four surfaced the moment `live-lane-alarms.tf` lost its blanket
+/// exemption. Every one was checked by hand and every one is CORRECTLY seeded
+/// — with the per-label fan-out `main.rs` could not produce, because only the
+/// construction site knows its own `endpoint` / `ws_type` / `source` values.
+/// Adding a duplicate literal seed in `main.rs` to satisfy the scanner would
+/// have made the code worse and the guard no truer.
+///
+/// A per-metric exemption with evidence is strictly better than the file-wide
+/// one it replaces: the other nineteen alarms in that file are now genuinely
+/// checked, and a NEW loss alarm added there is caught.
+const SEEDED_VIA_HANDLE: &[(&str, &str)] = &[
+    (
+        "tv_ticks_lost_total",
+        "SpillDropCounters::new (storage/src/ws_frame_spill.rs) builds a \
+         handle per (source x ws_type) and loops `increment(0)` over all of \
+         them at construction.",
+    ),
+    (
+        "tv_dhan_ws_wal_dropped_total",
+        "WalRingSink::pre_register (core/src/websocket/pool_supervisor.rs) \
+         seeds it per endpoint label at sink construction.",
+    ),
+    (
+        "tv_dhan_ws_ring_full_total",
+        "WalRingSink::pre_register — same site, same call.",
+    ),
+    (
+        "tv_dhan_ws_ring_bytes_full_total",
+        "WalRingSink::pre_register — same site, same call.",
+    ),
 ];
 
 const KNOWN_GAUGES: &[&str] = &[
+    // ADDED 2026-09-01. Surfaced when `live-lane-alarms.tf` lost its blanket
+    // exemption. Emitted as `metrics::gauge!(REBALANCE_AGE_SECS).set(..)` in
+    // `depth_rebalance.rs` — a gauge is published verbatim, with no delta and
+    // no dropped first sample, so it has no seeding hazard at all.
+    "tv_depth_rebalance_age_secs",
     "tv_dhan_feed_stack_up",
     "tv_dhan_ws_alive_connections",
     "tv_questdb_wal_suspended_tables",
@@ -299,7 +384,10 @@ fn every_alarmed_counter_is_registered_at_boot() {
 
     let mut missing: Vec<String> = Vec::new();
     for (name, file) in &alarmed {
-        if KNOWN_GAUGES.contains(&name.as_str()) || KNOWN_NO_PRODUCER.contains(&name.as_str()) {
+        if KNOWN_GAUGES.contains(&name.as_str())
+            || KNOWN_NO_PRODUCER.contains(&name.as_str())
+            || SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
+        {
             continue;
         }
         if !registered.contains(name.as_str()) {
@@ -358,4 +446,52 @@ fn the_four_counters_that_motivated_this_guard_are_registered() {
             "{name} was found alarmed-but-unregistered on 2026-08-28; it must stay registered"
         );
     }
+}
+
+/// Every [`SEEDED_VIA_HANDLE`] exemption must still have its seeding site.
+///
+/// An exemption that outlives the code it points at is not an exemption, it is
+/// a blind spot with a paper trail. This file has already carried one: three
+/// names sat under "DEAD MONITORS ... Verified 2026-08-28" while two of them
+/// were being emitted and seeded the whole time, and an audit run on
+/// 2026-09-01 reported one of them to the operator as a CRITICAL blind spot on
+/// the strength of that comment. Prose does not stay true; a test does.
+#[test]
+fn the_handle_seeded_exemptions_still_have_their_seeding_sites() {
+    assert!(
+        !SEEDED_VIA_HANDLE.is_empty(),
+        "the exemption list is empty — either delete this test or restore it"
+    );
+
+    // WalRingSink::pre_register — three counters, seeded per endpoint label.
+    let pool = read("crates/core/src/websocket/pool_supervisor.rs");
+    let pre_register = pool
+        .split_once("fn pre_register(&self)")
+        .and_then(|(_, rest)| rest.split_once("\n    }"))
+        .map(|(body, _)| body)
+        .unwrap_or_default();
+    assert!(
+        !pre_register.is_empty(),
+        "WalRingSink::pre_register has moved or been renamed. Three alarmed \
+         loss counters are exempted from the seeding guard because it seeds \
+         them; if it is gone, those alarms are dead on their first episode."
+    );
+    assert_eq!(
+        pre_register.matches("increment(0)").count(),
+        3,
+        "pre_register no longer seeds exactly three counters — the exemptions \
+         for tv_dhan_ws_wal_dropped_total / _ring_full_total / \
+         _ring_bytes_full_total assume it seeds all three:\n{pre_register}"
+    );
+
+    // SpillDropCounters::new — a loop over every (source x ws_type) handle.
+    let spill = read("crates/storage/src/ws_frame_spill.rs");
+    assert!(
+        spill.contains("ticks_lost_channel_full[idx].increment(0)")
+            && spill.contains("ticks_lost_writer_dead[idx].increment(0)"),
+        "SpillDropCounters::new no longer seeds both tv_ticks_lost_total \
+         sources over every ws_type. That counter's alarm is the tick-loss \
+         pager, and an unseeded series means its FIRST episode — the one that \
+         matters — publishes nothing."
+    );
 }
