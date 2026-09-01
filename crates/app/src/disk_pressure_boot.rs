@@ -86,6 +86,15 @@ pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConf
         market_data_hot_days: cfg.market_data_hot_days.min(days),
         depth_hot_days: cfg.depth_hot_days.min(days),
         intraday_hot_days: cfg.intraday_hot_days.min(days),
+        // The marker the archiver reads to keep `market_depth` on its
+        // hour-granular window while a spill replay may be in flight.
+        //
+        // Set ONLY here. Under sustained pressure the spill dirs are
+        // non-empty BECAUSE the disk is full, so deferring to the day window
+        // makes the one hourly-reclaimable table unreclaimable exactly when
+        // reclaiming it is the point. The drop itself is unchanged and still
+        // fail-closed: export -> recount -> HeadObject -> `VerifiedArchive`.
+        under_disk_pressure: true,
         ..cfg.clone()
     }
 }
