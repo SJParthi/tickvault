@@ -759,16 +759,35 @@ const MAPPING_POLL_INTERVAL_MS: u64 = 500;
 /// # NOT shipped to CloudWatch — deliberately, and this is a real limitation
 ///
 /// This counter is readable on the box's `/metrics` endpoint and nowhere else.
-/// Adding it to the EMF `metric_selectors` list was attempted and REVERTED:
-/// `user-data.sh.tftpl` currently renders to **15,870 bytes against a 15,872
-/// byte budget**, and the size guard that pins it explicitly forbids buying
-/// room by shaving unrelated blocks. Its prescribed remedy — moving content
-/// out of user-data into a file copied in after the repo clone — is a larger
-/// change than this fix should carry.
 ///
-/// So a boot that timed out waiting is visible in the log line and on
-/// `/metrics`, but not in CloudWatch. Shipping it is a follow-up that has to
-/// deal with the byte budget first.
+/// ⚠ CORRECTED 2026-09-01 — the reason recorded here is DEAD, and it had
+/// already been dead for a week when it was blocking this.
+///
+/// It used to read: *"Adding it to the EMF `metric_selectors` list was
+/// attempted and REVERTED: `user-data.sh.tftpl` currently renders to 15,870
+/// bytes against a 15,872 byte budget."* Both halves stopped being true on
+/// 2026-08-25, when the selector moved OUT of that template into
+/// `deploy/aws/cloudwatch-agent.json` — a guard now *forbids* a second copy in
+/// the template. Measured 2026-09-01 by running the size guard: the template
+/// renders **13,869 of 15,872 bytes, with 2,003 free**, and adding an EMF name
+/// costs **zero** user-data bytes.
+///
+/// # The real blocker today is COST, not bytes — and it is smaller than it looks
+///
+/// An EMF name is ~$0.30/mo against a maximal month already ~$8.58 above the
+/// automatic `STOP_EC2_INSTANCES` line. That is an operator decision, not an
+/// executor one, so it is stated rather than taken.
+///
+/// It is also less urgent than it reads. The consequence this counter reports
+/// — a boot that timed out waiting for the mapping artifact — is exactly the
+/// universe-collapse case, and that case DOES page: the fall-back arm emits
+/// `WS-GAP-03` with `source = "fell_back_to_indices"`, which has a CloudWatch
+/// metric filter and an alarm. So the OUTCOME is covered; what is missing is
+/// the ability to see the near-misses that did not collapse.
+///
+/// The reusable lesson is the one this correction exists for: a MEASUREMENT
+/// copied into a justification carries no date, and this one outlived the
+/// thing it measured by a week while still stopping work.
 pub const MAPPING_WAIT_COUNTER: &str = "tv_dhan_live_universe_mapping_wait_total";
 
 /// Wait — bounded — for today's mapping artifact to exist before the lane

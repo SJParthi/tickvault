@@ -4417,8 +4417,19 @@ async fn run_frame_drain(
                 // The detector's own blindness, reported ONCE per episode.
                 //
                 // The gauge inside `scan_silence` publishes this every scan,
-                // but the gauge does not reach CloudWatch: it did not fit the
-                // EC2 user-data byte budget (see EMF-METRIC-SELECTOR-NOTES.md).
+                // but the gauge does not reach CloudWatch.
+                //
+                // CORRECTED 2026-09-01: the stated reason -- "it did not fit
+                // the EC2 user-data byte budget" -- is DEAD. The EMF selector
+                // moved out of `user-data.sh.tftpl` on 2026-08-25 and a guard
+                // now forbids a second copy there; the template renders 13,869
+                // of 15,872 bytes with 2,003 free (measured by running the size
+                // guard). An EMF name costs zero user-data bytes.
+                //
+                // What still holds is the COST: ~$0.30/mo against a maximal
+                // month already ~$8.58 above the automatic STOP_EC2_INSTANCES
+                // line. That is an operator decision, so the coded log line
+                // below remains the carrier -- deliberately, not by default.
                 // A counter that measures a blind spot and reaches nobody is
                 // worse than no counter — the loss is measured, the
                 // measurement is discarded, and the dashboard stays green — so
