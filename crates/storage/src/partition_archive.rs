@@ -125,6 +125,70 @@ pub const ARCHIVE_S3_PREFIX: &str = "questdb-partitions";
 /// at the start of every run.
 pub const ARCHIVE_TEMP_DIR: &str = "data/tmp/partition-archive";
 
+/// Process-global mutual exclusion for archive passes.
+///
+/// See the acquisition site in
+/// [`PartitionArchiver::archive_and_drop_old_partitions`] for why this exists
+/// and why it is a `try_lock` rather than a `lock`. Declared `const_new` so it
+/// costs nothing until first contention and needs no lazy initialiser.
+static ARCHIVE_PASS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Free-space level below which an archive pass is reported as WEDGED.
+///
+/// # The trap this names (2026-09-01)
+///
+/// The archiver exports each partition to a gzip TEMPORARY FILE on the volume
+/// it is trying to free, then uploads it, then drops the partition. There is
+/// no free-space check anywhere on that path — so as the volume approaches
+/// full, the export starts failing, every partition is kept, and the pass
+/// reports a pile of per-partition failures while freeing nothing. That is a
+/// deadlock: the disk fills, writes fail, data spills to disk, the reclaim
+/// cannot write its scratch file, the disk stays full. Observed as the
+/// 93%-full session on 2026-09-01.
+///
+/// # Why this is a WARNING and emphatically NOT a refusal
+///
+/// The obvious shape — refuse to start below a floor — is the wrong one, and
+/// it took writing it to see why: refusing to run the only thing that frees
+/// space guarantees the space is never freed. It converts a pass that might
+/// still archive a few small partitions into one that provably archives none,
+/// which is strictly worse at exactly the moment it matters most.
+///
+/// So the pass ALWAYS proceeds. What this constant buys is that the condition
+/// stops being invisible: below it, the run emits one coded error naming the
+/// deadlock and increments a counter, so "the archiver is wedged by the very
+/// condition it exists to fix" becomes a thing an operator is told rather
+/// than something inferred from a pile of unexplained failures.
+///
+/// 2 GiB is sized against one gzipped partition — the largest observed is an
+/// hour of `market_depth` — so crossing it means the next export is genuinely
+/// at risk, not merely that the disk is busy.
+pub const ARCHIVE_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Whether an archive pass has room to write its scratch file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveSpaceVerdict {
+    /// At or above [`ARCHIVE_MIN_FREE_BYTES`] — exports should succeed.
+    Ample,
+    /// Below the floor. The pass still runs (see the constant's doc); this is
+    /// the operator signal that it is likely to fail for lack of scratch.
+    Wedged,
+    /// Free space could not be read. Distinct from `Wedged` on purpose: an
+    /// unreadable volume is not evidence of a full one, and reporting it as
+    /// full would be a fabricated finding.
+    Unknown,
+}
+
+/// Classifies free space against the scratch floor. Pure, O(1).
+#[must_use]
+pub const fn archive_space_verdict(free_bytes: Option<u64>, floor: u64) -> ArchiveSpaceVerdict {
+    match free_bytes {
+        None => ArchiveSpaceVerdict::Unknown,
+        Some(free) if free >= floor => ArchiveSpaceVerdict::Ample,
+        Some(_) => ArchiveSpaceVerdict::Wedged,
+    }
+}
+
 /// HTTP timeout for DDL / count / drop statements (mirrors the detach path).
 const ARCHIVE_DDL_TIMEOUT_SECS: u64 = 30;
 
@@ -1096,6 +1160,37 @@ pub struct ArchiveRunSummary {
     /// Uncompressed CSV bytes exported — the disk-bytes-freed ESTIMATE
     /// basis (columnar on-disk size differs; CSV is the honest upper proxy).
     pub csv_bytes_exported: u64,
+    /// Whether the sweep ACTUALLY RAN, as opposed to returning early.
+    ///
+    /// # Why a summary needs this at all
+    ///
+    /// Every other field here is a count, and a pass that never started has
+    /// the same counts as a pass that ran and found nothing to do: all zeros.
+    /// Two early returns produce exactly that — the concurrency-guard skip and
+    /// the WAL-suspension fail-closed skip — and both are emphatically NOT
+    /// "the day's archival is done".
+    ///
+    /// Without this flag a caller cannot tell them apart, and both callers got
+    /// it wrong in different directions: the daily scheduler read a zero
+    /// summary as a COMPLETE day and wrote its durable latch, sealing a day on
+    /// which nothing had been archived; the disk-pressure leg read
+    /// `dropped == 0` as "ran and found nothing reclaimable", which is its
+    /// escalation condition, and would have raised a false `STORAGE-GAP-05`
+    /// Critical.
+    ///
+    /// `false` by `Default` is load-bearing: both early returns hand back
+    /// `ArchiveRunSummary::default()`, so they report honestly without either
+    /// site having to remember to set anything.
+    pub pass_ran: bool,
+    /// Tables skipped this run because they were WAL-SUSPENDED.
+    ///
+    /// Kept separate from [`Self::tables_list_failed`] because the two need
+    /// different operator actions — a list-query error is retried, a
+    /// suspension needs `ALTER TABLE … RESUME WAL` — and because a suspended
+    /// table otherwise leaves NO trace: it `continue`s before any other
+    /// counter is touched, so a run that skipped every table for suspension
+    /// is byte-identical to a run with nothing to do.
+    pub tables_wal_suspended: u32,
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
@@ -1264,10 +1359,120 @@ impl PartitionArchiver {
     // a unit-tested pure function and the first prod run is the live probe
     // (a failed probe is a loud no-op, never a drop).
     pub async fn archive_and_drop_old_partitions(&mut self) -> ArchiveRunSummary {
+        // MUTUAL EXCLUSION between archive passes, taken here rather than at
+        // the call sites so no caller can forget it and no FUTURE caller has
+        // to know it exists.
+        //
+        // Two independent drivers reach this function: the disk-pressure loop
+        // (`disk_pressure_boot.rs`, 60-second poll) and the daily post-close
+        // loop (`daily_archive_boot.rs`). Before 2026-09-01 the daily leg was
+        // a ONE-SHOT inline block in `main.rs`, so an overlap needed a
+        // pressure episode to land inside that single instant and was
+        // vanishingly unlikely. Making the daily leg a polling loop — the fix
+        // for it never running at all — turns that near-impossibility into a
+        // routine occurrence, because both legs are awake in the same window.
+        //
+        // Two concurrent passes over the SAME tables are not merely wasteful.
+        // They race on the drop: pass A verifies partition P in S3 and is
+        // about to drop it while pass B, holding its own pre-drop recount for
+        // P taken before A's drop, issues a second `DROP PARTITION`. QuestDB
+        // answers the loser with an error, which this code classifies as a
+        // FAILURE and retries next run — so the visible symptom is a
+        // permanently "failing" archive of a partition that was archived
+        // perfectly well, and the counter that pages on it
+        // (`tv_partition_archive_failed_total`) fires on a healthy system.
+        //
+        // `try_lock`, never `lock`: the other pass is already doing this work,
+        // so QUEUEING behind it would run a second redundant sweep the moment
+        // the first finished. Skipping is the correct answer and is reported
+        // rather than silent. O(1), no allocation, no await while contended.
+        let _pass_guard = match ARCHIVE_PASS_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                metrics::counter!("tv_partition_archive_pass_skipped_concurrent_total")
+                    .increment(1);
+                warn!(
+                    "partition archive pass SKIPPED — another pass is already in flight \
+                     (this is the disk-pressure leg and the daily leg overlapping, which \
+                     is expected; the in-flight pass does the work)"
+                );
+                return ArchiveRunSummary::default();
+            }
+        };
+        self.run_archive_pass().await
+    }
+
+    /// The pass body, WITHOUT the concurrency guard.
+    ///
+    /// Split out so the guard lives at exactly one boundary — the public
+    /// entry point every production caller uses — while the body stays
+    /// callable directly by the stub integration tests below.
+    ///
+    /// Those tests exercise export/verify/drop decisions and cargo runs them
+    /// in PARALLEL, so calling the guarded entry point would have them contend
+    /// on the process-global lock and all but one would take the skip arm and
+    /// assert against an empty summary. That is the guard working correctly
+    /// and the test asking the wrong question. The guard has its own test
+    /// instead (`the_pass_guard_refuses_a_second_concurrent_pass`).
+    async fn run_archive_pass(&mut self) -> ArchiveRunSummary {
         let mut summary = ArchiveRunSummary::default();
 
         self.ensure_audit_table().await;
         self.clean_temp_dir();
+
+        // SCRATCH-SPACE VERDICT — reported, never used to refuse.
+        //
+        // See `ARCHIVE_MIN_FREE_BYTES` for why refusing would be the wrong
+        // shape. The pass proceeds regardless; this exists so the deadlock is
+        // NAMED at the moment it starts rather than inferred afterwards from
+        // a pile of per-partition export failures that all share one cause.
+        // Probe the temp dir, CREATING it first.
+        //
+        // `clean_temp_dir` above returns early when the directory is absent —
+        // it is created lazily by the first export — and `df` on a path that
+        // does not exist exits non-zero in both its GNU and BSD forms. So
+        // probing it directly returned `ProbeFailed` → `Unknown` → a `debug!`
+        // nobody sees, on every run before the first export ever happened.
+        // The wedge detector would have been inert in exactly the situation it
+        // exists for, since a full volume is also where `create_dir_all` is
+        // most likely to have failed.
+        let temp_dir = std::path::Path::new(ARCHIVE_TEMP_DIR);
+        let probe_path = if std::fs::create_dir_all(temp_dir).is_ok() {
+            temp_dir
+        } else {
+            // Could not create it — fall back to the volume's own root, which
+            // answers the same question ("how much room is on this disk") and
+            // is what the disk-pressure loop already probes.
+            std::path::Path::new(".")
+        };
+        let free_bytes = match crate::disk_health_watcher::probe_disk_free_bytes(probe_path) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
+                Some(free_bytes)
+            }
+            crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => None,
+        };
+        match archive_space_verdict(free_bytes, ARCHIVE_MIN_FREE_BYTES) {
+            ArchiveSpaceVerdict::Ample => {}
+            ArchiveSpaceVerdict::Wedged => {
+                metrics::counter!("tv_partition_archive_wedged_total").increment(1);
+                error!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    free_bytes = free_bytes.unwrap_or(0),
+                    floor_bytes = ARCHIVE_MIN_FREE_BYTES,
+                    "partition archive starting with LESS scratch space than one \
+                     partition needs — the archiver writes a temporary export file to \
+                     the very volume it is freeing, so exports are likely to fail. The \
+                     pass proceeds anyway (refusing would guarantee nothing is freed), \
+                     but expect per-partition failures with a single root cause"
+                );
+            }
+            ArchiveSpaceVerdict::Unknown => {
+                // Deliberately quiet. An unreadable volume is not evidence of
+                // a full one, and logging it at error level would page on a
+                // `df` that is merely unavailable.
+                debug!("partition archive: free-space probe unavailable; proceeding");
+            }
+        }
 
         // F3 (review round 1): WAL-suspension gate FIRST. A suspended
         // table's export/recount see only APPLIED rows — its ACKed-but-
@@ -1293,6 +1498,22 @@ impl PartitionArchiver {
                  (see WAL-SUSPEND-01 runbook; resume WAL, then the next run archives it)"
             );
         }
+
+        // Past every fail-closed gate — the sweep is genuinely happening now.
+        // Set HERE and not at the top of the function: everything above this
+        // line is a reason the pass did NOT run, and a caller must be able to
+        // tell that apart from a pass that ran and found nothing.
+        summary.pass_ran = true;
+        // A run where tables are WAL-suspended reaches this point, proceeds,
+        // and archives nothing FOR THOSE TABLES — they `continue` before
+        // `tables_scanned` or `tables_list_failed` are touched, so they leave
+        // no trace in any other count and the run looks clean.
+        //
+        // Recorded in its OWN field rather than folded into
+        // `tables_list_failed`: a list-query error and a WAL suspension need
+        // different operator actions (retry vs `RESUME WAL`), and merging them
+        // would put the wrong remedy in front of whoever reads the summary.
+        summary.tables_wal_suspended = u32::try_from(suspended.len()).unwrap_or(u32::MAX);
 
         // Build the worklist: (table, partition) pairs older than each
         // table's class hot window, active partition excluded, hostile names
@@ -4110,7 +4331,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.partitions_considered, 1);
         assert_eq!(summary.verified, 1);
@@ -4180,7 +4401,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.dropped, 0);
         assert_eq!(summary.failed, 1);
@@ -4211,7 +4432,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         // CONTRACT CHANGED 2026-08-25. This previously asserted
         // "conflict => keep the partition forever". That policy deadlocked
@@ -4285,7 +4506,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.verified, 1);
         assert_eq!(summary.dropped, 1, "reused archive still verifies + drops");
@@ -4334,7 +4555,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         // CONTRACT CHANGED 2026-08-25. This previously asserted
         // "conflict => keep the partition forever". That policy deadlocked
@@ -4408,7 +4629,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         // CONTRACT CHANGED 2026-08-25. This previously asserted
         // "conflict => keep the partition forever". That policy deadlocked
@@ -4477,7 +4698,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.verified, 1, "the archive itself verified");
         assert_eq!(summary.dropped, 0, "drop must be WITHHELD without the ACK");
@@ -4519,7 +4740,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(
             summary.partitions_considered, 0,
@@ -4552,7 +4773,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.tables_scanned, 0);
         assert_eq!(summary.partitions_considered, 0);
@@ -4581,7 +4802,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.failed, 1, "empty body = export failure, not 0 rows");
         assert_eq!(summary.dropped, 0);
@@ -4616,7 +4837,7 @@ mod stub_integration_tests {
         let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
 
         let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(1)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.partitions_considered, 1, "bounded per run");
         assert_eq!(summary.dropped, 1);
@@ -4875,6 +5096,67 @@ mod hour_granular_eligibility_tests {
         assert!(
             !tickvault_common::config::PartitionRetentionConfig::default().under_disk_pressure,
             "the default must be off"
+        );
+    }
+}
+
+#[cfg(test)]
+mod archive_space_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn archive_space_verdict_reports_ample_at_or_above_the_floor() {
+        assert_eq!(
+            archive_space_verdict(Some(ARCHIVE_MIN_FREE_BYTES), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Ample,
+            "exactly the floor must count as enough — the floor is the minimum \
+             that works, not the first value that fails"
+        );
+        assert_eq!(
+            archive_space_verdict(Some(ARCHIVE_MIN_FREE_BYTES * 10), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Ample
+        );
+    }
+
+    #[test]
+    fn below_the_floor_is_wedged() {
+        assert_eq!(
+            archive_space_verdict(Some(ARCHIVE_MIN_FREE_BYTES - 1), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Wedged
+        );
+        assert_eq!(
+            archive_space_verdict(Some(0), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Wedged,
+            "a completely full volume is the case this exists to name"
+        );
+    }
+
+    /// An unreadable volume must NOT be reported as a full one. Reporting a
+    /// `df` that merely failed as evidence of a wedged disk would be a
+    /// fabricated finding, and it would page.
+    #[test]
+    fn an_unreadable_probe_is_unknown_not_wedged() {
+        assert_eq!(
+            archive_space_verdict(None, ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Unknown
+        );
+        assert_ne!(
+            archive_space_verdict(None, ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Wedged,
+            "'I could not measure' and 'it is full' are different claims and \
+             must never collapse into one"
+        );
+    }
+
+    /// The floor is sized against one gzipped partition, the largest of which
+    /// is an hour of `market_depth`. A floor below that would let the pass
+    /// start with no room for the export it is about to write.
+    #[test]
+    fn the_floor_is_large_enough_for_one_partition_export() {
+        assert!(
+            ARCHIVE_MIN_FREE_BYTES >= 1024 * 1024 * 1024,
+            "a sub-gigabyte floor cannot cover one hour of market_depth \
+             compressed, which is the working set this floor protects"
         );
     }
 }

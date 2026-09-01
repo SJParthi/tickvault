@@ -423,10 +423,26 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
     match PartitionArchiver::new(questdb, &pressure_cfg).await {
         Ok(Some(mut archiver)) => {
             let summary = archiver.archive_and_drop_old_partitions().await;
+            // The pass may have returned WITHOUT running — the daily leg holds
+            // the concurrency guard, or the WAL probe failed closed. Both hand
+            // back an all-zero summary, and `dropped == 0` is this function's
+            // escalation signal, so reporting it as `Some(0)` would raise a
+            // false STORAGE-GAP-05 Critical for a pass that never started.
+            // `None` is exactly the "never happened" case this function's own
+            // doc comment reserves.
+            if !summary.pass_ran {
+                info!(
+                    "disk-pressure archive pass did not run (another pass holds the \
+                     archive guard, or the WAL probe failed closed) — reporting as \
+                     not-run rather than as nothing-reclaimable"
+                );
+                return None;
+            }
             info!(
                 verified = summary.verified,
                 dropped = summary.dropped,
                 failed = summary.failed,
+                tables_wal_suspended = summary.tables_wal_suspended,
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 "disk-pressure archive pass complete (every drop had a verified S3 copy)"

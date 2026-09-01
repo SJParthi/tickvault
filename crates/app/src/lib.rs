@@ -100,6 +100,7 @@ pub mod boot_helpers;
 /// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
 /// the 15:40 timeframe check's catch-up arm consults them so a
 /// post-15:40 restart never re-fires an already-delivered daily card.
+pub mod daily_archive_boot;
 pub mod daily_task_marker;
 pub mod depth200_atm;
 pub mod depth20_layout;
