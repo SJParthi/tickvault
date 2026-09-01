@@ -153,6 +153,35 @@ pub enum AppendRefusal {
     SlotsExhausted,
 }
 
+/// The per-tick values an append carries, as ONE value rather than seven
+/// positional arguments.
+///
+/// Not cosmetic. Seven bare numbers at a call site — four of them `u32` — is a
+/// shape where transposing `total_buy_quantity` and `total_sell_quantity`, or
+/// `volume` and `open_interest`, compiles perfectly and silently inverts a
+/// book-pressure signal. Named fields make that transposition impossible to
+/// write by accident, and the compiler rejects a forgotten one.
+///
+/// `Copy` and field-for-field identical to the stored record minus `prev` and
+/// `slot`, which the arena owns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TickSample {
+    /// Exchange timestamp, IST epoch seconds, verbatim.
+    pub exchange_timestamp: u32,
+    /// Last traded price.
+    pub last_traded_price: f32,
+    /// Last trade quantity.
+    pub last_trade_quantity: u16,
+    /// Cumulative day volume as of this tick.
+    pub volume: u32,
+    /// Open interest as of this tick.
+    pub open_interest: u32,
+    /// Total buy quantity.
+    pub total_buy_quantity: u32,
+    /// Total sell quantity.
+    pub total_sell_quantity: u32,
+}
+
 /// Composite instrument key, per I-P1-11.
 ///
 /// `security_id` alone is NOT unique — Dhan reuses numeric ids across
@@ -230,17 +259,7 @@ impl TickRamArena {
     /// [`AppendRefusal::ArenaFull`] once retention capacity is reached, or
     /// [`AppendRefusal::SlotsExhausted`] for a new instrument past the slot
     /// ceiling. Both are refusals, never evictions — see the module header.
-    pub fn append(
-        &mut self,
-        key: ArenaKey,
-        exchange_timestamp: u32,
-        last_traded_price: f32,
-        last_trade_quantity: u16,
-        volume: u32,
-        open_interest: u32,
-        total_buy_quantity: u32,
-        total_sell_quantity: u32,
-    ) -> Result<u32, AppendRefusal> {
+    pub fn append(&mut self, key: ArenaKey, sample: TickSample) -> Result<u32, AppendRefusal> {
         // Capacity is checked BEFORE a slot is allocated, so a full arena
         // cannot burn one of the 25,000 slots on an instrument it will never
         // store a tick for.
@@ -256,13 +275,13 @@ impl TickRamArena {
         let slot_idx = slot as usize;
         self.arena.push(CompactTick {
             prev: self.heads[slot_idx],
-            exchange_timestamp,
-            last_traded_price,
-            volume,
-            open_interest,
-            total_buy_quantity,
-            total_sell_quantity,
-            last_trade_quantity,
+            exchange_timestamp: sample.exchange_timestamp,
+            last_traded_price: sample.last_traded_price,
+            volume: sample.volume,
+            open_interest: sample.open_interest,
+            total_buy_quantity: sample.total_buy_quantity,
+            total_sell_quantity: sample.total_sell_quantity,
+            last_trade_quantity: sample.last_trade_quantity,
             slot,
         });
         self.heads[slot_idx] = idx;
@@ -415,7 +434,55 @@ mod tests {
         ts: u32,
         ltp: f32,
     ) -> Result<u32, AppendRefusal> {
-        arena.append(k, ts, ltp, 1, 100, 0, 0, 0)
+        arena.append(
+            k,
+            TickSample {
+                exchange_timestamp: ts,
+                last_traded_price: ltp,
+                last_trade_quantity: 1,
+                volume: 100,
+                open_interest: 0,
+                total_buy_quantity: 0,
+                total_sell_quantity: 0,
+            },
+        )
+    }
+
+    /// The reason `append` takes a struct rather than seven positional
+    /// numbers: named fields make a transposition impossible to write, where
+    /// four bare `u32`s in a row would compile and silently invert a signal.
+    #[test]
+    fn tick_sample_fields_land_in_the_record_unswapped() {
+        let mut a = TickRamArena::with_capacity(4);
+        let k = key(11);
+        a.append(
+            k,
+            TickSample {
+                exchange_timestamp: 1_700_000_000,
+                last_traded_price: 24_150.25,
+                last_trade_quantity: 7,
+                volume: 111,
+                open_interest: 222,
+                total_buy_quantity: 333,
+                total_sell_quantity: 444,
+            },
+        )
+        .expect("append");
+        let t = a.latest(k).expect("stored");
+        // Every value is distinct, so a swap between ANY pair fails here.
+        assert_eq!(t.exchange_timestamp, 1_700_000_000);
+        assert_eq!(t.last_traded_price, 24_150.25);
+        assert_eq!(t.last_trade_quantity, 7);
+        assert_eq!(t.volume, 111);
+        assert_eq!(t.open_interest, 222);
+        assert_eq!(
+            t.total_buy_quantity, 333,
+            "buy pressure must never carry the sell side's number"
+        );
+        assert_eq!(
+            t.total_sell_quantity, 444,
+            "sell pressure must never carry the buy side's number"
+        );
     }
 
     #[test]
