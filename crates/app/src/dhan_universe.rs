@@ -76,6 +76,52 @@ const FNO_UNDERLYING_TAG: &str = "FNO_UNDERLYING";
 /// rather than trusting that two copies of a string stay equal.
 const NTM_INDEX_NAME: &str = "Nifty Total Market";
 
+/// Row ceiling for a SINGLE index constituent list.
+///
+/// # The number, and what justifies it
+///
+/// The broadest NSE India index is Nifty Total Market at roughly **750**
+/// constituents; every other list in [`INDEX_CONSTITUENCY_SLUGS`] is a subset
+/// of that membership and therefore smaller. 5,000 is **~6.6x the largest
+/// real list**, so no legitimate response can reach it — which is the property
+/// a fail-closed ceiling needs. A list that returns more than this is not a
+/// big list; it is a malformed or wrong response.
+///
+/// # Why this exists
+///
+/// [`MAX_CSV_BODY_BYTES`] (50 MiB) bounds each DOWNLOAD, and each body is
+/// dropped as the loop advances — but it does not bound the ACCUMULATED
+/// `constituents` vector. At ~40 B/row a 50 MiB body parses to ~1.25 M rows,
+/// and 49 lists of those is roughly **10 GB on a 32 GiB host**; at a minimal
+/// row it approaches 41 GB. The input is vendor-controlled, so one oversized
+/// or malformed niftyindices response could OOM the process — which takes
+/// every WebSocket down at once, the single worst outcome for a feed whose
+/// requirement is no tick loss.
+///
+/// # Why over-cap is a FAILED list, not a truncation
+///
+/// Truncating to the first 5,000 rows would produce a WRONG universe that
+/// reports a healthy day: the join would succeed, the gauges would look
+/// normal, and the missing membership would be invisible. Counting it as a
+/// failed list instead routes it through [`MAX_FAILED_INDEX_LIST_FRACTION`],
+/// the gate that already exists to judge exactly this — a build missing too
+/// much membership is rejected outright rather than shipped quietly.
+const MAX_CONSTITUENTS_PER_LIST: usize = 5_000;
+
+/// Ceiling on the ACCUMULATED rows across every list in one build.
+///
+/// A second bound behind [`MAX_CONSTITUENTS_PER_LIST`], not a duplicate of it:
+/// the per-list cap assumes the list count is the fixed
+/// [`INDEX_CONSTITUENCY_SLUGS`] set, and this one holds even if that set grows
+/// or a future caller loops differently. 49 lists x 5,000 = 245,000, so 250,000
+/// is the per-list bound made total, with room for the slug list to gain a few
+/// entries without a silent behaviour change.
+///
+/// At ~168 B per `Constituent` (three owned `String`s plus the struct) this
+/// caps the accumulation at roughly **42 MB** — a bound in BYTES, which is
+/// what the previous count-free version lacked.
+const MAX_CONSTITUENTS_TOTAL: usize = 250_000;
+
 /// Backoff before respawning a died rider task. Matches the house sibling
 /// (`groww_universe`, `disk_health_watcher`) — short, because the thing that
 /// is not happening while we wait is the day's entire instrument mapping.
@@ -592,10 +638,21 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 ///
 /// The per-list bodies are dropped as the loop advances, so the 50 MB download
 /// cap bounds each list individually but NOT the accumulated `constituents`
-/// vector — a vendor serving millions of minimal rows across 49 lists could
-/// still grow it without limit. Recorded rather than fixed here: the honest
-/// bound is a row-count ceiling per list, which needs a number the vendor's
-/// real list sizes have to justify.
+/// vector.
+///
+/// **FIXED 2026-09-01.** That gap was real and vendor-controlled: a
+/// niftyindices response of millions of minimal rows across 49 lists could
+/// grow the accumulation to ~10 GB (41 GB at a minimal row) on a 32 GiB host,
+/// and an OOM kill drops every WebSocket at once. The comment here asked for
+/// "a number the vendor's real list sizes have to justify" — the broadest NSE
+/// index is Nifty Total Market at ~750 constituents and every other list is a
+/// subset of it, so [`MAX_CONSTITUENTS_PER_LIST`] (5,000, ~6.6x the largest
+/// real list) cannot be reached by a legitimate response.
+///
+/// Over-cap is treated as a FAILED list rather than truncated, so it routes
+/// through the existing [`MAX_FAILED_INDEX_LIST_FRACTION`] gate instead of
+/// silently shipping a short universe. [`MAX_CONSTITUENTS_TOTAL`] bounds the
+/// accumulation at ~42 MB in BYTES, which the count-free version lacked.
 async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinOutcome> {
     let client = build_hardened_csv_client().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -659,6 +716,37 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
                 if rows.is_empty() {
                     failed_lists += 1;
                     warn!(index = display_name, "index list parsed to zero rows");
+                } else if rows.len() > MAX_CONSTITUENTS_PER_LIST {
+                    // Fail the LIST, never truncate it — see
+                    // `MAX_CONSTITUENTS_PER_LIST`. A silently shortened list
+                    // would join cleanly and report a healthy day while
+                    // carrying a fraction of the intended membership; the
+                    // failed-fraction gate below exists to judge exactly that.
+                    failed_lists += 1;
+                    warn!(
+                        index = display_name,
+                        rows = rows.len(),
+                        ceiling = MAX_CONSTITUENTS_PER_LIST,
+                        "index list REFUSED — more rows than any real NSE index has \
+                         (the broadest, Nifty Total Market, is ~750). Treated as a failed \
+                         list rather than truncated: a shortened list would look healthy \
+                         while missing membership. Accumulating it unbounded is what could \
+                         OOM the process, which drops every socket at once"
+                    );
+                } else if constituents.len().saturating_add(rows.len()) > MAX_CONSTITUENTS_TOTAL {
+                    // The accumulation bound. Reachable only if many lists are
+                    // individually legal yet collectively enormous, which the
+                    // per-list cap alone cannot catch.
+                    failed_lists += 1;
+                    warn!(
+                        index = display_name,
+                        accumulated = constituents.len(),
+                        rows = rows.len(),
+                        ceiling = MAX_CONSTITUENTS_TOTAL,
+                        "index list REFUSED — would push the accumulated constituent set \
+                         past its total ceiling. Refusing bounds the build's memory in \
+                         BYTES; the failed-fraction gate decides whether the day survives"
+                    );
                 } else {
                     constituents.extend(rows);
                 }
@@ -1328,6 +1416,80 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod constituent_bound_tests {
+    use super::{
+        INDEX_CONSTITUENCY_SLUGS, MAX_CONSTITUENTS_PER_LIST, MAX_CONSTITUENTS_TOTAL,
+        MAX_FAILED_INDEX_LIST_FRACTION, failed_list_fraction,
+    };
+
+    /// The per-list ceiling must clear the largest REAL list by a wide margin,
+    /// or a legitimate vendor response would start failing builds.
+    #[test]
+    fn max_constituents_per_list_is_far_above_the_broadest_real_index() {
+        // Nifty Total Market, the broadest NSE index, is ~750 constituents and
+        // every other list is a subset of its membership.
+        const BROADEST_REAL_LIST: usize = 750;
+        assert!(
+            MAX_CONSTITUENTS_PER_LIST >= BROADEST_REAL_LIST * 5,
+            "the ceiling must be unreachable by a legitimate response, or it \
+             becomes a source of false build failures rather than a memory bound"
+        );
+        assert_eq!(MAX_CONSTITUENTS_PER_LIST, 5_000);
+    }
+
+    /// The total must be the per-list bound made total, with headroom for the
+    /// slug set to grow — not an independently invented number.
+    #[test]
+    fn max_constituents_total_covers_every_slug_at_the_per_list_ceiling() {
+        let implied = INDEX_CONSTITUENCY_SLUGS.len() * MAX_CONSTITUENTS_PER_LIST;
+        assert!(
+            MAX_CONSTITUENTS_TOTAL >= implied,
+            "the total ceiling ({MAX_CONSTITUENTS_TOTAL}) must not be below what the \
+             per-list ceiling already permits across {} slugs ({implied}), or the \
+             total would reject builds the per-list rule considers legal",
+            INDEX_CONSTITUENCY_SLUGS.len()
+        );
+    }
+
+    /// The bound is a BYTE bound in effect, which is the property the previous
+    /// count-free version lacked. ~168 B per `Constituent` (three owned
+    /// `String`s plus the struct).
+    #[test]
+    fn the_total_ceiling_bounds_accumulation_in_bytes_not_just_rows() {
+        const BYTES_PER_CONSTITUENT: usize = 168;
+        let worst_case_bytes = MAX_CONSTITUENTS_TOTAL * BYTES_PER_CONSTITUENT;
+        assert!(
+            worst_case_bytes < 128 * 1024 * 1024,
+            "worst-case accumulation is {worst_case_bytes} bytes; it must stay far \
+             below the host's memory so a malformed vendor response cannot OOM the \
+             process — an OOM drops every WebSocket at once"
+        );
+    }
+
+    /// An over-cap list must be REFUSED (counted as failed), never truncated —
+    /// and the refusal must flow into the gate that already judges missing
+    /// membership. This pins the routing, which is the load-bearing half: a
+    /// truncated list would join cleanly and report a healthy day.
+    #[test]
+    fn refusing_lists_feeds_the_existing_failed_fraction_gate() {
+        let total = INDEX_CONSTITUENCY_SLUGS.len();
+        // A single refused list is tolerated — one malformed index must not
+        // lose the other 48.
+        assert!(
+            failed_list_fraction(1, total) <= MAX_FAILED_INDEX_LIST_FRACTION,
+            "one refused list out of {total} must degrade the build, not abort it"
+        );
+        // Refusing most of them must NOT pass: that is a build carrying a
+        // fraction of the intended membership.
+        assert!(
+            failed_list_fraction(total, total) > MAX_FAILED_INDEX_LIST_FRACTION,
+            "every list refused must reject the build outright — shipping it would \
+             report a healthy day with almost no membership"
+        );
     }
 }
 
