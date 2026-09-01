@@ -1191,6 +1191,23 @@ pub struct ArchiveRunSummary {
     /// counter is touched, so a run that skipped every table for suspension
     /// is byte-identical to a run with nothing to do.
     pub tables_wal_suspended: u32,
+    /// True ONLY when this call returned without starting, because another
+    /// pass already held [`ARCHIVE_PASS_LOCK`].
+    ///
+    /// # Why this is separate from `pass_ran == false`
+    ///
+    /// Both early returns hand back a default summary, so until 2026-09-01
+    /// they were indistinguishable — and they mean opposite things. A
+    /// WAL-probe fail-closed means NOBODY is archiving and the caller should
+    /// retry. A lock skip means the OTHER driver is archiving right now and
+    /// the caller should stand aside without spending anything.
+    ///
+    /// Collapsing them cost a real defect (adversarial review, 2026-09-01):
+    /// the daily scheduler charged an attempt for every tick that landed
+    /// inside a long disk-pressure pass, so six overlaps exhausted the day's
+    /// budget, paged that the archive had not completed on a box where it was
+    /// completing, and then abandoned the daily sweep for that day.
+    pub contended: bool,
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
@@ -1396,7 +1413,10 @@ impl PartitionArchiver {
                      (this is the disk-pressure leg and the daily leg overlapping, which \
                      is expected; the in-flight pass does the work)"
                 );
-                return ArchiveRunSummary::default();
+                return ArchiveRunSummary {
+                    contended: true,
+                    ..ArchiveRunSummary::default()
+                };
             }
         };
         self.run_archive_pass().await
