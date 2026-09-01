@@ -6882,24 +6882,6 @@ fn reconcile_pending_topups(
     freed
 }
 
-/// Test-surface wrapper: the pre-acknowledgement signature, acks discarded.
-#[cfg(test)]
-fn top_up_late_contracts(
-    selection: &[tickvault_core::websocket::pool_supervisor::SubscribeInstrument],
-    sent: &mut std::collections::HashSet<(u64, u8)>,
-    slots: &mut [(
-        tokio::sync::mpsc::Sender<
-            tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
-        >,
-        usize,
-    )],
-    attempts: u32,
-    budget: usize,
-) -> usize {
-    let mut pending = Vec::new();
-    top_up_late_contracts_acked(selection, sent, slots, &mut pending, attempts, budget)
-}
-
 fn contract_identity(
     instrument: &tickvault_core::websocket::pool_supervisor::SubscribeInstrument,
 ) -> (u64, u8) {
@@ -6940,7 +6922,7 @@ fn contract_identity(
 /// answers on the NEXT attempt and un-marks exactly what the socket did not
 /// take. Re-offering is safe: the guard dedups anything it already holds.
 ///
-/// The `#[cfg(test)]` wrapper [`top_up_late_contracts`] keeps the older test
+/// The test-only wrapper [`top_up_late_contracts`] keeps the older test
 /// surface; production goes through this function.
 fn top_up_late_contracts_acked(
     selection: &[tickvault_core::websocket::pool_supervisor::SubscribeInstrument],
@@ -11645,6 +11627,23 @@ mod tests {
 
     /// A channel wide enough that a refusal in these tests always means the
     /// code refused, never that the buffer happened to be full.
+    /// Test-surface wrapper: the pre-acknowledgement signature, acks discarded.
+    fn top_up_late_contracts(
+        selection: &[tickvault_core::websocket::pool_supervisor::SubscribeInstrument],
+        sent: &mut std::collections::HashSet<(u64, u8)>,
+        slots: &mut [(
+            tokio::sync::mpsc::Sender<
+                tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
+            >,
+            usize,
+        )],
+        attempts: u32,
+        budget: usize,
+    ) -> usize {
+        let mut pending = Vec::new();
+        top_up_late_contracts_acked(selection, sent, slots, &mut pending, attempts, budget)
+    }
+
     fn topup_slot(
         room: usize,
     ) -> (
