@@ -941,6 +941,93 @@ pub const fn classify_spill_ceiling(
     }
 }
 
+/// What a tier does at the per-write floor when the free-space probe FAILS.
+///
+/// The two tiers answer this differently ON PURPOSE, and the difference is the
+/// whole point of the type existing rather than each site hard-coding an `else`
+/// arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindWritePolicy {
+    /// Write anyway, counted. Correct for TICKS: one broken `df` must not
+    /// disable the tier that carries decision-critical rows.
+    FailOpen,
+    /// Refuse. Correct for DEPTH: it is record-only, carries ~24x the tick row
+    /// volume, and writing it blind is how the volume fills under ticks.
+    FailClosed,
+}
+
+/// The per-write floor's verdict, separated from the I/O for the same reason
+/// [`SpillCeilingVerdict`] was: an arm reachable only when `df` is broken on a
+/// live box is an arm no test can otherwise drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillFloorVerdict {
+    /// Free space is known and sufficient for the payload plus the floor.
+    Allow,
+    /// Free space is known and insufficient. Refuse.
+    RefuseNoRoom,
+    /// The probe failed and this tier writes blind, counted.
+    AllowProbeFailed,
+    /// The probe failed and this tier refuses rather than write blind.
+    RefuseProbeFailed,
+}
+
+/// Decides whether a rescue write may proceed at the per-write floor.
+///
+/// # Why the blind arm is asymmetric, and why that asymmetry is now a TYPE
+///
+/// Found by an adversarial sweep on 2026-09-01, hours after the reserve split
+/// it defeats was shipped. Both tiers refuse on a failed probe INSIDE their
+/// ceiling arm, and that arm engages only once the tier's OWN spill directory
+/// is past its rail. The two directories are INDEPENDENT. So with `df` broken,
+/// the tick directory over its ceiling, and the depth directory still under
+/// its cap:
+///
+/// | tier | path | outcome |
+/// |---|---|---|
+/// | tick | `OverCeilingProbeFailed` | **REFUSE** |
+/// | depth | ceiling arm skipped, floor fails open | **WRITE** |
+///
+/// Decision-critical ticks discarded while record-only depth is written — the
+/// exact inversion the two-reserve split exists to prevent, arriving through
+/// the one door the split's `const _` assert cannot watch. That assert compares
+/// BYTE VALUES, and the probe-failure path carries no byte value at all: it is
+/// the whole `None` domain rather than a band inside it.
+///
+/// It is reachable, not theoretical. A single-table WAL suspension grows one
+/// spill directory and not the other, which is what happened on 2026-08-25
+/// when fourteen tables suspended individually.
+///
+/// A `floor` of zero means the floor is DISABLED (the value tests inject when
+/// they need the allow arm without depending on the build machine's free
+/// space). A disabled floor cannot refuse, blind or otherwise — otherwise
+/// adding this policy would silently break every test that injects zero.
+#[must_use]
+pub const fn classify_spill_floor(
+    free: Option<u64>,
+    payload_len: u64,
+    floor: u64,
+    blind: BlindWritePolicy,
+) -> SpillFloorVerdict {
+    match free {
+        Some(free_bytes) => {
+            // saturating: a payload near u64::MAX must refuse, never wrap into
+            // a small `needed` that then compares as plenty of room.
+            let needed = payload_len.saturating_add(floor);
+            if free_bytes < needed {
+                SpillFloorVerdict::RefuseNoRoom
+            } else {
+                SpillFloorVerdict::Allow
+            }
+        }
+        None => match blind {
+            BlindWritePolicy::FailOpen => SpillFloorVerdict::AllowProbeFailed,
+            // A disabled floor stays disabled even when blind.
+            BlindWritePolicy::FailClosed if floor == 0 => SpillFloorVerdict::AllowProbeFailed,
+            BlindWritePolicy::FailClosed => SpillFloorVerdict::RefuseProbeFailed,
+        },
+    }
+}
+
 /// Reads free bytes for `dir`, or `None` when the probe failed.
 ///
 /// Collapses the probe's richer outcome to the one bit
@@ -1158,23 +1245,37 @@ fn spill_failed_ilp(
     // So the fail-open is the right call. What was actually wrong is that it
     // was SILENT: the tier could write blind, indefinitely, with nothing
     // saying so. It is now counted.
-    if let crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } =
-        crate::disk_health_watcher::probe_disk_free_bytes(dir)
-    {
-        let needed = (payload.len() as u64).saturating_add(SPILL_MIN_FREE_HEADROOM_BYTES);
-        if free_bytes < needed {
+    // FAIL OPEN when the probe fails, and that is deliberate for THIS tier:
+    // one broken `df` must not disable the rescue path that carries
+    // decision-critical rows. The depth twin fails CLOSED for the mirror-image
+    // reason — see `classify_spill_floor` for why the asymmetry is now a typed
+    // policy rather than two hand-written `else` arms that silently diverged.
+    let free_now = spill_free_bytes(dir);
+    match classify_spill_floor(
+        free_now,
+        payload.len() as u64,
+        SPILL_MIN_FREE_HEADROOM_BYTES,
+        BlindWritePolicy::FailOpen,
+    ) {
+        SpillFloorVerdict::Allow => {}
+        SpillFloorVerdict::AllowProbeFailed => {
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
+        }
+        SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
-                    "refusing a {}-byte tick spill: only {free_bytes} bytes free, and the \
-                     write must leave {SPILL_MIN_FREE_HEADROOM_BYTES} bytes of headroom so \
-                     it cannot take QuestDB down with it",
-                    payload.len()
+                    "refusing a {}-byte tick spill: {} free, and the write must leave \
+                     {SPILL_MIN_FREE_HEADROOM_BYTES} bytes of headroom so it cannot take \
+                     QuestDB down with it",
+                    payload.len(),
+                    match free_now {
+                        Some(b) => format!("only {b} bytes"),
+                        None => "an unreadable amount".to_string(),
+                    }
                 ),
             ));
         }
-    } else {
-        metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
     }
 
     // One file per feed per hour: bounded file count, and an operator replaying
@@ -2582,6 +2683,192 @@ mod tests {
     /// This is the arm coverage the old shape could never have: a unit test
     /// cannot manufacture a nearly-full disk, so before the decision was
     /// separated out, the arm that protects the database was untestable and
+    /// Every arm of the per-write floor, including the two the live box can
+    /// only reach with a broken `df`.
+    #[test]
+    fn classify_spill_floor_covers_every_arm() {
+        use BlindWritePolicy::{FailClosed, FailOpen};
+        use SpillFloorVerdict as V;
+        for (free, payload, floor, blind, want) in [
+            // Known free space: identical for both policies.
+            (Some(100_u64), 1_u64, 10_u64, FailOpen, V::Allow),
+            (Some(100), 1, 10, FailClosed, V::Allow),
+            (Some(10), 1, 10, FailOpen, V::RefuseNoRoom),
+            (Some(10), 1, 10, FailClosed, V::RefuseNoRoom),
+            // Exactly enough is enough — the floor is inclusive.
+            (Some(11), 1, 10, FailClosed, V::Allow),
+            // Blind: the policies diverge, and that divergence is the fix.
+            (None, 1, 10, FailOpen, V::AllowProbeFailed),
+            (None, 1, 10, FailClosed, V::RefuseProbeFailed),
+            // A DISABLED floor (0) stays disabled even when blind, or every
+            // test injecting 0 to reach the allow arm would start refusing.
+            (None, 1, 0, FailClosed, V::AllowProbeFailed),
+            // Saturating: a payload near u64::MAX must refuse, never WRAP
+            // into a small `needed` that then reads as plenty of room.
+            (
+                Some(u64::MAX - 5),
+                u64::MAX,
+                10,
+                FailClosed,
+                V::RefuseNoRoom,
+            ),
+            // HONEST EDGE, asserted rather than hidden: at exactly u64::MAX
+            // free AND a u64::MAX payload, `needed` saturates to u64::MAX and
+            // the floor is swallowed, so this ALLOWS. It is unreachable — the
+            // payload is a Vec that must fit in RAM — and it is pinned here
+            // because the first draft of this test asserted the opposite and
+            // was wrong. Saturation is still the right choice: the failure it
+            // prevents is wrapping, which would allow a huge write on a nearly
+            // full disk. This edge allows a huge write on an infinite one.
+            (Some(u64::MAX), u64::MAX, 10, FailClosed, V::Allow),
+        ] {
+            assert_eq!(
+                classify_spill_floor(free, payload, floor, blind),
+                want,
+                "free={free:?} payload={payload} floor={floor} blind={blind:?}"
+            );
+        }
+    }
+
+    /// THE invariant, swept across the whole domain including the blind case.
+    ///
+    /// Depth is record-only; ticks are decision-critical. So at every possible
+    /// disk state, depth must refuse to spill AT LEAST as readily as ticks. A
+    /// state where depth writes while ticks are refused is the inversion the
+    /// two-reserve split exists to prevent.
+    ///
+    /// The 2026-09-01 sweep that found this bug found it in the `None` column,
+    /// which the existing arithmetic guard cannot reach: that guard compares
+    /// byte values, and probe failure carries no byte value at all. This test
+    /// drives BOTH tiers' complete decision — ceiling arm and floor — over
+    /// known AND unknown free space.
+    #[test]
+    fn depth_never_spills_while_ticks_are_refused_including_when_df_is_blind() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        fn tick_refuses(free: Option<u64>, dir: u64, ceiling: u64, payload: u64) -> bool {
+            if matches!(
+                classify_spill_ceiling(dir, ceiling, free, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+                SpillCeilingVerdict::OverCeilingNoRoom
+                    | SpillCeilingVerdict::OverCeilingProbeFailed
+            ) {
+                return true;
+            }
+            matches!(
+                classify_spill_floor(
+                    free,
+                    payload,
+                    SPILL_MIN_FREE_HEADROOM_BYTES,
+                    BlindWritePolicy::FailOpen,
+                ),
+                SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed
+            )
+        }
+
+        fn depth_refuses(free: Option<u64>, dir: u64, cap: u64, payload: u64) -> bool {
+            if matches!(
+                classify_spill_ceiling(dir, cap, free, DEPTH_SPILL_FREE_RESERVE_BYTES),
+                SpillCeilingVerdict::OverCeilingNoRoom
+                    | SpillCeilingVerdict::OverCeilingProbeFailed
+            ) {
+                return true;
+            }
+            matches!(
+                classify_spill_floor(
+                    free,
+                    payload,
+                    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                    BlindWritePolicy::FailClosed,
+                ),
+                SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed
+            )
+        }
+
+        let frees = [
+            None,
+            Some(0),
+            Some(1),
+            Some(GIB),
+            Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + 1),
+            Some(DEPTH_SPILL_FREE_RESERVE_BYTES),
+            Some(DEPTH_SPILL_FREE_RESERVE_BYTES + 1),
+            Some(200 * GIB),
+        ];
+        // The directories are INDEPENDENT, which is exactly what made the bug
+        // reachable — so they are swept independently, both over and under
+        // their own rails.
+        let dirs = [0_u64, 5 * GIB, 10 * GIB];
+        let rails = [1_u64, 10 * GIB];
+        // Payload >= 1. A zero-byte spill is excluded deliberately: it writes
+        // nothing, so it cannot consume the room ticks need, and treating it
+        // as an inversion would be an assertion about a no-op.
+        let payloads = [1_u64, 4096, 32 * 1024 * 1024];
+
+        for free in frees {
+            for td in dirs {
+                for tc in rails {
+                    for dd in dirs {
+                        for dc in rails {
+                            for p in payloads {
+                                if tick_refuses(free, td, tc, p) {
+                                    assert!(
+                                        depth_refuses(free, dd, dc, p),
+                                        "INVERSION: ticks refused but depth would write. \
+                                         free={free:?} tick_dir={td} tick_ceiling={tc} \
+                                         depth_dir={dd} depth_cap={dc} payload={p}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The precise state that was broken, named so a regression is legible
+    /// rather than one failing row inside the sweep above.
+    #[test]
+    fn a_blind_probe_refuses_depth_even_while_its_own_directory_is_under_cap() {
+        // Depth's directory is well under its cap, so its ceiling arm is
+        // skipped entirely — this is the regime depth spends most of its life
+        // in, and before the fix it wrote blind here.
+        assert_eq!(
+            classify_spill_ceiling(
+                0,
+                10 * 1024 * 1024 * 1024,
+                None,
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::UnderCeiling,
+            "precondition: depth's ceiling arm must be skipped for this to test the floor"
+        );
+        assert_eq!(
+            classify_spill_floor(
+                None,
+                4096,
+                DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                BlindWritePolicy::FailClosed,
+            ),
+            SpillFloorVerdict::RefuseProbeFailed,
+            "depth must refuse when it cannot see the disk"
+        );
+        // The tick tier in the SAME state still writes — that asymmetry is the
+        // point, not an oversight.
+        assert_eq!(
+            classify_spill_floor(
+                None,
+                4096,
+                SPILL_MIN_FREE_HEADROOM_BYTES,
+                BlindWritePolicy::FailOpen,
+            ),
+            SpillFloorVerdict::AllowProbeFailed,
+            "ticks must keep writing: one broken df must not disable the \
+             decision-critical tier"
+        );
+    }
+
     /// the arm that lost 243 million rows was the one pinned.
     #[test]
     fn test_classify_spill_ceiling_covers_every_arm() {
