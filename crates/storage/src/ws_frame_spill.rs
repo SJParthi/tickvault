@@ -233,6 +233,92 @@ pub struct ReplayedFrame {
 /// (operator Quote 13), which is what makes the honest sizing affordable.
 const SPILL_CHANNEL_CAPACITY: usize = 524_288;
 
+/// Divisor on the resolved memory ceiling for [`wal_queue_max_bytes`]. 1/16.
+const WAL_QUEUE_RAM_FRACTION_DIVISOR: u64 = 16;
+
+/// Floor on the queue's byte budget — 256 MiB, whatever the host reports.
+///
+/// Deliberately equal to `dhan_feed_stack::FRAME_RING_MAX_BYTES`, the sibling
+/// in-memory buffer on the same path, so the two absorbers are sized on one
+/// scale rather than two.
+const WAL_QUEUE_MIN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Ceiling on the queue's byte budget — 2 GiB. Mirrors
+/// `dhan_feed_stack::FRAME_RING_MAX_BYTES_CEILING` for the same reason.
+const WAL_QUEUE_MAX_BYTES_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The queue's byte budget for a host whose memory ceiling is `ceiling`.
+///
+/// Pure, so the clamp is provable without a host to read.
+#[must_use]
+pub(crate) const fn wal_queue_budget_from_ceiling(ceiling: Option<u64>) -> u64 {
+    let Some(total) = ceiling else {
+        // Nothing could be read about memory. Take the FLOOR, not the ceiling:
+        // an unknown host is the one case where guessing large is guessing
+        // toward the OOM this budget exists to prevent.
+        return WAL_QUEUE_MIN_BYTES;
+    };
+    let share = total / WAL_QUEUE_RAM_FRACTION_DIVISOR;
+    // `Ord::clamp` is not const, hence the explicit form.
+    if share < WAL_QUEUE_MIN_BYTES {
+        WAL_QUEUE_MIN_BYTES
+    } else if share > WAL_QUEUE_MAX_BYTES_CEILING {
+        WAL_QUEUE_MAX_BYTES_CEILING
+    } else {
+        share
+    }
+}
+
+/// BYTE ceiling on everything queued but not yet written, resolved once.
+///
+/// # The defect this closes (2026-09-01)
+///
+/// [`SPILL_CHANNEL_CAPACITY`] bounds the queue at 524,288 **records**, and its
+/// own doc prices that at "≈ 12 MiB (524k × ~24 B)". That arithmetic counts the
+/// `WalRecord` HEADER and omits the field that carries the payload: `frame` is
+/// a `Bytes`, i.e. a heap buffer the record owns a refcount on. A depth-200
+/// frame is up to `DEPTH_200_MAX_FRAME_BYTES` = 512 KiB, so the same 524,288
+/// slots are worth **256 GiB** of resident heap on a 32 GiB host — a count
+/// bound reported as a byte bound, off by four orders of magnitude.
+///
+/// It is reachable rather than theoretical: the queue only fills when the
+/// writer stalls, a stalled writer is what a saturated disk produces, and a
+/// saturated disk is exactly when depth frames are largest and most frequent.
+/// The failure mode is an OOM kill, which takes the whole process — all
+/// sockets, the aggregator, and everything still queued — where a refusal
+/// costs one frame and leaves a counter behind.
+///
+/// So the bound is on bytes AND records, and whichever binds first wins.
+///
+/// Derived from the host rather than fixed, so the same binary is correct on
+/// the 32 GiB production box (2 GiB, the ceiling) and in a 4 GiB dev container
+/// (256 MiB, the floor). `resolve_memory_ceiling` prefers a cgroup limit over
+/// machine RAM, which is what makes a container-limited run size to its real
+/// ceiling instead of the machine's.
+///
+/// **This does not change behaviour for the ordinary tick mix.** A 162-byte
+/// Full packet fills the 524,288-record bound at ~85 MiB, far under the floor,
+/// so the record bound still bites first and the byte bound never engages. It
+/// engages only when the payload mix is heavy enough to threaten the host —
+/// which is precisely the case the record bound cannot see.
+fn wal_queue_max_bytes() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let ceiling = crate::resource_monitor::resolve_memory_ceiling(
+            Path::new(crate::resource_monitor::DEFAULT_CGROUP_V2_MEMORY_MAX_PATH),
+            Path::new(crate::resource_monitor::DEFAULT_PROC_MEMINFO_PATH),
+        );
+        let budget = wal_queue_budget_from_ceiling(ceiling.bytes());
+        info!(
+            budget_bytes = budget,
+            ceiling_source = ceiling.source(),
+            ceiling_bytes = ceiling.bytes().unwrap_or(0),
+            "WAL capture queue byte budget resolved"
+        );
+        budget
+    })
+}
+
 /// WAL file magic bytes — segment-local sanity check.
 ///
 /// TICK-SEQ-01 PR-2a: `TVW1` = v1 record (no `frame_seq`); `TVW2` = v2 record
@@ -425,6 +511,14 @@ struct SpillDropCounters {
     ticks_lost_channel_full: [metrics::Counter; WS_TYPE_COUNT],
     /// `tv_ticks_lost_total{source="spill_writer_dead", ws_type}` — Disconnected arm.
     ticks_lost_writer_dead: [metrics::Counter; WS_TYPE_COUNT],
+    /// `tv_ticks_lost_total{source="spill_bytes_full", ws_type}` — byte-budget arm.
+    ///
+    /// A SEPARATE source from `spill_drop_critical` because the operator action
+    /// differs: a record-full channel means the writer is behind, a byte-full
+    /// channel means the queued PAYLOAD is large — heavy depth, not a slow
+    /// disk — and the remedy is a depth-scope or host-memory decision rather
+    /// than a disk one.
+    ticks_lost_bytes_full: [metrics::Counter; WS_TYPE_COUNT],
 }
 
 impl SpillDropCounters {
@@ -454,15 +548,24 @@ impl SpillDropCounters {
                 "ws_type" => t.as_str(),
             )
         });
+        let ticks_lost_bytes_full = WS_TYPES_BY_INDEX.map(|t| {
+            metrics::counter!(
+                "tv_ticks_lost_total",
+                "source" => "spill_bytes_full",
+                "ws_type" => t.as_str(),
+            )
+        });
         let counters = Self {
             drop_critical,
             ticks_lost_channel_full,
             ticks_lost_writer_dead,
+            ticks_lost_bytes_full,
         };
         for idx in 0..WS_TYPE_COUNT {
             counters.drop_critical[idx].increment(0);
             counters.ticks_lost_channel_full[idx].increment(0);
             counters.ticks_lost_writer_dead[idx].increment(0);
+            counters.ticks_lost_bytes_full[idx].increment(0);
         }
         counters
     }
@@ -470,6 +573,15 @@ impl SpillDropCounters {
 
 pub struct WsFrameSpill {
     spill_tx: Sender<WalRecord>,
+    /// Bytes of frame payload QUEUED but not yet handed to the writer.
+    ///
+    /// Incremented by `append` before the `try_send`, decremented by the
+    /// writer the instant a record leaves the channel. Shared with the writer
+    /// thread through the `Arc`, which is why it is not a plain `AtomicU64`.
+    ///
+    /// See [`wal_queue_max_bytes`] for why a byte bound exists at all when the
+    /// channel is already record-bounded.
+    queued_bytes: Arc<AtomicU64>,
     drop_critical: Arc<AtomicU64>,
     persisted_total: Arc<AtomicU64>,
     /// Pre-resolved per-`WsType` loss counters — see [`SpillDropCounters`].
@@ -573,6 +685,8 @@ impl WsFrameSpill {
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         let drop_critical = Arc::new(AtomicU64::new(0));
         let persisted_total = Arc::new(AtomicU64::new(0));
+        let queued_bytes = Arc::new(AtomicU64::new(0));
+        let queued_bytes_for_thread = Arc::clone(&queued_bytes); // APPROVED: Arc clone in the one-shot constructor
 
         let persisted_for_thread = persisted_total.clone(); // APPROVED: Arc clone in the one-shot constructor
         let wal_dir_for_thread = wal_dir.clone(); // APPROVED: one-shot constructor, not per-frame
@@ -603,6 +717,7 @@ impl WsFrameSpill {
                             &wal_dir_for_thread,
                             &persisted_for_thread,
                             &stop_for_thread,
+                            &queued_bytes_for_thread,
                         )
                     }));
                     match outcome {
@@ -642,6 +757,7 @@ impl WsFrameSpill {
 
         Ok(Self {
             spill_tx: tx,
+            queued_bytes,
             drop_critical,
             persisted_total,
             drop_counters: SpillDropCounters::new(),
@@ -687,6 +803,7 @@ impl WsFrameSpill {
         drop(rx); // no writer ever runs → channel is Disconnected for sends
         Self {
             spill_tx: tx,
+            queued_bytes: Arc::new(AtomicU64::new(0)),
             drop_critical: Arc::new(AtomicU64::new(0)),
             persisted_total: Arc::new(AtomicU64::new(0)),
             drop_counters: SpillDropCounters::new(),
@@ -753,9 +870,38 @@ impl WsFrameSpill {
             received_at_nanos: plausible_receipt_nanos(received_at_nanos),
             frame: frame.into(),
         };
+
+        // BYTE reservation, taken BEFORE `try_send` and released on every path
+        // that does not hand the record to the writer.
+        //
+        // Same shape as `RingBudget::try_reserve_detailed` on the frame ring
+        // one step downstream — deliberately, because that is the pattern this
+        // lane already proves. Two relaxed atomics, no allocation, no lock: the
+        // hot path stays O(1).
+        //
+        // The reserve-then-check form admits a bounded overshoot of
+        // (concurrent producers − 1) × frame_len — at 16 sockets and the
+        // largest frame the socket accepts, ~25 MiB against a budget measured
+        // in gibibytes. Documented rather than locked away, on the same
+        // reasoning as `day_ohlc_tracker`'s insert race: an exact bound would
+        // need a lock on the hot path to buy a tighter version of an already
+        // round number.
+        let frame_bytes = record.frame.len() as u64;
+        let budget = wal_queue_max_bytes();
+        let prev_bytes = self.queued_bytes.fetch_add(frame_bytes, Ordering::Relaxed);
+        if prev_bytes.saturating_add(frame_bytes) > budget {
+            self.queued_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
+            return self.refuse_over_byte_budget(ws_type, frame_bytes, prev_bytes, budget);
+        }
+
         match self.spill_tx.try_send(record) {
             Ok(()) => AppendOutcome::Spilled,
             Err(TrySendError::Full(_)) => {
+                // The record never reached the writer, so the writer will never
+                // decrement for it. Release here or the budget leaks toward
+                // zero and every later frame is refused on a queue that is
+                // actually empty.
+                self.queued_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
                 let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
                 // `code` added 2026-08-26. Without it this line carried only
                 // `ws_type` and `drop_count`, so the CloudWatch metric filter
@@ -787,6 +933,8 @@ impl WsFrameSpill {
                 AppendOutcome::Dropped
             }
             Err(TrySendError::Disconnected(_)) => {
+                // Released for the same reason as the `Full` arm above.
+                self.queued_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
                 // WS-SPILL-02: the writer thread was dead at this instant
                 // (channel Disconnected). The WS-SPILL-01 supervisor respawns
                 // it, so this window is tiny and practically unreachable — but
@@ -811,6 +959,50 @@ impl WsFrameSpill {
                 AppendOutcome::Dropped
             }
         }
+    }
+
+    /// Cold arm for a frame refused because the queue is at its BYTE budget.
+    ///
+    /// Out of line and `#[cold]` for two reasons that point the same way. It
+    /// runs only when a frame is already being lost, so it has no business in
+    /// the hot instruction stream — and keeping the `error!` out of
+    /// `append_with_seq_at`'s own body keeps that body free of
+    /// allocation-shaped tokens, which is what
+    /// `wal_append_zero_alloc_by_construction_guard` reads. The guard bounds
+    /// the happy path at the `Spilled` arm, so a formatting drop arm placed
+    /// ABOVE the send would sit inside the region it scans; moving it here is
+    /// the fix rather than widening the guard.
+    ///
+    /// The caller has ALREADY released the reservation before calling.
+    #[cold]
+    #[inline(never)]
+    fn refuse_over_byte_budget(
+        &self,
+        ws_type: WsType,
+        frame_bytes: u64,
+        queued_bytes: u64,
+        budget: u64,
+    ) -> AppendOutcome {
+        let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
+        error!(
+            code = ErrorCode::WsSpill02FrameDropped.code_str(),
+            ws_type = ws_type.as_str(),
+            drop_count = prev + 1,
+            frame_bytes,
+            queued_bytes,
+            budget_bytes = budget,
+            "CRITICAL: WAL spill queue at its BYTE budget — frame dropped \
+             (queued payload too large; the record count is not the binding limit)"
+        );
+        let idx = ws_type_index(ws_type);
+        // Shares `drop_critical` with the other two arms so every existing
+        // alarm on that series fires for this cause too — no new CloudWatch
+        // metric, no added cost. The distinguishing cause lives on the SLA
+        // counter's `source` label.
+        self.drop_counters.drop_critical[idx].increment(1);
+        self.drop_counters.ticks_lost_bytes_full[idx].increment(1);
+        self.record_feed_drop_for_health(ws_type);
+        AppendOutcome::Dropped
     }
 
     /// SP5.1: on a terminal drop of a market-data frame, record the drop
@@ -988,7 +1180,17 @@ fn writer_loop(
     wal_dir: &Path,
     persisted: &AtomicU64,
     stop: &AtomicBool,
+    queued_bytes: &AtomicU64,
 ) -> anyhow::Result<()> {
+    /// Releases a record's byte reservation the instant it leaves the channel.
+    ///
+    /// Called on RECEIPT, never after the write — a record that fails to
+    /// persist has still left the queue, and holding its bytes would shrink
+    /// the budget by exactly the amount a failing disk keeps producing.
+    fn release(queued_bytes: &AtomicU64, record: &WalRecord) {
+        queued_bytes.fetch_sub(record.frame.len() as u64, Ordering::Relaxed);
+    }
+
     // `None` = no open segment; the next record reopens one. A transient disk
     // error sets this back to `None` instead of propagating out of the thread.
     // The thread therefore NEVER dies on a transient I/O hiccup — it keeps
@@ -1002,6 +1204,12 @@ fn writer_loop(
     // write becomes a cost.
     let depth_gauge = metrics::gauge!("tv_ws_frame_spill_queue_depth");
     let high_water_gauge = metrics::gauge!("tv_ws_frame_spill_queue_high_water");
+    // The queue's depth in BYTES, which is the dimension that can exhaust the
+    // host. `queue_depth` counts records, so a queue holding 200 depth-200
+    // frames and one holding 200 ticker packets read identically on it while
+    // differing by four orders of magnitude in resident heap. Without this
+    // gauge a byte blow-up is invisible right up to the OOM kill.
+    let bytes_gauge = metrics::gauge!("tv_ws_frame_spill_queue_bytes");
     let mut high_water: usize = 0;
     // Seeded so the series REGISTERS at startup. The CloudWatch agent computes
     // deltas and drops the first sample of a series it has never seen, so an
@@ -1010,6 +1218,7 @@ fn writer_loop(
     // 2026-08-28.
     depth_gauge.set(0.0);
     high_water_gauge.set(0.0);
+    bytes_gauge.set(0.0);
     loop {
         // Timed, not blocking, so the thread can notice a shutdown request.
         //
@@ -1052,6 +1261,7 @@ fn writer_loop(
             }
         };
 
+        release(queued_bytes, &first);
         #[cfg(test)]
         maybe_test_panic(&first);
         bytes_written += persist_record_resilient(&mut current, wal_dir, &first, persisted);
@@ -1060,6 +1270,7 @@ fn writer_loop(
         for _ in 0..256 {
             match rx.try_recv() {
                 Ok(r) => {
+                    release(queued_bytes, &r);
                     #[cfg(test)]
                     maybe_test_panic(&r);
                     bytes_written += persist_record_resilient(&mut current, wal_dir, &r, persisted);
@@ -1105,6 +1316,7 @@ fn writer_loop(
         // a peak that decays between scrapes was never observed at all.
         let queued = rx.len();
         depth_gauge.set(queued as f64);
+        bytes_gauge.set(queued_bytes.load(Ordering::Relaxed) as f64);
         if queued > high_water {
             high_water = queued;
             high_water_gauge.set(high_water as f64);
@@ -3049,6 +3261,128 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod wal_queue_byte_budget_tests {
+    use super::*;
+
+    /// The whole point: the queue is bounded in BYTES, not only in records.
+    ///
+    /// The old bound was 524,288 records with no length check, so the same
+    /// queue was worth 12 MiB of ticker packets or ~256 GiB of depth-200
+    /// frames. This pins the arithmetic that makes the second case impossible.
+    #[test]
+    fn the_budget_is_a_fraction_of_the_host_clamped_at_both_ends() {
+        // Production: r8g.xlarge, 32 GiB. 1/16 = 2 GiB, exactly the ceiling.
+        let prod = 32 * 1024 * 1024 * 1024;
+        assert_eq!(
+            wal_queue_budget_from_ceiling(Some(prod)),
+            WAL_QUEUE_MAX_BYTES_CEILING,
+            "32 GiB host must resolve to the 2 GiB ceiling"
+        );
+
+        // A 4 GiB dev container: 1/16 = 256 MiB, exactly the floor.
+        let dev = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            wal_queue_budget_from_ceiling(Some(dev)),
+            WAL_QUEUE_MIN_BYTES,
+            "4 GiB host must resolve to the 256 MiB floor"
+        );
+
+        // A tiny host must NOT resolve below the floor.
+        assert_eq!(
+            wal_queue_budget_from_ceiling(Some(64 * 1024 * 1024)),
+            WAL_QUEUE_MIN_BYTES,
+            "a host smaller than the floor still gets the floor"
+        );
+
+        // A host between the two scales with it rather than clamping.
+        let mid = 16 * 1024 * 1024 * 1024;
+        assert_eq!(
+            wal_queue_budget_from_ceiling(Some(mid)),
+            mid / WAL_QUEUE_RAM_FRACTION_DIVISOR,
+            "a host between floor and ceiling scales with the host"
+        );
+    }
+
+    /// An unreadable host takes the FLOOR, never the ceiling.
+    ///
+    /// Guessing large on an unknown host guesses toward the OOM this budget
+    /// exists to prevent, so the direction of the fallback is load-bearing.
+    #[test]
+    fn an_unknown_host_falls_back_to_the_floor_not_the_ceiling() {
+        assert_eq!(wal_queue_budget_from_ceiling(None), WAL_QUEUE_MIN_BYTES);
+        assert!(
+            wal_queue_budget_from_ceiling(None) < WAL_QUEUE_MAX_BYTES_CEILING,
+            "the unknown-host fallback must be the SMALL end"
+        );
+    }
+
+    /// The bound must never be so tight that the ORDINARY tick mix hits it.
+    ///
+    /// A Full packet is 162 bytes. The record bound (524,288) must still be
+    /// what binds for that mix, or this change would convert a working feed
+    /// into a dropping one — the exact regression a byte bound could cause.
+    #[test]
+    fn the_record_bound_still_binds_first_for_the_ordinary_tick_mix() {
+        let full_packet_bytes = 162_u64;
+        let bytes_at_record_capacity = full_packet_bytes * SPILL_CHANNEL_CAPACITY as u64;
+        assert!(
+            bytes_at_record_capacity < WAL_QUEUE_MIN_BYTES,
+            "a full channel of 162-byte packets is {bytes_at_record_capacity} bytes, which must \
+             stay under even the FLOOR ({WAL_QUEUE_MIN_BYTES}) — otherwise the byte bound would \
+             start refusing ordinary ticks"
+        );
+    }
+
+    /// And it must be tight enough that the pathological mix CANNOT reach the
+    /// host's memory. This is the failure the change exists to prevent.
+    #[test]
+    fn a_full_channel_of_max_frames_cannot_exceed_the_budget() {
+        // The largest frame the depth-200 socket accepts.
+        let depth_200_max = 512_u64 * 1024;
+        let unbounded_worst_case = depth_200_max * SPILL_CHANNEL_CAPACITY as u64;
+        let host = 32_u64 * 1024 * 1024 * 1024;
+        assert!(
+            unbounded_worst_case > host,
+            "sanity: the record-only bound really does exceed a 32 GiB host \
+             ({unbounded_worst_case} bytes) — this is the defect being fixed"
+        );
+        let budget = wal_queue_budget_from_ceiling(Some(host));
+        assert!(
+            budget < host,
+            "the byte budget must sit strictly under the host it protects"
+        );
+        // The budget is what now bounds the pathological mix, not the record count.
+        assert!(
+            budget < unbounded_worst_case,
+            "the byte budget must be the binding limit for max-size frames"
+        );
+    }
+
+    /// A refused frame must RELEASE its reservation, or the budget ratchets
+    /// down to zero and a permanently-empty queue refuses everything.
+    ///
+    /// `new_with_dead_writer_for_test` drops the receiver, so every send takes the
+    /// `Disconnected` arm — which is one of the two arms that must release.
+    #[test]
+    fn a_refused_frame_releases_its_byte_reservation() {
+        let spill = WsFrameSpill::new_with_dead_writer_for_test();
+        for _ in 0..64 {
+            assert_eq!(
+                spill.append(WsType::LiveFeed, vec![0_u8; 4096]),
+                AppendOutcome::Dropped,
+                "no writer exists, so every append must be refused"
+            );
+        }
+        assert_eq!(
+            spill.queued_bytes.load(Ordering::Relaxed),
+            0,
+            "every refused frame must have released its reservation; a leak here \
+             would make the budget shrink monotonically until nothing is accepted"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
