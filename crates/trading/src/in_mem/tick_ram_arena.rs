@@ -49,6 +49,21 @@
 //! session produced is retained, in order, until the arena is full — which is
 //! the literal guarantee the directive asks for, stated with its bound.
 //!
+//! # NOT WIRED YET — read this before quoting the guarantee above
+//!
+//! This store has **zero production callers**. Nothing on the frame drain
+//! appends to it, so no tick is resident in it today. What the paragraph
+//! above describes is a CAPABILITY that now exists and is proven by tests —
+//! it is not a delivered guarantee, and it must not be reported as one. The
+//! remaining work is the producer: one `append` call on the decode path,
+//! which touches the hot path and its DHAT gates and therefore lands as its
+//! own change with its own reviewer.
+//!
+//! Stated here rather than left to be discovered because CLAUDE.md records
+//! three separate paths that were described as dormant shortly before going
+//! live, and one stale row that manufactured a false finding. A module whose
+//! header claims a guarantee nothing exercises is the same class.
+//!
 //! # Complexity
 //!
 //! | Operation | Cost |
@@ -130,6 +145,18 @@ const _: () = assert!(
     "CompactTick must stay 32 bytes: the memory budget, the capacity \
      derivation and this module's header all quote that figure"
 );
+
+/// Largest capacity whose indices can never be mistaken for [`NO_TICK`].
+///
+/// `append` stores `arena.len()` as a `u32` head pointer, and `NO_TICK`
+/// (`u32::MAX`) means "this instrument has no ticks". A capacity that lets an
+/// index REACH `u32::MAX` therefore produces a stored head that reads as the
+/// empty sentinel, and the next append after that wraps the index to 0 and
+/// re-points the chain at another instrument's record. That is silent
+/// cross-instrument corruption with no panic, no counter and no log — the
+/// exact class the `slot` u16 assert below already guards for slot numbers.
+/// One of the two was covered; this is the other.
+pub const MAX_TICK_ARENA_CAPACITY: usize = (NO_TICK as usize) - 1;
 
 /// Slot ceiling. Deliberately the same 25,000 the aggregator, indicator engine
 /// and day-OHLC tracker use — one figure for the same universe, so a reader
@@ -217,8 +244,18 @@ impl TickRamArena {
     /// table — so no append can ever trigger a reallocation. A 2.7 GB
     /// allocation happening lazily, mid-session, on the frame drain, is exactly
     /// the stall this store exists to avoid.
+    ///
+    /// # Capacity clamp
+    ///
+    /// `capacity` is clamped to [`MAX_TICK_ARENA_CAPACITY`]. Above that, a
+    /// stored index can equal the [`NO_TICK`] sentinel and the store begins
+    /// returning ANOTHER instrument's ticks with no error of any kind. A
+    /// smaller-than-asked arena refuses loudly through `refused_full`; the
+    /// unclamped alternative is silent cross-instrument corruption, so the
+    /// clamp is the fail-closed direction.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = clamp_capacity(capacity);
         Self {
             arena: Vec::with_capacity(capacity),
             capacity,
@@ -289,7 +326,7 @@ impl TickRamArena {
         Ok(idx)
     }
 
-    /// The most recent tick for an instrument. **O(1)**.
+    /// The most recent tick for an instrument. **O(1) average** (one hash probe).
     #[must_use]
     pub fn latest(&self, key: ArenaKey) -> Option<&CompactTick> {
         let slot = *self.slot_of.get(&key)?;
@@ -383,7 +420,12 @@ impl TickRamArena {
     pub fn committed_bytes(&self) -> u64 {
         let records =
             (self.capacity as u64).saturating_mul(core::mem::size_of::<CompactTick>() as u64);
-        let tables = (MAX_TICK_ARENA_SLOTS as u64).saturating_mul(8);
+        // `heads` and `counts` are both `Vec<u32>`. Derived from the type rather
+        // than a literal 8, so widening either field cannot leave this figure
+        // quietly wrong while every doc comment keeps quoting it.
+        let tables = (MAX_TICK_ARENA_SLOTS as u64)
+            .saturating_mul(core::mem::size_of::<u32>() as u64)
+            .saturating_mul(2);
         records.saturating_add(tables)
     }
 }
@@ -408,13 +450,40 @@ impl<'a> Iterator for TickWalk<'a> {
     }
 }
 
+/// Clamp a requested capacity to what the index width can represent.
+///
+/// Split out as a pure function ON PURPOSE: the clamp cannot be exercised
+/// through [`TickRamArena::with_capacity`], because proving it would mean
+/// actually allocating a 137 GB arena. A test that cannot run is not a test,
+/// so the decision lives here where it costs nothing to check.
+#[must_use]
+pub const fn clamp_capacity(capacity: usize) -> usize {
+    if capacity > MAX_TICK_ARENA_CAPACITY {
+        MAX_TICK_ARENA_CAPACITY
+    } else {
+        capacity
+    }
+}
+
 /// Ticks that fit in `budget_bytes` of retention.
 ///
 /// Pure so the sizing can be tested without a host: the boot path supplies the
 /// budget, this decides what it buys.
 #[must_use]
 pub const fn capacity_for_budget(budget_bytes: u64) -> usize {
-    (budget_bytes / core::mem::size_of::<CompactTick>() as u64) as usize
+    let raw = budget_bytes / core::mem::size_of::<CompactTick>() as u64;
+    // Clamped, not truncated by an `as usize` cast. Two reasons, and the
+    // second is the one that matters:
+    //   1. On a 32-bit target `as usize` would WRAP a large count to a small
+    //      one, silently sizing a tiny arena from a huge budget.
+    //   2. Any capacity at or above `NO_TICK` lets a stored index equal the
+    //      empty sentinel — see MAX_TICK_ARENA_CAPACITY. A nonsense budget
+    //      must yield a refusing arena, never a corrupting one.
+    if raw > MAX_TICK_ARENA_CAPACITY as u64 {
+        MAX_TICK_ARENA_CAPACITY
+    } else {
+        clamp_capacity(raw as usize)
+    }
 }
 
 #[cfg(test)]
@@ -692,5 +761,92 @@ mod tests {
             expected -= 1;
         }
         assert_eq!(expected, -1, "all 10,000 walked, none missing");
+    }
+
+    // ---- index-width safety -------------------------------------------
+    //
+    // These pin the one defect an adversarial review found in this module:
+    // `append` stores `arena.len() as u32`, and `NO_TICK` is `u32::MAX`. If a
+    // capacity ever let an index REACH the sentinel, the head for that
+    // instrument would read as "empty" while the tick was stored, and the very
+    // next append would wrap the index to 0 and re-point the chain at whatever
+    // instrument owns record 0. Silent cross-instrument corruption: no panic,
+    // no refusal, no counter. The clamp makes it unrepresentable.
+
+    #[test]
+    fn clamp_capacity_never_returns_a_capacity_that_can_reach_the_sentinel() {
+        // The whole point: no clamped capacity may allow index == NO_TICK.
+        for requested in [
+            0usize,
+            1,
+            25_000,
+            MAX_TICK_ARENA_CAPACITY - 1,
+            MAX_TICK_ARENA_CAPACITY,
+            MAX_TICK_ARENA_CAPACITY + 1,
+            NO_TICK as usize,
+            usize::MAX,
+        ] {
+            let got = clamp_capacity(requested);
+            assert!(
+                got <= MAX_TICK_ARENA_CAPACITY,
+                "clamp_capacity({requested}) = {got} exceeds the ceiling"
+            );
+            // The largest index a full arena can store is `got - 1`.
+            if got > 0 {
+                let largest_index = (got - 1) as u64;
+                assert!(
+                    largest_index < u64::from(NO_TICK),
+                    "clamp_capacity({requested}) = {got} permits index {largest_index}, \
+                     which equals the NO_TICK sentinel and would read as 'no ticks'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_capacity_is_the_identity_for_every_realistic_size() {
+        // A clamp that quietly shrinks ordinary configurations would be worse
+        // than the bug it fixes, so the no-op half is pinned too.
+        for requested in [0usize, 1, 1_000, 84_375_000, 1 << 31] {
+            assert_eq!(clamp_capacity(requested), requested);
+        }
+    }
+
+    #[test]
+    fn capacity_for_budget_clamps_a_nonsense_budget_instead_of_wrapping() {
+        // u64::MAX / 32 = 576_460_752_303_423_487. Unclamped this reached
+        // Vec::with_capacity, which aborts the process under `panic = "abort"`
+        // — a boot outage from a mis-set config byte, rather than a refusal.
+        assert_eq!(capacity_for_budget(u64::MAX), MAX_TICK_ARENA_CAPACITY);
+        assert_eq!(
+            capacity_for_budget(u64::MAX / 2),
+            MAX_TICK_ARENA_CAPACITY,
+            "any budget past the ceiling must land ON the ceiling, not wrap"
+        );
+        // And the ordinary path is untouched.
+        assert_eq!(capacity_for_budget(0), 0);
+        assert_eq!(capacity_for_budget(32), 1);
+        assert_eq!(capacity_for_budget(31), 0, "a partial record buys nothing");
+    }
+
+    #[test]
+    fn a_clamped_arena_still_refuses_rather_than_corrupting() {
+        // The clamp changes capacity, so the store must still behave: refuse
+        // loudly through the counter, never silently drop or alias.
+        let mut arena = TickRamArena::with_capacity(2);
+        assert_eq!(arena.capacity(), 2);
+        assert!(push(&mut arena, key(1), 1, 100.0).is_ok());
+        assert!(push(&mut arena, key(1), 2, 101.0).is_ok());
+        assert_eq!(
+            push(&mut arena, key(1), 3, 102.0),
+            Err(AppendRefusal::ArenaFull)
+        );
+        assert_eq!(arena.refused_full(), 1);
+        // The two that landed are intact and in newest-first order.
+        let walked: Vec<u32> = arena
+            .walk_back(key(1))
+            .map(|t| t.exchange_timestamp)
+            .collect();
+        assert_eq!(walked, vec![2, 1]);
     }
 }

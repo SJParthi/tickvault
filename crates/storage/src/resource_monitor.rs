@@ -542,11 +542,26 @@ mod tests {
     /// persistence tests use. Deliberately not a new dev-dependency: adding a
     /// crate needs operator approval (CLAUDE.md CARGO), and the ceiling tests
     /// need nothing a nanosecond-tagged path cannot give them.
+    /// A probe directory that is unique WITHOUT depending on the clock.
+    ///
+    /// Adversarial review (2026-09-01) found two problems with the previous
+    /// nanos-only version, and the second is the one that bites:
+    ///
+    ///   1. `map_or(0, ..)` collapsed the tag to a CONSTANT `0` on any
+    ///      `SystemTime` error, so every caller would share one directory.
+    ///   2. Two call sites already passed the same tag (`"ceiling"`), so on
+    ///      that collapse they would race writing DIFFERENT contents to the
+    ///      same `memory.max` and the assertion outcome would depend on
+    ///      thread scheduling.
+    ///
+    /// A monotonic per-process counter plus the pid makes uniqueness a
+    /// property of the program rather than of the clock, so neither failure
+    /// mode survives even if `SystemTime` returns an error every time.
     fn unique_probe_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!("tv-resource-monitor-{tag}-{nanos}"))
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("tv-resource-monitor-{tag}-{pid}-{seq}"))
     }
 
     // -- thresholds sanity --
@@ -743,7 +758,7 @@ mod tests {
 
     #[test]
     fn resolve_memory_ceiling_prefers_the_cgroup_because_it_is_the_smaller_bound() {
-        let dir = unique_probe_dir("ceiling");
+        let dir = unique_probe_dir("ceiling-cgroup-max");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let cgroup = dir.join("memory.max");
         let meminfo = dir.join("meminfo");

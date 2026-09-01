@@ -1021,8 +1021,21 @@ pub const fn classify_spill_floor(
         }
         None => match blind {
             BlindWritePolicy::FailOpen => SpillFloorVerdict::AllowProbeFailed,
-            // A disabled floor stays disabled even when blind.
-            BlindWritePolicy::FailClosed if floor == 0 => SpillFloorVerdict::AllowProbeFailed,
+            // NO `floor == 0` CARVE-OUT (removed 2026-09-01, adversarial review).
+            //
+            // It read reasonably — "a disabled floor stays disabled even when
+            // blind" — and it was a trap. `DepthWriter::for_test` is `pub`,
+            // sets `spill_min_free_headroom: 0`, and IS reachable from
+            // production: `dhan_feed_stack` builds one as a `mem::replace`
+            // placeholder. Today that placeholder is overwritten two lines
+            // later, so the window is transient — but any future edit that
+            // returns or `?`s in between would leave a fail-CLOSED tier
+            // silently writing BLIND, which is the precise inversion this
+            // policy type was introduced to make impossible.
+            //
+            // The policy is about BLINDNESS, not about the floor value. A
+            // tier that asked to fail closed when it cannot see free space
+            // still cannot see free space when its floor happens to be zero.
             BlindWritePolicy::FailClosed => SpillFloorVerdict::RefuseProbeFailed,
         },
     }
@@ -1196,6 +1209,17 @@ fn spill_failed_ilp(
                 ));
             }
             SpillCeilingVerdict::OverCeilingProbeFailed => {
+                // COUNT THE BLINDNESS (2026-09-01, adversarial review).
+                //
+                // Until now only the FLOOR arms touched this counter, so a
+                // broken `df` refusing every rescue AT THE CEILING left the
+                // tier permanently refusing with `tv_spill_free_probe_blind_total`
+                // sitting at its seeded 0. The operator would watch
+                // `tv_ticks_dropped_total` climb with nothing naming the
+                // cause — and a broken probe is the one cause with a
+                // one-command fix. Same counter, same label, so a blind
+                // episode reads as one number wherever it bites.
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
                     format!(
@@ -2700,9 +2724,14 @@ mod tests {
             // Blind: the policies diverge, and that divergence is the fix.
             (None, 1, 10, FailOpen, V::AllowProbeFailed),
             (None, 1, 10, FailClosed, V::RefuseProbeFailed),
-            // A DISABLED floor (0) stays disabled even when blind, or every
-            // test injecting 0 to reach the allow arm would start refusing.
-            (None, 1, 0, FailClosed, V::AllowProbeFailed),
+            // A zero floor does NOT re-open a fail-closed tier when the probe
+            // is blind. The carve-out that used to allow this was removed on
+            // 2026-09-01: the policy is about BLINDNESS, not about the floor
+            // value, and `DepthWriter::for_test` (pub, floor 0) is reachable
+            // from a production `mem::replace` placeholder — so the carve-out
+            // was a live path back to blind writing for the one tier that
+            // must never take it.
+            (None, 1, 0, FailClosed, V::RefuseProbeFailed),
             // Saturating: a payload near u64::MAX must refuse, never WRAP
             // into a small `needed` that then reads as plenty of room.
             (
@@ -2810,14 +2839,27 @@ mod tests {
                 for tc in rails {
                     for dd in dirs {
                         for dc in rails {
-                            for p in payloads {
-                                if tick_refuses(free, td, tc, p) {
-                                    assert!(
-                                        depth_refuses(free, dd, dc, p),
-                                        "INVERSION: ticks refused but depth would write. \
-                                         free={free:?} tick_dir={td} tick_ceiling={tc} \
-                                         depth_dir={dd} depth_cap={dc} payload={p}"
-                                    );
+                            // ASYMMETRIC payloads (2026-09-01, adversarial review).
+                            // The sweep used to bind ONE `p` to both tiers,
+                            // which asserts a weaker invariant than the one
+                            // that matters: the real requirement is that a
+                            // refused tick implies a refused depth write for
+                            // ANY depth payload, not only an equal-sized one.
+                            // Bounded in practice by the 32 MiB producer caps,
+                            // so the asymmetry is unreachable today — but a
+                            // future floor change would have passed the old
+                            // test while a real inversion existed.
+                            for tp in payloads {
+                                for dp in payloads {
+                                    if tick_refuses(free, td, tc, tp) {
+                                        assert!(
+                                            depth_refuses(free, dd, dc, dp),
+                                            "INVERSION: ticks refused but depth would write. \
+                                             free={free:?} tick_dir={td} tick_ceiling={tc} \
+                                             tick_payload={tp} depth_dir={dd} depth_cap={dc} \
+                                             depth_payload={dp}"
+                                        );
+                                    }
                                 }
                             }
                         }

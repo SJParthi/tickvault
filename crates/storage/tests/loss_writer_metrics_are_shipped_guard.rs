@@ -50,20 +50,34 @@ const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[
     ),
     (
         "tv_spill_free_probe_blind_total",
-        "DEGRADED-STATE signal, not a loss signal. It counts rescues written \
-     without a free-space answer because the `df` probe failed. The per-write \
-     floor deliberately fails OPEN there — failing closed would let one broken \
-     probe disable the whole rescue tier, turning every failed flush back into \
-     the permanent loss this tier exists to prevent — so the write proceeds, \
-     and this makes it visible instead of silent. Held local because the \
-     LOSSES it could lead to are already shipped AND alarmed \
-     (`tv_ticks_dropped_total`, `tv_depth_rows_dropped_total`, \
-     `tv_ticks_lost_total`), so an extra ~$0.30/mo name would buy an earlier \
-     warning of an outcome that is already paged. The rule files record the \
-     maximal-month projection as ALREADY past the budget's automatic \
-     STOP_EC2_INSTANCES line, which is why that $0.30 has to be argued for \
-     rather than assumed. Ship it if a session ever reports a non-zero value \
-     locally — at that point it has earned the money.",
+        "CORRECTED 2026-09-01 (adversarial review). The previous text rested \
+     this whole exemption on the claim that the floor `deliberately fails OPEN \
+     there ... so the write proceeds`. That is FALSE for half the surface. \
+     Ticks fail OPEN (the write proceeds and this counter marks it), but DEPTH \
+     fails CLOSED — the rows are refused and permanently dropped — and as of \
+     this change BOTH tiers also increment it at the soft-ceiling arm, where \
+     both refuse. So the counter now means `wrote blind` for one tier and \
+     `dropped rows` for the other, and an exemption argued from the wrong half \
+     is exactly the stale-claim class this repository has twice recorded \
+     manufacturing false findings. \
+     STILL HELD LOCAL, on a narrower and honest argument: the LOSS is already \
+     shipped and alarmed (`tv_ticks_dropped_total`, \
+     `tv_depth_rows_dropped_total`, `tv_ticks_lost_total`), and every blind \
+     refusal already writes a coded ERROR naming the cause verbatim — `the \
+     free-space probe failed — refusing rather than growing blind` — so the \
+     cause IS discoverable today, in logs. What is not available is the \
+     ability to ALARM on the cause. \
+     THE BLOCKER IS A BUDGET LEVER, NOT A JUDGEMENT CALL. \
+     `cloudwatch_app_alarms_wiring::test_emf_metric_selectors_name_count_is_pinned` \
+     records the maximal month at ~$123.88 against the automatic \
+     STOP_EC2_INSTANCES line at $117.00 and the operator's $125 hard cap — \
+     under $1.20 of room — and states in terms that the next addition of ANY \
+     size must come with a LEVER rather than a cost note. The lever exists and \
+     is already operator-approved in principle: the Quote 10 Elastic IP \
+     release (-$3.60/mo), bundled with an instance recreate. Ship this name in \
+     the change that takes that lever, or in any change that otherwise returns \
+     the maximal month below $117 — not before, because a name that stops the \
+     trading box mid-month costs more than the blindness it cures.",
     ),
 ];
 

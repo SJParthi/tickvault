@@ -747,6 +747,11 @@ fn spill_failed_depth_ilp(
                 ));
             }
             crate::tick_persistence::SpillCeilingVerdict::OverCeilingProbeFailed => {
+                // Twin of the tick ceiling arm (2026-09-01): count the blind
+                // refusal, or a broken `df` disables depth rescue for the
+                // whole session with no counter naming the cause.
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth")
+                    .increment(1);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
                     format!(

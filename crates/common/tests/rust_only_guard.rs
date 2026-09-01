@@ -1023,6 +1023,70 @@ fn assert_sorted_unique(allowlist: &[&str], name: &str) {
 
 // ============================ THIN SHELL ============================
 
+/// Strip Rust comments, string-literal aware.
+///
+/// Used by the `Command::new` spelling scan so a comment placed INSIDE the
+/// path (`Command::/*x*/new(`) cannot hide a spawn. String-aware because a
+/// `//` inside a literal is not a comment, and treating it as one would
+/// truncate real code and produce false FAILURES.
+fn strip_rs_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // A space, so `Command::/*x*/new(` does NOT silently become the
+            // canonical spelling here — normalisation removes whitespace
+            // afterwards, and the count comparison is what flags it.
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
 fn repo_root() -> PathBuf {
     // crates/common -> repo root
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2576,6 +2640,36 @@ fn command_new_is_never_written_in_a_spelling_the_spawn_scan_cannot_see() {
             if content.contains(marker) {
                 violations.push(format!("{path}: contains `{marker}`"));
             }
+        }
+
+        // SCOPE FIX #16 (2026-09-01) — close the CLASS, not a sixth literal.
+        //
+        // Adversarial review defeated the list above with two spellings it
+        // does not enumerate and never could, because the set is infinite:
+        //
+        //     std::process::Command::\n        new("python3")   // NEWLINE
+        //     std::process::Command::/*x*/new("python3")      // COMMENT
+        //
+        // Both compile; both passed 22/22 green. Enumerating a seventh
+        // literal would lose the same race again — the lesson this file
+        // records sixteen times is that a class nobody enumerated is
+        // invisible, and invisibility reads as green.
+        //
+        // So: strip comments, delete ALL whitespace, and compare COUNTS. A
+        // call that only becomes visible AFTER normalisation is, by
+        // definition, one the raw substring scan cannot see. Counts rather
+        // than presence, so a file holding one canonical call and one
+        // evasive call is still caught.
+        let decommented = strip_rs_comments(&content);
+        let normalised: String = decommented.chars().filter(|c| !c.is_whitespace()).collect();
+        let visible = decommented.matches("Command::new(").count();
+        let actual = normalised.matches("Command::new(").count();
+        if actual > visible {
+            violations.push(format!(
+                "{path}: {} `Command::new(` call(s) written with whitespace or a \
+                 comment inside the path, so the spawn scan cannot see them",
+                actual - visible
+            ));
         }
     }
     assert!(
