@@ -703,6 +703,111 @@ pub const SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// makes it useless as a protection and effective only as a data shredder.
 pub const SPILL_SOFT_CEILING_FREE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Worst case bytes ONE session of ticks can spill if the database is
+/// unreachable for the entire session.
+///
+/// DERIVED, not chosen. Measured 2026-09-01: 83,446,729 ticks ingested in a
+/// session, and a `ticks` row is 144 bytes on the wire (4 SYMBOL columns at
+/// 4 B of interned key + 7 eight-byte columns + the designated timestamp).
+/// 83.4M x 144 B = 12.0 GB. Rounded up to 16 GiB so a busier session, or a
+/// universe grown toward the 25,000-instrument ceiling, still fits.
+///
+/// This exists only to derive [`DEPTH_SPILL_FREE_RESERVE_BYTES`] below. It is
+/// deliberately a named constant rather than a literal inside that
+/// expression, because the number it encodes is a MEASUREMENT and a future
+/// reader must be able to see what it was measured from.
+pub const WORST_CASE_SESSION_TICK_SPILL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Per-write free-space floor for the DEPTH rescue tier.
+///
+/// # The gap this closes (found by adversarial review, 2026-09-01)
+///
+/// The tick tier has TWO independent free-space defences: the soft ceiling's
+/// reserve (which engages only once the spill directory is past its size
+/// rail) and [`SPILL_MIN_FREE_HEADROOM_BYTES`], a per-write floor checked on
+/// EVERY rescue regardless of directory size.
+///
+/// The depth tier had only the first. Below its size rail it wrote with no
+/// free-space consultation at all, which meant the regime it spends most of
+/// its life in — a small spill directory on a disk that QuestDB is staging
+/// merges onto — had no bound whatsoever. Measured free-space troughs of
+/// 1.94 GB are on the record in this file; a depth rescue landing in one had
+/// nothing to stop it.
+///
+/// # Why DOUBLE the tick floor, and not the same number
+///
+/// The ratio is deliberately the SAME as the ceiling reserves' (32 GiB depth
+/// against 16 GiB tick), because both mechanisms express one rule: ticks are
+/// decision-critical and depth is record-only, so depth gives way first. Two
+/// defences expressing the same priority with different ratios would be a
+/// contradiction waiting to be resolved in the wrong direction.
+///
+/// Sized to what the priority needs and no further: every extra byte here is
+/// depth data refused on a disk that still has room, which is the defect the
+/// 2026-09-01 free-space change exists to stop.
+pub const DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * SPILL_MIN_FREE_HEADROOM_BYTES;
+
+const _: () = assert!(
+    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES > SPILL_MIN_FREE_HEADROOM_BYTES,
+    "depth's per-write floor MUST exceed the tick tier's, or the two \
+     defences disagree about which lane gives way first."
+);
+
+/// Free-space reserve the DEPTH rescue tier must leave behind — deliberately
+/// LARGER than the tick tier's.
+///
+/// # Why the two tiers cannot share one reserve
+///
+/// Until 2026-09-01 they did, and it was backwards. The operator's own rule
+/// for this system is that ticks are decision-critical (a strategy reads
+/// folded tick state from RAM and can never wait on the database) while depth
+/// is record-only (nothing reads it back — verified: zero readers in the
+/// indicator, strategy and risk paths). So when disk gets tight, the lane
+/// that must survive is ticks.
+///
+/// A single shared reserve produces the opposite outcome, because depth is
+/// the bigger writer by every measure:
+///
+/// | | ticks | depth |
+/// |---|---|---|
+/// | rows per packet | 1 | 10 (5 levels x 2 sides) |
+/// | disk footprint (measured) | 14 GB | 110 GB |
+/// | rescue success (measured 2026-09-01) | 84.6% | 23.7% |
+///
+/// With one reserve, depth consumes the remaining free space first and BOTH
+/// tiers then refuse together — so the lane nothing reads starves the lane
+/// every trade depends on. The 84.6% vs 23.7% split is that already happening.
+///
+/// # The derivation
+///
+/// Depth must stop rescuing while there is still room for an ENTIRE session
+/// of ticks to spill on top of the database's own reserve:
+///
+/// ```text
+/// DEPTH_SPILL_FREE_RESERVE_BYTES
+///   = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES   (the database keeps operating)
+///   + WORST_CASE_SESSION_TICK_SPILL_BYTES     (every tick of a session fits)
+/// ```
+///
+/// That is 32 GiB against the tick tier's 16 GiB. The 16 GiB BAND between
+/// them is the point of the whole change: inside it depth refuses and ticks
+/// are still rescued, which is the priority order stated above expressed as
+/// a number rather than as a comment.
+///
+/// A bigger multiple was rejected: every extra byte here is depth data
+/// discarded on a disk that still has room, which is the exact defect the
+/// 2026-09-01 fix was made to stop. The reserve is sized to what ticks
+/// provably need and no more.
+pub const DEPTH_SPILL_FREE_RESERVE_BYTES: u64 =
+    SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + WORST_CASE_SESSION_TICK_SPILL_BYTES;
+
+const _: () = assert!(
+    DEPTH_SPILL_FREE_RESERVE_BYTES > SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+    "depth MUST reserve more than ticks. If these are ever equal the two \
+     tiers refuse together and record-only depth can starve decision-critical \
+     ticks out of their rescue path — the defect this constant exists to fix."
+);
+
 /// What the soft ceiling decides for one rescue write.
 ///
 /// Extracted as a pure function for a reason the CI failure of 2026-09-01
@@ -885,36 +990,51 @@ fn spill_failed_ilp(
     // to put is indefensible.
     let ceiling = tick_spill_max_bytes();
     let held = spill_dir_bytes(dir);
-    match classify_spill_ceiling(
-        held,
-        ceiling,
-        spill_free_bytes(dir),
-        SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
-    ) {
-        SpillCeilingVerdict::UnderCeiling => {}
-        SpillCeilingVerdict::OverCeilingWithRoom => {
-            // Room to spare. Allow the rescue and record that we are past the
-            // soft rail, so the growth is never silent.
-            metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
-        }
-        SpillCeilingVerdict::OverCeilingNoRoom => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                format!(
-                    "tick spill dir past its {ceiling}-byte soft ceiling and free space is \
+    // The probe is deliberately INSIDE this branch, not an argument to the
+    // call below.
+    //
+    // REGRESSION FIXED 2026-09-01 (adversarial review). Extracting the
+    // decision into a pure function made `spill_free_bytes(dir)` an eagerly
+    // evaluated argument, so every rescue forked `df` -- including the common
+    // under-ceiling case, which is most of them, and which needs no free-space
+    // answer at all. Combined with the live headroom guard further down that
+    // was TWO process forks per rescue where the pre-refactor code did one.
+    //
+    // Worth stating because it is the characteristic cost of pure functions:
+    // moving a decision out of an `if` turns a lazily-computed input into an
+    // unconditionally-computed one, and the compiler will not tell you.
+    if held >= ceiling {
+        match classify_spill_ceiling(
+            held,
+            ceiling,
+            spill_free_bytes(dir),
+            SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        ) {
+            SpillCeilingVerdict::UnderCeiling => {}
+            SpillCeilingVerdict::OverCeilingWithRoom => {
+                // Room to spare. Allow the rescue and record that we are past the
+                // soft rail, so the growth is never silent.
+                metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
+            }
+            SpillCeilingVerdict::OverCeilingNoRoom => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "tick spill dir past its {ceiling}-byte soft ceiling and free space is \
                      at or below the {SPILL_SOFT_CEILING_FREE_RESERVE_BYTES}-byte database \
                      reserve — refusing so QuestDB keeps room to operate"
-                ),
-            ));
-        }
-        SpillCeilingVerdict::OverCeilingProbeFailed => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                format!(
-                    "tick spill dir past its {ceiling}-byte soft ceiling and the free-space \
+                    ),
+                ));
+            }
+            SpillCeilingVerdict::OverCeilingProbeFailed => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "tick spill dir past its {ceiling}-byte soft ceiling and the free-space \
                      probe failed — refusing rather than growing blind"
-                ),
-            ));
+                    ),
+                ));
+            }
         }
     }
     // LIVE FREE-SPACE GUARD (2026-08-25). The ceiling above is derived from
@@ -1172,11 +1292,26 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
 /// and the dashboard stays green" — and it is right. The counter alone was the
 /// first version of this fix and the guard caught it.
 ///
-/// A `warn!` rather than an EMF metric because the deployed selector list lives
-/// in a user-data template that currently renders at EXACTLY its 15,872-byte
-/// budget, with zero free bytes. Adding a name there is a real decision with a
-/// real monthly cost, not a formality — so this takes the log route the guard
-/// explicitly offers instead.
+/// The counter is now EMF-SHIPPED as well as logged.
+///
+/// ⚠ CORRECTED 2026-09-01. This paragraph used to read: *"A `warn!` rather
+/// than an EMF metric because the deployed selector list lives in a user-data
+/// template that currently renders at EXACTLY its 15,872-byte budget, with
+/// zero free bytes."*
+///
+/// **Both halves of that were false by the time they were being relied on.**
+/// The selector no longer lives in the user-data template at all — it moved to
+/// `deploy/aws/cloudwatch-agent.json` on 2026-08-25 and a guard now *forbids*
+/// a second copy in the template. And the template does not render at its
+/// budget: measured 2026-09-01 by running the guard, it renders **13,869 of
+/// 15,872 bytes, with 2,003 free**.
+///
+/// So a drop counter on the one writer that can permanently destroy market
+/// data was kept off CloudWatch by a blocker that had already been removed.
+/// The reusable lesson is not "check the number" — it is that a MEASUREMENT
+/// copied into a justification carries no date, and this one was copied from a
+/// rule-file section that is itself stale. Adding an EMF name now costs
+/// ~$0.30/mo and **zero** user-data bytes.
 ///
 /// Powers of two: 1, 2, 4, 8, … The first occurrence always logs, the rate
 /// decays logarithmically so a corruption storm cannot flood the sink, and the

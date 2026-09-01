@@ -628,16 +628,32 @@ pub fn depth_spill_max_bytes() -> u64 {
 /// rescue the cap protects. Duplicated from the tick writer's private helper
 /// rather than shared, because that one is module-private there.
 fn depth_spill_dir_bytes(dir: &Path) -> u64 {
+    // Counts the quarantine subtree, matching the tick twin
+    // (`tick_persistence::spill_dir_bytes`).
+    //
+    // FIXED 2026-09-01 (adversarial review). The tick side gained this on
+    // 2026-08-28; depth never did, and the asymmetry was load-bearing: the
+    // replay supervisor quarantines unparseable depth files into
+    // `<dir>/quarantine`, and quarantined bytes occupy the same volume while
+    // counting toward nothing here. A directory holding 9 GB of quarantine
+    // and 2 GB of live files reported 2 GB against a 10 GB cap — so the cap,
+    // and every reserve decision behind it, could never engage. A rail that
+    // cannot fire is not a conservative rail; it is an absent one.
     // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| e.metadata().ok())
-        .filter(std::fs::Metadata::is_file)
-        .map(|m| m.len())
-        .sum()
+    fn files_in(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    }
+    files_in(dir).saturating_add(files_in(
+        &dir.join(crate::tick_spill_replay::QUARANTINE_DIR),
+    ))
     // O(1) EXEMPT: end
 }
 
@@ -698,7 +714,11 @@ fn spill_failed_depth_ilp(
         depth_spill_dir_bytes(dir),
         cap_bytes,
         crate::tick_persistence::spill_free_bytes(dir),
-        crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        // DEPTH reserve, NOT the tick reserve — depth must refuse first.
+        // See `DEPTH_SPILL_FREE_RESERVE_BYTES` for the derivation and for why
+        // sharing one reserve let record-only depth starve decision-critical
+        // ticks out of their rescue path.
+        crate::tick_persistence::DEPTH_SPILL_FREE_RESERVE_BYTES,
     ) {
         crate::tick_persistence::SpillCeilingVerdict::UnderCeiling => {}
         crate::tick_persistence::SpillCeilingVerdict::OverCeilingWithRoom => {
@@ -720,6 +740,41 @@ fn spill_failed_depth_ilp(
                 format!(
                     "depth spill dir past its {cap_bytes}-byte soft cap and the free-space \
                      probe failed — refusing rather than growing blind"
+                ),
+            ));
+        }
+    }
+
+    // PER-WRITE FREE-SPACE FLOOR (2026-09-01, adversarial review).
+    //
+    // The ceiling above engages only once the spill directory is past its
+    // size rail. Below it, this tier previously wrote with NO free-space
+    // consultation at all -- and that is the regime depth spends most of its
+    // life in. A 4 GB spill directory against a 10 GB rail reads
+    // `UnderCeiling` and wrote freely onto a disk whose free space had
+    // dropped to under a gigabyte, which is exactly the WAL-suspension
+    // outage this tier exists to avoid.
+    //
+    // The floor is DOUBLE the tick tier's, matching the ceiling reserves'
+    // ratio, because both encode one rule: depth is record-only and gives
+    // way before decision-critical ticks do.
+    //
+    // Not memoised, deliberately: free space is a moving quantity and a
+    // cached answer describes a disk that no longer exists. One probe per
+    // rescue is free -- a rescue only happens when a flush already failed.
+    if let crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } =
+        crate::disk_health_watcher::probe_disk_free_bytes(dir)
+    {
+        let floor = crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES;
+        let needed = (payload.len() as u64).saturating_add(floor);
+        if free_bytes < needed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte depth spill: only {free_bytes} bytes free, and the \
+                     write must leave {floor} bytes of headroom -- depth is record-only and \
+                     must not consume the room decision-critical ticks need",
+                    payload.len()
                 ),
             ));
         }
@@ -2525,14 +2580,14 @@ mod tests {
         // themselves are pinned exhaustively below, where no filesystem is
         // involved at all.
         use crate::tick_persistence::{
-            SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingVerdict, classify_spill_ceiling,
+            DEPTH_SPILL_FREE_RESERVE_BYTES, SpillCeilingVerdict, classify_spill_ceiling,
             spill_free_bytes,
         };
         let expected = classify_spill_ceiling(
             depth_spill_dir_bytes(&dir),
             held,
             spill_free_bytes(&dir),
-            SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+            DEPTH_SPILL_FREE_RESERVE_BYTES,
         );
         let outcome = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held);
         match expected {
@@ -2580,8 +2635,8 @@ mod tests {
             classify_spill_ceiling(
                 held,
                 held,
-                Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
-                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
             ),
             SpillCeilingVerdict::OverCeilingNoRoom,
             "exactly ON the reserve must refuse -- at a boundary the safe \
@@ -2591,14 +2646,14 @@ mod tests {
             classify_spill_ceiling(
                 held,
                 held,
-                Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES - 1),
-                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES - 1),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
             ),
             SpillCeilingVerdict::OverCeilingNoRoom,
             "below the reserve must refuse -- this is the whole point of the rail"
         );
         assert_eq!(
-            classify_spill_ceiling(held, held, None, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            classify_spill_ceiling(held, held, None, DEPTH_SPILL_FREE_RESERVE_BYTES),
             SpillCeilingVerdict::OverCeilingProbeFailed,
             "an UNREADABLE free-space number must refuse. Optimism here trades \
              a bounded tick loss for an unbounded disk, which is the outage \
@@ -2608,14 +2663,14 @@ mod tests {
             classify_spill_ceiling(
                 held,
                 held,
-                Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + 1),
-                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES + 1),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
             ),
             SpillCeilingVerdict::OverCeilingWithRoom,
             "one byte over the reserve is room, and must be allowed"
         );
         assert_eq!(
-            classify_spill_ceiling(held - 1, held, None, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            classify_spill_ceiling(held - 1, held, None, DEPTH_SPILL_FREE_RESERVE_BYTES),
             SpillCeilingVerdict::UnderCeiling,
             "below the rail the probe must not even be consulted"
         );
