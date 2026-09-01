@@ -2007,28 +2007,72 @@ version = \"0.1.57\"\n";
     );
 }
 
-/// (h) The native build toolchain the LOCKFILE pulls in may only shrink.
+/// EVERY tracked `Cargo.lock` in the repository, as `(path, package names)`.
+///
+/// # SCOPE FIX #13 (2026-09-01) — the twelfth hole, and it is the same shape
+/// as the eleven before it
+///
+/// Both lockfile guards used to read `root.join("Cargo.lock")` — one file.
+/// But the root manifest carries `exclude = ["fuzz"]`, so `fuzz/` is a
+/// SEPARATE cargo workspace with its own `fuzz/Cargo.lock` (a real, tracked,
+/// several-hundred-package graph), and `.github/workflows/fuzz.yml` runs
+/// `cargo fuzz build` against it every week in CI.
+///
+/// That file was invisible to all three mechanisms at once: the interpreter
+/// guard and the native-builder guard both read only the root path, and the
+/// token scan excludes `.lock` outright. A `pyo3`, `mlua`, `v8` or `cmake`
+/// arriving in the fuzz graph would have been green forever.
+///
+/// LATENT, not live — the fuzz graph is clean today. It is fixed anyway,
+/// because "clean today" is a measurement and this file exists precisely
+/// because measurements go stale while the guard around them does not.
+///
+/// The durable lesson, now recorded for the twelfth time: every one of these
+/// holes was in what the scan LOOKED AT, never in the tokens it banned. So
+/// this asks git which lockfiles exist rather than naming one.
+fn all_locked_graphs() -> Vec<(String, Vec<String>)> {
+    let root = repo_root();
+    let paths = git_ls_files(&["*Cargo.lock"]);
+    assert!(
+        !paths.is_empty(),
+        "RUST-ONLY GUARD IS BLIND: `git ls-files -- *Cargo.lock` matched nothing. \
+         At minimum the workspace root lockfile is tracked, so an empty result \
+         means the enumeration broke and both lockfile guards are enforcing \
+         nothing."
+    );
+    paths
+        .into_iter()
+        .map(|p| {
+            let lock = std::fs::read_to_string(root.join(&p))
+                .unwrap_or_else(|e| panic!("rust_only_guard: cannot read {p}: {e}"));
+            let names = locked_package_names(&lock);
+            // Anti-vacuity, PER FILE: a parser that returns nothing makes every
+            // assertion downstream trivially true, which is exactly how a guard
+            // reports green while enforcing nothing. Every real lockfile in this
+            // repository resolves hundreds of packages.
+            assert!(
+                names.len() > 100,
+                "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from \
+                 {p}. The lockfile format changed or the read failed, and this \
+                 guard is enforcing nothing.",
+                names.len()
+            );
+            (p, names)
+        })
+        .collect()
+}
+
+/// (h) The native build toolchain the LOCKFILES pull in may only shrink.
 #[test]
 fn native_build_toolchain_only_shrinks() {
     assert_sorted_unique(
         NATIVE_BUILD_TOOLCHAIN_BUDGET,
         "NATIVE_BUILD_TOOLCHAIN_BUDGET",
     );
-    let root = repo_root();
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
-        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
-    let names = locked_package_names(&lock);
-
-    // Anti-vacuity: a parser that returns nothing makes every assertion below
-    // trivially true, which is how a guard reports green while enforcing
-    // nothing. The graph has hundreds of packages.
-    assert!(
-        names.len() > 100,
-        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
-         The lockfile format changed or the read failed, and this guard is \
-         enforcing nothing.",
-        names.len()
-    );
+    // Union across every tracked lockfile — a build script that executes in
+    // the weekly fuzz lane executes just as truly as one in the main graph.
+    let graphs = all_locked_graphs();
+    let names: Vec<String> = graphs.iter().flat_map(|(_, n)| n.iter().cloned()).collect();
 
     // Every native-build-system driver we know how to name. Absence from this
     // list is not safety — it is the reason the list is a LIST and not a
@@ -2107,21 +2151,20 @@ fn native_build_toolchain_only_shrinks() {
 /// target-agnostic; that is a property of the FILE, not a breach.
 #[test]
 fn embedded_interpreters_are_absent_from_the_locked_graph() {
-    let root = repo_root();
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
-        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
-    let names = locked_package_names(&lock);
-
-    // Anti-vacuity, same reason as the sibling test: a parser returning
-    // nothing would make the assertion below trivially true. That is the
-    // false-OK class this file exists to prevent, and it must never be the
-    // way THIS guard reports green.
+    // Every tracked lockfile, not just the root — see `all_locked_graphs`
+    // for SCOPE FIX #13. An interpreter embedded in the fuzz graph runs in
+    // CI just as truly as one in the main graph, and until 2026-09-01 it was
+    // invisible to this guard, to its native-builder sibling, and to the
+    // token scan simultaneously. Per-file anti-vacuity lives in the helper.
+    let graphs = all_locked_graphs();
+    let names: Vec<String> = graphs.iter().flat_map(|(_, n)| n.iter().cloned()).collect();
     assert!(
-        names.len() > 100,
-        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
-         The lockfile format changed or the read failed, and this guard is \
-         enforcing nothing.",
-        names.len()
+        !names.is_empty(),
+        "RUST-ONLY GUARD IS BLIND: no package names across any tracked \
+         lockfile. Per-file anti-vacuity lives in `all_locked_graphs`; this \
+         is the belt-and-braces check that the UNION is non-empty, because a \
+         filter below over an empty list would report clean while enforcing \
+         nothing."
     );
 
     // Scripting/bytecode runtimes that would execute non-Rust code from
