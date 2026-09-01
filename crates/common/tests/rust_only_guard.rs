@@ -378,6 +378,43 @@ fn has_interpreter_shebang(content: &str) -> bool {
     content.lines().next().is_some_and(|l| l.starts_with("#!"))
 }
 
+/// The runtime a shebang line names, if any — `#!/usr/bin/env node` -> `node`,
+/// `#!/bin/bash` -> `bash`, `#!/usr/bin/env -S deno run` -> `deno`.
+///
+/// # Why this exists (SCOPE FIX #15, 2026-09-01)
+///
+/// [`has_interpreter_shebang`] asks whether a shebang EXISTS, which is the
+/// right question for deciding what to scan and the wrong one for deciding
+/// what is allowed. The line `#!/usr/bin/env node` on an extension-less
+/// tracked file passed every check in this file at once: it carries no banned
+/// file extension, no python-family token, and `count_node_invocations`
+/// skipped it because `is_command_position` sees a prefix starting with `#`
+/// and matches no arm. Being IN the invocation scan even satisfied
+/// `every_tracked_executable_is_inside_the_invocation_scan`.
+///
+/// A shebang is the kernel's instruction for which interpreter runs the file.
+/// Reading the name it gives is therefore the most direct possible check, and
+/// it needs no enumeration of file names or extensions — the same move §0.3
+/// of the lock file made for deciding WHICH files to scan, applied one step
+/// further to WHAT they declare.
+fn shebang_runtime(content: &str) -> Option<String> {
+    let first = content.lines().next()?;
+    let rest = first.strip_prefix("#!")?;
+    // `env` and its `-S` split-string form introduce the real runtime; a bare
+    // path is the runtime itself. Flags between them are skipped so
+    // `#!/usr/bin/env -S deno run --allow-net` resolves to `deno`.
+    let mut parts = rest.split_whitespace().filter(|p| !p.is_empty());
+    let mut current = parts.next()?;
+    loop {
+        let base = current.rsplit('/').next().unwrap_or(current);
+        if base == "env" || base.starts_with('-') {
+            current = parts.next()?;
+            continue;
+        }
+        return Some(base.to_string());
+    }
+}
+
 /// Whole-line comment: first non-whitespace char is `#` — but a shebang
 /// (`#!`) is NOT a comment: it selects the interpreter that EXECUTES the
 /// file, so it must be scanned for the the banned interpreter token like any code line
@@ -721,11 +758,45 @@ fn literals_in_group(after: &str) -> Vec<String> {
 fn rust_spawn_violations(content: &str) -> Vec<String> {
     let mut hits: Vec<String> = extract_spawn_literals(content)
         .into_iter()
-        .filter(|lit| line_has_banned_token(lit))
+        .filter(|lit| line_has_banned_token(lit) || spawn_literal_names_node_family(lit))
         .collect();
     hits.sort();
     hits.dedup();
     hits
+}
+
+/// True when a spawn literal names a [`NODE_FAMILY`] runtime.
+///
+/// # Why this exists (SCOPE FIX #15, 2026-09-01)
+///
+/// `rust_spawn_violations` filtered spawn literals through `banned_tokens()`
+/// ALONE, which is the python family plus perl. `NODE_FAMILY` was never
+/// applied to `.rs` at all — `node_family_invocations_only_shrink` scans
+/// `load_invocation_scan_files()`, which excludes `.rs` — so
+/// `Command::new("node")` in Rust passed every guard in this file
+/// simultaneously. Found by an adversarial hunt commissioned specifically to
+/// find hole eight; the live tree is CLEAN, so this closes a latent breach,
+/// not an active one.
+///
+/// Two shapes are caught, and the second is the one that matters:
+///
+///   * the literal IS the runtime — `"node"`, or a path `"/usr/bin/node"`;
+///   * the literal CARRIES the runtime in command position — the payload of
+///     `Command::new("bash").arg("-c").arg("node /opt/x.js")`, where the
+///     program is an allowlisted shell and the runtime hides in an argument.
+///
+/// Reusing `count_node_invocations` for the second shape is deliberate: it
+/// already encodes the command-position parser and its false-positive
+/// discipline, so a literal like `"SSM managed node"` stays a sentence.
+fn spawn_literal_names_node_family(lit: &str) -> bool {
+    let trimmed = lit.trim();
+    NODE_FAMILY.iter().any(|name| {
+        trimmed == *name
+            || trimmed
+                .rsplit('/')
+                .next()
+                .is_some_and(|base| base == *name && trimmed.contains('/'))
+    }) || count_node_invocations(lit) > 0
 }
 
 // ---- SCOPE FIX #5 (2026-08-11): inline JavaScript in workflows ----
@@ -1349,6 +1420,95 @@ fn every_tracked_executable_is_inside_the_invocation_scan() {
     );
 }
 
+/// SCOPE FIX #15 (2026-09-01): every tracked shebang must NAME an allowed
+/// runtime — not merely exist.
+///
+/// The sibling above proves a shebang file is INSIDE the invocation scan.
+/// That is necessary and was not sufficient: being scanned buys nothing when
+/// the scan cannot read the line. `#!/usr/bin/env node` on an extension-less
+/// tracked file cleared every check in this file simultaneously — no banned
+/// extension, no python-family token, and `count_node_invocations` skips it
+/// because `is_command_position` matches no arm on a prefix starting with
+/// `#`. It even SATISFIED the sibling test, because it is in the scan.
+///
+/// Allowed set is `bash` and `sh` only. All ~99 tracked shebangs are `bash`
+/// today, so this closes a latent hole at a hard floor rather than
+/// grandfathering anything — there is no allowlist to grow.
+#[test]
+fn every_tracked_shebang_names_an_allowed_runtime() {
+    const ALLOWED_SHEBANG_RUNTIMES: &[&str] = &["bash", "sh"];
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    let mut checked = 0_usize;
+    for path in git_ls_files(&["."]) {
+        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        let Some(runtime) = shebang_runtime(&content) else {
+            continue;
+        };
+        checked += 1;
+        if !ALLOWED_SHEBANG_RUNTIMES.contains(&runtime.as_str()) {
+            violations.push(format!("{path}: #! names `{runtime}`"));
+        }
+    }
+    assert!(
+        checked > 20,
+        "RUST-ONLY GUARD IS BLIND: only {checked} tracked shebang(s) parsed. \
+         Expected >20 (the tree has ~99, all bash). Either `git ls-files` or \
+         `shebang_runtime` is broken, and this test is enforcing nothing."
+    );
+    assert!(
+        violations.is_empty(),
+        "RUST-ONLY VIOLATION: tracked file(s) declare a non-Rust runtime in \
+         their shebang: {violations:?}. The kernel runs whatever this line \
+         names, so a `#!/usr/bin/env node` script is a live interpreter no \
+         matter what the file is called. Allowed: \
+         {ALLOWED_SHEBANG_RUNTIMES:?}. Port it to Rust — do NOT widen the \
+         allowed set without a fresh dated operator quote in \
+         rust-only-forever-lock-2026-07-19.md."
+    );
+}
+
+/// BITE-PROOF for SCOPE FIX #15's shebang parser.
+///
+/// The real-tree test above is clean by construction (all 99 shebangs are
+/// bash), so it cannot demonstrate that the parser CATCHES anything. These
+/// fixtures do, and they pin the `env`/`-S`/flag-skipping behaviour that a
+/// naive `split('/').last()` would get wrong.
+#[test]
+fn shebang_runtime_parser_self_test() {
+    for (line, expected) in [
+        ("#!/usr/bin/env node\n", Some("node")),
+        ("#!/usr/bin/env -S deno run --allow-net\n", Some("deno")),
+        ("#!/usr/bin/node\n", Some("node")),
+        ("#!/bin/bash\n", Some("bash")),
+        ("#!/bin/sh -e\n", Some("sh")),
+        ("#!/usr/bin/env bash\n", Some("bash")),
+        ("# not a shebang\n", None),
+        ("fn main() {}\n", None),
+    ] {
+        assert_eq!(
+            shebang_runtime(line).as_deref(),
+            expected,
+            "shebang parse of {line:?}"
+        );
+    }
+    // The exact hostile file from the 2026-09-01 hunt: extension-less,
+    // tracked, executable, and invisible to every other check here.
+    let hostile = "#!/usr/bin/env node\nconst fs=require('fs');\n";
+    assert_eq!(
+        shebang_runtime(hostile).as_deref(),
+        Some("node"),
+        "the hostile fixture MUST resolve to node — if this fails, SCOPE FIX \
+         #15 has been reverted and the hole is open again"
+    );
+    assert!(
+        !["bash", "sh"].contains(&shebang_runtime(hostile).unwrap_or_default().as_str()),
+        "and it must NOT be in the allowed set"
+    );
+}
+
 /// (e) NO Rust-side process spawn of a banned interpreter (SCOPE FIX #4).
 /// Narrow by design: only the string literal handed to `Command::new` /
 /// `.arg` is inspected, so doc-comment prose can never false-positive.
@@ -1358,9 +1518,27 @@ fn no_rust_spawn_of_banned_interpreter() {
     let root = repo_root();
     let mut violations: Vec<String> = Vec::new();
     for path in git_ls_files(&["*.rs"]) {
-        // This guard names the tokens it bans; scanning itself would be
-        // self-referential. Its own spawns are `git` only (see `git_ls_files`).
-        if path.ends_with("crates/common/tests/rust_only_guard.rs") {
+        // These two files name the tokens they ban; scanning them is
+        // self-referential. Their own real spawns are `git` only (see
+        // `git_ls_files` here and its twin there).
+        //
+        // The SIBLING was added 2026-09-01 with SCOPE FIX #15, and only
+        // because that fix made it necessary: extending the scan to
+        // `NODE_FAMILY` matched `Command::new("node")` inside
+        // `spawn_scanner_extracts_literals_and_ignores_non_literals`, which is
+        // a raw-string FIXTURE that bite-proves that guard's own extractor. A
+        // guard cannot prove it detects a thing without writing the thing
+        // down.
+        //
+        // An explicit two-file list, never a `*_guard.rs` glob: a glob would
+        // silently exempt every future guard file, which is how an exemption
+        // becomes a hole. Adding a third file here is a visible diff and needs
+        // the same justification.
+        const SELF_REFERENTIAL_GUARDS: &[&str] = &[
+            "crates/common/tests/rust_only_guard.rs",
+            "crates/common/tests/browser_surface_and_toolchain_guard.rs",
+        ];
+        if SELF_REFERENTIAL_GUARDS.iter().any(|g| path.ends_with(g)) {
             continue;
         }
         let content = std::fs::read_to_string(root.join(&path))
@@ -2045,6 +2223,43 @@ const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
 /// unannounced in a lockfile nobody reads.
 const NATIVE_BUILD_TOOLCHAIN_BUDGET: &[&str] = &["cc", "cmake", "pkg-config"];
 
+/// True when crate `name` belongs to the crate FAMILY `family`.
+///
+/// A family is the package itself plus its hyphen-suffixed siblings:
+/// `rustpython` covers `rustpython-vm`, `rustpython-compiler` and
+/// `rustpython-stdlib`, and does NOT cover `rustpythonic`.
+///
+/// # Why this exists (SCOPE FIX #14, 2026-09-01)
+///
+/// The embedded-interpreter check used exact equality, so it banned exactly
+/// one member per family and was blind to every sibling — and an interpreter
+/// reaches the graph as whichever sibling a dependent happens to name.
+/// Asking "is this crate in the family?" instead of "is this crate one of
+/// the seventeen strings I listed?" is the same move
+/// `rust-only-forever-lock-2026-07-19.md` §0.3 made for shebangs, for the
+/// same reason: an enumeration of members is wrong by construction, and a
+/// class nobody listed reads as green.
+///
+/// BOTH separators count, and that was a bug on the first attempt at this
+/// (caught by adversarial review the same day). Cargo permits `-` and `_` in
+/// package names and interpreter families genuinely use both: `rustpython-vm`
+/// and `quickjs-rs` are hyphenated, while `gluon_vm`, `gluon_base`,
+/// `starlark_map`, `starlark_derive`, `deno_runtime`, `boa_parser`, `boa_gc`
+/// and `wasmi_core` are underscored. A hyphen-only rule left five of the
+/// twenty-four families as one-member enumerations while the doc claimed
+/// they were covered — the same failure one level down.
+///
+/// A SEPARATOR is load-bearing either way. Matching a bare prefix would make
+/// `rune` catch `runes` and `v8` catch `v8x`, and a guard whose first act is
+/// a false positive teaches the next reader that the cheapest fix is an
+/// allowlist entry.
+fn is_in_crate_family(name: &str, family: &str) -> bool {
+    name == family
+        || name
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+}
+
 /// Package names declared in `Cargo.lock`, in file order.
 fn locked_package_names(content: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2282,21 +2497,70 @@ fn embedded_interpreters_are_absent_from_the_locked_graph() {
     // Scripting/bytecode runtimes that would execute non-Rust code from
     // inside a Rust binary. Absence from this list is not safety — it is why
     // the list is a LIST, and adding to it is how the next one gets caught.
+    //
+    // WIDENED 2026-09-01 (SCOPE FIX #14). Two changes, and the first matters
+    // more than the second:
+    //
+    //   (a) These are now FAMILIES matched by prefix, not exact names. The
+    //       old check was `n == i`, so `rustpython-vm` was banned while
+    //       `rustpython-compiler`, `rustpython-parser` and `rustpython-stdlib`
+    //       were invisible — and a crate reaches the graph as whichever of
+    //       its sibling crates the dependent happens to name. Interpreters
+    //       ship as crate FAMILIES; a guard that enumerates one member of
+    //       each family is the same enumeration failure `rust-only-forever-
+    //       lock-2026-07-19.md` §0.3 records having been wrong seven times.
+    //       A family matches `name == family` OR `name` starting with
+    //       `"{family}-"`, so `rune` catches `rune-modules` and never
+    //       `runes-something`.
+    //
+    //   (b) Eight families added that had no entry at all: `rustpython`
+    //       (subsuming the old `-vm` row), `rune`, `starlark`, `extism`,
+    //       `wasm3`, `gluon`, `koto` and `steel`. Each embeds a language
+    //       runtime in-process.
+    //
+    //   (c) BOTH `-` and `_` count as the family separator, and three entries
+    //       were shortened to their family ROOT (`boa_engine` -> `boa`,
+    //       `deno_core` -> `deno`, `steel-core` -> `steel`). The first cut of
+    //       this fix accepted only `-`, which left `gluon_vm`, `starlark_map`,
+    //       `deno_runtime`, `boa_parser` and `wasmi_core` invisible — the same
+    //       enumeration failure one level down, inside the fix for it.
+    //
+    // Verified against the real graph before widening: NONE of these matches
+    // any of the 476 packages in the tracked lockfiles, so this adds
+    // enforcement without adding a single exemption.
+    //
+    // Still NOT here, deliberately, and the reason is the same as the
+    // `wasm-bindgen` carve-out above: `wasm` as a family would match
+    // `wasm-bindgen` and fail the build over packages compiled for no
+    // target we ship. `wasm3` is the specific interpreter; `wasm` is not.
+    // Each entry is the family ROOT, not one member of it. `boa` rather than
+    // `boa_engine` so `boa_parser` and `boa_gc` are covered; `deno` rather
+    // than `deno_core` so `deno_runtime` and `deno_ast` are; `steel` rather
+    // than `steel-core`. Verified CLEAN against all 476 packages in the
+    // tracked lockfiles at each of these roots — shortening a family widens
+    // the net, so it is checked rather than assumed.
     const EMBEDDED_INTERPRETERS: &[&str] = &[
-        "boa_engine",
-        "deno_core",
+        "boa",
+        "deno",
         "duktape",
+        "extism",
+        "gluon",
         "hematita",
+        "koto",
         "mlua",
         "neon",
         "pyo3",
         "quick-js",
-        "quickjs-rs",
+        "quickjs",
         "rhai",
         "rlua",
         "rquickjs",
-        "rustpython-vm",
+        "rune",
+        "rustpython",
+        "starlark",
+        "steel",
         "v8",
+        "wasm3",
         "wasmer",
         "wasmi",
         "wasmtime",
@@ -2306,7 +2570,7 @@ fn embedded_interpreters_are_absent_from_the_locked_graph() {
     let found: Vec<&str> = EMBEDDED_INTERPRETERS
         .iter()
         .copied()
-        .filter(|i| names.iter().any(|n| n == i))
+        .filter(|family| names.iter().any(|n| is_in_crate_family(n, family)))
         .collect();
 
     assert!(
@@ -2347,7 +2611,7 @@ fn embedded_interpreter_detection_self_test() {
     let hits = |names: &[String]| -> usize {
         ["pyo3", "rhai", "mlua"]
             .iter()
-            .filter(|i| names.iter().any(|n| n == *i))
+            .filter(|family| names.iter().any(|n| is_in_crate_family(n, family)))
             .count()
     };
     assert_eq!(hits(&clean_names), 0, "a clean graph must not match");
@@ -2356,6 +2620,62 @@ fn embedded_interpreter_detection_self_test() {
         1,
         "an interpreter in the graph MUST be detected — if this fails, the \
          real-tree test above is reporting green while enforcing nothing"
+    );
+
+    // SCOPE FIX #14 bite-proof — the half that was broken until 2026-09-01.
+    //
+    // A sibling crate of a banned family must be caught. Under the old exact
+    // equality this line returned 0: the list carried `rustpython-vm` and a
+    // graph that pulled `rustpython-compiler` instead sailed through.
+    let sibling = locked_package_names(
+        "[[package]]\nname = \"serde\"\n[[package]]\nname = \"rustpython-compiler\"\n",
+    );
+    assert!(
+        sibling.iter().any(|n| is_in_crate_family(n, "rustpython")),
+        "a hyphen-suffixed sibling MUST match its family — this is the exact \
+         hole SCOPE FIX #14 closed, and a failure here means the widening was \
+         reverted while the family list still claims to cover it"
+    );
+
+    // And the half that keeps the fix from becoming a false-positive engine:
+    // a name that merely STARTS with a family string is NOT in the family.
+    // Without the hyphen requirement `rune` would flag `runes`, and the first
+    // false positive is what teaches the next reader to reach for an
+    // allowlist entry instead of a fix.
+    assert!(
+        !is_in_crate_family("v8x", "v8"),
+        "a bare prefix is NOT a family"
+    );
+
+    // The UNDERSCORE half — the bug inside the first cut of this fix. These
+    // are real crate names from the families in the list; a hyphen-only
+    // matcher returned false for every one of them while the doc claimed the
+    // family was covered.
+    for (member, family) in [
+        ("gluon_vm", "gluon"),
+        ("starlark_map", "starlark"),
+        ("deno_runtime", "deno"),
+        ("boa_parser", "boa"),
+        ("wasmi_core", "wasmi"),
+        ("rustpython_vm", "rustpython"),
+    ] {
+        assert!(
+            is_in_crate_family(member, family),
+            "underscore-separated sibling {member} MUST match family {family} — \
+             cargo permits both separators and interpreter families use both"
+        );
+    }
+    assert!(
+        !is_in_crate_family("runes", "rune"),
+        "a bare prefix is NOT a family — the hyphen is what makes this precise"
+    );
+    assert!(
+        !is_in_crate_family("rustpythonic", "rustpython"),
+        "a bare prefix is NOT a family"
+    );
+    assert!(
+        is_in_crate_family("rune", "rune"),
+        "a family must still match itself exactly"
     );
 }
 

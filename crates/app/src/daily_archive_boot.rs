@@ -184,6 +184,13 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
     // identical to a pass that ran and found nothing to do. Checking the
     // counts first would read "nothing happened" as "nothing needed to
     // happen" and latch the day on a sweep that never started.
+    // A lock skip is reported FIRST and under its own name, because it is the
+    // one "did not run" that is not this scheduler's problem: the other driver
+    // is doing the work right now. The caller refunds the attempt on this
+    // reason and only on this reason — see `AttemptLedger::refund`.
+    if summary.contended {
+        return PassVerdict::Incomplete("contended");
+    }
     if !summary.pass_ran {
         return PassVerdict::Incomplete("did_not_run");
     }
@@ -237,6 +244,36 @@ impl AttemptLedger {
                 self.day = Some(day);
                 self.attempts = 1;
             }
+        }
+    }
+
+    /// Gives back one attempt on `day` — used ONLY when the pass never
+    /// started because another pass already held the lock.
+    ///
+    /// # Why a refund and not "record later"
+    ///
+    /// The attempt is recorded BEFORE the pass deliberately, so a panic or a
+    /// cancellation still costs an attempt and the loop cannot retry forever.
+    /// That is the right default and it is kept. But a lock skip is not a
+    /// failed attempt — it means the OTHER driver (the disk-pressure leg) is
+    /// doing this exact work right now, so charging the daily budget for it
+    /// is charging for someone else's success.
+    ///
+    /// Found by adversarial review 2026-09-01, and it was a real defect: the
+    /// pressure leg polls every 60s and a pass can export, upload, verify and
+    /// drop up to `max_partitions_per_run` partitions, so six daily ticks
+    /// landing inside one long pressure pass exhausted the whole day's budget.
+    /// The consequences were both wrong and opposite: a page saying the
+    /// archive did not complete on a box where it was completing, AND the
+    /// daily sweep permanently abandoned for that day once the lock freed.
+    ///
+    /// Saturating at zero: a refund without a matching record is a no-op
+    /// rather than an underflow, so this can never manufacture attempts.
+    pub const fn refund(&mut self, day: i32) {
+        if let Some(d) = self.day
+            && d == day
+        {
+            self.attempts = self.attempts.saturating_sub(1);
         }
     }
 }
@@ -479,6 +516,24 @@ async fn run_daily_archive_loop(
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome.as_str())
             .increment(1);
 
+        // REFUND before anything else reads the ledger. A contended pass never
+        // started — the disk-pressure leg holds the lock and is doing exactly
+        // this work — so charging the day's six attempts for it would exhaust
+        // the budget on someone else's success and then abandon the daily
+        // sweep once the lock freed. Found by adversarial review 2026-09-01.
+        if matches!(
+            outcome,
+            PassOutcome::Ran(PassVerdict::Incomplete("contended"))
+        ) {
+            ledger.refund(today);
+            debug!(
+                attempt,
+                "daily archive tick stood aside — the disk-pressure leg holds the \
+                 archive lock and is doing this work; attempt refunded, not spent"
+            );
+            continue;
+        }
+
         if outcome.latches_the_day() {
             // Durable, so a crash-restart three seconds later does not re-run
             // a sweep that already finished. `write_daily_marker` is fail-open
@@ -704,6 +759,73 @@ mod tests {
             ledger.attempts_on(100),
             0,
             "yesterday's count must not survive the rollover"
+        );
+    }
+
+    /// The HIGH defect found by adversarial review 2026-09-01: a pass that
+    /// never started because the disk-pressure leg held the lock was charging
+    /// the day's attempt budget. Six overlaps exhausted it, paged that the
+    /// archive had not completed on a box where it WAS completing, and then
+    /// abandoned the daily sweep for the rest of that day.
+    #[test]
+    fn refund_gives_back_only_the_contended_attempt() {
+        let mut ledger = AttemptLedger::default();
+        ledger.record(100);
+        ledger.record(100);
+        assert_eq!(ledger.attempts_on(100), 2);
+
+        ledger.refund(100);
+        assert_eq!(
+            ledger.attempts_on(100),
+            1,
+            "a contended tick must cost nothing — the other driver is doing \
+             this work right now"
+        );
+
+        // Saturating: a refund without a matching record can never manufacture
+        // attempts, and can never underflow.
+        ledger.refund(100);
+        ledger.refund(100);
+        ledger.refund(100);
+        assert_eq!(ledger.attempts_on(100), 0);
+
+        // A refund aimed at a different day must not touch today's count —
+        // otherwise a midnight rollover mid-pass would silently hand back an
+        // attempt that belonged to the previous day.
+        ledger.record(101);
+        ledger.refund(100);
+        assert_eq!(
+            ledger.attempts_on(101),
+            1,
+            "a refund for another day must be a no-op"
+        );
+    }
+
+    /// The two `did not run` causes mean OPPOSITE things and were reported
+    /// identically until 2026-09-01: a WAL-probe fail-closed means NOBODY is
+    /// archiving, a lock skip means someone else IS.
+    #[test]
+    fn pass_verdict_tells_a_lock_skip_apart_from_a_pass_that_never_ran() {
+        let contended = ArchiveRunSummary {
+            contended: true,
+            ..ArchiveRunSummary::default()
+        };
+        assert!(
+            matches!(
+                pass_verdict(&contended, 200),
+                PassVerdict::Incomplete("contended")
+            ),
+            "a lock skip must be named, so the caller can refund it"
+        );
+
+        let never_ran = ArchiveRunSummary::default();
+        assert!(
+            matches!(
+                pass_verdict(&never_ran, 200),
+                PassVerdict::Incomplete("did_not_run")
+            ),
+            "a fail-closed skip must stay `did_not_run` — it is a real failed \
+             attempt and must keep costing one"
         );
     }
 

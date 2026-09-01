@@ -88,9 +88,26 @@ impl SingleSlotTtlCache {
 // BoundedTtlCache — /api/quote/{security_id}
 // ---------------------------------------------------------------------------
 
-/// Hard cap on cached quote entries. The only-200 caching policy already
-/// bounds the key space to real instruments (the ~250-1200 daily universe);
-/// this cap is defence-in-depth against any future policy drift.
+/// Hard cap on cached quote entries.
+///
+/// **CORRECTED 2026-09-01 — this cap is a CONCURRENCY bound, not universe
+/// headroom, and the sentence that stood here said the opposite.** It read:
+/// *"The only-200 caching policy already bounds the key space to real
+/// instruments (the ~250-1200 daily universe); this cap is defence-in-depth
+/// against any future policy drift."* The subscribed universe is now
+/// ~24,600 instruments (the 2026-08-15 full-mode authorization), so 2048 is
+/// roughly **8% of it**, not headroom above it. A reader trusting the old
+/// text would conclude the cap can never bind. It can.
+///
+/// What actually keeps it from binding is the **1-second TTL**
+/// (`QUOTE_CACHE_TTL_SECS`), not the key space: reaching the cap with every
+/// entry still fresh requires 2,048 DISTINCT security-ids queried inside one
+/// second. At that point each further new-key `put` pays a full O(cap)
+/// `retain` under the lock and frees nothing, because nothing has expired
+/// yet — see the note on [`BoundedTtlCache::put`]. That is a real
+/// degradation and it is flagged rather than relabelled; it is also
+/// self-limiting, since sustaining it means sustaining 2,048 requests per
+/// second at the endpoint, which is a larger problem than the scan.
 pub const QUOTE_CACHE_MAX_ENTRIES: usize = 2048;
 
 /// Per-key TTL cache with a hard entry cap. At cap, NEW keys are
@@ -145,6 +162,17 @@ impl BoundedTtlCache {
     /// (the response was already served fresh — only the cache write is
     /// skipped); an EXISTING key is always overwritten in place. The sweep
     /// is O(cap) on this cold path and runs only at the cap boundary.
+    ///
+    /// **Honest cost at the boundary (added 2026-09-01).** "Runs only at the
+    /// cap boundary" is true and understates the worst case: once the map is
+    /// AT cap with every entry still inside the 1-second TTL, the sweep frees
+    /// nothing, so EVERY subsequent new-key `put` pays a full O(cap) `retain`
+    /// under the lock and then skip-inserts. It is O(1) amortized in every
+    /// realistic pattern and O(cap) per call in that one, which needs 2,048
+    /// distinct security-ids inside one second to reach — see
+    /// [`QUOTE_CACHE_MAX_ENTRIES`]. Flagged, not relabelled; recorded in
+    /// CLAUDE.md's non-O(1) table so a complexity claim elsewhere cannot
+    /// read as covering it.
     pub fn put(&self, key: u64, body: String) {
         let mut guard = lock_recovering(&self.map);
         if guard.len() >= self.max_entries && !guard.contains_key(&key) {
@@ -310,9 +338,14 @@ mod tests {
     #[test]
     fn test_quote_cache_cap_constant_is_bounded() {
         // Memory envelope pin: cap x ~300B body ≈ well under 1 MiB.
+        // CORRECTED 2026-09-01: this floor used to say "must hold the daily
+        // universe", which stopped being true when the universe went to
+        // ~24,600. The cap is a per-second CONCURRENCY bound, so the floor
+        // is now justified as such — 1,200 concurrent distinct quotes inside
+        // one second is already far above anything an operator surface does.
         assert!(
             QUOTE_CACHE_MAX_ENTRIES >= 1200,
-            "must hold the daily universe"
+            "must absorb a realistic burst of distinct quotes within one TTL"
         );
         assert!(
             QUOTE_CACHE_MAX_ENTRIES <= 10_000,
