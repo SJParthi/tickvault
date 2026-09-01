@@ -1243,6 +1243,27 @@ async fn async_main() -> Result<()> {
         .increment(0);
     metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER)
         .increment(0);
+    // Telegram drop counters, seeded 2026-09-01.
+    //
+    // These three were created LAZILY, inside their own error arms, so a
+    // process that had never failed to send published no series at all — and
+    // an absent CloudWatch series is indistinguishable from a healthy zero.
+    // `telegram-drop-alarm.tf` pages at 3 drops; without a seeded baseline the
+    // agent's delta pipeline discards the first sample of a series it has
+    // never seen, so the alarm behaved as though its threshold were 4 and the
+    // FIRST episode of a broken bot was invisible.
+    //
+    // This is a log-metric-filter metric, not an EMF one, so seeding it costs
+    // NOTHING against the metric budget — which matters, because the maximal
+    // month sits ~$1 under the operator's cap with room for roughly three more
+    // EMF names.
+    //
+    // Labels are the exact three the producers emit: `service.rs` (send_failed,
+    // noop_mode) and `coalescer.rs:423` (coalesced_sample_capped).
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "send_failed").increment(0);
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "noop_mode").increment(0);
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "coalesced_sample_capped")
+        .increment(0);
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations

@@ -4224,3 +4224,190 @@ importantly — the default the movers ranking must use: **rank by
 That last consequence is why this correction was worth chasing rather than
 quietly amending: a gainers list ranked on the wrong column produces a
 plausible, completely different list, and nothing about it would look wrong.
+
+---
+
+# WAVE 9 — the 2026-09-01 audit: the fifteenth socket, the folded refusal, and the unseeded pager
+
+**Status of this wave:** IN_PROGRESS (the plan file's own Status stays IN_PROGRESS).
+**Date:** 2026-09-01
+**Authorised by:** Parthiban, 2026-09-01, verbatim: *"Fix everything I never ever wanted to
+face any websocket disconnect or reconnect and there shouldn't be any tick loss no db
+pressure no memory ram pressure nowhere our entire 16 websocket connections shoudl never
+ever be dropped or lost at any point of time especially starting. 9 am till 3.49 pm per
+current day should never ever be stopped or lost dude okay?"*
+
+## Why this wave exists
+
+A live read of the Monday 2026-08-31 session (CloudWatch, `Tickvault/Prod`, 115 metrics)
+plus a four-agent source sweep. Session facts, all MEASURED:
+
+| Fact | Value |
+|---|---|
+| Ticks ingested | 83,932,875 (week high) |
+| **Permanently lost** | **0** — `tv_ticks_lost_total`=0, `wal_dropped`=0, dropped==spilled exactly |
+| Refused by DB, rescued to disk | 11,362,297 (13.5%, 37x Friday) |
+| QuestDB apply lag | 18 -> **80,217**, monotonic, never recovered |
+| Alive connections | **14**, held min=max=14 for 8 hours |
+| Reconnects / dial failures | 47 / 46, **all inside one 5-minute window at 08:50 IST** |
+
+Four things the audit CORRECTED rather than found (recorded because this repo's history
+says stale findings manufacture false work):
+
+- "Six dead dashboard widgets" — **FALSE**. Those greps are removal comments
+  (`dashboard.tf:97,105,112`); the widgets were retired 2026-07-15/17.
+- "Dead alarm `order_fill_lag_high`" — **FALSE**. Deliberately dormant,
+  `actions_enabled=false` (`order-side-alarms.tf:282`), guard-pinned.
+- "87 invisible loss counters" — **OVERSTATED**. `loss_counter_visibility_guard.rs:477`
+  already enforces shipped-or-logged. They lack a *chartable series*, not visibility.
+- CLAUDE.md's "spot store projects ~34.9 GB" — **STALE**. `config/base.toml:930` sets
+  `spot_days = 1`, not 35, so the projection is 721 MB, and the store commits **zero**
+  bytes today (`[rest_candle_fold] enabled = false`, no writer).
+
+## Design
+
+**Item 9.1 — the fifteenth socket (the operator's stated #1).**
+`tv_dhan_ws_alive_connections` peaked at 14. Two independent causes:
+(a) the gauge's ceiling is **15, not 16** — the order-update socket is spawned by
+`dhan_rest_stack.rs` and `AliveConnectionGuard::acquire` refuses non-market-data endpoints
+(`dhan_feed_stack.rs:7993`), so 16 was never countable here;
+(b) the 5th depth-200 socket (the day's biggest mover) is genuinely lost every session.
+Depth attaches PRE-OPEN (~08:50, driven toward the 09:12 readiness deadline). At that
+moment `fetch_movers` finds `candles_1m` empty (the aggregator folds from 09:15) AND its
+pre-open tick fallback empty (capture starts 09:00), so `top_mover_pick` returns `None`
+(`dhan_feed_stack.rs:7268`). Its `None` arm states *"The retry loop asks again"* — but
+`depth_done = true` latches unconditionally at `:7615`, `outstanding_halves` (`:6823`)
+never returns the depth half again, and the selection block short-circuits to
+`DepthSelection::default()` (`:7183`). **A comment asserting a retry the code prevents.**
+Fix: a separate `depth200_fifth_done` latch so the depth half stays outstanding for the
+fifth socket ONLY, re-attempting the pick on the existing 60 s loop once a ranking exists
+(from ~09:00 via ticks, ~09:16 via candles), and dialing just that one instrument on a
+later loop iteration. Depth-20 and the four ATM depth-200 sockets are never re-planned.
+
+**Item 9.2 — the folded refusal counter.** `dhan_feed_stack.rs:2052` folds FIVE distinct
+reasons into `reason="out_of_session"`, and the 30 s read-out at `:4289-4311` deliberately
+skips that field entirely. Suppression is CORRECT for true `out_of_session` (ticks outside
+[09:00,15:40) are normal daily) and WRONG for the other four — `stale_trading_day` has a
+recorded 8,898 fabricated bars (`:1969-1974`) and `out_of_band_timestamp` measured
+2,008,916/session (`multi_tf_aggregator.rs:717`). Fix: split the single counter field into
+five, widen `refusals()`, and add the two real-signal reasons to the EXISTING
+AGGREGATOR-DROP-01 line and its emit condition. **No new metric name, no new EMF entry,
+$0/mo** — which matters because the maximal month is ~$123.88 against a $125 cap and a
+$117 auto-stop line, leaving ~3 names of headroom.
+
+**Item 9.3 — the unseeded pager.** `tv_telegram_dropped_total` is created lazily in error
+arms only, so an unregistered counter publishes no series and the FIRST episode is
+invisible — making the documented alarm threshold of 3 behave as 4. Fix: seed all three
+reason labels at `main.rs:1245` beside the existing seeds. Log-filter metric, **$0**.
+
+**Item 9.4 — the boot-only gauge that reads as live.** `tv_dhan_feed_stack_connections`
+is written once at bring-up (`:8651`) and never moves; it reads 1.0 while 14 sockets are
+alive. Its own doc admits it, but it is EMF-shipped, so an operator reads a live count.
+Fix: publish it on every dial and every park.
+
+## NOT taken in this wave, deliberately
+
+- **`ticks.ts` -> receipt clock.** This is the measured root cause of the DB pressure:
+  `ticks` is `PARTITION BY HOUR` on exchange last-TRADE time and **10.0% of one day's
+  64.3M ticks carried a ts more than an hour behind arrival**, so one commit in ten
+  reopens a closed hourly partition and rewrites it (`tick_persistence.rs:1954`, measured
+  live). Changing it is the single biggest lever AND changes `ts` semantics for every
+  consumer — the cross-verify window and `partition_archive` both key on it. It needs
+  `scripts/diagnose-write-amplification.sh` run on the box first. Specified, not shipped.
+- **`QDB_CAIRO_O3_MAX_LAG` 60000000 -> 300000.** An agent proposed this as its #2 lever,
+  claiming the unit is milliseconds (16.7 h). **REJECTED.** The comment block above it
+  states every value there was *"VERIFIED against the running container on 2026-08-18 via
+  SHOW PARAMETERS"*; QuestDB's `cairo.o3.max.lag` is microseconds (default 600000000 =
+  10 min), so 60000000 = 60 s exactly as documented. Applying it would have set a
+  0.3-second merge window. Recorded so nobody re-proposes it.
+- **Gating the live lane's first dial on 09:00.** It would kill most of the 46 dial
+  failures (they are pre-open TCP-RSTs — `market_hours_gate.rs:5-10` documents Dhan
+  RSTing idle pre-open connections) but would cost the 09:00-09:15 pre-open candles the
+  2026-08-28 operator directive requires. A 25 ms/slot stagger on the FIRST dial is the
+  safe half and is deferred to its own wave with its own measurement.
+
+## Edge Cases
+
+- Fifth socket never fills because the whole session is genuinely flat: the socket goes
+  unused and that is HONEST — the retry must stop at 15:30, not spin.
+- `pool.admit` must refuse a sixth depth-200 socket even if the retry misfires.
+- The retry must NOT re-plan depth-20 or the four ATM sockets (they are already subscribed;
+  re-dialing would drop live books).
+- Seeding a counter with `.increment(0)` must happen AFTER the metrics recorder is
+  installed, or it resolves to a no-op recorder (same rationale as the existing seeds).
+- Splitting the refusal field must not change the emitted metric label — the EMF processor
+  folds label values, so the single `out_of_session` series must stay byte-identical.
+
+## Failure Modes
+
+- Retry loop dials a sixth socket -> Dhan error 805 -> `ParkReason::PoolOverflow`, permanent.
+  Guarded by the `DEPTH_200_MAX_SOCKETS` check plus `pool.admit`.
+- A late fifth-socket dial races the 15:30 attach hard stop (`:7094`) -> bounded by the
+  same stop.
+- Un-suppressing two reasons makes the 30 s line fire on a day where they are legitimately
+  non-zero -> it is a log line, not a page; no alarm is added.
+
+## Test Plan
+
+- `outstanding_halves` gains a fifth-socket case: depth_done=true + fifth_done=false must
+  still return the depth half. Pure function, unit-testable.
+- A test that the fifth-socket retry stops at 15:30 and after first success.
+- A test that the five split refusal fields sum to the previous single field.
+- A test that the AGGREGATOR-DROP-01 emit condition fires on stale_trading_day > 0 and does
+  NOT fire on true out_of_session alone.
+- A test that all three telegram reason labels are seeded at boot.
+- Guard re-bless: any source-scan guard pinning the touched lines.
+
+## Rollback
+
+Every item is additive and independently revertable. 9.1 is one boolean; reverting restores
+today's 14-socket behaviour. 9.2/9.3 are counters and log fields with no metric-name change,
+so no terraform, no EMF count move, no cost change. 9.4 is one gauge publish.
+
+## Observability
+
+No new EMF metric name and no new alarm in this wave — deliberate, given ~3 names of budget
+headroom. 9.2 adds fields to an existing coded line (`AGGREGATOR-DROP-01`), which a
+CloudWatch metric filter can later extract as a numeric value at $0.10/mo if a page is
+wanted (the §2.3e precedent). 9.1 makes the fifth socket visible through the already-shipped
+`tv_dhan_ws_alive_connections`. 9.4 repairs an already-shipped gauge.
+
+### ⚠ Item 9.1 CORRECTED 2026-09-01, before any code was written
+
+The design above says the fix is *"re-attempting the pick on the existing 60 s loop"*.
+**That loop does not exist to retry on.** `dhan_feed_stack.rs:7758` RETURNS from the
+attach task once `contracts_done && depth_done` and the top-up window is closed — and it
+returns while handing `depth_commands` BY MOVE to the per-minute rebalance machinery
+(`:7770-7775`), because holding them any longer closes those channels. So there is no
+surviving loop iteration in which a late fifth-socket dial could run.
+
+That makes item 9.1 an ARCHITECTURAL change, not a latch flip. The three available shapes,
+none of them small:
+
+| Shape | Cost |
+|---|---|
+| Keep the attach task alive past both halves to chase the fifth | Changes the single success-return, and delays the `depth_commands` hand-off that makes the ATM machinery live |
+| Delay the depth dial until a ranking exists (~09:00 ticks / ~09:16 candles) | Forfeits pre-open depth, which the 2026-08-28 directive requires |
+| Give the fifth socket to the rebalance machinery | That machinery tops up EXISTING sockets; it does not hold `pool` and cannot dial |
+
+**One genuine de-risking finding, recorded for whoever takes this:** the fear in the
+comment at `:7212` — that dialing the fifth later is unsafe — is smaller than it reads.
+`PoolSupervisor::admit` (`pool_supervisor.rs:2367`) delegates to `budget.try_open`, which
+is STATEFUL per endpoint, so a later dial cannot over-open: it either returns the next
+slot (index 4, exactly `DEPTH_200_TOP_MOVER_SOCKET`) or refuses with `PoolBudgetRefusal`,
+which the existing `Err` arm already handles. Over-dialing into Dhan error 805 is
+therefore structurally impossible. And `build_feed_stack_plan(&mut pool, now, &[], &[],
+&[fifth])` plans ONLY that socket, because `plan_pool` returns early on an empty set
+(`:717`) — depth-20 and the four ATM sockets cannot be re-planned by accident.
+
+**NOT IMPLEMENTED in this wave, deliberately.** It touches the live connection path in an
+environment where neither Dhan nor QuestDB is reachable, so it cannot be validated here,
+and a wrong move parks a socket permanently — the exact failure the operator is asking to
+prevent. It is specified above and should land as its own PR with box validation.
+
+**Also corrected:** the 16-vs-15 half is NOT a defect. `AliveConnectionGuard::acquire`
+refuses non-market-data endpoints (`:7993`), and the order-update socket is spawned by
+`dhan_rest_stack.rs`, so `tv_dhan_ws_alive_connections` has a structural ceiling of 15 and
+"16" was never countable on this gauge. A full house is **15 on this gauge plus the
+order-update socket**, not 16. The honest fix is to document the ceiling or count the
+sixteenth — not to hunt a socket that was never in this gauge's scope.
