@@ -40,7 +40,7 @@ futures-util = "=0.3.34"
 # from_le_bytes reads, never the zerocopy derive machinery.
 
 # ---- Section 3: Data Pipeline ----
-papaya = "=0.2.4"
+papaya = "=0.2.5"
 crossbeam-channel = "=0.5.16"
 # ringbuf removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers — hot-path ring buffers use rtrb + crossbeam-channel.
@@ -255,7 +255,7 @@ form_urlencoded = "=1.2.2"
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.24.1", features = ["v4", "serde"] }
+uuid = { version = "=1.26.0", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 

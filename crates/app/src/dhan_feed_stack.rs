@@ -1001,6 +1001,14 @@ pub struct LiveIngest {
     refused_timestamp: u64,
     refused_slot: u64,
     refused_out_of_session: u64,
+    /// Ticks refused for `stale_trading_day` — split out of the blended
+    /// `out_of_session` field 2026-09-01. Its own site records 8,898
+    /// FABRICATED bars verified live, so a rising rate is a vendor-staleness
+    /// signal, not the normal shut-market case it was buried in.
+    refused_stale_trading_day: u64,
+    /// Ticks refused for `out_of_band_timestamp` — 2,008,916 measured in one
+    /// session. Corruption-adjacent and likewise not normal.
+    refused_out_of_band_ts: u64,
     seals_emitted: u64,
     seals_dropped: u64,
     /// Bars the fold produced for a timeframe nobody asked for.
@@ -1163,6 +1171,8 @@ impl LiveIngest {
             refused_timestamp: 0,
             refused_slot: 0,
             refused_out_of_session: 0,
+            refused_stale_trading_day: 0,
+            refused_out_of_band_ts: 0,
             seals_emitted: 0,
             seals_skipped: 0,
             seals_rescued: 0,
@@ -1176,19 +1186,28 @@ impl LiveIngest {
     }
 
     /// Cumulative aggregator refusals by reason: (price, timestamp, slot,
-    /// out-of-session).
+    /// out-of-session, stale-trading-day, out-of-band-timestamp).
     ///
     /// `out_of_session` is returned but is NOT a defect: ticks arriving
     /// outside the fold window are refused by design. It is reported
-    /// separately from the other three precisely so a caller cannot lump a
-    /// normal pre-open tick in with a bad price and page on it.
+    /// separately precisely so a caller cannot lump a normal pre-open tick in
+    /// with a bad price and page on it.
+    ///
+    /// The last two were SPLIT OUT of that field on 2026-09-01. They had been
+    /// folded into it, and the 30s read-out skips it — so two reasons that are
+    /// genuinely NOT normal (a vendor stamp for another trading day, and one
+    /// outside the plausible band) had no operator surface at all. They are
+    /// returned apart so the caller can report them without also reporting the
+    /// shut-market case.
     #[must_use]
-    pub const fn refusals(&self) -> (u64, u64, u64, u64) {
+    pub const fn refusals(&self) -> (u64, u64, u64, u64, u64, u64) {
         (
             self.refused_price,
             self.refused_timestamp,
             self.refused_slot,
             self.refused_out_of_session,
+            self.refused_stale_trading_day,
+            self.refused_out_of_band_ts,
         )
     }
 
@@ -2048,7 +2067,27 @@ impl LiveIngest {
                 self.refused_slot = self.refused_slot.saturating_add(1);
                 counters().refused("slot_exhausted").increment(1);
             } else {
-                self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
+                // The METRIC label stays `out_of_session` for all three arms
+                // below, deliberately: the EMF processor folds label values
+                // into one summed series per host, so splitting the label
+                // would buy nothing in CloudWatch and a new metric NAME costs
+                // ~$0.30/mo against roughly three names of remaining budget.
+                // What splits here are the in-process FIELDS, which the 30s
+                // AGGREGATOR-DROP-01 line reports — free, and enough to tell
+                // a vendor-staleness episode from a normal pre-open tick.
+                if stats.stale_trading_day {
+                    self.refused_stale_trading_day =
+                        self.refused_stale_trading_day.saturating_add(1);
+                } else if stats.out_of_band_timestamp {
+                    self.refused_out_of_band_ts = self.refused_out_of_band_ts.saturating_add(1);
+                } else {
+                    // True `out_of_session`, plus `untraded_sentinel` and
+                    // `untraded_timestamp`. All three are NORMAL: the market
+                    // is shut, or the instrument has simply never traded
+                    // today. They stay blended because none of them is a
+                    // defect and reporting them would page for quiet strikes.
+                    self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
+                }
                 counters().refused("out_of_session").increment(1);
             }
             return IngestOutcome::WrittenOutOfSession;
@@ -3944,7 +3983,7 @@ async fn run_frame_drain(
     // Last reported aggregator-refusal totals, so the 30s arm can report a
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
-    let mut last_refusals: (u64, u64, u64, u64) = (0, 0, 0, 0);
+    let mut last_refusals: (u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0);
 
     loop {
         tokio::select! {
@@ -4290,21 +4329,37 @@ async fn run_frame_drain(
                 let d_price = now.0.saturating_sub(last_refusals.0);
                 let d_ts = now.1.saturating_sub(last_refusals.1);
                 let d_slot = now.2.saturating_sub(last_refusals.2);
-                // `out_of_session` (now.3) is deliberately NOT reported: it is
-                // the designed refusal for a tick outside the fold window, and
-                // folding it in here would page for normal pre-open traffic —
-                // exactly the false-alarm class the silence gate was fixed for.
-                if d_price > 0 || d_ts > 0 || d_slot > 0 {
+                let d_stale = now.4.saturating_sub(last_refusals.4);
+                let d_oob = now.5.saturating_sub(last_refusals.5);
+                // `out_of_session` (now.3) is still deliberately NOT reported:
+                // it is the designed refusal for a tick outside the fold
+                // window, and folding it in here would page for normal
+                // pre-open traffic — the false-alarm class the silence gate
+                // was fixed for.
+                //
+                // 2026-09-01: two reasons were SPLIT OUT of that field and ARE
+                // reported. They were never the normal case — `stale_trading_day`
+                // has 8,898 fabricated bars recorded at its own site, and
+                // `out_of_band_timestamp` measured 2,008,916 in one session —
+                // but they were buried in a field this read-out skipped, so
+                // neither had any operator surface at all.
+                if d_price > 0 || d_ts > 0 || d_slot > 0 || d_stale > 0 || d_oob > 0 {
                     error!(
                         code = ErrorCode::AggregatorDrop01.code_str(),
                         refused_price = d_price,
                         refused_timestamp = d_ts,
                         refused_slot_exhausted = d_slot,
+                        refused_stale_trading_day = d_stale,
+                        refused_out_of_band_timestamp = d_oob,
                         "Dhan live feed: the aggregator refused ticks in the last 30s. \
                          PRICE and TIMESTAMP refusals are HARD -- no candle and no row; \
                          the upstream packet failed a sanity check. A SLOT refusal is \
                          candle-only: the instrument capacity is exhausted and NEW \
                          instruments get no candles, but their rows ARE still written. \
+                         STALE_TRADING_DAY and OUT_OF_BAND_TIMESTAMP are also \
+                         candle-only: the row is written but the vendor stamped it \
+                         for another day or outside the plausible band, so no bucket \
+                         can hold it -- a rising rate is a VENDOR data-quality signal. \
                          Do not read the total as a tick-loss count."
                     );
                     last_refusals = now;
@@ -13668,7 +13723,7 @@ mod tests {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         assert_eq!(
             ingest.refusals(),
-            (0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
             "a fresh fold has refused nothing"
         );
 
@@ -13686,13 +13741,71 @@ mod tests {
             "a NaN price must be refused, got {outcome:?}"
         );
 
-        let (price, ts, slot, oos) = ingest.refusals();
+        let (price, ts, slot, oos, stale, oob) = ingest.refusals();
         assert_eq!(price, 1, "the price refusal must be counted for the report");
         assert_eq!((ts, slot), (0, 0), "only the price counter moves");
         assert_eq!(
             oos, 0,
             "an in-session tick must not be booked as out-of-session — that \
              bucket is deliberately excluded from the page"
+        );
+        assert_eq!(
+            (stale, oob),
+            (0, 0),
+            "the two reasons split out of the blended out-of-session field on \
+             2026-09-01 must stay zero for a plain bad-price refusal"
+        );
+    }
+
+    /// An out-of-band vendor timestamp must be COUNTED SEPARATELY from the
+    /// normal out-of-session bucket.
+    ///
+    /// Before 2026-09-01 both landed in one `refused_out_of_session` field,
+    /// and the 30s AGGREGATOR-DROP-01 read-out skipped that field entirely —
+    /// so `out_of_band_timestamp`, measured at 2,008,916 in a single session,
+    /// had NO operator surface at all. The suppression was correct for the
+    /// reason it was written for (a tick outside the fold window is normal
+    /// every day) and wrong for the two that were later folded in beside it.
+    ///
+    /// This test is the bite-proof: it drives the out-of-band arm and asserts
+    /// the count lands in the SPLIT field and NOT in the suppressed one.
+    #[test]
+    fn an_out_of_band_timestamp_is_counted_apart_from_normal_out_of_session() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+
+        // `1` is far below MIN_PLAUSIBLE_EXCHANGE_TS_SECS (1_600_000_000), so
+        // the fold cannot bucket it. A non-zero receipt makes it the
+        // CANDLE-ONLY arm rather than the hard refusal: the row is still
+        // written under the receipt stamp, only the candle is skipped.
+        let packet = ticker_packet(13, 100.0, 1);
+        let parsed = dispatch_frame(&packet, 1_779_355_000_000_000_000)
+            .expect("a well-formed ticker packet must parse with an out-of-band ltt");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        assert_ne!(
+            tick.received_at_nanos, 0,
+            "the candle-only arm requires a receipt stamp — without one this \
+             would take the HARD refusal path and the test would prove nothing"
+        );
+
+        let _ = ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+
+        let (price, ts, slot, oos, stale, oob) = ingest.refusals();
+        assert_eq!(
+            oob, 1,
+            "the out-of-band refusal must land in its own field, which the 30s \
+             report DOES read"
+        );
+        assert_eq!(
+            oos, 0,
+            "it must NOT land in the blended out-of-session field, which the \
+             30s report deliberately skips — that blending is the defect"
+        );
+        assert_eq!(
+            (price, ts, slot, stale),
+            (0, 0, 0, 0),
+            "no other refusal counter moves"
         );
     }
 
