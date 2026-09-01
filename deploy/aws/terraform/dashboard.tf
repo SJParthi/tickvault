@@ -909,7 +909,43 @@ resource "aws_cloudwatch_dashboard" "operator" {
             # Neither is alarmed on its own: the existing loss alarm is the
             # pager, and a second alarm for the same event pages twice.
             [local.dash_namespace, "tv_depth_rows_spilled_total", { label = "depth rows rescued to disk (survivable)", stat = "Sum" }],
-            [local.dash_namespace, "tv_depth_spill_write_errors_total", { label = "depth rescue FAILED (permanent loss)", stat = "Sum" }]
+            [local.dash_namespace, "tv_depth_spill_write_errors_total", { label = "depth rescue FAILED (permanent loss)", stat = "Sum" }],
+            # The two SOFT-RAIL crossings, added 2026-09-01.
+            #
+            # Until that day the spill ceiling was `volume_total / 32` -- a
+            # constant, so it fired identically on an empty disk and a full
+            # one. It refused with 136 GB free and permanently discarded
+            # 5,141,980 ticks and 238,615,500 depth rows on a 55%-empty disk.
+            #
+            # The rail is now soft: past it, the writer probes FREE space and
+            # proceeds while a reserve remains. These two count that -- every
+            # rescue written past the old refusal point. A rising line is the
+            # fix WORKING; the same event before 2026-09-01 was a silent
+            # discard with no series at all.
+            #
+            # Depth reserves DOUBLE what ticks do (32 GiB vs 16 GiB), because
+            # ticks are decision-critical and depth is record-only. So the
+            # depth line going flat while the tick line still rises is the
+            # priority order working, not a fault.
+            #
+            # Deliberately NOT alarmed: crossing the soft rail is expected
+            # behaviour under database backpressure, and the loss alarms
+            # already page on the outcome that matters.
+            [local.dash_namespace, "tv_tick_spill_over_soft_ceiling_total", { label = "tick rescues past the soft rail (fix working)", stat = "Sum" }],
+            [local.dash_namespace, "tv_depth_spill_over_soft_cap_total", { label = "depth rescues past the soft rail (should stop first)", stat = "Sum" }],
+            # Non-finite optional prices dropped at the row boundary, charted
+            # 2026-09-01. It was emitted and logged but never shipped, on the
+            # written grounds that the EMF selector had "zero free bytes" --
+            # a measurement that was already stale: the selector had moved out
+            # of the user-data template entirely, which renders 2,003 bytes
+            # under its budget. A drop counter on the one writer that can
+            # permanently destroy market data was kept off CloudWatch by a
+            # blocker that no longer existed.
+            #
+            # Not alarmed: a non-finite optional price is a vendor data fault,
+            # not a system fault, and the row is still written with the field
+            # omitted. The line is here so a storm is VISIBLE, not so it pages.
+            [local.dash_namespace, "tv_tick_optional_price_dropped_total", { label = "non-finite optional prices dropped (vendor data fault)", stat = "Sum" }]
           ]
           period = 300
         }

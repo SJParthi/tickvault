@@ -5,7 +5,7 @@
 # Run `make help` to see all available targets.
 # =============================================================================
 
-.PHONY: help run run-supervised stop build test check fmt clippy clean \
+.PHONY: help run run-supervised stop build test check fmt clippy clippy-ci clean \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open questdb questdb-prod questdb-autoopen-install questdb-autoopen-uninstall \
         jaeger prometheus traefik alloy loki \
@@ -138,6 +138,9 @@ fmt: ## Format code
 clippy: ## Lint with clippy (zero warnings)
 	@cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
 	@echo "  ✅ Clippy clean"
+
+clippy-ci: ## Lint at EXACT CI scope (works when the cargo-clippy shim is missing)
+	@bash scripts/clippy-local.sh
 
 clean: ## Clean build artifacts
 	@cargo clean

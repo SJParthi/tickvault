@@ -1023,6 +1023,70 @@ fn assert_sorted_unique(allowlist: &[&str], name: &str) {
 
 // ============================ THIN SHELL ============================
 
+/// Strip Rust comments, string-literal aware.
+///
+/// Used by the `Command::new` spelling scan so a comment placed INSIDE the
+/// path (`Command::/*x*/new(`) cannot hide a spawn. String-aware because a
+/// `//` inside a literal is not a comment, and treating it as one would
+/// truncate real code and produce false FAILURES.
+fn strip_rs_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // A space, so `Command::/*x*/new(` does NOT silently become the
+            // canonical spelling here — normalisation removes whitespace
+            // afterwards, and the count comparison is what flags it.
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
 fn repo_root() -> PathBuf {
     // crates/common -> repo root
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2007,28 +2071,72 @@ version = \"0.1.57\"\n";
     );
 }
 
-/// (h) The native build toolchain the LOCKFILE pulls in may only shrink.
+/// EVERY tracked `Cargo.lock` in the repository, as `(path, package names)`.
+///
+/// # SCOPE FIX #13 (2026-09-01) — the twelfth hole, and it is the same shape
+/// as the eleven before it
+///
+/// Both lockfile guards used to read `root.join("Cargo.lock")` — one file.
+/// But the root manifest carries `exclude = ["fuzz"]`, so `fuzz/` is a
+/// SEPARATE cargo workspace with its own `fuzz/Cargo.lock` (a real, tracked,
+/// several-hundred-package graph), and `.github/workflows/fuzz.yml` runs
+/// `cargo fuzz build` against it every week in CI.
+///
+/// That file was invisible to all three mechanisms at once: the interpreter
+/// guard and the native-builder guard both read only the root path, and the
+/// token scan excludes `.lock` outright. A `pyo3`, `mlua`, `v8` or `cmake`
+/// arriving in the fuzz graph would have been green forever.
+///
+/// LATENT, not live — the fuzz graph is clean today. It is fixed anyway,
+/// because "clean today" is a measurement and this file exists precisely
+/// because measurements go stale while the guard around them does not.
+///
+/// The durable lesson, now recorded for the twelfth time: every one of these
+/// holes was in what the scan LOOKED AT, never in the tokens it banned. So
+/// this asks git which lockfiles exist rather than naming one.
+fn all_locked_graphs() -> Vec<(String, Vec<String>)> {
+    let root = repo_root();
+    let paths = git_ls_files(&["*Cargo.lock"]);
+    assert!(
+        !paths.is_empty(),
+        "RUST-ONLY GUARD IS BLIND: `git ls-files -- *Cargo.lock` matched nothing. \
+         At minimum the workspace root lockfile is tracked, so an empty result \
+         means the enumeration broke and both lockfile guards are enforcing \
+         nothing."
+    );
+    paths
+        .into_iter()
+        .map(|p| {
+            let lock = std::fs::read_to_string(root.join(&p))
+                .unwrap_or_else(|e| panic!("rust_only_guard: cannot read {p}: {e}"));
+            let names = locked_package_names(&lock);
+            // Anti-vacuity, PER FILE: a parser that returns nothing makes every
+            // assertion downstream trivially true, which is exactly how a guard
+            // reports green while enforcing nothing. Every real lockfile in this
+            // repository resolves hundreds of packages.
+            assert!(
+                names.len() > 100,
+                "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from \
+                 {p}. The lockfile format changed or the read failed, and this \
+                 guard is enforcing nothing.",
+                names.len()
+            );
+            (p, names)
+        })
+        .collect()
+}
+
+/// (h) The native build toolchain the LOCKFILES pull in may only shrink.
 #[test]
 fn native_build_toolchain_only_shrinks() {
     assert_sorted_unique(
         NATIVE_BUILD_TOOLCHAIN_BUDGET,
         "NATIVE_BUILD_TOOLCHAIN_BUDGET",
     );
-    let root = repo_root();
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
-        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
-    let names = locked_package_names(&lock);
-
-    // Anti-vacuity: a parser that returns nothing makes every assertion below
-    // trivially true, which is how a guard reports green while enforcing
-    // nothing. The graph has hundreds of packages.
-    assert!(
-        names.len() > 100,
-        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
-         The lockfile format changed or the read failed, and this guard is \
-         enforcing nothing.",
-        names.len()
-    );
+    // Union across every tracked lockfile — a build script that executes in
+    // the weekly fuzz lane executes just as truly as one in the main graph.
+    let graphs = all_locked_graphs();
+    let names: Vec<String> = graphs.iter().flat_map(|(_, n)| n.iter().cloned()).collect();
 
     // Every native-build-system driver we know how to name. Absence from this
     // list is not safety — it is the reason the list is a LIST and not a
@@ -2107,21 +2215,20 @@ fn native_build_toolchain_only_shrinks() {
 /// target-agnostic; that is a property of the FILE, not a breach.
 #[test]
 fn embedded_interpreters_are_absent_from_the_locked_graph() {
-    let root = repo_root();
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
-        .expect("rust_only_guard: Cargo.lock must exist — it is the pinned graph");
-    let names = locked_package_names(&lock);
-
-    // Anti-vacuity, same reason as the sibling test: a parser returning
-    // nothing would make the assertion below trivially true. That is the
-    // false-OK class this file exists to prevent, and it must never be the
-    // way THIS guard reports green.
+    // Every tracked lockfile, not just the root — see `all_locked_graphs`
+    // for SCOPE FIX #13. An interpreter embedded in the fuzz graph runs in
+    // CI just as truly as one in the main graph, and until 2026-09-01 it was
+    // invisible to this guard, to its native-builder sibling, and to the
+    // token scan simultaneously. Per-file anti-vacuity lives in the helper.
+    let graphs = all_locked_graphs();
+    let names: Vec<String> = graphs.iter().flat_map(|(_, n)| n.iter().cloned()).collect();
     assert!(
-        names.len() > 100,
-        "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from Cargo.lock. \
-         The lockfile format changed or the read failed, and this guard is \
-         enforcing nothing.",
-        names.len()
+        !names.is_empty(),
+        "RUST-ONLY GUARD IS BLIND: no package names across any tracked \
+         lockfile. Per-file anti-vacuity lives in `all_locked_graphs`; this \
+         is the belt-and-braces check that the UNION is non-empty, because a \
+         filter below over an empty list would report clean while enforcing \
+         nothing."
     );
 
     // Scripting/bytecode runtimes that would execute non-Rust code from
@@ -2453,5 +2560,194 @@ fn scope_fix_2026_08_19_self_test() {
         !rust_spawn_violations(&escaped).is_empty(),
         "self-test: an escaped quote inside a literal must not desynchronise \
          the scanner and hide the literal after it"
+    );
+}
+
+/// Markers that RENAME `std::process::Command`, defeating the spawn scan.
+///
+/// The spawn scan is marker-driven on the literal `Command::new("`. A single
+/// renamed import makes every spawn in that file invisible to it.
+const COMMAND_ALIAS_MARKERS: &[&str] = &[
+    ", Command as ",
+    "= std::process::Command;",
+    "process::Command as ",
+    "{Command as ",
+];
+
+/// Spellings of `Command::new(` that the spawn scan's literal marker misses.
+///
+/// The scan matches the exact substring `Command::new("`. Rust accepts several
+/// other spellings of the same call, and each one is invisible to it.
+///
+/// Scoped to `Command` DELIBERATELY. The obvious wider ban — any `>::new(` —
+/// was measured against this checkout and matches FOUR legitimate sites, all
+/// `Vec::<&str>::new()` / `Vec::<String>::new()` turbofish. A guard whose first
+/// act is four false positives on idiomatic Rust teaches the next reader that
+/// the cheapest fix is an allowlist, which is how three anchors in this file's
+/// own history were weakened. The narrow form costs nothing and stays credible.
+// Byte-sorted, as `assert_sorted_unique` requires. The grouping by KIND is in
+// the trailing comments rather than the order, because ' ' < ':' < '>' puts the
+// whitespace and qualified forms either side of each other.
+const COMMAND_SPELLING_MARKERS: &[&str] = &[
+    "Command ::new(",  // whitespace before `::`
+    "Command >::new(", // fully-qualified, spaced
+    "Command:: new(",  // whitespace after `::`
+    "Command::new (",  // whitespace before `(`
+    "Command::new(r",  // raw string: `r"python3"` / `r#"python3"#`
+    "Command>::new(",  // fully-qualified: `<std::process::Command>::new("…")`
+];
+
+/// SCOPE FIX #15 (2026-09-01) — the fourteenth hole, LATENT, closed before use.
+///
+/// Every previous fix in this file was written after a real class went
+/// unscanned. This one is written while the tree is CLEAN: all six spellings
+/// below have **zero occurrences** across `crates/` and `fuzz/`, measured on
+/// this checkout before the guard was added.
+///
+/// That is the point. The pattern this file records fourteen times is that a
+/// class nobody enumerated is invisible, and invisibility reads as green — so
+/// the cheapest moment to close a spelling hole is while nothing is using it
+/// and the ban therefore costs nothing to adopt.
+///
+/// | spelling | matches `Command::new("`? |
+/// |---|---|
+/// | `Command::new(r"python3")` | no — `(r` breaks the adjacency |
+/// | `<std::process::Command>::new("python3")` | no — `Command>::new(` |
+/// | `Command ::new("python3")` | no — space before `::` |
+/// | `Command:: new("python3")` | no — space after `::` |
+/// | `Command::new ("python3")` | no — space before `(` |
+///
+/// Each is ordinary Rust the compiler accepts, and `.rs` has no backstop: it
+/// is excluded from the token scan, carries no shebang, and is not a banned
+/// extension. The canonical `Command::new("…")` form remains available and is
+/// the one the spawn scan can see, so nothing legitimate is lost.
+#[test]
+fn command_new_is_never_written_in_a_spelling_the_spawn_scan_cannot_see() {
+    assert_sorted_unique(COMMAND_SPELLING_MARKERS, "COMMAND_SPELLING_MARKERS");
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for path in git_ls_files(&["*.rs"]) {
+        // This guard names the spellings it bans, so it cannot scan itself.
+        if path.ends_with("rust_only_guard.rs") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        scanned += 1;
+        for marker in COMMAND_SPELLING_MARKERS {
+            if content.contains(marker) {
+                violations.push(format!("{path}: contains `{marker}`"));
+            }
+        }
+
+        // SCOPE FIX #16 (2026-09-01) — close the CLASS, not a sixth literal.
+        //
+        // Adversarial review defeated the list above with two spellings it
+        // does not enumerate and never could, because the set is infinite:
+        //
+        //     std::process::Command::\n        new("python3")   // NEWLINE
+        //     std::process::Command::/*x*/new("python3")      // COMMENT
+        //
+        // Both compile; both passed 22/22 green. Enumerating a seventh
+        // literal would lose the same race again — the lesson this file
+        // records sixteen times is that a class nobody enumerated is
+        // invisible, and invisibility reads as green.
+        //
+        // So: strip comments, delete ALL whitespace, and compare COUNTS. A
+        // call that only becomes visible AFTER normalisation is, by
+        // definition, one the raw substring scan cannot see. Counts rather
+        // than presence, so a file holding one canonical call and one
+        // evasive call is still caught.
+        let decommented = strip_rs_comments(&content);
+        let normalised: String = decommented.chars().filter(|c| !c.is_whitespace()).collect();
+        let visible = decommented.matches("Command::new(").count();
+        let actual = normalised.matches("Command::new(").count();
+        if actual > visible {
+            violations.push(format!(
+                "{path}: {} `Command::new(` call(s) written with whitespace or a \
+                 comment inside the path, so the spawn scan cannot see them",
+                actual - visible
+            ));
+        }
+    }
+    assert!(
+        scanned > 100,
+        "self-test: expected to scan many .rs files, scanned {scanned} — the \
+         file list is broken and this guard is passing vacuously"
+    );
+    assert!(
+        violations.is_empty(),
+        "`Command::new` written in a spelling the spawn scan cannot see. Use \
+         the canonical `Command::new(\"…\")` form so the interpreter ban still \
+         applies:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// SCOPE FIX #14 (2026-09-01) — the thirteenth hole, PROVEN BY PLANTING.
+///
+/// The Rust spawn scan looks for the literal `Command::new("`. Renaming the
+/// type at the import site defeats it completely, and `.rs` is excluded from
+/// the token scan, has no shebang, and is not a banned extension — so there is
+/// no backstop whatsoever.
+///
+/// Measured on this checkout by planting four tracked `.rs` files:
+///
+/// | payload | result |
+/// |---|---|
+/// | `std::process::Command::new("python3")` (control) | FAILED, correctly |
+/// | `use ...Command as Runner; Runner::new("python3")` | **20 passed — green** |
+/// | `type Sh = std::process::Command; Sh::new("python3")` | **20 passed — green** |
+/// | `use ...Command as C; C::new("node")` | **20 passed — green** |
+///
+/// Only the import line differs between row 1 and row 2. Reachable from any
+/// compiled crate including `build.rs`, which executes on every `cargo build`,
+/// and an inline `-c` payload means no interpreted-language FILE ever lands.
+///
+/// This bans the RENAME rather than enumerating one more alias name, because
+/// enumerating the next name is the approach that has now been wrong fourteen
+/// times. Zero legitimate aliased imports existed when this landed, so the ban
+/// costs nothing; if one is ever genuinely needed, the canonical unaliased
+/// form is always available and is the form the spawn scan can see.
+#[test]
+fn command_is_never_aliased_past_the_spawn_scan() {
+    assert_sorted_unique(COMMAND_ALIAS_MARKERS, "COMMAND_ALIAS_MARKERS");
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for path in git_ls_files(&["*.rs"]) {
+        // This guard names the markers it bans; scanning itself is
+        // self-referential, exactly as the sibling spawn scan documents.
+        if path.ends_with("crates/common/tests/rust_only_guard.rs") {
+            continue;
+        }
+        let content = std::fs::read_to_string(root.join(&path))
+            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        scanned += 1;
+        for marker in COMMAND_ALIAS_MARKERS {
+            if content.contains(marker) {
+                violations.push(format!("{path}: renames Command via `{marker}`"));
+            }
+        }
+    }
+
+    // Anti-vacuity: a glob that matches nothing, or a read that fails open,
+    // would make this assertion trivially true — the exact false-OK class this
+    // file exists to prevent.
+    assert!(
+        scanned > 100,
+        "RUST-ONLY GUARD IS BLIND: scanned only {scanned} .rs file(s). The \
+         enumeration broke and this guard is enforcing nothing."
+    );
+
+    assert!(
+        violations.is_empty(),
+        "RUST-ONLY VIOLATION: `std::process::Command` is renamed, which makes \
+         every spawn in that file invisible to the `Command::new(\"` spawn \
+         scan: {violations:?}. Use the canonical unaliased form so the scan \
+         can see it. See SCOPE FIX #14 above — this exact shape was planted \
+         and passed 20/20 green before this guard existed."
     );
 }

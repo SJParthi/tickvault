@@ -628,16 +628,32 @@ pub fn depth_spill_max_bytes() -> u64 {
 /// rescue the cap protects. Duplicated from the tick writer's private helper
 /// rather than shared, because that one is module-private there.
 fn depth_spill_dir_bytes(dir: &Path) -> u64 {
+    // Counts the quarantine subtree, matching the tick twin
+    // (`tick_persistence::spill_dir_bytes`).
+    //
+    // FIXED 2026-09-01 (adversarial review). The tick side gained this on
+    // 2026-08-28; depth never did, and the asymmetry was load-bearing: the
+    // replay supervisor quarantines unparseable depth files into
+    // `<dir>/quarantine`, and quarantined bytes occupy the same volume while
+    // counting toward nothing here. A directory holding 9 GB of quarantine
+    // and 2 GB of live files reported 2 GB against a 10 GB cap — so the cap,
+    // and every reserve decision behind it, could never engage. A rail that
+    // cannot fire is not a conservative rail; it is an absent one.
     // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| e.metadata().ok())
-        .filter(std::fs::Metadata::is_file)
-        .map(|m| m.len())
-        .sum()
+    fn files_in(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    }
+    files_in(dir).saturating_add(files_in(
+        &dir.join(crate::tick_spill_replay::QUARANTINE_DIR),
+    ))
     // O(1) EXEMPT: end
 }
 
@@ -679,15 +695,161 @@ fn spill_failed_depth_ilp(
     feed: Feed,
     now_unix_secs: i64,
     cap_bytes: u64,
+    min_free_headroom_bytes: u64,
 ) -> std::io::Result<PathBuf> {
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
 
-    if depth_spill_dir_bytes(dir) >= cap_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            format!("depth spill dir at or past its {cap_bytes}-byte cap"),
-        ));
+    // SOFT cap, not a refusal — see the twin in `tick_persistence.rs`.
+    //
+    // MEASURED IN PRODUCTION 2026-09-01: this exact arm fired 48 times with
+    // `cap_bytes = 10_063_871_360` while `df` reported 143 GB free, and
+    // 238,615,500 depth rows were permanently discarded. Depth carries ~24x the
+    // tick row volume against an IDENTICALLY sized ceiling, which is why the
+    // depth twin failed 12x more often than the tick one for the same defect.
+    //
+    // The rail's intent — the rescue tier must never starve QuestDB — is kept.
+    // Only the measured quantity changes: from the volume's TOTAL size, which
+    // cannot threaten anything, to FREE space, which is the only thing that can.
+    // LAZY PROBE (2026-09-01, adversarial review). The tick twin was repaired
+    // for this the same day and the depth twin was left behind, so the fork
+    // this guard removed on one path was still being paid on the other.
+    //
+    // `spill_free_bytes(dir)` is an EAGERLY evaluated argument, so passing it
+    // unconditionally forks `df` on EVERY rescue — including the common
+    // under-cap case, which needs no free-space answer at all. Combined with
+    // the per-write floor below that was TWO forks per depth rescue, on a path
+    // that can run on the frame-drain task.
+    let held = depth_spill_dir_bytes(dir);
+    if held >= cap_bytes {
+        match crate::tick_persistence::classify_spill_ceiling(
+            held,
+            cap_bytes,
+            crate::tick_persistence::spill_free_bytes(dir),
+            // DEPTH reserve, NOT the tick reserve — depth must refuse first.
+            // See `DEPTH_SPILL_FREE_RESERVE_BYTES` for the derivation and for
+            // why sharing one reserve let record-only depth starve
+            // decision-critical ticks out of their rescue path.
+            crate::tick_persistence::DEPTH_SPILL_FREE_RESERVE_BYTES,
+        ) {
+            crate::tick_persistence::SpillCeilingVerdict::UnderCeiling => {}
+            crate::tick_persistence::SpillCeilingVerdict::OverCeilingWithRoom => {
+                metrics::counter!("tv_depth_spill_over_soft_cap_total").increment(1);
+            }
+            crate::tick_persistence::SpillCeilingVerdict::OverCeilingNoRoom => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "depth spill dir past its {cap_bytes}-byte soft cap and free space is \
+                     at or below the database reserve — refusing so QuestDB keeps room \
+                     to operate"
+                    ),
+                ));
+            }
+            crate::tick_persistence::SpillCeilingVerdict::OverCeilingProbeFailed => {
+                // Twin of the tick ceiling arm (2026-09-01): count the blind
+                // refusal, or a broken `df` disables depth rescue for the
+                // whole session with no counter naming the cause.
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth")
+                    .increment(1);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "depth spill dir past its {cap_bytes}-byte soft cap and the free-space \
+                     probe failed — refusing rather than growing blind"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // PER-WRITE FREE-SPACE FLOOR (2026-09-01, adversarial review).
+    //
+    // The ceiling above engages only once the spill directory is past its
+    // size rail. Below it, this tier previously wrote with NO free-space
+    // consultation at all -- and that is the regime depth spends most of its
+    // life in. A 4 GB spill directory against a 10 GB rail reads
+    // `UnderCeiling` and wrote freely onto a disk whose free space had
+    // dropped to under a gigabyte, which is exactly the WAL-suspension
+    // outage this tier exists to avoid.
+    //
+    // The floor is the TICK TIER'S CEILING RESERVE, not a multiple of the tick
+    // floor. See `DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES` for why a ratio was the
+    // wrong shape and let a live inversion through.
+    //
+    // INJECTED, not read from the constant. Production passes
+    // `DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES`; tests pass a small value where
+    // they need the ALLOW arm. Without the parameter the floor's own tests
+    // would assert an outcome that depends on the build machine's free space
+    // -- the exact environment-dependence trap the sibling test below records
+    // falling into once already. `cap_bytes` was injected for that reason from
+    // the start; the floor simply had not caught up.
+    //
+    // Not memoised, deliberately: free space is a moving quantity and a
+    // cached answer describes a disk that no longer exists. One probe per
+    // rescue is free -- a rescue only happens when a flush already failed.
+    // FAIL CLOSED when the probe fails -- deliberately NOT the tick twin's
+    // fail-open (2026-09-01, second adversarial round, hours after the reserve
+    // split this defeats was shipped).
+    //
+    // The tick tier fails OPEN here and its comment gives a good reason: one
+    // broken `df` must not disable the whole rescue tier. Copying that
+    // reasoning to depth reintroduced the exact inversion the two-reserve
+    // split exists to prevent. Both tiers refuse on a failed probe INSIDE
+    // their ceiling arm, and that arm engages only once the tier's own spill
+    // directory is past its rail -- and the directories are INDEPENDENT:
+    //
+    //     `df` broken, tick dir over its ceiling, depth dir under its cap
+    //       ticks -> OverCeilingProbeFailed  -> REFUSE
+    //       depth -> ceiling arm skipped     -> fail-open -> WRITE
+    //
+    // Decision-critical ticks discarded while record-only depth is written.
+    // Reachable, not theoretical: a single-table WAL suspension grows one
+    // directory and not the other, which is what happened on 2026-08-25 when
+    // fourteen tables suspended individually.
+    //
+    // The reserves' `const _` assert cannot see this. It compares byte values;
+    // the probe-failure path carries none -- it is the whole `None` domain.
+    //
+    // Depth is record-only and carries ~24x the tick row volume, so a blind
+    // `df` now costs depth rows and never tick rows. That is the ordering the
+    // operator set. The refusal is counted by the same blind counter, so the
+    // event stays visible either way.
+    let free_now = crate::tick_persistence::spill_free_bytes(dir);
+    match crate::tick_persistence::classify_spill_floor(
+        free_now,
+        payload.len() as u64,
+        min_free_headroom_bytes,
+        crate::tick_persistence::BlindWritePolicy::FailClosed,
+    ) {
+        crate::tick_persistence::SpillFloorVerdict::Allow => {}
+        crate::tick_persistence::SpillFloorVerdict::AllowProbeFailed => {
+            // Only reachable with the floor DISABLED (`0`), which is the value
+            // tests inject to exercise the allow arm without depending on the
+            // build machine's free space.
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
+        }
+        crate::tick_persistence::SpillFloorVerdict::RefuseProbeFailed => {
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "refusing a depth spill: the free-space probe failed and depth is \
+                 record-only -- it must not write blind while decision-critical ticks \
+                 may need the room",
+            ));
+        }
+        crate::tick_persistence::SpillFloorVerdict::RefuseNoRoom => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte depth spill: only {} bytes free, and the write \
+                     must leave {min_free_headroom_bytes} bytes of headroom -- depth is \
+                     record-only and must not consume the room decision-critical ticks need",
+                    payload.len(),
+                    free_now.unwrap_or(0)
+                ),
+            ));
+        }
     }
 
     // One file per feed per hour: bounded file count, and an operator replaying
@@ -780,6 +942,16 @@ pub struct DepthWriter {
     /// Spill directory. Production uses [`DEPTH_SPILL_DIR`]; tests get an
     /// isolated temp dir so they never write into the repo.
     spill_dir: PathBuf,
+    /// Per-write free-space floor for the rescue tier. Production carries
+    /// `DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES`; tests carry 0.
+    ///
+    /// A FIELD rather than a `cfg(test)` branch, deliberately: a `cfg` split
+    /// on a data-integrity decision means the tested code is not the shipped
+    /// code, which is the common-runtime violation this repository forbids.
+    /// With a field, production and tests run the identical path and differ
+    /// only in a value -- and the value itself is pinned by the direct-call
+    /// tests that exercise both arms.
+    spill_min_free_headroom: u64,
     /// Hand-off queue to the depth writer thread when this writer has been
     /// split by [`DepthWriter::split_for_offload`]. `None` means the
     /// synchronous arm, which is what every non-lane caller still uses.
@@ -881,6 +1053,8 @@ impl DepthWriter {
                     dropped: 0,
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
+                    spill_min_free_headroom:
+                        crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
                     offload: None,
                     rescue: None,
                     retained_spans: 0,
@@ -900,6 +1074,8 @@ impl DepthWriter {
                     dropped: 0,
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
+                    spill_min_free_headroom:
+                        crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
                     offload: None,
                     rescue: None,
                     retained_spans: 0,
@@ -926,9 +1102,33 @@ impl DepthWriter {
             dropped: 0,
             rescued: 0,
             spill_dir: temp_depth_spill_dir(),
+            spill_min_free_headroom: 0,
             offload: None,
             rescue: None,
             retained_spans: 0,
+        }
+    }
+
+    /// A short-lived stand-in for `std::mem::replace`, carrying the REAL floor.
+    ///
+    /// `for_test` sets `spill_min_free_headroom: 0`, and production code uses
+    /// it as a placeholder while swapping the live writer out for its offload
+    /// split. Adversarial review flagged the shape (2026-09-01): the window is
+    /// transient today — the real producer is installed two lines later with
+    /// no early return in between — but a floor of ZERO means NO floor on the
+    /// sighted path, so any future edit that returns or `?`s inside that
+    /// window would leave a depth writer spilling with nothing checking free
+    /// space at all.
+    ///
+    /// Rather than pin the window with a test that a refactor can silently
+    /// invalidate, the placeholder simply carries the production floor. Then
+    /// the hazard is not "guarded" — it does not exist.
+    #[must_use]
+    // TEST-EXEMPT: a construction-shape helper; its behaviour is the production floor, pinned by `the_mem_replace_placeholder_carries_the_production_floor`.
+    pub fn placeholder_for_offload_swap(feed: Feed) -> Self {
+        Self {
+            spill_min_free_headroom: crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+            ..Self::for_test(feed)
         }
     }
 
@@ -1147,7 +1347,13 @@ impl DepthWriter {
             }
         }
 
-        if perform_depth_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, rows) {
+        if perform_depth_rescue(
+            &self.spill_dir,
+            self.buffer.as_bytes(),
+            self.feed,
+            rows,
+            self.spill_min_free_headroom,
+        ) {
             self.rescued = self.rescued.saturating_add(rows as u64);
         }
         self.buffer.clear();
@@ -1186,6 +1392,7 @@ impl DepthWriter {
             sender: self.sender.take(),
             feed: self.feed,
             spill_dir: self.spill_dir.clone(),
+            spill_min_free_headroom: self.spill_min_free_headroom,
         };
         self.offload = Some(tx);
         (self, sink, rx)
@@ -1201,6 +1408,7 @@ impl DepthWriter {
         let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_RESCUE_QUEUE_DEPTH);
         let sink = DepthRescueSink {
             spill_dir: self.spill_dir.clone(),
+            spill_min_free_headroom: self.spill_min_free_headroom,
             feed: self.feed,
         };
         self.rescue = Some(tx);
@@ -1587,6 +1795,7 @@ impl DepthRescueBatch {
 /// The depth rescue thread's half: everything the write needs, and nothing else.
 pub struct DepthRescueSink {
     spill_dir: PathBuf,
+    spill_min_free_headroom: u64,
     feed: Feed,
 }
 
@@ -1602,6 +1811,7 @@ impl DepthRescueSink {
             batch.buffer.as_bytes(),
             self.feed,
             batch.rows,
+            self.spill_min_free_headroom,
         );
     }
 }
@@ -1613,12 +1823,25 @@ impl DepthRescueSink {
 /// SAME code serves the thread and the fallback; two copies would have drifted,
 /// and the one that drifted would have been the fallback — the path that only
 /// runs on the worst day.
-fn perform_depth_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, rows: usize) -> bool {
+fn perform_depth_rescue(
+    spill_dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    rows: usize,
+    min_free_headroom_bytes: u64,
+) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    match spill_failed_depth_ilp(spill_dir, payload, feed, now, depth_spill_max_bytes()) {
+    match spill_failed_depth_ilp(
+        spill_dir,
+        payload,
+        feed,
+        now,
+        depth_spill_max_bytes(),
+        min_free_headroom_bytes,
+    ) {
         Ok(path) => {
             // BOTH counters, and the EMF-shipped one is not optional: it is the
             // only depth series an alarm watches, so incrementing only the new
@@ -1768,6 +1991,7 @@ pub struct DepthWriterSink {
     sender: Option<Sender>,
     feed: Feed,
     spill_dir: PathBuf,
+    spill_min_free_headroom: u64,
 }
 
 impl DepthWriterSink {
@@ -1826,6 +2050,7 @@ impl DepthWriterSink {
             self.feed,
             now,
             depth_spill_max_bytes(),
+            self.spill_min_free_headroom,
         ) {
             Ok(path) => {
                 metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
@@ -2428,17 +2653,31 @@ mod tests {
              the false-OK this tier exists to avoid"
         );
         assert!(
-            spill_failed_depth_ilp(&dir, b"x\n", Feed::Dhan, 0, DEPTH_SPILL_MAX_BYTES).is_err(),
+            spill_failed_depth_ilp(&dir, b"x\n", Feed::Dhan, 0, DEPTH_SPILL_MAX_BYTES, 0).is_err(),
             "the spill helper reports the failure rather than claiming success"
         );
         let _ = std::fs::remove_file(&dir);
     }
     #[test]
-    fn the_bound_refuses_a_spill_once_the_directory_is_at_the_cap() {
-        // The enforcement itself, end to end. The cap is a PARAMETER precisely
-        // so this can bite without writing half a gigabyte onto a volume that
-        // is 86% full — a disk guard whose test must fill the disk is a guard
-        // nobody exercises.
+    fn the_cap_is_a_soft_rail_measured_against_free_space_not_total_size() {
+        // RE-BLESSED 2026-09-01, and the reason matters more than the edit.
+        //
+        // This test used to assert that reaching the cap REFUSES, full stop.
+        // That is the behaviour that discarded 238,615,500 depth rows in
+        // production on 2026-09-01 with 136 GB free, because the cap was
+        // derived from the volume's TOTAL size -- a number that never moves,
+        // so it fired identically on an empty disk and a full one.
+        //
+        // The rail's INTENT is unchanged and still pinned below: the rescue
+        // tier must never starve the database it rescues from. What changed is
+        // the quantity the refusal is measured against.
+        //
+        // Note what the OLD shape made untestable. A unit test cannot
+        // manufacture a nearly-full filesystem, so the arm that actually
+        // protects the database was the one arm no test could reach -- while
+        // the arm that lost the data was the one it pinned. Splitting the
+        // decision out as `classify_spill_ceiling` fixes that: every arm is
+        // now reachable from a table of numbers, and both are asserted here.
         let dir = spill_tmp("at-cap");
         std::fs::create_dir_all(&dir).expect("mk dir");
         let seeded = b"already-here\n";
@@ -2454,30 +2693,122 @@ mod tests {
             "the cap is measured from real bytes on disk"
         );
 
-        // Under the cap: accepted.
-        spill_failed_depth_ilp(&dir, b"under\n", Feed::Dhan, 1_700_000_000, held + 1)
-            .expect("below the cap the rescue must succeed — otherwise the test is vacuous");
+        // Under the cap: accepted. (Unchanged.)
+        spill_failed_depth_ilp(&dir, b"under\n", Feed::Dhan, 1_700_000_000, held + 1, 0)
+            .expect("below the cap the rescue must succeed -- otherwise the test is vacuous");
 
-        // At the cap: REFUSED, and classifiable so the "cap" counter stage is
-        // the right one.
-        let err = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held)
-            .expect_err("at the cap the rescue must refuse rather than fill the disk");
-        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
-        assert!(
-            format!("{err}").contains(&held.to_string()),
-            "the refusal names the ceiling it hit: {err}"
+        // AT the cap: the outcome must AGREE with the classifier for whatever
+        // free space this machine actually has.
+        //
+        // Written this way after the first draft asserted a fixed ALLOW and
+        // failed on a build container with 8.6 GiB free -- under the 16 GiB
+        // reserve, so the code was right and the test was wrong. CI runners
+        // sit in the same range, so a fixed-outcome assertion here is
+        // environment-dependent by construction: it would have passed on the
+        // prod box (138 GB free) and failed every CI run, which is the worst
+        // possible place to learn it.
+        //
+        // Agreement is the stronger property anyway. A fixed ALLOW only proves
+        // one arm on one machine; this proves the writer genuinely CONSULTS
+        // `classify_spill_ceiling` rather than deciding on its own -- on any
+        // machine, at whatever free space it happens to have. The arms
+        // themselves are pinned exhaustively below, where no filesystem is
+        // involved at all.
+        use crate::tick_persistence::{
+            DEPTH_SPILL_FREE_RESERVE_BYTES, SpillCeilingVerdict, classify_spill_ceiling,
+            spill_free_bytes,
+        };
+        let expected = classify_spill_ceiling(
+            depth_spill_dir_bytes(&dir),
+            held,
+            spill_free_bytes(&dir),
+            DEPTH_SPILL_FREE_RESERVE_BYTES,
         );
-
-        // The refusal is a REFUSAL, not a partial write.
-        let after = depth_spill_dir_bytes(&dir);
-        let body =
-            std::fs::read_to_string(dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")))
+        let outcome = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held, 0);
+        match expected {
+            SpillCeilingVerdict::OverCeilingWithRoom => {
+                outcome.expect(
+                    "this machine has room, so the rescue must be ALLOWED -- refusing \
+                     with room is what discarded 238,615,500 rows onto a 55%-empty disk",
+                );
+                let body = std::fs::read_to_string(
+                    dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")),
+                )
                 .unwrap_or_default();
-        assert!(
-            !body.contains("over"),
-            "a capped rescue must write NOTHING, not a truncated row: {body}"
+                assert!(
+                    body.contains("over"),
+                    "an allowed rescue must actually have written the row: {body}"
+                );
+            }
+            SpillCeilingVerdict::OverCeilingNoRoom
+            | SpillCeilingVerdict::OverCeilingProbeFailed => {
+                let err = outcome.expect_err(
+                    "this machine is at or below the database reserve, so the rescue \
+                     must REFUSE -- that is the case the rail exists for",
+                );
+                assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+                // The refusal is a REFUSAL, not a partial write.
+                let body = std::fs::read_to_string(
+                    dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")),
+                )
+                .unwrap_or_default();
+                assert!(
+                    !body.contains("over"),
+                    "a refused rescue must write NOTHING, not a truncated row: {body}"
+                );
+            }
+            SpillCeilingVerdict::UnderCeiling => panic!(
+                "the fixture seeds the directory TO the cap, so this arm is \
+                 unreachable -- if it fires, the seeding no longer works and \
+                 every assertion above it is vacuous"
+            ),
+        }
+
+        // AT the cap on a disk WITHOUT room: still REFUSED. This is the arm
+        // the rail exists for, and the arm the old shape could never test.
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "exactly ON the reserve must refuse -- at a boundary the safe \
+             direction is the database's"
         );
-        assert_eq!(after, depth_spill_dir_bytes(&dir));
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES - 1),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "below the reserve must refuse -- this is the whole point of the rail"
+        );
+        assert_eq!(
+            classify_spill_ceiling(held, held, None, DEPTH_SPILL_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::OverCeilingProbeFailed,
+            "an UNREADABLE free-space number must refuse. Optimism here trades \
+             a bounded tick loss for an unbounded disk, which is the outage \
+             this tier exists to avoid"
+        );
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES + 1),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingWithRoom,
+            "one byte over the reserve is room, and must be allowed"
+        );
+        assert_eq!(
+            classify_spill_ceiling(held - 1, held, None, DEPTH_SPILL_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::UnderCeiling,
+            "below the rail the probe must not even be consulted"
+        );
 
         // And production really does pass the const, so the bound above is the
         // one that fires on the box.
@@ -2885,5 +3216,38 @@ mod tests {
                 name.len()
             );
         }
+    }
+
+    /// The `mem::replace` placeholder must carry the REAL floor.
+    ///
+    /// `for_test` sets the floor to 0, and 0 means NO floor on the sighted
+    /// path — a writer that always has room. Production briefly holds a
+    /// placeholder while swapping the live writer for its offload split; the
+    /// window is transient today, but a floor-0 depth writer escaping it would
+    /// spill with nothing checking free space, which is the exact inversion
+    /// the typed blind-write policy was introduced to make impossible.
+    #[test]
+    fn the_mem_replace_placeholder_carries_the_production_floor() {
+        let placeholder = DepthWriter::placeholder_for_offload_swap(Feed::Dhan);
+        assert_eq!(
+            placeholder.spill_min_free_headroom,
+            crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+            "the placeholder must carry the production depth floor, not the \
+             test writer's zero"
+        );
+        assert!(
+            placeholder.spill_min_free_headroom > 0,
+            "a floor of zero is not a floor — it allows any write the probe \
+             can see space for, however little"
+        );
+        // Non-vacuous: the thing it is derived FROM really does carry zero, so
+        // this test would fail if someone "simplified" the placeholder back to
+        // `for_test`.
+        assert_eq!(
+            DepthWriter::for_test(Feed::Dhan).spill_min_free_headroom,
+            0,
+            "for_test is expected to carry 0 — if that changed, this test is \
+             no longer proving anything and should be re-derived"
+        );
     }
 }

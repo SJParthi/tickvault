@@ -365,7 +365,22 @@ fn a_refused_handoff_falls_back_inline_rather_than_dropping() {
     // the old inline route. A `_ =>` arm that discarded here would reintroduce
     // the 2026-08-19 defect one layer further in, where the source scans above
     // (which watch `dhan_feed_stack`) cannot see it.
-    let runner = strip_line_comments(&read("crates/storage/src/seal_writer_runner.rs"));
+    // Scan PRODUCTION code only. The file's own `#[cfg(test)]` module contains
+    // string literals that quote the very lines asserted on below, so scanning
+    // the whole file lets a test's text satisfy a claim about the code -- the
+    // guard then passes with the production line DELETED. Verified by bite test
+    // on 2026-09-01: removing `self.inline_fallback.increment(1)` at :482 still
+    // passed, because `:1380` mentions it inside a quoted assertion.
+    let whole = strip_line_comments(&read("crates/storage/src/seal_writer_runner.rs"));
+    let runner = whole
+        .split_once("#[cfg(test)]")
+        .map(|(prod, _)| prod.to_string())
+        .unwrap_or(whole);
+    assert!(
+        runner.len() > 1_000,
+        "the production half of seal_writer_runner.rs scanned empty -- every
+         assertion below would pass vacuously"
+    );
     let code = squash(&runner);
     assert!(
         code.contains(
@@ -376,10 +391,32 @@ fn a_refused_handoff_falls_back_inline_rather_than_dropping() {
         "both refusal arms must be handled together and must keep the item — a discard here \
          is a silent seal loss that no `dhan_feed_stack` scan can reach"
     );
+    // The PROPERTY is "the inline fallback is counted". Assert that, not one
+    // syntax for it.
+    //
+    // This assertion used to be the literal
+    // `SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1)`, i.e. the bare
+    // `metrics::counter!` macro form. On 2026-09-01 that form was deliberately
+    // REPLACED by a pre-resolved `metrics::Counter` handle, because this site
+    // sits on the per-tick fold and the bare macro is banned there (it drops to
+    // an allocating arm on a non-literal label -- the `record_ws_lag` incident,
+    // ~36M allocations/hour). So the guard failed on a change that made the code
+    // strictly BETTER, while the behaviour it exists to protect was untouched.
+    //
+    // That is the drift class this repository has been bitten by before: a
+    // source-scan guard tied to a spelling rather than to a fact. Both forms are
+    // accepted now, and the handle form additionally requires the const to be
+    // BOUND to that field -- otherwise `self.inline_fallback` could be wired to
+    // some other metric name and this would still pass.
+    let macro_form = code.contains("SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1)");
+    let handle_form = code
+        .contains("inline_fallback: metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER)")
+        && code.contains("self.inline_fallback.increment(1)");
     assert!(
-        code.contains("SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(1)"),
+        macro_form || handle_form,
         "the inline fallback must be counted, or a permanently-behind escalation thread looks \
-         identical to a healthy one"
+         identical to a healthy one. Neither the bare-macro form nor a pre-resolved handle \
+         bound to SEAL_ESCALATION_INLINE_FALLBACK_COUNTER was found."
     );
 }
 

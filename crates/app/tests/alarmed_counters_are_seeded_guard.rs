@@ -56,8 +56,21 @@ const KNOWN_INDIRECT: &[&str] = &[
     // Built from a `for_each` map of error codes; the metric is a log METRIC
     // FILTER, not a counter this process emits, so there is nothing to seed.
     "error-code-alarms.tf",
-    // Same: log metric filters over coded ERROR lines.
-    "live-lane-alarms.tf",
+    // ⚠ REMOVED 2026-09-01 (adversarial review). This file was exempted with
+    // the reason "Same: log metric filters over coded ERROR lines." That is
+    // FALSE and measurably so: `live-lane-alarms.tf` contains TWENTY-THREE
+    // alarms on `namespace = local.app_namespace` and ZERO
+    // `aws_cloudwatch_log_metric_filter` resources. Among them are
+    // `tv_ticks_lost_total`, `tv_dhan_ws_wal_dropped_total`,
+    // `tv_ws_frame_wal_reinjected_dropped_total` and
+    // `tv_aggregator_slot_exhausted_total` — the loss counters this guard
+    // exists for.
+    //
+    // Every one happens to be seeded today, so nothing was broken. What was
+    // broken is the GUARD: a new loss alarm added to that file was unchecked
+    // BY CONSTRUCTION, and the exemption's own wording made it look
+    // deliberate. An exemption that is written down can be argued with — but
+    // only if what it says is true.
 ];
 
 /// Metric names that are GAUGES, which have no dropped-first-sample hazard.
@@ -72,24 +85,96 @@ const KNOWN_INDIRECT: &[&str] = &[
 /// permanently healthy. Fixing them means either adding the producer or
 /// deleting the alarm — a decision, not a seeding.
 const KNOWN_NO_PRODUCER: &[&str] = &[
+    // ⚠ CORRECTED 2026-09-01 (adversarial review). This list previously
+    // carried THREE names under the heading "DEAD MONITORS", with the claim:
+    // "Verified 2026-08-28: no `counter!`, `gauge!` or `histogram!` anywhere
+    // in `crates/*/src` emits these names, so their alarms are permanently
+    // green and always will be."
+    //
+    // That was FALSE for two of the three, and it was written as a dated,
+    // VERIFIED claim — the most trusted shape a comment can take:
+    //
+    //   tv_telegram_dropped_total          seeded on all three `reason`
+    //                                      labels at `main.rs` and
+    //                                      incremented at
+    //                                      `notification/coalescer.rs`. It is
+    //                                      ALSO produced by a log metric
+    //                                      filter in telegram-drop-alarm.tf,
+    //                                      so it is alive in both lanes.
+    //   tv_wal_suspension_probe_failed_total
+    //                                      emitted twice in
+    //                                      `storage/src/wal_suspension_watcher.rs`.
+    //
+    // Both are removed, so the guard now REQUIRES them to stay seeded. The
+    // cost of the stale entry was not a broken alarm — both were fine — but a
+    // comment that told the next reader two live counters were dead. That is
+    // the manufactures-a-false-finding class this repository keeps paying
+    // for, and it cost a session: an audit run today reported one of them as
+    // a CRITICAL blind spot on the strength of exactly this reasoning.
+    //
     // Emitted by a Lambda (`crates/aws-lambdas/src/deploy_watchdog.rs`), not
     // by this process. Correctly unseeded here.
     "tv_binary_main_sha_mismatch",
     // A DERIVED metric: the alarm reads a log metric filter, not a counter we
     // emit. Nothing to register.
     "tv_orders_placed_delta_total",
-    // ⚠ DEAD MONITORS. Verified 2026-08-28: no `counter!`, `gauge!` or
-    // `histogram!` anywhere in `crates/*/src` emits these names, so their
-    // alarms are permanently green and always will be. Left listed rather than
-    // fixed because the fix is a design call — add the producer, or retire the
-    // alarm — and the same class is already recorded in
-    // `dhan-rest-only-noise-lock-2026-07-14.md`.
-    "tv_telegram_dropped_total",
+    // The one genuinely producerless name of the original three. Re-verified
+    // 2026-09-01: zero `counter!`/`gauge!`/`histogram!` sites anywhere in
+    // `crates/*/src`. Its alarm is permanently green and always will be, so
+    // this stays a real open finding — add the producer or retire the alarm.
     "tv_order_fill_lag_seconds",
-    "tv_wal_suspension_probe_failed_total",
+];
+
+/// Counters seeded through a PRE-RESOLVED HANDLE rather than a named literal,
+/// with the verified seeding site for each.
+///
+/// # Why this list has to exist (2026-09-01)
+///
+/// The extractor reads `increment(0)` calls and resolves the metric NAME from
+/// the adjacent literal or constant. That works for
+/// `counter!("tv_x").increment(0)` and cannot work for
+/// `self.wal_dropped.increment(0)`, where the name was bound to a struct field
+/// somewhere else entirely. Following a field back to its metric name needs
+/// dataflow analysis, which a source scan does not have.
+///
+/// These four surfaced the moment `live-lane-alarms.tf` lost its blanket
+/// exemption. Every one was checked by hand and every one is CORRECTLY seeded
+/// — with the per-label fan-out `main.rs` could not produce, because only the
+/// construction site knows its own `endpoint` / `ws_type` / `source` values.
+/// Adding a duplicate literal seed in `main.rs` to satisfy the scanner would
+/// have made the code worse and the guard no truer.
+///
+/// A per-metric exemption with evidence is strictly better than the file-wide
+/// one it replaces: the other nineteen alarms in that file are now genuinely
+/// checked, and a NEW loss alarm added there is caught.
+const SEEDED_VIA_HANDLE: &[(&str, &str)] = &[
+    (
+        "tv_ticks_lost_total",
+        "SpillDropCounters::new (storage/src/ws_frame_spill.rs) builds a \
+         handle per (source x ws_type) and loops `increment(0)` over all of \
+         them at construction.",
+    ),
+    (
+        "tv_dhan_ws_wal_dropped_total",
+        "WalRingSink::pre_register (core/src/websocket/pool_supervisor.rs) \
+         seeds it per endpoint label at sink construction.",
+    ),
+    (
+        "tv_dhan_ws_ring_full_total",
+        "WalRingSink::pre_register — same site, same call.",
+    ),
+    (
+        "tv_dhan_ws_ring_bytes_full_total",
+        "WalRingSink::pre_register — same site, same call.",
+    ),
 ];
 
 const KNOWN_GAUGES: &[&str] = &[
+    // ADDED 2026-09-01. Surfaced when `live-lane-alarms.tf` lost its blanket
+    // exemption. Emitted as `metrics::gauge!(REBALANCE_AGE_SECS).set(..)` in
+    // `depth_rebalance.rs` — a gauge is published verbatim, with no delta and
+    // no dropped first sample, so it has no seeding hazard at all.
+    "tv_depth_rebalance_age_secs",
     "tv_dhan_feed_stack_up",
     "tv_dhan_ws_alive_connections",
     "tv_questdb_wal_suspended_tables",
@@ -176,6 +261,80 @@ fn zero_registered_names() -> std::collections::BTreeSet<String> {
     out
 }
 
+/// Remove Rust comments before scanning for registrations.
+///
+/// # Why this exists (2026-09-01, found by adversarial review)
+///
+/// Without it this guard had a CRITICAL false-OK: the terraform side already
+/// stripped `#` comments, but the Rust side split raw source on
+/// `metrics::counter!(`, so a registration that had been COMMENTED OUT still
+/// counted as present. Bite-proven — prefixing a real seeding line with `//`
+/// left the guard fully green while the counter lost its baseline and its
+/// alarm went dead on the first episode. That is precisely the failure this
+/// guard exists to prevent, hiding inside the guard itself.
+///
+/// String-literal aware: a `//` inside a metric name or message must not be
+/// treated as the start of a comment, or stripping would corrupt the very
+/// literals the scan is looking for.
+fn strip_rust_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                // Escaped char: copy it verbatim so `\"` never ends the string.
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            // Line comment: drop through end of line, keep the newline so
+            // line-oriented context in panic messages stays meaningful.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            // Block comment. Rust nests these; track depth so an inner `*/`
+            // cannot terminate an outer comment early.
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
 fn collect_zero_registrations(
     dir: &Path,
     consts: &std::collections::BTreeMap<String, String>,
@@ -193,9 +352,11 @@ fn collect_zero_registrations(
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
+        // Comments FIRST: a commented-out registration must not count.
+        let src = strip_rust_comments(&raw);
         // A registration may wrap across lines, so join the file and scan for
         // each `counter!(..)` span that ends in `.increment(0)`.
         for span in src.split("metrics::counter!(").skip(1) {
@@ -299,7 +460,10 @@ fn every_alarmed_counter_is_registered_at_boot() {
 
     let mut missing: Vec<String> = Vec::new();
     for (name, file) in &alarmed {
-        if KNOWN_GAUGES.contains(&name.as_str()) || KNOWN_NO_PRODUCER.contains(&name.as_str()) {
+        if KNOWN_GAUGES.contains(&name.as_str())
+            || KNOWN_NO_PRODUCER.contains(&name.as_str())
+            || SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
+        {
             continue;
         }
         if !registered.contains(name.as_str()) {
@@ -358,4 +522,121 @@ fn the_four_counters_that_motivated_this_guard_are_registered() {
             "{name} was found alarmed-but-unregistered on 2026-08-28; it must stay registered"
         );
     }
+}
+
+/// Every [`SEEDED_VIA_HANDLE`] exemption must still have its seeding site.
+///
+/// An exemption that outlives the code it points at is not an exemption, it is
+/// a blind spot with a paper trail. This file has already carried one: three
+/// names sat under "DEAD MONITORS ... Verified 2026-08-28" while two of them
+/// were being emitted and seeded the whole time, and an audit run on
+/// 2026-09-01 reported one of them to the operator as a CRITICAL blind spot on
+/// the strength of that comment. Prose does not stay true; a test does.
+#[test]
+fn the_handle_seeded_exemptions_still_have_their_seeding_sites() {
+    assert!(
+        !SEEDED_VIA_HANDLE.is_empty(),
+        "the exemption list is empty — either delete this test or restore it"
+    );
+
+    // WalRingSink::pre_register — three counters, seeded per endpoint label.
+    let pool = read("crates/core/src/websocket/pool_supervisor.rs");
+    let pre_register = pool
+        .split_once("fn pre_register(&self)")
+        .and_then(|(_, rest)| rest.split_once("\n    }"))
+        .map(|(body, _)| body)
+        .unwrap_or_default();
+    assert!(
+        !pre_register.is_empty(),
+        "WalRingSink::pre_register has moved or been renamed. Three alarmed \
+         loss counters are exempted from the seeding guard because it seeds \
+         them; if it is gone, those alarms are dead on their first episode."
+    );
+    assert_eq!(
+        pre_register.matches("increment(0)").count(),
+        3,
+        "pre_register no longer seeds exactly three counters — the exemptions \
+         for tv_dhan_ws_wal_dropped_total / _ring_full_total / \
+         _ring_bytes_full_total assume it seeds all three:\n{pre_register}"
+    );
+
+    // A function that seeds is worth nothing if nobody calls it. Adversarial
+    // review (2026-09-01) bite-proved that replacing the `sink.pre_register()`
+    // call with a comment left this guard fully green while all three counters
+    // silently lost their baseline. The seeding SITE and the seeding CALL are
+    // two different claims, and only one of them was being checked.
+    let pool_no_comments = strip_rust_comments(&pool);
+    assert!(
+        pool_no_comments.contains("pre_register()"),
+        "WalRingSink::pre_register exists but is never CALLED (comments \
+         stripped, so a commented-out call does not count). The three \
+         exempted counters are unseeded and their alarms are dead on the \
+         first episode."
+    );
+
+    // SpillDropCounters::new — a loop over every (source x ws_type) handle.
+    let spill = read("crates/storage/src/ws_frame_spill.rs");
+    assert!(
+        spill.contains("ticks_lost_channel_full[idx].increment(0)")
+            && spill.contains("ticks_lost_writer_dead[idx].increment(0)"),
+        "SpillDropCounters::new no longer seeds both tv_ticks_lost_total \
+         sources over every ws_type. That counter's alarm is the tick-loss \
+         pager, and an unseeded series means its FIRST episode — the one that \
+         matters — publishes nothing."
+    );
+}
+
+/// Self-test for the comment stripper.
+///
+/// A scanner is only as trustworthy as its own parsing. This pins the three
+/// cases that matter: a commented-out registration must disappear, a real one
+/// must survive, and a `//` inside a string literal must NOT be mistaken for
+/// the start of a comment (which would corrupt the metric names the scan is
+/// looking for and produce false FAILURES instead of false passes).
+#[test]
+fn the_comment_stripper_hides_commented_out_code_and_keeps_real_code() {
+    // 1. Line comment: the registration must be gone.
+    let commented = r#"// metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        !strip_rust_comments(commented).contains("metrics::counter!"),
+        "a commented-out registration survived stripping — the guard would \
+         count it as present"
+    );
+
+    // 2. Block comment, including a nested one.
+    let blocked = r#"/* outer /* inner */ metrics::counter!("tv_probe_total"); */ let x = 1;"#;
+    let stripped = strip_rust_comments(blocked);
+    assert!(
+        !stripped.contains("metrics::counter!"),
+        "a block-commented registration survived stripping: {stripped}"
+    );
+    assert!(
+        stripped.contains("let x = 1;"),
+        "the stripper ate code after a nested block comment: {stripped}"
+    );
+
+    // 3. Real code survives untouched.
+    let real = r#"metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        strip_rust_comments(real).contains(r#"metrics::counter!("tv_probe_total")"#),
+        "the stripper removed a REAL registration"
+    );
+
+    // 4. `//` inside a string literal is not a comment. Getting this wrong
+    //    would truncate URLs and messages and could hide a following
+    //    registration on the same line.
+    let in_string = r#"let u = "https://x/y"; metrics::counter!("tv_probe_total").increment(0);"#;
+    let out = strip_rust_comments(in_string);
+    assert!(
+        out.contains("tv_probe_total"),
+        "a `//` inside a string literal was treated as a comment, hiding the \
+         registration that followed it: {out}"
+    );
+
+    // 5. An escaped quote must not end the string early.
+    let escaped = r#"let s = "a\"// b"; metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        strip_rust_comments(escaped).contains("tv_probe_total"),
+        "an escaped quote ended the string early and swallowed real code"
+    );
 }

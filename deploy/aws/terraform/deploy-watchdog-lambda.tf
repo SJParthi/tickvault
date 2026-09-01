@@ -358,6 +358,14 @@ resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_not_invoked" {
   dimensions = {
     FunctionName = aws_lambda_function.deploy_watchdog.function_name
   }
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = []
+  # GATED (2026-09-01): ships DISARMED. The market-hours gate Lambda
+  # (market-hours-liveness-alarm.tf ALARM_NAMES) enables actions at 09:20 IST
+  # Mon-Fri and disables them at 15:35 IST. Without this the alarm pages every
+  # Saturday and Sunday: the watched Lambda is on a MON-FRI cron, so its
+  # Invocations datapoint is legitimately ABSENT at the weekend and
+  # treat_missing_data = breaching turns that absence into an ALARM. The gate
+  # cannot disarm an alarm that ships armed, so this line is half of the fix.
+  actions_enabled = false
+  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
+  ok_actions      = []
 }

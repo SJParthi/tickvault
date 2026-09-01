@@ -432,7 +432,28 @@ pub struct SealSpillWriter {
     /// the cached handle. Uncontended: the seal writer task is the single
     /// producer, so this is an uncontended lock/unlock pair, not a wait.
     open: Mutex<Option<OpenSpillFile>>,
+    /// Pre-resolved handles for the two `append_seal` failure counters.
+    ///
+    /// `append_seal` is reachable from the FRAME-DRAIN task: the escalation
+    /// offload's `Full`/`Disconnected` arm runs the inline cascade on the
+    /// caller (see `SealOverflow::escalate`), and that caller is the per-tick
+    /// fold. The bare `metrics::counter!` macro is banned there — it builds a
+    /// `Key` and takes a sharded-registry lock per call, where a resolved
+    /// handle is a plain atomic add.
+    ///
+    /// Honest magnitude: both sites are ERROR paths, so in a healthy session
+    /// neither fires at all, and when they do the syscall that preceded them
+    /// dwarfs the lookup. They are resolved anyway because "a failing disk" is
+    /// exactly the state in which every one of these fires per seal, on the
+    /// thread that empties the socket — the moment the registry lock is least
+    /// affordable.
+    err_no_handle: metrics::Counter,
+    err_write: metrics::Counter,
 }
+
+/// Name of the spill-write failure counter. Both label values are
+/// compile-time literals, so the handle set is enumerable up front.
+const SPILL_WRITE_ERRORS_COUNTER: &str = "tv_seal_spill_write_errors_total";
 
 impl SealSpillWriter {
     /// Production constructor. Uses `data/spill/`.
@@ -441,7 +462,20 @@ impl SealSpillWriter {
         Self {
             spill_dir: PathBuf::from(SEAL_SPILL_DIR),
             open: Mutex::new(None),
+            err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
+            err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
         }
+    }
+
+    /// The directory this writer appends into.
+    ///
+    /// Exposed so the absorption pipeline can ask the FILESYSTEM about free
+    /// space before it escalates. The pipeline owns that decision because a
+    /// refusal here would only redirect the bytes to the DLQ on the SAME
+    /// volume — see `SealAbsorptionPipeline::escalate_evicted`.
+    #[must_use]
+    pub fn spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir
     }
 
     /// Test constructor. Tests pass an isolated `tempdir` to allow
@@ -452,6 +486,8 @@ impl SealSpillWriter {
         Self {
             spill_dir: dir,
             open: Mutex::new(None),
+            err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
+            err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
         }
     }
 
@@ -552,8 +588,7 @@ impl SealSpillWriter {
         let Some(current) = open.as_mut() else {
             // Structurally unreachable: the branch above either populated the
             // slot or returned Err. Refuse loudly rather than assume.
-            metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "no_handle")
-                .increment(1);
+            self.err_no_handle.increment(1);
             anyhow::bail!(
                 "seal spill handle missing after open — refusing to claim a durable write"
             );
@@ -574,7 +609,7 @@ impl SealSpillWriter {
             // still propagates, so the absorption pipeline escalates THIS
             // seal to the tier-3 DLQ exactly as before.
             *open = None;
-            metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "write").increment(1);
+            self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
             return Err(err).with_context(|| format!("failed to write seal to {path:?}"));
         }
@@ -1961,6 +1996,39 @@ mod tests {
         assert_eq!(out.deleted, 0, "a file with zero age must survive");
         assert!(path.exists());
     }
+
+    /// The absorption pipeline asks this writer where it writes so it can ask
+    /// the filesystem how much room is left. If it ever named a different
+    /// directory from the one appends land in, the free-space floor would be
+    /// measuring the wrong volume and would read healthy while the real one
+    /// filled.
+    #[test]
+    fn spill_dir_reports_the_directory_appends_actually_land_in() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tickvault-seal-spill-dir-{}-{}",
+            std::process::id(),
+            "accessor"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        assert_eq!(writer.spill_dir(), dir.as_path());
+
+        // Non-vacuous: append a seal and confirm the file lands under exactly
+        // the directory this accessor names.
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 100, 24_000.5), 1_777_000_000)
+            .expect("append must land");
+        let entries: Vec<_> = std::fs::read_dir(writer.spill_dir())
+            .expect("spill dir must exist after an append")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "an appended seal must be visible in the directory spill_dir() names"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// C3 phase-B pins: the spill `tf_ordinal` byte round-trips every one of the
@@ -1997,5 +2065,43 @@ mod c3_tf_ordinal_pins {
         for ord in TF_COUNT..=255usize {
             assert!(TfIndex::from_ordinal(ord).is_none(), "{ord} must refuse");
         }
+    }
+}
+
+/// Source pins for the sites `append_seal` exposes to the frame-drain
+/// task through the seal-escalation inline fallback.
+#[cfg(test)]
+mod per_tick_metrics_pins {
+    use super::*;
+
+    /// `append_seal` is reachable from the FRAME-DRAIN task.
+    ///
+    /// The seal-escalation offload's `Full`/`Disconnected` arm runs the inline
+    /// cascade on the CALLER, and that caller is the per-tick fold — so this
+    /// function inherits the fold's ban on the bare `metrics::counter!` macro
+    /// (a `Key` build plus a sharded-registry lock, versus an atomic add on a
+    /// resolved handle). Both sites are error paths, so no behavioural test
+    /// can distinguish the two forms; a source scan is the only thing that
+    /// holds it.
+    #[test]
+    fn append_seal_uses_pre_resolved_counter_handles() {
+        let src = include_str!("seal_spill.rs");
+        let start = src
+            .find("pub fn append_seal(&self, seal: &SerializedSeal")
+            .expect("append_seal must exist");
+        let end = src[start..]
+            .find("\n    /// Closes the cached append handle")
+            .expect("append_seal must be followed by close_open_handle");
+        let body = &src[start..start + end];
+        assert!(
+            !body.contains("metrics::"),
+            "bare metrics macro inside append_seal — it is reachable from the frame-drain \
+             task via the escalation fallback; resolve the handle once"
+        );
+        assert!(
+            body.contains("self.err_no_handle.increment(1)")
+                && body.contains("self.err_write.increment(1)"),
+            "both failure sites must increment a pre-resolved handle"
+        );
     }
 }
