@@ -296,7 +296,7 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
   dimensions = {
     FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
   }
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
   # NO ok_actions (the round-14 precedent): these run on a schedule, so the
   # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
   # lookback — never that anything was fixed. The telegram-webhook Lambda
@@ -342,6 +342,14 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_not_invoked" {
   dimensions = {
     FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
   }
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = []
+  # GATED (2026-09-01): ships DISARMED. The market-hours gate Lambda
+  # (market-hours-liveness-alarm.tf ALARM_NAMES) enables actions at 09:20 IST
+  # Mon-Fri and disables them at 15:35 IST. Without this the alarm pages every
+  # Saturday and Sunday: the watched Lambda is on a MON-FRI cron, so its
+  # Invocations datapoint is legitimately ABSENT at the weekend and
+  # treat_missing_data = breaching turns that absence into an ALARM. The gate
+  # cannot disarm an alarm that ships armed, so this line is half of the fix.
+  actions_enabled = false
+  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
+  ok_actions      = []
 }

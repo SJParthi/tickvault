@@ -460,6 +460,46 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 8
         # alarms — this one and the depth-steering sibling added the same day.
         aws_cloudwatch_metric_alarm.dhan_worst_socket_deaf.alarm_name,
+        # 2026-09-01: the THREE "did it run?" alarms JOIN the gate.
+        #
+        # These are a different shape from everything above and the reason is
+        # arithmetic, not judgement. Each watches a Lambda whose EventBridge
+        # schedule is MON-FRI, with period = 86400, evaluation_periods = 1 and
+        # treat_missing_data = "breaching". On Saturday and Sunday the watched
+        # Lambda correctly does not run, so its Invocations datapoint is
+        # ABSENT, so every one of them breaches -- roughly six pages every
+        # weekend, on three checks that are working exactly as designed.
+        #
+        # treat_missing_data is deliberately NOT changed: ABSENCE IS THE
+        # CONDITION these alarms detect (a dropped schedule produces no
+        # invocation and therefore no error, which is why their sibling Errors
+        # alarms are structurally blind to it). Flipping them to notBreaching
+        # would silence the weekend noise by making the check itself blind --
+        # trading a false page for a false OK, which is the worse of the two.
+        #
+        # The gate is the correct half to change: it disables their ACTIONS
+        # from Friday 15:35 IST to Monday 09:20 IST, so the weekend ALARM
+        # transition happens silently, and the open path's reset-to-OK (which
+        # now runs BEFORE enable, corrected 2026-08-28) means Monday morning
+        # brings no spurious "recovered" page either.
+        #
+        # Detection is not materially weakened: all three watched Lambdas fire
+        # in the morning (08:45, 08:50, 08:50/09:20 IST), so a dropped weekday
+        # schedule is already missing by the time the gate opens at 09:20 --
+        # the reset to OK re-evaluates against a still-missing datapoint and
+        # pages within a minute or two.
+        #
+        # HONEST RESIDUAL: the open path skips enabling when the box is down or
+        # the holiday marker is today. So on a day the tv-app box fails to
+        # start, a simultaneously-dropped Lambda schedule would not page. That
+        # is accepted -- a box that did not start is itself already paged for
+        # loudly by the start-watchdog, and these three are checks ON the
+        # checks, not the primary signal.
+        #
+        # The gate now arms 11 alarms.
+        aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,
+        aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,
+        aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).
