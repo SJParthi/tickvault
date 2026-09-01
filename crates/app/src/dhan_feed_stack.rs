@@ -4337,33 +4337,64 @@ async fn run_frame_drain(
                 // pre-open traffic — the false-alarm class the silence gate
                 // was fixed for.
                 //
-                // 2026-09-01: two reasons were SPLIT OUT of that field and ARE
-                // reported. They were never the normal case — `stale_trading_day`
-                // has 8,898 fabricated bars recorded at its own site, and
-                // `out_of_band_timestamp` measured 2,008,916 in one session —
-                // but they were buried in a field this read-out skipped, so
-                // neither had any operator surface at all.
-                if d_price > 0 || d_ts > 0 || d_slot > 0 || d_stale > 0 || d_oob > 0 {
+                // The PAGER below keeps EXACTLY the three reasons it has always
+                // carried. `stale_trading_day` and `out_of_band_timestamp` were
+                // split out of `out_of_session` on 2026-09-01 and are reported
+                // on the SEPARATE `warn!` beneath — never here.
+                //
+                // Recorded because a first draft got this wrong and NO test
+                // would have caught it: this line's code is metric-filtered as
+                // `{ $.code = "AGGREGATOR-DROP-01" && $.level = "ERROR" }` at
+                // threshold 1 / dta 1 / `ok_recovery = false`
+                // (`error-code-alarms.tf`). MEASURED on the 2026-08-31 session:
+                // this pager fired ZERO times all day (verified non-vacuous —
+                // the same window carries 1,589 HOT-PATH-02 and 4,845
+                // WS-GAP-03 ERROR events), while `out_of_band_timestamp` ran
+                // ~2M/session ≈ 85/s. Widening this gate would therefore have
+                // taken a silent pager to one that emits in virtually every
+                // 30s window, latching that alarm in ALARM for the whole
+                // session — and because `ok_recovery = false` it never sends
+                // an OK, so it would stay latched and bury the permanent-loss
+                // signal the pager exists for. All 23 metric filters require
+                // `$.level = "ERROR"`, so `warn!` informs without paging.
+                if d_price > 0 || d_ts > 0 || d_slot > 0 {
                     error!(
                         code = ErrorCode::AggregatorDrop01.code_str(),
                         refused_price = d_price,
                         refused_timestamp = d_ts,
                         refused_slot_exhausted = d_slot,
-                        refused_stale_trading_day = d_stale,
-                        refused_out_of_band_timestamp = d_oob,
                         "Dhan live feed: the aggregator refused ticks in the last 30s. \
                          PRICE and TIMESTAMP refusals are HARD -- no candle and no row; \
                          the upstream packet failed a sanity check. A SLOT refusal is \
                          candle-only: the instrument capacity is exhausted and NEW \
                          instruments get no candles, but their rows ARE still written. \
-                         STALE_TRADING_DAY and OUT_OF_BAND_TIMESTAMP are also \
-                         candle-only: the row is written but the vendor stamped it \
-                         for another day or outside the plausible band, so no bucket \
-                         can hold it -- a rising rate is a VENDOR data-quality signal. \
                          Do not read the total as a tick-loss count."
                     );
-                    last_refusals = now;
                 }
+
+                // The two candle-only VENDOR data-quality reasons. They were
+                // buried in `out_of_session`, which the pager above skips, so
+                // until 2026-09-01 neither had ANY operator surface. Reported
+                // at WARN precisely so they inform without paging: in both
+                // cases the ROW IS WRITTEN and only the candle bucket is
+                // skipped, so this is a trend to watch, never a tick-loss
+                // count and never a 2am page.
+                if d_stale > 0 || d_oob > 0 {
+                    warn!(
+                        refused_stale_trading_day = d_stale,
+                        refused_out_of_band_timestamp = d_oob,
+                        "Dhan live feed: the aggregator skipped the candle bucket for \
+                         some ticks in the last 30s because the vendor stamped them for \
+                         another trading day or outside the plausible time band. The \
+                         ROWS ARE STILL WRITTEN -- this is not tick loss. A rising rate \
+                         is a vendor data-quality signal."
+                    );
+                }
+
+                // Baseline advances every cycle, whether or not either line
+                // fired, so both blocks always report a true 30s delta instead
+                // of a figure that silently accumulated across quiet cycles.
+                last_refusals = now;
 
                 let (silent, never, named) =
                     ingest.scan_silence_named(now_millis, &mut worst_silent);
