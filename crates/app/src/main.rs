@@ -1677,6 +1677,10 @@ async fn async_main() -> Result<()> {
     // (each daily prod boot reclaims immediately), then every 6 h.
     tokio::spawn(async {
         use std::time::Duration;
+        // Monotonic, so the pressure floor cannot be defeated by a wall-clock
+        // jump (NTP step, DST, a container clock correction).
+        let reclaim_clock = tokio::time::Instant::now();
+        let mut last_pressure_reclaim_secs: Option<u64> = None;
         loop {
             let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
             let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
@@ -1724,10 +1728,46 @@ async fn async_main() -> Result<()> {
             // of something discovered when the volume fills.
             let _dlq =
                 tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
-            tokio::time::sleep(Duration::from_secs(
-                tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
-            ))
-            .await;
+
+            // Wait for the scheduled interval OR a disk-pressure request,
+            // whichever comes first (2026-09-01).
+            //
+            // Before this, the sweep above ran on a fixed 6-hourly timer and
+            // nothing could hurry it. That timer is the deadlock: when the
+            // volume fills, QuestDB suspends its tables and `partition_archive`
+            // correctly refuses to archive a suspended table — so the pressure
+            // loop's own archival pass reclaims NOTHING, and these capture
+            // segments become the only thing on the volume that can still be
+            // freed. On 2026-08-25 the disk hit 100% at ~11:11 IST; a timer
+            // last fired at 09:00 would not have acted until 15:00.
+            //
+            // The floor keeps a long episode from turning this cold path into
+            // a hot loop: the pressure loop polls often and stays in an
+            // episode for many polls, so requests are honoured at most once a
+            // minute. The SCHEDULED pass is never floored — it is the
+            // guarantee; pressure only ever makes it earlier.
+            let by_pressure =
+                tickvault_app::reclaim_signal::wait_for_reclaim_or(Duration::from_secs(
+                    tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
+                ))
+                .await;
+            if by_pressure {
+                let now_secs = reclaim_clock.elapsed().as_secs();
+                if tickvault_app::reclaim_signal::should_honor_reclaim(
+                    last_pressure_reclaim_secs,
+                    now_secs,
+                    tickvault_app::reclaim_signal::RECLAIM_MIN_INTERVAL_SECS,
+                ) {
+                    last_pressure_reclaim_secs = Some(now_secs);
+                    metrics::counter!("tv_reclaim_pressure_sweeps_total").increment(1);
+                } else {
+                    // Inside the floor: skip straight back to waiting rather
+                    // than sweeping again. Counted so a storm of refused
+                    // requests is visible instead of looking like inactivity.
+                    metrics::counter!("tv_reclaim_floored_total").increment(1);
+                    continue;
+                }
+            }
         }
     });
 
