@@ -35,9 +35,10 @@
 ///
 /// Shrink-only in spirit: adding a row is a decision that must be justified
 /// in writing, not a way to make the build green.
-const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[(
-    "tv_tick_volume_saturated_total",
-    "UNREACHABLE today, by construction. `saturate_volume_to_i64` narrows a \
+const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[
+    (
+        "tv_tick_volume_saturated_total",
+        "UNREACHABLE today, by construction. `saturate_volume_to_i64` narrows a \
      u64 cumulative volume onto the LONG column, and every live source is \
      narrower or equal (`ParsedTick::volume` is u32; Groww and TrueData day \
      volume are i64), so the saturating arm cannot be reached from \
@@ -46,7 +47,25 @@ const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[(
      structurally incapable of moving — the inverse of the defect this guard \
      exists to catch, and just as wasteful. Ship it in the same change that \
      introduces a u64-wide volume source, not before.",
-)];
+    ),
+    (
+        "tv_spill_free_probe_blind_total",
+        "DEGRADED-STATE signal, not a loss signal. It counts rescues written \
+     without a free-space answer because the `df` probe failed. The per-write \
+     floor deliberately fails OPEN there — failing closed would let one broken \
+     probe disable the whole rescue tier, turning every failed flush back into \
+     the permanent loss this tier exists to prevent — so the write proceeds, \
+     and this makes it visible instead of silent. Held local because the \
+     LOSSES it could lead to are already shipped AND alarmed \
+     (`tv_ticks_dropped_total`, `tv_depth_rows_dropped_total`, \
+     `tv_ticks_lost_total`), so an extra ~$0.30/mo name would buy an earlier \
+     warning of an outcome that is already paged. The rule files record the \
+     maximal-month projection as ALREADY past the budget's automatic \
+     STOP_EC2_INSTANCES line, which is why that $0.30 has to be argued for \
+     rather than assumed. Ship it if a session ever reports a non-zero value \
+     locally — at that point it has earned the money.",
+    ),
+];
 
 fn read(rel: &str) -> String {
     std::fs::read_to_string(rel).unwrap_or_else(|e| panic!("{rel}: {e}"))

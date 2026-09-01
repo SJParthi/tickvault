@@ -709,8 +709,29 @@ pub const SPILL_SOFT_CEILING_FREE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// DERIVED, not chosen. Measured 2026-09-01: 83,446,729 ticks ingested in a
 /// session, and a `ticks` row is 144 bytes on the wire (4 SYMBOL columns at
 /// 4 B of interned key + 7 eight-byte columns + the designated timestamp).
-/// 83.4M x 144 B = 12.0 GB. Rounded up to 16 GiB so a busier session, or a
-/// universe grown toward the 25,000-instrument ceiling, still fits.
+/// 83.4M x 144 B = 12.0 GB. Rounded up to 16 GiB so a busier session at
+/// TODAY'S universe still fits.
+///
+/// # ⚠ CORRECTED 2026-09-01 (same day, adversarial review) — it does NOT
+/// # cover the 25,000-instrument target, and the first version claimed it did
+///
+/// The sentence above originally ended "…or a universe grown toward the
+/// 25,000-instrument ceiling, still fits." **That is false, by roughly 21x,
+/// and it was my claim.** The 83.4M-tick session ran the deduped live set of
+/// ~868 instruments. Scaling to the authorized ~24,600 is 28.3x, i.e. ~2.36
+/// billion ticks x 144 B ≈ **340 GB** — larger than the entire 300 GB volume,
+/// so no reserve can cover it and none should pretend to.
+///
+/// The number itself is NOT raised, because a reserve bigger than the disk is
+/// not a reserve. What changes is the claim: this figure covers a full-session
+/// database outage **at today's ~868-instrument universe**, and at the 24,600
+/// target a full-session outage overflows the volume no matter how the reserve
+/// is set. The protection at that scale is the shed ladder and the archival
+/// tier draining the disk, not this constant.
+///
+/// Recorded rather than quietly narrowed because the failure mode is the one
+/// this repository keeps paying for: a measurement taken at one scale, written
+/// up as if it held at another, and then trusted by the next reader.
 ///
 /// This exists only to derive [`DEPTH_SPILL_FREE_RESERVE_BYTES`] below. It is
 /// deliberately a named constant rather than a literal inside that
@@ -734,23 +755,84 @@ pub const WORST_CASE_SESSION_TICK_SPILL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// 1.94 GB are on the record in this file; a depth rescue landing in one had
 /// nothing to stop it.
 ///
-/// # Why DOUBLE the tick floor, and not the same number
+/// # Why it is the TICK CEILING RESERVE, and not merely double the tick floor
 ///
-/// The ratio is deliberately the SAME as the ceiling reserves' (32 GiB depth
-/// against 16 GiB tick), because both mechanisms express one rule: ticks are
-/// decision-critical and depth is record-only, so depth gives way first. Two
-/// defences expressing the same priority with different ratios would be a
-/// contradiction waiting to be resolved in the wrong direction.
+/// CRITICAL DEFECT FOUND BY ADVERSARIAL REVIEW, 2026-09-01 — inside the very
+/// change written to prevent it.
 ///
-/// Sized to what the priority needs and no further: every extra byte here is
-/// depth data refused on a disk that still has room, which is the defect the
-/// 2026-09-01 free-space change exists to stop.
-pub const DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * SPILL_MIN_FREE_HEADROOM_BYTES;
+/// The first version of this constant was `2 * SPILL_MIN_FREE_HEADROOM_BYTES`
+/// (4 GiB), reasoning that it should mirror the ceiling reserves' 2:1 ratio.
+/// That reasoning is WRONG, because the two tiers' ceiling arms are gated by
+/// INDEPENDENT directory sizes, so a ratio between the reserves only expresses
+/// a priority while both tiers happen to be in the same regime. With the tick
+/// spill directory OVER its size rail and the depth directory UNDER its own:
+///
+/// | free space | tick tier | depth tier |
+/// |---|---|---|
+/// | 5 GiB | ceiling arm fires, `free <= 16 GiB` reserve → **REFUSE** | `UnderCeiling`, `free >= payload + 4 GiB` → **WRITE** |
+///
+/// Decision-critical ticks discarded while record-only depth keeps writing —
+/// the exact inversion the reserve split exists to prevent, reintroduced
+/// through the OTHER of the two defences. Neither `const _` assert could see
+/// it: one compared floor-to-floor and the other reserve-to-reserve, and the
+/// failure is CROSS-KIND.
+///
+/// # The invariant, stated so it can be checked mechanically
+///
+/// **At every free-space value where the tick tier can refuse, the depth tier
+/// must already have refused.**
+///
+/// The tick tier refuses at `free <= SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`
+/// (ceiling arm) or at `free < payload + SPILL_MIN_FREE_HEADROOM_BYTES`
+/// (floor). Setting this floor to the tick tier's CEILING reserve dominates
+/// both — on every write, regardless of either directory's size. That is what
+/// makes the priority hold in *every* regime rather than only in matching
+/// ones, and it is why a ratio was the wrong shape for this constant.
+pub const DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES: u64 = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
 
 const _: () = assert!(
     DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES > SPILL_MIN_FREE_HEADROOM_BYTES,
     "depth's per-write floor MUST exceed the tick tier's, or the two \
      defences disagree about which lane gives way first."
+);
+
+/// Pre-register both `tier` label values of `tv_spill_free_probe_blind_total`
+/// at 0.
+///
+/// That counter records rescues written WITHOUT a free-space answer, because
+/// the `df` probe failed. A per-write floor must NOT fail closed — one broken
+/// probe would disable the entire rescue tier — so the write proceeds; what
+/// was wrong before is that it proceeded SILENTLY.
+///
+/// A counter that is never incremented is never REGISTERED as a series, and an
+/// absent series is indistinguishable from a healthy zero — the failure this
+/// repository has already paid for once, on the depth loss counters.
+///
+/// Emitted as a STRING LITERAL at every site, deliberately:
+/// `loss_writer_metrics_are_shipped_guard` extracts metric names by scanning
+/// for literals, so routing this through a `const` would make it invisible to
+/// the very guard added to catch unshipped loss counters. It is listed in that
+/// guard's `DELIBERATELY_LOCAL_ONLY` with its cost reason instead, so the
+/// guard stays honest about it rather than silently not noticing.
+pub fn seed_spill_free_probe_blind_counters() {
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(0);
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(0);
+}
+
+// THE CROSS-KIND ASSERT — the one whose absence let the inversion through.
+//
+// The two same-kind asserts (floor-vs-floor above, reserve-vs-reserve below)
+// are both satisfiable while the inversion is live, because the tick tier's
+// STRONGEST guard is its ceiling reserve while the depth tier's ALWAYS-ON
+// guard is its per-write floor. Those are different kinds, so no same-kind
+// comparison can relate them. This one does.
+const _: () = assert!(
+    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES >= SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+    "depth's ALWAYS-ON per-write floor MUST be at least the tick tier's \
+     ceiling reserve. Below that there is a band of free-space values in \
+     which ticks are refused and depth is still written — decision-critical \
+     data discarded to make room for record-only data, which is the exact \
+     inversion this split exists to prevent."
 );
 
 /// Free-space reserve the DEPTH rescue tier must leave behind — deliberately
@@ -1058,6 +1140,24 @@ fn spill_failed_ilp(
     //
     // A refusal here is still an honest counted drop, not a silent one: the
     // caller's `Err` arm logs HOT-PATH-02 naming this reason.
+    // ASYMMETRY WITH THE CEILING ARM, DELIBERATE — flagged by adversarial
+    // review 2026-09-01 and kept, with the fall-through made VISIBLE.
+    //
+    // The ceiling arm fails CLOSED on a probe failure; this floor falls
+    // through and writes. Same file, opposite semantics — which reads like an
+    // oversight and is not. The two arms ask different questions:
+    //
+    //   ceiling — "we are ALREADY past our size rail; may we keep growing?"
+    //             Unknown => do not grow. It bites only in an already
+    //             abnormal state, so refusing costs little.
+    //   floor   — "is there room for THIS one write?" Unknown => refusing
+    //             means a single broken `df` disables the entire rescue tier
+    //             for the process lifetime, turning every failed flush back
+    //             into the permanent loss this tier exists to prevent.
+    //
+    // So the fail-open is the right call. What was actually wrong is that it
+    // was SILENT: the tier could write blind, indefinitely, with nothing
+    // saying so. It is now counted.
     if let crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } =
         crate::disk_health_watcher::probe_disk_free_bytes(dir)
     {
@@ -1073,6 +1173,8 @@ fn spill_failed_ilp(
                 ),
             ));
         }
+    } else {
+        metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
     }
 
     // One file per feed per hour: bounded file count, and an operator replaying
@@ -1932,8 +2034,17 @@ impl TickWriter {
     /// which run ON THE FRAME-DRAIN TASK. The write it used to perform inline
     /// is not small: `create_dir_all`, a `read_dir` + per-entry `metadata()`
     /// walk of the spill directory AND its quarantine subdirectory, a live
-    /// `statvfs`, and then up to [`MAX_PRODUCER_BUFFER_BYTES`] — 32 MiB — of
-    /// file write. All of it on the same volume QuestDB is stalling on.
+    /// free-space probe, and then up to [`MAX_PRODUCER_BUFFER_BYTES`] —
+    /// 32 MiB — of file write. All of it on the same volume QuestDB is
+    /// stalling on.
+    ///
+    /// CORRECTED 2026-09-01 (adversarial review): this said "a live `statvfs`".
+    /// There is no `statvfs` anywhere in this workspace — the probe is
+    /// [`crate::disk_health_watcher::probe_disk_free_bytes`], which **forks and
+    /// execs `df`**. That is materially worse than the doc implied on exactly
+    /// this path, since a fork is far more expensive than a syscall and this
+    /// arm runs on the frame-drain task. The cost argument the paragraph makes
+    /// is therefore stronger than it was written to be, not weaker.
     ///
     /// And it fires at the worst possible instant BY CONSTRUCTION. The cut
     /// that calls it only trips after the hand-off queue has been full for
@@ -4094,6 +4205,52 @@ mod tests {
             QUARANTINE_BUDGET_FRACTION >= 2,
             "a fraction below 2 lets quarantine take at least half the spill ceiling, \
              starving the LIVE rescue path that keeps rows QuestDB would still accept"
+        );
+    }
+
+    /// Both `tier` label values must be seeded, not just one.
+    ///
+    /// The CloudWatch agent computes its delta PER LABEL SET, so seeding one
+    /// tier leaves the other exactly as blind as before — a partially-seeded
+    /// family is a partial blind spot wearing the appearance of a covered one.
+    /// This is the failure this repository already paid for on the depth loss
+    /// counters, which is why it is pinned rather than assumed.
+    #[test]
+    fn test_seed_spill_free_probe_blind_counters_seeds_both_tiers() {
+        // Runs clean with no recorder installed, and twice — boot may call it
+        // on a re-spawn path and a panic there would take the lane down for a
+        // metric.
+        seed_spill_free_probe_blind_counters();
+        seed_spill_free_probe_blind_counters();
+
+        // The property that actually matters is WHICH label values are seeded,
+        // and that cannot be read back from the metrics facade without a
+        // recorder. Pin it at the source instead.
+        let src = include_str!("tick_persistence.rs");
+        let body = src
+            // Needle assembled from parts on PURPOSE: spelled as one literal it
+            // reads as a `pub fn` DECLARATION to `pub-fn-test-guard.sh`, which
+            // greps source, and this test would then count itself as a second
+            // untested pub fn. Found by the guard blocking the push.
+            .split_once(concat!(
+                "pub ",
+                "fn ",
+                "seed_spill_free_probe_blind_counters()"
+            ))
+            .map(|(_, rest)| rest.split_once("\n}").map_or(rest, |(b, _)| b))
+            .unwrap_or_default();
+        for tier in ["\"tick\"", "\"depth\""] {
+            assert!(
+                body.contains(tier),
+                "the seeding function does not register the {tier} tier — the \
+                 agent seeds per LABEL SET, so that tier's first blind write \
+                 would be eaten as its baseline and never seen"
+            );
+        }
+        assert_eq!(
+            body.matches("increment(0)").count(),
+            2,
+            "expected exactly two seeded label sets"
         );
     }
 }

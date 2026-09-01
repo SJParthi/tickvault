@@ -2776,6 +2776,11 @@ fn seed_drain_loss_baselines() {
     // same operator action: check the spill directory before the next session.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(0);
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth").increment(0);
+    // Rescues written WITHOUT a free-space answer, because the `df` probe
+    // failed. Both tiers, both label values — a partially-seeded family is a
+    // partial blind spot wearing the appearance of a covered one, and the
+    // agent computes its delta per LABEL SET.
+    tickvault_storage::tick_persistence::seed_spill_free_probe_blind_counters();
     // ADDED 2026-08-29 by an adversarial sweep of the FIRST pass of this fix.
     // Both carry LIVE CloudWatch alarms and both were still unseeded, so the
     // alarm could not fire on the first episode — the one that matters.

@@ -427,3 +427,100 @@ fn guard_self_test() {
          `contains` trivially fails against in the wrong direction"
     );
 }
+
+/// THE CROSS-KIND INVARIANT — the property whose absence let a live inversion
+/// survive the change written to prevent it.
+///
+/// # What went wrong, and why the existing asserts could not see it
+///
+/// Adversarial review, 2026-09-01, on the same day the reserve split landed:
+/// the depth per-write floor was `2 * SPILL_MIN_FREE_HEADROOM_BYTES` (4 GiB),
+/// chosen to mirror the ceiling reserves' 2:1 ratio. A ratio between the
+/// RESERVES only expresses a priority while both tiers are in the same
+/// regime — and the two ceiling arms are gated by INDEPENDENT directory
+/// sizes, so they routinely are not.
+///
+/// With the tick spill directory OVER its size rail and the depth directory
+/// UNDER its own, at 5 GiB free:
+///
+/// * tick — ceiling arm fires, `5 GiB <= 16 GiB` reserve → **REFUSE**
+/// * depth — `UnderCeiling`, `5 GiB >= payload + 4 GiB` → **WRITE**
+///
+/// Decision-critical ticks discarded to make room for record-only depth. Both
+/// `const _` asserts passed throughout: one compares floor-to-floor, the other
+/// reserve-to-reserve, and the failure is CROSS-KIND.
+///
+/// # The property this pins
+///
+/// **At every free-space value where the tick tier can refuse, the depth tier
+/// must already have refused.**
+///
+/// Swept across the whole band rather than checked at one convenient number,
+/// because the defect lived in a band and any single sample outside it reads
+/// clean.
+#[test]
+fn at_every_free_space_value_where_ticks_refuse_depth_has_already_refused() {
+    use tickvault_storage::tick_persistence::{
+        DEPTH_SPILL_FREE_RESERVE_BYTES, DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+        SPILL_MIN_FREE_HEADROOM_BYTES, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingVerdict,
+        classify_spill_ceiling,
+    };
+
+    const PAYLOAD: u64 = 32 * 1024 * 1024;
+
+    // Would the TICK tier refuse at this free-space value, in EITHER of its
+    // two arms and in EITHER directory regime?
+    let tick_can_refuse = |free: u64| -> bool {
+        let over_rail = matches!(
+            classify_spill_ceiling(10, 10, Some(free), SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::OverCeilingNoRoom
+        );
+        let floor = free < PAYLOAD.saturating_add(SPILL_MIN_FREE_HEADROOM_BYTES);
+        over_rail || floor
+    };
+
+    // Would the DEPTH tier refuse at the same value? Its floor is ALWAYS-ON —
+    // it does not depend on either directory being over a rail, which is
+    // exactly what makes the invariant hold in every regime.
+    let depth_refuses =
+        |free: u64| -> bool { free < PAYLOAD.saturating_add(DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES) };
+
+    let gib = 1024 * 1024 * 1024_u64;
+    let mut checked = 0_u32;
+    // 0 to 40 GiB in 256 MiB steps: covers both reserves, both floors, and
+    // the whole band between them.
+    let mut free = 0_u64;
+    while free <= 40 * gib {
+        if tick_can_refuse(free) {
+            assert!(
+                depth_refuses(free),
+                "INVERSION at {free} bytes free: the tick tier can refuse here \
+                 while the depth tier still writes. Decision-critical data is \
+                 discarded to make room for record-only data — the exact \
+                 defect the reserve split exists to prevent. depth floor = {}, \
+                 tick ceiling reserve = {}.",
+                DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            );
+            checked += 1;
+        }
+        free += 256 * 1024 * 1024;
+    }
+
+    assert!(
+        checked >= 32,
+        "only {checked} sample(s) reached the refusing branch — the sweep is \
+         not exercising the property and would pass vacuously"
+    );
+
+    // And the structural statement, so a future edit that keeps the sweep
+    // passing by shrinking the payload still fails here.
+    assert!(
+        DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES >= SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        "depth's ALWAYS-ON floor must dominate the tick tier's ceiling reserve"
+    );
+    assert!(
+        DEPTH_SPILL_FREE_RESERVE_BYTES > SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        "and the reserves must keep their own ordering"
+    );
+}
