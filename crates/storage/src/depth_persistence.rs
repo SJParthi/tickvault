@@ -683,11 +683,45 @@ fn spill_failed_depth_ilp(
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
 
+    // SOFT cap, not a refusal — see the twin in `tick_persistence.rs`.
+    //
+    // MEASURED IN PRODUCTION 2026-09-01: this exact arm fired 48 times with
+    // `cap_bytes = 10_063_871_360` while `df` reported 143 GB free, and
+    // 238,615,500 depth rows were permanently discarded. Depth carries ~24x the
+    // tick row volume against an IDENTICALLY sized ceiling, which is why the
+    // depth twin failed 12x more often than the tick one for the same defect.
+    //
+    // The rail's intent — the rescue tier must never starve QuestDB — is kept.
+    // Only the measured quantity changes: from the volume's TOTAL size, which
+    // cannot threaten anything, to FREE space, which is the only thing that can.
     if depth_spill_dir_bytes(dir) >= cap_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            format!("depth spill dir at or past its {cap_bytes}-byte cap"),
-        ));
+        match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. }
+                if free_bytes > crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES =>
+            {
+                metrics::counter!("tv_depth_spill_over_soft_cap_total").increment(1);
+            }
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "depth spill dir past its {cap_bytes}-byte soft cap AND only \
+                         {free_bytes} bytes free, at or below the database reserve — \
+                         refusing so QuestDB keeps room to operate"
+                    ),
+                ));
+            }
+            crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { reason } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "depth spill dir past its {cap_bytes}-byte soft cap and the \
+                         free-space probe failed ({reason}) — refusing rather than \
+                         growing blind"
+                    ),
+                ));
+            }
+        }
     }
 
     // One file per feed per hour: bounded file count, and an operator replaying

@@ -678,6 +678,31 @@ pub const TICK_SPILL_MIN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// half-gigabyte write is most dangerous.
 pub const SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Free-space floor that turns the spill SOFT CEILING into a refusal.
+///
+/// Past `tick_spill_max_bytes()` the rescue keeps writing while the disk has
+/// genuine room, and refuses only once free space falls to this reserve. It is
+/// deliberately EIGHT TIMES [`SPILL_MIN_FREE_HEADROOM_BYTES`]: that guard is a
+/// per-write floor sized against one ~544 MB rescue landing in a momentary
+/// trough, whereas this one is a standing reserve for a spill directory that
+/// has already outgrown its rail and will keep growing until the drain catches
+/// up. QuestDB needs room to stage and merge partitions, not merely room for
+/// one more file.
+///
+/// 16 GiB against the live 322 GB volume is ~5% held back — an order of
+/// magnitude more protection than the 2 GiB per-write floor, while still
+/// leaving ~127 GB of today's free space usable for rescue instead of the
+/// 9.37 GB the old total-derived rail allowed.
+///
+/// # Why this exists at all
+///
+/// MEASURED 2026-09-01: the total-derived ceiling refused 4 tick rescues and
+/// 48 depth rescues with 143 GB free, permanently discarding 5,142,980 ticks
+/// and 238,615,500 depth rows. A rail that fires at a fixed fraction of a
+/// disk's TOTAL size fires identically on an empty disk and a full one, which
+/// makes it useless as a protection and effective only as a data shredder.
+pub const SPILL_SOFT_CEILING_FREE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Fraction of the volume the spill tier may occupy: one thirty-second.
 ///
 /// Not a round number chosen for looks. It has to satisfy two bounds at once:
@@ -775,12 +800,59 @@ fn spill_failed_ilp(
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
 
+    // The ceiling is a SOFT rail, not a refusal.
+    //
+    // MEASURED IN PRODUCTION 2026-09-01: this arm refused four times with
+    // `ceiling = 10_063_871_360` (1/32 of a 322 GB volume) while `df` reported
+    // **143 GB free**. 5,142,980 ticks were permanently discarded onto a disk
+    // that was 53% used. The depth twin fired 48 times the same morning and
+    // discarded 238,615,500 rows. Neither disk was anywhere near full.
+    //
+    // The rail's INTENT is right and is kept: the spill tier must never be able
+    // to starve the database it rescues from. What was wrong is the quantity it
+    // measured. `tick_spill_max_bytes()` derives from the volume's TOTAL size —
+    // a constant that never changes — so it fires at the same 3% whether the
+    // disk is empty or nearly full. Total size cannot threaten QuestDB. Only
+    // FREE space can.
+    //
+    // New rule: past the soft ceiling, refuse ONLY when free space is already
+    // at or below the headroom the live guard below enforces anyway. Above it
+    // there is demonstrably room, and discarding market data we have somewhere
+    // to put is indefensible.
     let ceiling = tick_spill_max_bytes();
     if spill_dir_bytes(dir) >= ceiling {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            format!("tick spill dir at or past its {ceiling}-byte ceiling"),
-        ));
+        match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. }
+                if free_bytes > SPILL_SOFT_CEILING_FREE_RESERVE_BYTES =>
+            {
+                // Room to spare. Allow the rescue and record that we are past
+                // the soft rail, so the growth is never silent.
+                metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
+            }
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "tick spill dir past its {ceiling}-byte soft ceiling AND only \
+                         {free_bytes} bytes free, at or below the \
+                         {SPILL_SOFT_CEILING_FREE_RESERVE_BYTES}-byte database reserve — \
+                         refusing so QuestDB keeps room to operate"
+                    ),
+                ));
+            }
+            // Probe failed: fall back to the OLD conservative behaviour. An
+            // unknown free-space number must never license unbounded growth.
+            crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { reason } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "tick spill dir past its {ceiling}-byte soft ceiling and the \
+                         free-space probe failed ({reason}) — refusing rather than \
+                         growing blind"
+                    ),
+                ));
+            }
+        }
     }
     // LIVE FREE-SPACE GUARD (2026-08-25). The ceiling above is derived from
     // the volume's TOTAL size, which is the right bound for "how much of this

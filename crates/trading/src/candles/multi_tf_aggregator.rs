@@ -535,6 +535,48 @@ impl MultiTfAggregator {
         // universe. `AGGREGATOR_DEFAULT_SLOTS` covers the adaptive sizer's
         // starting range so the common case never reallocates.
         //
+        // GROW ONCE, TO THE CEILING (2026-09-01) — because the boot pre-size
+        // is measurably BELOW the session peak and cannot be fixed from here.
+        //
+        // `dhan_feed_stack` pre-sizes this table from `distinct_fold_slots`
+        // over the instrument sets it holds AT BOOT, which is the spot
+        // universe only — `dhan_feed_stack`'s own live capture reads
+        // "tracked: 865", and its comment says "865 is exactly the spot
+        // universe". The ~22,000 option/future contracts
+        // attach LATER in the session, and the per-minute ATM re-fit adds more
+        // after that — the live measured peak is 22,996 subscribed
+        // instruments (pinned in `dhan_live_universe`'s headroom test). The same file already says this in as many words about
+        // the DETECTOR, which it deliberately sizes at `AGGREGATOR_MAX_SLOTS`
+        // instead: "the universe grows ~26x after boot when contracts attach".
+        // The fold was left on the boot count.
+        //
+        // So plain `Vec` doubling from ~865 to ~23,000 runs five reallocs ON
+        // THE DRAIN TASK, and the last of them memmoves ~13,900 slots
+        // (~75 MB at ~5.4 KB/slot) — worse than the 8k->16k case the note
+        // above was written about.
+        //
+        // Reserving the FULL remaining ceiling on the first growth makes that
+        // exactly one realloc for the process lifetime, taken at the smallest
+        // n the table will ever have (the boot pre-size, ~4.7 MB), after which
+        // `slots.capacity() == effective_capacity()` and the exhaustion check
+        // above refuses before `push` can ever grow again.
+        //
+        // Reserving at CONSTRUCTION instead was considered and rejected: the
+        // ceiling is 25,000 x ~5.4 KB ~= 135 MB, and `with_capacity` is the
+        // constructor every unit test uses, so it would put that reservation
+        // behind every test in the crate to save one 4.7 MB move in prod.
+        //
+        // `reserve_exact` and not `reserve`: the amount asked for IS the final
+        // size, so the growth-amortisation `reserve` would add on top is pure
+        // waste. The aggregate-quadratic trap in the note above came from
+        // asking for FIXED CHUNKS repeatedly; asking once for the ceiling has
+        // no repeat.
+        if self.slots.len() == self.slots.capacity() {
+            self.slots
+                .reserve_exact(capacity.saturating_sub(self.slots.len()));
+            self.index
+                .reserve(capacity.saturating_sub(self.index.len()));
+        }
         // Exact: len() < capacity <= AGGREGATOR_MAX_SLOTS (25_000) << u32::MAX.
         let idx = self.slots.len();
         self.slots.push(InstrumentSlot {
@@ -2239,6 +2281,104 @@ mod tests {
             .expect("slot");
         assert_eq!(after, before, "a refused tick must leave state untouched");
         assert!(after.high.is_finite() && after.low.is_finite());
+    }
+
+    /// The slot table may realloc AT MOST ONCE for the process lifetime.
+    ///
+    /// # The measured relationship this pins
+    ///
+    /// `dhan_feed_stack` pre-sizes the fold from `distinct_fold_slots` over
+    /// the instrument sets it holds AT BOOT — the spot universe, measured at
+    /// ~865 distinct instruments (that file's own live capture line reads
+    /// "tracked: 865"). The ~22,000 option/future contracts attach LATER, and the per-minute ATM re-fit adds more after that; the measured
+    /// live peak is 22,996 subscribed instruments. The SAME file already
+    /// records this about the detector, which it deliberately sizes at
+    /// `AGGREGATOR_MAX_SLOTS` instead: "the universe grows ~26x after boot
+    /// when contracts attach". The fold was left on the boot count, so plain
+    /// `Vec` doubling ran five reallocs mid-session on the frame-drain task,
+    /// the last memmoving ~13,900 slots (~75 MB at ~5.4 KB/slot).
+    ///
+    /// The boot site is not editable from this crate, so the guarantee is made
+    /// here: the first growth reserves the whole remaining ceiling, after
+    /// which `len == capacity` is unreachable because the exhaustion check
+    /// refuses first.
+    #[test]
+    fn the_slot_table_reallocs_at_most_once_when_the_universe_outgrows_the_boot_pre_size() {
+        // Same SHAPE as production, scaled down so the test is fast: a boot
+        // pre-size far below the session peak.
+        const BOOT_PRE_SIZE: usize = 8;
+        const SESSION_PEAK: usize = 500;
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, BOOT_PRE_SIZE);
+        agg.force_capacity_for_test(SESSION_PEAK);
+
+        let mut capacity_changes = 0usize;
+        let mut last_capacity = agg.slots.capacity();
+        for sid in 0..SESSION_PEAK as u64 {
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid + 1, SEG_IDX, OPEN, 100.0, 1),
+                None,
+                |_, _, _, _, _| {},
+            );
+            assert!(
+                stats.folded(),
+                "sid {sid} must get a slot below the ceiling"
+            );
+            if agg.slots.capacity() != last_capacity {
+                capacity_changes += 1;
+                last_capacity = agg.slots.capacity();
+            }
+        }
+        assert_eq!(agg.len(), SESSION_PEAK);
+        assert_eq!(
+            capacity_changes, 1,
+            "the slot table must grow exactly once — to the ceiling — no matter how far the \
+             session peak exceeds the boot pre-size; {capacity_changes} reallocs means a \
+             multi-megabyte memmove landed on the frame-drain task"
+        );
+        assert!(
+            agg.slots.capacity() >= SESSION_PEAK,
+            "the single growth must reach the ceiling, not a doubling step short of it"
+        );
+    }
+
+    /// The one growth must land at the SMALLEST n the table will ever have.
+    ///
+    /// Reserving to the ceiling is only cheap because it happens on the very
+    /// first slot past the boot pre-size, when there are ~865 slots (~4.7 MB)
+    /// to move. If it were deferred, the same single realloc would move an
+    /// arbitrarily larger table.
+    #[test]
+    fn the_single_growth_happens_on_the_first_slot_past_the_pre_size() {
+        const BOOT_PRE_SIZE: usize = 4;
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, BOOT_PRE_SIZE);
+        agg.force_capacity_for_test(64);
+        let pre_size_capacity = agg.slots.capacity();
+
+        for sid in 0..BOOT_PRE_SIZE as u64 {
+            agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid + 1, SEG_IDX, OPEN, 100.0, 1),
+                None,
+                |_, _, _, _, _| {},
+            );
+        }
+        assert_eq!(
+            agg.slots.capacity(),
+            pre_size_capacity,
+            "filling the pre-size must not realloc at all"
+        );
+
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(9_999, SEG_IDX, OPEN, 100.0, 1),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(
+            agg.slots.capacity() >= 64,
+            "the first slot past the pre-size must reserve the whole remaining ceiling"
+        );
     }
 
     #[test]
