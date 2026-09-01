@@ -999,4 +999,41 @@ mod tests {
              up mid-session would never be noticed"
         );
     }
+
+    /// Names the host precondition the escalation tests silently depend on.
+    ///
+    /// Added 2026-09-01 after `cargo test -p tickvault-storage` produced 30
+    /// failures on a container with 520 MB free. Every one of them read
+    /// `left: 0, right: 1` — because below [`SEAL_ESCALATION_MIN_FREE_BYTES`]
+    /// the escalation chain correctly REFUSES to spill, so nothing is there to
+    /// drain. The code was right and the disk was full, but nothing said so.
+    ///
+    /// This is the inverse of the false-OK this repository keeps retiring: a
+    /// false RED, which is just as corrosive because it teaches people to
+    /// re-run until green. One test that names both numbers turns thirty
+    /// opaque failures into a one-line diagnosis.
+    ///
+    /// It asserts a REAL precondition rather than skipping: a skip would be a
+    /// silent pass, and the whole point is to be loud.
+    #[test]
+    fn seal_escalation_tests_require_free_disk_and_say_so_when_they_do_not() {
+        let dir = std::env::temp_dir();
+        let Some(free) = spill_free_bytes(&dir) else {
+            // A blind probe is not a test failure — the escalation path itself
+            // fails OPEN here, so the suite is still meaningful.
+            return;
+        };
+        assert!(
+            free >= SEAL_ESCALATION_MIN_FREE_BYTES,
+            "HOST PRECONDITION UNMET, not a code defect: this volume has {free} \
+             bytes free but the seal escalation floor is {floor} bytes \
+             (SEAL_ESCALATION_MIN_FREE_BYTES). Below that floor the chain \
+             REFUSES to spill by design, so escalation tests see an empty spill \
+             file and fail as `left: 0, right: 1` with no hint of why. Free up \
+             disk (`cargo clean` usually does it) and re-run — do NOT change \
+             the floor to make tests pass.",
+            free = free,
+            floor = SEAL_ESCALATION_MIN_FREE_BYTES,
+        );
+    }
 }
