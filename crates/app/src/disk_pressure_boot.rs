@@ -404,6 +404,29 @@ async fn run_disk_pressure_loop(
                 let dropped = run_one_pass(&questdb, &cfg).await;
                 if let Some(n) = dropped {
                     metrics::counter!("tv_disk_pressure_partitions_dropped_total").increment(n);
+                    // A `warn!` beside the counter, not merely a counter
+                    // (2026-09-01). `loss_counter_visibility_guard` caught
+                    // this: the counter's only operator surface was its
+                    // PROXIMITY to the episode-start `warn!` above, and
+                    // inserting the reclaim-signal block between them pushed
+                    // it out of range — the metric is not EMF-selected, so it
+                    // reached nobody at all.
+                    //
+                    // Fixed by giving it its own line rather than by shuffling
+                    // the code back: partitions leaving the box is worth
+                    // stating on its own terms. Every one was verified present
+                    // in S3 before the drop, so this is reclaim and not data
+                    // loss — but it IS the box shedding history under
+                    // pressure, and an operator should read it as such.
+                    warn!(
+                        partitions_dropped = n,
+                        used_pct = used,
+                        hot_days = pressure_hot_days(&cfg),
+                        "disk-pressure pass dropped archived partitions — each was \
+                         verified present in S3 before its drop, so the data is in \
+                         cold storage, not gone; the box is shedding hot-window \
+                         history to stay writable"
+                    );
                 }
                 apply_action(&mut state, action, now_secs, dropped);
             }
