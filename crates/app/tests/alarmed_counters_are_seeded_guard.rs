@@ -505,6 +505,48 @@ fn the_terraform_scanner_is_not_vacuous() {
     );
 }
 
+/// Attributes an empty Rust scan correctly — 2026-09-01.
+///
+/// An adversarial audit reported the two Rust scanners as a false-OK:
+/// `collect_const_literals` and `collect_zero_registrations` both open with
+/// `let Ok(entries) = read_dir(dir) else { return; }`, so a moved source root
+/// yields an empty scan, which the audit read as "the guard then passes having
+/// compared nothing."
+///
+/// CHECKED, and it is the OPPOSITE. `every_alarmed_counter_is_registered_at_boot`
+/// treats every alarmed name absent from `registered` as MISSING — so an empty
+/// scan makes *all* of them missing and the assertion fires. The guard already
+/// fails CLOSED on this axis; there was no vacuity to close. Recorded here
+/// because the direction is the whole point: a finding that is wrong in the
+/// reassuring direction hides a bug, and one wrong in the alarming direction —
+/// this one — sends the next reader to fix something that is not broken.
+///
+/// What IS worth fixing is the DIAGNOSIS. With the root moved, the failure
+/// arrives as a wall of ~49 "ALARMED COUNTER NEVER REGISTERED" lines, which
+/// reads exactly like a real regression in boot-time seeding. This test fires
+/// first with the actual cause named, turning a misleading failure into a
+/// one-line one. That is the same false-RED class as the seal suite's disk
+/// coupling: not a missing assertion, a misattributed one.
+#[test]
+fn an_empty_rust_scan_is_reported_as_a_moved_root_not_a_seeding_regression() {
+    let consts = const_metric_literals();
+    assert!(
+        !consts.is_empty(),
+        "const_metric_literals() found ZERO `const NAME: &str = \"tv_...\"` \
+         declarations. The source root has moved or the scanner is broken — \
+         this is NOT a boot-time seeding regression, which is what the other \
+         assertions in this file are about to look like."
+    );
+
+    let zeroed = zero_registered_names();
+    assert!(
+        !zeroed.is_empty(),
+        "zero_registered_names() found ZERO boot-time counter registrations. \
+         Same cause, same warning: the failures below are a broken scan, not \
+         missing seeding sites."
+    );
+}
+
 /// Bite-proof: the four names this guard was written for must be present.
 ///
 /// Without this the guard could pass by never having matched them at all.

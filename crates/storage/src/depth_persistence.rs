@@ -1198,6 +1198,53 @@ impl DepthWriter {
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
         let feed = self.feed.as_str();
+
+        // The `const _` proof below covers the closed SETS. It cannot cover a
+        // caller — 2026-09-01.
+        //
+        // `DepthRow`'s four symbol fields are `pub &'static str`, so nothing
+        // stops a future construction site assigning a literal that is not a
+        // member of any proven set. That gap is not hypothetical in kind: the
+        // TICK writer's twin optimisation was attempted the same day and its
+        // suite refused it, because `questdb-rs` escapes a newline as a
+        // backslash followed by a REAL newline, which still reaches the wire
+        // and splits one record into two. A forged depth row is the same
+        // class.
+        //
+        // `debug_assert!` is the right instrument and re-adding the sanitiser
+        // is not: this is the highest-volume writer in the process
+        // (~1.53e9 rows/session), the runtime call is exactly what the const
+        // proof was written to delete, and `debug_assert!` compiles to NOTHING
+        // in release. So the optimisation is preserved byte for byte while
+        // every test, every debug run and every CI suite gains a loud failure
+        // the moment a caller introduces a value the proof does not cover.
+        //
+        // `ilp_symbol_is_clean` is a `const fn`, so this is the SAME predicate
+        // the compile-time proof evaluates — not a second, drift-prone copy.
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(row.segment),
+            "DepthRow.segment {:?} is not ILP-safe. append_row passes symbols \
+             through unsanitised because the const proof covers the closed sets \
+             — a caller has supplied a value outside them, which would forge a \
+             row on the wire.",
+            row.segment
+        );
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(row.depth_kind),
+            "DepthRow.depth_kind {:?} is not ILP-safe — see the segment assert \
+             above; this field is part of the DEDUP key, so a forged value also \
+             corrupts d20/d200 separation.",
+            row.depth_kind
+        );
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(row.side),
+            "DepthRow.side {:?} is not ILP-safe — see the segment assert above.",
+            row.side
+        );
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(feed),
+            "feed label {feed:?} is not ILP-safe — see the segment assert above."
+        );
         // Passed through WITHOUT `sanitize_ilp_symbol`, deliberately.
         //
         // All four are `&'static str` from CLOSED SETS, and the `const _` block
@@ -3249,5 +3296,55 @@ mod tests {
             "for_test is expected to carry 0 — if that changed, this test is \
              no longer proving anything and should be re-derived"
         );
+    }
+
+    /// The unsanitised symbol path is guarded in debug — 2026-09-01.
+    ///
+    /// `append_row` deliberately skips `sanitize_ilp_symbol` because the
+    /// `const _` block proves every member of the closed sets is ILP-safe.
+    /// The proof cannot cover a CALLER, and the four fields are `pub`.
+    ///
+    /// This pins that a value outside the proven sets is caught rather than
+    /// written. It is a `should_panic` on a `debug_assert!`, so it exercises
+    /// exactly the build configuration tests and CI run in — and costs
+    /// nothing in release, which is the point: the highest-volume writer in
+    /// the process keeps the optimisation.
+    #[test]
+    #[should_panic(expected = "is not ILP-safe")]
+    fn a_hostile_segment_is_refused_in_debug_rather_than_forging_a_row() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        // A raw newline is the specific value that defeats the encoder: it is
+        // escaped as a backslash plus a REAL newline, so it still reaches the
+        // wire and splits one record into two.
+        r.segment = "NSE\nFNO";
+        let _ = w.append_row(&r);
+    }
+
+    /// Same guard, on the field that is part of the DEDUP key.
+    #[test]
+    #[should_panic(expected = "is not ILP-safe")]
+    fn a_hostile_depth_kind_is_refused_in_debug() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.depth_kind = "d20,evil=1";
+        let _ = w.append_row(&r);
+    }
+
+    /// And the happy path must still be untouched — a guard that fires on
+    /// legitimate input would be worse than none.
+    #[test]
+    fn every_proven_label_still_appends_cleanly() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        for (kind, side) in [
+            (DEPTH_KIND_5, DEPTH_SIDE_BID),
+            (DEPTH_KIND_20, DEPTH_SIDE_ASK),
+            (DEPTH_KIND_200, DEPTH_SIDE_BID),
+        ] {
+            let mut r = row();
+            r.depth_kind = kind;
+            r.side = side;
+            w.append_row(&r).expect("proven labels must append"); // APPROVED: test-only
+        }
     }
 }
