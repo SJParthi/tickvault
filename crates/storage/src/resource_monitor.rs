@@ -345,6 +345,14 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
         let m_rss = metrics::gauge!("tv_process_rss_bytes");
         let m_spill_free_pct = metrics::gauge!("tv_spill_free_pct");
         let m_probe_failed = metrics::counter!("tv_resource_monitor_probe_failed_total");
+        // Consecutive cycles with no readable memory ceiling. Used to throttle
+        // the UNCHECKED warning to powers of two: the condition is persistent
+        // by nature (an unreadable /proc/meminfo does not heal itself), so at a
+        // 60s cadence an unthrottled line would be ~1,440 identical warnings a
+        // day — which is how a real signal gets filtered out and ignored.
+        // Powers of two give ~11 lines a day instead, and the FIRST one is
+        // immediate.
+        let mut ceiling_unreadable_streak: u64 = 0;
 
         info!(
             interval_secs = RESOURCE_MONITOR_POLL_INTERVAL_SECS,
@@ -430,6 +438,7 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
                             );
                         }
                         Some(_) => {
+                            ceiling_unreadable_streak = 0;
                             debug!(rss_bytes = rss, ceiling = ceiling.source(), "RSS ok");
                         }
                         // NOT "RSS ok". Nothing was compared, so nothing is
@@ -438,11 +447,27 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
                         // failed probe in this monitor.
                         None => {
                             m_probe_failed.increment(1);
-                            debug!(
-                                rss_bytes = rss,
-                                "resource monitor: no memory ceiling readable — RSS \
-                                 recorded but UNCHECKED"
-                            );
+                            ceiling_unreadable_streak = ceiling_unreadable_streak.saturating_add(1);
+                            // WARN, not DEBUG (2026-09-01, adversarial review).
+                            //
+                            // The arm below — an unreadable RSS — already warns,
+                            // and this is the same class: nothing was compared,
+                            // so the RSS alarm is not merely quiet, it is
+                            // STRUCTURALLY unable to fire. At `debug!` that state
+                            // was honest in the code and invisible in production,
+                            // which is most of the way back to the false-OK this
+                            // arm was repaired for. The counter it increments has
+                            // no alarm either, so the log line is the only
+                            // operator-reachable signal that exists.
+                            if ceiling_unreadable_streak.is_power_of_two() {
+                                warn!(
+                                    rss_bytes = rss,
+                                    consecutive_cycles = ceiling_unreadable_streak,
+                                    "resource monitor: no memory ceiling readable — RSS \
+                                     recorded but UNCHECKED, so the RSS threshold cannot \
+                                     fire at all (throttled to powers of two)"
+                                );
+                            }
                         }
                     }
                 }

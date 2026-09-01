@@ -1109,6 +1109,29 @@ impl DepthWriter {
         }
     }
 
+    /// A short-lived stand-in for `std::mem::replace`, carrying the REAL floor.
+    ///
+    /// `for_test` sets `spill_min_free_headroom: 0`, and production code uses
+    /// it as a placeholder while swapping the live writer out for its offload
+    /// split. Adversarial review flagged the shape (2026-09-01): the window is
+    /// transient today — the real producer is installed two lines later with
+    /// no early return in between — but a floor of ZERO means NO floor on the
+    /// sighted path, so any future edit that returns or `?`s inside that
+    /// window would leave a depth writer spilling with nothing checking free
+    /// space at all.
+    ///
+    /// Rather than pin the window with a test that a refactor can silently
+    /// invalidate, the placeholder simply carries the production floor. Then
+    /// the hazard is not "guarded" — it does not exist.
+    #[must_use]
+    // TEST-EXEMPT: a construction-shape helper; its behaviour is the production floor, pinned by `the_mem_replace_placeholder_carries_the_production_floor`.
+    pub fn placeholder_for_offload_swap(feed: Feed) -> Self {
+        Self {
+            spill_min_free_headroom: crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+            ..Self::for_test(feed)
+        }
+    }
+
     /// Test-only: points the rescue tier at an isolated directory.
     #[cfg(test)]
     #[must_use]
@@ -3193,5 +3216,38 @@ mod tests {
                 name.len()
             );
         }
+    }
+
+    /// The `mem::replace` placeholder must carry the REAL floor.
+    ///
+    /// `for_test` sets the floor to 0, and 0 means NO floor on the sighted
+    /// path — a writer that always has room. Production briefly holds a
+    /// placeholder while swapping the live writer for its offload split; the
+    /// window is transient today, but a floor-0 depth writer escaping it would
+    /// spill with nothing checking free space, which is the exact inversion
+    /// the typed blind-write policy was introduced to make impossible.
+    #[test]
+    fn the_mem_replace_placeholder_carries_the_production_floor() {
+        let placeholder = DepthWriter::placeholder_for_offload_swap(Feed::Dhan);
+        assert_eq!(
+            placeholder.spill_min_free_headroom,
+            crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+            "the placeholder must carry the production depth floor, not the \
+             test writer's zero"
+        );
+        assert!(
+            placeholder.spill_min_free_headroom > 0,
+            "a floor of zero is not a floor — it allows any write the probe \
+             can see space for, however little"
+        );
+        // Non-vacuous: the thing it is derived FROM really does carry zero, so
+        // this test would fail if someone "simplified" the placeholder back to
+        // `for_test`.
+        assert_eq!(
+            DepthWriter::for_test(Feed::Dhan).spill_min_free_headroom,
+            0,
+            "for_test is expected to carry 0 — if that changed, this test is \
+             no longer proving anything and should be re-derived"
+        );
     }
 }

@@ -5198,7 +5198,7 @@ impl DepthIngest {
                     );
                 }
             })?;
-        let placeholder = DepthWriter::for_test(Feed::Dhan);
+        let placeholder = DepthWriter::placeholder_for_offload_swap(Feed::Dhan);
         let live = std::mem::replace(&mut self.writer, placeholder);
         let (producer, sink, rx) = live.split_for_offload();
         self.writer = producer;

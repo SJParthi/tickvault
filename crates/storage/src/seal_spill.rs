@@ -467,6 +467,17 @@ impl SealSpillWriter {
         }
     }
 
+    /// The directory this writer appends into.
+    ///
+    /// Exposed so the absorption pipeline can ask the FILESYSTEM about free
+    /// space before it escalates. The pipeline owns that decision because a
+    /// refusal here would only redirect the bytes to the DLQ on the SAME
+    /// volume — see `SealAbsorptionPipeline::escalate_evicted`.
+    #[must_use]
+    pub fn spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir
+    }
+
     /// Test constructor. Tests pass an isolated `tempdir` to allow
     /// parallel execution.
     #[must_use]
@@ -1984,6 +1995,39 @@ mod tests {
         let out = prune_spill_files_at(&dir, 0, now);
         assert_eq!(out.deleted, 0, "a file with zero age must survive");
         assert!(path.exists());
+    }
+
+    /// The absorption pipeline asks this writer where it writes so it can ask
+    /// the filesystem how much room is left. If it ever named a different
+    /// directory from the one appends land in, the free-space floor would be
+    /// measuring the wrong volume and would read healthy while the real one
+    /// filled.
+    #[test]
+    fn spill_dir_reports_the_directory_appends_actually_land_in() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tickvault-seal-spill-dir-{}-{}",
+            std::process::id(),
+            "accessor"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        assert_eq!(writer.spill_dir(), dir.as_path());
+
+        // Non-vacuous: append a seal and confirm the file lands under exactly
+        // the directory this accessor names.
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 100, 24_000.5), 1_777_000_000)
+            .expect("append must land");
+        let entries: Vec<_> = std::fs::read_dir(writer.spill_dir())
+            .expect("spill dir must exist after an append")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "an appended seal must be visible in the directory spill_dir() names"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
