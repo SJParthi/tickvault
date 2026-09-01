@@ -2121,6 +2121,26 @@ async fn async_main() -> Result<()> {
             config.partition_retention.clone(),
         );
 
+    // The DAILY archive sweep, on its own polling scheduler (2026-09-01).
+    //
+    // This replaces an inline block that used to sit in the `market_close`
+    // arm of the shutdown `tokio::select!` below. That block could not run at
+    // all if the process started after 15:30 IST — `compute_market_close_sleep`
+    // returns ZERO past the close and the arm is guarded on it being non-zero
+    // — and it was also skipped whenever shutdown arrived by SIGTERM, which is
+    // how the 17:30 box stop always arrives. Neither case reported anything,
+    // because a sweep that never runs leaves every failure counter flat.
+    //
+    // Spawned HERE, beside the disk-pressure loop, because the two are the
+    // same class of job and are now mutually excluded inside
+    // `partition_archive` itself rather than by luck of timing.
+    let _daily_archive_supervisor =
+        tickvault_app::daily_archive_boot::spawn_supervised_daily_archive_loop(
+            config.questdb.clone(),
+            config.partition_retention.clone(),
+            config.trading.market_close_time.clone(),
+        );
+
     // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
     // supervised per-table QuestDB WAL-suspension probe. Polls
     // `wal_tables()` every 60s via the shared probe client; a table whose
@@ -4059,56 +4079,17 @@ async fn run_process_runloop(
         );
         tokio::time::sleep(drain).await;
 
-        // Post-market: archive→verify→drop old QuestDB partitions (2026-07-13
-        // disk-pressure remediation). MUST run BEFORE the legacy detach cycle
-        // so a >retention_days partition is archived+dropped (disk freed, S3
-        // copy verified) rather than detached-unarchived (renamed inside the
-        // same volume, zero bytes freed). Gated on `archive_enabled` (serde
-        // default false) — a config rollback restores detach-only behaviour
-        // byte-identically. Fail-closed: a partition is dropped ONLY after
-        // its S3 copy is row-count- and size-verified; any failure keeps the
-        // partition and retries next run.
-        if config.partition_retention.archive_enabled {
-            match tickvault_storage::partition_archive::PartitionArchiver::new(
-                &config.questdb,
-                &config.partition_retention,
-            )
-            .await
-            {
-                Ok(Some(mut archiver)) => {
-                    let summary = archiver.archive_and_drop_old_partitions().await;
-                    info!(
-                        tables_scanned = summary.tables_scanned,
-                        partitions_considered = summary.partitions_considered,
-                        verified = summary.verified,
-                        dropped = summary.dropped,
-                        failed = summary.failed,
-                        rows_archived = summary.rows_archived,
-                        gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
-                        csv_bytes_exported = summary.csv_bytes_exported,
-                        "post-market partition archive complete (verified S3 copy before every drop)"
-                    );
-                }
-                // Review round 1 F1b (fail-closed): no explicit archive
-                // bucket AND no explicit TV_ENVIRONMENT/ENVIRONMENT env var
-                // — archival skipped rather than guessing the prod bucket.
-                // The constructor already logged the actionable warn.
-                Ok(None) => {}
-                Err(err) => {
-                    error!(
-                        ?err,
-                        code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
-                            .code_str(),
-                        "partition archiver construction failed — archive cycle skipped \
-                         this run (fail-closed no-op; detach cycle still runs)"
-                    );
-                }
-            }
-        }
+        // The daily archive sweep used to run HERE, inline. It now runs from
+        // `daily_archive_boot::spawn_supervised_daily_archive_loop`, spawned at
+        // boot, because this arm is unreachable on any run that started after
+        // 15:30 IST and is skipped entirely when shutdown arrives by SIGTERM —
+        // which is how the 17:30 box stop always arrives. Keeping a second copy
+        // here would give the sweep two drivers that could drift; there is now
+        // exactly one.
 
         // Post-market: detach old QuestDB partitions (Phase B).
         // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
-        // KEPT even with the archive leg enabled: the archive cycle above drops
+        // KEPT even with the archive leg enabled: the daily archive loop drops
         // aged partitions first, so this legacy cycle finds nothing new — but its
         // `total_detached=…` log lines keep firing so the CloudWatch evidence
         // trail (the 15:30 IST "partition" filter) continues uninterrupted.
