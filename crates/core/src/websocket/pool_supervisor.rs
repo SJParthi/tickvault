@@ -3253,7 +3253,10 @@ where
                         // A dropped receiver means the caller stopped caring
                         // (its attach loop ended). Nothing to do about it and
                         // nothing lost: the guard is already truthful.
-                        let _ = ack.send(outcome);
+                        if ack.send(outcome).is_err() {
+                            // Receiver gone: the caller stopped waiting.
+                            // Nothing to do and nothing lost.
+                        }
                     }
                 }
                 Ok(LiveSubscriptionCommand::Swap { old, new }) => {
