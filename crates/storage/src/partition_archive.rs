@@ -1132,6 +1132,40 @@ pub struct PartitionArchiver {
     audit: PartitionArchiveAuditWriter,
 }
 
+/// Which partition-list window a table gets this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HourWindowDecision {
+    /// Hour-granular, no spill in flight. The ordinary hour path.
+    Hours(u32),
+    /// Hour-granular DESPITE a spill in flight, because the volume is under
+    /// a disk-pressure episode. Counted separately so forcing is never
+    /// invisible.
+    ForcedHours(u32),
+    /// Table is hour-capable but a spill replay may be in flight and we are
+    /// not under pressure. Fall back to the day window.
+    DeferredToDays,
+    /// Table is not on the arrival-stamped allowlist. Day window by class.
+    DaysByClass,
+}
+
+/// Pure window choice, so the rule is testable without HTTP or a recorder.
+///
+/// `hours` is `None` for every table outside `ARRIVAL_STAMPED_HOUR_TABLES`
+/// and for a configured `0`, which is what keeps the day path the default.
+#[must_use]
+pub(crate) fn hour_window_decision(
+    hours: Option<u32>,
+    spill_pending: bool,
+    under_disk_pressure: bool,
+) -> HourWindowDecision {
+    match hours {
+        None => HourWindowDecision::DaysByClass,
+        Some(h) if !spill_pending => HourWindowDecision::Hours(h),
+        Some(h) if under_disk_pressure => HourWindowDecision::ForcedHours(h),
+        Some(_) => HourWindowDecision::DeferredToDays,
+    }
+}
+
 impl PartitionArchiver {
     /// Builds the archiver: HTTP clients, the S3 client from the default AWS
     /// credential chain (instance role on prod), and the resolved bucket.
@@ -1846,14 +1880,41 @@ impl PartitionArchiver {
         // degradation is bounded (archival is deferred, never skipped), and
         // it needs no coordination between two subsystems -- a directory
         // check is a fact both can see without a lock.
+        //
+        // UNDER DISK PRESSURE the deferral inverts (2026-09-01). The spill
+        // dirs are non-empty BECAUSE the disk is full, so deferring makes the
+        // one hourly-reclaimable table unreclaimable at exactly the moment
+        // reclaiming it is the point. Measured on the live box that day:
+        // `market_depth` held 185.7 GB across 10 hourly partitions against a
+        // configured 4-hour window, on a 93%-full volume, while the pressure
+        // episode reclaimed zero and escalated STORAGE-GAP-05.
+        //
+        // Overriding is safe because the deferral is defence-in-depth, not
+        // the defence. The drop is unchanged and remains fail-closed: export
+        // -> post-export recount over the identical range -> `HeadObject` ->
+        // `VerifiedArchive`. A replay that lands mid-window moves the row
+        // count, verification fails, and the partition is KEPT. The residual
+        // that the recount "cannot close entirely without a table lock
+        // QuestDB does not offer" is a narrow race against ONE partition; the
+        // alternative under pressure is a full volume, which WAL-suspends
+        // EVERY table at once (precedent: 2026-08-25, 14 tables suspended,
+        // writes ACKed and never applied, box unreachable by SSM).
         let spill_pending = Self::spill_dirs_have_pending_data();
-        let list_sql = match hot_window_hours(table, self.cfg.depth_hot_hours) {
-            Some(hours) if !spill_pending => build_detach_list_sql_hours(table, hours),
-            Some(_) => {
+        let list_sql = match hour_window_decision(
+            hot_window_hours(table, self.cfg.depth_hot_hours),
+            spill_pending,
+            self.cfg.under_disk_pressure,
+        ) {
+            HourWindowDecision::Hours(hours) => build_detach_list_sql_hours(table, hours),
+            HourWindowDecision::ForcedHours(hours) => {
+                metrics::counter!("tv_partition_archive_hour_window_forced_total").increment(1);
+                build_detach_list_sql_hours(table, hours)
+            }
+            HourWindowDecision::DeferredToDays => {
                 metrics::counter!("tv_partition_archive_hour_window_deferred_total").increment(1);
                 build_detach_list_sql(table, hot_days)
             }
-            None => build_detach_list_sql(table, hot_days),
+            HourWindowDecision::DaysByClass => build_detach_list_sql(table, hot_days),
         };
         let response = self
             .ddl_client
@@ -4705,6 +4766,87 @@ mod hour_granular_eligibility_tests {
         assert!(
             sql.contains("table_partitions('market_depth')"),
             "table name must be single-quoted: {sql}"
+        );
+    }
+    // ---- hour-window decision under disk pressure (2026-09-01) ----------
+    //
+    // The measured incident these pin: `market_depth` held 185.7 GB in 10
+    // hourly partitions against a configured 4-hour window, on a 93%-full
+    // volume, while the pressure episode reclaimed ZERO. Cause: the spill
+    // dirs are non-empty BECAUSE the disk is full, so the hour window
+    // deferred to a 2-day one that protects every partition the box wrote
+    // that session.
+
+    #[test]
+    fn pressure_keeps_the_hour_window_when_a_spill_is_pending() {
+        // The exact incident shape: hour-capable table, spill pending,
+        // pressure episode active. Before the fix this returned the day
+        // window and the pass reclaimed nothing.
+        assert_eq!(
+            hour_window_decision(Some(4), true, true),
+            HourWindowDecision::ForcedHours(4),
+            "under pressure the hour window must survive a pending spill — \
+             deferring is what made the 93%-full volume unreclaimable"
+        );
+    }
+
+    #[test]
+    fn without_pressure_a_pending_spill_still_defers() {
+        // The conservative default is UNCHANGED off-pressure. This is the
+        // half that must not regress: the deferral exists for a real race.
+        assert_eq!(
+            hour_window_decision(Some(4), true, false),
+            HourWindowDecision::DeferredToDays
+        );
+    }
+
+    #[test]
+    fn no_spill_uses_the_hour_window_and_is_not_counted_as_forced() {
+        // Forcing must be distinguishable from the ordinary hour path, or
+        // the counter cannot tell an operator that a race window was opened.
+        assert_eq!(
+            hour_window_decision(Some(4), false, false),
+            HourWindowDecision::Hours(4)
+        );
+        assert_eq!(
+            hour_window_decision(Some(4), false, true),
+            HourWindowDecision::Hours(4),
+            "pressure alone must not mark the decision forced when there is \
+             no spill to race against"
+        );
+    }
+
+    #[test]
+    fn a_table_off_the_allowlist_never_reaches_the_hour_path() {
+        // `hours = None` is how every table except `market_depth` arrives
+        // here. Pressure must not promote one onto an hour window it was
+        // never proven safe for.
+        for pressure in [false, true] {
+            for spill in [false, true] {
+                assert_eq!(
+                    hour_window_decision(None, spill, pressure),
+                    HourWindowDecision::DaysByClass,
+                    "pressure={pressure} spill={spill} must stay on days"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pressure_marker_cannot_be_set_from_configuration() {
+        // It is `#[serde(skip)]` on purpose: the only writer is
+        // `disk_pressure_boot::pressure_config`. If TOML could set it, an
+        // operator could force the race window open permanently without
+        // ever being under pressure.
+        let cfg: tickvault_common::config::PartitionRetentionConfig =
+            toml::from_str("under_disk_pressure = true").expect("parses");
+        assert!(
+            !cfg.under_disk_pressure,
+            "under_disk_pressure must be unreachable from TOML"
+        );
+        assert!(
+            !tickvault_common::config::PartitionRetentionConfig::default().under_disk_pressure,
+            "the default must be off"
         );
     }
 }
