@@ -2260,8 +2260,11 @@ mod apply_tests {
         // stalled drain is tick loss at Dhan's side with no sequence number to
         // detect it. Dropping costs one stale minute.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(LiveSubscriptionCommand::Extend(vec![]))
-            .expect("fills the channel");
+        tx.try_send(LiveSubscriptionCommand::Extend {
+            more: vec![],
+            ack: None,
+        })
+        .expect("fills the channel");
         let mut sockets = vec![RebalanceSocket {
             tx,
             held: Some(instrument(1_000, ExchangeSegment::NseFno)),

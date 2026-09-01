@@ -737,8 +737,11 @@ mod apply_tests {
         // connection never received.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         // Fill it.
-        tx.try_send(LiveSubscriptionCommand::Extend(vec![]))
-            .expect("prime");
+        tx.try_send(LiveSubscriptionCommand::Extend {
+            more: vec![],
+            ack: None,
+        })
+        .expect("prime");
         let mut sockets = vec![Depth20LiveSocket {
             tx,
             held: vec![ins(1), ins(2)],

@@ -1370,6 +1370,22 @@ impl SubscribeGuard {
         }
     }
 
+    /// Shrink the guard to `len` and RETURN the instruments cut off.
+    ///
+    /// The same operation as [`Self::truncate_to`], but the tail is handed
+    /// back instead of dropped: the top-up handler uses it to tell the
+    /// caller exactly which instruments never reached the wire, so they can
+    /// be offered again. Returns an empty `Vec` when nothing is cut. Cold
+    /// path — one `split_off` per budget exhaustion, never per tick.
+    #[must_use]
+    pub fn take_from(&mut self, len: usize) -> Vec<SubscribeInstrument> {
+        // Clamped so a past-the-end `len` cuts nothing: `split_off(len())`
+        // returns an empty Vec without allocating.
+        // O(1) EXEMPT: cold path — one split_off per budget exhaustion, never per tick.
+        let at = len.min(self.instruments.len());
+        self.instruments.split_off(at)
+    }
+
     #[must_use]
     pub fn spare_capacity(&self) -> usize {
         let max =
@@ -1627,7 +1643,7 @@ pub const TOPUP_WIRE_BUDGET: Duration = Duration::from_secs(5);
 /// the connection driver would each need their own null check in the drain
 /// loop, and — worse — could deliver an `Extend` and a `Swap` in an order
 /// neither sender chose. One channel gives the sequence the sender wrote.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum LiveSubscriptionCommand {
     /// Add instruments to a set already on the wire.
     ///
@@ -1635,7 +1651,22 @@ pub enum LiveSubscriptionCommand {
     /// ~4,150 slots stranded on the boot-dialed spot connection, which is
     /// exactly what the authorized ATM window was short of. See
     /// [`SubscribeGuard::try_extend`].
-    Extend(Vec<SubscribeInstrument>),
+    Extend {
+        /// The instruments to add.
+        more: Vec<SubscribeInstrument>,
+        /// Where the connection reports what ACTUALLY reached the wire.
+        ///
+        /// Added 2026-09-01 after an audit found the caller marking every
+        /// instrument of a chunk as subscribed the moment `try_send`
+        /// succeeded — while this task, seconds later, could hit its wire
+        /// budget and truncate the guard to what it had really sent. The
+        /// caller's `sent` set then filtered the remainder out of every
+        /// later top-up, so the socket carried fewer contracts than the
+        /// operator authorized for the rest of the session, with a green
+        /// dashboard. `None` when the sender does not need the answer
+        /// (tests, one-shot primes); a dropped receiver is ignored.
+        ack: Option<tokio::sync::oneshot::Sender<ExtendOutcome>>,
+    },
     /// Replace one instrument with another, without re-dialing.
     ///
     /// The per-minute at-the-money re-selection for depth-200 and depth-20.
@@ -1648,6 +1679,31 @@ pub enum LiveSubscriptionCommand {
         /// The instrument to take its place.
         new: SubscribeInstrument,
     },
+}
+
+/// What a [`LiveSubscriptionCommand::Extend`] actually did to the socket.
+///
+/// The truth the caller needs and could not previously get: `try_send`
+/// succeeding means the COMMAND was queued, not that the instruments are on
+/// the wire. This is the answer, sent once per command through the `ack`
+/// the caller attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtendOutcome {
+    /// Every offered instrument is in the guard. Either it went out on the
+    /// wire, or a send failed part-way and the guard was deliberately LEFT
+    /// naming it so the reconnect replay delivers it — from the caller's
+    /// side both mean "do not offer it again".
+    Held,
+    /// `try_extend` refused the whole set (per-connection cap). Nothing is
+    /// held; the caller must free every offered instrument for a later
+    /// attempt on a connection with room.
+    Refused,
+    /// The wire budget expired (or a send timed out) part-way. The guard was
+    /// truncated to what really went out; `not_held` is the tail that did
+    /// NOT, handed back so the caller can un-mark exactly those and re-offer
+    /// them on the next top-up. The guard dedups a re-offer of anything it
+    /// already holds, so re-offering can never double-subscribe.
+    Truncated { not_held: Vec<SubscribeInstrument> },
 }
 
 // ---------------------------------------------------------------------------
@@ -3038,8 +3094,13 @@ where
         // up and the attach sending, and it disappears permanently after.
         if let Some(rx) = commands.as_mut() {
             match rx.try_recv() {
-                Ok(LiveSubscriptionCommand::Extend(more)) => {
+                Ok(LiveSubscriptionCommand::Extend { more, ack }) => {
                     let added = more.len();
+                    // Decided by the arms below; sent ONCE after the match so
+                    // no arm can forget it. A missing ack would leave the
+                    // caller's `sent` set frozen on its optimistic guess,
+                    // which is the exact defect the ack exists to end.
+                    let outcome: ExtendOutcome;
                     match guard.try_extend(more) {
                         Ok(start) => {
                             // BOUNDED and PACED. Both were missing, and the
@@ -3102,22 +3163,28 @@ where
                             if budget_exhausted {
                                 // Keep the guard honest: it is the reconnect
                                 // replay, so it must name only what the socket
-                                // actually holds.
-                                guard.truncate_to(start + sent);
+                                // actually holds. The cut tail goes BACK to
+                                // the caller (2026-09-01) so the next top-up
+                                // can offer it again instead of filtering it
+                                // out forever on a stale "already sent" set.
+                                let not_held = guard.take_from(start + sent);
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                     endpoint = supervisor.slot().endpoint.as_str(),
                                     pool_index = supervisor.slot().pool_index,
                                     added,
                                     sent,
+                                    not_held = not_held.len(),
                                     budget_secs = TOPUP_WIRE_BUDGET.as_secs(),
+                                    source = "topup_budget_exhausted",
                                     "live subscription top-up hit its wire budget and STOPPED - \
                                      the socket stayed up and is carrying what did reach it. \
-                                     The remainder is not subscribed this session unless a later \
-                                     top-up offers it again."
+                                     The remainder is handed back to the caller and re-offered \
+                                     by the next top-up."
                                 );
                                 metrics::counter!("tv_dhan_ws_topup_budget_exhausted_total")
                                     .increment(1);
+                                outcome = ExtendOutcome::Truncated { not_held };
                             } else if failed {
                                 // Do NOT mark the guard lost here — the
                                 // supervisor owns that transition and will see
@@ -3135,6 +3202,10 @@ where
                                      replay sends the whole set and reconciles it"
                                 );
                                 metrics::counter!("tv_dhan_ws_topup_failed_total").increment(1);
+                                // The guard still names them and the replay
+                                // will deliver them: from the caller's side
+                                // that is "held", not "re-offer".
+                                outcome = ExtendOutcome::Held;
                             } else {
                                 info!(
                                     endpoint = supervisor.slot().endpoint.as_str(),
@@ -3146,6 +3217,7 @@ where
                                 );
                                 metrics::counter!("tv_dhan_ws_topup_instruments_total")
                                     .increment(added as u64);
+                                outcome = ExtendOutcome::Held;
                             }
                         }
                         Err(_) => {
@@ -3174,7 +3246,14 @@ where
                                  authorized. The pool-dialed contracts and depth are unaffected."
                             );
                             metrics::counter!("tv_dhan_ws_topup_refused_total").increment(1);
+                            outcome = ExtendOutcome::Refused;
                         }
+                    }
+                    if let Some(ack) = ack {
+                        // A dropped receiver means the caller stopped caring
+                        // (its attach loop ended). Nothing to do about it and
+                        // nothing lost: the guard is already truthful.
+                        let _ = ack.send(outcome);
                     }
                 }
                 Ok(LiveSubscriptionCommand::Swap { old, new }) => {
@@ -3325,40 +3404,41 @@ where
                                 //
                                 // `lost_instruments` is the REMEDIATION
                                 // trigger: it returns `SubscribeFailed`, which
-                                // makes the outer loop redial. It stays gated
-                                // on an unsubscribe that ANSWERED `Ok`.
+                                // makes the outer loop redial.
                                 //
-                                // `possibly_emptied` is the VISIBILITY fact: a
-                                // timed-out unsubscribe may still have reached
-                                // the wire, so the socket may be empty even
-                                // though nothing here can know it. That is the
-                                // blindness worth counting, and counting it
-                                // costs nothing.
+                                // Since 2026-09-01 it covers BOTH an
+                                // unsubscribe that answered `Ok` AND one that
+                                // TIMED OUT. Until then the timed-out case was
+                                // counted (`possibly_emptied`) and NOT
+                                // redialled, on the argument that the socket's
+                                // state was unknown. Two independent audits
+                                // found the same hole the same day: a budget
+                                // elapsing does not mean the frame was never
+                                // written — a slow flush that lands afterwards
+                                // leaves Dhan holding nothing, and the socket
+                                // then keeps ponging, counts as alive, and
+                                // delivers nothing for the rest of the session,
+                                // with the emptied-socket alarm keyed on a
+                                // `source` this path never emitted. The two
+                                // errors are not symmetric: a redial is
+                                // idempotent (the guard already names the NEW
+                                // instrument, so the replay lands the right
+                                // strike) and costs one backoff, while an empty
+                                // socket costs every tick until the next
+                                // unrelated disconnect. The redial is bounded
+                                // by the same ladder every `SubscribeFailed`
+                                // uses; a socket that cannot take a one-second
+                                // write is sick and belongs on it anyway.
                                 //
-                                // Why they are not the same bool: making a
-                                // TIMEOUT trigger the redial turned a bounded
-                                // failure into an unbounded one. The redial
-                                // re-enters `send_subscribe`, and this code
-                                // path has no timeout of its own around that
-                                // call — so a socket that never answers took
-                                // the redial, hung on the replayed subscribe,
-                                // and held the drain forever. CI caught it as
-                                // a 180-second test timeout on
-                                // `a_socket_that_never_answers_costs_the_drain_two_seconds_not_twenty`,
-                                // which passes on main and hung here: proof
-                                // that the widening, not the test, was wrong.
-                                //
-                                // The reasoning that produced the widening was
-                                // still right — a timed-out unsubscribe really
-                                // may have landed — so the FACT is kept and
-                                // only the ACTION is withheld. Acting on it
-                                // safely needs a bounded redial, which is its
-                                // own change.
+                                // `possibly_emptied` survives as the VISIBILITY
+                                // fact — which of the two paths brought us here
+                                // — so triage can tell a refused write from a
+                                // silent one.
+                                let unsubscribe_may_have_landed = unsubscribe_succeeded
+                                    || (wire_timed_out && swap.unsubscribe.is_some());
                                 let lost_instruments =
-                                    unsubscribe_succeeded && swap.subscribe.is_some();
-                                let possibly_emptied = wire_timed_out
-                                    && swap.unsubscribe.is_some()
-                                    && swap.subscribe.is_some();
+                                    unsubscribe_may_have_landed && swap.subscribe.is_some();
+                                let possibly_emptied = lost_instruments && !unsubscribe_succeeded;
                                 // The guard already carries the NEW instrument
                                 // — see `try_swap` for why it is recorded
                                 // before the wire moves. That is what makes
@@ -3384,21 +3464,21 @@ where
                                 // not a hypothetical — it broke this exact
                                 // counter twice today.
                                 //
-                                // The alarm keys on `swap_emptied_socket` only,
-                                // because that is the case a redial is
-                                // scheduled for. `swap_maybe_emptied` is the
-                                // honest third state: the unsubscribe did not
-                                // answer, so whether the socket is empty is
-                                // UNKNOWN here. Folding it into either of the
-                                // other two would be a claim this code cannot
-                                // make — one direction hides an empty socket,
-                                // the other pages for one that is fine.
+                                // TWO `source` values since 2026-09-01. The
+                                // alarm keys on `swap_emptied_socket`, which
+                                // is the case a redial is scheduled for — and
+                                // that case now INCLUDES the timed-out
+                                // unsubscribe (see `lost_instruments` above).
+                                // The former third value, `swap_maybe_emptied`,
+                                // named a state that was counted and never
+                                // remediated; it is gone because the state is
+                                // now handled, not because it stopped being
+                                // uncertain. `possibly_emptied` in the fields
+                                // still says which path it was.
                                 error!(
                                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                     source = if lost_instruments {
                                         "swap_emptied_socket"
-                                    } else if possibly_emptied {
-                                        "swap_maybe_emptied"
                                     } else {
                                         "swap_wire_failed"
                                     },
@@ -3409,13 +3489,13 @@ where
                                     wire_timed_out,
                                     "live subscription swap failed on the wire. The retained set \
                                      already names the new instrument, so a reconnect replay lands \
-                                     the right strike. When the unsubscribe had already succeeded \
-                                     the socket is now carrying NOTHING, and a redial is scheduled \
-                                     here to recover it — without one, a transport-healthy socket \
-                                     keeps ponging while delivering no data. When the unsubscribe \
-                                     TIMED OUT instead, whether the socket is empty is unknown \
-                                     from here: no redial is scheduled, and this line is the only \
-                                     record that the question exists."
+                                     the right strike. When the unsubscribe succeeded OR timed out \
+                                     the socket may now be carrying NOTHING, and a redial is \
+                                     scheduled here to recover it — without one, a transport-healthy \
+                                     socket keeps ponging while delivering no data. \
+                                     `possibly_emptied` = the timed-out path (unknown, treated as \
+                                     emptied, because a redial is idempotent and an empty socket is \
+                                     not)."
                                 );
                                 metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
                                 if wire_timed_out {
@@ -6591,13 +6671,13 @@ mod tests {
                         }
                         Err(_) => true,
                     };
-                    // The INITIAL subscribe answers; the swap's does not.
-                    if first {
-                        Ok(())
-                    } else {
-                        std::future::pending::<()>().await;
-                        unreachable!()
-                    }
+                    // Every subscribe answers. Since 2026-09-01 a timed-out
+                    // unsubscribe forces a REDIAL, and the redial replays the
+                    // guard through this same method; hanging it would only
+                    // test the fake. The hang this test exercises is the
+                    // unsubscribe below.
+                    let _ = first;
+                    Ok(())
                 }
             }
             fn send_unsubscribe(
@@ -6678,11 +6758,18 @@ mod tests {
              is not bounding it"
         );
         let s = st.lock().expect("fake state");
+        // No subscribe follows the timed-out unsubscribe ON THIS SOCKET —
+        // that would be the over-limit shape Dhan answers with a Fatal 804.
+        // The third call is the REDIAL replaying the retained set on a fresh
+        // connection (2026-09-01): a timed-out unsubscribe may have landed,
+        // so the socket is treated as emptied and re-dialled, never left
+        // ponging with nothing subscribed.
         assert_eq!(
             s.wire_calls,
-            vec!["subscribe", "unsubscribe"],
-            "the subscribe went out after the unsubscribe TIMED OUT — that is \
-             the over-limit shape Dhan answers with a Fatal 804"
+            vec!["subscribe", "unsubscribe", "subscribe"],
+            "expected the initial subscribe, the timed-out unsubscribe, then the \
+             redial replay — got {:?}",
+            s.wire_calls
         );
     }
 
@@ -6742,9 +6829,12 @@ mod tests {
         // A top-up of instruments the connection does NOT already hold. Ids
         // 250..400, so nothing here repeats the initial set — see
         // `instruments_from`.
-        tx.send(LiveSubscriptionCommand::Extend(instruments_from(250, 150)))
-            .await
-            .expect("channel open");
+        tx.send(LiveSubscriptionCommand::Extend {
+            more: instruments_from(250, 150),
+            ack: None,
+        })
+        .await
+        .expect("channel open");
         drop(tx);
 
         let exit = run_connection_with_commands(
@@ -6808,9 +6898,10 @@ mod tests {
         let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
             .expect("inside cap");
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tx.send(LiveSubscriptionCommand::Extend(instruments_from(
-            250, 4_000,
-        )))
+        tx.send(LiveSubscriptionCommand::Extend {
+            more: instruments_from(250, 4_000),
+            ack: None,
+        })
         .await
         .expect("channel open");
         drop(tx);
@@ -6852,6 +6943,24 @@ mod tests {
     /// Dhan answers 804 and drops the socket. So the budget path truncates and
     /// the send-FAILURE path deliberately does not: a dying socket is about to
     /// replay everything anyway.
+    #[test]
+    fn take_from_returns_the_cut_tail_and_shrinks_the_guard() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        // Past the end: nothing cut, nothing returned, guard untouched.
+        assert!(g.take_from(1_000).is_empty());
+        assert_eq!(g.len(), 250);
+        // Inside: the tail comes back in order and the guard shrinks to `len`.
+        let tail = g.take_from(200);
+        assert_eq!(tail.len(), 50);
+        assert_eq!(g.len(), 200);
+        assert_eq!(tail[0].security_id, instruments(250)[200].security_id);
+        assert_eq!(tail[49].security_id, instruments(250)[249].security_id);
+        // Re-extending with the cut tail is accepted: it is genuinely not held.
+        assert_eq!(g.try_extend(tail).expect("room"), 200);
+        assert_eq!(g.len(), 250);
+    }
+
     #[test]
     fn truncate_to_shrinks_the_guard_and_can_never_grow_it() {
         let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
