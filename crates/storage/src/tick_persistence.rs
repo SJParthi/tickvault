@@ -703,6 +703,70 @@ pub const SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// makes it useless as a protection and effective only as a data shredder.
 pub const SPILL_SOFT_CEILING_FREE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// What the soft ceiling decides for one rescue write.
+///
+/// Extracted as a pure function for a reason the CI failure of 2026-09-01
+/// made concrete: the test that pinned the old behaviour could only ever
+/// exercise the REFUSE arm by having the ceiling refuse unconditionally,
+/// because a unit test cannot manufacture a nearly-full filesystem. So the
+/// arm that actually protects the database was the one arm no test could
+/// reach, and the arm that discarded 243 million rows was the one it pinned.
+///
+/// With the decision separated from the I/O, every arm is reachable from a
+/// table of numbers, including the two that matter most: at the ceiling with
+/// room (allow) and at the ceiling without it (refuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCeilingVerdict {
+    /// Below the rail. Nothing to decide.
+    UnderCeiling,
+    /// Past the rail, but the volume demonstrably has room. Allow, and count.
+    OverCeilingWithRoom,
+    /// Past the rail and free space is at or under the database reserve.
+    /// Refuse — this is the case the rail exists for.
+    OverCeilingNoRoom,
+    /// Past the rail and free space is unknown. Refuse: an unreadable
+    /// free-space number is exactly when unbounded growth is least
+    /// affordable.
+    OverCeilingProbeFailed,
+}
+
+/// Decides whether a rescue write may proceed past the soft ceiling.
+///
+/// `free` is `None` when the free-space probe failed. `reserve` is the room
+/// left for the database — see [`SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`].
+///
+/// The comparison is strictly greater-than, so a volume sitting exactly on
+/// the reserve refuses. At a boundary the safe direction is the database's.
+#[must_use]
+pub const fn classify_spill_ceiling(
+    dir_bytes: u64,
+    ceiling: u64,
+    free: Option<u64>,
+    reserve: u64,
+) -> SpillCeilingVerdict {
+    if dir_bytes < ceiling {
+        return SpillCeilingVerdict::UnderCeiling;
+    }
+    match free {
+        Some(free_bytes) if free_bytes > reserve => SpillCeilingVerdict::OverCeilingWithRoom,
+        Some(_) => SpillCeilingVerdict::OverCeilingNoRoom,
+        None => SpillCeilingVerdict::OverCeilingProbeFailed,
+    }
+}
+
+/// Reads free bytes for `dir`, or `None` when the probe failed.
+///
+/// Collapses the probe's richer outcome to the one bit
+/// [`classify_spill_ceiling`] needs, so the decision stays a pure function of
+/// numbers rather than of a filesystem type.
+#[must_use]
+pub fn spill_free_bytes(dir: &std::path::Path) -> Option<u64> {
+    match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => Some(free_bytes),
+        crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => None,
+    }
+}
+
 /// Fraction of the volume the spill tier may occupy: one thirty-second.
 ///
 /// Not a round number chosen for looks. It has to satisfy two bounds at once:
@@ -820,38 +884,37 @@ fn spill_failed_ilp(
     // there is demonstrably room, and discarding market data we have somewhere
     // to put is indefensible.
     let ceiling = tick_spill_max_bytes();
-    if spill_dir_bytes(dir) >= ceiling {
-        match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
-            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. }
-                if free_bytes > SPILL_SOFT_CEILING_FREE_RESERVE_BYTES =>
-            {
-                // Room to spare. Allow the rescue and record that we are past
-                // the soft rail, so the growth is never silent.
-                metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
-            }
-            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    format!(
-                        "tick spill dir past its {ceiling}-byte soft ceiling AND only \
-                         {free_bytes} bytes free, at or below the \
-                         {SPILL_SOFT_CEILING_FREE_RESERVE_BYTES}-byte database reserve — \
-                         refusing so QuestDB keeps room to operate"
-                    ),
-                ));
-            }
-            // Probe failed: fall back to the OLD conservative behaviour. An
-            // unknown free-space number must never license unbounded growth.
-            crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { reason } => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    format!(
-                        "tick spill dir past its {ceiling}-byte soft ceiling and the \
-                         free-space probe failed ({reason}) — refusing rather than \
-                         growing blind"
-                    ),
-                ));
-            }
+    let held = spill_dir_bytes(dir);
+    match classify_spill_ceiling(
+        held,
+        ceiling,
+        spill_free_bytes(dir),
+        SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+    ) {
+        SpillCeilingVerdict::UnderCeiling => {}
+        SpillCeilingVerdict::OverCeilingWithRoom => {
+            // Room to spare. Allow the rescue and record that we are past the
+            // soft rail, so the growth is never silent.
+            metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
+        }
+        SpillCeilingVerdict::OverCeilingNoRoom => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "tick spill dir past its {ceiling}-byte soft ceiling and free space is \
+                     at or below the {SPILL_SOFT_CEILING_FREE_RESERVE_BYTES}-byte database \
+                     reserve — refusing so QuestDB keeps room to operate"
+                ),
+            ));
+        }
+        SpillCeilingVerdict::OverCeilingProbeFailed => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "tick spill dir past its {ceiling}-byte soft ceiling and the free-space \
+                     probe failed — refusing rather than growing blind"
+                ),
+            ));
         }
     }
     // LIVE FREE-SPACE GUARD (2026-08-25). The ceiling above is derived from
@@ -2235,6 +2298,79 @@ mod tests {
     ///
     /// BITE PROOF: delete the `is_finite` loop in `from_parsed_tick` and
     /// this test fails — the row is built and `high` comes back `Some(NaN)`.
+    /// `spill_free_bytes` collapses the probe outcome to the one bit the
+    /// decision needs.
+    ///
+    /// Deliberately asserts a RANGE rather than a value: the number is
+    /// whatever the host has, and a test that pins a specific free-byte count
+    /// is a test that fails on a different machine. What must hold everywhere
+    /// is that a readable directory yields `Some`, and that the value is a
+    /// plausible byte count rather than a sentinel.
+    #[test]
+    fn test_spill_free_bytes_reads_a_real_directory() {
+        let dir = std::env::temp_dir();
+        let free = spill_free_bytes(&dir);
+        let Some(bytes) = free else {
+            // A probe failure on a real temp dir is itself worth failing on:
+            // it would mean every rescue past the soft rail refuses, which is
+            // the pre-fix behaviour wearing a different hat.
+            panic!("the system temp dir must be probeable; got None");
+        };
+        assert!(
+            bytes > 0,
+            "a mounted filesystem reporting zero free bytes would refuse every \
+             rescue — if this ever fires, check the probe, not the disk"
+        );
+        // A path that cannot exist must degrade to None, never to a number.
+        let missing = std::path::Path::new("/nonexistent-tv-spill-probe-target");
+        assert_eq!(
+            spill_free_bytes(missing),
+            None,
+            "an unreadable path must yield None so the classifier REFUSES — \
+             inventing a number here would license unbounded growth"
+        );
+    }
+
+    /// The rule itself, exhaustively, with no filesystem involved.
+    ///
+    /// This is the arm coverage the old shape could never have: a unit test
+    /// cannot manufacture a nearly-full disk, so before the decision was
+    /// separated out, the arm that protects the database was untestable and
+    /// the arm that lost 243 million rows was the one pinned.
+    #[test]
+    fn test_classify_spill_ceiling_covers_every_arm() {
+        const R: u64 = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
+        for (held, ceiling, free, want) in [
+            (0_u64, 1_u64, None, SpillCeilingVerdict::UnderCeiling),
+            (0, 1, Some(0), SpillCeilingVerdict::UnderCeiling),
+            (1, 1, None, SpillCeilingVerdict::OverCeilingProbeFailed),
+            (1, 1, Some(0), SpillCeilingVerdict::OverCeilingNoRoom),
+            (1, 1, Some(R), SpillCeilingVerdict::OverCeilingNoRoom),
+            (1, 1, Some(R + 1), SpillCeilingVerdict::OverCeilingWithRoom),
+            (
+                u64::MAX,
+                0,
+                Some(u64::MAX),
+                SpillCeilingVerdict::OverCeilingWithRoom,
+            ),
+        ] {
+            assert_eq!(
+                classify_spill_ceiling(held, ceiling, free, R),
+                want,
+                "held={held} ceiling={ceiling} free={free:?} reserve={R}"
+            );
+        }
+        // A ceiling of 0 means "always past the rail", so the decision is
+        // then entirely a free-space question. Stated because a future
+        // `tick_spill_max_bytes()` returning 0 on an unreadable volume must
+        // not become an accidental allow-everything.
+        assert_eq!(
+            classify_spill_ceiling(0, 0, None, R),
+            SpillCeilingVerdict::OverCeilingProbeFailed,
+            "a zero ceiling with an unreadable probe must REFUSE, not allow"
+        );
+    }
+
     #[test]
     fn a_non_finite_price_is_refused_not_emitted_as_a_poison_ilp_row() {
         for (field, mutate) in [

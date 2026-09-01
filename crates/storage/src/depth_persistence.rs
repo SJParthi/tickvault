@@ -694,33 +694,34 @@ fn spill_failed_depth_ilp(
     // The rail's intent — the rescue tier must never starve QuestDB — is kept.
     // Only the measured quantity changes: from the volume's TOTAL size, which
     // cannot threaten anything, to FREE space, which is the only thing that can.
-    if depth_spill_dir_bytes(dir) >= cap_bytes {
-        match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
-            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. }
-                if free_bytes > crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES =>
-            {
-                metrics::counter!("tv_depth_spill_over_soft_cap_total").increment(1);
-            }
-            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    format!(
-                        "depth spill dir past its {cap_bytes}-byte soft cap AND only \
-                         {free_bytes} bytes free, at or below the database reserve — \
-                         refusing so QuestDB keeps room to operate"
-                    ),
-                ));
-            }
-            crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { reason } => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    format!(
-                        "depth spill dir past its {cap_bytes}-byte soft cap and the \
-                         free-space probe failed ({reason}) — refusing rather than \
-                         growing blind"
-                    ),
-                ));
-            }
+    match crate::tick_persistence::classify_spill_ceiling(
+        depth_spill_dir_bytes(dir),
+        cap_bytes,
+        crate::tick_persistence::spill_free_bytes(dir),
+        crate::tick_persistence::SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+    ) {
+        crate::tick_persistence::SpillCeilingVerdict::UnderCeiling => {}
+        crate::tick_persistence::SpillCeilingVerdict::OverCeilingWithRoom => {
+            metrics::counter!("tv_depth_spill_over_soft_cap_total").increment(1);
+        }
+        crate::tick_persistence::SpillCeilingVerdict::OverCeilingNoRoom => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "depth spill dir past its {cap_bytes}-byte soft cap and free space is \
+                     at or below the database reserve — refusing so QuestDB keeps room \
+                     to operate"
+                ),
+            ));
+        }
+        crate::tick_persistence::SpillCeilingVerdict::OverCeilingProbeFailed => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "depth spill dir past its {cap_bytes}-byte soft cap and the free-space \
+                     probe failed — refusing rather than growing blind"
+                ),
+            ));
         }
     }
 
@@ -2468,11 +2469,25 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
     #[test]
-    fn the_bound_refuses_a_spill_once_the_directory_is_at_the_cap() {
-        // The enforcement itself, end to end. The cap is a PARAMETER precisely
-        // so this can bite without writing half a gigabyte onto a volume that
-        // is 86% full — a disk guard whose test must fill the disk is a guard
-        // nobody exercises.
+    fn the_cap_is_a_soft_rail_measured_against_free_space_not_total_size() {
+        // RE-BLESSED 2026-09-01, and the reason matters more than the edit.
+        //
+        // This test used to assert that reaching the cap REFUSES, full stop.
+        // That is the behaviour that discarded 238,615,500 depth rows in
+        // production on 2026-09-01 with 136 GB free, because the cap was
+        // derived from the volume's TOTAL size -- a number that never moves,
+        // so it fired identically on an empty disk and a full one.
+        //
+        // The rail's INTENT is unchanged and still pinned below: the rescue
+        // tier must never starve the database it rescues from. What changed is
+        // the quantity the refusal is measured against.
+        //
+        // Note what the OLD shape made untestable. A unit test cannot
+        // manufacture a nearly-full filesystem, so the arm that actually
+        // protects the database was the one arm no test could reach -- while
+        // the arm that lost the data was the one it pinned. Splitting the
+        // decision out as `classify_spill_ceiling` fixes that: every arm is
+        // now reachable from a table of numbers, and both are asserted here.
         let dir = spill_tmp("at-cap");
         std::fs::create_dir_all(&dir).expect("mk dir");
         let seeded = b"already-here\n";
@@ -2488,30 +2503,122 @@ mod tests {
             "the cap is measured from real bytes on disk"
         );
 
-        // Under the cap: accepted.
+        // Under the cap: accepted. (Unchanged.)
         spill_failed_depth_ilp(&dir, b"under\n", Feed::Dhan, 1_700_000_000, held + 1)
-            .expect("below the cap the rescue must succeed — otherwise the test is vacuous");
+            .expect("below the cap the rescue must succeed -- otherwise the test is vacuous");
 
-        // At the cap: REFUSED, and classifiable so the "cap" counter stage is
-        // the right one.
-        let err = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held)
-            .expect_err("at the cap the rescue must refuse rather than fill the disk");
-        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
-        assert!(
-            format!("{err}").contains(&held.to_string()),
-            "the refusal names the ceiling it hit: {err}"
+        // AT the cap: the outcome must AGREE with the classifier for whatever
+        // free space this machine actually has.
+        //
+        // Written this way after the first draft asserted a fixed ALLOW and
+        // failed on a build container with 8.6 GiB free -- under the 16 GiB
+        // reserve, so the code was right and the test was wrong. CI runners
+        // sit in the same range, so a fixed-outcome assertion here is
+        // environment-dependent by construction: it would have passed on the
+        // prod box (138 GB free) and failed every CI run, which is the worst
+        // possible place to learn it.
+        //
+        // Agreement is the stronger property anyway. A fixed ALLOW only proves
+        // one arm on one machine; this proves the writer genuinely CONSULTS
+        // `classify_spill_ceiling` rather than deciding on its own -- on any
+        // machine, at whatever free space it happens to have. The arms
+        // themselves are pinned exhaustively below, where no filesystem is
+        // involved at all.
+        use crate::tick_persistence::{
+            SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingVerdict, classify_spill_ceiling,
+            spill_free_bytes,
+        };
+        let expected = classify_spill_ceiling(
+            depth_spill_dir_bytes(&dir),
+            held,
+            spill_free_bytes(&dir),
+            SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
         );
-
-        // The refusal is a REFUSAL, not a partial write.
-        let after = depth_spill_dir_bytes(&dir);
-        let body =
-            std::fs::read_to_string(dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")))
+        let outcome = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held);
+        match expected {
+            SpillCeilingVerdict::OverCeilingWithRoom => {
+                outcome.expect(
+                    "this machine has room, so the rescue must be ALLOWED -- refusing \
+                     with room is what discarded 238,615,500 rows onto a 55%-empty disk",
+                );
+                let body = std::fs::read_to_string(
+                    dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")),
+                )
                 .unwrap_or_default();
-        assert!(
-            !body.contains("over"),
-            "a capped rescue must write NOTHING, not a truncated row: {body}"
+                assert!(
+                    body.contains("over"),
+                    "an allowed rescue must actually have written the row: {body}"
+                );
+            }
+            SpillCeilingVerdict::OverCeilingNoRoom
+            | SpillCeilingVerdict::OverCeilingProbeFailed => {
+                let err = outcome.expect_err(
+                    "this machine is at or below the database reserve, so the rescue \
+                     must REFUSE -- that is the case the rail exists for",
+                );
+                assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+                // The refusal is a REFUSAL, not a partial write.
+                let body = std::fs::read_to_string(
+                    dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")),
+                )
+                .unwrap_or_default();
+                assert!(
+                    !body.contains("over"),
+                    "a refused rescue must write NOTHING, not a truncated row: {body}"
+                );
+            }
+            SpillCeilingVerdict::UnderCeiling => panic!(
+                "the fixture seeds the directory TO the cap, so this arm is \
+                 unreachable -- if it fires, the seeding no longer works and \
+                 every assertion above it is vacuous"
+            ),
+        }
+
+        // AT the cap on a disk WITHOUT room: still REFUSED. This is the arm
+        // the rail exists for, and the arm the old shape could never test.
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "exactly ON the reserve must refuse -- at a boundary the safe \
+             direction is the database's"
         );
-        assert_eq!(after, depth_spill_dir_bytes(&dir));
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES - 1),
+                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "below the reserve must refuse -- this is the whole point of the rail"
+        );
+        assert_eq!(
+            classify_spill_ceiling(held, held, None, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::OverCeilingProbeFailed,
+            "an UNREADABLE free-space number must refuse. Optimism here trades \
+             a bounded tick loss for an unbounded disk, which is the outage \
+             this tier exists to avoid"
+        );
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + 1),
+                SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingWithRoom,
+            "one byte over the reserve is room, and must be allowed"
+        );
+        assert_eq!(
+            classify_spill_ceiling(held - 1, held, None, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::UnderCeiling,
+            "below the rail the probe must not even be consulted"
+        );
 
         // And production really does pass the const, so the bound above is the
         // one that fires on the box.
