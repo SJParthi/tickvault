@@ -74,15 +74,20 @@ fn ceiling_block<'a>(src: &'a str, compare: &str) -> Option<&'a str> {
 #[test]
 fn the_tick_spill_ceiling_refuses_only_against_free_space() {
     let src = production_half("src/tick_persistence.rs");
-    let block = ceiling_block(&src, "if spill_dir_bytes(dir) >= ceiling {")
+    let block = ceiling_block(&src, "let ceiling = tick_spill_max_bytes();")
         .expect("the tick soft-ceiling comparison must still exist");
 
     assert!(
-        block.contains("probe_disk_free_bytes"),
-        "the tick spill ceiling refuses without consulting free space. On \
-         2026-09-01 that exact shape discarded 5,141,980 ticks with 136 GB \
-         free. A ceiling derived from the volume's TOTAL size is a constant; \
-         it cannot tell you whether QuestDB has room."
+        block.contains("classify_spill_ceiling("),
+        "the tick spill ceiling decides without consulting \
+         `classify_spill_ceiling`. On 2026-09-01 a size-only refusal \
+         discarded 5,141,980 ticks with 136 GB free. A ceiling derived from \
+         the volume's TOTAL size is a constant; it cannot tell you whether \
+         QuestDB has room."
+    );
+    assert!(
+        block.contains("spill_free_bytes("),
+        "the decision must be fed REAL free space, not a placeholder"
     );
     assert!(
         block.contains("SPILL_SOFT_CEILING_FREE_RESERVE_BYTES"),
@@ -99,14 +104,14 @@ fn the_tick_spill_ceiling_refuses_only_against_free_space() {
 #[test]
 fn the_depth_spill_ceiling_refuses_only_against_free_space() {
     let src = production_half("src/depth_persistence.rs");
-    let block = ceiling_block(&src, "if depth_spill_dir_bytes(dir) >= cap_bytes {")
-        .expect("the depth soft-cap comparison must still exist");
+    let block = ceiling_block(&src, "classify_spill_ceiling(")
+        .expect("the depth soft-cap decision must route through the classifier");
 
     assert!(
-        block.contains("probe_disk_free_bytes"),
-        "the depth spill cap refuses without consulting free space. This is \
-         the writer that discarded 238,615,500 rows on 2026-09-01 — 46x the \
-         tick loss — because depth carries ~24x the tick row volume"
+        block.contains("spill_free_bytes("),
+        "the depth spill cap decides without real free space. This is the \
+         writer that discarded 238,615,500 rows on 2026-09-01 -- 46x the tick \
+         loss -- because depth carries ~24x the tick row volume"
     );
     assert!(
         block.contains("SPILL_SOFT_CEILING_FREE_RESERVE_BYTES"),
@@ -120,37 +125,114 @@ fn the_depth_spill_ceiling_refuses_only_against_free_space() {
     );
 }
 
+/// Both writers must share ONE decision, not two lookalike copies.
+///
+/// Recorded because that is how the original defect scaled: the tick and
+/// depth writers each carried their own `/ 32` rail, so the same wrong idea
+/// had to be found and fixed twice. A single function means a future change
+/// to the rule cannot land on one writer and miss the other.
+#[test]
+fn both_writers_share_one_decision_function() {
+    let depth = production_half("src/depth_persistence.rs");
+    assert!(
+        depth.contains("crate::tick_persistence::classify_spill_ceiling("),
+        "the depth writer must call the SHARED classifier, not a private copy \
+         of the same reasoning"
+    );
+    let tick = production_half("src/tick_persistence.rs");
+    assert!(
+        tick.contains("pub const fn classify_spill_ceiling("),
+        "the shared classifier must remain PUBLIC and const -- it is the one \
+         place the rule is written down, and the depth writer reaches it \
+         across module boundaries"
+    );
+    // The old per-writer inline shape must not come back alongside it.
+    //
+    // `spill_free_bytes` is the ONE place allowed to touch the raw probe
+    // outcome -- collapsing it to `Option<u64>` is its entire job -- so its
+    // body is cut out before counting. Everywhere else, matching on
+    // `DiskHealthOutcome` means a writer has started deciding for itself
+    // again, which is precisely how the two rails drifted apart.
+    for (name, src) in [("tick", &tick), ("depth", &depth)] {
+        let outside_helper = src.replace(
+            "match crate::disk_health_watcher::probe_disk_free_bytes(dir) {\n        crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => Some(free_bytes),\n        crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => None,\n    }",
+            "<collapsed by spill_free_bytes>",
+        );
+        let inline = outside_helper
+            .matches("DiskHealthOutcome::ProbeFailed")
+            .count();
+        assert_eq!(
+            inline, 0,
+            "{name} writer matches on the raw probe outcome at {inline} site(s) \
+             OUTSIDE `spill_free_bytes`. The probe collapses to Option<u64> \
+             there so the decision stays a pure function of numbers -- \
+             re-inlining it is how the two writers drifted apart in the first \
+             place"
+        );
+    }
+}
+
 /// A probe that FAILS must refuse, not allow.
 ///
 /// This is the direction the fix could most easily be got wrong in: having
 /// established that free space licenses the write, an unreadable probe looks
-/// like a case for optimism. It is the opposite — an unknown free-space
+/// like a case for optimism. It is the opposite -- an unknown free-space
 /// number is exactly when unbounded growth is least affordable.
+///
+/// Asserted against the CLASSIFIER rather than a source scan, because this is
+/// a behaviour and behaviours are testable. The source scan above proves the
+/// writers reach it; this proves what it decides.
 #[test]
-fn a_failed_free_space_probe_still_refuses_on_both_writers() {
-    for (path, compare) in [
+fn a_failed_free_space_probe_still_refuses() {
+    use tickvault_storage::tick_persistence::{
+        SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingVerdict, classify_spill_ceiling,
+    };
+    const R: u64 = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
+
+    // Every arm, exhaustively. None of this needs a filesystem, which is the
+    // point: the arm that protects the database was previously untestable
+    // because a unit test cannot manufacture a nearly-full disk.
+    let cases = [
+        (99_u64, 100_u64, None, SpillCeilingVerdict::UnderCeiling),
+        (99, 100, Some(0), SpillCeilingVerdict::UnderCeiling),
+        (100, 100, None, SpillCeilingVerdict::OverCeilingProbeFailed),
+        (100, 100, Some(0), SpillCeilingVerdict::OverCeilingNoRoom),
+        (100, 100, Some(R), SpillCeilingVerdict::OverCeilingNoRoom),
         (
-            "src/tick_persistence.rs",
-            "if spill_dir_bytes(dir) >= ceiling {",
+            100,
+            100,
+            Some(R + 1),
+            SpillCeilingVerdict::OverCeilingWithRoom,
         ),
         (
-            "src/depth_persistence.rs",
-            "if depth_spill_dir_bytes(dir) >= cap_bytes {",
+            u64::MAX,
+            100,
+            Some(u64::MAX),
+            SpillCeilingVerdict::OverCeilingWithRoom,
         ),
-    ] {
-        let src = production_half(path);
-        let block = ceiling_block(&src, compare).expect("comparison must exist");
-        let probe_failed = block
-            .find("ProbeFailed")
-            .unwrap_or_else(|| panic!("{path}: the ProbeFailed arm is gone"));
-        let after = &block[probe_failed..];
-        assert!(
-            after.contains("return Err("),
-            "{path}: the ProbeFailed arm must REFUSE. Allowing on an \
-             unreadable probe trades a bounded tick loss for an unbounded \
-             disk, which is the outage this whole tier exists to avoid"
+        (
+            u64::MAX,
+            100,
+            None,
+            SpillCeilingVerdict::OverCeilingProbeFailed,
+        ),
+    ];
+    for (held, ceiling, free, want) in cases {
+        assert_eq!(
+            classify_spill_ceiling(held, ceiling, free, R),
+            want,
+            "held={held} ceiling={ceiling} free={free:?} reserve={R}"
         );
     }
+
+    // The boundary, stated on its own because it is the one a reader will
+    // want to check: EXACTLY on the reserve refuses. At a boundary the safe
+    // direction is the database's.
+    assert_eq!(
+        classify_spill_ceiling(1, 1, Some(R), R),
+        SpillCeilingVerdict::OverCeilingNoRoom,
+        "sitting exactly ON the reserve must refuse"
+    );
 }
 
 /// Bite-proof for the scanner itself.
