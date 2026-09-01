@@ -113,11 +113,28 @@ fn the_depth_spill_ceiling_refuses_only_against_free_space() {
          writer that discarded 238,615,500 rows on 2026-09-01 -- 46x the tick \
          loss -- because depth carries ~24x the tick row volume"
     );
+    // INVERTED 2026-09-01, hours after it was written, and the reversal is
+    // the record worth keeping. This assertion originally demanded the
+    // depth writer use the SAME reserve as the tick writer, reasoning that
+    // "two spill tiers on one volume with different reserves would let
+    // whichever is looser starve the other".
+    //
+    // That reasoning was right about the mechanism and wrong about the
+    // direction. Sharing one reserve does not stop starvation -- it
+    // GUARANTEES it, in the worst direction: depth writes 10 rows per packet
+    // against the tick tier's 1, so it exhausts the shared reserve first and
+    // both tiers then refuse together. The measured result on the day this
+    // was written was 84.6% tick rescue against 23.7% depth -- record-only
+    // depth already taking decision-critical ticks down with it.
+    //
+    // The correct rule is an ORDERING, not equality: depth must reserve MORE,
+    // so it refuses while ticks are still rescued. Pinned as a property over
+    // the whole band in `depth_refuses_while_ticks_are_still_rescued`.
     assert!(
-        block.contains("SPILL_SOFT_CEILING_FREE_RESERVE_BYTES"),
-        "the depth refusal must use the SAME database reserve as the tick \
-         writer. Two spill tiers on one volume with different reserves would \
-         let whichever is looser starve the other"
+        block.contains("DEPTH_SPILL_FREE_RESERVE_BYTES"),
+        "the depth refusal must use the DEPTH reserve, which is deliberately \
+         LARGER than the tick reserve so record-only depth gives way before \
+         decision-critical ticks do"
     );
     assert!(
         block.contains("tv_depth_spill_over_soft_cap_total"),
@@ -232,6 +249,138 @@ fn a_failed_free_space_probe_still_refuses() {
         classify_spill_ceiling(1, 1, Some(R), R),
         SpillCeilingVerdict::OverCeilingNoRoom,
         "sitting exactly ON the reserve must refuse"
+    );
+}
+
+/// THE PRIORITY BAND: depth must refuse while ticks are still rescued.
+///
+/// This is the whole point of giving the two tiers different reserves, and it
+/// is asserted as a property over a range rather than at one convenient
+/// number, because a single sample can be satisfied by two reserves that
+/// happen to differ without the ORDER being guaranteed.
+///
+/// # The rule it encodes
+///
+/// Ticks are decision-critical: a strategy reads folded tick state from RAM
+/// and can never wait on the database. Depth is record-only -- verified zero
+/// readers in the indicator, strategy and risk paths. So when disk gets
+/// tight, depth is the lane that gives way.
+///
+/// Until 2026-09-01 both tiers shared ONE reserve, which produced exactly the
+/// opposite: depth writes 10 rows per packet against the tick tier's 1, so it
+/// consumed the shared reserve first and both refused together. The measured
+/// consequence that day was a rescue success of 84.6% for ticks against 23.7%
+/// for depth -- the record-only lane starving the decision-critical one.
+#[test]
+fn depth_refuses_while_ticks_are_still_rescued() {
+    use tickvault_storage::tick_persistence::{
+        DEPTH_SPILL_FREE_RESERVE_BYTES, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingVerdict,
+        classify_spill_ceiling,
+    };
+
+    assert!(
+        DEPTH_SPILL_FREE_RESERVE_BYTES > SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        "depth must reserve MORE than ticks. Equal reserves are the 2026-09-01 \
+         defect: both tiers refuse at the same moment, so record-only depth \
+         takes decision-critical ticks down with it"
+    );
+
+    // Sample across the whole band, not just its edges. Both tiers are past
+    // their size rail here (held == ceiling), so the only variable is free
+    // space -- which is exactly the question the reserves answer.
+    let lo = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
+    let hi = DEPTH_SPILL_FREE_RESERVE_BYTES;
+    let band = hi - lo;
+    assert!(
+        band >= 8 * 1024 * 1024 * 1024,
+        "the band is only {band} bytes. It must be wide enough to hold a \
+         session's worth of tick spill, or depth stepping aside buys ticks \
+         nothing"
+    );
+
+    for step in 1..=64_u64 {
+        // Strictly inside the band: (lo, hi].
+        let free = lo + (band * step / 64);
+        assert_eq!(
+            classify_spill_ceiling(1, 1, Some(free), SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::OverCeilingWithRoom,
+            "at {free} bytes free, TICKS must still be rescued -- they are the \
+             lane a trading decision depends on"
+        );
+        assert_eq!(
+            classify_spill_ceiling(1, 1, Some(free), DEPTH_SPILL_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "at {free} bytes free, DEPTH must refuse -- it is record-only, and \
+             its rows must not consume the room ticks need"
+        );
+    }
+
+    // ABOVE the band: both are rescued. Depth stepping aside must not become
+    // depth being permanently off.
+    let plenty = hi + 1;
+    assert_eq!(
+        classify_spill_ceiling(1, 1, Some(plenty), DEPTH_SPILL_FREE_RESERVE_BYTES),
+        SpillCeilingVerdict::OverCeilingWithRoom,
+        "with room to spare, depth must still be rescued -- refusing here is \
+         the original defect (243 million rows discarded onto a 55%-empty disk)"
+    );
+
+    // BELOW the band: both refuse. Ticks are decision-critical, not more
+    // important than the database staying up -- if the database dies there is
+    // nothing to decide with.
+    let starved = lo.saturating_sub(1);
+    for reserve in [
+        SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        DEPTH_SPILL_FREE_RESERVE_BYTES,
+    ] {
+        assert_eq!(
+            classify_spill_ceiling(1, 1, Some(starved), reserve),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "below the database reserve BOTH tiers must refuse -- ticks do not \
+             outrank QuestDB having room to operate"
+        );
+    }
+}
+
+/// The depth reserve must stay DERIVED, never re-hardcoded.
+///
+/// Pinned because the number's defensibility lives entirely in its
+/// derivation: depth stops rescuing while a whole session of ticks could
+/// still spill on top of the database's own reserve. A literal `32 GiB` here
+/// would be the same figure with none of the reasoning, and the next person
+/// to change the tick reserve would silently break the ordering.
+#[test]
+fn the_depth_reserve_is_derived_from_the_tick_reserve() {
+    use tickvault_storage::tick_persistence::{
+        DEPTH_SPILL_FREE_RESERVE_BYTES, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        WORST_CASE_SESSION_TICK_SPILL_BYTES,
+    };
+    assert_eq!(
+        DEPTH_SPILL_FREE_RESERVE_BYTES,
+        SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + WORST_CASE_SESSION_TICK_SPILL_BYTES,
+        "the depth reserve must remain the SUM of the database reserve and a \
+         session's worst-case tick spill -- that sum is the reason the number \
+         is defensible, and a literal would keep the value while losing it"
+    );
+    // The measured basis: 83,446,729 ticks x 144 B = 12.0 GB on 2026-09-01.
+    // The constant must cover it with real margin, not sit on top of it.
+    const MEASURED_SESSION_TICK_SPILL: u64 = 83_446_729 * 144;
+    assert!(
+        WORST_CASE_SESSION_TICK_SPILL_BYTES > MEASURED_SESSION_TICK_SPILL,
+        "the worst-case allowance ({WORST_CASE_SESSION_TICK_SPILL_BYTES}) must \
+         exceed the MEASURED session ({MEASURED_SESSION_TICK_SPILL}) -- sitting \
+         at or below it means a normal day exhausts the allowance"
+    );
+
+    let src = production_half("src/depth_persistence.rs");
+    assert!(
+        src.contains("DEPTH_SPILL_FREE_RESERVE_BYTES"),
+        "the depth writer must pass the DEPTH reserve"
+    );
+    assert!(
+        !src.contains("SPILL_SOFT_CEILING_FREE_RESERVE_BYTES"),
+        "the depth writer must NOT reach for the tick reserve -- that is the \
+         shared-reserve defect returning under a different name"
     );
 }
 

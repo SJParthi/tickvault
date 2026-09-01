@@ -1113,8 +1113,37 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        103,
-        "Z+ L2 VERIFY ratchet: expected exactly 103 names in the MAIN EMF \
+        106,
+        "Z+ L2 VERIFY ratchet: expected exactly 106 names in the MAIN EMF \
+         (2026-09-01 TENTH: 103 -> 106, and TWO of the three were ALREADY \
+         emitted and reaching nobody. tv_tick_spill_over_soft_ceiling_total \
+         and tv_depth_spill_over_soft_cap_total are new, added with the change \
+         that made the spill rail measure FREE space instead of the volume's \
+         TOTAL size. The old rail refused with 136 GB free and permanently \
+         discarded 5,141,980 ticks and 238,615,500 depth rows onto a disk that \
+         was 55% empty. The new rail is SOFT: past it the writer probes free \
+         space and proceeds while a reserve remains, and these two count \
+         exactly that -- without them, growth past the rail is as silent as \
+         the discard it replaced. \
+         tv_tick_optional_price_dropped_total is the third and the more \
+         instructive one. It has existed for months, on the one writer that \
+         can permanently destroy market data, and was kept OFF CloudWatch by a \
+         comment in its own doc stating the selector had zero free bytes. \
+         Measured 2026-09-01 by running the size guard: the template renders \
+         13,869 of 15,872 bytes with 2,003 free, and the selector moved OUT of \
+         that template on 2026-08-25 -- the stated blocker had been gone for a \
+         week. It was found by a NEW guard, \
+         loss_writer_metrics_are_shipped_guard, which runs producer -> \
+         selector: the one direction none of the three existing guards \
+         covered, which is why a counter could be emitted and reach nobody \
+         with an entirely green build. \
+         +$0.90/mo, maximal month ~$124.68 -> ~$125.58. HONEST: that is ~$8.58 \
+         ABOVE the automatic STOP_EC2_INSTANCES line at $117 (90% of the $130 \
+         limit_amount), though under the operator hard cap of $150 raised \
+         2026-08-25, and the live account is far below both (Aug MTD $48.87). \
+         The already-approved Elastic IP release (-$3.60/mo) alone puts the \
+         maximal month back under the stop line; limit_amount is NOT changed \
+         here -- that is a three-site lockstep needing its own dated quote.) \
          (2026-08-29 NINTH: 104 -> 103, a REMOVAL and the first LEVER this \
          ratchet has been given rather than another cost note. \
          tv_subsystem_memory_estimated_bytes came off the list because \
