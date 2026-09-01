@@ -2510,6 +2510,88 @@ const COMMAND_ALIAS_MARKERS: &[&str] = &[
     "{Command as ",
 ];
 
+/// Spellings of `Command::new(` that the spawn scan's literal marker misses.
+///
+/// The scan matches the exact substring `Command::new("`. Rust accepts several
+/// other spellings of the same call, and each one is invisible to it.
+///
+/// Scoped to `Command` DELIBERATELY. The obvious wider ban — any `>::new(` —
+/// was measured against this checkout and matches FOUR legitimate sites, all
+/// `Vec::<&str>::new()` / `Vec::<String>::new()` turbofish. A guard whose first
+/// act is four false positives on idiomatic Rust teaches the next reader that
+/// the cheapest fix is an allowlist, which is how three anchors in this file's
+/// own history were weakened. The narrow form costs nothing and stays credible.
+// Byte-sorted, as `assert_sorted_unique` requires. The grouping by KIND is in
+// the trailing comments rather than the order, because ' ' < ':' < '>' puts the
+// whitespace and qualified forms either side of each other.
+const COMMAND_SPELLING_MARKERS: &[&str] = &[
+    "Command ::new(",  // whitespace before `::`
+    "Command >::new(", // fully-qualified, spaced
+    "Command:: new(",  // whitespace after `::`
+    "Command::new (",  // whitespace before `(`
+    "Command::new(r",  // raw string: `r"python3"` / `r#"python3"#`
+    "Command>::new(",  // fully-qualified: `<std::process::Command>::new("…")`
+];
+
+/// SCOPE FIX #15 (2026-09-01) — the fourteenth hole, LATENT, closed before use.
+///
+/// Every previous fix in this file was written after a real class went
+/// unscanned. This one is written while the tree is CLEAN: all six spellings
+/// below have **zero occurrences** across `crates/` and `fuzz/`, measured on
+/// this checkout before the guard was added.
+///
+/// That is the point. The pattern this file records fourteen times is that a
+/// class nobody enumerated is invisible, and invisibility reads as green — so
+/// the cheapest moment to close a spelling hole is while nothing is using it
+/// and the ban therefore costs nothing to adopt.
+///
+/// | spelling | matches `Command::new("`? |
+/// |---|---|
+/// | `Command::new(r"python3")` | no — `(r` breaks the adjacency |
+/// | `<std::process::Command>::new("python3")` | no — `Command>::new(` |
+/// | `Command ::new("python3")` | no — space before `::` |
+/// | `Command:: new("python3")` | no — space after `::` |
+/// | `Command::new ("python3")` | no — space before `(` |
+///
+/// Each is ordinary Rust the compiler accepts, and `.rs` has no backstop: it
+/// is excluded from the token scan, carries no shebang, and is not a banned
+/// extension. The canonical `Command::new("…")` form remains available and is
+/// the one the spawn scan can see, so nothing legitimate is lost.
+#[test]
+fn command_new_is_never_written_in_a_spelling_the_spawn_scan_cannot_see() {
+    assert_sorted_unique(COMMAND_SPELLING_MARKERS, "COMMAND_SPELLING_MARKERS");
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for path in git_ls_files(&["*.rs"]) {
+        // This guard names the spellings it bans, so it cannot scan itself.
+        if path.ends_with("rust_only_guard.rs") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        scanned += 1;
+        for marker in COMMAND_SPELLING_MARKERS {
+            if content.contains(marker) {
+                violations.push(format!("{path}: contains `{marker}`"));
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "self-test: expected to scan many .rs files, scanned {scanned} — the \
+         file list is broken and this guard is passing vacuously"
+    );
+    assert!(
+        violations.is_empty(),
+        "`Command::new` written in a spelling the spawn scan cannot see. Use \
+         the canonical `Command::new(\"…\")` form so the interpreter ban still \
+         applies:\n{}",
+        violations.join("\n")
+    );
+}
+
 /// SCOPE FIX #14 (2026-09-01) — the thirteenth hole, PROVEN BY PLANTING.
 ///
 /// The Rust spawn scan looks for the literal `Command::new("`. Renaming the
