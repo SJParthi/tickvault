@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 109] = [
+pub const ALARM_PHRASES: [(&str, &str); 110] = [
     // ---- capacity + candle building ----
     (
         "aggregator-slots-exhausted",
@@ -534,6 +534,10 @@ pub const ALARM_PHRASES: [(&str, &str); 109] = [
     (
         "errcode-risk-gap-03",
         "🔷 DHAN: some instruments have gone quiet or never sent a price today",
+    ),
+    (
+        "errcode-stream-silent",
+        "The error feed the alarms read has stopped arriving — the app is still reporting errors, so the other alarms are now blind until this is fixed",
     ),
     (
         "errcode-storage-gap-05",

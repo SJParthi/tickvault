@@ -2576,3 +2576,129 @@ retry, and does not recover the frames, which are gone when the WAL pair fires.
   stands).
 - Adds the next EMF name or alarm without a LEVER, per §2.3n and the table
   above.
+
+### §2.3s — 2026-09-02: all 27 coded-error alarms depend on ONE log file, and the guard for that class cannot see it
+
+**The verbatim operator authorization (2026-09-02, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "do evryhtig dont tell me nay reason dud efix it bro okay?"
+
+Given in DIRECT response to a report that named this gap, verified it three ways,
+and said explicitly that it was being left unpatched as an operator decision
+rather than a midnight edit. The operator overruled that and ordered the fix.
+This dated row is the rule-file-first record, written BEFORE the terraform.
+
+#### The gap, verified three ways
+
+| # | Fact | How checked |
+|---|---|---|
+| 1 | The agent ships **two files into ONE log group**: `errors.jsonl.2*` (flat — `$.code`) and `app.2*` (nested — `$.fields.code`) | `deploy/aws/cloudwatch-agent.json` `collect_list`, 2 entries, same `log_group_name` |
+| 2 | **All 27** metric filters on that group read `$.code`. **Zero** read `$.fields.code` | `describe-metric-filters` = 27; `grep -c 'fields\.code' deploy/aws/terraform/*.tf` = 0 |
+| 3 | `app_log_ingestion_silent` watches `AWS/Logs IncomingLogEvents` dimensioned on the **LOG GROUP** | `log-retention.tf:97-102` |
+
+So if the `errors.jsonl` glob stops matching, **27 coded-error alarms go
+permanently silent** while `app.log` keeps the group full and the ingestion
+alarm green. That is a false OK on the alerting path itself — the guard that
+reports "your alarms died" is structurally blind to the only way they
+realistically die.
+
+It is not hypothetical. That alarm's OWN description names the incident class:
+the 2026-07-06 `data/logs/machine/` reorg that left the agent tailing globs
+which no longer matched. It even lists both globs — the alarm covers their
+UNION, never each one.
+
+#### What was NOT done, and why the cheap fixes are worse
+
+- **Match both schemas in the 27 filters** — every error exists in both files,
+  so every threshold silently doubles. Twenty-seven alarms mis-calibrated at
+  once is worse than the gap.
+- **Split into two log groups** — gives per-group `IncomingLogEvents` for each,
+  and invalidates every runbook, saved query and triage step that names
+  `/tickvault/<env>/app`.
+- **Alarm on the flat count being zero** — a session with no errors is HEALTHY.
+  That pages on good news, which this file records as the fastest way to train
+  an operator to ignore an alarm.
+
+#### What shipped
+
+Two metric filters that count the SAME errors in each schema, and one
+metric-math alarm on the **divergence only**:
+
+```
+IF(nested >= 5 AND flat < 1, 1, 0)
+```
+
+That is the exact failure signature and nothing else: the app is demonstrably
+still emitting errors, and the file the alarms read is producing none. Either
+count alone is meaningless — a quiet session is zero in both and must not page,
+which is why `treat_missing_data = notBreaching`.
+
+`nested >= 5` rather than `>= 1` deliberately: at a 5-minute period boundary the
+two files can legitimately land one or two events in different windows. Five in
+one schema and zero in the other is not a boundary artifact.
+
+`ok_actions = []` — recovery means an operator repaired the agent or the glob. A
+datapoint ageing out of the window is not that, and a green "recovered" page for
+an aged-out datapoint is the Rule-11 false recovery this file records repeatedly.
+
+#### ⚠ Honest cost
+
+2 log-derived metric names ≈ **$0.60/mo** + 1 alarm ≈ **$0.10/mo** ⇒
+**~$0.70/mo**. No EMF selector entry, no user-data byte.
+
+Measured live the same day: `limit_amount` **$150**, the 90%
+`STOP_EC2_INSTANCES` action line **$135.00**, September forecast **$114.01**.
+This sits **~$21 under** the action line. The per-section arithmetic in
+§2.3j–§2.3p that costs against a $130 ceiling is stale — see the dated
+correction at the end of this file.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+It does not stop the stream failing, and it does not make the 27 filters
+schema-agnostic — they still read `$.code` only. It converts a silent,
+total failure of the coded-error alerting path into a page. That is the
+entire claim.
+
+It also cannot fire if BOTH streams stop, because then `nested` is zero too.
+That case is already owned by `app_log_ingestion_silent`, which is exactly the
+alarm this one complements rather than replaces.
+
+#### What a PR that violates §2.3s looks like (REJECT)
+
+- Alarms on `tv_log_errors_flat_total` being zero on its own — pages on a quiet
+  session.
+- Drops the `nested >= 5` guard to `>= 1` without a measured boundary study.
+- Adds `ok_actions` (an aged-out datapoint is not a repaired agent).
+- Makes any of the 27 coded-error filters match both schemas — that
+  double-counts every error and breaks all 27 thresholds at once.
+- Removes this alarm on the grounds that `app_log_ingestion_silent` covers it:
+  it does not, and the whole reason this section exists is that it cannot.
+
+#### ⚠ The `FILL` residual, recorded rather than assumed away
+
+The alarm's expression is `IF(nested >= 5 AND FILL(flat, 0) < 1, 1, 0)`, and
+the `FILL` is the difference between an alarm and a decoration.
+
+A log metric filter emits a datapoint ONLY when a matching line arrives. In
+the exact failure this alarm exists for — `errors.jsonl` not reaching
+CloudWatch — `flat` therefore has **no datapoints at all**, and CloudWatch
+metric math drops every period where an input is missing. A bare `flat < 1`
+would evaluate to nothing, produce no datapoint, fall through to
+`treat_missing_data = notBreaching`, and stay green through the whole outage.
+An alarm that is structurally blind in its own target case is worse than no
+alarm, because it also reports that the case is covered.
+
+`FILL(m, 0)` is AWS's documented tool for a metric that only reports when the
+value is non-zero, which is precisely what a metric filter is, and `nested` is
+deliberately left unfilled so it supplies the timestamp grid — in the failure
+case it is the series that HAS data.
+
+**What is NOT claimed:** that this has been observed firing. The construction
+is right on the documented semantics, but no session in this repository has
+yet produced the divergence, and CloudWatch's behaviour when an input series
+is empty across an entire evaluation range is not something this repository
+has measured. **The honest verification is a deliberate probe** — stop the
+agent's `errors.jsonl` glob from matching on a session with live errors and
+confirm the alarm goes red within two periods — or the first real occurrence.
+Until one of those happens this is a well-reasoned detector, not a proven one,
+and it must not be cited as proof that the coded-error path is now watched.
