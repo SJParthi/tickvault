@@ -46,7 +46,9 @@
 
 use std::collections::BTreeSet;
 
-use tickvault_core::websocket::pool_supervisor::{LiveSubscriptionCommand, SubscribeInstrument};
+use tickvault_core::websocket::pool_supervisor::{
+    LiveSubscriptionCommand, SubscribeInstrument, SwapOutcome,
+};
 
 use crate::depth20_layout::Depth20Layout;
 
@@ -362,6 +364,28 @@ pub struct Depth20LiveSocket {
     pub tx: tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
     /// What this connection is believed to hold.
     pub held: Vec<SubscribeInstrument>,
+    /// Swaps sent this minute and not yet answered by the connection task.
+    ///
+    /// `held` moves the moment a swap is QUEUED; the connection answers
+    /// through these once the guard and the wire have both had their say,
+    /// and [`reconcile_pending_depth20_swaps`] folds each answer back at
+    /// the top of the next minute. Bounded by the swaps one socket can
+    /// take per minute (≤ its window, 50), read once a minute.
+    pub pending: Vec<PendingDepth20SwapAck>,
+}
+
+/// One depth-20 swap the connection task has been handed but not answered.
+///
+/// Carries both halves so a refused command — or a task that died with it
+/// queued — can be reverted exactly: `take` goes back to `release`.
+#[derive(Debug)]
+pub struct PendingDepth20SwapAck {
+    /// The connection's verdict, once it has one.
+    ack: tokio::sync::oneshot::Receiver<SwapOutcome>,
+    /// The instrument the swap released.
+    release: SubscribeInstrument,
+    /// The instrument the swap took.
+    take: SubscribeInstrument,
 }
 
 /// The counter for depth-20 swaps that reached a channel.
@@ -380,7 +404,7 @@ pub const DEPTH20_UNPAIRED: &str = "tv_depth20_track_unpaired_total";
 /// until the first swap.
 pub fn pre_register_depth20_counters() {
     metrics::counter!(DEPTH20_SWAPS_SENT).increment(0);
-    for reason in ["channel_full", "channel_closed", "no_socket"] {
+    for reason in ["channel_full", "channel_closed", "no_socket", "not_held"] {
         metrics::counter!(DEPTH20_SWAPS_REFUSED, "reason" => reason).increment(0);
     }
     for side in ["arrival", "departure"] {
@@ -420,12 +444,22 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
             continue;
         };
         for (release, take) in &socket_plan.swaps {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             let command = LiveSubscriptionCommand::Swap {
                 old: *release,
                 new: *take,
+                ack: Some(ack_tx),
             };
             match socket.tx.try_send(command) {
                 Ok(()) => {
+                    // Queued, not yet on the wire: the connection's answer
+                    // is folded in by `reconcile_pending_depth20_swaps`
+                    // next minute, and only THAT settles `held`.
+                    socket.pending.push(PendingDepth20SwapAck {
+                        ack: ack_rx,
+                        release: *release,
+                        take: *take,
+                    });
                     // Replace in place so the set keeps its dial order; an
                     // order change here would produce a different — though
                     // equivalent — diff next minute, and equivalent is not
@@ -487,6 +521,64 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
     }
     sent
 }
+/// Folds every answered depth-20 swap acknowledgement back into `held`.
+///
+/// Non-blocking (`try_recv`), run at the top of each minute BEFORE `held` is
+/// read for the next plan. Returns how many swaps were UN-marked (the taken
+/// instrument put back to the released one, in place).
+///
+/// Same table as `depth_rebalance::reconcile_pending_swaps`: `Held` and the
+/// two wire-failure `NotHeld`s keep the advanced belief (the guard already
+/// names the new instrument); a REFUSED `NotHeld` and a dropped sender revert
+/// it. See [`SwapOutcome::caller_should_unmark`].
+// TEST-EXEMPT: pinned by the four depth-20 ack cases (held keeps, refused reverts, dropped sender reverts, emptied or wire_failed keeps)
+pub fn reconcile_pending_depth20_swaps(sockets: &mut [Depth20LiveSocket]) -> usize {
+    let mut unmarked_total = 0usize;
+    for (index, socket) in sockets.iter_mut().enumerate() {
+        if socket.pending.is_empty() {
+            continue;
+        }
+        let mut unmarked = 0usize;
+        let held = &mut socket.held;
+        socket.pending.retain_mut(|p| {
+            let unmark = match p.ack.try_recv() {
+                Ok(outcome) => outcome.caller_should_unmark(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => true,
+            };
+            if unmark {
+                // The exact inverse of the apply: put the released instrument
+                // back where the taken one was written, so dial order — the
+                // thing a depth-20 diff is matched on — is preserved.
+                // O(1) EXEMPT: n <= 50 per socket, once a minute, cold path.
+                if let Some(slot) = held.iter_mut().find(|h| **h == p.take) {
+                    *slot = p.release;
+                } else {
+                    held.push(p.release);
+                }
+                unmarked = unmarked.saturating_add(1);
+            }
+            false
+        });
+        if unmarked > 0 {
+            metrics::counter!(DEPTH20_SWAPS_REFUSED, "reason" => "not_held")
+                .increment(unmarked as u64);
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                socket = index,
+                unmarked,
+                source = "swap_ack_not_held",
+                "depth-20 tracking: the connection did NOT take queued swaps (refused, or the \
+                 task ended with them unanswered) — the believed window is reverted so next \
+                 minute plans them again from what the socket really carries"
+            );
+        }
+        unmarked_total = unmarked_total.saturating_add(unmarked);
+    }
+    unmarked_total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +775,7 @@ mod apply_tests {
             Depth20LiveSocket {
                 tx,
                 held: ids.iter().copied().map(ins).collect(),
+                pending: Vec::new(),
             },
             rx,
         )
@@ -706,7 +799,7 @@ mod apply_tests {
         let plan = plan_depth20_minute(&held, &want(&[2, 3]));
         assert_eq!(apply_depth20_plan(&mut sockets, &plan), 1);
         match rx.try_recv().expect("a command") {
-            LiveSubscriptionCommand::Swap { old, new } => {
+            LiveSubscriptionCommand::Swap { old, new, .. } => {
                 assert_eq!(old, ins(1));
                 assert_eq!(new, ins(3));
             }
@@ -730,6 +823,95 @@ mod apply_tests {
         );
     }
 
+    /// Pulls the ack sender out of the one command a socket received, so a
+    /// test can play the connection task's part.
+    fn take_ack(
+        rx: &mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
+    ) -> tokio::sync::oneshot::Sender<SwapOutcome> {
+        match rx.try_recv().expect("one command") {
+            LiveSubscriptionCommand::Swap { ack: Some(ack), .. } => ack,
+            other => panic!("expected a swap carrying an ack, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_ack_keeps_the_advanced_window() {
+        let (socket, mut rx) = live(&[1, 2], 4);
+        let mut sockets = vec![socket];
+        let held = vec![sockets[0].held.clone()];
+        let plan = plan_depth20_minute(&held, &want(&[2, 3]));
+        assert_eq!(apply_depth20_plan(&mut sockets, &plan), 1);
+        assert_eq!(sockets[0].pending.len(), 1);
+        // Unanswered: still pending, nothing reverted.
+        assert_eq!(reconcile_pending_depth20_swaps(&mut sockets), 0);
+        assert_eq!(sockets[0].pending.len(), 1);
+        take_ack(&mut rx)
+            .send(SwapOutcome::Held)
+            .expect("receiver alive");
+        assert_eq!(reconcile_pending_depth20_swaps(&mut sockets), 0);
+        assert!(sockets[0].pending.is_empty());
+        assert_eq!(sockets[0].held, vec![ins(3), ins(2)]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_ack_puts_the_released_instrument_back_in_place() {
+        // Audit finding 8: `held` ran ahead of the wire on a queued command,
+        // and a refused swap left the window naming an instrument the
+        // connection never received — so every later diff was wrong.
+        let (socket, mut rx) = live(&[1, 2], 4);
+        let mut sockets = vec![socket];
+        let held = vec![sockets[0].held.clone()];
+        let plan = plan_depth20_minute(&held, &want(&[2, 3]));
+        apply_depth20_plan(&mut sockets, &plan);
+        take_ack(&mut rx)
+            .send(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_REFUSED,
+            })
+            .expect("receiver alive");
+        assert_eq!(reconcile_pending_depth20_swaps(&mut sockets), 1);
+        assert_eq!(
+            sockets[0].held,
+            vec![ins(1), ins(2)],
+            "the released instrument must go back where the taken one was"
+        );
+        assert!(sockets[0].pending.is_empty());
+        // And next minute plans the same swap again, from the truth.
+        let held_now = vec![sockets[0].held.clone()];
+        assert!(!plan_depth20_minute(&held_now, &want(&[2, 3])).is_quiet());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_ack_sender_reverts_the_window() {
+        let (socket, rx) = live(&[1, 2], 4);
+        let mut sockets = vec![socket];
+        let held = vec![sockets[0].held.clone()];
+        let plan = plan_depth20_minute(&held, &want(&[2, 3]));
+        apply_depth20_plan(&mut sockets, &plan);
+        drop(rx);
+        assert_eq!(reconcile_pending_depth20_swaps(&mut sockets), 1);
+        assert_eq!(sockets[0].held, vec![ins(1), ins(2)]);
+    }
+
+    #[tokio::test]
+    async fn an_emptied_ack_keeps_the_window_the_guard_already_names() {
+        // The guard was replaced in place before the wire moved and a
+        // redial replays it; reverting would diff against a guard that no
+        // longer holds the released instrument, refused every minute.
+        let (socket, mut rx) = live(&[1, 2], 4);
+        let mut sockets = vec![socket];
+        let held = vec![sockets[0].held.clone()];
+        let plan = plan_depth20_minute(&held, &want(&[2, 3]));
+        apply_depth20_plan(&mut sockets, &plan);
+        take_ack(&mut rx)
+            .send(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_EMPTIED,
+            })
+            .expect("receiver alive");
+        assert_eq!(reconcile_pending_depth20_swaps(&mut sockets), 0);
+        assert_eq!(sockets[0].held, vec![ins(3), ins(2)]);
+        assert!(sockets[0].pending.is_empty());
+    }
+
     #[tokio::test]
     async fn held_does_not_move_when_the_channel_is_full() {
         // The failure this guards: a believed-held set running ahead of the
@@ -737,11 +919,15 @@ mod apply_tests {
         // connection never received.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         // Fill it.
-        tx.try_send(LiveSubscriptionCommand::Extend(vec![]))
-            .expect("prime");
+        tx.try_send(LiveSubscriptionCommand::Extend {
+            more: vec![],
+            ack: None,
+        })
+        .expect("prime");
         let mut sockets = vec![Depth20LiveSocket {
             tx,
             held: vec![ins(1), ins(2)],
+            pending: Vec::new(),
         }];
         let held = vec![sockets[0].held.clone()];
         let plan = plan_depth20_minute(&held, &want(&[2, 3]));
@@ -760,6 +946,7 @@ mod apply_tests {
         let mut sockets = vec![Depth20LiveSocket {
             tx,
             held: vec![ins(1), ins(2)],
+            pending: Vec::new(),
         }];
         let held = vec![sockets[0].held.clone()];
         let plan = plan_depth20_minute(&held, &want(&[2, 3]));

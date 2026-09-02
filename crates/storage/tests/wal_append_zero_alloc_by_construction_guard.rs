@@ -123,6 +123,44 @@ fn the_frame_parameter_stays_a_move_not_a_copy() {
     );
 }
 
+/// The append must reserve BYTES, not only a channel slot.
+///
+/// `SPILL_CHANNEL_CAPACITY` bounds the queue at 524,288 RECORDS and each
+/// record owns a `Bytes` heap buffer, so the record bound alone is worth
+/// ~256 GiB of resident heap at the largest frame the depth-200 socket
+/// accepts — on a 32 GiB host. Losing this reservation would not fail any
+/// other test in the suite: the queue would still be "bounded", the append
+/// would still be O(1) and allocation-free, and the only symptom would be an
+/// OOM kill under a writer stall, which is exactly when the queue fills.
+#[test]
+fn the_append_reserves_bytes_before_it_sends() {
+    let src = spill_source();
+    let region = happy_path_region(&src);
+
+    assert!(
+        region.contains("wal_queue_max_bytes()"),
+        "the append no longer consults the queue's BYTE budget. The channel's \
+         record bound is not a memory bound — see `wal_queue_max_bytes`."
+    );
+    assert!(
+        region.contains("queued_bytes.fetch_add"),
+        "the append no longer reserves the frame's bytes before sending, so \
+         nothing tracks the queue's resident payload."
+    );
+
+    // The reservation must be RELEASED on every path that does not hand the
+    // record to the writer, or the budget ratchets to zero and a permanently
+    // empty queue refuses every frame.
+    let releases = src.matches("queued_bytes.fetch_sub").count();
+    assert!(
+        releases >= 4,
+        "expected at least four byte-budget releases (the over-budget arm, the \
+         channel-Full arm, the writer-Disconnected arm, and the writer's \
+         on-receipt release) but found {releases}. A missing release leaks the \
+         budget downward until the queue refuses everything."
+    );
+}
+
 /// Bite-proof for the scanner itself.
 ///
 /// A guard whose extractor silently returns the wrong slice reports green for

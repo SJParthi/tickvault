@@ -199,8 +199,14 @@ pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>
     let stamp = artifact_stamp(&path);
 
     // Cache hit: same file, same size, same mtime.
+    //
+    // The clone happens HERE, after `cached_artifact` has dropped the lock —
+    // this signature is public and owns its result, so the copy still occurs,
+    // but it no longer blocks every other task waiting on the cache. Callers
+    // on a per-minute path should prefer an `Arc`-returning accessor; see the
+    // note in `cached_artifact`.
     if let Some(hit) = cached_artifact(date_ist, stamp) {
-        return Ok(hit);
+        return Ok(hit.as_ref().clone());
     }
 
     let body = std::fs::read_to_string(&path)?;
@@ -272,14 +278,30 @@ type CachedArtifact = (
 /// A `None` stamp never matches — see [`artifact_stamp`]. Lock poisoning is
 /// recovered with `into_inner()` (the house pattern): a panic in another
 /// thread must not turn a cache into a hard failure of the boot path.
-fn cached_artifact(date_ist: &str, stamp: Option<(u64, i128)>) -> Option<Vec<ContractRow>> {
+fn cached_artifact(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+) -> Option<std::sync::Arc<Vec<ContractRow>>> {
     let stamp = stamp?;
     let guard = CONTRACT_ARTIFACT_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (cached_date, cached_stamp, rows) = guard.as_ref()?;
     if cached_date == date_ist && *cached_stamp == Some(stamp) {
-        return Some(rows.as_ref().clone());
+        // Return the `Arc`, NOT a deep clone — 2026-09-01.
+        //
+        // This used to be `rows.as_ref().clone()`, which copied the whole
+        // ~11 MB `Vec` (~46,000 `String` allocations) WHILE HOLDING THE LOCK.
+        // The depth rebalance calls this once a minute for the whole session,
+        // on a tokio worker the WebSocket read loops share on a 4-vCPU host —
+        // the same "pins a worker, the read loop stops pumping pongs, the
+        // socket gets dropped" hazard the ILP flush was moved off the drain to
+        // avoid.
+        //
+        // The `Arc` bump is O(1) and the lock is now held for exactly that.
+        // Any caller that genuinely needs an owned `Vec` clones it AFTER the
+        // guard is dropped, so the copy no longer blocks other tasks.
+        return Some(std::sync::Arc::clone(rows));
     }
     None
 }

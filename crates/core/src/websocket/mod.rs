@@ -37,6 +37,9 @@
 // PR #4 (2026-05-19): `depth_connection` module DELETED.
 
 pub mod activity_watchdog;
+// 2026-09-02 (audit finding 9): edge latch so a dropped socket-lifecycle audit
+// row is LOUD once per episode instead of a bare counter nothing reads.
+pub mod audit_drop_latch;
 // 2026-08-09 revival, transport round: the ONE `DhanFeedSocket` implementation
 // — tokio-tungstenite over TLS with an EXPLICIT frame cap (the library default
 // is a 64 MiB message, which sixteen sockets could turn into a gigabyte of

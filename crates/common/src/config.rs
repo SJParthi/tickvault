@@ -2473,6 +2473,30 @@ pub struct PartitionRetentionConfig {
     /// there before anything is dropped.
     #[serde(default = "default_depth_hot_hours")]
     pub depth_hot_hours: u32,
+    /// Internal marker: this config drives a DISK-PRESSURE archive pass.
+    ///
+    /// NOT a config knob. `#[serde(skip)]` means no TOML can set it and an
+    /// absent field is `false`, so the only way it becomes true is
+    /// `disk_pressure_boot::pressure_config`, which builds the config for a
+    /// pressure pass and nothing else.
+    ///
+    /// It exists because the archiver's hour-granular window is deferred
+    /// whenever a spill replay might be in flight, and under sustained disk
+    /// pressure that guard becomes self-defeating: the spill dirs are
+    /// non-empty BECAUSE the disk is full, so the one table that can be
+    /// reclaimed hourly (`market_depth`) falls back to a 2-day window, the
+    /// pass reclaims nothing, and the disk stays full. Measured 2026-09-01:
+    /// `market_depth` held 185.7 GB in 10 hourly partitions against a
+    /// configured 4-hour window, on a 93%-full volume.
+    ///
+    /// The deferral is defence-in-depth, not the primary defence. The primary
+    /// defence is the export -> post-export recount -> HeadObject verify
+    /// chain, which is fail-closed: a partition whose row count moved between
+    /// export and recount fails verification and is KEPT. Under pressure the
+    /// alternative to a narrow, already-guarded race is a full volume, which
+    /// WAL-suspends every table at once.
+    #[serde(skip)]
+    pub under_disk_pressure: bool,
 }
 
 impl Default for PartitionRetentionConfig {
@@ -2493,6 +2517,7 @@ impl Default for PartitionRetentionConfig {
             pressure_max_passes: default_pressure_max_passes(),
             ingest_shed_session_burn_bytes: default_ingest_shed_session_burn_bytes(),
             depth_hot_hours: default_depth_hot_hours(),
+            under_disk_pressure: false,
         }
     }
 }

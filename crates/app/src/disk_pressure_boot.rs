@@ -40,8 +40,8 @@ use tickvault_common::ingest_shed::{
 };
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
-    PressureAction, PressureProbe, PressureState, apply_action, decide_pressure_action,
-    pressure_hot_days, thresholds_are_sane, used_pct_from,
+    PressureAction, PressureProbe, PressureState, ProbeHealth, ProbeHealthTransition, apply_action,
+    decide_pressure_action, pressure_hot_days, thresholds_are_sane, used_pct_from,
 };
 use tickvault_storage::partition_archive::PartitionArchiver;
 use tracing::{error, info, warn};
@@ -53,6 +53,35 @@ pub const DISK_PRESSURE_POLL_INTERVAL_SECS: u64 = 60;
 
 /// Backoff before respawning the loop after an unexpected exit.
 pub const DISK_PRESSURE_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// How long the disk-pressure probe may fail CONSECUTIVELY before its silence
+/// is itself the finding (2026-09-02, audit finding 10).
+///
+/// A failed probe correctly decides `Idle` — a blind probe must never trigger
+/// a drop — but a probe that fails every poll idles the pressure archiver for
+/// the whole session with only a per-poll `warn!` and a counter nothing
+/// pages on. Five minutes is long enough that a transient `statvfs` hiccup
+/// never pages, and short enough that an unmounted data volume is reported
+/// while there is still a session left to act in.
+pub const PRESSURE_PROBE_FAILING_AFTER_SECS: u64 = 300;
+
+/// [`PRESSURE_PROBE_FAILING_AFTER_SECS`] expressed in polls — DERIVED from the
+/// poll cadence so a change to the interval cannot silently change the
+/// wall-clock threshold. Const-asserted: exact division (no rounding hides a
+/// mismatch) and at least two polls (one failed poll is a blip).
+pub const PRESSURE_PROBE_FAILING_POLLS: u32 = {
+    let polls = PRESSURE_PROBE_FAILING_AFTER_SECS / DISK_PRESSURE_POLL_INTERVAL_SECS;
+    assert!(
+        polls * DISK_PRESSURE_POLL_INTERVAL_SECS == PRESSURE_PROBE_FAILING_AFTER_SECS,
+        "PRESSURE_PROBE_FAILING_AFTER_SECS must be an exact multiple of the poll interval"
+    );
+    assert!(
+        polls >= 2,
+        "a sustained probe failure needs at least two polls"
+    );
+    // Bounded by the assert above (300 / 60 = 5); the cast cannot truncate.
+    polls as u32
+};
 
 /// Build the retention config an archive pass should use while under
 /// pressure: every high-volume class compressed to the pressure window.
@@ -86,6 +115,15 @@ pub fn pressure_config(cfg: &PartitionRetentionConfig) -> PartitionRetentionConf
         market_data_hot_days: cfg.market_data_hot_days.min(days),
         depth_hot_days: cfg.depth_hot_days.min(days),
         intraday_hot_days: cfg.intraday_hot_days.min(days),
+        // The marker the archiver reads to keep `market_depth` on its
+        // hour-granular window while a spill replay may be in flight.
+        //
+        // Set ONLY here. Under sustained pressure the spill dirs are
+        // non-empty BECAUSE the disk is full, so deferring to the day window
+        // makes the one hourly-reclaimable table unreclaimable exactly when
+        // reclaiming it is the point. The drop itself is unchanged and still
+        // fail-closed: export -> recount -> HeadObject -> `VerifiedArchive`.
+        under_disk_pressure: true,
         ..cfg.clone()
     }
 }
@@ -193,6 +231,9 @@ async fn run_disk_pressure_loop(
     cfg: PartitionRetentionConfig,
 ) {
     let mut state = PressureState::default();
+    // Edge latch for a PERSISTENTLY blind probe — fed every poll, pages once
+    // per episode (2026-09-02, audit finding 10). It changes no action.
+    let mut probe_health = ProbeHealth::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(DISK_PRESSURE_POLL_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Monotonic seconds since the loop started — supplied to the pure
@@ -254,6 +295,38 @@ async fn run_disk_pressure_loop(
 
         let action = decide_pressure_action(probe, &state, &cfg, now_secs);
         let used = probe.used_pct.unwrap_or(0);
+
+        // A probe that has been blind for PRESSURE_PROBE_FAILING_AFTER_SECS
+        // has idled the whole pressure archiver for that long: every poll
+        // above correctly decided `Idle` on a reading it never got, and the
+        // only trace was a per-poll `warn!` plus a counter nothing pages on.
+        // The archiver is the one automatic mechanism that reclaims disk, so
+        // its silent stand-down is exactly the class STORAGE-GAP-05 exists
+        // for — it rides that existing filtered code with its own `source`.
+        match probe_health.observe(probe.used_pct.is_some(), PRESSURE_PROBE_FAILING_POLLS) {
+            ProbeHealthTransition::Unchanged => {}
+            ProbeHealthTransition::FailingSustained => {
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    source = "pressure_probe_failing",
+                    consecutive_failed_polls = probe_health.consecutive_failures(),
+                    failing_after_secs = PRESSURE_PROBE_FAILING_AFTER_SECS,
+                    path = %data_dir.display(),
+                    "the disk-pressure probe has FAILED on every poll for \
+                     {PRESSURE_PROBE_FAILING_AFTER_SECS}s — pressure archival is IDLE \
+                     because it cannot see the volume, not because the volume is fine. \
+                     Free space is UNKNOWN from here; check the data volume is mounted \
+                     and readable (df on it) before trusting any disk gauge"
+                );
+            }
+            ProbeHealthTransition::Recovered => {
+                info!(
+                    path = %data_dir.display(),
+                    "the disk-pressure probe is reading the volume again — pressure \
+                     archival resumes deciding on real numbers"
+                );
+            }
+        }
 
         // The SECOND lever. Everything below this line reclaims space by
         // deleting old data; this one stops writing new data, and it only
@@ -373,14 +446,62 @@ async fn run_disk_pressure_loop(
                          eligible)"
                     );
                 }
+                // Wake the spill/WAL reclaim sweep NOW rather than letting it
+                // wait out its 6-hourly timer (2026-09-01).
+                //
+                // This is the deadlock breaker. QuestDB tables suspend when
+                // the volume fills, and `partition_archive` correctly refuses
+                // to archive a suspended table — so the archival pass below
+                // can reclaim NOTHING once the dominant table is suspended.
+                // Our own capture segments are the one thing on this volume
+                // that QuestDB does not own, so pruning them is the only
+                // reclaim that still works in that state, and it is what lets
+                // `wal_auto_resume` reach its free-space threshold.
+                //
+                // Requested BEFORE the pass, not after: the pass is the slow
+                // part, and on a suspended table it is also the useless part.
+                // Rate-floored inside the sweep, so a long episode cannot turn
+                // a cold path into a hot loop.
+                crate::reclaim_signal::request_reclaim();
+
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
                 let dropped = run_one_pass(&questdb, &cfg).await;
                 if let Some(n) = dropped {
                     metrics::counter!("tv_disk_pressure_partitions_dropped_total").increment(n);
+                    // A `warn!` beside the counter, not merely a counter
+                    // (2026-09-01). `loss_counter_visibility_guard` caught
+                    // this: the counter's only operator surface was its
+                    // PROXIMITY to the episode-start `warn!` above, and
+                    // inserting the reclaim-signal block between them pushed
+                    // it out of range — the metric is not EMF-selected, so it
+                    // reached nobody at all.
+                    //
+                    // Fixed by giving it its own line rather than by shuffling
+                    // the code back: partitions leaving the box is worth
+                    // stating on its own terms. Every one was verified present
+                    // in S3 before the drop, so this is reclaim and not data
+                    // loss — but it IS the box shedding history under
+                    // pressure, and an operator should read it as such.
+                    warn!(
+                        partitions_dropped = n,
+                        used_pct = used,
+                        hot_days = pressure_hot_days(&cfg),
+                        "disk-pressure pass dropped archived partitions — each was \
+                         verified present in S3 before its drop, so the data is in \
+                         cold storage, not gone; the box is shedding hot-window \
+                         history to stay writable"
+                    );
                 }
                 apply_action(&mut state, action, now_secs, dropped);
             }
             PressureAction::Escalate => {
+                // Escalation is the state where this matters MOST: the
+                // archival pass reclaimed nothing, which on a full volume is
+                // the signature of suspended tables. The spill sweep is then
+                // the only reclaim left, so ask for it here too — the pass
+                // arm above is not reached on an escalated poll.
+                crate::reclaim_signal::request_reclaim();
+
                 metrics::counter!("tv_disk_pressure_unrelievable_total").increment(1);
                 error!(
                     code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
@@ -414,10 +535,26 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
     match PartitionArchiver::new(questdb, &pressure_cfg).await {
         Ok(Some(mut archiver)) => {
             let summary = archiver.archive_and_drop_old_partitions().await;
+            // The pass may have returned WITHOUT running — the daily leg holds
+            // the concurrency guard, or the WAL probe failed closed. Both hand
+            // back an all-zero summary, and `dropped == 0` is this function's
+            // escalation signal, so reporting it as `Some(0)` would raise a
+            // false STORAGE-GAP-05 Critical for a pass that never started.
+            // `None` is exactly the "never happened" case this function's own
+            // doc comment reserves.
+            if !summary.pass_ran {
+                info!(
+                    "disk-pressure archive pass did not run (another pass holds the \
+                     archive guard, or the WAL probe failed closed) — reporting as \
+                     not-run rather than as nothing-reclaimable"
+                );
+                return None;
+            }
             info!(
                 verified = summary.verified,
                 dropped = summary.dropped,
                 failed = summary.failed,
+                tables_wal_suspended = summary.tables_wal_suspended,
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 "disk-pressure archive pass complete (every drop had a verified S3 copy)"
@@ -784,5 +921,57 @@ mod self_measured_burn_tests {
         // And the live value is in range on this machine's clock.
         let now = secs_of_day_ist();
         assert!(now < 86_400, "seconds-of-day out of range: {now}");
+    }
+}
+
+#[cfg(test)]
+mod probe_health_wiring_tests {
+    use super::{
+        DISK_PRESSURE_POLL_INTERVAL_SECS, PRESSURE_PROBE_FAILING_AFTER_SECS,
+        PRESSURE_PROBE_FAILING_POLLS,
+    };
+
+    /// 2026-09-02 (audit finding 10): the sustained-failure threshold is
+    /// DERIVED from the poll cadence, not typed beside it, so a future change
+    /// to the interval cannot silently change how long a blind probe stays
+    /// unreported.
+    #[test]
+    fn the_failing_threshold_is_derived_from_the_poll_cadence() {
+        assert_eq!(
+            u64::from(PRESSURE_PROBE_FAILING_POLLS) * DISK_PRESSURE_POLL_INTERVAL_SECS,
+            PRESSURE_PROBE_FAILING_AFTER_SECS,
+            "polls × interval must equal the wall-clock threshold exactly"
+        );
+        assert!(
+            PRESSURE_PROBE_FAILING_POLLS >= 2,
+            "a single failed poll is a blip, never a sustained failure"
+        );
+    }
+
+    /// The latch is fed on EVERY poll (both probe arms), pages once on the
+    /// sustained edge with the existing STORAGE-GAP-05 filter and a `source`
+    /// field, and logs the recovery. Source-scan, because the loop needs a
+    /// disk and a tokio runtime to reach.
+    #[test]
+    fn the_probe_health_latch_is_wired_into_the_loop() {
+        let src = include_str!("disk_pressure_boot.rs");
+        let cutoff = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cutoff];
+        assert!(
+            prod.contains(
+                "probe_health.observe(probe.used_pct.is_some(), PRESSURE_PROBE_FAILING_POLLS)"
+            ),
+            "the latch must be fed the probe verdict every poll"
+        );
+        assert!(
+            prod.contains("ProbeHealthTransition::FailingSustained =>")
+                && prod.contains("source = \"pressure_probe_failing\"")
+                && prod.contains("StorageGap05DiskPressureUnrelievable.code_str()"),
+            "the sustained edge must page on the existing STORAGE-GAP-05 filter with its source"
+        );
+        assert!(
+            prod.contains("ProbeHealthTransition::Recovered =>"),
+            "the recovery edge must be logged"
+        );
     }
 }

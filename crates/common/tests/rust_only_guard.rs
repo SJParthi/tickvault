@@ -111,6 +111,14 @@ const BANNED_FILE_PATHSPECS: &[&str] = &[
     "*.jl",
     "*.ipynb", // SCOPE FIX #6 — shell variants (all zero tracked; `.sh` + bash only)
     "*.bash", "*.zsh", "*.ksh", "*.ps1", "*.bat", "*.fish", "*.nu",
+    // SCOPE FIX #17 (2026-09-02) — COMPILED-or-VM runtimes. The ban listed
+    // scripting languages only; a tracked `.java` / `.go` / `.swift` source
+    // file is a second toolchain in the product path just as surely, and the
+    // lock says "one language" not "no scripting". Verified at fix time:
+    // `git ls-files -- <pathspec>` returns ZERO for all nine, so the hard-zero
+    // floor is unchanged. `*.R`/`*.r` are both listed because git pathspecs
+    // are case-sensitive.
+    "*.java", "*.kt", "*.kts", "*.scala", "*.go", "*.cs", "*.swift", "*.R", "*.r",
 ];
 
 // ============================ PURE CORE ============================
@@ -378,6 +386,103 @@ fn has_interpreter_shebang(content: &str) -> bool {
     content.lines().next().is_some_and(|l| l.starts_with("#!"))
 }
 
+/// The runtime a shebang line names, if any — `#!/usr/bin/env node` -> `node`,
+/// `#!/bin/bash` -> `bash`, `#!/usr/bin/env -S deno run` -> `deno`.
+///
+/// # Why this exists (SCOPE FIX #15, 2026-09-01)
+///
+/// [`has_interpreter_shebang`] asks whether a shebang EXISTS, which is the
+/// right question for deciding what to scan and the wrong one for deciding
+/// what is allowed. The line `#!/usr/bin/env node` on an extension-less
+/// tracked file passed every check in this file at once: it carries no banned
+/// file extension, no python-family token, and `count_node_invocations`
+/// skipped it because `is_command_position` sees a prefix starting with `#`
+/// and matches no arm. Being IN the invocation scan even satisfied
+/// `every_tracked_executable_is_inside_the_invocation_scan`.
+///
+/// A shebang is the kernel's instruction for which interpreter runs the file.
+/// Reading the name it gives is therefore the most direct possible check, and
+/// it needs no enumeration of file names or extensions — the same move §0.3
+/// of the lock file made for deciding WHICH files to scan, applied one step
+/// further to WHAT they declare.
+fn shebang_runtime(content: &str) -> Option<String> {
+    let first = content.lines().next()?;
+    let rest = first.strip_prefix("#!")?;
+    // `env` and its `-S` split-string form introduce the real runtime; a bare
+    // path is the runtime itself. Flags between them are skipped so
+    // `#!/usr/bin/env -S deno run --allow-net` resolves to `deno`.
+    let mut parts = rest.split_whitespace().filter(|p| !p.is_empty());
+    let mut current = parts.next()?;
+    loop {
+        let base = current.rsplit('/').next().unwrap_or(current);
+        if base == "env" || base.starts_with('-') {
+            current = parts.next()?;
+            continue;
+        }
+        return Some(base.to_string());
+    }
+}
+
+/// The inline program a `bash`/`sh` shebang carries via `-c`, if any.
+///
+/// # Why this exists (SCOPE FIX #17, 2026-09-02)
+///
+/// `#!/usr/bin/env -S bash -c "node app.js"` names an ALLOWED runtime, so
+/// [`shebang_runtime`] waves it through — and the payload it hands that
+/// runtime is invisible to every line scanner: the whole line begins with
+/// `#!`, so `is_command_position` matches no arm on the prefix and
+/// `count_node_invocations` never counts the `node`. The kernel, however,
+/// runs exactly that `node`. A shebang is the one line where "the runtime is
+/// bash" and "the program is not" can both be true at once.
+///
+/// Only a SHORT option cluster containing `c` selects a payload (`-c`, `-ec`,
+/// `-ce`). `-euo pipefail` carries no `c`; `--norc` is a long option; a bare
+/// `-c` with nothing after it has no payload. All three yield `None`, and the
+/// self-test pins them — a guard that started counting `-euo pipefail` would
+/// fail on most of this repo's own scripts.
+fn shebang_inline_payload(content: &str) -> Option<String> {
+    let first = content.lines().next()?;
+    let rest = first.strip_prefix("#!")?;
+    let mut parts = rest.split_whitespace();
+    // Resolve the runtime exactly as `shebang_runtime` does, then keep the
+    // iterator positioned after it.
+    let runtime = loop {
+        let current = parts.next()?;
+        let base = current.rsplit('/').next().unwrap_or(current);
+        if base == "env" || base.starts_with('-') {
+            continue;
+        }
+        break base;
+    };
+    if !matches!(runtime, "bash" | "sh") {
+        return None;
+    }
+    let mut after_c: Option<String> = None;
+    while let Some(tok) = parts.next() {
+        let is_short_cluster_with_c =
+            tok.starts_with('-') && !tok.starts_with("--") && tok[1..].contains('c');
+        if is_short_cluster_with_c {
+            let payload: Vec<&str> = parts.collect();
+            if payload.is_empty() {
+                return None;
+            }
+            after_c = Some(payload.join(" "));
+            break;
+        }
+    }
+    let payload = after_c?;
+    let payload = payload
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .to_string();
+    if payload.is_empty() {
+        None
+    } else {
+        Some(payload)
+    }
+}
+
 /// Whole-line comment: first non-whitespace char is `#` — but a shebang
 /// (`#!`) is NOT a comment: it selects the interpreter that EXECUTES the
 /// file, so it must be scanned for the the banned interpreter token like any code line
@@ -538,6 +643,8 @@ fn content_has_banned_invocation(content: &str) -> bool {
     content
         .lines()
         .any(|l| !is_comment_line(l) && line_has_banned_token(l))
+        // SCOPE FIX #17: the program a `bash -c` shebang hands to bash.
+        || shebang_inline_payload(content).is_some_and(|p| line_has_banned_token(&p))
 }
 
 /// Given (path, content) pairs already scoped by `is_invocation_scan_target`,
@@ -688,7 +795,7 @@ fn extract_spawn_literals(content: &str) -> Vec<String> {
 /// scanner, because it reports clean.
 fn literals_in_group(after: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = after.char_indices();
+    let chars = after.char_indices();
     let mut in_string = false;
     let mut lit_start = 0_usize;
     let mut escaped = false;
@@ -721,11 +828,45 @@ fn literals_in_group(after: &str) -> Vec<String> {
 fn rust_spawn_violations(content: &str) -> Vec<String> {
     let mut hits: Vec<String> = extract_spawn_literals(content)
         .into_iter()
-        .filter(|lit| line_has_banned_token(lit))
+        .filter(|lit| line_has_banned_token(lit) || spawn_literal_names_node_family(lit))
         .collect();
     hits.sort();
     hits.dedup();
     hits
+}
+
+/// True when a spawn literal names a [`NODE_FAMILY`] runtime.
+///
+/// # Why this exists (SCOPE FIX #15, 2026-09-01)
+///
+/// `rust_spawn_violations` filtered spawn literals through `banned_tokens()`
+/// ALONE, which is the python family plus perl. `NODE_FAMILY` was never
+/// applied to `.rs` at all — `node_family_invocations_only_shrink` scans
+/// `load_invocation_scan_files()`, which excludes `.rs` — so
+/// `Command::new("node")` in Rust passed every guard in this file
+/// simultaneously. Found by an adversarial hunt commissioned specifically to
+/// find hole eight; the live tree is CLEAN, so this closes a latent breach,
+/// not an active one.
+///
+/// Two shapes are caught, and the second is the one that matters:
+///
+///   * the literal IS the runtime — `"node"`, or a path `"/usr/bin/node"`;
+///   * the literal CARRIES the runtime in command position — the payload of
+///     `Command::new("bash").arg("-c").arg("node /opt/x.js")`, where the
+///     program is an allowlisted shell and the runtime hides in an argument.
+///
+/// Reusing `count_node_invocations` for the second shape is deliberate: it
+/// already encodes the command-position parser and its false-positive
+/// discipline, so a literal like `"SSM managed node"` stays a sentence.
+fn spawn_literal_names_node_family(lit: &str) -> bool {
+    let trimmed = lit.trim();
+    NODE_FAMILY.iter().any(|name| {
+        trimmed == *name
+            || trimmed
+                .rsplit('/')
+                .next()
+                .is_some_and(|base| base == *name && trimmed.contains('/'))
+    }) || count_node_invocations(lit) > 0
 }
 
 // ---- SCOPE FIX #5 (2026-08-11): inline JavaScript in workflows ----
@@ -772,9 +913,82 @@ const NODE_RUNTIME_BUDGET: &[(&str, usize)] = &[(".mcp.json", 2)];
 /// artifact is not banning the invocation. All four have ZERO live invocations,
 /// so including them costs nothing and closes the class rather than one member
 /// of it.
+///
+/// # SCOPE FIX #17 (2026-09-02) — compiled / VM toolchains
+///
+/// `java`, `kotlin`, `kotlinc`, `scala`, `groovy`, `go`, `dotnet`, `julia`,
+/// `Rscript` and `swift` joined. Each is a whole runtime or compiler that a
+/// single `RUN go build` / `java -jar` line in a Dockerfile, workflow or
+/// script would put into the product path, and NONE was a banned token — the
+/// ban enumerated scripting languages and stopped there. Their FILE
+/// extensions joined [`BANNED_FILE_PATHSPECS`] in the same change; an
+/// extension ban is not an invocation ban (the 2026-08-01 `pip` lesson), so
+/// both halves land together. All ten have ZERO live invocations.
+///
+/// Deliberately NOT included, each with its reason, and pinned by
+/// `scope_fix_2026_09_02_self_test`:
+///   - `jq` — it RUNS the All Green verdict in `ci.yml` (the jq+shell port of
+///     the old evaluator, merge-gate-lock §5.1). Banning it fails the merge
+///     gate on its own implementation.
+///   - `awk` / `sed` — POSIX text tools every shell script in this tree uses;
+///     they are not language runtimes in the sense this lock bans, and a
+///     guard that fails on `sed -i` is allowlisted within the hour.
+///   - `perl` — already a member of `banned_tokens()` (joined 2026-08-10);
+///     the `perl -ne` exemption history lives there, not here.
+///   - bare `R` — a one-letter token that is also `chmod -R`, `cp -R`,
+///     `grep -R`; `Rscript` is the invocable form and is listed.
+///
+/// `go` and `swift` are ENGLISH WORDS that legitimately begin sentences, and
+/// a line beginning with a word is command position by definition — the
+/// first version of this fix counted "swift recovery is expected after a
+/// reconnect" in a real comment. They therefore additionally require a
+/// toolchain-shaped NEXT token; see [`PROSE_AMBIGUOUS_RUNTIMES`].
 const NODE_FAMILY: &[&str] = &[
-    "node", "npx", "npm", "yarn", "pnpm", "deno", "bun", "ruby", "gem", "php", "lua",
+    "node", "npx", "npm", "yarn", "pnpm", "deno", "bun", "ruby", "gem", "php", "lua", "java",
+    "kotlin", "kotlinc", "scala", "groovy", "go", "dotnet", "julia", "Rscript", "swift",
 ];
+
+/// Runtimes whose names are ordinary English words, so command position alone
+/// is not evidence of an invocation. For these the token must be FOLLOWED by
+/// something only a toolchain invocation carries — see
+/// [`next_token_is_toolchain_use`].
+///
+/// The residual this buys is stated and pinned rather than hidden: a bare
+/// `"command": "go"` in a JSON argv (nothing after the runtime on the line)
+/// counts 0, while the same line with `node` counts 1. Accepting the bare
+/// form would count the sentence, and the sentence is what appears in real
+/// files.
+const PROSE_AMBIGUOUS_RUNTIMES: &[&str] = &["go", "swift"];
+
+/// Does the text after a [`PROSE_AMBIGUOUS_RUNTIMES`] token look like a
+/// toolchain invocation rather than prose? True when the next token is a
+/// flag (`-o`, `--version`), a path or source file (`./cmd`, `main.go`,
+/// `Package.swift`), or one of the compiler's own subcommands.
+fn next_token_is_toolchain_use(runtime: &str, after: &str) -> bool {
+    let Some(next) = after.split_whitespace().next() else {
+        return false;
+    };
+    let next = next.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ']');
+    if next.is_empty() {
+        return false;
+    }
+    // A flag, a path, or a source file. The source-file arm demands a dot
+    // INSIDE the token: `main.go` yes, a sentence-ending `go.` no, `.` no.
+    let looks_like_file =
+        next.len() > 1 && next.contains('.') && !next.starts_with('.') && !next.ends_with('.');
+    if next.starts_with('-') || next.contains('/') || looks_like_file {
+        return true;
+    }
+    let subcommands: &[&str] = match runtime {
+        "go" => &[
+            "build", "run", "test", "get", "mod", "install", "vet", "fmt", "generate", "tool",
+            "version", "env", "clean", "doc", "list", "tidy", "work",
+        ],
+        "swift" => &["build", "run", "test", "package", "repl"],
+        _ => &[],
+    };
+    subcommands.contains(&next)
+}
 
 /// Words that INTRODUCE a command without being one, so whatever follows them
 /// is still in command position.
@@ -809,7 +1023,35 @@ const COMMAND_INTRODUCERS: &[&str] = &[
     "bash",
     "sh",
     "timeout",
+    // More wrapper BINARIES — 2026-09-01 (hole TWELVE). Each takes the command
+    // as its immediate next argument, so the runtime lands in command position
+    // behind a name that was simply not on the list. The enumerate-the-names
+    // approach has now been wrong here more than once; these close the shapes
+    // that actually appear in shell scripts and unit files.
+    "watch",
+    "setsid",
+    "stdbuf",
+    "parallel",
+    "nice",
+    "ionice",
+    "doas",
 ];
+
+/// HONEST LIMIT — two wrapper shapes remain UNCOVERED, recorded rather than
+/// silently missed.
+///
+/// `ssh host "node app.js"` and `find . -type f -exec node {} \;` both place a
+/// BARE WORD (`host`, `.`) between the wrapper and the runtime. The parser
+/// consumes left to right and must consume the ENTIRE prefix, so a bare word
+/// stops it — and accepting bare words is exactly what would turn
+/// `SSM managed node` into a build failure. `-exec` is handled as a separator
+/// above, which covers the common `find` form; `ssh` is not.
+///
+/// A miss here is a false NEGATIVE. Accepting bare words would make this a
+/// false-positive engine, and a guard whose first act is a false positive gets
+/// allowlisted within a week — which is how three anchors in this file were
+/// weakened before.
+const _WRAPPER_SHAPES_NOT_COVERED: &[&str] = &["ssh <host> \"<runtime> …\""];
 
 /// Does `token` start a COMMAND at byte offset `at` within `line`?
 ///
@@ -863,11 +1105,42 @@ fn is_command_position(line: &str, at: usize) -> bool {
     // inside a brace group (`{ node app.js; }`) or after a background job
     // (`a & node app.js`) is in command position, and neither character ended
     // a segment before.
-    let sep_end = ["|", "&&", "||", ";", "$(", "(", "`", "=", "{", "&", "\n"]
-        .iter()
-        .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
-        .max()
-        .unwrap_or(0);
+    // `[` joined 2026-09-01 (hole TEN): an argv ARRAY puts the runtime in
+    // command position with no shell separator anywhere —
+    // `"args": ["node", "app.js"]` (the shape `.mcp.json` itself uses),
+    // terraform `command = ["node"]`, compose `command: [node, s.js]`.
+    // `[` was not a separator, so every one of them read as a mention.
+    let mut sep_end = [
+        "|", "&&", "||", ";", "$(", "(", "`", "=", "{", "&", "[", "\n",
+    ]
+    .iter()
+    .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
+    .max()
+    .unwrap_or(0);
+
+    // `-exec` is a separator, not an introducer, because the parser consumes
+    // LEFT to right and `find . -exec node` puts an unconsumable bare word
+    // (`.`) ahead of it. Treating it as a separator skips the argument list
+    // the way a pipe does. `find`'s own predicates never follow `-exec`.
+    if let Some(i) = before.rfind("-exec") {
+        sep_end = sep_end.max(i + "-exec".len());
+    }
+
+    // `,` is a separator ONLY inside a bracketed list — the second and later
+    // elements of an argv array (`["sh", "-c", "node app.js"]`).
+    //
+    // Deliberately NOT a general separator: prose in a scanned .json/.yml
+    // string ("the box, node counts") would otherwise land in command
+    // position and fail the build on a sentence. Requiring an OPEN bracket
+    // earlier in the line is what keeps the false-positive rate at zero,
+    // and this guard survives only while its first act is never a false
+    // positive.
+    if before.contains('[') {
+        if let Some(i) = before.rfind(',') {
+            sep_end = sep_end.max(i + 1);
+        }
+    }
+
     let mut seg = before[sep_end..].trim();
 
     // Bounded: every arm strictly shortens `seg`, and the loop returns the
@@ -878,6 +1151,22 @@ fn is_command_position(line: &str, at: usize) -> bool {
         }
         let next = if let Some(rest) = seg.strip_prefix("- ") {
             rest
+        } else if matches!(seg, "-" | "@" | "@-" | "-@" | "+") {
+            // Whole-segment MARKERS, 2026-09-01 (holes ELEVEN and TWELVE).
+            //
+            // `-` alone: a bare YAML sequence item (`  - node`). `before` is
+            // trim_end()'d, so the `- ` arm above never fires on it — the
+            // trailing space it needs has already been trimmed. Only the
+            // QUOTED form (`- "node"`) was caught, which is the rarer one.
+            //
+            // `@`, `@-`, `-@`, `+`: make recipe-line prefixes (`@node x.js`
+            // silences the echo). Recipe lines carry no shell separator, so
+            // the prefix was the whole segment and nothing consumed it.
+            //
+            // Safe because each is the ENTIRE segment: a lone marker cannot
+            // appear in prose, and anything else on the line leaves a
+            // remainder these arms do not match.
+            ""
         } else if seg.ends_with('"') || seg.ends_with('\'') {
             // The token's OWN opening quote: `"command": "` before `npx`.
             &seg[..seg.len() - 1]
@@ -944,27 +1233,52 @@ fn is_command_position(line: &str, at: usize) -> bool {
 }
 
 /// Count node-family invocations in COMMAND POSITION on non-comment lines.
+///
+/// SCOPE FIX #17 (2026-09-02): also counts the program a `bash -c` shebang
+/// hands to bash ([`shebang_inline_payload`]), which no line scan can see.
 fn count_node_invocations(content: &str) -> usize {
     let mut hits = 0usize;
     for line in content.lines() {
         if is_comment_line(line) {
             continue;
         }
-        for name in NODE_FAMILY {
-            let mut rest = line;
-            let mut base = 0usize;
-            while let Some(i) = rest.find(name) {
-                let at = base + i;
-                let after = line[at + name.len()..].chars().next();
-                // A whole word, not a prefix of `nodejs_helper` or a suffix of
-                // `managed-node`.
-                let word_end = after.is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-');
-                if word_end && is_command_position(line, at) {
-                    hits = hits.saturating_add(1);
-                }
-                base = at + name.len();
-                rest = &line[base..];
+        hits = hits.saturating_add(count_node_invocations_in_line(line));
+    }
+    if let Some(payload) = shebang_inline_payload(content) {
+        hits = hits.saturating_add(count_node_invocations_in_line(&payload));
+    }
+    hits
+}
+
+fn count_node_invocations_in_line(line: &str) -> usize {
+    let mut hits = 0usize;
+    for name in NODE_FAMILY {
+        let mut rest = line;
+        let mut base = 0usize;
+        while let Some(i) = rest.find(name) {
+            let at = base + i;
+            let after = line[at + name.len()..].chars().next();
+            // A whole word, not a prefix of `nodejs_helper` or a suffix of
+            // `managed-node`.
+            let word_end = after.is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-');
+            // SCOPE FIX #17: a word START too. `go` is a substring of
+            // `cargo`, `governor`, `mongo`; `java` of `java-properties` was
+            // already caught by `word_end`, but `Rscript` inside
+            // `myRscript` and `go` inside `cargo` need the left edge checked
+            // as well. `is_command_position` happened to reject most of
+            // them; this makes the boundary explicit rather than incidental.
+            let before = line[..at].chars().next_back();
+            let word_start = before.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            // SCOPE FIX #17: `go` / `swift` are English words. Command
+            // position is where a sentence starts, so for those two the NEXT
+            // token must look like a toolchain use.
+            let toolchain_shaped = !PROSE_AMBIGUOUS_RUNTIMES.contains(name)
+                || next_token_is_toolchain_use(name, &line[at + name.len()..]);
+            if word_end && word_start && toolchain_shaped && is_command_position(line, at) {
+                hits = hits.saturating_add(1);
             }
+            base = at + name.len();
+            rest = &line[base..];
         }
     }
     hits
@@ -1143,7 +1457,44 @@ fn repo_root() -> PathBuf {
         .expect("rust_only_guard: cannot canonicalize repo root")
 }
 
+/// TRACKED files matching `pathspecs`. The stale-entry checks and the
+/// shrink-only budgets stay on this form deliberately: a budget entry must
+/// name a file that is actually in the repository, and an untracked scratch
+/// file must never be able to satisfy "still tracked".
 fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
+    git_ls_files_with(&[], pathspecs)
+}
+
+/// Tracked AND untracked-but-not-ignored files matching `pathspecs`.
+///
+/// # Why this exists (SCOPE FIX #17, 2026-09-02)
+///
+/// Every scan in this file ran on `git ls-files`, which lists what is
+/// COMMITTED. A brand-new interpreter script, a `.go` source, a shebang
+/// wrapper — none of it appears until someone runs `git add`, so a scanner
+/// built on tracked files alone reports GREEN on precisely the change it
+/// exists to catch: the first commit of a new runtime. The browser guard
+/// learned this the same way (its `scan_paths` has carried
+/// `--others --exclude-standard` since its C1 bite-test) and this file's own
+/// §0 record has an untracked `crates/x/src/evil.rs` being invisible to every
+/// diff source. Repeated here rather than inherited, because a guard that
+/// only sees yesterday's files is not a guard.
+///
+/// `--exclude-standard` honours `.gitignore`, so `target/` and editor
+/// droppings are not scanned; the result is sorted and deduplicated so a
+/// file that is both tracked and modified appears once.
+fn git_ls_files_including_untracked(pathspecs: &[&str]) -> Vec<String> {
+    let mut all = git_ls_files_with(&[], pathspecs);
+    all.extend(git_ls_files_with(
+        &["--others", "--exclude-standard"],
+        pathspecs,
+    ));
+    all.sort();
+    all.dedup();
+    all
+}
+
+fn git_ls_files_with(extra_args: &[&str], pathspecs: &[&str]) -> Vec<String> {
     let root = repo_root();
     let mut cmd = Command::new("git");
     // `-z` = NUL-delimited output: non-ASCII paths are emitted VERBATIM
@@ -1151,6 +1502,7 @@ fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
     // extension/prefix checks (hostile review round 1, fix 3).
     cmd.arg("ls-files")
         .arg("-z")
+        .args(extra_args)
         .arg("--")
         .args(pathspecs)
         .current_dir(&root);
@@ -1181,7 +1533,9 @@ fn git_ls_files(pathspecs: &[&str]) -> Vec<String> {
 /// IS a guard failure.
 fn load_invocation_scan_files() -> Vec<(String, String)> {
     let root = repo_root();
-    git_ls_files(&["."])
+    // SCOPE FIX #17 (2026-09-02): tracked AND untracked. See
+    // `git_ls_files_including_untracked`.
+    git_ls_files_including_untracked(&["."])
         .into_iter()
         .filter_map(|p| {
             // INVERTED 2026-08-19: scan everything tracked unless it is on the
@@ -1192,13 +1546,39 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
             if is_excluded_from_invocation_scan(&p) {
                 return None;
             }
-            // Unreadable => binary or vanished => nothing to scan. Never a
-            // panic: the tree legitimately contains binary assets, and a guard
-            // that crashes on one is a guard someone disables.
-            let content = std::fs::read_to_string(root.join(&p)).ok()?;
+            // SCOPE FIX #17: decoded LOSSILY, never skipped. This used to be
+            // `read_to_string(..).ok()?`, and `read_to_string` fails on any
+            // non-UTF-8 byte — so one Latin-1 `é` in a comment took the whole
+            // file out of the scan, silently. A file with `\xff\xfe` on line 1
+            // and `node app.js` on line 2 was invisible. An I/O failure is
+            // now a panic: a scan target we cannot open IS a guard failure.
+            let content = read_scan_text(&root, &p);
             Some((p, content))
         })
         .collect()
+}
+
+/// Decode scanned bytes LOSSILY. Non-UTF-8 sequences become U+FFFD, which
+/// matches no banned token — but every VALID byte around them is still
+/// scanned. `read_to_string` would instead reject the whole file, and a
+/// rejected file is a skipped file (SCOPE FIX #17, 2026-09-02).
+fn decode_scan_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Read a scan target as text, lossily. PANICS on an I/O failure: a file the
+/// enumeration listed but the guard cannot open is the one case that must
+/// never read as green. The previous `let Ok(..) else { continue }` shape at
+/// eight sites in this file waved exactly that case through.
+fn read_scan_text(root: &Path, path: &str) -> String {
+    let bytes = std::fs::read(root.join(path)).unwrap_or_else(|e| {
+        panic!(
+            "rust_only_guard: cannot read `{path}`: {e}. A scan target that cannot be \
+             opened is a guard FAILURE, not a file to skip — an unreadable file is \
+             indistinguishable from a clean one only if the guard chooses not to look."
+        )
+    });
+    decode_scan_bytes(&bytes)
 }
 
 // ============================ REAL-TREE TESTS ============================
@@ -1226,7 +1606,11 @@ fn no_banned_files_outside_allowlist() {
     // test previously covered, and it composes with the assert above rather than
     // competing with it: theirs widens WHAT is looked for, mine proves the looking
     // actually happened.
-    let tracked_banned = git_ls_files(BANNED_FILE_PATHSPECS);
+    //
+    // SCOPE FIX #17 (2026-09-02): tracked AND untracked. A new `.go` file that
+    // has not been `git add`ed is exactly the change this test exists to
+    // refuse, and it was invisible until the commit that made it permanent.
+    let tracked_banned = git_ls_files_including_untracked(BANNED_FILE_PATHSPECS);
     let new = py_files_not_in_allowlist(&tracked_banned, TRACKED_BANNED_ALLOWLIST);
     assert!(
         new.is_empty(),
@@ -1322,11 +1706,11 @@ fn every_tracked_executable_is_inside_the_invocation_scan() {
     let root = repo_root();
     let mut hidden: Vec<String> = Vec::new();
     let mut executables = 0_usize;
-    for path in git_ls_files(&["."]) {
-        // Unreadable => binary => not a shebang script.
-        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+    // SCOPE FIX #17 (2026-09-02): tracked AND untracked, decoded lossily,
+    // never skipped — a binary has no shebang to find, and a Latin-1 script
+    // still has one.
+    for path in git_ls_files_including_untracked(&["."]) {
+        let content = read_scan_text(&root, &path);
         if !has_interpreter_shebang(&content) {
             continue;
         }
@@ -1349,6 +1733,94 @@ fn every_tracked_executable_is_inside_the_invocation_scan() {
     );
 }
 
+/// SCOPE FIX #15 (2026-09-01): every tracked shebang must NAME an allowed
+/// runtime — not merely exist.
+///
+/// The sibling above proves a shebang file is INSIDE the invocation scan.
+/// That is necessary and was not sufficient: being scanned buys nothing when
+/// the scan cannot read the line. `#!/usr/bin/env node` on an extension-less
+/// tracked file cleared every check in this file simultaneously — no banned
+/// extension, no python-family token, and `count_node_invocations` skips it
+/// because `is_command_position` matches no arm on a prefix starting with
+/// `#`. It even SATISFIED the sibling test, because it is in the scan.
+///
+/// Allowed set is `bash` and `sh` only. All ~99 tracked shebangs are `bash`
+/// today, so this closes a latent hole at a hard floor rather than
+/// grandfathering anything — there is no allowlist to grow.
+#[test]
+fn every_tracked_shebang_names_an_allowed_runtime() {
+    const ALLOWED_SHEBANG_RUNTIMES: &[&str] = &["bash", "sh"];
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    let mut checked = 0_usize;
+    // SCOPE FIX #17 (2026-09-02): tracked AND untracked, decoded lossily.
+    for path in git_ls_files_including_untracked(&["."]) {
+        let content = read_scan_text(&root, &path);
+        let Some(runtime) = shebang_runtime(&content) else {
+            continue;
+        };
+        checked += 1;
+        if !ALLOWED_SHEBANG_RUNTIMES.contains(&runtime.as_str()) {
+            violations.push(format!("{path}: #! names `{runtime}`"));
+        }
+    }
+    assert!(
+        checked > 20,
+        "RUST-ONLY GUARD IS BLIND: only {checked} tracked shebang(s) parsed. \
+         Expected >20 (the tree has ~99, all bash). Either `git ls-files` or \
+         `shebang_runtime` is broken, and this test is enforcing nothing."
+    );
+    assert!(
+        violations.is_empty(),
+        "RUST-ONLY VIOLATION: tracked file(s) declare a non-Rust runtime in \
+         their shebang: {violations:?}. The kernel runs whatever this line \
+         names, so a `#!/usr/bin/env node` script is a live interpreter no \
+         matter what the file is called. Allowed: \
+         {ALLOWED_SHEBANG_RUNTIMES:?}. Port it to Rust — do NOT widen the \
+         allowed set without a fresh dated operator quote in \
+         rust-only-forever-lock-2026-07-19.md."
+    );
+}
+
+/// BITE-PROOF for SCOPE FIX #15's shebang parser.
+///
+/// The real-tree test above is clean by construction (all 99 shebangs are
+/// bash), so it cannot demonstrate that the parser CATCHES anything. These
+/// fixtures do, and they pin the `env`/`-S`/flag-skipping behaviour that a
+/// naive `split('/').last()` would get wrong.
+#[test]
+fn shebang_runtime_parser_self_test() {
+    for (line, expected) in [
+        ("#!/usr/bin/env node\n", Some("node")),
+        ("#!/usr/bin/env -S deno run --allow-net\n", Some("deno")),
+        ("#!/usr/bin/node\n", Some("node")),
+        ("#!/bin/bash\n", Some("bash")),
+        ("#!/bin/sh -e\n", Some("sh")),
+        ("#!/usr/bin/env bash\n", Some("bash")),
+        ("# not a shebang\n", None),
+        ("fn main() {}\n", None),
+    ] {
+        assert_eq!(
+            shebang_runtime(line).as_deref(),
+            expected,
+            "shebang parse of {line:?}"
+        );
+    }
+    // The exact hostile file from the 2026-09-01 hunt: extension-less,
+    // tracked, executable, and invisible to every other check here.
+    let hostile = "#!/usr/bin/env node\nconst fs=require('fs');\n";
+    assert_eq!(
+        shebang_runtime(hostile).as_deref(),
+        Some("node"),
+        "the hostile fixture MUST resolve to node — if this fails, SCOPE FIX \
+         #15 has been reverted and the hole is open again"
+    );
+    assert!(
+        !["bash", "sh"].contains(&shebang_runtime(hostile).unwrap_or_default().as_str()),
+        "and it must NOT be in the allowed set"
+    );
+}
+
 /// (e) NO Rust-side process spawn of a banned interpreter (SCOPE FIX #4).
 /// Narrow by design: only the string literal handed to `Command::new` /
 /// `.arg` is inspected, so doc-comment prose can never false-positive.
@@ -1357,14 +1829,33 @@ fn every_tracked_executable_is_inside_the_invocation_scan() {
 fn no_rust_spawn_of_banned_interpreter() {
     let root = repo_root();
     let mut violations: Vec<String> = Vec::new();
-    for path in git_ls_files(&["*.rs"]) {
-        // This guard names the tokens it bans; scanning itself would be
-        // self-referential. Its own spawns are `git` only (see `git_ls_files`).
-        if path.ends_with("crates/common/tests/rust_only_guard.rs") {
+    // SCOPE FIX #17 (2026-09-02): tracked AND untracked — a new `.rs` that
+    // spawns an interpreter is invisible until `git add` otherwise.
+    for path in git_ls_files_including_untracked(&["*.rs"]) {
+        // These two files name the tokens they ban; scanning them is
+        // self-referential. Their own real spawns are `git` only (see
+        // `git_ls_files` here and its twin there).
+        //
+        // The SIBLING was added 2026-09-01 with SCOPE FIX #15, and only
+        // because that fix made it necessary: extending the scan to
+        // `NODE_FAMILY` matched `Command::new("node")` inside
+        // `spawn_scanner_extracts_literals_and_ignores_non_literals`, which is
+        // a raw-string FIXTURE that bite-proves that guard's own extractor. A
+        // guard cannot prove it detects a thing without writing the thing
+        // down.
+        //
+        // An explicit two-file list, never a `*_guard.rs` glob: a glob would
+        // silently exempt every future guard file, which is how an exemption
+        // becomes a hole. Adding a third file here is a visible diff and needs
+        // the same justification.
+        const SELF_REFERENTIAL_GUARDS: &[&str] = &[
+            "crates/common/tests/rust_only_guard.rs",
+            "crates/common/tests/browser_surface_and_toolchain_guard.rs",
+        ];
+        if SELF_REFERENTIAL_GUARDS.iter().any(|g| path.ends_with(g)) {
             continue;
         }
-        let content = std::fs::read_to_string(root.join(&path))
-            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        let content = read_scan_text(&root, &path);
         for hit in rust_spawn_violations(&content) {
             violations.push(format!("{path}: spawns `{hit}`"));
         }
@@ -1394,8 +1885,7 @@ fn github_script_usage_only_shrinks() {
     let root = repo_root();
     let mut counted: Vec<(String, usize)> = Vec::new();
     for path in git_ls_files(&[".github/workflows/*.yml", ".github/workflows/*.yaml"]) {
-        let content = std::fs::read_to_string(root.join(&path))
-            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        let content = read_scan_text(&root, &path);
         let uses = count_github_script_uses(&content);
         let blocks = count_inline_script_blocks(&content);
         // A `script:` block without its `uses:` line (or vice versa) is still
@@ -1783,6 +2273,62 @@ fn guard_self_test() {
         );
     }
 
+    // SCOPE FIX #16 (2026-09-01) — holes TEN, ELEVEN and TWELVE.
+    //
+    // Every form below counted 0 before this fix. The argv-array shapes are
+    // the sharpest: `.mcp.json` in this very repo uses one, so the file that
+    // motivated the node-family ban was itself written in a shape the ban
+    // could not read.
+    for invocation in [
+        // TEN — argv arrays. No shell separator anywhere on the line.
+        r#"    "args": ["node", "app.js"],"#,
+        r#"  command = ["node", "server.js"]"#,
+        "  command: [node, server.js]",
+        r#"    "args": ["sh", "-c", "node app.js"],"#,
+        // ELEVEN — a BARE YAML sequence item. The quoted form was caught;
+        // the unquoted one, which is the commoner style, was not.
+        "  - node",
+        "      - npx",
+        // TWELVE — make recipe prefixes and more wrapper binaries.
+        "\t@node build.js",
+        "\t-node optional.js",
+        "\t@-npm run build",
+        "watch node status.js",
+        "setsid node daemon.js",
+        "stdbuf -oL node stream.js",
+        "nice -n 10 node batch.js",
+        "find . -type f -exec node {} ;",
+    ] {
+        assert_eq!(
+            count_node_invocations(invocation),
+            1,
+            "self-test: `{invocation}` is a node-family INVOCATION and must be \
+             counted — SCOPE FIX #16 (holes 10/11/12)"
+        );
+    }
+
+    // The false-POSITIVE half of SCOPE FIX #16, and the reason `,` is a
+    // separator ONLY inside a bracketed list. Every line below contains a
+    // comma or a dash next to a node-family word in ORDINARY PROSE; a general
+    // comma separator would fail the build on all of them.
+    for prose in [
+        "  \"description\": \"restarts the box, node counts stay flat\",",
+        "  # after the reboot, node registration is checked",
+        "  summary: on failure, npm cache is cleared by hand",
+        "echo \"drained, node left the pool\"",
+        "  # the managed-node fleet, node by node, is drained",
+        "  see docs/architecture, node roles are listed there",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: `{prose}` is PROSE containing a comma — a general comma \
+             separator would put the runtime word in command position and fail \
+             the build on a sentence. The bracket requirement is what keeps \
+             this guard's false-positive rate at zero."
+        );
+    }
+
     // Token boundaries.
     let t = banned_token();
     assert!(line_has_banned_token(&format!("{t}3 scripts/foo.rs")));
@@ -2045,6 +2591,43 @@ const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
 /// unannounced in a lockfile nobody reads.
 const NATIVE_BUILD_TOOLCHAIN_BUDGET: &[&str] = &["cc", "cmake", "pkg-config"];
 
+/// True when crate `name` belongs to the crate FAMILY `family`.
+///
+/// A family is the package itself plus its hyphen-suffixed siblings:
+/// `rustpython` covers `rustpython-vm`, `rustpython-compiler` and
+/// `rustpython-stdlib`, and does NOT cover `rustpythonic`.
+///
+/// # Why this exists (SCOPE FIX #14, 2026-09-01)
+///
+/// The embedded-interpreter check used exact equality, so it banned exactly
+/// one member per family and was blind to every sibling — and an interpreter
+/// reaches the graph as whichever sibling a dependent happens to name.
+/// Asking "is this crate in the family?" instead of "is this crate one of
+/// the seventeen strings I listed?" is the same move
+/// `rust-only-forever-lock-2026-07-19.md` §0.3 made for shebangs, for the
+/// same reason: an enumeration of members is wrong by construction, and a
+/// class nobody listed reads as green.
+///
+/// BOTH separators count, and that was a bug on the first attempt at this
+/// (caught by adversarial review the same day). Cargo permits `-` and `_` in
+/// package names and interpreter families genuinely use both: `rustpython-vm`
+/// and `quickjs-rs` are hyphenated, while `gluon_vm`, `gluon_base`,
+/// `starlark_map`, `starlark_derive`, `deno_runtime`, `boa_parser`, `boa_gc`
+/// and `wasmi_core` are underscored. A hyphen-only rule left five of the
+/// twenty-four families as one-member enumerations while the doc claimed
+/// they were covered — the same failure one level down.
+///
+/// A SEPARATOR is load-bearing either way. Matching a bare prefix would make
+/// `rune` catch `runes` and `v8` catch `v8x`, and a guard whose first act is
+/// a false positive teaches the next reader that the cheapest fix is an
+/// allowlist entry.
+fn is_in_crate_family(name: &str, family: &str) -> bool {
+    name == family
+        || name
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+}
+
 /// Package names declared in `Cargo.lock`, in file order.
 fn locked_package_names(content: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2282,21 +2865,70 @@ fn embedded_interpreters_are_absent_from_the_locked_graph() {
     // Scripting/bytecode runtimes that would execute non-Rust code from
     // inside a Rust binary. Absence from this list is not safety — it is why
     // the list is a LIST, and adding to it is how the next one gets caught.
+    //
+    // WIDENED 2026-09-01 (SCOPE FIX #14). Two changes, and the first matters
+    // more than the second:
+    //
+    //   (a) These are now FAMILIES matched by prefix, not exact names. The
+    //       old check was `n == i`, so `rustpython-vm` was banned while
+    //       `rustpython-compiler`, `rustpython-parser` and `rustpython-stdlib`
+    //       were invisible — and a crate reaches the graph as whichever of
+    //       its sibling crates the dependent happens to name. Interpreters
+    //       ship as crate FAMILIES; a guard that enumerates one member of
+    //       each family is the same enumeration failure `rust-only-forever-
+    //       lock-2026-07-19.md` §0.3 records having been wrong seven times.
+    //       A family matches `name == family` OR `name` starting with
+    //       `"{family}-"`, so `rune` catches `rune-modules` and never
+    //       `runes-something`.
+    //
+    //   (b) Eight families added that had no entry at all: `rustpython`
+    //       (subsuming the old `-vm` row), `rune`, `starlark`, `extism`,
+    //       `wasm3`, `gluon`, `koto` and `steel`. Each embeds a language
+    //       runtime in-process.
+    //
+    //   (c) BOTH `-` and `_` count as the family separator, and three entries
+    //       were shortened to their family ROOT (`boa_engine` -> `boa`,
+    //       `deno_core` -> `deno`, `steel-core` -> `steel`). The first cut of
+    //       this fix accepted only `-`, which left `gluon_vm`, `starlark_map`,
+    //       `deno_runtime`, `boa_parser` and `wasmi_core` invisible — the same
+    //       enumeration failure one level down, inside the fix for it.
+    //
+    // Verified against the real graph before widening: NONE of these matches
+    // any of the 476 packages in the tracked lockfiles, so this adds
+    // enforcement without adding a single exemption.
+    //
+    // Still NOT here, deliberately, and the reason is the same as the
+    // `wasm-bindgen` carve-out above: `wasm` as a family would match
+    // `wasm-bindgen` and fail the build over packages compiled for no
+    // target we ship. `wasm3` is the specific interpreter; `wasm` is not.
+    // Each entry is the family ROOT, not one member of it. `boa` rather than
+    // `boa_engine` so `boa_parser` and `boa_gc` are covered; `deno` rather
+    // than `deno_core` so `deno_runtime` and `deno_ast` are; `steel` rather
+    // than `steel-core`. Verified CLEAN against all 476 packages in the
+    // tracked lockfiles at each of these roots — shortening a family widens
+    // the net, so it is checked rather than assumed.
     const EMBEDDED_INTERPRETERS: &[&str] = &[
-        "boa_engine",
-        "deno_core",
+        "boa",
+        "deno",
         "duktape",
+        "extism",
+        "gluon",
         "hematita",
+        "koto",
         "mlua",
         "neon",
         "pyo3",
         "quick-js",
-        "quickjs-rs",
+        "quickjs",
         "rhai",
         "rlua",
         "rquickjs",
-        "rustpython-vm",
+        "rune",
+        "rustpython",
+        "starlark",
+        "steel",
         "v8",
+        "wasm3",
         "wasmer",
         "wasmi",
         "wasmtime",
@@ -2306,7 +2938,7 @@ fn embedded_interpreters_are_absent_from_the_locked_graph() {
     let found: Vec<&str> = EMBEDDED_INTERPRETERS
         .iter()
         .copied()
-        .filter(|i| names.iter().any(|n| n == i))
+        .filter(|family| names.iter().any(|n| is_in_crate_family(n, family)))
         .collect();
 
     assert!(
@@ -2347,7 +2979,7 @@ fn embedded_interpreter_detection_self_test() {
     let hits = |names: &[String]| -> usize {
         ["pyo3", "rhai", "mlua"]
             .iter()
-            .filter(|i| names.iter().any(|n| n == *i))
+            .filter(|family| names.iter().any(|n| is_in_crate_family(n, family)))
             .count()
     };
     assert_eq!(hits(&clean_names), 0, "a clean graph must not match");
@@ -2356,6 +2988,62 @@ fn embedded_interpreter_detection_self_test() {
         1,
         "an interpreter in the graph MUST be detected — if this fails, the \
          real-tree test above is reporting green while enforcing nothing"
+    );
+
+    // SCOPE FIX #14 bite-proof — the half that was broken until 2026-09-01.
+    //
+    // A sibling crate of a banned family must be caught. Under the old exact
+    // equality this line returned 0: the list carried `rustpython-vm` and a
+    // graph that pulled `rustpython-compiler` instead sailed through.
+    let sibling = locked_package_names(
+        "[[package]]\nname = \"serde\"\n[[package]]\nname = \"rustpython-compiler\"\n",
+    );
+    assert!(
+        sibling.iter().any(|n| is_in_crate_family(n, "rustpython")),
+        "a hyphen-suffixed sibling MUST match its family — this is the exact \
+         hole SCOPE FIX #14 closed, and a failure here means the widening was \
+         reverted while the family list still claims to cover it"
+    );
+
+    // And the half that keeps the fix from becoming a false-positive engine:
+    // a name that merely STARTS with a family string is NOT in the family.
+    // Without the hyphen requirement `rune` would flag `runes`, and the first
+    // false positive is what teaches the next reader to reach for an
+    // allowlist entry instead of a fix.
+    assert!(
+        !is_in_crate_family("v8x", "v8"),
+        "a bare prefix is NOT a family"
+    );
+
+    // The UNDERSCORE half — the bug inside the first cut of this fix. These
+    // are real crate names from the families in the list; a hyphen-only
+    // matcher returned false for every one of them while the doc claimed the
+    // family was covered.
+    for (member, family) in [
+        ("gluon_vm", "gluon"),
+        ("starlark_map", "starlark"),
+        ("deno_runtime", "deno"),
+        ("boa_parser", "boa"),
+        ("wasmi_core", "wasmi"),
+        ("rustpython_vm", "rustpython"),
+    ] {
+        assert!(
+            is_in_crate_family(member, family),
+            "underscore-separated sibling {member} MUST match family {family} — \
+             cargo permits both separators and interpreter families use both"
+        );
+    }
+    assert!(
+        !is_in_crate_family("runes", "rune"),
+        "a bare prefix is NOT a family — the hyphen is what makes this precise"
+    );
+    assert!(
+        !is_in_crate_family("rustpythonic", "rustpython"),
+        "a bare prefix is NOT a family"
+    );
+    assert!(
+        is_in_crate_family("rune", "rune"),
+        "a family must still match itself exactly"
     );
 }
 
@@ -2451,7 +3139,9 @@ fn non_literal_spawn_sites_only_shrink() {
         if !path.contains("/src/") {
             continue;
         }
-        let content = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        // SCOPE FIX #17: was `unwrap_or_default()` — an unreadable or
+        // non-UTF-8 file counted as ZERO spawns, i.e. read as clean.
+        let content = read_scan_text(&root, &path);
         let n = non_literal_spawn_count(&content);
         if n > 0 || NON_LITERAL_SPAWN_BUDGET.iter().any(|(p, _)| *p == path) {
             counted.push((path, n));
@@ -2481,7 +3171,9 @@ fn ci_actions_are_pinned_to_the_allowlist() {
     let root = repo_root();
     let mut seen: Vec<String> = Vec::new();
     for path in git_ls_files(&[".github/workflows/*.yml", ".github/workflows/*.yaml"]) {
-        let content = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        // SCOPE FIX #17: was `unwrap_or_default()` — an unreadable workflow
+        // contributed no action names and so could carry any vendor runtime.
+        let content = read_scan_text(&root, &path);
         seen.extend(ci_action_names(&content));
     }
     seen.sort();
@@ -2680,9 +3372,9 @@ fn command_new_is_never_written_in_a_spelling_the_spawn_scan_cannot_see() {
         if path.ends_with("rust_only_guard.rs") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        // SCOPE FIX #17: was `let Ok(..) else { continue }` — a non-UTF-8
+        // source file was silently exempt from the spelling scan.
+        let content = read_scan_text(&root, &path);
         scanned += 1;
         for marker in COMMAND_SPELLING_MARKERS {
             if content.contains(marker) {
@@ -2771,8 +3463,7 @@ fn command_is_never_aliased_past_the_spawn_scan() {
         if path.ends_with("crates/common/tests/rust_only_guard.rs") {
             continue;
         }
-        let content = std::fs::read_to_string(root.join(&path))
-            .unwrap_or_else(|e| panic!("rust_only_guard: cannot read `{path}`: {e}"));
+        let content = read_scan_text(&root, &path);
         scanned += 1;
         for marker in COMMAND_ALIAS_MARKERS {
             if content.contains(marker) {
@@ -2878,4 +3569,175 @@ fn scope_fix_2026_09_01_self_test() {
              bare-word acceptance that covers this also covers `managed node`."
         );
     }
+}
+
+/// SCOPE FIX #17 (2026-09-02) — four holes, each bite-proven in BOTH
+/// directions here because the live tree is clean of all four and the
+/// real-tree tests therefore cannot demonstrate that anything is caught.
+///
+/// The false-POSITIVE half is the half that matters: the first version of
+/// the `go`/`swift` widening counted "swift recovery is expected after a
+/// reconnect" in a real comment, because a line that begins with a word is
+/// command position by definition. A guard whose first act is a false
+/// positive gets allowlisted within a week.
+#[test]
+fn scope_fix_2026_09_02_self_test() {
+    // ---- H-a: a non-UTF-8 file is scanned, not skipped -------------------
+    let mut latin1 = b"\xff\xfe# not utf-8 \xe9\n".to_vec();
+    latin1.extend_from_slice(b"node app.js\n");
+    assert!(
+        std::str::from_utf8(&latin1).is_err(),
+        "self-test fixture must be genuinely non-UTF-8 or it proves nothing"
+    );
+    let decoded = decode_scan_bytes(&latin1);
+    assert_eq!(
+        count_node_invocations(&decoded),
+        1,
+        "self-test: a file with invalid UTF-8 on line 1 must still have its \
+         `node app.js` counted — `read_to_string(..).ok()` used to drop the \
+         whole file"
+    );
+    let banned = banned_token();
+    let mut latin1_py = b"\xff\xfe\n".to_vec();
+    latin1_py.extend_from_slice(format!("{banned}3 -c 'x'\n").as_bytes());
+    assert!(
+        content_has_banned_invocation(&decode_scan_bytes(&latin1_py)),
+        "self-test: the interpreter ban must survive a lossy decode too"
+    );
+
+    // ---- H-b: the program a `bash -c` shebang hands to bash ---------------
+    assert_eq!(
+        shebang_inline_payload("#!/usr/bin/env -S bash -c \"node app.js\"\n"),
+        Some("node app.js".to_string())
+    );
+    assert_eq!(
+        shebang_inline_payload("#!/bin/sh -ec 'npm ci'\nexit 0\n"),
+        Some("npm ci".to_string())
+    );
+    for no_payload in [
+        "#!/usr/bin/env -S bash -euo pipefail\n",
+        "#!/bin/bash --norc\n",
+        "#!/bin/bash -c\n",
+        "#!/bin/bash\nnode app.js\n", // the body is the LINE scan's job
+        "#!/usr/bin/env node\n",      // not bash; `shebang_runtime` owns it
+    ] {
+        assert_eq!(
+            shebang_inline_payload(no_payload),
+            None,
+            "self-test: {no_payload:?} carries no inline program"
+        );
+    }
+    assert!(
+        count_node_invocations("#!/usr/bin/env -S bash -c \"node app.js\"\n") > 0,
+        "self-test: the `bash -c` shebang payload must be counted — the line \
+         scan cannot see past the `#!` prefix"
+    );
+    assert_eq!(
+        count_node_invocations("#!/usr/bin/env -S bash -euo pipefail\necho hi\n"),
+        0,
+        "self-test: a flag cluster without `c` is not a payload"
+    );
+    assert!(content_has_banned_invocation(&format!(
+        "#!/usr/bin/env -S sh -ec \"{banned}3 x.py\"\n"
+    )));
+
+    // ---- H-d: the compiled/VM toolchains MUST count ----------------------
+    for shape in [
+        "RUN go build ./...",
+        "go run main.go",
+        "  - run: go test ./...",
+        "java -jar app.jar",
+        "sudo java -version",
+        "kotlinc Main.kt -include-runtime",
+        "scala Main.scala",
+        "groovy build.groovy",
+        "dotnet run --project x",
+        "julia script.jl",
+        "Rscript analysis.R",
+        "swift build -c release",
+        "swift run",
+        "ExecStart=/usr/bin/java -jar /opt/app.jar",
+        "\"command\": \"java\"",
+    ] {
+        assert!(
+            count_node_invocations(shape) > 0,
+            "self-test: {shape:?} is a toolchain invocation in command \
+             position and MUST count"
+        );
+    }
+
+    // ---- H-d: the must-NOT-count half ------------------------------------
+    // The first is a REAL line from `.github/workflows/ci.yml:423`; the
+    // `governor` line is the only `Cargo.lock` package whose name contains a
+    // family member as a substring; the `swift recovery` line is the real
+    // false positive the first version of this fix produced.
+    for prose in [
+        "          sudo rm -rf /usr/share/dotnet \\",
+        "name = \"governor\"",
+        "java-properties = \"0.1\"",
+        "url = \"https://docs.oracle.com/java/tutorial/\"",
+        "RUN cargo build --release",
+        "sudo cargo build",
+        "chmod -R 0755 /opt/app",
+        "cp -R src dst",
+        "swift recovery is expected after a reconnect",
+        "go to the next step once the gate is green",
+        "go. Then re-run the gate",
+        "  - name: go",
+        "myRscript=1",
+        "# java -jar app.jar (commented out)",
+    ] {
+        assert_eq!(
+            count_node_invocations(prose),
+            0,
+            "self-test: {prose:?} is PROSE or a non-invocation — counting it \
+             would be the false positive this guard cannot survive"
+        );
+    }
+
+    // The pinned residual, asserted so it is not mistaken for covered:
+    // a bare `"command": "go"` is indistinguishable from the word and stays
+    // uncounted, while the same shape with an unambiguous runtime counts.
+    assert_eq!(count_node_invocations("\"command\": \"go\""), 0);
+    assert_eq!(count_node_invocations("\"command\": \"node\""), 1);
+
+    // ---- H-d: the deliberate exclusions, pinned ---------------------------
+    for excluded in ["awk", "jq", "sed", "perl", "R"] {
+        assert!(
+            !NODE_FAMILY.contains(&excluded),
+            "self-test: `{excluded}` is deliberately NOT in NODE_FAMILY — see \
+             the docblock (jq runs the All Green gate; perl lives in \
+             `banned_tokens()`; bare `R` is `chmod -R`)"
+        );
+    }
+    assert!(
+        banned_tokens().iter().any(|t| t == "perl"),
+        "self-test: perl is banned by `banned_tokens()`, which is why it is \
+         not duplicated in NODE_FAMILY"
+    );
+    for member in [
+        "java", "kotlin", "kotlinc", "scala", "groovy", "go", "dotnet", "julia", "Rscript", "swift",
+    ] {
+        assert!(
+            NODE_FAMILY.contains(&member),
+            "self-test: `{member}` must be banned"
+        );
+    }
+    for spec in [
+        "*.java", "*.kt", "*.kts", "*.scala", "*.go", "*.cs", "*.swift", "*.R", "*.r",
+    ] {
+        assert!(
+            BANNED_FILE_PATHSPECS.contains(&spec),
+            "self-test: `{spec}` must be a banned file pathspec"
+        );
+    }
+
+    // ---- H-c: the untracked enumeration is a SUPERSET of the tracked one --
+    let tracked = git_ls_files(&["."]);
+    let all = git_ls_files_including_untracked(&["."]);
+    assert!(all.len() >= tracked.len());
+    assert!(
+        tracked.iter().all(|t| all.binary_search(t).is_ok()),
+        "self-test: every tracked file must also appear in the tracked+untracked set"
+    );
 }

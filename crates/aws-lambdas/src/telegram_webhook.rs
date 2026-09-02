@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 102] = [
+pub const ALARM_PHRASES: [(&str, &str); 103] = [
     // ---- capacity + candle building ----
     (
         "aggregator-slots-exhausted",
@@ -510,6 +510,10 @@ pub const ALARM_PHRASES: [(&str, &str); 102] = [
     (
         "errcode-proc-01",
         "The app was killed by the server for using too much memory",
+    ),
+    (
+        "errcode-resource-02",
+        "The trading app's memory is close to its ceiling — it will be slowed, not killed, but check what is growing",
     ),
     (
         "errcode-risk-gap-03",

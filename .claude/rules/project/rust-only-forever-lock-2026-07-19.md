@@ -505,3 +505,375 @@ a great deal more code than 235 lines of formatted JavaScript, and nothing here
 measures that. Both are bounded by the same shrink-only discipline as every
 other budget in this family, and both are stated so the next reader knows where
 the edge is rather than discovering it.
+
+## §0.5. 2026-09-01 — SCOPE FIX #14: the interpreter ban enumerated ONE MEMBER PER FAMILY
+
+Operator directive (2026-09-01, typos preserved):
+
+> "Ensure to use one and only RUST O(1) in the entire workspace codebase except frontend alone so check this every nook and corner with assurance and guarantee"
+
+§0.4 closed the two residuals §0.3 had left open and reported the
+embedded-interpreter check as settled. It was not. The check was real and it
+ran — but it matched package names by **exact equality**, so it banned exactly
+one member of each interpreter family and was blind to every sibling.
+
+### The hole
+
+`EMBEDDED_INTERPRETERS` listed `rustpython-vm`. RustPython actually reaches a
+graph as any of `rustpython-vm`, `rustpython-compiler`, `rustpython-parser`,
+`rustpython-stdlib` or `rustpython-common`, depending on which crate the
+dependent names — and only the first was banned. The same shape applied to
+every multi-crate runtime in the list.
+
+Eight families had **no entry at all**: `rune`, `starlark`, `extism`, `wasm3`,
+`gluon`, `koto`, `steel-core`, and `rustpython` as a family rather than one
+crate. Each embeds a language runtime **inside** the Rust binary, where no
+file-extension ban, no shebang check and no spawn scan can see it.
+
+This is the seventh instance of the identical failure §0.3 names: **an
+enumeration of members is wrong by construction, and a class nobody listed
+reads as green.**
+
+### The fix
+
+`is_in_crate_family(name, family)` replaces `name == family`. A crate is in a
+family when it IS the family or starts with `"{family}-"`. So one `rustpython`
+entry now covers all five sibling crates, and the list widened 17 → 24
+families.
+
+**The hyphen is load-bearing and is the half that keeps this honest.** A bare
+prefix would make `rune` fire on `runes` and `v8` on `v8x`. A guard whose
+first act is a false positive teaches the next reader that the cheapest fix is
+an allowlist entry — which is how three anchors in this branch were weakened
+before.
+
+**Verified before widening, not after:** none of the 24 families matches any
+of the 476 packages across the tracked lockfiles. This adds enforcement
+without adding a single exemption.
+
+**Bite-proven both directions** (`embedded_interpreter_detection_self_test`):
+reverting `is_in_crate_family` to exact equality fails the sibling assertion
+(1 failed), and restoring it passes the full suite (23 passed). The
+false-positive half is pinned by three explicit near-miss assertions
+(`runes`/`rune`, `rustpythonic`/`rustpython`, `v8x`/`v8`).
+
+### Deliberately NOT added
+
+`wasm` as a family. It would match `wasm-bindgen`, which IS in the lockfile
+today — pulled transitively by chrono, getrandom, uuid, reqwest and
+opentelemetry, every one of them under `cfg(target_arch = "wasm32")`, so never
+compiled for a target we ship. Banning it would fail the build over packages
+that exist in no artifact we produce. `wasm3` is the specific interpreter;
+`wasm` is not. That carve-out is unchanged from §0.4 and is re-verified here.
+
+### Still not claimed
+
+A family list is still a LIST. It is now a list of families rather than a list
+of crates, which is one level less wrong — but a runtime whose crate name
+shares no prefix with anything here still passes. What changed is that adding
+the next one costs a single entry instead of one entry per sibling, and that
+the seven names added today are enforced rather than assumed absent.
+
+## §0.6. 2026-09-01 — SCOPE FIX #15: hole EIGHT, and it was TWO holes, both CRITICAL
+
+Same operator directive as §0.5, same day. A hunt commissioned specifically to
+find "hole eight" — told to assume it existed — found two, and the live tree is
+CLEAN of both, so these close LATENT breaches rather than active ones.
+
+### Hole 8a — a shebang was checked for EXISTENCE, never for WHAT IT NAMES
+
+`has_interpreter_shebang` asks whether a first line starts with `#!`. That is
+the right question for deciding **which files to scan** (SCOPE FIX #8's whole
+point) and the wrong one for deciding **what is allowed**.
+
+A tracked, extension-less, executable file whose first line reads
+`#!/usr/bin/env node` cleared every check in `rust_only_guard.rs`
+**simultaneously**:
+
+| check | why it missed |
+|---|---|
+| `BANNED_FILE_PATHSPECS` | no extension to ban |
+| `banned_tokens()` | `node` is not in the python family |
+| `count_node_invocations` | `is_command_position` sees a prefix starting with `#` and matches no arm |
+| `every_tracked_executable_is_inside_the_invocation_scan` | the file IS in the scan — it **passed** |
+
+That last row is the sharp one: the existing test proves a shebang file is
+*being scanned*, which buys nothing when the scan cannot read the line. A
+guard that is satisfied by the hostile artifact is worse than no guard.
+
+**Fixed** by `shebang_runtime()`, which resolves what the line actually names
+(`env` and `-S` forms included, so `#!/usr/bin/env -S deno run --allow-net`
+resolves to `deno`), and `every_tracked_shebang_names_an_allowed_runtime`,
+which permits **`bash` and `sh` only**. All ~99 tracked shebangs are `bash`, so
+this lands at a hard floor with **no allowlist to grow**.
+
+### Hole 8b — `NODE_FAMILY` was never applied to Rust at all
+
+`no_rust_spawn_of_banned_interpreter` filtered spawn literals through
+`banned_tokens()` alone — the python family plus perl. The node family was
+checked only by `node_family_invocations_only_shrink`, which scans
+`load_invocation_scan_files()`, and that **excludes `.rs`**. So
+`Command::new("node")` in Rust passed both, each believing the other covered
+it.
+
+The sibling browser guard did not help: its `SPAWN_ALLOWLIST` reads only
+`Command::new("`, so `Command::new("bash").arg("-c").arg("node /opt/x.js")`
+shows it the allowlisted `bash` and nothing else.
+
+**Fixed** by `spawn_literal_names_node_family`, which catches both shapes — the
+literal that IS the runtime (`"node"`, `"/usr/bin/node"`) and the literal that
+CARRIES it in command position (the `-c` payload above). Reusing
+`count_node_invocations` for the second shape is deliberate: it already
+encodes the command-position parser **and** its false-positive discipline, so
+`"SSM managed node"` stays a sentence.
+
+### Both bite-proven, against the hunt's own hostile artifacts
+
+| planted | result |
+|---|---|
+| `tools/tv-report`, extension-less, `#!/usr/bin/env node` | **FAILS** — `tools/tv-report: #! names \`node\`` |
+| `Command::new("bash").arg("-c").arg("node /opt/x.js")` in a real `.rs` | **FAILS** — ``spawns `node /opt/x.js` `` |
+| both removed | 25 tests pass |
+
+The second proof is the one worth keeping: the program was the **allowlisted**
+`bash`, and the runtime hidden in an argument was still caught.
+
+### One exemption added, and why it is two names rather than a glob
+
+Extending the spawn scan to `NODE_FAMILY` matched `Command::new("node")` inside
+`browser_surface_and_toolchain_guard.rs` —
+`spawn_scanner_extracts_literals_and_ignores_non_literals`, a raw-string
+FIXTURE that bite-proves that guard's own extractor. A guard cannot prove it
+detects a thing without writing the thing down, which is exactly why
+`rust_only_guard.rs` has always skipped itself.
+
+`SELF_REFERENTIAL_GUARDS` is an explicit **two-file list**, never a
+`*_guard.rs` glob. A glob would silently exempt every future guard file, and
+that is precisely how an exemption becomes a hole. A third entry is a visible
+diff and needs the same justification.
+
+### Still open, recorded rather than quietly carried
+
+The same hunt found six more, all latent and all with the live tree CLEAN.
+None is fixed here and none should be assumed covered:
+
+| # | Hole | Sev |
+|---|---|---|
+| H10 | argv **arrays** — `"args": ["node","app.js"]`, terraform `command = ["node"]`, compose `command: [node, s.js]`. `[` is not a separator in `is_command_position`. This is the shape `.mcp.json` itself uses | HIGH |
+| H11 | bare YAML sequence item `  - node` (the quoted form `- "node"` IS caught; `before` is `trim_end`'d so the `- ` arm never fires) | HIGH |
+| H12 | unlisted wrapper binaries — `find … -exec node`, `watch`, `setsid`, `stdbuf`, `parallel`, `ssh box "node …"`, and make's `@`/`-` recipe prefixes. `COMMAND_INTRODUCERS` enumerates 17 names, which is the enumerate-names failure this file keeps recording | HIGH |
+| H13 | `.wasm` is excluded from every guard at once; `.wat` is neither banned nor token-detectable | MED |
+| H14 | the browser guard opens only `*.rs` and `*.html` — `<script>` in a tracked `.svg`, `.md`, `.json` or a `.tftpl` is uncounted by all three budgets | MED |
+| H15 | `.md` is excluded outright, so a new `SKILL.md` with fenced interpreter code is invisible to both guards — the exact class deleted on 2026-07-31 | MED |
+| H16 | `cargo_config_declares_no_external_runner_or_linker` is root-only and **fails open** on an unreadable file; a per-package `crates/app/.cargo/config.toml` is never opened | MED |
+
+H12 is the one that matters most conceptually: it is the same enumeration
+failure as 8a, one level out. Closing it properly means asking what a token is
+in the LINE's grammar rather than listing the words that may precede it — the
+same move made twice now, and not yet made a third time.
+
+## §0.7. 2026-09-01 — SCOPE FIX #16: four of the seven open holes CLOSED
+
+Same operator directive as §0.5/§0.6, same day. The §0.6 table above says
+"None is fixed here" — this section fixes **H10, H11, H12 (partly) and H16**.
+The live tree was and remains CLEAN of all four, so these close LATENT holes.
+
+### H10 — argv arrays (HIGH)
+
+`[` was not a separator, so an argv array put the runtime in command position
+with no shell separator anywhere on the line and every form read as a mention:
+
+| form | where it is the dominant shape |
+|---|---|
+| `"args": ["node", "app.js"]` | **`.mcp.json` in this repo** |
+| `command = ["node", "server.js"]` | terraform |
+| `command: [node, server.js]` | docker-compose |
+
+The file that motivated the node-family ban was itself written in a shape the
+ban could not read.
+
+**Fixed** by adding `[` to the separator set. `,` is a separator too, but
+**only when an open bracket appears earlier in the line** — a general comma
+separator would put the runtime word in command position for any prose
+containing `", node"` and fail the build on a sentence. Six prose fixtures
+pin that (`"restarts the box, node counts stay flat"` and five siblings).
+
+### H11 — bare YAML sequence item (HIGH)
+
+`  - node`. The `- ` arm could never fire on it: `before` is `trim_end()`'d,
+so the trailing space the arm needs is already gone by the time it runs. Only
+the QUOTED form `- "node"` was caught, which is the rarer style.
+
+**Fixed** by a whole-segment marker arm.
+
+### H12 — wrapper prefixes (HIGH) — PARTLY closed, and the residual is stated
+
+**Closed:** make recipe prefixes (`@`, `-`, `@-`, `-@`, `+`) as whole-segment
+markers; `-exec` as a separator, which covers `find . -exec node`; and
+`watch`, `setsid`, `stdbuf`, `parallel`, `nice`, `ionice`, `doas` added as
+introducers.
+
+**NOT closed, deliberately:** `ssh host "node app.js"`. It places a BARE WORD
+(`host`) between the wrapper and the runtime, and the parser must consume the
+ENTIRE prefix to return true. Accepting bare words is exactly what would turn
+`SSM managed node` into a build failure — the false positive this guard cannot
+survive. Recorded at the site as `_WRAPPER_SHAPES_NOT_COVERED` rather than left
+to be rediscovered. A miss here is a false NEGATIVE; the alternative is a
+false-positive engine, and a guard whose first act is a false positive gets
+allowlisted within a week.
+
+### H16 — cargo config: root-only AND fails open (MED)
+
+Two defects in one test. It read only `.cargo/config.toml` at the repo root —
+but cargo reads the file from the package directory and every ancestor, so
+`crates/app/.cargo/config.toml` sets the runner/linker for that package and was
+never opened. And `let Ok(body) = … else { return }` meant an unreadable config
+**passed as trivially safe** — the one case that most needs to fail was the one
+case waved through.
+
+**Fixed:** enumerates every `.cargo/config.toml` and `.cargo/config` via
+`scan_paths` (tracked AND untracked, the SCOPE FIX C1 lesson), and panics on an
+unreadable one. This matters because §0's own record has an interpreter package
+ACTUALLY being the arm64 linker of every production lambda while reading green.
+
+### Bite-proofs (both directions, planted then removed)
+
+| planted | before | after |
+|---|---|---|
+| `scripts/planted-argv.json` with `"args": ["-c", "node /opt/evil.js"]` | **passes green** | **FAILS** — `("scripts/planted-argv.json", 1, 0)` |
+| `crates/app/.cargo/config.toml` with `runner = "node-emulator"` | never opened | **FAILS** — names the per-package path |
+
+The first was verified by reverting the parser to HEAD with the plant still in
+the tree and watching it pass — the fix, not the fixture, is what catches it.
+
+### Still open after this section
+
+**H13** (`.wasm`/`.wat`), **H14** (the browser guard opens only `*.rs` and
+`*.html`), **H15** (`.md` excluded, so a `SKILL.md` with fenced interpreter
+code is invisible) and the `ssh` half of H12. H15 is the awkward one: scanning
+`.md` naively would flag this repository's own rule files, which discuss the
+banned runtimes at length — the honest shape is to scan only FENCED CODE BLOCKS
+carrying an interpreter language tag, which is a parser, not a predicate.
+
+## §0.8. 2026-09-02 — SCOPE FIX #17: four holes the second sweep found, and the first attempt at one was a false-positive engine
+
+Operator directive (2026-09-02, given in direct response to the Second Sweep
+Ledger, whose finding-14 row named these holes — typos preserved):
+
+> "go ahead and fix the remaining open findings dude okay?"
+
+> "Once fixed finished and resolved merge and deploy it also dude okay?"
+
+Same shape as §0.5–§0.7: the live tree was and remains CLEAN of all four, so
+these close LATENT holes, and every one is bite-proven in both directions
+because the real-tree tests cannot demonstrate that anything is caught.
+
+### H-a — a non-UTF-8 file was SKIPPED, silently, by nine scans
+
+`read_to_string` fails on ONE invalid byte. Eight sites in
+`rust_only_guard.rs` and five in `browser_surface_and_toolchain_guard.rs`
+read with `.ok()?`, `let Ok(..) else { continue }` or `unwrap_or_default()`
+— so a Latin-1 `é` in a comment took the whole file out of every scan at
+once, and a file with `\xff\xfe` on line 1 and `node app.js` on line 2 was
+invisible. The comment at the loader said this was deliberate ("a guard that
+crashes on one is a guard someone disables"), which is the reassuring-comment
+class §0.2 records.
+
+**Fixed:** `decode_scan_bytes` / `read_scan_text` decode LOSSILY (invalid
+bytes become U+FFFD, which matches nothing; every valid byte around them is
+still scanned) and PANIC on an I/O failure — a listed file the guard cannot
+open is a guard failure, never a file to skip. All thirteen sites use them.
+
+### H-b — a `bash -c` shebang hands bash a program nobody scanned
+
+`#!/usr/bin/env -S bash -c "node app.js"` names an ALLOWED runtime, so
+§0.6's `shebang_runtime` waves it through, and the payload is invisible to
+every line scanner: the line starts with `#!`, `is_command_position`
+matches no arm on that prefix, and the `node` is never counted. The kernel
+runs exactly that `node`.
+
+**Fixed:** `shebang_inline_payload` extracts the program after a SHORT flag
+cluster containing `c` (`-c`, `-ec`, `-ce`) and feeds it to both
+`count_node_invocations` and the interpreter-token scan. `-euo pipefail`
+(no `c`), `--norc` (long option) and a bare `-c` yield no payload — pinned,
+because most of this repo's own scripts open with `-euo pipefail`.
+
+### H-c — every scan enumerated TRACKED files only
+
+A new interpreter script, a `.go` source, a shebang wrapper — none appears
+in `git ls-files` until `git add`, so the guard reported green on exactly
+the change it exists to catch: the first commit of a new runtime. The
+browser guard has carried `--others --exclude-standard` since its own C1
+bite-test; this file's §0 records an untracked `crates/x/src/evil.rs` being
+invisible to every diff source. The lesson was learned and not applied here.
+
+**Fixed:** `git_ls_files_with(extra_args, pathspecs)` and
+`git_ls_files_including_untracked`; the invocation scan, both shebang tests,
+`no_banned_files_outside_allowlist` and `no_rust_spawn_of_banned_interpreter`
+now include untracked-but-not-ignored files. **Deliberately left
+tracked-only, documented at the site:** the stale-entry checks and the
+shrink-only budgets — a budget entry must name a file that is actually in the
+repository, and an untracked scratch file must never satisfy "still tracked".
+
+### H-d — the ban enumerated SCRIPTING languages and stopped
+
+`java`, `go`, `dotnet`, `swift`, `kotlin`, `scala`, `groovy`, `julia`,
+`Rscript` — a whole second toolchain in one `RUN go build` line, and none
+was a banned token or a banned extension. `*.java .kt .kts .scala .go .cs
+.swift .R .r` joined `BANNED_FILE_PATHSPECS` (all nine verified ZERO tracked)
+and the ten runtimes joined `NODE_FAMILY`, because an extension ban is not an
+invocation ban (the 2026-08-01 `pip` lesson, again).
+
+**Deliberately excluded, with the reason in the docblock and pinned by
+test:** `jq` runs the All Green verdict in `ci.yml` (merge-gate-lock §5.1) —
+banning it fails the merge gate on its own implementation; `awk`/`sed` are
+POSIX text tools every script here uses; `perl` already lives in
+`banned_tokens()`; bare `R` is also `chmod -R`.
+
+### ⚠ The first version counted a SENTENCE, and that is the reusable part
+
+A line that begins with a word is command position by definition. `go` and
+`swift` are English words. The first version of this fix counted **"swift
+recovery is expected after a reconnect"** — a real comment — as an
+invocation. That is precisely the false positive this file says a guard
+cannot survive: it would have been allowlisted within the week.
+
+**Fixed** by `PROSE_AMBIGUOUS_RUNTIMES` (`go`, `swift`): those two
+additionally require a toolchain-shaped NEXT token — a flag, a path or source
+file (`main.go`, never a sentence-ending `go.`), or the compiler's own
+subcommand (`build`, `run`, `test`, `mod`, …). A word-START boundary was
+added to `count_node_invocations` at the same time (`go` inside `cargo`,
+`Rscript` inside `myRscript`), with `-` allowed on the left because make's
+`-node` recipe prefix is a real invocation — the existing `guard_self_test`
+caught the first draft rejecting it.
+
+The must-NOT-count fixtures include the real `sudo rm -rf /usr/share/dotnet`
+line from `ci.yml`, `name = "governor"` (the only `Cargo.lock` package with a
+family member as a substring), `java-properties`, a `/java/` URL, `cargo
+build` under `sudo` and `RUN`, `chmod -R`, and `go to the next step`.
+
+### Bite-proofs (untracked plants, never `git add`ed, then removed)
+
+| planted | result |
+|---|---|
+| `scripts/planted-shebang-wrapper` — `#!/usr/bin/env -S bash -c "node /opt/evil.js"` | **FAILS** `node_family_invocations_only_shrink` — `("scripts/planted-shebang-wrapper", 1, 0)` |
+| `scripts/planted.go` | **FAILS** `no_banned_files_outside_allowlist` — `["scripts/planted.go"]` |
+| `scripts/planted-latin1.sh` — `\xff\xfe` on line 1, `node app.js` on line 2 | **FAILS** — `("scripts/planted-latin1.sh", 1, 0)` |
+| `scripts/planted-toolchain.sh` — `RUN go build ./...` + `java -jar x.jar` | **FAILS** — `("scripts/planted-toolchain.sh", 2, 0)` |
+| `scripts/benign-planted.sh` — the five must-not-count lines above | **passes**, 26/26 |
+
+All four hostile plants were planted together and every one was named in
+the failure output; the benign plant passed with the fix in place.
+
+### Still open after this section
+
+- **H12's `ssh` half** — `ssh host "node …"` still needs a bare word
+  consumed, which is the false-positive engine §0.7 refused.
+- **Split-argv `"command": "go"`** — a bare ambiguous runtime with nothing
+  after it on the line counts 0 by construction (pinned: the same line with
+  `node` counts 1). The word IS the sentence; there is nothing to check.
+- **H13 / H14 / H15** — unchanged from §0.7.
+- The `PROSE_AMBIGUOUS_RUNTIMES` subcommand list is an enumeration, the
+  failure shape this file keeps recording. It is bounded by the two
+  compilers' own verb sets rather than by what a script author might write,
+  which is the narrower and therefore safer direction to be wrong in.

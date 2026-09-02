@@ -212,6 +212,86 @@ const FEED_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `pool_supervisor::IDLE_POLL_INTERVAL`.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long, after OUR side has sent (or answered) a WebSocket Close frame,
+/// the socket waits for the peer's half of the close handshake before the
+/// connection is dropped and the next dial can begin.
+///
+/// **Added 2026-09-02 (audit finding 4).** [`DhanFeedSocket::close`] used to
+/// send the Close frame and return immediately, so the supervisor's redial
+/// arm could be dialing the replacement socket while the old one was still a
+/// half-open connection on Dhan's side. Dhan enforces its 5-per-endpoint cap
+/// by killing the OLDEST socket (its 805 semantics), so if a not-yet-torn-down
+/// socket still counts against that cap, an instant redial gets a HEALTHY
+/// sibling killed to make room for the replacement.
+///
+/// Whether Dhan actually counts a half-open socket against the cap is
+/// **Assumed** — it is consistent with the 805-storm history in this file
+/// but has never been measured against the vendor. The wait is cheap and
+/// bounded, and it is the direction that cannot make things worse: a peer
+/// that answers promptly ends it early, and a peer that never answers costs
+/// at most this constant on a path that is about to sleep for a backoff
+/// rung anyway.
+///
+/// Two seconds: longer than an Indian-internet round trip by an order of
+/// magnitude, shorter than the shortest non-zero ladder rung, and inside the
+/// 2 s swap budget this file already accepts on the drain task. **Skipped on
+/// a bare TCP reset** — there is no peer left to answer, and waiting would
+/// only delay a recovery that is already overdue. The backoff maths in
+/// `pool_supervisor` is untouched: this wait runs BEFORE the rung sleep, not
+/// instead of it.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `DIAL_TIMEOUT` above.
+pub const CLOSE_HANDSHAKE_WAIT: Duration = Duration::from_secs(2);
+
+/// How the bounded close handshake ended. Debug/log surface only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseHandshake {
+    /// The last read ended in a reset or a dead stream: nothing to wait for.
+    Skipped,
+    /// The peer's Close reply (or its stream end) arrived inside the bound.
+    Completed,
+    /// The bound elapsed with no reply: the socket is dropped regardless.
+    TimedOut,
+}
+
+impl CloseHandshake {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Completed => "completed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Waits, bounded by [`CLOSE_HANDSHAKE_WAIT`], for the peer to finish the
+/// WebSocket close handshake after our Close frame has gone out.
+///
+/// Generic over the stream so the bound is testable against a scripted peer
+/// under `tokio::time::pause` — the real socket is `DhanFeedSocketImpl::close`.
+/// Drains any data frames still in flight (they are discarded: the guard has
+/// already been marked lost) and returns on the peer's Close, on stream end,
+/// on a read error, or at the bound — whichever is first.
+async fn await_close_handshake<S>(stream: &mut S, last_read_ended_by_reset: bool) -> CloseHandshake
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    if last_read_ended_by_reset {
+        return CloseHandshake::Skipped;
+    }
+    let drain = async {
+        loop {
+            match stream.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    };
+    match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, drain).await {
+        Ok(()) => CloseHandshake::Completed,
+        Err(_elapsed) => CloseHandshake::TimedOut,
+    }
+}
+
 /// How long one subscribe message may take to reach the socket. A blocked write
 /// while the pool waits is the same disconnect hazard as a blocked read.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `pool_supervisor::IDLE_POLL_INTERVAL`.
@@ -910,6 +990,12 @@ pub struct DhanFeedSocketImpl<T: FeedTokenSource> {
     /// tungstenite error's `Display` embeds the request URL, and that URL
     /// carries the JWT in its query string.
     last_dial_failure_reason: &'static str,
+    /// Whether the most recent read ended in a bare reset / dead stream
+    /// rather than a frame or a Close. Read by [`DhanFeedSocket::close`] to
+    /// decide whether the peer can still answer a close handshake — see
+    /// [`CLOSE_HANDSHAKE_WAIT`]. `false` after every successful read and
+    /// every successful dial.
+    last_read_ended_by_reset: bool,
 }
 
 impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
@@ -921,6 +1007,7 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
             token,
             stream: None,
             last_dial_failure_reason: "unknown",
+            last_read_ended_by_reset: false,
         }
     }
 
@@ -1258,6 +1345,7 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                     "Dhan feed socket connected"
                 );
                 self.stream = Some(stream);
+                self.last_read_ended_by_reset = false;
                 Ok(())
             }
             Err(err) => {
@@ -1436,6 +1524,9 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         {
             let Some(message) = stream.next().await else {
                 debug!(endpoint = endpoint.as_str(), "Dhan feed stream ended");
+                // The peer is already gone: nothing can answer a close
+                // handshake, so `close()` must not wait for one.
+                self.last_read_ended_by_reset = true;
                 return SocketEvent::Closed { code: None };
             };
             let message = match message {
@@ -1464,9 +1555,17 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                         "Dhan feed read failed — treating as a disconnect so the supervisor's \
                          ladder reconnects"
                     );
+                    // A read error is the bare-reset shape (the
+                    // `ResetWithoutClosingHandshake` class this file's
+                    // history is full of): no peer left to answer a Close.
+                    self.last_read_ended_by_reset = true;
                     return SocketEvent::Closed { code: None };
                 }
             };
+            // A frame arrived, so the stream is alive: whatever this turns
+            // out to be — data, a control frame, a Dhan disconnect packet or
+            // the peer's own Close — a close handshake can still complete.
+            self.last_read_ended_by_reset = false;
 
             match message {
                 Message::Binary(payload) => {
@@ -1536,6 +1635,18 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                 "Dhan feed socket close was not clean — the socket is dropped regardless"
             );
         }
+        // Give the peer its half of the close handshake, bounded — see
+        // `CLOSE_HANDSHAKE_WAIT` for why an instant redial on top of a
+        // half-open socket can get a HEALTHY sibling killed (Assumed: that
+        // Dhan counts the half-open socket against its per-endpoint cap).
+        // Skipped when the last read was a reset: nothing is left to answer.
+        let verdict = await_close_handshake(&mut stream, self.last_read_ended_by_reset).await;
+        debug!(
+            endpoint = self.params.endpoint.as_str(),
+            close_handshake = verdict.as_str(),
+            wait_bound_ms = CLOSE_HANDSHAKE_WAIT.as_millis(),
+            "Dhan feed socket closed"
+        );
     }
 }
 
@@ -1808,6 +1919,66 @@ mod tests {
         let mut s = String::from(DHAN_MAIN_FEED_WS_BASE_URL);
         s.push('/');
         s
+    }
+
+    /// The close-handshake wait (2026-09-02, audit finding 4): bounded on a
+    /// clean Close the peer never answers, SKIPPED entirely on a bare reset,
+    /// and ended early by the peer's own Close reply. Under the paused clock
+    /// the bound is asserted as an exact duration, not approximated.
+    #[tokio::test(start_paused = true)]
+    async fn the_close_handshake_wait_is_bounded_on_a_clean_close_and_skipped_on_a_reset() {
+        use futures_util::stream;
+        type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        // A peer that never answers our Close: wait exactly the bound.
+        let mut silent = stream::pending::<Item>();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            await_close_handshake(&mut silent, false).await,
+            CloseHandshake::TimedOut
+        );
+        assert_eq!(
+            started.elapsed(),
+            CLOSE_HANDSHAKE_WAIT,
+            "a clean close waits for the peer, bounded by the named constant"
+        );
+
+        // A bare TCP reset: there is no peer to wait for, and no time passes.
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            await_close_handshake(&mut silent, true).await,
+            CloseHandshake::Skipped
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a reset must not delay the recovery it already needs"
+        );
+
+        // A peer that answers: an in-flight data frame is drained and the
+        // Close reply ends the wait early.
+        let mut replying = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Ping(WsBytes::new())),
+            Ok(Message::Close(None)),
+        ]);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            await_close_handshake(&mut replying, false).await,
+            CloseHandshake::Completed
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // A stream that has already ended completes at once as well.
+        let mut ended = stream::iter(Vec::<Item>::new());
+        assert_eq!(
+            await_close_handshake(&mut ended, false).await,
+            CloseHandshake::Completed
+        );
+        assert_eq!(CloseHandshake::TimedOut.as_str(), "timed_out");
+        assert!(
+            CLOSE_HANDSHAKE_WAIT < DIAL_TIMEOUT,
+            "the handshake wait must never dominate a dial cycle"
+        );
     }
 
     /// A bare numeric SecurityId immediately before a JSON object close.

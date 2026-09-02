@@ -44,6 +44,25 @@ fn repo_root() -> PathBuf {
         .expect("browser_surface_guard: cannot canonicalize repo root")
 }
 
+/// Read a scan target as text, LOSSILY, and PANIC on an I/O failure.
+///
+/// SCOPE FIX #17 (2026-09-02). Five scans in this file read with
+/// `let Ok(body) = read_to_string(..) else { continue }`, and `read_to_string`
+/// rejects the whole file on ONE non-UTF-8 byte — so a Latin-1 `é` in a
+/// comment silently exempted a source file from the browser-surface, spawn,
+/// JS-volume, inline-handler and content-type scans all at once. Lossy
+/// decoding keeps every valid byte scannable; an unreadable file is a guard
+/// FAILURE, never a file to skip, because a skipped file reads as clean.
+fn read_scan_text(root: &Path, path: &str) -> String {
+    let bytes = std::fs::read(root.join(path)).unwrap_or_else(|e| {
+        panic!(
+            "browser_surface_guard: cannot read `{path}`: {e}. A file the enumeration \
+             listed but the guard cannot open must fail the build, not pass it."
+        )
+    });
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Files matching `pathspec` that are tracked **or newly added and not
 /// ignored**.
 ///
@@ -140,10 +159,7 @@ fn browser_code_in_rust_is_pinned_to_the_enumerated_surfaces() {
         if path.ends_with("browser_surface_and_toolchain_guard.rs") {
             continue;
         }
-        let full = root.join(&path);
-        let Ok(body) = std::fs::read_to_string(&full) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         let count = body.matches("<script").count();
         if count > 0 {
             actual.insert(path, count);
@@ -242,22 +258,51 @@ fn strip_toml_comments(body: &str) -> String {
 #[test]
 fn cargo_config_declares_no_external_runner_or_linker() {
     let root = repo_root();
-    let path = root.join(".cargo/config.toml");
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        // No cargo config at all is trivially safe.
-        return;
-    };
 
-    let code = strip_toml_comments(&body);
+    // EVERY cargo config, not just the root one — SCOPE FIX #16 (2026-09-01,
+    // hole SIXTEEN). Cargo reads `.cargo/config.toml` from the package
+    // directory and every ancestor, so `crates/app/.cargo/config.toml` sets
+    // the runner/linker for that package's builds and this test never opened
+    // it. Root-only is the enumerate-one-location failure this repo's
+    // rust-only lock has now recorded several times in a row.
+    //
+    // `scan_paths` covers tracked AND untracked files, so a config added but
+    // not yet committed is caught too — the SCOPE FIX C1 lesson.
+    let mut configs = scan_paths(".cargo/config.toml");
+    configs.extend(scan_paths("**/.cargo/config.toml"));
+    configs.extend(scan_paths(".cargo/config"));
+    configs.extend(scan_paths("**/.cargo/config"));
+    configs.sort();
+    configs.dedup();
 
     let mut found = Vec::new();
-    for (lineno, line) in code.lines().enumerate() {
-        let t = line.trim_start();
-        // Match the KEY, not a substring: `runner = ...` / `linker = ...`,
-        // including the dotted and quoted forms cargo accepts.
-        let is_key = |key: &str| t.starts_with(key) && t[key.len()..].trim_start().starts_with('=');
-        if is_key("runner") || is_key("linker") {
-            found.push(format!("  .cargo/config.toml:{}: {}", lineno + 1, t.trim()));
+    for rel in &configs {
+        let path = root.join(rel);
+        // FAIL CLOSED — SCOPE FIX #16. The previous version returned early on
+        // any read error, so an unreadable config passed as "trivially safe".
+        // A file cargo WILL read but this guard CANNOT is the one case that
+        // most needs to fail, not the one case that is waved through.
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "CARGO CONFIG UNREADABLE: {rel} exists in the tree but could not be \
+                 read ({e}).\n\n\
+                 This guard now fails CLOSED here. Cargo reads this file on every \
+                 build; a config the toolchain honours and the guard cannot inspect \
+                 is exactly the blind spot `runner`/`linker` enforcement exists to \
+                 prevent."
+            )
+        });
+
+        let code = strip_toml_comments(&body);
+        for (lineno, line) in code.lines().enumerate() {
+            let t = line.trim_start();
+            // Match the KEY, not a substring: `runner = ...` / `linker = ...`,
+            // including the dotted and quoted forms cargo accepts.
+            let is_key =
+                |key: &str| t.starts_with(key) && t[key.len()..].trim_start().starts_with('=');
+            if is_key("runner") || is_key("linker") {
+                found.push(format!("  {rel}:{}: {}", lineno + 1, t.trim()));
+            }
         }
     }
 
@@ -399,9 +444,7 @@ fn every_spawned_binary_is_on_the_allowlist() {
         if SPAWN_SCAN_EXEMPT.contains(&path.as_str()) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         for bin in spawned_literals(&body) {
             seen_any = true;
             if !allowed.contains(&bin.as_str()) {
@@ -675,9 +718,7 @@ fn javascript_volume_inside_script_tags_only_shrinks() {
         if is_the_scanner_itself(&path) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         actual.insert(path, js_line_count(&body));
     }
 
@@ -756,9 +797,7 @@ fn inline_event_handlers_only_shrink() {
             if is_the_scanner_itself(&path) {
                 continue;
             }
-            let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-                continue;
-            };
+            let body = read_scan_text(&root, &path);
             let n = inline_handler_count(&body);
             if n > 0 {
                 actual.insert(path, n);
@@ -822,9 +861,7 @@ fn nothing_serves_a_javascript_content_type() {
         if is_the_scanner_itself(&path) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         let lower = body.to_ascii_lowercase();
         for n in needles {
             if lower.contains(n) {

@@ -57,6 +57,25 @@ use tickvault_common::config::PartitionRetentionConfig;
 /// drift apart.
 pub const PRESSURE_MIN_HOT_DAYS: u32 = crate::partition_archive::MIN_HOT_DAYS;
 
+/// How long an ESCALATED episode waits before it is allowed one more pass.
+///
+/// One hour, and the number is not arbitrary: `market_depth` is partitioned
+/// BY HOUR, so one hour is exactly the granularity at which a partition that
+/// was too young to touch can become eligible. Waiting less would re-export
+/// against an unchanged worklist; waiting more would leave reclaimable space
+/// on a filling volume.
+pub const PRESSURE_REARM_AFTER_SECS: u64 = 3_600;
+
+/// How many times one episode may re-arm after escalating.
+///
+/// Three, against a ~9-hour session: enough to cover the morning case the
+/// re-arm exists for (an episode opening before the first depth hour is
+/// eligible), and bounded so a volume that is genuinely unreclaimable stops
+/// instead of looping exports against a full disk for the rest of the day.
+/// The Critical page fires ONCE either way — a re-arm restores the ability to
+/// try, never the ability to page again.
+pub const PRESSURE_MAX_REARMS: u32 = 3;
+
 /// One observation of the data volume.
 ///
 /// `used_pct: None` means the probe FAILED (e.g. `df` unavailable or
@@ -127,6 +146,15 @@ pub struct EpisodeState {
     /// is what turns a Critical into one page per episode instead of one per
     /// poll — the difference between an alert and a flood.
     pub escalated: bool,
+    /// Monotonic seconds at which this episode escalated, for the re-arm.
+    ///
+    /// `None` until escalation, and it is what makes the escalation a PAGE
+    /// rather than a permanent stand-down — see [`PRESSURE_REARM_AFTER_SECS`].
+    pub escalated_at_secs: Option<u64>,
+    /// Re-arms already spent in this episode. Bounded by
+    /// [`PRESSURE_MAX_REARMS`] so a volume that is genuinely unreclaimable
+    /// cannot loop exports forever.
+    pub rearms_used: u32,
 }
 
 /// What the caller should do next.
@@ -205,6 +233,39 @@ pub fn decide_pressure_action(
                 return PressureAction::EndEpisode;
             }
             if ep.escalated {
+                // RE-ARM, added 2026-09-01 after an adversarial audit found
+                // this arm was a permanent stand-down, not a page.
+                //
+                // The escalate comment below reasons that a zero-reclaim pass
+                // means "every partition old enough is already gone, or none
+                // could be verified into S3 … neither improves by trying
+                // again". The first half of that is FALSE, and it is false in
+                // the exact case the pressure archiver exists for: partitions
+                // become eligible AS THE CLOCK ADVANCES. `market_depth` is
+                // hour-partitioned with a 4-hour floor, so an episode opening
+                // at 11:26 IST — which is when the measured 185.7 GB/day depth
+                // load crosses 75% of a 300 GB volume — finds the 09:00 hour
+                // not yet eligible, drops zero, escalates on its FIRST pass,
+                // and then holds for the rest of the session. By 14:00 several
+                // hours ARE eligible and nothing goes back to look.
+                //
+                // The exit condition made it permanent: `used < low_water`
+                // requires a pass to free space, and `Hold` runs no pass. So
+                // the one automatic mechanism that reclaims disk switched
+                // itself off precisely on the morning it was needed.
+                //
+                // One hour, because that is the granularity at which new
+                // partitions can become eligible; bounded by
+                // `PRESSURE_MAX_REARMS` so a genuinely unreclaimable volume
+                // still stops rather than looping exports. The page already
+                // fired and is NOT repeated — `escalated` stays latched for
+                // alerting; only the ability to try again is restored.
+                let rearm_due = ep
+                    .escalated_at_secs
+                    .is_some_and(|at| now_secs.saturating_sub(at) >= PRESSURE_REARM_AFTER_SECS);
+                if rearm_due && ep.rearms_used < PRESSURE_MAX_REARMS {
+                    return PressureAction::ContinuePass;
+                }
                 return PressureAction::Hold;
             }
             // A pass that reclaimed nothing means one of two things: every
@@ -249,17 +310,39 @@ pub fn apply_action(
                 passes_used: 1,
                 last_pass_dropped: dropped_this_pass,
                 escalated: false,
+                escalated_at_secs: None,
+                rearms_used: 0,
             });
         }
         PressureAction::ContinuePass => {
             if let Some(ep) = state.episode.as_mut() {
                 ep.passes_used = ep.passes_used.saturating_add(1);
                 ep.last_pass_dropped = dropped_this_pass;
+                // A ContinuePass reached while ALREADY escalated is a re-arm,
+                // and it is the only way `rearms_used` can move. Counting it
+                // here rather than at the decision keeps the two in lockstep:
+                // a decision the caller never executed cannot spend a re-arm.
+                if ep.escalated {
+                    ep.rearms_used = ep.rearms_used.saturating_add(1);
+                    // Re-stamp so the NEXT re-arm is another full hour away
+                    // rather than firing on every poll once the first hour has
+                    // elapsed. Without this the bound would be spent in three
+                    // consecutive polls, which is three exports in three
+                    // minutes against a volume that just told us it has
+                    // nothing to give.
+                    ep.escalated_at_secs = Some(now_secs);
+                }
             }
         }
         PressureAction::Escalate => {
             if let Some(ep) = state.episode.as_mut() {
                 ep.escalated = true;
+                // Stamped ONCE. A second Escalate cannot reach here — the
+                // decision returns Hold (or a re-arm) while `escalated` is
+                // true — but `get_or_insert` states the intent rather than
+                // relying on that, so a future edit to the decision cannot
+                // silently reset the re-arm clock and make the wait perpetual.
+                ep.escalated_at_secs.get_or_insert(now_secs);
             }
         }
         PressureAction::EndEpisode => {
@@ -270,6 +353,174 @@ pub fn apply_action(
         | PressureAction::Idle
         | PressureAction::Cooldown
         | PressureAction::Hold => {}
+    }
+}
+
+/// What one poll's probe verdict did to the probe-health latch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeHealthTransition {
+    /// Same state as last poll: healthy-and-still-healthy, or failing but not
+    /// yet for long enough, or already-reported-and-still-failing.
+    Unchanged,
+    /// The probe has now failed `failing_after` polls in a row. Fired ONCE
+    /// per episode — the caller pages on this edge.
+    FailingSustained,
+    /// A successful probe after a reported sustained failure. Fired ONCE — the
+    /// caller may log the recovery.
+    Recovered,
+}
+
+/// Edge latch for a PERSISTENTLY failing disk-pressure probe (2026-09-02,
+/// audit finding 10).
+///
+/// # The gap this closes
+///
+/// [`decide_pressure_action`] maps a failed probe to [`PressureAction::Idle`],
+/// and that is correct: a blind probe must never trigger a drop. But the
+/// consequence is that a probe which fails EVERY poll idles the pressure
+/// archiver for the whole session — the one automatic mechanism that reclaims
+/// disk switches itself off — and the only trace was a `warn!` per poll plus
+/// `tv_disk_pressure_probe_failed_total`, neither of which is a page. A
+/// `df` that stops working (an unmounted data volume, a permissions change,
+/// a wedged `statvfs`) therefore looked identical to a quiet disk.
+///
+/// The decision function is deliberately UNTOUCHED — a failed probe still
+/// yields `Idle`. This latch sits beside it and answers a different question:
+/// "has the probe been blind for long enough that its silence is itself the
+/// finding?" Pure: no clock, no disk; the caller supplies the poll verdict
+/// and the threshold in polls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProbeHealth {
+    /// Consecutive failed polls, reset to 0 by any success.
+    consecutive_failures: u32,
+    /// Whether `FailingSustained` has been fired for the current episode.
+    reported: bool,
+}
+
+impl ProbeHealth {
+    /// A healthy, never-failed latch.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            reported: false,
+        }
+    }
+
+    /// Fold one poll's verdict in and report the edge, if any.
+    ///
+    /// `failing_after` is the number of CONSECUTIVE failed polls that
+    /// constitutes a sustained failure; the caller derives it from its poll
+    /// cadence (see `disk_pressure_boot::PRESSURE_PROBE_FAILING_POLLS`). A
+    /// threshold of 0 or 1 fires on the very first failure, which a caller
+    /// polling once a minute would find noisy — the boot-side constant is
+    /// const-asserted to be at least 2.
+    #[must_use]
+    pub fn observe(&mut self, probe_ok: bool, failing_after: u32) -> ProbeHealthTransition {
+        if probe_ok {
+            self.consecutive_failures = 0;
+            if self.reported {
+                self.reported = false;
+                return ProbeHealthTransition::Recovered;
+            }
+            return ProbeHealthTransition::Unchanged;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if !self.reported && self.consecutive_failures >= failing_after {
+            self.reported = true;
+            return ProbeHealthTransition::FailingSustained;
+        }
+        ProbeHealthTransition::Unchanged
+    }
+
+    /// Consecutive failed polls so far (for the log payload).
+    #[must_use]
+    pub const fn consecutive_failures(self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
+#[cfg(test)]
+mod probe_health_tests {
+    use super::{ProbeHealth, ProbeHealthTransition};
+
+    #[test]
+    fn a_healthy_probe_never_transitions() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..100 {
+            assert_eq!(h.observe(true, 5), ProbeHealthTransition::Unchanged);
+        }
+        assert_eq!(h.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn a_failure_shorter_than_the_threshold_is_not_sustained() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..4 {
+            assert_eq!(h.observe(false, 5), ProbeHealthTransition::Unchanged);
+        }
+        assert_eq!(h.consecutive_failures(), 4);
+        // A success before the fifth failure resets the run and is NOT a
+        // recovery, because nothing was ever reported.
+        assert_eq!(h.observe(true, 5), ProbeHealthTransition::Unchanged);
+        assert_eq!(h.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn the_threshold_poll_fires_sustained_exactly_once() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..4 {
+            assert_eq!(h.observe(false, 5), ProbeHealthTransition::Unchanged);
+        }
+        assert_eq!(
+            h.observe(false, 5),
+            ProbeHealthTransition::FailingSustained,
+            "the FIFTH consecutive failure is the edge"
+        );
+        for _ in 0..1_000 {
+            assert_eq!(
+                h.observe(false, 5),
+                ProbeHealthTransition::Unchanged,
+                "a still-failing probe is counted, never re-paged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_success_after_a_reported_failure_is_a_recovery_and_re_arms() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..3 {
+            let _ = h.observe(false, 3);
+        }
+        assert_eq!(h.observe(true, 3), ProbeHealthTransition::Recovered);
+        assert_eq!(h.observe(true, 3), ProbeHealthTransition::Unchanged);
+        // The next sustained failure is a NEW episode and must page again.
+        let _ = h.observe(false, 3);
+        let _ = h.observe(false, 3);
+        assert_eq!(h.observe(false, 3), ProbeHealthTransition::FailingSustained);
+    }
+
+    #[test]
+    fn a_failed_probe_still_decides_idle_the_latch_changes_no_action() {
+        // The load-bearing property: adding the latch did NOT touch the
+        // decision. A blind probe under pressure-enabled config is still Idle.
+        use super::{
+            PartitionRetentionConfig, PressureProbe, PressureState, decide_pressure_action,
+        };
+        let cfg = PartitionRetentionConfig {
+            pressure_archive_enabled: true,
+            pressure_high_water_pct: 75,
+            pressure_low_water_pct: 60,
+            ..PartitionRetentionConfig::default()
+        };
+        let mut h = ProbeHealth::new();
+        for _ in 0..10 {
+            let _ = h.observe(false, 2);
+            assert_eq!(
+                decide_pressure_action(PressureProbe::failed(), &PressureState::default(), &cfg, 0),
+                super::PressureAction::Idle
+            );
+        }
     }
 }
 
@@ -358,6 +609,139 @@ mod tests {
         );
     }
 
+    /// The Critical found by adversarial audit 2026-09-01: escalation was a
+    /// permanent stand-down, not a page.
+    ///
+    /// Once `escalated`, every later poll returned `Hold`, which runs no pass
+    /// — and the only exit is `used < low_water`, which needs a pass to reach.
+    /// So the one automatic disk reclaimer switched itself off for the rest of
+    /// the session, and it did so preferentially in the MORNING: an episode
+    /// opening at ~11:26 IST (where the measured 185.7 GB/day depth load
+    /// crosses 75% of 300 GB) finds no hour-partition past the 4-hour floor,
+    /// drops zero, and escalates on its FIRST pass. Hours become eligible from
+    /// 13:00 onward and nothing went back to look.
+    #[test]
+    fn an_escalated_episode_rearms_after_an_hour_and_then_stops() {
+        let escalated_at = |at: u64, rearms: u32| PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 1,
+                last_pass_dropped: Some(0),
+                escalated: true,
+                escalated_at_secs: Some(at),
+                rearms_used: rearms,
+            }),
+            last_episode_end_secs: None,
+        };
+
+        // Still above low water, one minute after escalating: HOLD. Re-trying
+        // immediately would export against a worklist that cannot have changed.
+        assert_eq!(
+            decide_pressure_action(PressureProbe::used(80), &escalated_at(0, 0), &cfg(), 60),
+            PressureAction::Hold,
+            "a re-arm before the partition granularity has elapsed is wasted work"
+        );
+
+        // One second short of the hour: still HOLD. Pins the boundary rather
+        // than the neighbourhood of it.
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::used(80),
+                &escalated_at(0, 0),
+                &cfg(),
+                PRESSURE_REARM_AFTER_SECS - 1
+            ),
+            PressureAction::Hold
+        );
+
+        // At the hour: one more pass. THIS is the fix — before it, this poll
+        // and every poll after it returned Hold forever.
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::used(80),
+                &escalated_at(0, 0),
+                &cfg(),
+                PRESSURE_REARM_AFTER_SECS
+            ),
+            PressureAction::ContinuePass,
+            "hour-partitions become eligible as the clock advances, so a \
+             zero-reclaim pass is not proof that the next one reclaims nothing"
+        );
+
+        // Bounded: at the cap it goes back to holding, however long it waits.
+        // A volume that is genuinely unreclaimable must stop, not loop exports
+        // against a full disk for the rest of the day.
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::used(80),
+                &escalated_at(0, PRESSURE_MAX_REARMS),
+                &cfg(),
+                PRESSURE_REARM_AFTER_SECS * 10
+            ),
+            PressureAction::Hold,
+            "the re-arm is bounded by PRESSURE_MAX_REARMS"
+        );
+
+        // And a recovered volume still ends the episode first, re-arm or not —
+        // the exit check runs before the escalation arm and must stay there.
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::used(59),
+                &escalated_at(0, 0),
+                &cfg(),
+                PRESSURE_REARM_AFTER_SECS
+            ),
+            PressureAction::EndEpisode
+        );
+    }
+
+    /// A re-arm restores the ability to TRY, never the ability to page again,
+    /// and it must not fire on every poll once the first hour has elapsed.
+    #[test]
+    fn a_rearm_spends_its_budget_and_restarts_the_clock() {
+        let mut state = PressureState {
+            episode: Some(EpisodeState {
+                passes_used: 1,
+                last_pass_dropped: Some(0),
+                escalated: true,
+                escalated_at_secs: Some(0),
+                rearms_used: 0,
+            }),
+            last_episode_end_secs: None,
+        };
+
+        apply_action(
+            &mut state,
+            PressureAction::ContinuePass,
+            PRESSURE_REARM_AFTER_SECS,
+            Some(0),
+        );
+        let ep = state.episode.expect("episode must survive a re-arm");
+        assert_eq!(ep.rearms_used, 1, "the re-arm must be counted");
+        assert!(
+            ep.escalated,
+            "the page latch must STAY latched — a re-arm restores the ability \
+             to try, never the ability to page again"
+        );
+        assert_eq!(
+            ep.escalated_at_secs,
+            Some(PRESSURE_REARM_AFTER_SECS),
+            "the clock must restart, or the whole budget is spent in three \
+             consecutive polls — three exports in three minutes against a \
+             volume that just said it has nothing to give"
+        );
+
+        // Immediately after the re-arm the next poll holds again.
+        assert_eq!(
+            decide_pressure_action(
+                PressureProbe::used(80),
+                &state,
+                &cfg(),
+                PRESSURE_REARM_AFTER_SECS + 60
+            ),
+            PressureAction::Hold
+        );
+    }
+
     #[test]
     fn hysteresis_exit_requires_below_low_water_not_below_high_water() {
         let state = PressureState {
@@ -365,6 +749,7 @@ mod tests {
                 passes_used: 1,
                 last_pass_dropped: Some(10),
                 escalated: false,
+                ..EpisodeState::default()
             }),
             last_episode_end_secs: None,
         };
@@ -387,6 +772,7 @@ mod tests {
                 passes_used: 1,
                 last_pass_dropped: Some(0),
                 escalated: false,
+                ..EpisodeState::default()
             }),
             last_episode_end_secs: None,
         };
@@ -404,6 +790,7 @@ mod tests {
                 passes_used: 4,
                 last_pass_dropped: Some(5),
                 escalated: false,
+                ..EpisodeState::default()
             }),
             last_episode_end_secs: None,
         };
@@ -420,6 +807,7 @@ mod tests {
                 passes_used: 4,
                 last_pass_dropped: Some(0),
                 escalated: true,
+                ..EpisodeState::default()
             }),
             last_episode_end_secs: None,
         };
@@ -437,6 +825,7 @@ mod tests {
                 passes_used: 4,
                 last_pass_dropped: Some(0),
                 escalated: true,
+                ..EpisodeState::default()
             }),
             last_episode_end_secs: None,
         };
@@ -562,6 +951,7 @@ mod tests {
                 passes_used: 1,
                 last_pass_dropped: Some(0),
                 escalated: false,
+                ..EpisodeState::default()
             }),
             last_episode_end_secs: None,
         };

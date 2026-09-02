@@ -100,6 +100,7 @@ pub mod boot_helpers;
 /// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
 /// the 15:40 timeframe check's catch-up arm consults them so a
 /// post-15:40 restart never re-fires an already-delivered daily card.
+pub mod daily_archive_boot;
 pub mod daily_task_marker;
 pub mod depth200_atm;
 pub mod depth20_layout;
@@ -175,6 +176,7 @@ pub mod movers;
 /// timeframes via the shared seal-writer channel + boot catch-up over the
 /// stored month. FOLD-01 runbook:
 /// `.claude/rules/project/rest-candle-fold-error-codes.md`.
+pub mod reclaim_signal;
 pub mod rest_candle_fold;
 /// Pure shutdown classifier (Telegram cleanliness overhaul, 2026-07-15):
 /// signal kind × runtime source × IST clock × trading calendar →

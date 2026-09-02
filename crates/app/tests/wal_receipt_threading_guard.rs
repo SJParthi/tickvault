@@ -64,13 +64,18 @@ fn boot_carries_the_wal_receipt_into_the_replay_vector() {
     let vec_decl = code
         .find("ws_wal_replay_live_feed: Vec<")
         .expect("the live-feed replay vector must exist");
-    let decl_line = &code[vec_decl
+    // The declaration is a tuple type; rustfmt legitimately splits it across
+    // lines once it grows (it did on 2026-09-02, when the TVW4 endpoint joined
+    // the tuple). Scan the whole type span, up to the `= Vec::new()` that ends
+    // it, so a line break can never turn this guard red — or, worse, green on
+    // a first line that happens to carry `i64` while the tuple no longer does.
+    let decl_span = &code[vec_decl
         ..code[vec_decl..]
-            .find('\n')
+            .find("= Vec::new()")
             .map_or(code.len(), |n| vec_decl + n)];
     assert!(
-        decl_line.contains("i64"),
-        "the replay vector must carry the receipt alongside the frame; found: {decl_line}"
+        decl_span.contains("i64"),
+        "the replay vector must carry the receipt alongside the frame; found: {decl_span}"
     );
 }
 

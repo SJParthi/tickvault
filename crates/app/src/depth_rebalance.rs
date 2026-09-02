@@ -41,7 +41,9 @@
 use std::collections::HashMap;
 
 use tickvault_common::types::ExchangeSegment;
-use tickvault_core::websocket::pool_supervisor::{LiveSubscriptionCommand, SubscribeInstrument};
+use tickvault_core::websocket::pool_supervisor::{
+    LiveSubscriptionCommand, SubscribeInstrument, SwapOutcome,
+};
 
 use crate::depth200_atm::{
     ChainMinute, Depth200AtmConfig, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair,
@@ -828,6 +830,27 @@ pub struct RebalanceSocket {
     /// What this connection holds. A depth-200 connection holds exactly one
     /// instrument; `None` only before its first subscription.
     pub held: Option<SubscribeInstrument>,
+    /// The last swap sent and not yet answered by the connection task.
+    ///
+    /// `held` advances the moment a swap is QUEUED (a successful `try_send`),
+    /// which proves nothing about the wire; the connection answers through
+    /// this once the guard and the wire have both had their say, and
+    /// [`reconcile_pending_swaps`] folds that answer back into `held` at the
+    /// top of the next minute. One per socket: a socket gets at most one
+    /// swap per minute, and the reconcile runs before the next is sent.
+    pub pending: Option<PendingSwapAck>,
+}
+
+/// A swap the connection task has been handed but not yet answered.
+///
+/// Carries what `held` was BEFORE the swap so a refused command — or a task
+/// that died with the command still queued — can revert it exactly.
+#[derive(Debug)]
+pub struct PendingSwapAck {
+    /// The connection's verdict, once it has one.
+    ack: tokio::sync::oneshot::Receiver<SwapOutcome>,
+    /// What the socket was believed to hold before the swap was sent.
+    old: Option<SubscribeInstrument>,
 }
 
 /// How often the rebalance looks — once a minute, offset past the boundary.
@@ -896,7 +919,8 @@ pub const REBALANCE_SWAPS_REFUSED: &str = "tv_depth_rebalance_swaps_refused_tota
 /// swap that is decided and then quietly dropped is the worst outcome
 /// available, because the socket stays on a stale contract while every log
 /// line says the rebalance is working.
-pub const REBALANCE_REFUSAL_REASONS: [&str; 3] = ["no_socket", "channel_full", "channel_closed"];
+pub const REBALANCE_REFUSAL_REASONS: [&str; 4] =
+    ["no_socket", "channel_full", "channel_closed", "not_held"];
 
 /// Pre-register the counters so a session that never refuses anything still
 /// publishes a zero, rather than a gap an alarm cannot distinguish from a dead
@@ -919,9 +943,11 @@ pub fn pre_register_rebalance_counters() {
 /// state with no sequence number for us to detect the loss. A full channel is
 /// a refusal, counted, and retried next minute; a stalled drain is tick loss.
 fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let command = LiveSubscriptionCommand::Swap {
         old: swap.old,
         new: swap.new,
+        ack: Some(ack_tx),
     };
     match socket.tx.try_send(command) {
         Ok(()) => {
@@ -929,7 +955,16 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
             // optimistically would leave the next minute's swap naming an old
             // instrument the connection never received, and the guard would
             // refuse it — one dropped message costing every future swap.
+            //
+            // And a successful send is still only "queued": the connection's
+            // ack, folded in by `reconcile_pending_swaps` next minute, is
+            // what settles whether the wire agreed.
+            let before = socket.held;
             socket.held = Some(swap.new);
+            socket.pending = Some(PendingSwapAck {
+                ack: ack_rx,
+                old: before,
+            });
             metrics::counter!(REBALANCE_SWAPS_SENT).increment(1);
             true
         }
@@ -957,6 +992,59 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
             false
         }
     }
+}
+
+/// Folds every answered swap acknowledgement back into `held`.
+///
+/// Non-blocking (`try_recv`), run at the top of each minute BEFORE `held` is
+/// read for the next plan, so the plan is made from what the connection
+/// actually did rather than from what was queued. Returns how many sockets
+/// were UN-marked (reverted to what they held before the swap).
+///
+/// | ack | meaning | action on `held` |
+/// |---|---|---|
+/// | `Held` | the new instrument reached the wire | none |
+/// | `NotHeld { refused }` | the guard refused; it is UNCHANGED | revert to `old` |
+/// | `NotHeld { wire_failed }` / `{ emptied }` | the guard already names the new instrument (a redial replays it) | none — reverting would plan a swap the guard refuses every minute |
+/// | not yet answered | task still on the wire | keep pending |
+/// | sender dropped | the connection task ended with the command queued | revert to `old` |
+///
+/// The middle row is the one worth a sentence: `held` must mirror the
+/// GUARD, because the guard is what validates the next swap. See
+/// [`SwapOutcome::caller_should_unmark`], which encodes exactly this.
+// TEST-EXEMPT: pinned by a_held_ack_keeps_the_advanced_believed_hold, a_refused_ack_reverts_the_believed_hold_so_the_swap_is_retried, a_dropped_ack_sender_reverts_the_believed_hold and an_emptied_or_wire_failed_ack_keeps_the_hold_the_guard_already_names
+pub fn reconcile_pending_swaps(sockets: &mut [RebalanceSocket]) -> usize {
+    let mut unmarked = 0usize;
+    for (index, socket) in sockets.iter_mut().enumerate() {
+        let Some(pending) = socket.pending.as_mut() else {
+            continue;
+        };
+        let verdict = match pending.ack.try_recv() {
+            Ok(outcome) => Some(outcome.caller_should_unmark()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(true),
+        };
+        let Some(unmark) = verdict else {
+            continue;
+        };
+        let before = pending.old;
+        socket.pending = None;
+        if unmark {
+            socket.held = before;
+            unmarked = unmarked.saturating_add(1);
+            metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "not_held").increment(1);
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                socket_index = index,
+                source = "swap_ack_not_held",
+                "depth rebalance: the connection did NOT take a queued swap (refused, or the \
+                 task ended with it unanswered) — the believed hold is reverted so next \
+                 minute plans the swap again from what the socket really carries"
+            );
+        }
+    }
+    unmarked
 }
 
 /// Applies one minute's decision to the sockets.
@@ -1176,6 +1264,19 @@ pub async fn run_depth_rebalance(
             second,
         )))
         .await;
+
+        // Fold in last minute's swap verdicts BEFORE `held` is read: a swap
+        // the connection refused (or never got to) must not be planned from.
+        let unmarked_200 = reconcile_pending_swaps(&mut sockets);
+        let unmarked_20 = crate::depth20_track::reconcile_pending_depth20_swaps(&mut depth20);
+        if unmarked_200 > 0 || unmarked_20 > 0 {
+            tracing::info!(
+                unmarked_depth200_sockets = unmarked_200,
+                unmarked_depth20_swaps = unmarked_20,
+                "depth rebalance: believed holds reverted from connection acks — the \
+                 affected swaps are planned again this minute"
+            );
+        }
 
         let candidates =
             crate::dhan_depth_universe::load_depth_candidates(&questdb, &date_ist, today_ymd).await;
@@ -2190,6 +2291,7 @@ mod apply_tests {
             RebalanceSocket {
                 tx,
                 held: Some(instrument(held, ExchangeSegment::NseFno)),
+                pending: None,
             },
             rx,
         )
@@ -2207,7 +2309,7 @@ mod apply_tests {
         assert_eq!(apply_decision(&mut sockets, &decision), 1);
         assert!(r0.try_recv().is_err(), "socket 0 must be untouched");
         match r1.try_recv().expect("socket 1 receives") {
-            LiveSubscriptionCommand::Swap { old, new } => {
+            LiveSubscriptionCommand::Swap { old, new, .. } => {
                 assert_eq!(old.security_id, 2_000);
                 assert_eq!(new.security_id, 2_001);
             }
@@ -2241,6 +2343,7 @@ mod apply_tests {
         let mut sockets = vec![RebalanceSocket {
             tx,
             held: Some(instrument(1_000, ExchangeSegment::NseFno)),
+            pending: None,
         }];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
@@ -2254,17 +2357,131 @@ mod apply_tests {
         );
     }
 
+    /// Pulls the ack sender out of the one command a socket received, so a
+    /// test can play the connection task's part.
+    fn take_ack(
+        rx: &mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
+    ) -> tokio::sync::oneshot::Sender<SwapOutcome> {
+        match rx.try_recv().expect("one command") {
+            LiveSubscriptionCommand::Swap { ack: Some(ack), .. } => ack,
+            other => panic!("expected a swap carrying an ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_held_ack_keeps_the_advanced_believed_hold() {
+        let (s0, mut r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &decision), 1);
+        assert!(
+            sockets[0].pending.is_some(),
+            "a sent swap is pending its ack"
+        );
+        // Not yet answered: nothing moves, still pending.
+        assert_eq!(reconcile_pending_swaps(&mut sockets), 0);
+        assert!(sockets[0].pending.is_some());
+        take_ack(&mut r0)
+            .send(SwapOutcome::Held)
+            .expect("receiver alive");
+        assert_eq!(reconcile_pending_swaps(&mut sockets), 0);
+        assert!(sockets[0].pending.is_none(), "answered acks are cleared");
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_001, ExchangeSegment::NseFno))
+        );
+    }
+
+    #[test]
+    fn a_refused_ack_reverts_the_believed_hold_so_the_swap_is_retried() {
+        // The defect (audit finding 8): `held` advanced when the command was
+        // QUEUED, so a swap the guard then refused left the caller believing
+        // the socket carried a strike it never received — and every later
+        // swap was planned from that belief.
+        let (s0, mut r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        apply_decision(&mut sockets, &decision);
+        take_ack(&mut r0)
+            .send(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_REFUSED,
+            })
+            .expect("receiver alive");
+        assert_eq!(reconcile_pending_swaps(&mut sockets), 1);
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_000, ExchangeSegment::NseFno)),
+            "a refused swap must un-mark so next minute plans it again"
+        );
+        assert!(sockets[0].pending.is_none());
+    }
+
+    #[test]
+    fn a_dropped_ack_sender_reverts_the_believed_hold() {
+        // The connection task ended with the command still queued: the guard
+        // never saw it, so the belief must fall back to what the wire had.
+        let (s0, r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        apply_decision(&mut sockets, &decision);
+        drop(r0);
+        assert_eq!(reconcile_pending_swaps(&mut sockets), 1);
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_000, ExchangeSegment::NseFno))
+        );
+    }
+
+    #[test]
+    fn an_emptied_or_wire_failed_ack_keeps_the_hold_the_guard_already_names() {
+        // The guard was replaced in place before the wire moved, and a redial
+        // replays it: reverting here would plan `old -> new` against a guard
+        // that no longer holds `old`, which is refused every minute forever.
+        for reason in [SwapOutcome::REASON_EMPTIED, SwapOutcome::REASON_WIRE_FAILED] {
+            let (s0, mut r0) = socket(4, 1_000);
+            let mut sockets = vec![s0];
+            let decision = RebalanceDecision {
+                atm_swaps: vec![swap(0, 1_000, 1_001)],
+                ..RebalanceDecision::default()
+            };
+            apply_decision(&mut sockets, &decision);
+            take_ack(&mut r0)
+                .send(SwapOutcome::NotHeld { reason })
+                .expect("receiver alive");
+            assert_eq!(reconcile_pending_swaps(&mut sockets), 0);
+            assert_eq!(
+                sockets[0].held,
+                Some(instrument(1_001, ExchangeSegment::NseFno)),
+                "reason {reason}: held must keep mirroring the guard"
+            );
+            assert!(sockets[0].pending.is_none());
+        }
+    }
+
     #[test]
     fn a_full_channel_drops_this_minute_rather_than_blocking() {
         // Awaiting here would apply backpressure to the frame drain, and a
         // stalled drain is tick loss at Dhan's side with no sequence number to
         // detect it. Dropping costs one stale minute.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(LiveSubscriptionCommand::Extend(vec![]))
-            .expect("fills the channel");
+        tx.try_send(LiveSubscriptionCommand::Extend {
+            more: vec![],
+            ack: None,
+        })
+        .expect("fills the channel");
         let mut sockets = vec![RebalanceSocket {
             tx,
             held: Some(instrument(1_000, ExchangeSegment::NseFno)),
+            pending: None,
         }];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
