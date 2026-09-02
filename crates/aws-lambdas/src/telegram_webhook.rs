@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 103] = [
+pub const ALARM_PHRASES: [(&str, &str); 105] = [
     // ---- capacity + candle building ----
     (
         "aggregator-slots-exhausted",
@@ -269,7 +269,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     // ---- market data capture + loss ----
     (
         "market-data-persistence-loss",
-        "Market prices were lost instead of being saved",
+        "Market prices were LOST — dropped without being rescued to disk",
     ),
     (
         "durable-floor-breach",
@@ -281,7 +281,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     ),
     (
         "ticks-spilling",
-        "Prices are being rescued to disk because saving them is failing",
+        "Prices are being saved to disk instead of the database because the database is behind — nothing is lost, they are replayed",
     ),
     ("ticks-lost-spill", "Rescued prices were lost for good"),
     (
@@ -457,7 +457,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     // ---- coded errors (the error!-to-phone route) ----
     (
         "errcode-dh-901",
-        "🔷 DHAN: sign-in is being refused — the access key is invalid or expired",
+        "🔷 DHAN: the broker sign-in check is failing — usually THEIR server, not our key. Read the status first: 401/403 means the key, 5xx means Dhan is down. Do not replace the key on a 5xx",
     ),
     (
         "errcode-dh-906",
@@ -501,7 +501,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     ),
     (
         "errcode-hot-path-02",
-        "Prices could not be saved and had to be rescued to disk",
+        "The database is behind, so prices are being held on disk and replayed — nothing is lost",
     ),
     (
         "errcode-oms-gap-06",
@@ -525,7 +525,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     ),
     (
         "errcode-wal-suspend-01",
-        "The database stopped applying writes — rows are accepted but not stored",
+        "The database is behind on applying writes — rows are accepted but not yet visible; if it does not catch up they stop being stored",
     ),
     (
         "errcode-ws-spill-01",
@@ -538,6 +538,14 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     (
         "errcode-ws-gap-02-swap-emptied-socket",
         "🔷 DHAN: an order-book connection was left carrying nothing after a contract swap",
+    ),
+    (
+        "deploy-provenance-blind",
+        "the check that tells you the box is running the latest code cannot run — it is not saying the code is fine, it is saying it does not know",
+    ),
+    (
+        "errcode-scoreboard-01",
+        "yesterday's per-connection summary could not be saved — the raw records are safe and it can be rebuilt, but the summary view is missing",
     ),
     (
         "errcode-ws-gap-03-universe-collapse",

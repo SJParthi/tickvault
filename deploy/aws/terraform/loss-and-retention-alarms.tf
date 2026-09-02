@@ -137,7 +137,7 @@ resource "aws_cloudwatch_metric_alarm" "partition_archive_failed" {
 # a shutdown DISCARD is loss.
 resource "aws_cloudwatch_metric_alarm" "market_data_persistence_loss" {
   alarm_name        = "tv-${var.environment}-market-data-persistence-loss"
-  alarm_description = "TICK or DEPTH ROWS DID NOT REACH QUESTDB. Sums five counters: tick persist errors, tick rows refused, depth rows dropped, depth persist errors, ILP pending rows discarded. These are the PERSISTENCE result, not the rescue chain - the spill/replay tier has its own alarms and those rows are recoverable; these are not. Depth has no spill tier at all: the writer discards its buffer so one rejected row cannot wedge the session, and those levels are gone from the table. DO: (1) check QuestDB first - ILP flush latency, tv_questdb_wal_suspended_tables, df -h /data. (2) grep /tickvault/<env>/app for HOT-PATH-02 lines; they name the feed, the stage and the row count. (3) the raw frames remain in the write-ahead log, so a bounded window may be replayable by hand. Runbook: docs/error-runbooks/wave-1-error-codes.md"
+  alarm_description = "TICK or DEPTH ROWS DID NOT REACH QUESTDB. Sums five counters: tick persist errors, tick rows refused, depth rows dropped, depth persist errors, ILP pending rows discarded. These are the PERSISTENCE result, not the rescue chain - the spill/replay tier has its own alarms and those rows are recoverable; these are not. Depth rows that reached the rescue tier are SUBTRACTED here, so this counts only rows that were dropped and NOT rescued: a rescued row is deferred and replays, it is not lost. DO: (1) check QuestDB first - ILP flush latency, tv_questdb_wal_suspended_tables, df -h /data. (2) grep /tickvault/<env>/app for HOT-PATH-02 lines; they name the feed, the stage and the row count. (3) the raw frames remain in the write-ahead log, so a bounded window may be replayable by hand. Runbook: docs/error-runbooks/wave-1-error-codes.md"
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
@@ -164,9 +164,24 @@ resource "aws_cloudwatch_metric_alarm" "market_data_persistence_loss" {
   # expression over five series evaluates to no-data if ANY leg is missing, and
   # a counter that legitimately did not increment in the window has no sample -
   # without FILL, four healthy legs would silence the fifth.
+  #
+  # m3 is depth rows dropped MINUS depth rows rescued to the spill tier.
+  #
+  # 2026-09-02: this leg read the raw drop counter, and on that day it
+  # fired on 126,655,860 rows while the rescue counter read 126,655,860 --
+  # identical to the row. Every row this alarm called LOST had been saved.
+  # Four of the five legs were zero, so the page was 100% false, and its
+  # own description above still claimed depth had no spill tier at all --
+  # true when this was written, false since the depth rescue path landed.
+  #
+  # Clamped at zero with IF (not MAX over an array -- element-wise MAX of
+  # two series is not a construct worth betting a LOSS alarm on) because
+  # the two counters are sampled independently: a drop counted just
+  # before its rescue would otherwise make this leg negative and MASK
+  # real loss on another leg. Clamping fails toward paging.
   metric_query {
     id          = "persistence_loss_total"
-    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)"
+    expression  = "FILL(m1,0)+FILL(m2,0)+IF(FILL(m3,0)-FILL(m3b,0)>0,FILL(m3,0)-FILL(m3b,0),0)+FILL(m4,0)+FILL(m5,0)"
     label       = "tick/depth rows lost at persistence (all five mechanisms)"
     return_data = true
   }
@@ -200,6 +215,20 @@ resource "aws_cloudwatch_metric_alarm" "market_data_persistence_loss" {
     return_data = false
     metric {
       metric_name = "tv_depth_rows_dropped_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m3b"
+    return_data = false
+    metric {
+      # The RESCUE counterpart of m3. Subtracted, never summed: a dropped row
+      # that reached the spill tier is deferred, not lost, and replays later.
+      metric_name = "tv_depth_rows_spilled_total"
       namespace   = local.app_namespace
       period      = 300
       stat        = "Sum"

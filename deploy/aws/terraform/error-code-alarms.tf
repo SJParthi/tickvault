@@ -813,6 +813,39 @@ locals {
       ok_recovery = true
       desc        = "WS-GAP-02 DEPTH SOCKET EMPTIED: an at-the-money swap unsubscribed the old contract and then failed to subscribe the new one, so this socket is now carrying NO instruments. It stays transport-healthy and keeps ponging, which is why no other alarm sees it: the connection gauge counts it alive and the no-ticks alarm reads the whole lane, where fifteen other sockets are still flowing. A redial is scheduled automatically by the same code path and the retained set already names the NEW contract, so the socket should come back holding the right strike within one backoff - this alarm returning to OK is that remediation working. If it does NOT clear, the socket is failing to re-dial: check tv_dhan_ws_park_total and the endpoint field on this log line. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
+    # SCOREBOARD-01 — 2026-09-02. Authorized by the operator's reaffirmation
+    # that day; the dated quote is in
+    # dhan-rest-only-noise-lock-2026-07-14.md section 2.3q, recorded BEFORE
+    # this entry per the rule-file-first law.
+    #
+    # WHY IT WAS INVISIBLE. A 2026-09-02 sweep of every write path found
+    # ws_connection_rollup.rs is the ONE file whose flush-failure arm has no
+    # counter at all — and SCOREBOARD-01 is Severity::Medium, so
+    # error_code_alarm_coverage_guard never required it to be alarmed either.
+    # Between the two it was log-sink-only by accident, not by decision: a
+    # failed flush loses the WHOLE per-connection day summary and nothing
+    # anywhere reports it.
+    #
+    # WHY THIS IS A SAFE PAGE, NOT NOISE. The rollup runs ONCE per day, after
+    # close. A failure is a single discrete event on a cold path, so this can
+    # fire at most once a day and cannot flap — unlike risk-gap-03, which
+    # produced 25 pages in one session and is the noise case this file
+    # records. eval 1 / dta 1 because a once-daily emitter has no second
+    # datapoint to wait for.
+    #
+    # ok_recovery = false: the rollup does not retry within the day, so an OK
+    # an hour later is the datapoint ageing out, never the summary arriving.
+    # The underlying ws_event_audit and feed_episode_audit rows are unaffected
+    # and the day can be re-rolled by hand.
+    "scoreboard-01" = {
+      pattern     = "{ $.code = \"SCOREBOARD-01\" && $.level = \"ERROR\" }"
+      period      = 86400
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false
+      desc        = "SCOREBOARD-01: a daily rollup failed to write. The per-connection or per-feed summary for that day is MISSING - this is the table you read to answer 'which connection misbehaved yesterday'. The raw ws_event_audit and feed_episode_audit rows it is folded FROM are unaffected, so nothing is lost and the day can be re-rolled by hand; what you lose until then is the summary view. Check QuestDB reachability at the 15:45 IST rollup window, then the stage field on the log line - it names which rollup and whether it failed on append or on flush. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
   }
 }
 

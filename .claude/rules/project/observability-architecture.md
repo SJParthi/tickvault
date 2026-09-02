@@ -150,6 +150,24 @@ minute — the RISK-GAP-03 noise trap on a hotter path. `ok_recovery = true`,
 unlike the xverify entries: the same arm schedules a redial and the retained
 set already names the NEW contract, so a return to OK is the remediation
 working and is worth telling**)**.
+and **SCOREBOARD-01 (added 2026-09-02** — authority
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3q, operator reaffirmation that
+day. A daily rollup that fails to write loses the WHOLE per-connection day
+summary — the table you read to answer "which connection misbehaved
+yesterday". It was log-sink-only by ACCIDENT rather than by decision: a sweep
+of every storage write path found `ws_connection_rollup.rs` is the one file
+whose flush-failure arm pairs `error!` with no counter at all, and
+`Scoreboard01AggregationDegraded` is `Severity::Medium`, so the coverage guard
+never required it to be alarmed and it is not on the exempt list either. It
+fell between two rules. SAFE TO PAGE because the rollup runs ONCE per day
+after close: this can fire at most once a day and structurally cannot flap,
+unlike RISK-GAP-03's 25 pages in one session. `period = 86400` and `eval = 1`
+because a once-daily emitter has no second datapoint to wait for.
+`ok_recovery = false`, unlike RISK-GAP-03: the rollup does not retry within
+the day, so an OK an hour later is the datapoint ageing out, never the summary
+arriving. Nothing is LOST when it fires — the raw `ws_event_audit` and
+`feed_episode_audit` rows it folds from are unaffected and the day is
+re-rollable by hand; what is lost until then is the view**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added

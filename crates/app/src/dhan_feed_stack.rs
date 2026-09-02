@@ -6063,8 +6063,31 @@ pub fn record_connection_tick(connection_index: u8, recv_millis: i64) {
 /// Pure, so the boundary cases are testable without a clock.
 #[must_use]
 pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
+    // Depth-200 slots are EXCLUDED, and that exclusion is the whole point.
+    //
+    // 2026-09-02: this alarm flipped ALARM/OK seven times between 08:44 and
+    // 09:47 IST and then latched, with the gauge climbing to 3,359 s — 56
+    // minutes — before resetting. Nothing was broken. A depth-200 connection
+    // carries exactly ONE option contract, so "no frame for 56 minutes" is
+    // what a quiet strike looks like, and the per-minute ATM re-fit swapping
+    // that contract is what reset it. Silence on a one-instrument socket is
+    // not evidence about the SOCKET, and no threshold can separate the two.
+    //
+    // Main-feed (thousands of instruments) and depth-20 (up to 50) keep their
+    // place: silence there is genuinely diagnostic, which is what this gauge
+    // exists to report. The type's docs already excluded never-ticked slots
+    // for exactly this reason and named the depth-200 case verbatim — it just
+    // did not carry the reasoning to a slot that ticked once and went quiet.
+    //
+    // Range comes from `jitter_base`, which tiles the slots in endpoint order,
+    // so this cannot drift from the pool layout without the tiling test failing.
+    let d200_start = DhanEndpointType::Depth200.jitter_base() as usize;
+    let d200_end = DhanEndpointType::OrderUpdate.jitter_base() as usize;
     let mut worst: Option<u64> = None;
-    for slot in &PER_CONN_LAST_TICK_MILLIS {
+    for (index, slot) in PER_CONN_LAST_TICK_MILLIS.iter().enumerate() {
+        if (d200_start..d200_end).contains(&index) {
+            continue; // one contract per socket — see above
+        }
         let last = slot.load(Ordering::Relaxed);
         if last == 0 {
             continue; // never ticked — see the type's docs
@@ -19437,5 +19460,89 @@ mod depth20_layout_wiring_tests {
             append < plan,
             "the fifth socket must be appended BEFORE the pool is planned"
         );
+    }
+}
+
+#[cfg(test)]
+mod deaf_socket_gauge_scope_tests {
+    use super::{
+        DhanEndpointType, PER_CONN_LAST_TICK_MILLIS, record_connection_tick,
+        worst_connection_tick_age_secs,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// `PER_CONN_LAST_TICK_MILLIS` is process-global and every test here seeds
+    /// ALL of it, so running two in parallel makes each stomp the other's
+    /// fixture. Caught on the first run of this module: the depth-200 case
+    /// failed in the suite and passed alone. Serialized behind one lock, the
+    /// same shape `tv_api_token_prod_guard.rs` uses for the env-var races.
+    /// Poisoning is tolerated — a panicking sibling must not cascade.
+    static SLOTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_slots() -> std::sync::MutexGuard<'static, ()> {
+        SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Seeds every slot to `now` so the assertions below are deterministic
+    /// despite `PER_CONN_LAST_TICK_MILLIS` being process-global.
+    fn seed_all_fresh(now_millis: i64) {
+        for slot in &PER_CONN_LAST_TICK_MILLIS {
+            slot.store(now_millis, Ordering::Relaxed);
+        }
+    }
+
+    /// The 2026-09-02 false page, pinned.
+    ///
+    /// A depth-200 socket carries ONE option contract. It went 56 minutes
+    /// without a frame because the strike was quiet, and the alarm called the
+    /// socket deaf — flipping seven times in an hour. Silence on a
+    /// one-instrument socket is not evidence about the socket.
+    #[test]
+    fn a_silent_depth200_socket_does_not_drive_the_worst_age() {
+        let _guard = lock_slots();
+        let now = 1_800_000_000_000_i64;
+        seed_all_fresh(now);
+        let d200 = DhanEndpointType::Depth200.jitter_base();
+        // One hour of silence on a depth-200 slot.
+        record_connection_tick(d200, now - 3_600_000);
+
+        let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
+        assert!(
+            worst < 60,
+            "a quiet depth-200 contract must not drive the deaf-socket gauge; got {worst}s"
+        );
+    }
+
+    /// The other half: the gauge must still catch what it exists for. A
+    /// main-feed socket carries thousands of instruments, so silence there is
+    /// genuinely diagnostic and MUST still be reported.
+    #[test]
+    fn a_silent_main_feed_socket_still_drives_the_worst_age() {
+        let _guard = lock_slots();
+        let now = 1_800_000_000_000_i64;
+        seed_all_fresh(now);
+        let main = DhanEndpointType::MainFeed.jitter_base();
+        record_connection_tick(main, now - 3_600_000);
+
+        let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
+        assert_eq!(
+            worst, 3_600,
+            "a silent MAIN-FEED socket is the case this gauge exists for"
+        );
+    }
+
+    /// Depth-20 carries up to 50 instruments, so it keeps its place too.
+    #[test]
+    fn a_silent_depth20_socket_still_drives_the_worst_age() {
+        let _guard = lock_slots();
+        let now = 1_800_000_000_000_i64;
+        seed_all_fresh(now);
+        let d20 = DhanEndpointType::Depth20.jitter_base();
+        record_connection_tick(d20, now - 1_800_000);
+
+        let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
+        assert_eq!(worst, 1_800, "depth-20 silence stays diagnostic");
     }
 }
