@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 103] = [
+pub const ALARM_PHRASES: [(&str, &str); 105] = [
     // ---- capacity + candle building ----
     (
         "aggregator-slots-exhausted",
@@ -538,6 +538,14 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     (
         "errcode-ws-gap-02-swap-emptied-socket",
         "🔷 DHAN: an order-book connection was left carrying nothing after a contract swap",
+    ),
+    (
+        "deploy-provenance-blind",
+        "the check that tells you the box is running the latest code cannot run — it is not saying the code is fine, it is saying it does not know",
+    ),
+    (
+        "errcode-scoreboard-01",
+        "yesterday's per-connection summary could not be saved — the raw records are safe and it can be rebuilt, but the summary view is missing",
     ),
     (
         "errcode-ws-gap-03-universe-collapse",
