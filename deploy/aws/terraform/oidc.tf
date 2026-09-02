@@ -140,6 +140,21 @@ resource "aws_iam_role_policy" "github_deploy" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
       },
       {
+        # 2026-09-02: the SSM MIRROR of main HEAD, written every 30 minutes by
+        # postmerge-catchup.yml so the deploy-watchdog's provenance comparison
+        # survives the absence of /tickvault/<env>/operator/github-token.
+        #
+        # Deliberately a SEPARATE statement from the binary-git-sha grant
+        # above, and deliberately NOT written by deploy-aws.yml: that workflow
+        # writes GITHUB_SHA, which IS main HEAD at deploy time, so a mirror
+        # written there would always equal binary-git-sha and the staleness
+        # signal could never go red. The mirror must advance when MAIN
+        # advances, deploy or no deploy.
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/desired-git-sha"
+      },
+      {
         # NSE-holiday intentional-stop marker (2026-07-07 round-3 review
         # fix): aws-autopilot.sh reads /tickvault/<env>/holiday-stop-date
         # (stamped by deploy/aws/holiday-gate.sh before its holiday

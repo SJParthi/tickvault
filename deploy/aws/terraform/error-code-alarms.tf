@@ -1090,7 +1090,10 @@ resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
 #   data/logs/machine/errors.jsonl.2*  ->  {"level":"ERROR","code":"X",...}
 #   data/logs/machine/app.2*           ->  {"level":"ERROR","fields":{"code":"X"}}
 #
-# So all 27 coded-error alarms depend on ONE file reaching CloudWatch. If its
+# So 25 of the 27 filters on this log group depend on ONE file reaching
+# CloudWatch (MEASURED live 2026-09-02, not counted from source: one is a bare
+# "DH-906" term filter that matches either schema, and tv-<env>-preopen-ready-
+# secs reads $.fields.ready_at_ist_secs and would survive). If that file's
 # glob stops matching -- exactly the 2026-07-06 incident signature, a
 # data/logs/machine/ reorg that left the agent tailing paths that no longer
 # existed -- every one of them goes permanently silent.
@@ -1106,13 +1109,13 @@ resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
 # The fix is a DETECTOR for the exact signature rather than a restructure.
 # Splitting the two files into separate log groups would give per-group
 # IncomingLogEvents for each, but it invalidates every runbook and saved query
-# that names /tickvault/<env>/app. Making the 27 filters match both schemas
-# would double-count every error and silently break all 27 thresholds. Both
+# that names /tickvault/<env>/app. Making those filters match both schemas
+# would double-count every error and silently break all 25 thresholds. Both
 # "fixes" cost more than the gap. Counting each schema separately costs two
 # metric filters and answers the question directly.
 # ---------------------------------------------------------------------------
 
-# Errors visible in the FLAT schema -- the population the 27 filters can see.
+# Errors visible in the FLAT schema -- the population those 25 filters can see.
 resource "aws_cloudwatch_log_metric_filter" "log_schema_flat_errors" {
   name           = "tv-${var.environment}-log-schema-flat-errors"
   log_group_name = aws_cloudwatch_log_group.tv_app.name
@@ -1165,10 +1168,10 @@ resource "aws_cloudwatch_metric_alarm" "errcode_stream_silent" {
     The log stream that every coded-error alarm depends on has STOPPED arriving,
     while the app is still producing errors.
 
-    All 27 coded-error metric filters read $.code, which only exists in
-    data/logs/machine/errors.jsonl. This alarm fires when the app.log stream
-    shows errors ($.fields.code) and errors.jsonl shows none -- meaning those 27
-    alarms are now silent and CANNOT fire, no matter what breaks next.
+    25 of the 27 metric filters on this log group read $.code, which only
+    exists in data/logs/machine/errors.jsonl. This alarm fires when the app.log
+    stream shows errors ($.fields.code) and errors.jsonl shows none -- meaning
+    those 25 alarms are silent and CANNOT fire, whatever breaks next.
 
     The log group still looks healthy, so app-log-ingestion-silent will NOT
     catch this. That is why this alarm exists.

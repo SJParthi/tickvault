@@ -61,6 +61,17 @@ resource "aws_iam_role_policy" "deploy_watchdog" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
       },
       {
+        # 2026-09-02: read the SSM MIRROR of main HEAD, so the provenance
+        # comparison survives the absence of the operator GitHub token.
+        # WRITER IS postmerge-catchup.yml (every 30 min), NOT deploy-aws.yml:
+        # deploy-aws writes GITHUB_SHA, which IS main HEAD at deploy time, so a
+        # mirror written there would always equal binary-git-sha and the
+        # staleness signal could never go red.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/desired-git-sha"
+      },
+      {
         # B9 deploy provenance: publish the mismatch metric. PutMetricData
         # supports no resource-level scoping — constrain by namespace so
         # this Lambda can only ever write Tickvault/Prod metrics.
@@ -125,6 +136,12 @@ resource "aws_lambda_function" "deploy_watchdog" {
       # /tickvault/prod/... path (prod is the only real env) — the two must
       # stay in lockstep; a staging env would need the workflow parameterized.
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
+      # 2026-09-02: the main-HEAD mirror the watchdog falls back to when
+      # /tickvault/<env>/operator/github-token is absent. Same lockstep note as
+      # above -- postmerge-catchup.yml writes the hardcoded /tickvault/prod/
+      # path. GitHub stays the PREFERRED source, so adding a token later
+      # upgrades the check with no further change.
+      DESIRED_SHA_PARAM = "/tickvault/${var.environment}/deploy/desired-git-sha"
     }
   }
 
