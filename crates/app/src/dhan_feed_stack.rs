@@ -3836,12 +3836,17 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 /// converts the CURRENT worker into a blocking thread while the runtime spins
 /// up a replacement, so the effective worker count is preserved.
 fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        tokio::task::block_in_place(flush)
-    } else {
-        flush()
+    // `try_current`, not `current`: `current()` PANICS when no runtime is
+    // installed, and this helper is now reached from `refold_wal_frames`,
+    // which unit tests call as a plain `#[test]` with no runtime at all. A
+    // panic there would be a test-only failure of a production helper — the
+    // worst shape, because it makes the safe fix look unsafe. No runtime
+    // means nothing to yield to, so the flush simply runs inline.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(flush)
+        }
+        _ => flush(),
     }
 }
 
@@ -9136,6 +9141,64 @@ pub fn refold_wal_frames(
         .seed_watermark_at_least(ist_day_start_secs);
 
     for (frame_seq, wal_received_at_nanos, endpoint, bytes) in frames {
+        // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
+        // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
+        // `DEPTH_FLUSH_ROW_THRESHOLD`; replay had NEITHER, so it appended the
+        // whole staged batch into one ILP buffer and flushed once at the end.
+        // That boot's logs name the result exactly: `rescued: 22324960,
+        // bytes: 4004164571` against `maximum configured allowed size of
+        // 104857600 bytes`, thirteen times. A 4 GB buffer can never be
+        // accepted, so EVERY replayed depth row went to the spill tier
+        // instead of QuestDB -- not lost, but not replayed either -- and the
+        // resident cost took the process past `MemoryHigh` (RESOURCE-02 at
+        // 14.2 GB of a 15 GiB ceiling, RSS peaking 16.65 GB).
+        //
+        // TOP of the loop, not the bottom: the depth arm below `continue`s at
+        // its own end, so a trigger placed after the match would skip exactly
+        // the frames that build the 4 GB buffer -- 22.3M depth rows against
+        // 2.4M tick rows on that boot.
+        //
+        // The live thresholds are reused deliberately rather than a new
+        // replay-specific pair being invented: they are already proven at a
+        // far higher sustained rate, and one number is one thing to keep
+        // true. At that boot's volumes this is ~2,400 flushes across a replay
+        // -- bounded work at boot, against a flush that currently cannot
+        // succeed at all.
+        if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD
+            || u64::try_from(ingest.depth_pending_rows()).unwrap_or(u64::MAX)
+                >= DEPTH_FLUSH_ROW_THRESHOLD
+        {
+            // `LiveIngest::flush` flushes the inline-depth sink first and
+            // unconditionally (see its body), so one call drains both buffers.
+            // A failure here is already loud and already rescues to the spill
+            // tier at its source; the loop carries on, exactly as the live
+            // drain does.
+            //
+            // COST, both paths, because only one of them is cheap:
+            //
+            // * Normal path — both offload writers are spawned ABOVE this
+            //   function (`spawn_offload_writer` / `spawn_depth_offload_writer`
+            //   run before either refold call site), so a flush is a bounded
+            //   `try_send` hand-off with no network in it. A slow database
+            //   fills the queue, the producer width-caps, and the rows go to
+            //   the spill tier — non-blocking throughout.
+            //
+            // * Degraded path — if a writer thread could not be spawned (a
+            //   real possibility under exactly the memory pressure this fix
+            //   addresses), the flush is a synchronous ILP round trip bounded
+            //   by `request_timeout=5000`. At this boot's volumes that is up
+            //   to ~2,400 round trips, so a STALLING QuestDB makes boot slow
+            //   in a way one end-of-batch flush did not.
+            //
+            // The trigger is deliberately NOT gated on `writer_is_offloaded()`,
+            // and this is the trade being made: gating it would reinstate the
+            // unbounded buffer in precisely the degraded case, and a 4 GB
+            // buffer OOM-KILLS the process — measured, ten times, with
+            // `StartLimitBurst=8` then leaving the session with no app at all.
+            // A slow boot costs part of a session; an OOM loop costs all of
+            // it. Bounded memory wins.
+            blocking_flush(|| ingest.flush());
+        }
         // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
         // sniff. A depth frame goes through the SAME `drain_depth_frame` the
         // live drain uses, with its ORIGINAL receipt, so replay and live
@@ -17450,6 +17513,72 @@ mod wal_refold_tests {
             p[base + 12..base + 16].copy_from_slice(&orders.to_le_bytes());
         }
         p
+    }
+
+    /// The bound the replay loop did not have, and the one MEASURED failure
+    /// it produced on 2026-09-02.
+    ///
+    /// The loop appended the whole staged batch into one ILP buffer and
+    /// flushed once at the end. That boot's own log lines name the outcome:
+    /// `rescued: 22324960, bytes: 4004164571` against `maximum configured
+    /// allowed size of 104857600 bytes`, thirteen times over. A 4 GB buffer
+    /// can never be accepted by questdb-rs, so every replayed depth row was
+    /// rescued to the spill tier rather than reaching QuestDB, and holding it
+    /// took the process past `MemoryHigh`.
+    ///
+    /// Two things are pinned, because either alone can be true while the bug
+    /// is back. The SOURCE pin is what makes this a real guard: the trigger
+    /// must sit ABOVE the `match endpoint` — the depth arm `continue`s, so a
+    /// trigger below it is skipped by exactly the frames that build the
+    /// buffer (22.3M depth rows against 2.4M tick rows on that boot), and a
+    /// well-meaning move to the "tidier" bottom of the loop would silently
+    /// restore the defect while every behavioural test still passed.
+    #[test]
+    fn the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let refold_at = production
+            .find("pub fn refold_wal_frames")
+            .expect("refold_wal_frames must exist");
+        let refold_end = production[refold_at..]
+            .find("\nfn ")
+            .map_or(production.len(), |off| refold_at + off);
+        let body = &production[refold_at..refold_end];
+
+        let flush_at = body.find("blocking_flush(|| ingest.flush())").expect(
+            "the replay loop must flush on a size trigger. Without it a \
+                 staged batch appends into ONE ILP buffer until the single \
+                 end-of-batch flush, which questdb-rs refuses past its \
+                 max_buf_size — measured at 4,004,164,571 bytes on 2026-09-02",
+        );
+        assert!(
+            body[..flush_at].contains("ingest.pending_rows() >= FLUSH_ROW_THRESHOLD")
+                && body[..flush_at].contains("DEPTH_FLUSH_ROW_THRESHOLD"),
+            "the flush must be gated on BOTH row thresholds the live drain \
+             uses — a depth-only or tick-only gate leaves the other buffer \
+             unbounded, and depth was the 22.3M-row half"
+        );
+
+        let match_at = body
+            .find("match endpoint {")
+            .expect("the endpoint match must exist");
+        assert!(
+            flush_at < match_at,
+            "the size trigger sits BELOW `match endpoint`, so the depth arm's \
+             `continue` skips it — that is the exact shape of the defect this \
+             test exists to stop, because depth is the half that builds the \
+             buffer"
+        );
+    }
+
+    /// `blocking_flush` is now reached from `refold_wal_frames`, which unit
+    /// tests call with no tokio runtime installed. `Handle::current()` panics
+    /// there, so the helper must ask with `try_current` — otherwise the safe
+    /// fix above becomes a test-only panic in a production helper.
+    #[test]
+    fn blocking_flush_does_not_panic_without_a_runtime() {
+        assert_eq!(blocking_flush(|| 7_u64), 7);
     }
 
     /// TVW4 (2026-09-02): a record that CARRIES the depth-20 endpoint is
