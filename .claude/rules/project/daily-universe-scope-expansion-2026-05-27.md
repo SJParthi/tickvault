@@ -916,6 +916,47 @@ code fix, tracked separately from this grow.
 > | Process RSS peak | **16,646,799,360 (16.65 GB)** |
 > | `MemoryHigh` ceiling it crossed | 16,106,127,360 (15 GiB) |
 >
+> ### ⚠ It did not merely cross the throttle — it was OOM-KILLED, ten times
+>
+> An earlier reading of this incident (mine, hours before) said `MemoryHigh`
+> "throttles rather than kills", and treated the RSS climb as expensive but
+> survivable. **The deploy log for `f601e011` refutes that**, verbatim from
+> `journalctl` on the box:
+>
+> ```
+> tickvault.service: A process of this unit has been killed by the OOM killer.
+> tickvault.service: Main process exited, code=killed, status=9/KILL
+> tickvault.service: Failed with result 'oom-kill'.
+> tickvault.service: Scheduled restart job, restart counter is at 10.
+> ```
+>
+> `MemoryHigh` is a throttle and there is deliberately no `MemoryMax`, so the
+> cgroup could not kill it — the **host** did. At 16.65 GB beside QuestDB's
+> 12.5 GiB committed ceiling on a 31.3 GiB host, this process was the largest
+> consumer on the box by a wide margin, and `OOMScoreAdjust=-900` cannot save
+> a process that is itself the reason the host is out of memory. That is the
+> honest limit of the ranking: it protects this process from OTHER processes'
+> pressure, never from its own.
+>
+> **And it was a LOOP, not a crash.** `Restart=always` brought it back; the
+> restart re-read the same WAL backlog, rebuilt the same buffer, and died
+> again — ten times, until `StartLimitBurst=8` inside
+> `StartLimitIntervalSec=600` transitioned the unit to `failed`. The deploy
+> failed with it (`SSM command status: Failed`) and the operator was paged.
+>
+> The consequence for the NEXT session is the part that matters: systemd's
+> start limits reset at boot, so the 08:30 IST start would have met the same
+> backlog — larger, because nothing confirmed those segments — OOM-looped
+> eight times, and left the trading session with no app at all. Not degraded:
+> absent.
+>
+> Recorded as a correction rather than an edit-in-place because the reasoning
+> error is the reusable part. "`MemoryHigh` is a throttle, not a kill" is a
+> true statement about the directive that was carried, unchecked, into a
+> conclusion about the OUTCOME — and the outcome was decided by the host, not
+> the directive. A claim about what a mechanism does is not a claim about what
+> happened, and `journalctl` had the answer the whole time.
+>
 > **The consequence is worse than the memory, and it is the part the
 > amplification framing hides.** A 4 GB buffer can never be accepted, so the
 > flush did not merely fail under load — it was **structurally incapable of
@@ -938,6 +979,13 @@ code fix, tracked separately from this grow.
 > The live thresholds are reused rather than a replay-specific pair being
 > invented: they are already proven at a far higher sustained rate, and one
 > number is one thing to keep true.
+>
+> **The fix bounds BOTH replay call sites**, which is why it addresses the loop
+> and not just the catch-up drain: the trigger lives inside `refold_wal_frames`,
+> and that function is what the STAGE-C boot replay and the catch-up drain each
+> call. The dominant measured term is that one unbounded buffer, evidenced at
+> 4.0 GB. It is NOT claimed to account for the whole 16.65 GB — the remainder
+> is unattributed and the next boot is the measurement.
 >
 > **⚠ What this does NOT fix.** It does not reduce the ~30× amplification the
 > paragraph above names — 512 MiB of frames still materializes ~22M depth
