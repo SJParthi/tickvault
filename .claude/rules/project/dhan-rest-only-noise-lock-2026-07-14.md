@@ -1633,6 +1633,37 @@ first removes both.
   `api_auth_failed` — each alarms a metric with no producer or no EMF entry, so
   none can ever fire). They cost no pages; they cost false confidence.
 
+  > **⚠ CORRECTED 2026-09-02 — "four dead monitors" is wrong; only ONE is dead,
+  > and the other three have live producers.** Checked against the live account
+  > and the source rather than carried forward:
+  >
+  > | Named above | Metric it reads | Rust emit sites | EMF-selected | Verdict |
+  > |---|---|---:|---:|---|
+  > | `order_fill_lag_high` | `tv_order_fill_lag_seconds` | **0** | **no** | **DEAD — confirmed** |
+  > | `seal_writer_dropped` | `tv_seal_writer_drain_dropped_total` | 2 | yes | ALIVE |
+  > | `api_auth_failed` | `tv_api_auth_failed_total` | 4 | log-filter | ALIVE |
+  > | `orders_placed_storm` | `tv_orders_placed_delta_total` | derived from `tv_orders_placed_total` (live emits) | log-filter | ALIVE |
+  >
+  > The three "alive" rows are log-metric-filter alarms or EMF-selected
+  > counters with real producers. The mistake is a specific and repeatable
+  > one: a `grep` for `metrics::counter!` on the same LINE as the metric name
+  > misses every counter built from a `const` identifier, which is the house
+  > style here — the same trap caught `tv_dhan_feed_depth_total` and
+  > `tv_dhan_ws_lag_excluded_total` in the 2026-09-02 sweep before they became
+  > false findings too.
+  >
+  > **Cost of believing the stale row:** it names three monitors as unable to
+  > fire, so a reader budgets work to rebuild watchdogs that already work —
+  > the exact `day_ohlc_tracker` (2026-08-12) failure mode, on an
+  > observability claim instead of a complexity one.
+  >
+  > `order_fill_lag_high` genuinely is dead and stays flagged:
+  > `cloudwatch_app_alarms_wiring.rs` calls it "the ONLY entry in this whole
+  > list with zero emit sites in crates/*/src", and
+  > `cloudwatch_dormant_alarms_guard.rs` records it as dormant pending its
+  > emitter. Live confirmation: it is absent from
+  > `list-metrics --namespace Tickvault/Prod` entirely.
+
 **What a PR that violates §2.3k looks like (REJECT):** restores
 `enable_alarm_actions` before `set_alarm_state` in either gate; drops
 `ok_actions` from the five alarms above as an alternative fix (it silences the
@@ -2275,3 +2306,273 @@ is stated rather than absorbed.
   precedent — this emitter repeats while the condition persists, so its OK
   is real.
 - Claims the page fires at 15 GiB before the resolver reads `memory.high`.
+
+---
+
+## ⚠ CORRECTED 2026-09-02 — every cost note above reasons from a $130 ceiling. The live limit is $150, and the arithmetic has been wrong in the ALARMING direction for eight days.
+
+**No authorization is claimed or needed here.** This records a live
+measurement and retires a dead constraint; it changes no alarm, adds no
+metric, and spends no money.
+
+**Read live from the account, 2026-09-02:**
+
+| Reading | Value | Source |
+|---|---|---|
+| `limit_amount` | **$150.00** | `budgets describe-budgets` |
+| 90% `STOP_EC2_INSTANCES` action line | **$135.00** | derived |
+| Actual spend, month to date | **$2.77** | ActualSpend (2 days in) |
+| AWS forecast, September | **$114.01** | ForecastedSpend |
+
+**What the sections above say instead.** Fifteen separate statements in
+this file reason from `$130` / a `$117.00` action line, and each new cost
+note inherited the figure from the one before it rather than re-reading
+the budget:
+
+| Section | Claim | Against the real $135 line |
+|---|---|---|
+| §2.3j | "~$120.58 — about $3.58 above the line" | **$14.42 UNDER** |
+| §2.3l | "~$122.88 … ~$5.88 past that line" | **$12.12 UNDER** |
+| §2.3m | "~$120.78 — about $3.78 above" | **$14.22 UNDER** |
+| §2.3n | "~$123.28 … under $2 of room" against the $125 cap | the cap is **$150** (Quote 19) |
+| §2.3p | "~$123.38 … about $6.38 above" | **$11.62 UNDER** |
+
+The ceiling moved to $150 on **2026-08-25** — the same day, and in the same
+`daily-universe-scope-expansion-2026-05-27.md` Quote 19, that authorized
+the EBS grow. The operator's words were *"even if we need to reach the max
+150 usd also let su gfo ahead dude but ensure to achieve alwyas O(1)"*.
+Every cost note written after that date still costed against $130.
+
+**Why this is worth a correction rather than an edit-in-place.** These are
+stale in the REASSURING direction's opposite — they overstate the danger —
+and this file's own header warns that a partial or stale disclosure reads
+exactly like a current one. §2.3n went further and set a policy from the
+wrong number: *"the next addition of any size must come with a lever, not
+just a cost note."* That policy was adopted against a margin that did not
+exist. Real observability gaps have been left open on it — §2.3g's
+`tv_wal_suspension_probe_failed_total`, §2.3d's headroom gauge, §2.3f's
+`tv_dhan_feed_xverify_runs_total` — each costing about $0.30/mo against a
+forecast that is **$21 below** the action line.
+
+**This is the second constraint in this file to expire and keep being
+quoted.** The first was the user-data byte budget: §2.3d-ii measured
+"zero bytes free", the boot template was restructured three days later,
+and §2.3d / §2.3f / §2.3g each went on citing the dead figure as a live
+blocker until the 2026-08-26 note retired it. The pattern is identical and
+so is the lesson that note recorded: **a measurement carries a date, and a
+measurement quoted from a quote is not a measurement.** A budget limit is
+one `budgets describe-budgets` call; a byte count is one guard run. Both
+must be re-run at the moment of writing, not inherited from the section
+above.
+
+**Not claimed:** that any of the deferred metrics should now be shipped.
+Each is still an operator decision with its own cost line — what changes
+is only that "we cannot afford it, we are past the shutdown line" has
+stopped being a true reason. The recorded per-section arithmetic is left
+in place as the audit trail; this row is the correction to all of it.
+
+### §2.3q — 2026-09-02: the deploy-provenance check had never been able to fire, and one daily rollup could fail in silence
+
+**The verbatim operator authorization (2026-09-02, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "i ceallry told yo uto fix and resovlev evrytign dude okay?"
+
+Given in DIRECT response to a message that named exactly these two items and
+stated plainly that each needed his go: *"`SCOREBOARD-01` (a daily rollup flush
+failure) is genuinely invisible — not in the alarmed code set, no counters in
+that file. And the watchdog could be made to shout when it self-disables.
+**Both need a dated operator quote in the rule file first** — that's this
+repo's own law."* That is the §28.2/§28.3 authorization shape this repository
+already accepts: a general go-ahead answering an ENUMERATED list selects the
+enumerated work. Recorded HERE before the terraform, per the rule-file-first
+law.
+
+#### Finding 1 — a watchdog that runs, publishes nothing, and reads as healthy
+
+`tv-<env>-binary-sha-stale` is the check that tells you the box is running old
+code. Measured live against the account:
+
+| Reading | Value |
+|---|---|
+| Alarm state | **OK**, `treat_missing_data = notBreaching` |
+| `tv_binary_main_sha_mismatch` datapoints, 3 days | **0** |
+| deploy-watchdog Lambda invocations, 3 days | **12** (3–5/day) |
+| Consecutive fires logging *"mismatch metric skipped — a sha is unknown"* | **4 of 4** examined |
+
+The producer runs and declines to produce. The alarm treats no-data as health.
+So the two compose into a monitor that **has never been able to fire**, and
+nothing anywhere said so.
+
+**Root cause, and it is not a code defect:** `/tickvault/<env>/operator/github-token`
+**does not exist** (`describe-parameters` under that path returns only
+`control-secret`). Without it the Lambda cannot ask GitHub for main HEAD, so
+`desired_sha` is None, so the mismatch value is None, so it skips. The BINARY
+sha is fine — `/tickvault/prod/deploy/binary-git-sha` was written by
+`deploy-aws.yml` the day before. Only the COMPARISON is dead.
+
+**This is the class the §2.3f note already warned about one level up:** an
+`Errors` alarm catches a Lambda that THROWS, and this one returns `Ok` having
+done nothing. The 2026-08-25 `*-not-invoked` family closed "did it run"; this
+closes **"did it produce"**, which is a different question and was open.
+
+**Two fixes, and the operator owns the one that matters.** The alarm
+(`tv-<env>-deploy-provenance-blind`) converts silence into a page. It does not
+create the missing parameter — that needs a real GitHub token, which is an
+operator action. Until that lands, this alarm will fire, and **that is the
+correct outcome**: it is reporting a real, current blindness rather than
+manufacturing calm.
+
+#### Finding 2 — SCOREBOARD-01 was log-sink-only by accident
+
+A sweep of every storage write path found `ws_connection_rollup.rs` is the one
+file whose flush-failure arm pairs `error!` with **no counter at all**. And
+`Scoreboard01AggregationDegraded` is `Severity::Medium`, so
+`error_code_alarm_coverage_guard::every_high_or_critical_code_is_alarmed_or_explicitly_exempt`
+never required it to be alarmed and it is not on the exempt list either. It
+fell between the two rules rather than being decided.
+
+A failed flush loses the ENTIRE per-connection day summary — the table you read
+to answer "which connection misbehaved yesterday". The raw `ws_event_audit` and
+`feed_episode_audit` rows it folds from are unaffected, so nothing is lost and
+the day is re-rollable by hand; what is lost until then is the view.
+
+**Why this is a safe page rather than noise:** the rollup runs ONCE per day
+after close, so this can fire at most once a day and structurally cannot flap —
+unlike `risk-gap-03`, whose 25 pages in one session are the noise case this
+file records. `ok_recovery = false` because the rollup does not retry within
+the day; an OK an hour later is the datapoint ageing out, never the summary
+arriving.
+
+#### ⚠ Honest cost
+
+Two log-filter alarms on existing log groups ≈ **$0.20/mo**, plus one new
+log-derived metric name (`tv_deploy_provenance_blind_total`, sparse — billed
+only in hours it fires) ≈ **$0.30/mo**. **~$0.50/mo total**, no EMF selector
+entry, no user-data byte.
+
+Against the budget as MEASURED the same day — `limit_amount` **$150**, the 90%
+`STOP_EC2_INSTANCES` line **$135**, September forecast **$114.01** — this sits
+**$21 under** the action line. The per-section arithmetic in §2.3j–§2.3p that
+costs against a $130 ceiling is stale; see the dated correction at the end of
+this file.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make the deploy check work.** It makes its failure visible. The
+  missing parameter is still missing and the comparison is still dead until an
+  operator places a token.
+- **It does not stop a rollup failing.** It stops one failing quietly.
+- **Neither alarm has ever fired**, so their wording and thresholds are
+  unverified in practice. The provenance one is expected to fire on its first
+  evaluation — by design, because the condition is real today.
+
+#### What a PR that violates §2.3q looks like (REJECT)
+
+- Rewords the emit-site message *"mismatch metric skipped — a sha is unknown"*
+  without updating the term filter — the alarm matches that substring, so a
+  reword silences it. The emit site carries a comment saying so.
+- Lowers `deploy_provenance_blind`'s threshold below 3 (a single transient skip
+  is not a blind watchdog) or its period below 86400 (the watchdog only fires
+  2–3×/day, so a shorter window cannot see "every fire").
+- Sets `treat_missing_data = "breaching"` on `deploy_provenance_blind` — this
+  metric is emitted only on FAILURE, so no data genuinely means no skips, and
+  breaching would page on every healthy weekend.
+- Gives `scoreboard-01` `ok_recovery = true` (a once-daily emitter cannot
+  recover by ageing out), or shortens its period below 86400.
+- Reverts the emit site to `info!`, restoring the silence this section exists
+  to end.
+- Claims `binary-sha-stale` is trustworthy while `deploy-provenance-blind` is
+  in ALARM — that is precisely the state in which it is not.
+
+### §2.3r — 2026-09-02: four loss counters had emit sites and no route to CloudWatch at all
+
+**The verbatim operator authorization (2026-09-02, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see build wire design integrate implement audit log vsialuise debug monitor logging capturing trackign montioring fix and resolve evrythign entirley dude see sicn eyou have access to aws isntance enitlrey even start stop also do evrythign whatevr is needed dude okay ocne evryhtign is enitlrey doen fix and reosleve na dmerge and dpeloy ti dude okay?"
+
+> "whatevr is needed and recommended go ahead dude okay? i just need the workign finalsied solution dude okay?"
+
+The second was given in DIRECT response to a reply that named this work and its
+price. This dated row is the rule-file edit §3 demands before any new
+Dhan-scoped page, recorded BEFORE the terraform.
+
+#### The gap
+
+A producer→route sweep found four counters with **real emit sites in
+`crates/*/src`** and `emf=0 dash=0 alarmfiles=0` — no path to CloudWatch by any
+route. They are not new counters that nobody wired; they are counters that
+have been able to fire in production and reach nobody.
+
+| Metric | What a non-zero value means |
+|---|---|
+| **`tv_tick_rescue_abandoned_total`** | the tick RESCUE thread did not finish within the shutdown budget — a payload counted as rescued may never have reached the spill file |
+| **`tv_depth_rescue_abandoned_total`** | the same, on the writer carrying ~24× the row volume |
+| `tv_wal_spill_shutdown_incomplete_total` | the frame-spill writer was abandoned at shutdown with frames queued — capture-at-receipt did not close |
+| `tv_wal_replay_restore_failed_total` | a deferred segment could not be moved back to the live directory, so no later boot re-globs it |
+
+**The first one is the one that matters, and its emit site says why in its own
+words:** it fires exactly when `dropped == spilled` — the equality this
+repository cites as proof that a session lost nothing — **stops being true.**
+The proof had no alarm behind it.
+
+#### Seeding, not just selecting
+
+All four are **seeded with `increment(0)` at construction** in the same change.
+This is not tidiness: the CloudWatch agent computes counter deltas and **drops
+the first sample of a series it has never seen**, so an unseeded counter whose
+first increment IS the event publishes nothing on the one day it matters. That
+is the same first-sample rule that hid `tv_depth_rows_spilled_total` on
+2026-08-28 (§2.3o) and made 104,540 depth rows permanently unclassifiable.
+Pinned by `loss_series_seeding_guard.rs`, which already forbids seeding a drop
+counter without its rescue discriminator.
+
+#### ⚠ Honest cost — and this one crosses the automatic stop line
+
+4 EMF names × $0.30 + 4 alarms × $0.10 = **+$1.60/mo**. But this change ships
+alongside the Quote 20 EBS grow (+$18.24/mo), and the two must be costed
+together because they land in the same PR:
+
+| Basis | Figure |
+|---|---|
+| September forecast, read live 2026-09-02 | $114.01 |
+| `limit_amount`, read live | $150.00 |
+| 90% `STOP_EC2_INSTANCES` action line | **$135.00** |
+| Forecast + EBS grow + this change | **$133.85** — $1.15 under |
+| **Maximal-month basis** (§2.3n's ~$123.28 + $19.84) | **~$143.12 — $8.12 OVER** |
+
+**The two bases disagree and the pessimistic one breaches.** That is stated
+rather than resolved by picking the friendlier number: §2.3n's standing rule is
+that *"the next addition of any size must come with a LEVER, not just a cost
+note"*, and **this change does not carry one.** The lever exists and is already
+approved — the Quote 10 Elastic IP release, −$3.60/mo — but its execution is
+bundled with an instance recreate and is not taken here.
+
+So the honest position is: **on the forecast basis this fits with $1.15 to
+spare; on the maximal-month basis the automatic stop fires and switches the
+trading box off.** An operator decision on the EIP release, or on
+`limit_amount` (which Quote 19 caps at $150, already the live value, so a
+ceiling edit cannot help), is now the blocking item on this surface — not a
+future nicety.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+Alarming a rescue-abandonment does not make the rescue finish. It converts the
+one event that invalidates the loss proof from invisible into a page — that is
+the entire claim. It does not shorten the shutdown budget, does not add a
+retry, and does not recover the frames, which are gone when the WAL pair fires.
+
+#### What a PR that violates §2.3r looks like (REJECT)
+
+- Ships any of the four counters without its `increment(0)` seed (the agent's
+  first-sample rule swallows the event).
+- Gives any of the four `ok_actions` (the loss already happened).
+- Uses a RATE threshold rather than `>= 1` — all four are zero on a healthy
+  lane, so a rate threshold invents a baseline that does not exist.
+- Market-hours-gates the two WAL alarms: WAL work runs at BOOT and at SHUTDOWN,
+  outside the gate window, so gating them makes them structurally unable to
+  fire on the paths they exist for.
+- Adds a per-INSTRUMENT or per-SEGMENT dimension (the §2.3 cardinality rule
+  stands).
+- Adds the next EMF name or alarm without a LEVER, per §2.3n and the table
+  above.

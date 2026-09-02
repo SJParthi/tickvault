@@ -2989,6 +2989,83 @@ pub const WAL_CATCHUP_BUDGET_SECS: u64 = 300;
 /// return non-empty forever cannot spin the boot path, not because the count
 /// itself is expected to bind.
 pub const WAL_CATCHUP_MAX_ROUNDS: u32 = 120;
+
+/// Fraction of the resolved memory ceiling at which the WAL catch-up drain
+/// STOPS and defers the rest to the next boot.
+///
+/// **Why a memory stop exists at all, measured 2026-09-02.** The drain's only
+/// bounds were a clock (`WAL_CATCHUP_BUDGET_SECS`) and a round count
+/// (`WAL_CATCHUP_MAX_ROUNDS`), and its per-round budget
+/// (`WAL_REPLAY_MAX_BYTES`, 512 MiB) bounds the FRAME PAYLOAD BYTES READ — not
+/// what those frames materialize downstream. Those are very different
+/// quantities, and the gap is not small:
+///
+/// | measured on the box, 2026-09-02 | value |
+/// |---|---|
+/// | process RSS across the whole trading session | **0.29 – 1.54 GiB, flat** |
+/// | RSS one five-minute bucket later, at 16:05 IST | **15.54 GiB** |
+/// | replay that produced it | 151 segments / 2,309,027 frames |
+/// | depth rows re-appended from them | **22,248,540** |
+/// | `RESOURCE-02` at the top | rss 16,688,558,080 vs limit 16,106,127,360 |
+///
+/// So ~512 MiB of frames became ~14.5 GiB of live footprint — roughly **30x**
+/// — the app crossed its `MemoryHigh`, and it went silent four minutes later.
+/// A mid-session restart is what exposed it: the WAL held a whole session, so
+/// the drain had a whole session to re-materialize.
+///
+/// **Why this and not a smaller `WAL_REPLAY_MAX_BYTES`.** Shrinking the input
+/// budget would trade a memory blowup for a drain shortfall — 120 rounds x
+/// 512 MiB is ~60 GB, roughly twice the largest backlog this box has recorded
+/// (244 segments, 31 GB), and cutting the budget to fit the worst-case
+/// amplification would put a real backlog out of reach in one boot. It would
+/// also be arithmetic on a single measurement: the 30x ratio is what ONE
+/// session's frame mix produced, not a constant of the system. Reading the
+/// actual RSS costs one `/proc` read per round and bounds the real quantity in
+/// every mix, including ones nobody has measured yet.
+///
+/// **Why 60%.** `RESOURCE-02` fires at 80% of the same ceiling and calls the
+/// kill "imminent" — so 60% leaves a full fifth of the ceiling between the
+/// drain standing down and the alarm the operator already gets, and the drain
+/// stops on its own before it becomes the thing being alarmed about. On the
+/// live 15 GiB `MemoryHigh` that is ~9 GiB, roughly six times the flat
+/// in-session working set, so a healthy boot never reaches it and drains at
+/// full speed.
+///
+/// **Failure shape is unchanged and already designed for:** whatever the drain
+/// does not reach stays a `*.wal` file and is re-globbed next boot. Stopping
+/// early can only recover LESS than an OOM, and an OOM recovers nothing at all
+/// while taking the box down with it.
+pub const WAL_CATCHUP_RSS_STOP_PCT: u64 = 60;
+
+/// Should the WAL catch-up drain stand down for memory before the next round?
+///
+/// Pure and O(1) — no I/O, no allocation — so the policy is testable without a
+/// cgroup, which is the whole reason it is not written inline in the loop.
+///
+/// Fails OPEN (returns `false`) when either input is unavailable, and that
+/// direction is deliberate: a missing ceiling is a host we cannot measure
+/// (non-Linux, cgroup v1, an unreadable file), and refusing to drain a real
+/// backlog because a probe returned `None` would turn an unmeasurable host
+/// into a permanently un-drained WAL. The pre-existing clock and round bounds
+/// still apply there, exactly as they did before this function existed.
+#[must_use]
+pub const fn wal_catchup_should_stop_for_memory(
+    rss_bytes: Option<u64>,
+    ceiling_bytes: Option<u64>,
+    stop_pct: u64,
+) -> bool {
+    let (Some(rss), Some(ceiling)) = (rss_bytes, ceiling_bytes) else {
+        return false;
+    };
+    if ceiling == 0 {
+        return false;
+    }
+    // Multiply-then-compare rather than divide: integer division would floor
+    // the threshold and, at a small ceiling, could floor it to zero and stop
+    // every drain instantly. u128 because ceiling * 100 overflows u64 only
+    // above ~1.8e17 bytes, but the cast costs nothing and removes the question.
+    (rss as u128) * 100 >= (ceiling as u128) * (stop_pct as u128)
+}
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -9835,7 +9912,49 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         let mut catchup_frames = 0usize;
         let mut catchup_ticks = 0u64;
         let mut catchup_not_folded = 0u64;
+        // Did the drain stand down for memory rather than for the clock or
+        // the round cap? Kept out of the loop so the tail below can report
+        // WHICH bound bound, which is the difference between "the backlog is
+        // big" and "this box cannot drain it".
+        let mut catchup_memory_stopped = false;
+        let mem_ceiling_bytes = tickvault_storage::resource_monitor::resolve_memory_ceiling(
+            &tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path(),
+            std::path::Path::new("/proc/meminfo"),
+        )
+        .bytes();
         while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
+            // MEMORY STOP — checked BEFORE the round, never after, because the
+            // whole point is not to start work whose footprint we cannot hold.
+            // One `/proc/self/status` read per round; the policy itself is the
+            // pure `wal_catchup_should_stop_for_memory` above.
+            let rss_now = tickvault_storage::resource_monitor::probe_vmrss_bytes(
+                std::path::Path::new("/proc/self/status"),
+            );
+            if wal_catchup_should_stop_for_memory(
+                rss_now,
+                mem_ceiling_bytes,
+                WAL_CATCHUP_RSS_STOP_PCT,
+            ) {
+                catchup_memory_stopped = true;
+                error!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    source = "wal_catchup_memory_stop",
+                    round = rounds,
+                    rss_bytes = rss_now.unwrap_or_default(),
+                    ceiling_bytes = mem_ceiling_bytes.unwrap_or_default(),
+                    stop_pct = WAL_CATCHUP_RSS_STOP_PCT,
+                    "WAL catch-up drain STOPPED for memory before its clock or \
+                     round cap — resident memory reached the stand-down \
+                     fraction of this host's ceiling. Nothing is stranded: \
+                     every segment the drain did not reach is still a `*.wal` \
+                     file and is re-globbed on the next boot. This is the \
+                     bound that did NOT exist on 2026-09-02, when a whole \
+                     session's WAL replayed 22,248,540 depth rows out of \
+                     ~512 MiB of frames, crossed MemoryHigh, and took the \
+                     process down four minutes later."
+                );
+                break;
+            }
             let wal_dir = crate::boot_helpers::ws_wal_dir();
             let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report(
                 &wal_dir,
@@ -9964,15 +10083,34 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "WAL catch-up drain round complete"
             );
         }
-        if rounds > 0 {
-            let exhausted =
-                tokio::time::Instant::now() >= catchup_deadline || rounds >= WAL_CATCHUP_MAX_ROUNDS;
+        if rounds > 0 || catchup_memory_stopped {
+            // `catchup_memory_stopped` joins `exhausted` deliberately: all
+            // three mean the SAME operational thing — the drain stood down
+            // with work still on disk — and the counter exists to say that,
+            // not to say which bound bound. The `stop_reason` field is what
+            // separates them for triage, at zero metric cost, which matters
+            // because the budget has $2.75 of margin to the automatic
+            // STOP_EC2_INSTANCES line and a new EMF name is ~$0.30/mo.
+            let exhausted = catchup_memory_stopped
+                || tokio::time::Instant::now() >= catchup_deadline
+                || rounds >= WAL_CATCHUP_MAX_ROUNDS;
+            let stop_reason = if catchup_memory_stopped {
+                "memory"
+            } else if rounds >= WAL_CATCHUP_MAX_ROUNDS {
+                "round_cap"
+            } else if exhausted {
+                "clock"
+            } else {
+                "drained"
+            };
             info!(
                 rounds,
                 frames = catchup_frames,
                 ticks = catchup_ticks,
                 not_folded = catchup_not_folded,
                 budget_exhausted = exhausted,
+                memory_stopped = catchup_memory_stopped,
+                stop_reason,
                 "WAL catch-up drain finished — recovered a backlog that a single \
                  512 MiB replay batch could never have reached"
             );
@@ -11143,6 +11281,160 @@ pub fn now_ist_secs_of_day() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    // -- WAL catch-up memory stop (2026-09-02) --------------------------------
+    //
+    // The policy these pin is the one that did not exist on 2026-09-02, when a
+    // mid-session restart replayed a whole session's WAL: 512 MiB of frames
+    // became 22,248,540 depth rows and drove RSS from a flat ~1 GiB to
+    // 15.54 GiB, past the 15 GiB MemoryHigh, and the process went silent four
+    // minutes later. Every number below is that incident's, so the fixtures
+    // stay tied to the failure rather than to a round number someone liked.
+
+    /// The live shape: 15 GiB ceiling, and RSS at the measured 15.54 GiB.
+    const CEILING_15GIB: u64 = 16_106_127_360;
+    /// `RESOURCE-02`'s own reading at the top of the incident.
+    const RSS_AT_INCIDENT: u64 = 16_688_558_080;
+
+    #[test]
+    fn memory_stop_fires_at_the_rss_that_actually_took_the_process_down() {
+        assert!(
+            wal_catchup_should_stop_for_memory(
+                Some(RSS_AT_INCIDENT),
+                Some(CEILING_15GIB),
+                WAL_CATCHUP_RSS_STOP_PCT
+            ),
+            "the drain must stand down at the RSS that crossed MemoryHigh on \
+             2026-09-02 — this is the whole reason the stop exists"
+        );
+    }
+
+    #[test]
+    fn a_healthy_in_session_working_set_never_stops_the_drain() {
+        // Measured the same day: RSS was 0.29-1.54 GiB for the entire trading
+        // session. If the stop fired anywhere in that band it would refuse to
+        // drain on every healthy boot, which is worse than the bug it fixes.
+        for rss_gib in [0.29_f64, 0.90, 1.54, 3.00, 5.00] {
+            let rss = (rss_gib * 1_073_741_824.0) as u64;
+            assert!(
+                !wal_catchup_should_stop_for_memory(
+                    Some(rss),
+                    Some(CEILING_15GIB),
+                    WAL_CATCHUP_RSS_STOP_PCT
+                ),
+                "{rss_gib} GiB is inside the measured healthy band (and well \
+                 under 60% of 15 GiB = ~9 GiB); the drain must run at full speed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stop_sits_below_the_resource_02_alarm_it_is_meant_to_pre_empt() {
+        // RESOURCE-02 fires at 80% and calls the kill imminent. The drain must
+        // stand down BEFORE that, or it becomes the thing being alarmed about.
+        let at_80pct = CEILING_15GIB * 80 / 100;
+        assert!(
+            wal_catchup_should_stop_for_memory(
+                Some(at_80pct),
+                Some(CEILING_15GIB),
+                WAL_CATCHUP_RSS_STOP_PCT
+            ),
+            "anything at the RESOURCE-02 threshold must already have stopped \
+             the drain"
+        );
+        assert!(
+            WAL_CATCHUP_RSS_STOP_PCT < 80,
+            "the stand-down fraction must stay strictly below RESOURCE-02's \
+             80%, else the drain and the alarm fire together and the alarm \
+             stops being an early warning"
+        );
+    }
+
+    #[test]
+    fn exactly_at_the_threshold_stops_rather_than_proceeds() {
+        // Boundary: >= not >. A drain that starts a round AT the line is a
+        // drain that finishes it above the line.
+        let exactly =
+            CEILING_15GIB * u64::from(u32::try_from(WAL_CATCHUP_RSS_STOP_PCT).unwrap()) / 100;
+        assert!(wal_catchup_should_stop_for_memory(
+            Some(exactly),
+            Some(CEILING_15GIB),
+            WAL_CATCHUP_RSS_STOP_PCT
+        ));
+        assert!(!wal_catchup_should_stop_for_memory(
+            Some(exactly - 1),
+            Some(CEILING_15GIB),
+            WAL_CATCHUP_RSS_STOP_PCT
+        ));
+    }
+
+    #[test]
+    fn an_unmeasurable_host_fails_open_and_still_drains() {
+        // Deliberate direction, stated in the fn's own doc: a missing probe is
+        // a host we cannot measure, not a host that is out of memory. Refusing
+        // to drain there would turn an unreadable /proc into a permanently
+        // un-drained WAL. The clock and round bounds still apply.
+        assert!(!wal_catchup_should_stop_for_memory(
+            None,
+            Some(CEILING_15GIB),
+            WAL_CATCHUP_RSS_STOP_PCT
+        ));
+        assert!(!wal_catchup_should_stop_for_memory(
+            Some(RSS_AT_INCIDENT),
+            None,
+            WAL_CATCHUP_RSS_STOP_PCT
+        ));
+        assert!(!wal_catchup_should_stop_for_memory(
+            None,
+            None,
+            WAL_CATCHUP_RSS_STOP_PCT
+        ));
+    }
+
+    #[test]
+    fn a_zero_ceiling_cannot_stop_every_drain_instantly() {
+        // A cgroup file that parses to 0 would make any RSS >= 0% of it. That
+        // must not brick the drain on every boot.
+        assert!(!wal_catchup_should_stop_for_memory(
+            Some(RSS_AT_INCIDENT),
+            Some(0),
+            WAL_CATCHUP_RSS_STOP_PCT
+        ));
+    }
+
+    #[test]
+    fn the_threshold_is_multiplied_not_divided_so_a_small_ceiling_is_safe() {
+        // Integer division would floor a small ceiling's threshold toward
+        // zero and stop the drain at any RSS. Multiply-then-compare does not.
+        // 10 bytes at 60% is 6, so 5 proceeds and 6 stops.
+        assert!(!wal_catchup_should_stop_for_memory(Some(5), Some(10), 60));
+        assert!(wal_catchup_should_stop_for_memory(Some(6), Some(10), 60));
+    }
+
+    #[test]
+    fn the_catchup_loop_consults_the_memory_stop_before_doing_a_round() {
+        // Source pin: the check must sit INSIDE the while-loop and BEFORE the
+        // replay call, because the point is not to start work whose footprint
+        // we cannot hold. A check moved after the round would measure the
+        // damage instead of preventing it.
+        let src = include_str!("dhan_feed_stack.rs");
+        let loop_body = src
+            .split("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .nth(1)
+            .expect("the WAL catch-up loop must exist");
+        let stop_at = loop_body
+            .find("wal_catchup_should_stop_for_memory")
+            .expect("the loop must consult the memory stop");
+        let replay_at = loop_body
+            .find("replay_all_with_report")
+            .expect("the loop must still perform a replay");
+        assert!(
+            stop_at < replay_at,
+            "the memory stop must be evaluated BEFORE the round's replay, not \
+             after it — checking afterwards measures the blowup instead of \
+             preventing it"
+        );
+    }
 
     /// The fold's baselines must be seeded at DRAIN START, not on first fold.
     ///

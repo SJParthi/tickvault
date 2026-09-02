@@ -359,7 +359,30 @@ async fn publish_binary_mismatch_metric(
     desired: Option<&str>,
 ) {
     let Some(value) = binary_mismatch_value(binary, desired) else {
-        info!("binary/main mismatch metric skipped — a sha is unknown");
+        // 2026-09-02: this was `info!`, and that is how a deploy-provenance
+        // check went blind for its whole life without anyone noticing. Live
+        // evidence: FOUR consecutive fires logged this line and published
+        // nothing, `tv_binary_main_sha_mismatch` had ZERO datapoints in three
+        // days, and `tv-<env>-binary-sha-stale` (treat_missing_data =
+        // notBreaching) therefore read OK the entire time. A producer that
+        // silently declines to produce is indistinguishable from a healthy
+        // one when the alarm treats no-data as health.
+        //
+        // Root cause on that day: `/tickvault/<env>/operator/github-token`
+        // does not exist, so `desired_sha` cannot ask GitHub for main HEAD.
+        // The binary sha itself was fine — written by deploy-aws.yml the day
+        // before — so only the COMPARISON was dead.
+        //
+        // ERROR, not INFO, because "I cannot do the one job I exist for" is
+        // an error even when the invocation returns Ok. The message TEXT is
+        // deliberately unchanged: `tv-<env>-deploy-provenance-blind`
+        // (deploy-watchdog-lambda.tf) is a term filter over this log group
+        // that matches on it, so rewording the string silences the alarm.
+        error!(
+            binary_sha_known = binary.is_some(),
+            desired_sha_known = desired.is_some(),
+            "binary/main mismatch metric skipped — a sha is unknown"
+        );
         return;
     };
     let datum = aws_sdk_cloudwatch::types::MetricDatum::builder()

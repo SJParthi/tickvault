@@ -811,6 +811,12 @@ impl WsFrameSpill {
         // would publish nothing on the bad day. Seeding here is what makes a
         // clean shutdown provable rather than merely unreported.
         metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(0);
+        // Same discipline for the replay RESTORE failure series. A deferred
+        // segment that cannot be moved back into the live directory is frames
+        // that no later boot will re-glob, so this is a loss signal — and it
+        // fires once, on the bad boot, which is precisely the shape the agent's
+        // first-sample rule swallows.
+        metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(0);
 
         let writer = thread::Builder::new()
             .name("ws-frame-spill-writer".to_string()) // APPROVED: one-shot constructor (thread name)

@@ -164,22 +164,23 @@ resource "aws_cloudwatch_metric_alarm" "market_data_persistence_loss" {
   # expression over five series evaluates to no-data if ANY leg is missing, and
   # a counter that legitimately did not increment in the window has no sample -
   # without FILL, four healthy legs would silence the fifth.
+  #
+  # m3 is depth rows dropped MINUS depth rows rescued to the spill tier.
+  #
+  # 2026-09-02: this leg read the raw drop counter, and on that day it
+  # fired on 126,655,860 rows while the rescue counter read 126,655,860 --
+  # identical to the row. Every row this alarm called LOST had been saved.
+  # Four of the five legs were zero, so the page was 100% false, and its
+  # own description above still claimed depth had no spill tier at all --
+  # true when this was written, false since the depth rescue path landed.
+  #
+  # Clamped at zero with IF (not MAX over an array -- element-wise MAX of
+  # two series is not a construct worth betting a LOSS alarm on) because
+  # the two counters are sampled independently: a drop counted just
+  # before its rescue would otherwise make this leg negative and MASK
+  # real loss on another leg. Clamping fails toward paging.
   metric_query {
     id          = "persistence_loss_total"
-    # m3 is depth rows dropped MINUS depth rows rescued to the spill tier.
-    #
-    # 2026-09-02: this leg read the raw drop counter, and on that day it
-    # fired on 126,655,860 rows while the rescue counter read 126,655,860 --
-    # identical to the row. Every row this alarm called LOST had been saved.
-    # Four of the five legs were zero, so the page was 100% false, and its
-    # own description below still claimed depth had no spill tier at all --
-    # true when this was written, false since the depth rescue path landed.
-    #
-    # Clamped at zero with IF (not MAX over an array -- element-wise MAX of
-    # two series is not a construct worth betting a LOSS alarm on) because
-    # the two counters are sampled independently: a drop counted just
-    # before its rescue would otherwise make this leg negative and MASK
-    # real loss on another leg. Clamping fails toward paging.
     expression  = "FILL(m1,0)+FILL(m2,0)+IF(FILL(m3,0)-FILL(m3b,0)>0,FILL(m3,0)-FILL(m3b,0),0)+FILL(m4,0)+FILL(m5,0)"
     label       = "tick/depth rows lost at persistence (all five mechanisms)"
     return_data = true

@@ -123,6 +123,15 @@ const KNOWN_NO_PRODUCER: &[&str] = &[
     // `crates/*/src`. Its alarm is permanently green and always will be, so
     // this stays a real open finding — add the producer or retire the alarm.
     "tv_order_fill_lag_seconds",
+    // A DERIVED metric, added 2026-09-02: the alarm
+    // `tv-<env>-deploy-provenance-blind` reads a log metric filter over the
+    // deploy-watchdog Lambda's OWN log group, so no counter in this process
+    // emits it and there is nothing here to register. It exists precisely
+    // BECAUSE that Lambda publishes nothing when it goes blind — see
+    // `dhan-rest-only-noise-lock-2026-07-14.md` §2.3q, where a producer that
+    // silently declined to produce composed with a notBreaching alarm into a
+    // monitor that had never been able to fire.
+    "tv_deploy_provenance_blind_total",
 ];
 
 /// Counters seeded through a PRE-RESOLVED HANDLE rather than a named literal,

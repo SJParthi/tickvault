@@ -1675,6 +1675,13 @@ fn register_drop_baseline(feed: Feed) {
     metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_client_build")
         .increment(0);
     metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_ddl").increment(0);
+    // The rescue-ABANDONED series needs the same seed, and it is the one that
+    // matters most: it fires exactly when `dropped == spilled` stops being
+    // true — rows counted as rescued whose payload may never have reached the
+    // spill file. Unseeded, its first and only increment is consumed as the
+    // delta baseline, so the one event that invalidates the rescue proof
+    // publishes nothing.
+    metrics::counter!(TICK_RESCUE_ABANDONED_COUNTER, "writer" => "tick").increment(0);
 }
 
 impl TickWriter {

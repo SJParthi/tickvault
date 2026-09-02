@@ -1113,8 +1113,27 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        106,
-        "Z+ L2 VERIFY ratchet: expected exactly 106 names in the MAIN EMF \
+        110,
+        "Z+ L2 VERIFY ratchet: expected exactly 110 names in the MAIN EMF \
+         (2026-09-02 ELEVENTH: 106 -> 110, and ALL FOUR were already emitted \
+         with real call sites while reaching CloudWatch through nothing at \
+         all. The one that matters is tv_tick_rescue_abandoned_total, whose \
+         own emit site says the tick RESCUE thread did not finish within the \
+         shutdown budget, so a rescued payload may never have reached the \
+         spill file -- it fires EXACTLY when `dropped == spilled`, the \
+         equality this repository cites as proof nothing was lost, stops \
+         being true. Its depth twin, tv_depth_rescue_abandoned_total, is the \
+         same signal on the writer carrying 24x the rows. \
+         tv_wal_spill_shutdown_incomplete_total and \
+         tv_wal_replay_restore_failed_total complete the WAL pair: a deferred \
+         segment that cannot be restored to the live directory is frames no \
+         later boot re-globs. All four are SEEDED at construction in the same \
+         change, because the agent computes counter deltas and DROPS the \
+         first sample of a series it has never seen -- an unseeded counter \
+         whose first increment IS the event publishes nothing on the one day \
+         it matters. +4 names = +$1.20/mo against a September forecast of \
+         $114.01 read live, a $150 limit_amount and a 90% \
+         STOP_EC2_INSTANCES line at $135.00. \
          (2026-09-01 TENTH: 103 -> 106, and TWO of the three were ALREADY \
          emitted and reaching nobody. tv_tick_spill_over_soft_ceiling_total \
          and tv_depth_spill_over_soft_cap_total are new, added with the change \

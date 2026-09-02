@@ -780,6 +780,127 @@ any schedule change; any IOPS or throughput change in either direction; raising
 `limit_amount`; live order fire; or any edit to the §28 frozen area. The
 operator's "never face pressure flushing / always O(1)" framing is the REASON
 for this grow, not a grant to make other changes in its name.
+
+**Quote 20 (2026-09-02, EBS grow 300 → 500 GB after the volume reached 2.4 GB free and the app died mid-session — preserve EXACTLY, typos included):**
+> "isnatnce upgrade or disk upgrade needed?"
+
+> "whatevr is needed and recommended go ahead dude okay? i just need the workign finalsied solution dude okay?"
+
+The first is the operator's QUESTION; the second is the authorization, given in
+DIRECT response to a reply that named the grow, priced it at **+$18.24/mo**,
+stated that gp3 is a **one-way door**, showed the resulting budget position
+against the automatic `STOP_EC2_INSTANCES` line, and closed with *"Say the word
+and I'll write the dated quote and run the grow"*. That is the §28.2/§28.3
+authorization shape this repository already accepts — a general go-ahead
+answering an ENUMERATED ask selects the enumerated work. This is the fresh
+dated quote §7 Mechanical Rule 3 requires, recorded BEFORE the volume change.
+
+**What this authorizes:** the root gp3 volume grows **300 → 500 GB**, and the
+`variables.tf` validation ceiling moves with it. Nothing else — the instance
+stays r8g.xlarge (Quote 15, FINALISED), the AZ stays un-pinned, the schedule
+stays 08:30–17:30 IST, and IOPS/throughput are UNCHANGED in either direction.
+
+#### The evidence — MEASURED live 2026-09-02, not projected
+
+The `tv_spill_dir_free_bytes` daily minimum has hit near zero three times in ten
+days, and the trend is not noise:
+
+| Date | Minimum free |
+|---|---:|
+| 2026-08-24 | **0.0 GB** — the disk-full halt Quote 19 answered |
+| 2026-08-31 | **7.2 GB** |
+| 2026-09-01 | **2.4 GB** |
+| 2026-09-02 | 153.2 GB at 15:44 IST — *then the app died and stopped publishing* |
+
+So the Quote 19 grow to 300 GB bought **six days**. A full session consumes
+essentially the whole volume: 2026-09-01 booted at ~309.6 GB free and ended at
+**2.4 GB**, i.e. **~307 GB in one session**, against a 300 GiB volume that
+presents ~309.6 GB free after filesystem overhead. The overnight archival IS
+working — it reclaims the whole session every night, which is exactly why the
+volume boots healthy and dies by close. **The margin is ~2 GB, and that is the
+defect: one session no longer fits with any room to spare.**
+
+`tv-prod-disk-fill-rate-high` is FIRING as this is written, reading **135.7
+%/day against a threshold of 4.0**.
+
+**Only SIZE is exhausted, and the Quote 17 I/O provisioning is NOT reverted to
+fund this** — the same discipline Quote 19 applied. Measured peaks remain
+**1,168 of 6,000 IOPS (19%)** and **107 of 500 MiB/s (21%)**.
+
+#### What 500 GB actually buys
+
+A 500 GiB volume presents ~524 GB free after overhead. Against the measured
+~307 GB session that is **~217 GB of margin (≈70% headroom)**, versus ~2 GB
+today. It is a real fix for the immediate risk and **it is not a fix for the
+burn rate**: at 307 GB/session the volume is still ~59% consumed every day, and
+the structural driver is depth at ~80% of the payload (§2.3o-i of
+`dhan-rest-only-noise-lock-2026-07-14.md` measures `market_depth` at 24× the
+tick row volume). A further grow past 500 needs its own dated quote AND its own
+lever; the honest next step is reducing the depth payload, not buying disk a
+third time.
+
+#### ⚠ Honest cost, and the margin is thin
+
+gp3 storage is $0.0912/GB-month, so +200 GB = **+$18.24/mo**. Read LIVE from the
+account the same day rather than inherited from an earlier section — this file's
+own dated correction records fifteen statements that reasoned from a stale $130
+ceiling:
+
+| Reading | Value | Source |
+|---|---|---|
+| `limit_amount` | **$150.00** | `budgets describe-budgets` |
+| 90% `STOP_EC2_INSTANCES` action line | **$135.00** | derived |
+| September actual, month to date | **$2.77** | ActualSpend |
+| September forecast | **$114.01** | ForecastedSpend |
+| Forecast + this grow | **$132.25** | derived |
+| Margin to the automatic stop | **$2.75** | derived |
+
+$2.75 is real money and it is stated rather than absorbed: the budget's
+AUTOMATIC action is `STOP_EC2_INSTANCES` on the trading box, so **the next
+addition of any size must come with a LEVER, not a cost note.** The levers are
+unchanged and neither is taken here: the already-approved Quote 10 Elastic IP
+release (−$3.60/mo, execution bundled with an instance recreate), or an operator
+decision on `limit_amount` — which Quote 19 caps at $150, already the live
+value, so a ceiling edit cannot buy more room.
+
+#### ⚠ What this quote does NOT authorize, and the half it cannot fix
+
+**It does not authorize an INSTANCE change, and the measured data argues against
+one.** The same day's readings refute the RAM case outright: process RSS across
+the entire trading session was **0.29 – 1.54 GiB**, flat, then jumped to
+**15.54 GiB inside a single five-minute bucket** at 16:05 IST. The logs name the
+cause — a mid-session restart triggered a WAL replay of **151 segments /
+2,309,027 frames / 22,248,540 depth rows re-appended**, which crossed the 15 GiB
+`MemoryHigh` (`RESOURCE-02: rss 16,688,558,080 vs limit 16,106,127,360`) and the
+app went silent four minutes later. That is a bounded burst with a code cause,
+not a capacity shortfall: more RAM would let a larger replay finish and would not
+stop the next one, which will be larger. CPU says the same — **12–13% average on
+4 vCPU** all day, one 67.9% peak.
+
+**A correction this quote also records:** an earlier session in this repository
+reported "16.63 GiB RSS, 88% unaccounted, leaking ~18 MiB/min" and hypothesised
+glibc arena retention. That reading was taken INSIDE one of these replay windows
+and is **withdrawn** — the app is ~1 GiB all day and there is no leak. The
+reusable lesson is the one this file keeps recording: a measurement carries a
+date and a context, and a memory figure sampled during a known burst is not a
+baseline.
+
+**Neither does it fix the WAL replay defect it exposed.** `WAL_REPLAY_MAX_BYTES`
+is 512 MiB and bounds the **input frames read**, not what the replay
+materializes from them — 512 MiB of frames expanded into 22.2M depth rows and
+~15 GiB of RAM, roughly **30× amplification**. Bounding the wrong quantity is a
+code fix, tracked separately from this grow.
+
+#### What a PR that violates Quote 20 looks like (REJECT)
+
+- Grows the volume beyond 500 GB without a fresh dated quote AND a lever that
+  keeps the maximal month under the $135 action line.
+- Reverts the Quote 17 IOPS/throughput provisioning to fund the size (19%/21%
+  utilisation — size is the only exhausted dimension).
+- Changes the instance type or the AZ pin under cover of this quote — the RSS
+  and CPU measurements above argue against both.
+- Raises `limit_amount` above $150 (Quote 19 caps it).
+- Presents 500 GB as a fix for the burn rate rather than for the margin.
 ---
 
 > **[ARCHIVED 2026-07-20]** §1 The rule (retired subscription contract) — moved verbatim to `docs/rules-archive/daily-universe-scope-expansion-2026-05-27-archive.md` (context-size incident; content unchanged).

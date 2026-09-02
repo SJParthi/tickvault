@@ -1159,3 +1159,99 @@ resource "aws_cloudwatch_metric_alarm" "offload_writer_shutdown_incomplete" {
   # datapoint aging out of its window - the abandoned queue does not come back.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# 2026-09-02 — the four loss counters that had emit sites and no route
+#
+# Authorized by dhan-rest-only-noise-lock-2026-07-14.md §2.3r (operator
+# "whatevr is needed and recommended go ahead dude okay? i just need the
+# workign finalsied solution dude okay?"). All four already had real emit
+# sites in crates/*/src and were EMF-selected in the same change; none had an
+# alarm, so each could fire in production and reach nobody.
+#
+# All four are ZERO on a healthy lane by construction, so the threshold is 1
+# rather than a rate: there is no baseline to calibrate against and any
+# non-zero reading IS the event. All four take ok_actions = [] — the loss has
+# already happened when they fire, and a counter aging out of its window is
+# not a repair.
+#
+# M-of-N (3/1) matches the ticks_spilling precedent above: the FIRST breach
+# still pages immediately, but the alarm stays in ALARM through interleaved
+# zero windows instead of resolving and re-firing on a flapping condition.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "tick_rescue_abandoned" {
+  alarm_name        = "tv-${var.environment}-tick-rescue-abandoned"
+  alarm_description = "The tick RESCUE thread did not finish within the shutdown budget, so a payload counted as rescued may never have reached the spill file. This is the alarm that fires EXACTLY when 'dropped equals spilled' — the equality this system reports as proof that nothing was lost — stops being true. Those rows are not in QuestDB and may not be on disk either. Triage: check the spill directory for the named file before the next session, and treat any tick-count reconciliation for that session as unproven until you have."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
+  metric_name         = "tv_tick_rescue_abandoned_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "depth_rescue_abandoned" {
+  alarm_name        = "tv-${var.environment}-depth-rescue-abandoned"
+  alarm_description = "The same signal as tv-<env>-tick-rescue-abandoned, on the depth writer — which carries roughly 24 times the tick row volume, so it is the larger exposure of the two. Depth levels counted as rescued may never have reached the depth spill file. Triage: identical — verify the named spill file exists before trusting any depth reconciliation for that session."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
+  metric_name         = "tv_depth_rescue_abandoned_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "wal_spill_shutdown_incomplete" {
+  alarm_name        = "tv-${var.environment}-wal-spill-shutdown-incomplete"
+  alarm_description = "The WAL frame-spill writer was abandoned at shutdown with frames still queued. Capture-at-receipt is the durable floor this whole architecture rests on, and this says the floor did not close cleanly: those raw frames were never written, so no later boot can re-glob them and no downstream counter can see the gap. Triage: this is un-recoverable loss for the frames in flight — record the session and check whether the shutdown was a deploy, a stop, or a kill."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
+  metric_name         = "tv_wal_spill_shutdown_incomplete_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "wal_replay_restore_failed" {
+  alarm_name        = "tv-${var.environment}-wal-replay-restore-failed"
+  alarm_description = "A WAL segment the replay budget DEFERRED could not be moved back into the live directory. The deferral itself is normal and designed — whatever a boot does not reach stays a *.wal file and is re-globbed next boot — but a segment that fails to be restored is one no later boot will find. Triage: look for orphaned segments in the staging directory and move them back by hand before the next boot; the frames are still on disk until someone deletes them."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
+  metric_name         = "tv_wal_replay_restore_failed_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  dimensions          = local.app_dimensions
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = local.app_alarm_actions
+  ok_actions    = []
+}
