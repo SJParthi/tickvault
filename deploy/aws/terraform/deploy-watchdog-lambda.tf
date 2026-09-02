@@ -369,3 +369,80 @@ resource "aws_cloudwatch_metric_alarm" "deploy_watchdog_not_invoked" {
   alarm_actions   = [aws_sns_topic.tv_alerts.arn]
   ok_actions      = []
 }
+
+# ---------------------------------------------------------------------------
+# DEPLOY-PROVENANCE BLIND — the watchdog is running but publishing nothing
+#
+# Authorized by the operator's 2026-09-02 reaffirmation; the dated quote and
+# the reasoning live in .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md
+# section 2.3q, recorded BEFORE this resource per the rule-file-first law.
+#
+# WHY THIS EXISTS. binary_sha_stale above reads a metric the watchdog only
+# publishes when BOTH shas are known, and it treats missing data as healthy.
+# So a watchdog that skips every fire reads exactly like a watchdog reporting
+# "in sync". Measured live on 2026-09-02: four consecutive fires skipped,
+# tv_binary_main_sha_mismatch had ZERO datapoints in three days, and
+# binary_sha_stale sat OK throughout. The check that detects a box running
+# stale code had never been able to fire.
+#
+# Root cause that day: /tickvault/<env>/operator/github-token does not exist,
+# so the Lambda cannot ask GitHub for main HEAD. Not a code defect — a missing
+# parameter — which is exactly why a code-only guard could never have caught
+# it and an OBSERVED-BEHAVIOUR alarm can.
+#
+# THRESHOLD 3, not 1, deliberately. The watchdog fires ~2-3 times a weekday
+# (instance-start + two crons), so 3 skips in a 24h window means EVERY fire
+# that day was blind — the same "every sample in the day" semantics
+# binary_sha_stale itself uses. A single transient skip (a GitHub blip, a
+# cold-start timeout) does not page.
+#
+# treat_missing_data = notBreaching is CORRECT here and is not the trap it is
+# in binary_sha_stale: this metric is emitted only on FAILURE, so no data
+# genuinely means no skips. ok_actions ARE set because the recovery is real —
+# skips stopping means the comparison started working again, not a datapoint
+# ageing out. A watchdog that stops running entirely is covered separately by
+# deploy_watchdog_not_invoked above.
+#
+# TERM filter, not a coded JSON filter: this Lambda's log group is its own
+# (/aws/lambda/tv-<env>-deploy-watchdog), NOT the app group that the
+# local.error_code_alerts family filters, so it needs its own standalone pair.
+# The matched substring is pinned by the comment at the emit site in
+# crates/aws-lambdas/src/deploy_watchdog.rs — rewording that message silences
+# this alarm.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_metric_filter" "deploy_provenance_blind" {
+  name           = "tv-${var.environment}-deploy-provenance-blind"
+  log_group_name = aws_cloudwatch_log_group.deploy_watchdog.name
+  pattern        = "\"mismatch metric skipped\""
+
+  metric_transformation {
+    name      = "tv_deploy_provenance_blind_total"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+    # NO dimensions: Lambda log events carry no host field and metric filters
+    # cannot emit constant dimensions. NO default_value: sparse metric, billed
+    # only in hours with datapoints, which notBreaching makes correct.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "deploy_provenance_blind" {
+  alarm_name          = "tv-${var.environment}-deploy-provenance-blind"
+  alarm_description   = "The deploy watchdog RAN but could not compare the running binary against main — every fire in the last 24h skipped, so tv-${var.environment}-binary-sha-stale is reading OK on no data and CANNOT tell you the box is on old code. Usual cause: /tickvault/${var.environment}/operator/github-token is missing or unreadable, so main HEAD cannot be fetched. Check the Lambda log for which sha was unknown (binary_sha_known / desired_sha_known). Runbook: .claude/rules/project/deploy-provenance.md"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "tv_deploy_provenance_blind_total"
+  namespace           = local.app_namespace
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 3
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.tv_alerts.arn]
+  ok_actions          = [aws_sns_topic.tv_alerts.arn]
+
+  tags = {
+    Project = "tickvault"
+    Layer   = "L2-VERIFY"
+  }
+}

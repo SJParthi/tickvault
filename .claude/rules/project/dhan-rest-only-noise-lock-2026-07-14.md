@@ -2370,3 +2370,116 @@ Each is still an operator decision with its own cost line — what changes
 is only that "we cannot afford it, we are past the shutdown line" has
 stopped being a true reason. The recorded per-section arithmetic is left
 in place as the audit trail; this row is the correction to all of it.
+
+### §2.3q — 2026-09-02: the deploy-provenance check had never been able to fire, and one daily rollup could fail in silence
+
+**The verbatim operator authorization (2026-09-02, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "i ceallry told yo uto fix and resovlev evrytign dude okay?"
+
+Given in DIRECT response to a message that named exactly these two items and
+stated plainly that each needed his go: *"`SCOREBOARD-01` (a daily rollup flush
+failure) is genuinely invisible — not in the alarmed code set, no counters in
+that file. And the watchdog could be made to shout when it self-disables.
+**Both need a dated operator quote in the rule file first** — that's this
+repo's own law."* That is the §28.2/§28.3 authorization shape this repository
+already accepts: a general go-ahead answering an ENUMERATED list selects the
+enumerated work. Recorded HERE before the terraform, per the rule-file-first
+law.
+
+#### Finding 1 — a watchdog that runs, publishes nothing, and reads as healthy
+
+`tv-<env>-binary-sha-stale` is the check that tells you the box is running old
+code. Measured live against the account:
+
+| Reading | Value |
+|---|---|
+| Alarm state | **OK**, `treat_missing_data = notBreaching` |
+| `tv_binary_main_sha_mismatch` datapoints, 3 days | **0** |
+| deploy-watchdog Lambda invocations, 3 days | **12** (3–5/day) |
+| Consecutive fires logging *"mismatch metric skipped — a sha is unknown"* | **4 of 4** examined |
+
+The producer runs and declines to produce. The alarm treats no-data as health.
+So the two compose into a monitor that **has never been able to fire**, and
+nothing anywhere said so.
+
+**Root cause, and it is not a code defect:** `/tickvault/<env>/operator/github-token`
+**does not exist** (`describe-parameters` under that path returns only
+`control-secret`). Without it the Lambda cannot ask GitHub for main HEAD, so
+`desired_sha` is None, so the mismatch value is None, so it skips. The BINARY
+sha is fine — `/tickvault/prod/deploy/binary-git-sha` was written by
+`deploy-aws.yml` the day before. Only the COMPARISON is dead.
+
+**This is the class the §2.3f note already warned about one level up:** an
+`Errors` alarm catches a Lambda that THROWS, and this one returns `Ok` having
+done nothing. The 2026-08-25 `*-not-invoked` family closed "did it run"; this
+closes **"did it produce"**, which is a different question and was open.
+
+**Two fixes, and the operator owns the one that matters.** The alarm
+(`tv-<env>-deploy-provenance-blind`) converts silence into a page. It does not
+create the missing parameter — that needs a real GitHub token, which is an
+operator action. Until that lands, this alarm will fire, and **that is the
+correct outcome**: it is reporting a real, current blindness rather than
+manufacturing calm.
+
+#### Finding 2 — SCOREBOARD-01 was log-sink-only by accident
+
+A sweep of every storage write path found `ws_connection_rollup.rs` is the one
+file whose flush-failure arm pairs `error!` with **no counter at all**. And
+`Scoreboard01AggregationDegraded` is `Severity::Medium`, so
+`error_code_alarm_coverage_guard::every_high_or_critical_code_is_alarmed_or_explicitly_exempt`
+never required it to be alarmed and it is not on the exempt list either. It
+fell between the two rules rather than being decided.
+
+A failed flush loses the ENTIRE per-connection day summary — the table you read
+to answer "which connection misbehaved yesterday". The raw `ws_event_audit` and
+`feed_episode_audit` rows it folds from are unaffected, so nothing is lost and
+the day is re-rollable by hand; what is lost until then is the view.
+
+**Why this is a safe page rather than noise:** the rollup runs ONCE per day
+after close, so this can fire at most once a day and structurally cannot flap —
+unlike `risk-gap-03`, whose 25 pages in one session are the noise case this
+file records. `ok_recovery = false` because the rollup does not retry within
+the day; an OK an hour later is the datapoint ageing out, never the summary
+arriving.
+
+#### ⚠ Honest cost
+
+Two log-filter alarms on existing log groups ≈ **$0.20/mo**, plus one new
+log-derived metric name (`tv_deploy_provenance_blind_total`, sparse — billed
+only in hours it fires) ≈ **$0.30/mo**. **~$0.50/mo total**, no EMF selector
+entry, no user-data byte.
+
+Against the budget as MEASURED the same day — `limit_amount` **$150**, the 90%
+`STOP_EC2_INSTANCES` line **$135**, September forecast **$114.01** — this sits
+**$21 under** the action line. The per-section arithmetic in §2.3j–§2.3p that
+costs against a $130 ceiling is stale; see the dated correction at the end of
+this file.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make the deploy check work.** It makes its failure visible. The
+  missing parameter is still missing and the comparison is still dead until an
+  operator places a token.
+- **It does not stop a rollup failing.** It stops one failing quietly.
+- **Neither alarm has ever fired**, so their wording and thresholds are
+  unverified in practice. The provenance one is expected to fire on its first
+  evaluation — by design, because the condition is real today.
+
+#### What a PR that violates §2.3q looks like (REJECT)
+
+- Rewords the emit-site message *"mismatch metric skipped — a sha is unknown"*
+  without updating the term filter — the alarm matches that substring, so a
+  reword silences it. The emit site carries a comment saying so.
+- Lowers `deploy_provenance_blind`'s threshold below 3 (a single transient skip
+  is not a blind watchdog) or its period below 86400 (the watchdog only fires
+  2–3×/day, so a shorter window cannot see "every fire").
+- Sets `treat_missing_data = "breaching"` on `deploy_provenance_blind` — this
+  metric is emitted only on FAILURE, so no data genuinely means no skips, and
+  breaching would page on every healthy weekend.
+- Gives `scoreboard-01` `ok_recovery = true` (a once-daily emitter cannot
+  recover by ageing out), or shortens its period below 86400.
+- Reverts the emit site to `info!`, restoring the silence this section exists
+  to end.
+- Claims `binary-sha-stale` is trustworthy while `deploy-provenance-blind` is
+  in ALARM — that is precisely the state in which it is not.
