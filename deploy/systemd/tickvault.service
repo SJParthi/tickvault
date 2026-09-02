@@ -210,6 +210,63 @@ Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
 LimitNOFILE=65536
 LimitNPROC=4096
 
+# ---------------------------------------------------------------------------
+# Memory ceiling + OOM ranking (2026-09-02 — second-sweep finding 5)
+# ---------------------------------------------------------------------------
+#
+# Until this block the unit set NO memory directive of any kind. Two things
+# followed from that, and both were measured in source rather than assumed:
+#
+#   1. The kernel OOM killer ranks by RSS, and this process is the largest
+#      RSS on the box after QuestDB. QuestDB's container already carries
+#      `oom_score_adj: -500` (deploy/docker/docker-compose.yml), so under
+#      host memory exhaustion the kernel would kill THIS process FIRST.
+#      That is the wrong order: QuestDB is recoverable — a stalled or
+#      restarted database is absorbed by the tick/depth spill tier and
+#      re-ingested — while this process is the ONLY tick capture path, and
+#      an upstream tick that arrives while it is dead is never resent.
+#   2. RESOURCE-02 (the process's own memory early warning,
+#      crates/storage/src/resource_monitor.rs) resolves its ceiling from the
+#      cgroup, and with no directive here the cgroup reports `max`, so the
+#      80% line it watched was 80% of the whole machine — unreachable
+#      before the kernel acts.
+#
+# OOMScoreAdjust=-900 puts this process BELOW QuestDB (-500) in the kill
+# order, so exhaustion takes the recoverable tenant first. It does not make
+# the process unkillable (-1000 would); the kernel still reclaims it last.
+#
+# MemoryHigh=15G is a THROTTLE, not a kill: past it the kernel reclaims this
+# cgroup aggressively and slows allocation, and RESOURCE-02 has a reachable
+# ceiling to page against. There is deliberately NO `MemoryMax=` — a hard
+# cap turns a memory spike into an OOM kill of the one process whose death
+# loses ticks, which is exactly the outcome the ranking above exists to
+# avoid. Throttle and page, never kill.
+#
+# WHY 15G. Host usable RAM (MemTotal on the r8g.xlarge, 32 GiB nominal) is
+# ~31.3 GiB. Committed to other tenants: QuestDB hard cap 12.5 GiB
+# (`mem_limit: ${QDB_MEM_LIMIT:-12g}` + `shm_size: 512m`, docker-compose.yml)
+# + sidecars ~0.64 GiB (tv-alloy 384m + tv-loki 256m) + an OS/page-cache
+# floor of 2–4 GiB. That leaves ~14.2–16.2 GiB for this process. Its
+# measured working-set envelope is 4.3–11.2 GB (the subsystem-memory gauges),
+# so 15 GiB sits ABOVE the envelope — a healthy session never touches it —
+# and BELOW host exhaustion, so the throttle engages before the kernel does.
+# AL2023 runs with no swap, so "before swap" and "before OOM" are the same
+# line here; the throttle is the only soft stop that exists.
+#
+# ONE COPY. deploy/aws/terraform/user-data.sh.tftpl installs this file with
+# a plain `cp` from the repo checkout (verified: it is not templated), so
+# there is no second copy of the unit to drift from this one.
+#
+# ROLLBACK — no code change, no rebuild, no redeploy:
+#   printf '[Service]\nMemoryHigh=infinity\nOOMScoreAdjust=0\n' \
+#     > /etc/systemd/system/tickvault.service.d/99-memory-rollback.conf
+#   systemctl daemon-reload && systemctl restart tickvault
+# `MemoryHigh=infinity` removes the throttle; `OOMScoreAdjust=0` restores the
+# kernel's default ranking. Reverting this file in git and redeploying
+# achieves the same thing.
+OOMScoreAdjust=-900
+MemoryHigh=15G
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict

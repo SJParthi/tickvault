@@ -375,13 +375,24 @@ churn (WS-GAP-05).
 ### RESOURCE-02 — resident memory bytes above threshold
 
 **Trigger:** process `VmRSS` (`/proc/self/status`) crossed the
-early-warning threshold (default 80% of the cgroup memory limit,
-`memory.max`). Distinct from the host-aggregate `mem_used_high` CloudWatch
-alarm — this is the tickvault process itself approaching its cgroup
+early-warning threshold (default 80% of the resolved memory ceiling).
+Distinct from the host-aggregate `mem_used_high` CloudWatch
+alarm — this is the tickvault process itself approaching its
 ceiling before the OOM killer (PROC-01) fires. `tv_process_rss_bytes`
-gauge. cgroup limit = `max` (unlimited) → skipped (no denominator).
-**Triage:** right-size the workload / investigate the leak; if it keeps
-climbing, PROC-01 (OOM kill) is imminent.
+gauge. *(CORRECTED 2026-09-02: this used to say "cgroup limit = `max`
+(unlimited) → skipped (no denominator)". That was the pre-2026-09-01
+behaviour and it was a false OK — with no memory directive on the systemd
+unit the check was never evaluated at all. The resolver now falls back to
+the machine's `MemTotal` when the cgroup reports `max`, and since
+2026-09-02 the unit carries `MemoryHigh=15G` so the ceiling is a real,
+reachable line rather than the whole host. Paged since 2026-09-02 via the
+`resource-02` entry in `error-code-alarms.tf`; dated row
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3p.)*
+**Triage:** right-size the workload / investigate the leak (the
+`tv_subsystem_memory_bytes` components say WHICH structure is growing);
+past `MemoryHigh` the kernel throttles the process rather than killing it
+(no `MemoryMax=` by design), but a throttled decoder loses ticks upstream,
+so treat a sustained page as a restart-in-the-next-quiet-window event.
 
 ### RESOURCE-03 — spill-directory free space below threshold
 

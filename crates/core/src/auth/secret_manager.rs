@@ -1237,11 +1237,23 @@ mod tests {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable");
+        // RETIRED 2026-09-02 (audit finding 13): the `spawn_day_ohlc_tick_consumer(`
+        // pin. That consumer drained the PROCESS tick broadcast, whose only
+        // publisher since PR-C2 (2026-07-14) lived inside `#[cfg(test)]` in
+        // `trading_pipeline.rs` — so for seven weeks main.rs allocated a
+        // 262,144-slot `ParsedTick` ring (~40 MB) and two subscribers that
+        // could never wake. The revived Dhan live lane folds its ticks
+        // internally (`dhan_feed_stack`) and never published to the channel.
+        // The channel, its `SharedInfraHandles` field, both `.subscribe()`s
+        // and the day-OHLC consumer spawn are DELETED together; the pin below
+        // makes sure a subscriber cannot come back without a publisher.
         assert!(
-            main_rs.contains("spawn_day_ohlc_tick_consumer("),
-            "main.rs MUST call `day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer` \
-             from the boot path. Without it, day_open/high/low/close never advance \
-             from the live tick stream."
+            !main_rs.contains("tick_broadcast_sender.subscribe()"),
+            "main.rs subscribes to a process tick broadcast again. That channel \
+             has NO production publisher (2026-09-02 audit finding 13): every \
+             `tick_tx.send` in the workspace sits inside `#[cfg(test)]`. Re-add a \
+             subscriber ONLY together with a real publisher, and re-bless this pin \
+             with a dated note naming it."
         );
         assert!(
             main_rs.contains("spawn_supervised_midnight_reset_task("),

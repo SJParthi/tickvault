@@ -121,6 +121,17 @@
 #     respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
 #   - chain-01 is a plain coded filter (both its stages — warmup +
 #     mid_session — are once-per-episode page-worthy).
+#
+# 2026-09-02 UPDATE (second-sweep finding 5 — dhan-rest-only-noise-lock
+# section 2.3p): +1 entry (RESOURCE-02, ~+$0.10/mo). The process's own memory
+# early warning was log-sink-only, and until the same change it could not
+# even reach its threshold: the systemd unit set no memory directive, the
+# cgroup reported `max`, and the resolver fell back to MemTotal (~31 GiB), so
+# its 80% line sat above anything the kernel would tolerate. The unit now
+# sets MemoryHigh=15G (a throttle, never a kill) and OOMScoreAdjust=-900,
+# so the page and the throttle share one real ceiling. Coded filter, eval
+# 3 / dta 1, ok_recovery = true: a repeat-emitter whose OK genuinely tracks
+# the RSS falling back under the line.
 # =============================================================================
 
 locals {
@@ -226,6 +237,35 @@ locals {
       dta         = 1
       ok_recovery = false # round-4: discrete OOM-kill event - auto-OK means the episode aged out, not that the memory pressure is resolved (Rule-11 false-recovery)
       desc        = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). NO recovered/OK page: an OOM kill is a discrete event, so the auto-OK ~15 min later only means the episode aged out - the leak/pressure behind it is not thereby fixed; watch tv_process_rss_bytes + host memory alarms for the real recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
+    }
+    # ADDED 2026-09-02 (second-sweep finding 5; noise-lock section 2.3p).
+    # RESOURCE-02 is the process's OWN memory early warning — the one signal
+    # meant to fire BEFORE the OOM killer — and it was log-sink-only. Worse,
+    # it was unreachable: the systemd unit set no memory directive, so the
+    # cgroup reported `max`, the resolver fell back to MemTotal (~31 GiB), and
+    # 80% of the whole machine is a line the kernel acts before. The unit now
+    # carries MemoryHigh=15G (a THROTTLE — deliberately no MemoryMax, which
+    # would turn a spike into a kill of the only tick-capture process) and
+    # OOMScoreAdjust=-900 (killed AFTER QuestDB, whose loss the spill tier
+    # absorbs). This alarm is the page that pairs with that throttle.
+    #
+    # Two emit sites share the code: resource_monitor.rs (the RSS-vs-ceiling
+    # arm, the intended one) and subsystem_memory.rs (the sampler-died
+    # respawn arm). Both are genuine memory-observability failures and both
+    # warrant the same triage, so a plain coded filter is correct here.
+    #
+    # ok_recovery = true: the monitor re-evaluates every cycle and re-emits
+    # while RSS stays over the line, so an OK genuinely means the RSS fell
+    # back under it (or the operator restarted the app) — the DH-901 shape,
+    # not the discrete-event proc-01 shape.
+    "resource-02" = {
+      pattern     = "{ $.code = \"RESOURCE-02\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "RESOURCE-02: the trading app's resident memory is at or above 80% of its ceiling (MemoryHigh=15G on the systemd unit). Past the ceiling the kernel THROTTLES this process - it is not killed (no MemoryMax by design) - but a throttled tick decoder falls behind the socket and the vendor drops ticks upstream. Triage NOW: tv_process_rss_bytes + the tv_subsystem_memory_bytes components (which one is growing?); tv_spill_dir_free_bytes + tv_questdb_wal_suspended_tables (a stalled database backs up every writer queue). If a queue grows without bound, restart the app in the next quiet window; under host exhaustion QuestDB (-500) is killed before this process (-900) and the spill tier absorbs that. OK = RSS fell back under the line. Runbook: docs/error-runbooks/wave-4-error-codes.md + dhan-rest-only-noise-lock-2026-07-14.md section 2.3p"
     }
     # AGGREGATOR-DROP-01 (added 2026-07-09 — audit finding): the ONLY
     # silent-data-loss path for a sealed candle (ring + spill + DLQ all

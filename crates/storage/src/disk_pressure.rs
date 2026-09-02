@@ -356,6 +356,174 @@ pub fn apply_action(
     }
 }
 
+/// What one poll's probe verdict did to the probe-health latch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeHealthTransition {
+    /// Same state as last poll: healthy-and-still-healthy, or failing but not
+    /// yet for long enough, or already-reported-and-still-failing.
+    Unchanged,
+    /// The probe has now failed `failing_after` polls in a row. Fired ONCE
+    /// per episode — the caller pages on this edge.
+    FailingSustained,
+    /// A successful probe after a reported sustained failure. Fired ONCE — the
+    /// caller may log the recovery.
+    Recovered,
+}
+
+/// Edge latch for a PERSISTENTLY failing disk-pressure probe (2026-09-02,
+/// audit finding 10).
+///
+/// # The gap this closes
+///
+/// [`decide_pressure_action`] maps a failed probe to [`PressureAction::Idle`],
+/// and that is correct: a blind probe must never trigger a drop. But the
+/// consequence is that a probe which fails EVERY poll idles the pressure
+/// archiver for the whole session — the one automatic mechanism that reclaims
+/// disk switches itself off — and the only trace was a `warn!` per poll plus
+/// `tv_disk_pressure_probe_failed_total`, neither of which is a page. A
+/// `df` that stops working (an unmounted data volume, a permissions change,
+/// a wedged `statvfs`) therefore looked identical to a quiet disk.
+///
+/// The decision function is deliberately UNTOUCHED — a failed probe still
+/// yields `Idle`. This latch sits beside it and answers a different question:
+/// "has the probe been blind for long enough that its silence is itself the
+/// finding?" Pure: no clock, no disk; the caller supplies the poll verdict
+/// and the threshold in polls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProbeHealth {
+    /// Consecutive failed polls, reset to 0 by any success.
+    consecutive_failures: u32,
+    /// Whether `FailingSustained` has been fired for the current episode.
+    reported: bool,
+}
+
+impl ProbeHealth {
+    /// A healthy, never-failed latch.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            reported: false,
+        }
+    }
+
+    /// Fold one poll's verdict in and report the edge, if any.
+    ///
+    /// `failing_after` is the number of CONSECUTIVE failed polls that
+    /// constitutes a sustained failure; the caller derives it from its poll
+    /// cadence (see `disk_pressure_boot::PRESSURE_PROBE_FAILING_POLLS`). A
+    /// threshold of 0 or 1 fires on the very first failure, which a caller
+    /// polling once a minute would find noisy — the boot-side constant is
+    /// const-asserted to be at least 2.
+    #[must_use]
+    pub fn observe(&mut self, probe_ok: bool, failing_after: u32) -> ProbeHealthTransition {
+        if probe_ok {
+            self.consecutive_failures = 0;
+            if self.reported {
+                self.reported = false;
+                return ProbeHealthTransition::Recovered;
+            }
+            return ProbeHealthTransition::Unchanged;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if !self.reported && self.consecutive_failures >= failing_after {
+            self.reported = true;
+            return ProbeHealthTransition::FailingSustained;
+        }
+        ProbeHealthTransition::Unchanged
+    }
+
+    /// Consecutive failed polls so far (for the log payload).
+    #[must_use]
+    pub const fn consecutive_failures(self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
+#[cfg(test)]
+mod probe_health_tests {
+    use super::{ProbeHealth, ProbeHealthTransition};
+
+    #[test]
+    fn a_healthy_probe_never_transitions() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..100 {
+            assert_eq!(h.observe(true, 5), ProbeHealthTransition::Unchanged);
+        }
+        assert_eq!(h.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn a_failure_shorter_than_the_threshold_is_not_sustained() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..4 {
+            assert_eq!(h.observe(false, 5), ProbeHealthTransition::Unchanged);
+        }
+        assert_eq!(h.consecutive_failures(), 4);
+        // A success before the fifth failure resets the run and is NOT a
+        // recovery, because nothing was ever reported.
+        assert_eq!(h.observe(true, 5), ProbeHealthTransition::Unchanged);
+        assert_eq!(h.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn the_threshold_poll_fires_sustained_exactly_once() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..4 {
+            assert_eq!(h.observe(false, 5), ProbeHealthTransition::Unchanged);
+        }
+        assert_eq!(
+            h.observe(false, 5),
+            ProbeHealthTransition::FailingSustained,
+            "the FIFTH consecutive failure is the edge"
+        );
+        for _ in 0..1_000 {
+            assert_eq!(
+                h.observe(false, 5),
+                ProbeHealthTransition::Unchanged,
+                "a still-failing probe is counted, never re-paged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_success_after_a_reported_failure_is_a_recovery_and_re_arms() {
+        let mut h = ProbeHealth::new();
+        for _ in 0..3 {
+            let _ = h.observe(false, 3);
+        }
+        assert_eq!(h.observe(true, 3), ProbeHealthTransition::Recovered);
+        assert_eq!(h.observe(true, 3), ProbeHealthTransition::Unchanged);
+        // The next sustained failure is a NEW episode and must page again.
+        let _ = h.observe(false, 3);
+        let _ = h.observe(false, 3);
+        assert_eq!(h.observe(false, 3), ProbeHealthTransition::FailingSustained);
+    }
+
+    #[test]
+    fn a_failed_probe_still_decides_idle_the_latch_changes_no_action() {
+        // The load-bearing property: adding the latch did NOT touch the
+        // decision. A blind probe under pressure-enabled config is still Idle.
+        use super::{
+            PartitionRetentionConfig, PressureProbe, PressureState, decide_pressure_action,
+        };
+        let cfg = PartitionRetentionConfig {
+            pressure_archive_enabled: true,
+            pressure_high_water_pct: 75,
+            pressure_low_water_pct: 60,
+            ..PartitionRetentionConfig::default()
+        };
+        let mut h = ProbeHealth::new();
+        for _ in 0..10 {
+            let _ = h.observe(false, 2);
+            assert_eq!(
+                decide_pressure_action(PressureProbe::failed(), &PressureState::default(), &cfg, 0),
+                super::PressureAction::Idle
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

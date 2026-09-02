@@ -934,7 +934,14 @@ async fn async_main() -> Result<()> {
         metrics::counter!("tv_ws_frame_wal_reinjected_dropped_total", "ws_type" => ws_type)
             .increment(0);
     }
-    let mut ws_wal_replay_live_feed: Vec<(u64, i64, bytes::Bytes)> = Vec::new();
+    // (frame_seq, received_at_nanos, TVW4 endpoint, frame) — the endpoint is
+    // what lets the lane's refold route a depth frame to the depth drain.
+    let mut ws_wal_replay_live_feed: Vec<(
+        u64,
+        i64,
+        tickvault_storage::ws_frame_spill::WalEndpoint,
+        bytes::Bytes,
+    )> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
@@ -951,6 +958,7 @@ async fn async_main() -> Result<()> {
                             ws_wal_replay_live_feed.push((
                                 rec.frame_seq,
                                 rec.received_at_nanos,
+                                rec.endpoint,
                                 bytes::Bytes::from(rec.frame),
                             ));
                         }
@@ -2007,7 +2015,6 @@ async fn async_main() -> Result<()> {
     let SharedInfraHandles {
         notifier,
         health_status,
-        tick_broadcast_sender,
         api_handle,
     } = build_shared_infra(
         &config,
@@ -2408,15 +2415,14 @@ async fn async_main() -> Result<()> {
     // tick-broadcast consumers (see the plan's Observability note).
     // -----------------------------------------------------------------------
     let day_ohlc_tracker = std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
-    {
-        let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-        let consumer_rx = tick_broadcast_sender.subscribe();
-        let _consumer_handle = tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
-            consumer_tracker,
-            consumer_rx,
-            tickvault_common::always_on::current(), // §30 GIFT exemption — same source as the aggregator/tick processor
-        );
-    }
+    // 2026-09-02 (audit finding 13): the tick-consumer spawn that sat here
+    // (`spawn_day_ohlc_tick_consumer` on a subscriber of the process broadcast)
+    // is DELETED with the publisher-less process tick broadcast — the
+    // "DORMANT SINCE PR-C2" note above was the honest description of a
+    // subscriber that could never wake, and the channel it waited on cost a
+    // ~40 MB `ParsedTick` ring for nothing. The function is retained,
+    // publisher-ready, in `day_ohlc_orchestrator.rs`; the midnight reset
+    // below stays because it is self-contained and clock-driven.
     {
         // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic in the
         // IST-midnight reset task can never silently take the daily reset offline
@@ -2944,7 +2950,10 @@ async fn async_main() -> Result<()> {
 ///    it owns the /health `questdb_reachable` flag write (see the param
 ///    note below).
 async fn run_slow_boot_observability(
-    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
+    // 2026-09-02 (audit finding 13): the `tick_rx` broadcast receiver this
+    // task took is DELETED with the publisher-less process tick broadcast.
+    // Its `recv()` arm never once fired since PR-C2 (2026-07-14); see
+    // `ticks_observed` below for what that means for the starved detector.
     questdb_config: tickvault_common::config::QuestDbConfig,
     // PR-C2 (2026-07-13): the deleted Dhan pool watchdog was the ONLY
     // production writer of the /health `questdb_reachable` flag — without a
@@ -2986,7 +2995,18 @@ async fn run_slow_boot_observability(
     // The pair is what separates "nothing is stalling" from "I can see
     // nothing" — a distinction the scan's own return value cannot make, since
     // an empty tracker and a healthy universe both yield zero.
-    let mut ticks_observed: u64 = 0;
+    //
+    // 2026-09-02 (audit finding 13): `ticks_observed` is a documented CONSTANT
+    // zero. The broadcast it counted arrivals on had no production publisher
+    // since PR-C2 (2026-07-14) — every `tick_tx.send` in the workspace is
+    // inside `#[cfg(test)]` — so it never incremented, and the channel is now
+    // deleted rather than kept as a 40 MB `ParsedTick` ring nobody fed. The
+    // starved detector below therefore keeps saying exactly what it said
+    // before: with the live lane ON this scan can see NOTHING, because the
+    // lane folds ticks internally; RISK-GAP-03 is the per-instrument silence
+    // signal that IS wired. Wiring a real tick source here means feeding
+    // `tick_gap_tracker.record_tick` from it and making this a live count.
+    let ticks_observed: u64 = 0;
     let mut stale_scans: u32 = 0;
     let mut starved_reported = false;
 
@@ -3017,32 +3037,12 @@ async fn run_slow_boot_observability(
     // same starvation also affected total-silence incidents pre-C2).
     let mut qdb_ping_ticker = tokio::time::interval(qdb_health_interval);
     qdb_ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 2026-09-02: the `tick_rx.recv()` select arm that fed
+    // `tick_gap_tracker.record_tick` is DELETED with the publisher-less
+    // broadcast (audit finding 13). The tracker stays, empty, so the
+    // starved-detector arithmetic below is unchanged and honest.
     loop {
         tokio::select! {
-            recv = tick_rx.recv() => match recv {
-                Ok(tick) => {
-                    ticks_observed = ticks_observed.saturating_add(1);
-                    // Gap detection — the tracker fires its own log/metric on
-                    // ERROR thresholds; no backfill request is published
-                    // (in-market backfill disabled by user policy).
-                    // I-P1-11 composite: security_id alone is not unique.
-                    let _ = tick_gap_tracker.record_tick(
-                        tick.security_id,
-                        tick.exchange_segment_code,
-                        tick.exchange_timestamp,
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        skipped,
-                        "S4-T1d: slow-boot observer lagged {skipped} ticks — gap tracker state is still valid"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    info!("S4-T1d: slow-boot observer shutting down (broadcast closed)");
-                    return;
-                }
-            },
             _ = qdb_ping_ticker.tick() => {
                 // Audit finding #2 (2026-04-24): periodic per-instrument stall
                 // scan every 30 s — cadence-tracked so the scan runs even when
@@ -3497,16 +3497,16 @@ struct SharedInfraHandles {
     /// Drives `/health` + `/api/feeds/health`. The lane updates it; the API
     /// server reads it.
     health_status: SharedHealthStatus,
-    /// The PROCESS-shared tick broadcast. The sole subscriber task
-    /// (slow-boot observability) is spawned in `build_shared_infra` and has
-    /// already `.subscribe()`d to this before anything could publish.
-    /// PUBLISHER-LESS since PR-C2 (2026-07-14): the lane's
-    /// `run_tick_processor` — the only publisher — was deleted with the Dhan
-    /// live-WS lane, and Groww persists via its own writer + owns its own
-    /// aggregator instance. Kept (with its subscribers) so the seal-writer
-    /// install + channel wiring stay publisher-ready; the C3 universe-chain
-    /// deletion decides whether the idle consumers go too.
-    tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
+    // 2026-09-02 (audit finding 13): the PROCESS-shared tick broadcast
+    // (`tick_broadcast_sender`) was REMOVED. The note that stood here said
+    // "PUBLISHER-LESS since PR-C2 (2026-07-14) … the C3 universe-chain
+    // deletion decides whether the idle consumers go too" — C3 never
+    // decided, and for seven weeks the field carried a 262,144-slot
+    // `ParsedTick` ring (~40 MB, `TICK_BROADCAST_CAPACITY`) with two
+    // subscribers that could never wake: every `tick_tx.send` in the
+    // workspace is inside `#[cfg(test)]`, and the revived Dhan live lane
+    // folds internally. A future real tick publisher re-creates the channel
+    // together with its consumers — never one without the other.
     // PR-C3 (2026-07-14): the PROCESS-shared order-update broadcast
     // (`order_update_sender`) was REMOVED — its publisher (the order-update
     // WS, retired 2026-07-14 per the Dhan noise lock) and its subscriber
@@ -3747,29 +3747,31 @@ async fn build_shared_infra(
     // --- Scoreboard IST-midnight resets (RELOCATED, stage-3 sweep) ---
     spawn_scoreboard_midnight_reset_task();
 
-    // --- Tick broadcast channel (PROCESS-shared) ---
-    // Held for the process lifetime so the subscriber tasks never wake on a
-    // disconnected channel. PUBLISHER-LESS on the REST-only runtime (the
-    // lane's `run_tick_processor` died with the Dhan live WS; the Groww
-    // bridge died 2026-07-15) — the consumers below idle by construction.
-    let (tick_broadcast_sender, _tick_broadcast_default_rx) =
-        tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
-            tickvault_common::constants::TICK_BROADCAST_CAPACITY,
-        );
+    // --- Tick broadcast channel (PROCESS-shared) — DELETED 2026-09-02 ---
+    // Audit finding 13: the `broadcast::channel::<ParsedTick>(
+    // TICK_BROADCAST_CAPACITY)` that stood here had NO production publisher
+    // since PR-C2 (2026-07-14) — its own comment said so ("PUBLISHER-LESS …
+    // the consumers below idle by construction") and kept it anyway. A
+    // 262,144-slot ring of ~112-byte ticks is ~40 MB of resident memory on
+    // a box whose entire sizing argument is memory, allocated for two
+    // subscribers that could never wake. Removed together with both
+    // `.subscribe()`s (this task's and the day-OHLC consumer's). The
+    // constant `TICK_BROADCAST_CAPACITY` in `constants.rs` is now UNUSED
+    // and stays in place only because a `common` edit escalates to
+    // workspace-wide tests; a future real tick publisher re-creates the
+    // channel and its consumers together.
     // PR-C3 (2026-07-14): the order-update broadcast channel was removed
     // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
-    // --- Subscriber task: slow-boot observability ---
-    // It `.subscribe()`s to `tick_broadcast_sender` HERE, in the hoisted
-    // prefix, before anything could publish — subscribe-before-publish is
-    // preserved by construction. (The tick-storage broadcast consumer was
+    // --- Slow-boot observability task ---
+    // Cadence-driven only (the 2s QuestDB ping + the 30s stall scan); it no
+    // longer subscribes to anything. (The tick-storage broadcast consumer was
     // REMOVED in this PR's PrevDayCache/TickStorage cleanup — see the dated
     // BATCH-5 note after the block below.) Stage-3 dead-WS sweep (2026-07-17): the
     // 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is DELETED —
     // the seal-writer above stays, fed exclusively by the REST-era candle
     // fold (FOLD-01) further below.
     {
-        let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
         let obs_health = health_status.clone();
         // Does a live tick SOURCE exist this session?
@@ -3791,7 +3793,7 @@ async fn build_shared_infra(
             tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
         );
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health, live_ticks_expected).await;
+            run_slow_boot_observability(questdb_cfg, obs_health, live_ticks_expected).await;
         });
         info!(
             live_ticks_expected,
@@ -3931,7 +3933,6 @@ async fn build_shared_infra(
     Ok(SharedInfraHandles {
         notifier,
         health_status,
-        tick_broadcast_sender,
         api_handle,
     })
 }

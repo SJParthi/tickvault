@@ -23,12 +23,25 @@
 // durability floor; overstating that floor is how a gap gets discovered late.
 // Adding a real fsync is a deliberate throughput trade, not a typo fix.
 //
-// Record format on disk (three versions; replay accepts all three):
+// Record format on disk (four versions; replay accepts all four):
 //     v1 [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame][crc32:u32 LE]
 //     v2 [MAGIC:4="TVW2"][ws_type:u8][frame_seq:u64 LE][len:u32 LE][frame][crc32]
 //     v3 [MAGIC:4="TVW3"][ws_type:u8][frame_seq:u64 LE][received_at_nanos:i64 LE]
 //        [len:u32 LE][frame][crc32]
+//     v4 [MAGIC:4="TVW4"][ws_type:u8][frame_seq:u64 LE][received_at_nanos:i64 LE]
+//        [endpoint:u8][len:u32 LE][frame][crc32]
 // CRC32 covers every header byte of that version, in order, then the frame.
+//
+// WHY v4 EXISTS (2026-09-02). Every one of the 16 Dhan sockets — main feed,
+// depth-20, depth-200 — writes its frames under `WsType::LiveFeed`, and the
+// record carried no endpoint. The boot refold therefore decoded every frame
+// with the MAIN-FEED grammar, recognised a depth frame by sniffing its header,
+// and could do nothing with it but count it: a ring-shed depth frame was
+// captured durably and then never re-persisted, because the replay had no way
+// to know which parser it belonged to. v4 carries the endpoint byte, so a
+// replayed depth frame is routed to the depth drain with its ORIGINAL receipt.
+// A v1–v3 record replays as `WalEndpoint::MainFeed`, which is exactly what the
+// refold assumed before — never a guess, never a synthesized value.
 //
 // WHY v3 EXISTS (2026-08-28). The receipt instant is stamped in
 // `FrameSink::accept` BEFORE this append — correctly, and early. It was then
@@ -128,6 +141,88 @@ impl WsType {
 }
 
 // ---------------------------------------------------------------------------
+// WalEndpoint — one byte tag (TVW4, 2026-09-02) naming WHICH Dhan socket a
+// live-feed frame came off, so replay can route a depth frame to the depth
+// drain instead of sniffing — and mis-sniffing — its header.
+// ---------------------------------------------------------------------------
+
+/// The socket a WAL frame was captured from.
+///
+/// Distinct from [`WsType`], which names the TRANSPORT (and therefore the
+/// broker). Every Dhan market-data socket writes under `WsType::LiveFeed`;
+/// this byte is what tells the main feed's 8-byte-header frames apart from the
+/// depth sockets' 12-byte-header frames at replay time. Mirrors
+/// `DhanEndpointType` one-to-one; the mapping lives on that enum so the two
+/// cannot drift apart silently.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WalEndpoint {
+    /// Live market-data feed: ticker / quote / full packets.
+    MainFeed = 0,
+    /// 20-level market depth.
+    Depth20 = 1,
+    /// 200-level full market depth.
+    Depth200 = 2,
+    /// Order/trade lifecycle events for orders we placed.
+    OrderUpdate = 3,
+}
+
+impl WalEndpoint {
+    /// TOTAL decode: an unknown byte maps to [`WalEndpoint::MainFeed`].
+    ///
+    /// Total on purpose. A record whose endpoint byte this binary does not
+    /// recognise is still a captured frame with a valid CRC; refusing it would
+    /// turn a forward-compatibility gap into a permanent loss. `MainFeed` is
+    /// the pre-v4 assumption, so an unknown value degrades to exactly the
+    /// behaviour every earlier binary had. The reader COUNTS the mapping (one
+    /// coded line per segment) so it is never silent.
+    // TEST-EXEMPT: covered by tvw4_unknown_endpoint_byte_maps_to_main_feed_not_a_panic
+    #[must_use]
+    pub const fn from_u8(b: u8) -> Self {
+        match b {
+            1 => Self::Depth20,
+            2 => Self::Depth200,
+            3 => Self::OrderUpdate,
+            _ => Self::MainFeed,
+        }
+    }
+
+    // TEST-EXEMPT: covered by tvw4_roundtrip_preserves_every_endpoint (asserts from_u8/as_u8 identity)
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    // TEST-EXEMPT: pure enum→&'static str mapping used only for log fields
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MainFeed => "main_feed",
+            Self::Depth20 => "depth_20",
+            Self::Depth200 => "depth_200",
+            Self::OrderUpdate => "order_update",
+        }
+    }
+
+    /// The endpoint a caller that only knows the TRANSPORT can honestly claim.
+    ///
+    /// The order-update transport is its own endpoint; every market-data
+    /// transport defaults to the main feed, because without a
+    /// `DhanEndpointType` in hand that is the only claim that cannot be wrong
+    /// in the dangerous direction (a depth frame labelled main-feed is
+    /// counted-and-skipped on replay; a main-feed frame labelled depth would
+    /// be fed to the wrong parser).
+    // TEST-EXEMPT: covered by append_with_seq_derives_the_endpoint_from_the_transport
+    #[must_use]
+    pub const fn for_ws_type(ws_type: WsType) -> Self {
+        match ws_type {
+            WsType::OrderUpdate => Self::OrderUpdate,
+            WsType::LiveFeed | WsType::TruedataFeed => Self::MainFeed,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -144,6 +239,9 @@ struct WalRecord {
     /// than re-stamping `now()`. [`WAL_RECEIPT_UNKNOWN_NANOS`] when the caller
     /// has none — never a synthesized clock read.
     received_at_nanos: i64,
+    /// TVW4 (2026-09-02): which socket the frame came off, so replay routes a
+    /// depth frame to the depth drain instead of sniffing its header.
+    endpoint: WalEndpoint,
     // Zero-tick-loss PR-8a (H1): `Bytes` (Arc-refcounted) so the WS read
     // loop hands ownership to the disk-writer thread with an O(1) refcount
     // bump instead of a per-frame `Vec<u8>` malloc. Derefs to `&[u8]`, so
@@ -196,6 +294,11 @@ pub struct ReplayedFrame {
     /// arrival — invisible while candles bucketed on the exchange clock, and
     /// data-losing once they bucket on receipt.
     pub received_at_nanos: i64,
+    /// TVW4: the socket this frame was captured from, read back from the v4
+    /// record. [`WalEndpoint::MainFeed`] for v1–v3 records that predate the
+    /// field — which is exactly what every earlier replay assumed, so a legacy
+    /// segment behaves precisely as it did before.
+    pub endpoint: WalEndpoint,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,8 +407,12 @@ pub(crate) const fn wal_queue_budget_from_ceiling(ceiling: Option<u64>) -> u64 {
 fn wal_queue_max_bytes() -> u64 {
     static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
+        // 2026-09-02: OUR unit's cgroup `memory.max`, not the root's. The root
+        // file reads `max` on a bare systemd host whether or not the unit
+        // carries a `MemoryMax=`, so a limit set on tickvault.service was
+        // invisible here and the budget sized itself to the whole machine.
         let ceiling = crate::resource_monitor::resolve_memory_ceiling(
-            Path::new(crate::resource_monitor::DEFAULT_CGROUP_V2_MEMORY_MAX_PATH),
+            &crate::resource_monitor::resolve_cgroup_memory_max_path(),
             Path::new(crate::resource_monitor::DEFAULT_PROC_MEMINFO_PATH),
         );
         let budget = wal_queue_budget_from_ceiling(ceiling.bytes());
@@ -328,8 +435,11 @@ fn wal_queue_max_bytes() -> u64 {
 const WAL_MAGIC: [u8; 4] = *b"TVW1";
 const WAL_MAGIC_V2: [u8; 4] = *b"TVW2";
 /// `TVW3` = v3 record: v2 plus an 8-byte LE `received_at_nanos` after
-/// `frame_seq`. NEW records are always written v3.
+/// `frame_seq`. Replay-only since v4.
 const WAL_MAGIC_V3: [u8; 4] = *b"TVW3";
+/// `TVW4` = v4 record: v3 plus a 1-byte `endpoint` after `received_at_nanos`.
+/// NEW records are always written v4.
+const WAL_MAGIC_V4: [u8; 4] = *b"TVW4";
 
 /// Minimum on-disk record size per version, used by the replay loop guard:
 /// v1 = magic(4)+ws_type(1)+len(4)+crc(4) = 13; v2 inserts frame_seq(8) = 21.
@@ -337,6 +447,8 @@ const WAL_MIN_RECORD_V1: usize = 13;
 const WAL_MIN_RECORD_V2: usize = 21;
 /// v3 inserts received_at_nanos(8) after frame_seq: 21 + 8 = 29.
 const WAL_MIN_RECORD_V3: usize = 29;
+/// v4 inserts endpoint(1) after received_at_nanos: 29 + 1 = 30.
+const WAL_MIN_RECORD_V4: usize = 30;
 
 /// Sentinel written when a caller has no receipt instant to offer, and the
 /// value a v1/v2 record replays with. NEVER a synthesized "now" — see the
@@ -839,27 +951,41 @@ impl WsFrameSpill {
         // No receipt instant offered — record the sentinel, NEVER a clock read
         // here. Minting one would be indistinguishable on replay from a real
         // arrival time, which is the exact defect TVW3 exists to close.
-        self.append_with_seq_at(ws_type, frame, frame_seq, WAL_RECEIPT_UNKNOWN_NANOS)
+        //
+        // No endpoint offered either — derive the only honest one from the
+        // transport (TVW4): the order-update transport IS its endpoint, and a
+        // market-data transport without a `DhanEndpointType` in hand is the
+        // main feed, the pre-v4 assumption. `const fn`, O(1), zero-alloc.
+        self.append_with_seq_at(
+            ws_type,
+            frame,
+            frame_seq,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::for_ws_type(ws_type),
+        )
     }
 
     /// Like [`WsFrameSpill::append_with_seq`] but also persists the frame's
     /// TRUE arrival instant (UTC epoch nanos), so boot replay can restore it
-    /// instead of re-stamping `now()`.
+    /// instead of re-stamping `now()`, and the SOCKET it came off (TVW4), so
+    /// replay can route a depth frame to the depth drain.
     ///
     /// The caller stamps `received_at_nanos` at the read instant, BEFORE this
-    /// append. Hot path, O(1), zero-alloc — the extra field is 8 bytes on an
+    /// append. Hot path, O(1), zero-alloc — the extra fields are 9 bytes on an
     /// already-moved struct.
-    // TEST-EXEMPT: same `try_send` path as `append_with_seq`; the receipt round-trip is covered by tvw3_roundtrip_preserves_received_at and tvw1_and_tvw2_records_replay_with_unknown_receipt.
+    // TEST-EXEMPT: same `try_send` path as `append_with_seq`; the receipt round-trip is covered by tvw3_roundtrip_preserves_received_at, the endpoint round-trip by tvw4_roundtrip_preserves_every_endpoint.
     pub fn append_with_seq_at(
         &self,
         ws_type: WsType,
         frame: impl Into<Bytes>,
         frame_seq: u64,
         received_at_nanos: i64,
+        endpoint: WalEndpoint,
     ) -> AppendOutcome {
         let record = WalRecord {
             ws_type,
             frame_seq,
+            endpoint,
             // Banded at the boundary, not trusted. An out-of-band value is
             // recorded as UNKNOWN rather than persisted, because
             // `tick_persistence` promotes a non-zero receipt to the row's
@@ -1968,8 +2094,11 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
         return 0;
     };
     let mut highest = 0u64;
-    // One header at a time; v3 is the largest at 29 bytes.
-    let mut head = [0u8; WAL_MIN_RECORD_V3];
+    // One header at a time; v4 is the largest at 30 bytes. The buffer MUST be
+    // the largest header — a 29-byte buffer against a 30-byte v4 header read
+    // `filled < min_rec` on every record and returned 0, which re-seeded
+    // nothing and re-issued capture_seq values already in the database.
+    let mut head = [0u8; WAL_MIN_RECORD_V4];
     loop {
         let mut filled = 0usize;
         while filled < head.len() {
@@ -1983,13 +2112,16 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
             return highest;
         }
         let magic = &head[0..4];
+        let is_v4 = magic == WAL_MAGIC_V4;
         let is_v3 = magic == WAL_MAGIC_V3;
         let is_v2 = magic == WAL_MAGIC_V2;
         let is_v1 = magic == WAL_MAGIC;
-        if !is_v1 && !is_v2 && !is_v3 {
+        if !is_v1 && !is_v2 && !is_v3 && !is_v4 {
             return highest;
         }
-        let min_rec = if is_v3 {
+        let min_rec = if is_v4 {
+            WAL_MIN_RECORD_V4
+        } else if is_v3 {
             WAL_MIN_RECORD_V3
         } else if is_v2 {
             WAL_MIN_RECORD_V2
@@ -1999,17 +2131,20 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
         if filled < min_rec {
             return highest;
         }
-        // v1: [magic|ws|len|frame|crc]                 -> len at 5
-        // v2: [magic|ws|seq(8)|len|frame|crc]           -> seq at 5, len at 13
-        // v3: [magic|ws|seq(8)|recv(8)|len|frame|crc]   -> seq at 5, len at 21
-        let len_off = if is_v3 {
+        // v1: [magic|ws|len|frame|crc]                      -> len at 5
+        // v2: [magic|ws|seq(8)|len|frame|crc]                -> seq at 5, len at 13
+        // v3: [magic|ws|seq(8)|recv(8)|len|frame|crc]        -> seq at 5, len at 21
+        // v4: [magic|ws|seq(8)|recv(8)|ep(1)|len|frame|crc]  -> seq at 5, len at 22
+        let len_off = if is_v4 {
+            22
+        } else if is_v3 {
             21
         } else if is_v2 {
             13
         } else {
             5
         };
-        if (is_v2 || is_v3)
+        if (is_v2 || is_v3 || is_v4)
             && let Ok(seq_bytes) = <[u8; 8]>::try_from(&head[5..13])
         {
             highest = highest.max(u64::from_le_bytes(seq_bytes));
@@ -2086,26 +2221,32 @@ pub fn packet_capture_seq(frame_seq: u64, packet_index: u64) -> Option<u64> {
 }
 
 fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
-    // TICK-SEQ-01: always write the v2 record (TVW2 + 8-byte LE frame_seq after
-    // ws_type). `u32::try_from` makes an over-large frame explicit rather than
-    // silently truncating (frames are ≤162 B in production).
+    // Always write the v4 record (TVW4: frame_seq + received_at_nanos +
+    // endpoint after ws_type). `u32::try_from` makes an over-large frame
+    // explicit rather than silently truncating (frames are ≤162 B on the main
+    // feed; depth frames are bounded by the transport's 512 KiB cap).
     let frame_len = u32::try_from(r.frame.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL frame > u32::MAX")
     })?;
     let frame_seq = r.frame_seq.to_le_bytes();
     let receipt = r.received_at_nanos.to_le_bytes();
-    // CRC covers ws_type || frame_seq || received_at_nanos || len || frame.
+    let endpoint = [r.endpoint.as_u8()];
+    // CRC covers ws_type || frame_seq || received_at_nanos || endpoint || len
+    // || frame — every header byte, so a flipped endpoint byte is rejected
+    // rather than silently routing a frame to the wrong parser.
     let crc = crc32_ieee_of(&[
         &[r.ws_type.as_u8()],
         &frame_seq[..],
         &receipt[..],
+        &endpoint[..],
         &frame_len.to_le_bytes()[..],
         &r.frame,
     ]);
-    w.write_all(&WAL_MAGIC_V3)?;
+    w.write_all(&WAL_MAGIC_V4)?;
     w.write_all(&[r.ws_type.as_u8()])?;
     w.write_all(&frame_seq)?;
     w.write_all(&receipt)?;
+    w.write_all(&endpoint)?;
     w.write_all(&frame_len.to_le_bytes())?;
     w.write_all(&r.frame)?;
     w.write_all(&crc.to_le_bytes())?;
@@ -2113,9 +2254,9 @@ fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
 }
 
 fn record_disk_size(r: &WalRecord) -> u64 {
-    // v3: magic(4) + ws_type(1) + frame_seq(8) + receipt(8) + len(4) + frame
-    //     + crc(4) = 29 + frame
-    WAL_MIN_RECORD_V3 as u64 + r.frame.len() as u64
+    // v4: magic(4) + ws_type(1) + frame_seq(8) + receipt(8) + endpoint(1)
+    //     + len(4) + frame + crc(4) = 30 + frame
+    WAL_MIN_RECORD_V4 as u64 + r.frame.len() as u64
 }
 
 fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
@@ -2302,9 +2443,55 @@ pub fn replay_all_with_budget<P: AsRef<Path>>(
     wal_dir: P,
     budget_bytes: usize,
 ) -> anyhow::Result<Vec<ReplayedFrame>> {
+    replay_all_with_report(wal_dir, budget_bytes).map(|batch| batch.frames)
+}
+
+/// One replay pass, WITH the accounting a caller needs to page on it.
+///
+/// `replay_all` / `replay_all_with_budget` return only the frames; the number
+/// of segments the budget DEFERRED was logged inside this function and then
+/// thrown away. A caller draining in rounds — the WAL catch-up loop — could
+/// therefore never tell "the backlog is drained" from "the backlog is deferred
+/// on every round", which is the difference between a healthy boot and a
+/// capacity problem. This struct carries that verdict out.
+#[derive(Debug, Default)]
+pub struct WalReplayBatch {
+    /// The frames read this pass, in capture order.
+    pub frames: Vec<ReplayedFrame>,
+    /// Segments the RAM budget stopped short of. They remain `*.wal` files
+    /// (or were restored to the live dir) and are re-globbed on the next pass.
+    pub deferred_segments: u64,
+    /// Frame-payload bytes held by `frames` — what the budget was measured
+    /// against.
+    pub bytes_replayed: u64,
+    /// The budget this pass ran under, echoed so a log line can carry both
+    /// numbers without the caller re-deriving one.
+    pub budget_bytes: u64,
+}
+
+/// Should THIS deferral page the operator?
+///
+/// Pure and O(1): pages on the first deferral of a boot and never again — a
+/// catch-up loop that defers on every one of its 120 rounds must produce ONE
+/// coded line, not 120 — and never on a pass that deferred nothing. The
+/// caller owns the latch; this decides.
+#[must_use]
+pub const fn should_page_replay_deferred(deferred_segments: u64, already_paged: bool) -> bool {
+    deferred_segments > 0 && !already_paged
+}
+
+// TEST-EXEMPT: covered by replay_all_with_report_counts_deferred_segments_and_bytes + every replay_all test above
+pub fn replay_all_with_report<P: AsRef<Path>>(
+    wal_dir: P,
+    budget_bytes: usize,
+) -> anyhow::Result<WalReplayBatch> {
     let wal_dir = wal_dir.as_ref();
     if !wal_dir.exists() {
-        return Ok(Vec::new()); // APPROVED: boot-time WAL replay, cold path
+        // APPROVED: boot-time WAL replay, cold path
+        return Ok(WalReplayBatch {
+            budget_bytes: budget_bytes as u64,
+            ..WalReplayBatch::default()
+        });
     }
 
     // Re-glob BOTH the in-progress staging dir (un-confirmed leftovers from a
@@ -2492,7 +2679,13 @@ pub fn replay_all_with_budget<P: AsRef<Path>>(
         }
     }
 
-    Ok(frames)
+    // APPROVED: casts — usize counts on a cold boot path, always ≤ u64.
+    Ok(WalReplayBatch {
+        frames,
+        deferred_segments: deferred as u64,
+        bytes_replayed: bytes_held as u64,
+        budget_bytes: budget_bytes as u64,
+    })
 }
 
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
@@ -2574,6 +2767,15 @@ pub struct ArchivePruneOutcome {
     /// the box is actually seeing, which is a different operator signal from
     /// routine age expiry.
     pub size_deleted: usize,
+    /// Bytes freed by the byte-ceiling pass (2026-09-02). Populated ONLY by
+    /// that pass, so on the ACTIVE directory it is the size of un-replayed
+    /// capture that disk pressure destroyed — the number a page has to carry.
+    pub size_deleted_bytes: u64,
+    /// Age, in whole seconds at prune time, of the OLDEST segment the byte
+    /// pass deleted (2026-09-02). Zero when it deleted nothing. Oldest, not
+    /// newest, because the pass deletes oldest-first and this bounds how far
+    /// back the destroyed capture reaches.
+    pub size_deleted_oldest_age_secs: u64,
     /// Total bytes remaining in the archive after both passes.
     pub bytes_after: u64,
 }
@@ -2779,7 +2981,7 @@ fn prune_wal_dir_at(
         // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
         survivors.sort_by_key(|(mtime, _, _)| *mtime);
         let mut remaining = total;
-        for (_, len, path) in &survivors {
+        for (mtime, len, path) in &survivors {
             if remaining <= max_bytes {
                 break;
             }
@@ -2787,6 +2989,13 @@ fn prune_wal_dir_at(
             match std::fs::remove_file(path) {
                 Ok(()) => {
                     outcome.size_deleted += 1;
+                    outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(*len);
+                    // Oldest-first walk, so the FIRST successful delete is the
+                    // oldest one; `max` keeps that true even if an earlier
+                    // remove failed and a later one succeeded.
+                    let age_secs = now.duration_since(*mtime).map_or(0, |d| d.as_secs());
+                    outcome.size_deleted_oldest_age_secs =
+                        outcome.size_deleted_oldest_age_secs.max(age_secs);
                     outcome.kept = outcome.kept.saturating_sub(1);
                     remaining = remaining.saturating_sub(*len);
                 }
@@ -2896,6 +3105,26 @@ pub fn prune_active_segments<P: AsRef<Path>>(
         if outcome.size_deleted > 0 {
             metrics::counter!("tv_ws_wal_active_pruned_under_pressure_total")
                 .increment(outcome.size_deleted as u64);
+            // ONE coded line per pass (2026-09-02). Until now this pass wrote an
+            // `info!` and a counter that is deliberately not EMF-selected — so
+            // capture destroyed under disk pressure reached no log filter and
+            // no alarm. Rides the already-filtered WS-SPILL-01 code with a
+            // distinguishing `source`; no new metric name, no new alarm.
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "active_segment_pruned_under_pressure",
+                segments_deleted = outcome.size_deleted,
+                bytes_freed = outcome.size_deleted_bytes,
+                oldest_segment_age_secs = outcome.size_deleted_oldest_age_secs,
+                max_bytes,
+                "ACTIVE WAL segments were deleted under DISK PRESSURE — un-replayed \
+                 capture that a future boot would otherwise have offered to the refold. \
+                 This is the prune-vs-suspended-QuestDB trade: keeping them would let the \
+                 volume fill, and a full volume WAL-suspends every QuestDB table (which \
+                 keeps ACKing writes it silently does not apply), so the prune protects the \
+                 live tape at the cost of the backlog. A frame shed at the ring \
+                 (tv_dhan_ws_ring_full_total) that reached only the WAL is now gone."
+            );
         }
         info!(
             deleted = outcome.deleted,
@@ -3027,15 +3256,20 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
     let mut out = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut i = 0usize;
     let mut corrupted_at: Option<(&str, usize)> = None;
+    // TVW4 records whose endpoint byte this binary does not recognise. They
+    // replay as `MainFeed` (total decode, never a drop) and are COUNTED here so
+    // the mapping is reported once per segment rather than silently applied.
+    let mut unknown_endpoint = 0usize;
     // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
     // minimum, then re-check the version-specific minimum after the magic check
     // so a partial v2 tail can never be read as if its frame_seq were payload.
     while i + WAL_MIN_RECORD_V1 <= buf.len() {
         let magic = &buf[i..i + 4];
+        let is_v4 = magic == WAL_MAGIC_V4;
         let is_v3 = magic == WAL_MAGIC_V3;
         let is_v2 = magic == WAL_MAGIC_V2;
         let is_v1 = magic == WAL_MAGIC;
-        if !is_v1 && !is_v2 && !is_v3 {
+        if !is_v1 && !is_v2 && !is_v3 && !is_v4 {
             // An unknown magic at offset 0 means the WHOLE segment is
             // unreadable — and the overwhelmingly likely cause is a DEPLOY
             // ROLLBACK: a newer binary wrote a record version this one cannot
@@ -3075,9 +3309,11 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         }
         // Version disambiguation + per-version minimum-size guard (security
         // review HIGH): a v2 record needs 21 bytes before its variable frame,
-        // a v3 record 29. Checked BEFORE any header field is read, so a
-        // partial tail can never be reinterpreted as payload.
-        let min_rec = if is_v3 {
+        // a v3 record 29, a v4 record 30. Checked BEFORE any header field is
+        // read, so a partial tail can never be reinterpreted as payload.
+        let min_rec = if is_v4 {
+            WAL_MIN_RECORD_V4
+        } else if is_v3 {
             WAL_MIN_RECORD_V3
         } else if is_v2 {
             WAL_MIN_RECORD_V2
@@ -3100,6 +3336,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         // v1: [magic|ws|len|frame|crc]
         // v2: [magic|ws|frame_seq(8)|len|frame|crc]
         // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
+        // v4: [magic|ws|frame_seq(8)|received_at_nanos(8)|endpoint(1)|len|frame|crc]
         // Every `try_into` below is on a slice whose bounds the per-version
         // minimum-size guard above has already validated, so these arms are
         // structurally unreachable. They still set `corrupted_at` rather than
@@ -3110,7 +3347,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         // shape of the crash-recovery replay defect found the same day, and
         // "unreachable" is a claim about today's bounds checks rather than a
         // guarantee about tomorrow's.
-        let (frame_seq, received_at_nanos, len_off) = if is_v3 {
+        let (frame_seq, received_at_nanos, endpoint_byte, len_off) = if is_v3 || is_v4 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
                 Ok(b) => b,
                 Err(_) => {
@@ -3125,10 +3362,19 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
                     break;
                 }
             };
+            // v4 carries the endpoint byte at offset 21; v3 has no such byte
+            // and reads as `None`, which maps to `MainFeed` below — the
+            // pre-v4 assumption, stated rather than guessed.
+            let (endpoint_byte, len_off) = if is_v4 {
+                (Some(buf[i + 21]), i + 22)
+            } else {
+                (None, i + 21)
+            };
             (
                 u64::from_le_bytes(seq_bytes),
                 i64::from_le_bytes(recv_bytes),
-                i + 21,
+                endpoint_byte,
+                len_off,
             )
         } else if is_v2 {
             let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
@@ -3141,10 +3387,25 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             (
                 u64::from_le_bytes(seq_bytes),
                 WAL_RECEIPT_UNKNOWN_NANOS,
+                None,
                 i + 13,
             )
         } else {
-            (0u64, WAL_RECEIPT_UNKNOWN_NANOS, i + 5)
+            (0u64, WAL_RECEIPT_UNKNOWN_NANOS, None, i + 5)
+        };
+        // TOTAL mapping: a v1–v3 record has no endpoint and replays as the
+        // main feed (what every earlier replay assumed); a v4 byte this binary
+        // does not recognise ALSO maps to the main feed, but is counted so the
+        // segment reports it once below rather than applying it silently.
+        let endpoint = match endpoint_byte {
+            None => WalEndpoint::MainFeed,
+            Some(b) => {
+                let ep = WalEndpoint::from_u8(b);
+                if ep.as_u8() != b {
+                    unknown_endpoint = unknown_endpoint.saturating_add(1);
+                }
+                ep
+            }
         };
         let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
             Ok(b) => b,
@@ -3185,7 +3446,19 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
         // version's byte set here would reject every record of that version as
         // corrupt, so the arms mirror `write_record` exactly.
         let len_le = (frame_len as u32).to_le_bytes();
-        let actual = if is_v3 {
+        let actual = if is_v4 {
+            // The RAW endpoint byte, not the decoded enum: an unknown value
+            // must still CRC-verify as the bytes on disk, or every record
+            // written by a newer binary would read as corrupt.
+            crc32_ieee_of(&[
+                &[ws_byte],
+                &frame_seq.to_le_bytes()[..],
+                &received_at_nanos.to_le_bytes()[..],
+                &[endpoint_byte.unwrap_or(0)],
+                &len_le[..],
+                &frame,
+            ])
+        } else if is_v3 {
             crc32_ieee_of(&[
                 &[ws_byte],
                 &frame_seq.to_le_bytes()[..],
@@ -3213,8 +3486,26 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             frame,
             frame_seq,
             received_at_nanos,
+            endpoint,
         });
         i = record_end;
+    }
+    if unknown_endpoint > 0 {
+        // Not a loss — every such frame was returned above, as `MainFeed`.
+        // Reported ONCE per segment so the forward-compatibility mapping is
+        // visible in the log rather than applied in silence. Rides the
+        // already-filtered WS-SPILL-01 code with a distinguishing `source`;
+        // no new metric name (cost rule).
+        warn!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "unknown_endpoint_byte",
+            segment = ?path,
+            frames = unknown_endpoint,
+            "WAL replay: TVW4 records carried an endpoint byte this binary does not \
+             recognise — they were replayed as MAIN-FEED frames (the pre-v4 \
+             assumption), never dropped. A newer build wrote them; a depth frame \
+             among them is counted-and-skipped by the refold rather than re-persisted."
+        );
     }
     // CORRUPTION ACCOUNTING -- added 2026-08-28.
     //
@@ -3956,6 +4247,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// FINDING 2 (2026-09-02): the deferral verdict must reach the CALLER,
+    /// not only this function's own log line. Two segments under a 1-byte
+    /// budget: one is consumed, one is deferred, and the report says so with
+    /// the bytes it held and the budget it ran under.
+    #[test]
+    fn replay_all_with_report_counts_deferred_segments_and_bytes() {
+        let dir = tmp_dir("replay-report-defer");
+        for _ in 0..2 {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![7u8; 64]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            wal_segments_in(&dir).len() >= 2,
+            "fixture needs two segments"
+        );
+
+        let first = replay_all_with_report(&dir, 1).expect("replay");
+        assert_eq!(
+            first.frames.len(),
+            1,
+            "one segment is read under a 1-byte budget"
+        );
+        assert_eq!(
+            first.deferred_segments, 1,
+            "the other is DEFERRED, and reported"
+        );
+        assert_eq!(first.bytes_replayed, 64, "payload bytes actually held");
+        assert_eq!(
+            first.budget_bytes, 1,
+            "the budget is echoed for the log line"
+        );
+
+        // The consumed segment was STAGED, not confirmed, so the next pass
+        // re-globs it from `replaying/` alongside the deferred one — the
+        // crash-safety invariant (an unconfirmed segment is always re-read).
+        let rest = replay_all_with_report(&dir, usize::MAX).expect("replay");
+        assert_eq!(rest.deferred_segments, 0, "a drained pass defers nothing");
+        assert_eq!(
+            rest.frames.len(),
+            2,
+            "staged leftover + the deferred segment"
+        );
+        assert_eq!(rest.bytes_replayed, 128);
+
+        let missing = replay_all_with_report(dir.join("never-created"), 5).expect("replay");
+        assert_eq!(missing.frames.len(), 0);
+        assert_eq!(missing.deferred_segments, 0);
+        assert_eq!(
+            missing.budget_bytes, 5,
+            "the budget is echoed even for a missing dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `should_page_replay_deferred` fires ONCE per boot and never on a pass
+    /// that deferred nothing — the caller's latch does the rest.
+    #[test]
+    fn should_page_replay_deferred_fires_once_per_boot_and_never_on_a_drained_pass() {
+        assert!(
+            should_page_replay_deferred(1, false),
+            "first deferral pages"
+        );
+        assert!(should_page_replay_deferred(13, false));
+        assert!(
+            !should_page_replay_deferred(13, true),
+            "already paged this boot: silent"
+        );
+        assert!(
+            !should_page_replay_deferred(0, false),
+            "a drained pass never pages"
+        );
+        assert!(!should_page_replay_deferred(0, true));
+        // The latch shape the catch-up loop uses: 120 deferring rounds, ONE page.
+        let mut paged = false;
+        let mut pages = 0u32;
+        for _ in 0..120 {
+            if should_page_replay_deferred(3, paged) {
+                paged = true;
+                pages += 1;
+            }
+        }
+        assert_eq!(
+            pages, 1,
+            "120 deferring rounds must produce exactly one page"
+        );
+    }
+
     /// The silent, permanent tick-loss path an adversarial sweep found on
     /// 2026-08-28, reproduced end to end.
     ///
@@ -4305,8 +4685,20 @@ mod tests {
         let second: i64 = 1_787_825_000_000_000_000;
         {
             let spill = WsFrameSpill::new(&dir).unwrap();
-            spill.append_with_seq_at(WsType::LiveFeed, vec![1, 2, 3], 11, first);
-            spill.append_with_seq_at(WsType::LiveFeed, vec![4, 5, 6], 12, second);
+            spill.append_with_seq_at(
+                WsType::LiveFeed,
+                vec![1, 2, 3],
+                11,
+                first,
+                WalEndpoint::MainFeed,
+            );
+            spill.append_with_seq_at(
+                WsType::LiveFeed,
+                vec![4, 5, 6],
+                12,
+                second,
+                WalEndpoint::MainFeed,
+            );
             wait_until_persisted(&spill, 2);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -4426,12 +4818,22 @@ mod tests {
     /// writer actually emits, or segments overrun (or under-run) their cap.
     #[test]
     fn tvw3_record_disk_size_matches_the_bytes_written() {
+        // Since TVW4 the writer emits v4, so the rotation accounting is
+        // measured against the v4 encoder; the v3 encoder stays one byte
+        // shorter and is pinned as such so the two cannot be confused.
         let frame = vec![1u8, 2, 3, 4, 5];
-        let encoded = encode_v3_record(WsType::LiveFeed, 1, 1_787_800_000_000_000_000, &frame);
+        let encoded = encode_v4_record(
+            WsType::LiveFeed,
+            1,
+            1_787_800_000_000_000_000,
+            WalEndpoint::MainFeed,
+            &frame,
+        );
         let rec = WalRecord {
             ws_type: WsType::LiveFeed,
             frame_seq: 1,
             received_at_nanos: 1_787_800_000_000_000_000,
+            endpoint: WalEndpoint::MainFeed,
             frame: Bytes::from(frame.clone()),
         };
         assert_eq!(
@@ -4441,6 +4843,11 @@ mod tests {
         );
         assert_eq!(
             encoded.len(),
+            WAL_MIN_RECORD_V4 + frame.len(),
+            "v4 overhead must be exactly {WAL_MIN_RECORD_V4} bytes"
+        );
+        assert_eq!(
+            encode_v3_record(WsType::LiveFeed, 1, 1_787_800_000_000_000_000, &frame).len(),
             WAL_MIN_RECORD_V3 + frame.len(),
             "v3 overhead must be exactly {WAL_MIN_RECORD_V3} bytes"
         );
@@ -4491,7 +4898,7 @@ mod tests {
         let dir = tmp_dir("v3-negative-receipt");
         {
             let spill = WsFrameSpill::new(&dir).unwrap();
-            spill.append_with_seq_at(WsType::LiveFeed, vec![1], 1, -42);
+            spill.append_with_seq_at(WsType::LiveFeed, vec![1], 1, -42, WalEndpoint::MainFeed);
             wait_until_persisted(&spill, 1);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -4572,6 +4979,276 @@ mod tests {
         v.extend_from_slice(frame);
         v.extend_from_slice(&crc.to_le_bytes());
         v
+    }
+
+    /// Test-only encoder for a v4 record, byte-for-byte mirroring
+    /// `write_record`. Kept beside `encode_v3_record` for the same reason: a
+    /// divergence between writer and encoder shows up as a failing
+    /// round-trip rather than silently.
+    fn encode_v4_record(
+        ws: WsType,
+        frame_seq: u64,
+        received_at_nanos: i64,
+        endpoint: WalEndpoint,
+        frame: &[u8],
+    ) -> Vec<u8> {
+        encode_v4_record_raw(ws, frame_seq, received_at_nanos, endpoint.as_u8(), frame)
+    }
+
+    /// The v4 encoder with a RAW endpoint byte, so a value this binary does
+    /// not recognise can be written exactly as a newer binary would write it.
+    fn encode_v4_record_raw(
+        ws: WsType,
+        frame_seq: u64,
+        received_at_nanos: i64,
+        endpoint_byte: u8,
+        frame: &[u8],
+    ) -> Vec<u8> {
+        let len = u32::try_from(frame.len()).expect("test frame fits u32");
+        let seq = frame_seq.to_le_bytes();
+        let recv = received_at_nanos.to_le_bytes();
+        let crc = crc32_ieee_of(&[
+            &[ws.as_u8()],
+            &seq[..],
+            &recv[..],
+            &[endpoint_byte],
+            &len.to_le_bytes()[..],
+            frame,
+        ]);
+        let mut v = Vec::new();
+        v.extend_from_slice(&WAL_MAGIC_V4);
+        v.push(ws.as_u8());
+        v.extend_from_slice(&seq);
+        v.extend_from_slice(&recv);
+        v.push(endpoint_byte);
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(frame);
+        v.extend_from_slice(&crc.to_le_bytes());
+        v
+    }
+
+    // --- TVW4: the endpoint-carrying record (2026-09-02) --------------------
+
+    /// The whole reason v4 exists: every endpoint survives the disk round-trip
+    /// EXACTLY, alongside the receipt. If this regresses, a replayed depth
+    /// frame is fed to the main-feed parser (or vice versa) and silently
+    /// discarded as unparseable.
+    #[test]
+    fn tvw4_roundtrip_preserves_every_endpoint() {
+        let dir = tmp_dir("v4-roundtrip");
+        let receipt: i64 = 1_787_800_000_000_000_000;
+        let all = [
+            WalEndpoint::MainFeed,
+            WalEndpoint::Depth20,
+            WalEndpoint::Depth200,
+            WalEndpoint::OrderUpdate,
+        ];
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            for (i, ep) in all.iter().enumerate() {
+                let seq = (i as u64 + 1) << PACKET_INDEX_BITS;
+                spill.append_with_seq_at(WsType::LiveFeed, vec![i as u8; 3], seq, receipt, *ep);
+            }
+            wait_until_persisted(&spill, all.len() as u64);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), all.len());
+        for (i, ep) in all.iter().enumerate() {
+            assert_eq!(
+                frames[i].endpoint, *ep,
+                "endpoint {ep:?} must round-trip verbatim"
+            );
+            assert_eq!(
+                WalEndpoint::from_u8(ep.as_u8()),
+                *ep,
+                "from_u8/as_u8 identity"
+            );
+            assert_eq!(
+                frames[i].received_at_nanos, receipt,
+                "the receipt still round-trips"
+            );
+            assert_eq!(frames[i].frame, vec![i as u8; 3]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A v4 record whose CRC did not cover the endpoint byte would let a
+    /// flipped byte route a frame to the wrong parser silently. Flip the
+    /// endpoint byte and require the record to be rejected.
+    #[test]
+    fn tvw4_crc_covers_the_endpoint_byte() {
+        let dir = tmp_dir("v4-crc");
+        let seg = dir.join("ws-frames-00000000000000000006.wal");
+        let mut bytes = encode_v4_record(
+            WsType::LiveFeed,
+            5,
+            1_787_800_000_000_000_000,
+            WalEndpoint::Depth20,
+            &[1, 2],
+        );
+        // Endpoint byte sits at offset 21. Corrupt it; the CRC must fail.
+        bytes[21] ^= 0x01;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert!(
+            frames.is_empty(),
+            "an endpoint-byte flip must fail CRC — otherwise the CRC does not \
+             cover the field and a depth frame reaches the main-feed parser"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An endpoint byte this binary does not know (written by a NEWER build)
+    /// must replay as MAIN-FEED — never dropped, never a panic. Dropping it
+    /// would turn a forward-compatibility gap into permanent loss.
+    #[test]
+    fn tvw4_unknown_endpoint_byte_maps_to_main_feed_not_a_panic() {
+        let dir = tmp_dir("v4-unknown-ep");
+        let seg = dir.join("ws-frames-00000000000000000007.wal");
+        let mut bytes = encode_v4_record_raw(
+            WsType::LiveFeed,
+            9,
+            1_787_800_000_000_000_000,
+            0xEE,
+            &[4, 4, 4],
+        );
+        bytes.extend_from_slice(&encode_v4_record_raw(WsType::LiveFeed, 10, 0, 0xFF, &[5]));
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 2, "unknown endpoint bytes are NOT dropped");
+        assert_eq!(frames[0].endpoint, WalEndpoint::MainFeed);
+        assert_eq!(frames[1].endpoint, WalEndpoint::MainFeed);
+        assert_eq!(frames[0].frame, vec![4, 4, 4]);
+        assert_eq!(frames[0].frame_seq, 9);
+        assert_eq!(
+            WalEndpoint::from_u8(0xEE),
+            WalEndpoint::MainFeed,
+            "total decode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A v3 fixture written by the previous binary replays as MAIN-FEED with
+    /// its receipt intact — exactly what every earlier replay assumed, so a
+    /// legacy segment behaves precisely as it did before v4.
+    #[test]
+    fn tvw3_fixture_replays_as_main_feed_with_its_receipt() {
+        let dir = tmp_dir("v4-v3-fixture");
+        let seg = dir.join("ws-frames-00000000000000000008.wal");
+        let receipt: i64 = 1_787_825_000_000_000_000;
+        let bytes = encode_v3_record(WsType::OrderUpdate, 77, receipt, b"{\"o\":1}");
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].endpoint,
+            WalEndpoint::MainFeed,
+            "v3 carries no endpoint"
+        );
+        assert_eq!(frames[0].received_at_nanos, receipt);
+        assert_eq!(frames[0].frame_seq, 77);
+        assert_eq!(frames[0].ws_type, WsType::OrderUpdate);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment that a rollback-then-upgrade left with v3 and v4 records
+    /// interleaved replays every record in order, each with the endpoint its
+    /// own version can honestly claim.
+    #[test]
+    fn tvw3_and_tvw4_records_interleave_in_one_segment() {
+        let dir = tmp_dir("v4-mixed");
+        let seg = dir.join("ws-frames-00000000000000000009.wal");
+        let mut bytes = encode_v3_record(WsType::LiveFeed, 1, 0, &[1]);
+        bytes.extend_from_slice(&encode_v4_record(
+            WsType::LiveFeed,
+            2,
+            0,
+            WalEndpoint::Depth200,
+            &[2],
+        ));
+        bytes.extend_from_slice(&encode_v3_record(WsType::LiveFeed, 3, 0, &[3]));
+        bytes.extend_from_slice(&encode_v4_record(
+            WsType::LiveFeed,
+            4,
+            0,
+            WalEndpoint::Depth20,
+            &[4],
+        ));
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let frames = replay_all(&dir).unwrap();
+        let got: Vec<(u64, WalEndpoint)> =
+            frames.iter().map(|f| (f.frame_seq, f.endpoint)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, WalEndpoint::MainFeed),
+                (2, WalEndpoint::Depth200),
+                (3, WalEndpoint::MainFeed),
+                (4, WalEndpoint::Depth20),
+            ],
+            "every record replays, in capture order, with its own version's endpoint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `append_with_seq` — the entry point with no `DhanEndpointType` in hand
+    /// — must derive the endpoint from the TRANSPORT: the order-update
+    /// transport is its own endpoint, a market-data transport is the main
+    /// feed. A depth label from a caller that cannot know it would feed a
+    /// main-feed frame to the depth parser on replay.
+    #[test]
+    fn append_with_seq_derives_the_endpoint_from_the_transport() {
+        let dir = tmp_dir("v4-derived-ep");
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append_with_seq(WsType::LiveFeed, vec![1], 1 << PACKET_INDEX_BITS);
+            spill.append_with_seq(WsType::OrderUpdate, vec![2], 2 << PACKET_INDEX_BITS);
+            spill.append_with_seq(WsType::TruedataFeed, vec![3], 3 << PACKET_INDEX_BITS);
+            wait_until_persisted(&spill, 3);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].endpoint, WalEndpoint::MainFeed);
+        assert_eq!(
+            frames[1].endpoint,
+            WalEndpoint::OrderUpdate,
+            "order-update transport IS its endpoint"
+        );
+        assert_eq!(frames[2].endpoint, WalEndpoint::MainFeed);
+        assert_eq!(
+            WalEndpoint::for_ws_type(WsType::OrderUpdate),
+            WalEndpoint::OrderUpdate
+        );
+        assert_eq!(
+            WalEndpoint::for_ws_type(WsType::LiveFeed),
+            WalEndpoint::MainFeed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The high-water probe reads v4 headers: a 29-byte buffer against a
+    /// 30-byte header would return 0 on every record and re-seed nothing.
+    #[test]
+    fn the_reseed_probe_reads_a_tvw4_header() {
+        let dir = tmp_dir("v4-reseed");
+        let seg = dir.join("ws-frames-00000000000000000010.wal");
+        let seq = 4_242u64 << PACKET_INDEX_BITS;
+        let bytes = encode_v4_record(WsType::LiveFeed, seq, 0, WalEndpoint::Depth20, &[1, 2, 3]);
+        std::fs::write(&seg, &bytes).unwrap();
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            seq,
+            "the probe must read the sequence out of a v4 header"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5032,6 +5709,38 @@ mod tests {
             staged.exists(),
             "replaying/ holds unconfirmed frames — never touchable by this pass"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING 3 (2026-09-02): the byte-ceiling prune of the ACTIVE directory
+    /// destroys un-replayed capture, and its outcome carried only a COUNT. The
+    /// page has to say how many bytes and how far back — so the pass reports
+    /// the bytes it freed and the age of the oldest segment it deleted.
+    #[test]
+    fn active_byte_ceiling_prune_reports_bytes_freed_and_oldest_age() {
+        let dir = tmp_dir("active-prune-pressure-report");
+        let now = SystemTime::now();
+        // Three 13-byte segments ("segment-bytes"), 3 h / 2 h / 1 h old, all
+        // inside retention. A 20-byte ceiling forces the two OLDEST out.
+        let oldest = plant_active_file(&dir, "ws-frames-00000000000000000040.wal", now, 10_800);
+        let middle = plant_active_file(&dir, "ws-frames-00000000000000000041.wal", now, 7_200);
+        let newest = plant_active_file(&dir, "ws-frames-00000000000000000042.wal", now, 3_600);
+        let outcome = prune_active_segments_at(&dir, 172_800, 20, now);
+        assert_eq!(outcome.deleted, 0, "nothing is age-expired");
+        assert_eq!(outcome.size_deleted, 2, "two oldest removed by the ceiling");
+        assert_eq!(outcome.size_deleted_bytes, 26, "13 B x 2 segments freed");
+        assert_eq!(
+            outcome.size_deleted_oldest_age_secs, 10_800,
+            "the OLDEST deleted segment's age, not the newest"
+        );
+        assert!(!oldest.exists() && !middle.exists());
+        assert!(newest.exists(), "the newest survives");
+        // A pass that deletes nothing under pressure reports zeros, so the
+        // page can never carry a stale number from a previous pass.
+        let quiet = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        assert_eq!(quiet.size_deleted, 0);
+        assert_eq!(quiet.size_deleted_bytes, 0);
+        assert_eq!(quiet.size_deleted_oldest_age_secs, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5502,6 +6211,7 @@ mod tests {
             frame: Bytes::from_static(&[1, 2, 3, 4]),
             frame_seq: far_future,
             received_at_nanos: 42,
+            endpoint: WalEndpoint::MainFeed,
         };
         let f = File::create(&seg).expect("segment");
         let mut w = BufWriter::new(f);
@@ -5541,6 +6251,7 @@ mod tests {
             // Deliberately tiny: far below any wall-clock-seeded value.
             frame_seq: 1 << PACKET_INDEX_BITS,
             received_at_nanos: 7,
+            endpoint: WalEndpoint::MainFeed,
         };
         let f = File::create(&seg).expect("segment");
         let mut w = BufWriter::new(f);
@@ -5573,6 +6284,7 @@ mod tests {
             frame: Bytes::from_static(&[1, 2, 3]),
             frame_seq: good_seq,
             received_at_nanos: 5,
+            endpoint: WalEndpoint::MainFeed,
         };
         let f = File::create(&seg).expect("segment");
         let mut w = BufWriter::new(f);
@@ -5678,6 +6390,7 @@ mod tests {
             frame: Bytes::from_static(&[1, 2, 3, 4]),
             frame_seq: far_future,
             received_at_nanos: 11,
+            endpoint: WalEndpoint::MainFeed,
         };
         let f = File::create(&seg).expect("segment");
         let mut w = BufWriter::new(f);

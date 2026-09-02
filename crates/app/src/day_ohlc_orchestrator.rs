@@ -116,7 +116,20 @@ pub const IST_MIDNIGHT_SECOND: u32 = 0;
 ///
 /// On `broadcast::Lagged`, increments a counter and continues. Closed
 /// channel exits the task (process shutdown).
-// TEST-EXEMPT: tokio::spawn wrapper over `broadcast::recv` — per-tick logic `tracker.update_tick()` is tested in `day_ohlc_tracker.rs::tests`; spawn site pinned by `test_day_ohlc_orchestrator_is_wired_into_main`.
+///
+/// # NOT SPAWNED from main.rs since 2026-09-02 (audit finding 13)
+///
+/// The process tick broadcast this consumer drained had NO production
+/// publisher since PR-C2 (2026-07-14): every `tick_tx.send` in the workspace
+/// sits inside `#[cfg(test)]` in `trading_pipeline.rs`, and the revived Dhan
+/// live lane folds its ticks internally (`dhan_feed_stack`) without ever
+/// publishing to the channel. main.rs therefore allocated a 262,144-slot
+/// `ParsedTick` ring (~40 MB) plus this subscriber, which could never wake.
+/// The channel and the spawn site are deleted; this function is RETAINED,
+/// publisher-ready, so a future real tick publisher can wire it back with a
+/// one-line spawn — its `secret_manager.rs` pin now asserts the ABSENCE of a
+/// publisher-less subscribe instead of the presence of this call.
+// TEST-EXEMPT: tokio::spawn wrapper over `broadcast::recv` — per-tick logic `tracker.update_tick()` is tested in `day_ohlc_tracker.rs::tests`; no production spawn site since 2026-09-02 (publisher-less broadcast deleted, see the doc above).
 pub fn spawn_day_ohlc_tick_consumer(
     tracker: Arc<DayOhlcTracker>,
     mut rx: broadcast::Receiver<ParsedTick>,

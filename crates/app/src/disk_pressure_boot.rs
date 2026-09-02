@@ -40,8 +40,8 @@ use tickvault_common::ingest_shed::{
 };
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
-    PressureAction, PressureProbe, PressureState, apply_action, decide_pressure_action,
-    pressure_hot_days, thresholds_are_sane, used_pct_from,
+    PressureAction, PressureProbe, PressureState, ProbeHealth, ProbeHealthTransition, apply_action,
+    decide_pressure_action, pressure_hot_days, thresholds_are_sane, used_pct_from,
 };
 use tickvault_storage::partition_archive::PartitionArchiver;
 use tracing::{error, info, warn};
@@ -53,6 +53,35 @@ pub const DISK_PRESSURE_POLL_INTERVAL_SECS: u64 = 60;
 
 /// Backoff before respawning the loop after an unexpected exit.
 pub const DISK_PRESSURE_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// How long the disk-pressure probe may fail CONSECUTIVELY before its silence
+/// is itself the finding (2026-09-02, audit finding 10).
+///
+/// A failed probe correctly decides `Idle` — a blind probe must never trigger
+/// a drop — but a probe that fails every poll idles the pressure archiver for
+/// the whole session with only a per-poll `warn!` and a counter nothing
+/// pages on. Five minutes is long enough that a transient `statvfs` hiccup
+/// never pages, and short enough that an unmounted data volume is reported
+/// while there is still a session left to act in.
+pub const PRESSURE_PROBE_FAILING_AFTER_SECS: u64 = 300;
+
+/// [`PRESSURE_PROBE_FAILING_AFTER_SECS`] expressed in polls — DERIVED from the
+/// poll cadence so a change to the interval cannot silently change the
+/// wall-clock threshold. Const-asserted: exact division (no rounding hides a
+/// mismatch) and at least two polls (one failed poll is a blip).
+pub const PRESSURE_PROBE_FAILING_POLLS: u32 = {
+    let polls = PRESSURE_PROBE_FAILING_AFTER_SECS / DISK_PRESSURE_POLL_INTERVAL_SECS;
+    assert!(
+        polls * DISK_PRESSURE_POLL_INTERVAL_SECS == PRESSURE_PROBE_FAILING_AFTER_SECS,
+        "PRESSURE_PROBE_FAILING_AFTER_SECS must be an exact multiple of the poll interval"
+    );
+    assert!(
+        polls >= 2,
+        "a sustained probe failure needs at least two polls"
+    );
+    // Bounded by the assert above (300 / 60 = 5); the cast cannot truncate.
+    polls as u32
+};
 
 /// Build the retention config an archive pass should use while under
 /// pressure: every high-volume class compressed to the pressure window.
@@ -202,6 +231,9 @@ async fn run_disk_pressure_loop(
     cfg: PartitionRetentionConfig,
 ) {
     let mut state = PressureState::default();
+    // Edge latch for a PERSISTENTLY blind probe — fed every poll, pages once
+    // per episode (2026-09-02, audit finding 10). It changes no action.
+    let mut probe_health = ProbeHealth::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(DISK_PRESSURE_POLL_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Monotonic seconds since the loop started — supplied to the pure
@@ -263,6 +295,38 @@ async fn run_disk_pressure_loop(
 
         let action = decide_pressure_action(probe, &state, &cfg, now_secs);
         let used = probe.used_pct.unwrap_or(0);
+
+        // A probe that has been blind for PRESSURE_PROBE_FAILING_AFTER_SECS
+        // has idled the whole pressure archiver for that long: every poll
+        // above correctly decided `Idle` on a reading it never got, and the
+        // only trace was a per-poll `warn!` plus a counter nothing pages on.
+        // The archiver is the one automatic mechanism that reclaims disk, so
+        // its silent stand-down is exactly the class STORAGE-GAP-05 exists
+        // for — it rides that existing filtered code with its own `source`.
+        match probe_health.observe(probe.used_pct.is_some(), PRESSURE_PROBE_FAILING_POLLS) {
+            ProbeHealthTransition::Unchanged => {}
+            ProbeHealthTransition::FailingSustained => {
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    source = "pressure_probe_failing",
+                    consecutive_failed_polls = probe_health.consecutive_failures(),
+                    failing_after_secs = PRESSURE_PROBE_FAILING_AFTER_SECS,
+                    path = %data_dir.display(),
+                    "the disk-pressure probe has FAILED on every poll for \
+                     {PRESSURE_PROBE_FAILING_AFTER_SECS}s — pressure archival is IDLE \
+                     because it cannot see the volume, not because the volume is fine. \
+                     Free space is UNKNOWN from here; check the data volume is mounted \
+                     and readable (df on it) before trusting any disk gauge"
+                );
+            }
+            ProbeHealthTransition::Recovered => {
+                info!(
+                    path = %data_dir.display(),
+                    "the disk-pressure probe is reading the volume again — pressure \
+                     archival resumes deciding on real numbers"
+                );
+            }
+        }
 
         // The SECOND lever. Everything below this line reclaims space by
         // deleting old data; this one stops writing new data, and it only
@@ -857,5 +921,57 @@ mod self_measured_burn_tests {
         // And the live value is in range on this machine's clock.
         let now = secs_of_day_ist();
         assert!(now < 86_400, "seconds-of-day out of range: {now}");
+    }
+}
+
+#[cfg(test)]
+mod probe_health_wiring_tests {
+    use super::{
+        DISK_PRESSURE_POLL_INTERVAL_SECS, PRESSURE_PROBE_FAILING_AFTER_SECS,
+        PRESSURE_PROBE_FAILING_POLLS,
+    };
+
+    /// 2026-09-02 (audit finding 10): the sustained-failure threshold is
+    /// DERIVED from the poll cadence, not typed beside it, so a future change
+    /// to the interval cannot silently change how long a blind probe stays
+    /// unreported.
+    #[test]
+    fn the_failing_threshold_is_derived_from_the_poll_cadence() {
+        assert_eq!(
+            u64::from(PRESSURE_PROBE_FAILING_POLLS) * DISK_PRESSURE_POLL_INTERVAL_SECS,
+            PRESSURE_PROBE_FAILING_AFTER_SECS,
+            "polls × interval must equal the wall-clock threshold exactly"
+        );
+        assert!(
+            PRESSURE_PROBE_FAILING_POLLS >= 2,
+            "a single failed poll is a blip, never a sustained failure"
+        );
+    }
+
+    /// The latch is fed on EVERY poll (both probe arms), pages once on the
+    /// sustained edge with the existing STORAGE-GAP-05 filter and a `source`
+    /// field, and logs the recovery. Source-scan, because the loop needs a
+    /// disk and a tokio runtime to reach.
+    #[test]
+    fn the_probe_health_latch_is_wired_into_the_loop() {
+        let src = include_str!("disk_pressure_boot.rs");
+        let cutoff = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cutoff];
+        assert!(
+            prod.contains(
+                "probe_health.observe(probe.used_pct.is_some(), PRESSURE_PROBE_FAILING_POLLS)"
+            ),
+            "the latch must be fed the probe verdict every poll"
+        );
+        assert!(
+            prod.contains("ProbeHealthTransition::FailingSustained =>")
+                && prod.contains("source = \"pressure_probe_failing\"")
+                && prod.contains("StorageGap05DiskPressureUnrelievable.code_str()"),
+            "the sustained edge must page on the existing STORAGE-GAP-05 filter with its source"
+        );
+        assert!(
+            prod.contains("ProbeHealthTransition::Recovered =>"),
+            "the recovery edge must be logged"
+        );
     }
 }

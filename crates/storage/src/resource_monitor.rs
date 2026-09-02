@@ -167,8 +167,14 @@ pub fn parse_meminfo_total_bytes(meminfo_body: &str) -> Option<u64> {
 /// to tell "no ceiling" apart from "ceiling of zero".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryCeiling {
-    /// A real cgroup limit. The OOM killer enforces exactly this.
+    /// A real cgroup `memory.max` limit. The OOM killer enforces exactly this.
     Cgroup(u64),
+    /// A cgroup `memory.high` throttle with NO hard `memory.max` (2026-09-02).
+    /// The kernel does not kill at this line, it reclaims aggressively and
+    /// stalls the allocator — which on the drain task is tick loss, not a
+    /// page. So it is the ceiling RESOURCE-02 should warn against when a
+    /// unit sets `MemoryHigh=` without `MemoryMax=`.
+    CgroupHigh(u64),
     /// No cgroup limit — the MACHINE's own RAM is what binds.
     HostTotal(u64),
     /// Neither could be read. Nothing can be concluded about memory.
@@ -180,7 +186,7 @@ impl MemoryCeiling {
     #[must_use]
     pub const fn bytes(self) -> Option<u64> {
         match self {
-            Self::Cgroup(b) | Self::HostTotal(b) => Some(b),
+            Self::Cgroup(b) | Self::CgroupHigh(b) | Self::HostTotal(b) => Some(b),
             Self::Unknown => None,
         }
     }
@@ -190,10 +196,90 @@ impl MemoryCeiling {
     pub const fn source(self) -> &'static str {
         match self {
             Self::Cgroup(_) => "cgroup",
+            Self::CgroupHigh(_) => "cgroup_high",
             Self::HostTotal(_) => "host_total",
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// PURE: resolve the ceiling from the three file BODIES, in priority order.
+///
+/// 1. `memory.max` numeric — the hard limit, the OOM killer's line.
+/// 2. `memory.high` numeric — the throttle line, when there is no hard limit.
+/// 3. `MemTotal` — the machine, when the cgroup binds nothing.
+///
+/// Each step is fail-soft: an absent or unparseable body (`None`, `max`,
+/// garbage) falls through to the next rather than to `Unknown`, so a host
+/// with a readable `/proc/meminfo` always resolves SOMETHING. `Unknown` is
+/// only reached when all three are unusable.
+#[must_use]
+// TEST-EXEMPT: pinned by the three ceiling_order_* cases in ceiling_order_tests (max, high, MemTotal)
+pub fn memory_ceiling_from_bodies(
+    memory_max_body: Option<&str>,
+    memory_high_body: Option<&str>,
+    meminfo_body: Option<&str>,
+) -> MemoryCeiling {
+    if let Some(limit) = memory_max_body.and_then(parse_cgroup_memory_max_bytes) {
+        return MemoryCeiling::Cgroup(limit);
+    }
+    // `memory.high` has the same single-token grammar as `memory.max`
+    // (a byte count or the literal `max`), so the same parser applies.
+    if let Some(high) = memory_high_body.and_then(parse_cgroup_memory_max_bytes) {
+        return MemoryCeiling::CgroupHigh(high);
+    }
+    match meminfo_body.and_then(parse_meminfo_total_bytes) {
+        Some(total) => MemoryCeiling::HostTotal(total),
+        None => MemoryCeiling::Unknown,
+    }
+}
+
+/// The `memory.high` file that sits beside a given `memory.max` path — same
+/// cgroup directory, sibling file. Pure path arithmetic, no fs access.
+#[must_use]
+// TEST-EXEMPT: pinned by resolve_memory_ceiling_reads_memory_high_beside_memory_max
+pub fn memory_high_path_beside(memory_max_path: &Path) -> PathBuf {
+    memory_max_path.with_file_name("memory.high")
+}
+
+/// PURE: the `memory.max` path of OUR cgroup, from `/proc/self/cgroup`.
+///
+/// Delegates to [`crate::oom_monitor::memory_events_path_from_proc_cgroup`]
+/// — the one resolver of "which cgroup directory is ours" — and swaps the
+/// file name, so the two monitors can never disagree about which cgroup they
+/// are reading. `None` means "use the fallback" (cgroup v1, or the root).
+#[must_use]
+// TEST-EXEMPT: pinned by cgroup_memory_max_path_resolves_the_unit_cgroup_not_the_root in ceiling_order_tests
+pub fn cgroup_memory_max_path_from_proc_cgroup(proc_cgroup: &str) -> Option<PathBuf> {
+    crate::oom_monitor::memory_events_path_from_proc_cgroup(proc_cgroup)
+        .map(|events| events.with_file_name("memory.max"))
+}
+
+/// The `memory.max` path RESOURCE-02 (and the WAL byte budget) should read on
+/// THIS host.
+///
+/// # The defect this closes (2026-09-02)
+///
+/// `platform_defaults` read [`DEFAULT_CGROUP_V2_MEMORY_MAX_PATH`] — the ROOT
+/// cgroup's `memory.max` — which on a bare systemd host is the literal `max`
+/// whether or not `tickvault.service` carries a `MemoryMax=`. So a limit set
+/// on OUR unit was invisible to the monitor: it fell through to `MemTotal`
+/// and measured the process against 32 GiB while the kernel would kill it at
+/// the unit's line. `oom_monitor` already resolved the unit's cgroup from
+/// `/proc/self/cgroup` for exactly this reason; this is the same resolution
+/// applied to the sibling file.
+///
+/// Reads `/proc/self/cgroup` and delegates to
+/// [`cgroup_memory_max_path_from_proc_cgroup`]; any failure falls back to
+/// the root path, never to a panic.
+// TEST-EXEMPT: thin fs-read wrapper over the fully-tested pure resolver; the
+// fallback arm is `resolve_cgroup_memory_max_path_always_ends_in_memory_max`.
+#[must_use]
+pub fn resolve_cgroup_memory_max_path() -> PathBuf {
+    std::fs::read_to_string(crate::oom_monitor::PROC_SELF_CGROUP_PATH)
+        .ok()
+        .and_then(|body| cgroup_memory_max_path_from_proc_cgroup(&body))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CGROUP_V2_MEMORY_MAX_PATH))
 }
 
 /// Resolves the memory ceiling, preferring a cgroup limit and falling back to
@@ -232,17 +318,17 @@ pub fn resolve_memory_ceiling(
     cgroup_memory_max_path: &Path,
     proc_meminfo_path: &Path,
 ) -> MemoryCeiling {
-    if let Some(limit) = probe_cgroup_memory_max_bytes(cgroup_memory_max_path) {
-        return MemoryCeiling::Cgroup(limit);
-    }
-    match std::fs::read_to_string(proc_meminfo_path)
-        .ok()
-        .as_deref()
-        .and_then(parse_meminfo_total_bytes)
-    {
-        Some(total) => MemoryCeiling::HostTotal(total),
-        None => MemoryCeiling::Unknown,
-    }
+    // 2026-09-02: `memory.high` (read beside `memory.max`) joins the order
+    // between the hard limit and the machine total. The pure priority lives
+    // in `memory_ceiling_from_bodies`; this is only the three fs reads.
+    let max_body = std::fs::read_to_string(cgroup_memory_max_path).ok();
+    let high_body = std::fs::read_to_string(memory_high_path_beside(cgroup_memory_max_path)).ok();
+    let meminfo_body = std::fs::read_to_string(proc_meminfo_path).ok();
+    memory_ceiling_from_bodies(
+        max_body.as_deref(),
+        high_body.as_deref(),
+        meminfo_body.as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +402,9 @@ impl ResourceMonitorPaths {
             proc_self_fd: PathBuf::from(DEFAULT_PROC_SELF_FD_PATH),
             proc_self_limits: PathBuf::from(DEFAULT_PROC_SELF_LIMITS_PATH),
             proc_self_status: PathBuf::from(DEFAULT_PROC_SELF_STATUS_PATH),
-            cgroup_memory_max: PathBuf::from(DEFAULT_CGROUP_V2_MEMORY_MAX_PATH),
+            // OUR unit's cgroup, not the root's (2026-09-02) — see
+            // `resolve_cgroup_memory_max_path` for the limit this used to miss.
+            cgroup_memory_max: resolve_cgroup_memory_max_path(),
             proc_meminfo: PathBuf::from(DEFAULT_PROC_MEMINFO_PATH),
             spill_dir,
         }
@@ -862,5 +950,118 @@ mod tests {
             "supervisor must keep running, not exit after spawning the monitor"
         );
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod ceiling_order_tests {
+    use super::{
+        DEFAULT_CGROUP_V2_MEMORY_MAX_PATH, MemoryCeiling, cgroup_memory_max_path_from_proc_cgroup,
+        memory_ceiling_from_bodies, memory_high_path_beside, resolve_cgroup_memory_max_path,
+        resolve_memory_ceiling,
+    };
+    use std::path::{Path, PathBuf};
+
+    const MEMINFO: &str = "MemTotal:       32827080 kB\nMemFree:        1234 kB\n";
+
+    #[test]
+    fn a_hard_max_wins_over_high_and_the_machine() {
+        assert_eq!(
+            memory_ceiling_from_bodies(Some("2147483648\n"), Some("1073741824\n"), Some(MEMINFO)),
+            MemoryCeiling::Cgroup(2_147_483_648)
+        );
+    }
+
+    #[test]
+    fn memory_high_is_the_ceiling_when_max_is_unlimited() {
+        let c = memory_ceiling_from_bodies(Some("max\n"), Some("1073741824\n"), Some(MEMINFO));
+        assert_eq!(c, MemoryCeiling::CgroupHigh(1_073_741_824));
+        assert_eq!(c.source(), "cgroup_high");
+        assert_eq!(c.bytes(), Some(1_073_741_824));
+    }
+
+    #[test]
+    fn the_machine_total_is_the_ceiling_when_both_cgroup_files_are_unusable() {
+        // `max`, absent, and garbage each fall through — never to Unknown
+        // while MemTotal is readable.
+        for (max, high) in [
+            (Some("max\n"), Some("max\n")),
+            (None, None),
+            (Some("not-a-number"), Some("")),
+        ] {
+            assert_eq!(
+                memory_ceiling_from_bodies(max, high, Some(MEMINFO)),
+                MemoryCeiling::HostTotal(32_827_080 * 1024),
+                "max={max:?} high={high:?}"
+            );
+        }
+        assert_eq!(
+            memory_ceiling_from_bodies(None, None, None),
+            MemoryCeiling::Unknown
+        );
+    }
+
+    #[test]
+    fn resolve_reads_memory_high_beside_memory_max() {
+        let dir =
+            std::env::temp_dir().join(format!("tv-resource-monitor-high-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let max = dir.join("memory.max");
+        let meminfo = dir.join("meminfo");
+        std::fs::write(&max, "max\n").unwrap_or_else(|e| panic!("write: {e}"));
+        std::fs::write(memory_high_path_beside(&max), "536870912\n")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        std::fs::write(&meminfo, MEMINFO).unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(
+            resolve_memory_ceiling(&max, &meminfo),
+            MemoryCeiling::CgroupHigh(536_870_912),
+            "the SIBLING memory.high in the same cgroup dir must be read"
+        );
+        assert_eq!(
+            memory_high_path_beside(Path::new(
+                "/sys/fs/cgroup/system.slice/x.service/memory.max"
+            )),
+            PathBuf::from("/sys/fs/cgroup/system.slice/x.service/memory.high")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_unit_cgroup_is_resolved_not_the_root() {
+        // The production shape: systemd puts the service in its own cgroup.
+        // Reading the ROOT memory.max here would miss a MemoryMax= on the unit.
+        assert_eq!(
+            cgroup_memory_max_path_from_proc_cgroup("0::/system.slice/tickvault.service\n"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/system.slice/tickvault.service/memory.max"
+            ))
+        );
+        // Root and cgroup-v1 shapes mean "use the fallback".
+        assert_eq!(cgroup_memory_max_path_from_proc_cgroup("0::/\n"), None);
+        assert_eq!(
+            cgroup_memory_max_path_from_proc_cgroup("12:memory:/user.slice\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_cgroup_memory_max_path_always_ends_in_memory_max() {
+        // Whatever this host's /proc/self/cgroup says (a container, a bare
+        // box, macOS), the resolved path names the right FILE, and the
+        // fallback is the documented root constant.
+        let p = resolve_cgroup_memory_max_path();
+        assert_eq!(p.file_name().and_then(|f| f.to_str()), Some("memory.max"));
+        assert!(
+            p.starts_with("/sys/fs/cgroup"),
+            "{} must live under the cgroup-v2 mount",
+            p.display()
+        );
+        assert_eq!(
+            Path::new(DEFAULT_CGROUP_V2_MEMORY_MAX_PATH)
+                .file_name()
+                .and_then(|f| f.to_str()),
+            Some("memory.max")
+        );
     }
 }

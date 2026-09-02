@@ -83,6 +83,7 @@ fn live(
         sockets.push(Depth20LiveSocket {
             tx,
             held: h.clone(),
+            pending: Vec::new(),
         });
         rxs.push(rx);
     }
@@ -174,7 +175,7 @@ proptest! {
             let mut got = Vec::new();
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {
-                    LiveSubscriptionCommand::Swap { old, new } => got.push((key(old), key(new))),
+                    LiveSubscriptionCommand::Swap { old, new, .. } => got.push((key(old), key(new))),
                     other => prop_assert!(false, "unexpected command {other:?}"),
                 }
             }
@@ -200,7 +201,11 @@ proptest! {
             .map(|h| {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 drop(rx);
-                Depth20LiveSocket { tx, held: h.clone() }
+                Depth20LiveSocket {
+                    tx,
+                    held: h.clone(),
+                    pending: Vec::new(),
+                }
             })
             .collect();
         let sent = apply_depth20_plan(&mut sockets, &plan);
@@ -223,7 +228,11 @@ proptest! {
             .map(|h| {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 drop(rx);
-                Depth20LiveSocket { tx, held: h.clone() }
+                Depth20LiveSocket {
+                    tx,
+                    held: h.clone(),
+                    pending: Vec::new(),
+                }
             })
             .collect();
         apply_depth20_plan(&mut sockets, &first);
