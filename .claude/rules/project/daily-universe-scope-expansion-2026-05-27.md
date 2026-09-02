@@ -891,6 +891,73 @@ materializes from them — 512 MiB of frames expanded into 22.2M depth rows and
 ~15 GiB of RAM, roughly **30× amplification**. Bounding the wrong quantity is a
 code fix, tracked separately from this grow.
 
+> ### ✅ RESOLVED 2026-09-02 — and the amplification was never the whole story
+>
+> The paragraph above is right that `WAL_REPLAY_MAX_BYTES` bounds the wrong
+> quantity, and right that the fix is code. What it does not say — because
+> nobody had read the replay loop yet — is that **the replay path had no
+> flush trigger at all**, while the live drain has had two since it was
+> written.
+>
+> `refold_wal_frames` appended the entire staged batch into ONE ILP buffer and
+> its caller flushed exactly once, after the loop. The live drain flushes on
+> `FLUSH_ROW_THRESHOLD` (1,000 tick rows) and `DEPTH_FLUSH_ROW_THRESHOLD`
+> (10,000 depth rows). Replay had neither.
+>
+> **MEASURED on the 2026-09-02 evening boot, from that session's own log
+> lines** — not projected:
+>
+> | Reading | Value |
+> |---|---:|
+> | Depth rows in a single ILP buffer | **22,324,960** |
+> | That buffer's size | **4,004,164,571 bytes (4.0 GB)** |
+> | questdb-rs `max_buf_size` | 104,857,600 bytes |
+> | Times the flush failed this way in one boot | **13** |
+> | Process RSS peak | **16,646,799,360 (16.65 GB)** |
+> | `MemoryHigh` ceiling it crossed | 16,106,127,360 (15 GiB) |
+>
+> **The consequence is worse than the memory, and it is the part the
+> amplification framing hides.** A 4 GB buffer can never be accepted, so the
+> flush did not merely fail under load — it was **structurally incapable of
+> succeeding**. Every replayed depth row therefore went to the spill tier
+> instead of QuestDB, on every boot with a backlog. Nothing was LOST (the
+> rescue is durable and re-ingestable, and `not_folded: 0`), but the replay
+> was not replaying: it was moving rows from one file to another at a cost of
+> 4 GB of RSS.
+>
+> **FIXED** by giving the replay loop the same two size triggers the live
+> drain uses, at the TOP of the frame loop. The placement is the load-bearing
+> detail and is pinned by a source assertion: the depth arm `continue`s at its
+> own end, so a trigger at the tidier-looking bottom of the loop would be
+> skipped by exactly the frames that build the buffer — 22.3M depth rows
+> against 2.4M tick rows on that boot. Guard:
+> `dhan_feed_stack.rs::the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer`,
+> bite-proven in both directions (remove the trigger → fails; move it below
+> the match → fails naming the `continue`).
+>
+> The live thresholds are reused rather than a replay-specific pair being
+> invented: they are already proven at a far higher sustained rate, and one
+> number is one thing to keep true.
+>
+> **⚠ What this does NOT fix.** It does not reduce the ~30× amplification the
+> paragraph above names — 512 MiB of frames still materializes ~22M depth
+> rows; they are now flushed in ~2,400 bounded batches instead of held as one
+> 4 GB buffer. It does not make replay free: ~2,400 HTTP round trips at boot
+> is real work, and if QuestDB is slow at boot that work is slower. And it
+> does not touch the depth row volume itself, which is the actual driver
+> (`market_depth` at 24× the tick row count).
+>
+> **The reusable lesson is the one this file keeps recording.** The memory
+> symptom was attributed, in-session, to the catch-up progress floor shipped
+> hours earlier — a plausible story, since that floor is what made round 0
+> run at all. It was wrong. The floor recovered 2,295,837 and 2,303,083 frames
+> where the previous night recovered zero, and the catch-up memory guard then
+> stood the loop down at round 1 exactly as designed. The 4 GB buffer was a
+> pre-existing defect the floor merely exposed by finally doing the work. A
+> symptom that appears right after a change is not evidence that the change
+> caused it, and the log line naming the real cause was already in the same
+> query.
+
 #### What a PR that violates Quote 20 looks like (REJECT)
 
 - Grows the volume beyond 500 GB without a fresh dated quote AND a lever that
