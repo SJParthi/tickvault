@@ -983,9 +983,35 @@ code fix, tracked separately from this grow.
 > **The fix bounds BOTH replay call sites**, which is why it addresses the loop
 > and not just the catch-up drain: the trigger lives inside `refold_wal_frames`,
 > and that function is what the STAGE-C boot replay and the catch-up drain each
-> call. The dominant measured term is that one unbounded buffer, evidenced at
-> 4.0 GB. It is NOT claimed to account for the whole 16.65 GB — the remainder
-> is unattributed and the next boot is the measurement.
+> call.
+>
+> ### The 16.65 GB is fully accounted for — the offload queue held FOUR of them
+>
+> An earlier version of this block called the 4.0 GB buffer "the dominant
+> measured term" and left the rest unattributed. It is attributable, exactly.
+>
+> `DEPTH_FLUSH_QUEUE_DEPTH = 4` (`depth_persistence.rs`) — the offload
+> writer's bounded hand-off queue holds up to four batches in flight. That
+> boot's log carries exactly **four** distinct large buffer sizes:
+> 3,970,753,375 · 3,991,889,008 · 4,004,092,481 · 4,004,164,571. Four slots,
+> four buffers, **≈15.97 GB**, against a measured peak of 16.65 GB. The
+> remaining ~0.68 GB is the ordinary working set, independently consistent
+> with the 0.29–1.54 GB baseline recorded for this process across a full
+> session.
+>
+> **The queue is bounded in COUNT, never in BYTES**, and that is the durable
+> lesson. `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) bounds the buffer the
+> PRODUCER retains on the `Full` arm; it says nothing about what already sits
+> in the four slots. That is harmless on the live path, where a batch is
+> ~10,000 rows ≈ 2 MB by construction — and it is precisely why the replay
+> path, which had no size trigger at all, could put 4 GB into each slot. A
+> bound on one side of a queue is not a bound on the queue.
+>
+> So the fix does not merely lower the peak, it removes the mechanism: with
+> replay batches sized like live batches the queue's byte footprint collapses
+> from ~16 GB to ~8 MB, a factor of ~2,000.
+>
+> Stated as arithmetic consistency against the log, not a re-measurement.
 >
 > **⚠ What this does NOT fix.** It does not reduce the ~30× amplification the
 > paragraph above names — 512 MiB of frames still materializes ~22M depth
