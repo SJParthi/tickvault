@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 105] = [
+pub const ALARM_PHRASES: [(&str, &str); 109] = [
     // ---- capacity + candle building ----
     (
         "aggregator-slots-exhausted",
@@ -295,6 +295,22 @@ pub const ALARM_PHRASES: [(&str, &str); 105] = [
     (
         "wal-frames-not-recovered",
         "Saved market data could not be recovered at start-up — that data is gone",
+    ),
+    (
+        "tick-rescue-abandoned",
+        "Prices marked as rescued may never have reached the disk file — treat this session's price count as unproven",
+    ),
+    (
+        "depth-rescue-abandoned",
+        "Order-book levels marked as rescued may never have reached the disk file — treat this session's depth count as unproven",
+    ),
+    (
+        "wal-spill-shutdown-incomplete",
+        "The app was cut off while still writing captured market data — those frames were never saved and cannot be recovered",
+    ),
+    (
+        "wal-replay-restore-failed",
+        "A saved market data file could not be put back for the next start-up — it is still on disk but no start-up will find it",
     ),
     (
         "wal-replay-unknown-magic",
