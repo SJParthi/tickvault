@@ -2830,3 +2830,55 @@ parameter (free tier) and one extra `PutParameter` per 30 minutes.
   backfilling missing runs.
 - Claims the deploy watchdog is fully restored: `github_stale` remains dead
   until an operator places `/tickvault/prod/operator/github-token`.
+
+#### ⚠ 2026-09-02 (same evening) — VERIFIED LIVE, and it opens a false-positive class I did not anticipate
+
+**Verified end-to-end**, not inferred from a step conclusion. The dispatched
+`postmerge-catchup` run's own log:
+
+```
+{ "Version": 1, "Tier": "Standard" }
+mirrored main HEAD f601e011... to /tickvault/prod/deploy/desired-git-sha
+```
+
+`Version: 1` means the parameter was CREATED. So the mirror exists, the
+repaired Lambda is deployed (terraform-apply for `f601e011` succeeded
+18:41 UTC), and `resolve_desired_sha` will return `("…", "ssm-mirror")` at
+its next fire. `tv-prod-deploy-provenance-blind` was in ALARM all evening,
+correctly — no watchdog run had yet cleared it.
+
+**The consequence this addendum did NOT state, and should have.** Before the
+mirror, `desired_sha` was ALWAYS `None` (the GitHub token does not exist), so
+`binary_mismatch_value` returned `None`, `tv_binary_main_sha_mismatch` was
+never published, and `tv-<env>-binary-sha-stale` sat permanently OK on
+`treat_missing_data = notBreaching` — the dead monitor §2.3q was written to
+expose. **Repairing the source makes that alarm live for the first time, and
+`binary_is_stale` is a plain sha inequality with no notion of what the diff
+touched.**
+
+`deploy-aws.yml` is PATH-FILTERED (`crates/**`, `Cargo.toml`, …), so a
+docs-only merge never deploys and main HEAD legitimately runs ahead of the
+deployed binary. Measured tonight: main went to `57d03993` (a docs-only PR)
+while the box runs `3002b3fb`. Once the next catchup mirrors `57d03993`,
+every watchdog fire reports a mismatch that reflects **no operational
+difference at all**.
+
+**Why this is a slow bleed rather than an immediate page**, which is why it
+is recorded rather than hot-fixed: the alarm is `statistic = "Minimum"`,
+`period = 86400`, `evaluation_periods = 1`. It fires only when EVERY fire in
+a 24-hour window reports a mismatch — so a docs merge followed by any code
+deploy that day produces a `0` and the Minimum stays 0. It pages only after a
+full day with a docs-only delta and no code deploy, e.g. a Friday docs merge
+over a weekend.
+
+**The fix, when someone takes it — NOT taken here.** Make the mirror advance
+only for deploy-relevant HEADs, mirroring `deploy-aws.yml`'s own path filter,
+so `desired-git-sha` means *"the sha the box SHOULD be running"* rather than
+*"main HEAD"*. `postmerge-catchup.yml` already does exactly this shape of
+commit-files path test for `terraform-apply`, so the precedent is in the same
+file. That preserves every real signal — a FAILED code deploy still leaves
+binary behind the mirror and still pages — while removing the docs-only case.
+
+Not done tonight deliberately: it is a third change to a watchdog repaired
+hours earlier, under time pressure, on an alarm that cannot fire for at least
+24 hours. Recording it so the next session decides rather than rediscovers.
