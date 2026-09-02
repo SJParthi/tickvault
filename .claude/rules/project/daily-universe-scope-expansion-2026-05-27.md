@@ -912,7 +912,7 @@ code fix, tracked separately from this grow.
 > | Depth rows in a single ILP buffer | **22,324,960** |
 > | That buffer's size | **4,004,164,571 bytes (4.0 GB)** |
 > | questdb-rs `max_buf_size` | 104,857,600 bytes |
-> | Times the flush failed this way in one boot | **13** |
+> | Times the flush failed this way | **9** (4 depth + 5 tick, across 3 restart cycles — corrected from '13 in one boot', which double-counted the dual log streams; see the WITHDRAWN block below) |
 > | Process RSS peak | **16,646,799,360 (16.65 GB)** |
 > | `MemoryHigh` ceiling it crossed | 16,106,127,360 (15 GiB) |
 >
@@ -985,7 +985,7 @@ code fix, tracked separately from this grow.
 > and that function is what the STAGE-C boot replay and the catch-up drain each
 > call.
 >
-> ### The 16.65 GB is fully accounted for — the offload queue held FOUR of them
+> ### ~~The 16.65 GB is fully accounted for — the offload queue held FOUR of them~~ **WITHDRAWN — see the correction below**
 >
 > An earlier version of this block called the 4.0 GB buffer "the dominant
 > measured term" and left the rest unattributed. It is attributable, exactly.
@@ -1012,6 +1012,65 @@ code fix, tracked separately from this grow.
 > from ~16 GB to ~8 MB, a factor of ~2,000.
 >
 > Stated as arithmetic consistency against the log, not a re-measurement.
+>
+> ### ⚠ WITHDRAWN 2026-09-02 (same evening, hours later) — the block above is WRONG, and it replaced an honest "unattributed" with a tidy falsehood
+>
+> The block above says the four ~4 GB depth buffers were the four slots of
+> `DEPTH_FLUSH_QUEUE_DEPTH = 4` held at one moment, summing to ~15.97 GB and
+> thereby accounting for the 16.65 GB peak. **It is not true.** It was written
+> from a `sort -u` over a grep — four distinct sizes, four queue slots, a
+> pleasing fit — without ever asking WHEN each was logged.
+>
+> Re-queried properly (`filter-log-events` over 17:00–19:00 UTC, every field
+> parsed rather than the sizes alone), the real shape is:
+>
+> | app time (IST) | writer | rescued rows | buffer bytes |
+> |---|---|---:|---:|
+> | 23:45:57 | tick | 2,394,026 | 750,100,476 |
+> | 23:50:02 | tick | 2,399,296 | 751,922,730 |
+> | 23:50:18 | **depth** | 22,313,460 | **4,004,092,481** |
+> | 23:50:37 | tick | 2,393,288 | 749,902,610 |
+> | 23:50:58 | **depth** | 22,247,280 | **3,991,889,008** |
+> | 23:58:45 | tick | 2,383,178 | 746,329,918 |
+> | 23:59:03 | **depth** | 22,130,130 | **3,970,753,375** |
+> | 23:59:21 | tick | 2,401,181 | 751,680,235 |
+> | 23:59:35 | **depth** | 22,324,960 | **4,004,164,571** |
+>
+> **NINE events, not thirteen and not eighteen**, in THREE restart cycles
+> (~23:45, ~23:50, ~23:59) of roughly two tick buffers and two depth buffers
+> each. The four depth sizes are spread across cycles 2 and 3 — they were
+> never four slots of one queue at one instant, and the ~15.97 GB sum adds
+> buffers that never coexisted.
+>
+> So the most that plausibly coexisted inside one cycle is ~2 × 4 GB depth
+> plus ~2 × 0.75 GB tick ≈ **9.5 GB**, which does NOT reach 16.65 GB. **The
+> peak remains only partly attributed**, and the original PR body said exactly
+> that — *"the dominant measured term, not a full account … the remainder is
+> unattributed"* — before this block replaced it with a neater story.
+>
+> **Two corrections of fact, and one of method.**
+>
+> * The "13 times" figure in the table at the top of this section is also
+>   wrong: it counted rows from a narrower window without noticing the
+>   duplication below. It is **9**.
+> * The duplication is itself a confirmation of
+>   `dhan-rest-only-noise-lock-2026-07-14.md` §2.3s: the log group receives
+>   BOTH `errors.jsonl` (flat `$.code`) and `app.log` (nested
+>   `$.fields.code`), so every event appears twice under different shapes. A
+>   naive count over that group double-counts, which is precisely why that
+>   section exists.
+> * The method error is the one worth keeping. A `sort -u` answers "which
+>   distinct values occurred", and I read it as "which values coexisted".
+>   Those are different questions, and only a timeline distinguishes them.
+>   Replacing a stated uncertainty with a confident account is a REGRESSION
+>   even when the arithmetic looks convincing — and this file's own header
+>   warns that a partial disclosure reads exactly like a complete one.
+>
+> **What is UNCHANGED: the defect, and the fix.** A single depth ILP buffer
+> genuinely reached 4,004,164,571 bytes against a 104,857,600-byte limit and
+> could never have flushed; the app was genuinely OOM-killed and genuinely
+> looped ten times. Bounding the buffer is the right fix whatever the peak
+> decomposes into. Only the accounting narrative was wrong.
 >
 > **⚠ What this does NOT fix.** It does not reduce the ~30× amplification the
 > paragraph above names — 512 MiB of frames still materializes ~22M depth
