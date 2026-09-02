@@ -913,6 +913,10 @@ fn register_depth_drop_baseline(feed: Feed) {
     metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_client_build")
         .increment(0);
     metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl").increment(0);
+    // Same reasoning as the tick side: this is the series that fires when the
+    // depth rescue proof (`dropped == spilled`) stops holding, so it must be
+    // registered before the bad day rather than during it.
+    metrics::counter!(DEPTH_RESCUE_ABANDONED_COUNTER, "writer" => "depth").increment(0);
 }
 
 /// Batched `market_depth` ILP writer.

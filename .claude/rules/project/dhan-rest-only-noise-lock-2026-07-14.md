@@ -2483,3 +2483,96 @@ this file.
   to end.
 - Claims `binary-sha-stale` is trustworthy while `deploy-provenance-blind` is
   in ALARM — that is precisely the state in which it is not.
+
+### §2.3r — 2026-09-02: four loss counters had emit sites and no route to CloudWatch at all
+
+**The verbatim operator authorization (2026-09-02, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see build wire design integrate implement audit log vsialuise debug monitor logging capturing trackign montioring fix and resolve evrythign entirley dude see sicn eyou have access to aws isntance enitlrey even start stop also do evrythign whatevr is needed dude okay ocne evryhtign is enitlrey doen fix and reosleve na dmerge and dpeloy ti dude okay?"
+
+> "whatevr is needed and recommended go ahead dude okay? i just need the workign finalsied solution dude okay?"
+
+The second was given in DIRECT response to a reply that named this work and its
+price. This dated row is the rule-file edit §3 demands before any new
+Dhan-scoped page, recorded BEFORE the terraform.
+
+#### The gap
+
+A producer→route sweep found four counters with **real emit sites in
+`crates/*/src`** and `emf=0 dash=0 alarmfiles=0` — no path to CloudWatch by any
+route. They are not new counters that nobody wired; they are counters that
+have been able to fire in production and reach nobody.
+
+| Metric | What a non-zero value means |
+|---|---|
+| **`tv_tick_rescue_abandoned_total`** | the tick RESCUE thread did not finish within the shutdown budget — a payload counted as rescued may never have reached the spill file |
+| **`tv_depth_rescue_abandoned_total`** | the same, on the writer carrying ~24× the row volume |
+| `tv_wal_spill_shutdown_incomplete_total` | the frame-spill writer was abandoned at shutdown with frames queued — capture-at-receipt did not close |
+| `tv_wal_replay_restore_failed_total` | a deferred segment could not be moved back to the live directory, so no later boot re-globs it |
+
+**The first one is the one that matters, and its emit site says why in its own
+words:** it fires exactly when `dropped == spilled` — the equality this
+repository cites as proof that a session lost nothing — **stops being true.**
+The proof had no alarm behind it.
+
+#### Seeding, not just selecting
+
+All four are **seeded with `increment(0)` at construction** in the same change.
+This is not tidiness: the CloudWatch agent computes counter deltas and **drops
+the first sample of a series it has never seen**, so an unseeded counter whose
+first increment IS the event publishes nothing on the one day it matters. That
+is the same first-sample rule that hid `tv_depth_rows_spilled_total` on
+2026-08-28 (§2.3o) and made 104,540 depth rows permanently unclassifiable.
+Pinned by `loss_series_seeding_guard.rs`, which already forbids seeding a drop
+counter without its rescue discriminator.
+
+#### ⚠ Honest cost — and this one crosses the automatic stop line
+
+4 EMF names × $0.30 + 4 alarms × $0.10 = **+$1.60/mo**. But this change ships
+alongside the Quote 20 EBS grow (+$18.24/mo), and the two must be costed
+together because they land in the same PR:
+
+| Basis | Figure |
+|---|---|
+| September forecast, read live 2026-09-02 | $114.01 |
+| `limit_amount`, read live | $150.00 |
+| 90% `STOP_EC2_INSTANCES` action line | **$135.00** |
+| Forecast + EBS grow + this change | **$133.85** — $1.15 under |
+| **Maximal-month basis** (§2.3n's ~$123.28 + $19.84) | **~$143.12 — $8.12 OVER** |
+
+**The two bases disagree and the pessimistic one breaches.** That is stated
+rather than resolved by picking the friendlier number: §2.3n's standing rule is
+that *"the next addition of any size must come with a LEVER, not just a cost
+note"*, and **this change does not carry one.** The lever exists and is already
+approved — the Quote 10 Elastic IP release, −$3.60/mo — but its execution is
+bundled with an instance recreate and is not taken here.
+
+So the honest position is: **on the forecast basis this fits with $1.15 to
+spare; on the maximal-month basis the automatic stop fires and switches the
+trading box off.** An operator decision on the EIP release, or on
+`limit_amount` (which Quote 19 caps at $150, already the live value, so a
+ceiling edit cannot help), is now the blocking item on this surface — not a
+future nicety.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+Alarming a rescue-abandonment does not make the rescue finish. It converts the
+one event that invalidates the loss proof from invisible into a page — that is
+the entire claim. It does not shorten the shutdown budget, does not add a
+retry, and does not recover the frames, which are gone when the WAL pair fires.
+
+#### What a PR that violates §2.3r looks like (REJECT)
+
+- Ships any of the four counters without its `increment(0)` seed (the agent's
+  first-sample rule swallows the event).
+- Gives any of the four `ok_actions` (the loss already happened).
+- Uses a RATE threshold rather than `>= 1` — all four are zero on a healthy
+  lane, so a rate threshold invents a baseline that does not exist.
+- Market-hours-gates the two WAL alarms: WAL work runs at BOOT and at SHUTDOWN,
+  outside the gate window, so gating them makes them structurally unable to
+  fire on the paths they exist for.
+- Adds a per-INSTRUMENT or per-SEGMENT dimension (the §2.3 cardinality rule
+  stands).
+- Adds the next EMF name or alarm without a LEVER, per §2.3n and the table
+  above.
