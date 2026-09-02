@@ -1570,7 +1570,57 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
             match message {
                 Message::Binary(payload) => {
                     match classify_frame(endpoint, &payload) {
-                        FrameClass::Disconnect(code) => SocketEvent::Closed { code: Some(code) },
+                        FrameClass::Disconnect(code) => {
+                            // A STACKED disconnect carries whole data packets
+                            // AHEAD of the 10-byte control packet, and this arm
+                            // drops the WHOLE frame: the payload becomes a
+                            // `Closed` event and is never handed up as
+                            // `SocketEvent::Frame`, so those bytes reach no
+                            // WAL, no ring and no counter. Capture-at-receipt
+                            // does not hold here, because capture happens
+                            // downstream of this return.
+                            //
+                            // Until now that discard was completely invisible:
+                            // no log, no metric, no field. It is real loss and
+                            // it should be measurable even while it is not yet
+                            // preventable.
+                            //
+                            // BYTES, not packets, for the reason the drain's
+                            // own give-up accounting states: the packet count
+                            // of bytes we did not walk is unknowable, and
+                            // estimating it would put a fabricated number
+                            // inside the one signal whose job is to stop
+                            // fabrication. `payload.len()` is exact and
+                            // `DISCONNECT_PACKET_SIZE` is the control packet's
+                            // own width, so the difference is exactly the
+                            // market data that was thrown away.
+                            //
+                            // ROUTE (stated plainly): this is a CODED LOG line
+                            // and nothing else. It is queryable in CloudWatch
+                            // Logs today at zero recurring cost, and it is NOT
+                            // alarmed -- a metric-filter alarm is ~$0.10/mo and
+                            // the budget's worst-case month already sits above
+                            // the automatic STOP_EC2_INSTANCES line, so adding
+                            // one needs a lever rather than a cost note.
+                            let discarded = payload.len().saturating_sub(DISCONNECT_PACKET_SIZE);
+                            if discarded > 0 {
+                                error!(
+                                    code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                                    source = "stacked_disconnect_discard",
+                                    endpoint = endpoint.as_str(),
+                                    discarded_bytes = discarded,
+                                    frame_bytes = payload.len(),
+                                    disconnect_code = code.as_u16(),
+                                    "a stacked disconnect frame carried market data AHEAD of the \
+                                     control packet and the whole frame was discarded — those \
+                                     bytes never reached the write-ahead log, so they are gone \
+                                     rather than deferred. The disconnect itself is classified \
+                                     correctly and the reconnect ladder is unaffected; what is \
+                                     lost is the data half of this one frame."
+                                );
+                            }
+                            SocketEvent::Closed { code: Some(code) }
+                        }
                         // `Bytes` -> `bytes::Bytes` is a refcount move, not a
                         // copy: the whole point of this type on this path.
                         FrameClass::Data => SocketEvent::Frame(ws_bytes_to_bytes(payload)),
@@ -2609,6 +2659,95 @@ mod tests {
         assert_eq!(
             classify_frame(DhanEndpointType::MainFeed, &frame),
             FrameClass::Disconnect(DisconnectCode::ExceededActiveConnections)
+        );
+    }
+
+    /// The data half of a stacked disconnect is DISCARDED, and the amount is
+    /// now computed rather than invisible.
+    ///
+    /// This does not assert the log line — a `tracing` subscriber in a unit
+    /// test proves the plumbing, not the arithmetic, and the arithmetic is the
+    /// part that could be silently wrong. What it pins is the number the log
+    /// carries: `payload.len() - DISCONNECT_PACKET_SIZE`, which is exactly the
+    /// market data thrown away when the frame becomes `SocketEvent::Closed`
+    /// instead of `SocketEvent::Frame`.
+    ///
+    /// Measured against the same shapes the two tests above use, so a change to
+    /// the stacked walk that altered which frames reach this arm would move
+    /// these numbers too.
+    #[test]
+    fn the_discarded_half_of_a_stacked_disconnect_is_exactly_the_data_packets() {
+        // One quote packet, then the 10-byte control packet.
+        let mut one_ahead = main_feed_packet(RESPONSE_CODE_QUOTE);
+        let quote_len = one_ahead.len();
+        one_ahead.extend_from_slice(&main_feed_disconnect(804));
+        assert_eq!(
+            one_ahead.len().saturating_sub(DISCONNECT_PACKET_SIZE),
+            quote_len,
+            "the discarded byte count must be the data packets alone — the \
+             control packet's own 10 bytes are legitimately consumed, not lost"
+        );
+
+        // Two packets ahead: the count must grow with the data, not with the
+        // frame's mere existence.
+        let mut two_ahead = main_feed_packet(RESPONSE_CODE_FULL);
+        let full_len = two_ahead.len();
+        two_ahead.extend_from_slice(&main_feed_packet(RESPONSE_CODE_OI));
+        let both_len = two_ahead.len();
+        two_ahead.extend_from_slice(&main_feed_disconnect(805));
+        assert_eq!(
+            two_ahead.len().saturating_sub(DISCONNECT_PACKET_SIZE),
+            both_len
+        );
+        assert!(
+            both_len > full_len,
+            "fixture sanity: the second packet must actually add bytes, else \
+             this test would pass on a frame that stacks nothing"
+        );
+
+        // A LONE disconnect loses nothing, and must not report a discard —
+        // that is the case the `if discarded > 0` gate exists for, and a log
+        // line on every ordinary disconnect would be noise on the one path
+        // that fires during every reconnect.
+        let lone = main_feed_disconnect(805);
+        assert_eq!(lone.len(), DISCONNECT_PACKET_SIZE);
+        assert_eq!(lone.len().saturating_sub(DISCONNECT_PACKET_SIZE), 0);
+    }
+
+    /// Source pin: the Disconnect arm must actually COMPUTE and REPORT the
+    /// discard, not merely return `Closed`.
+    ///
+    /// Without this, the arithmetic above could stay correct while nothing
+    /// called it — the dead-code shape this repository has recorded repeatedly,
+    /// where a signal exists and reaches nobody.
+    #[test]
+    fn the_disconnect_arm_reports_the_discard_it_causes() {
+        let src = include_str!("connection.rs");
+        let arm = src
+            .split("FrameClass::Disconnect(code) =>")
+            .nth(1)
+            .expect("the Disconnect arm must exist");
+        // Bound the window to the arm itself, not the whole rest of the file.
+        let arm = &arm[..arm.len().min(4000)];
+        assert!(
+            arm.contains("saturating_sub(DISCONNECT_PACKET_SIZE)"),
+            "the arm must subtract the control packet's own width, so the \
+             number reported is the DATA lost and not the frame size"
+        );
+        assert!(
+            arm.contains("discarded_bytes"),
+            "the discarded amount must reach the log as its own field, so it \
+             is queryable rather than buried in prose"
+        );
+        assert!(
+            arm.contains("stacked_disconnect_discard"),
+            "the line needs a `source` an alarm could match on later without \
+             catching every other WS-GAP-01 emit"
+        );
+        assert!(
+            arm.contains("if discarded > 0"),
+            "an ordinary lone disconnect must not log — it fires on every \
+             reconnect and would drown the signal it is meant to carry"
         );
     }
 
