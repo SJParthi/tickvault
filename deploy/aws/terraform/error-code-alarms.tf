@@ -1191,7 +1191,7 @@ resource "aws_cloudwatch_metric_alarm" "errcode_stream_silent" {
   treat_missing_data = "notBreaching"
 
   metric_query {
-    id          = "verdict"
+    id = "verdict"
     # FILL(flat, 0) is load-bearing, not decoration. A metric filter emits a
     # datapoint ONLY when a matching line arrives, so in the exact failure this
     # alarm exists for -- errors.jsonl not arriving -- `flat` has NO datapoints
@@ -1230,7 +1230,12 @@ resource "aws_cloudwatch_metric_alarm" "errcode_stream_silent" {
     }
   }
 
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # `local.app_alarm_actions`, the same indirection every alarm in this repo
+  # uses -- NOT a direct topic reference. A direct `aws_sns_topic.tv_alerts.arn`
+  # resolves to the same topic today and silently stops matching the moment
+  # that local gains a second target; the comment on the preopen-ready alarm
+  # above records the same lesson from its own first draft.
+  alarm_actions = local.app_alarm_actions
 
   # No ok_actions. Recovery here means an operator repaired the agent or the
   # glob; a datapoint ageing out of the window is not that, and a green
