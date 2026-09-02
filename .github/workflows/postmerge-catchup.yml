@@ -86,6 +86,7 @@ jobs:
       # No checkout needed — everything goes through the GitHub API via the
       # preinstalled gh CLI.
       - name: Backfill main HEAD if it has no ci.yml / bench.yml run
+        id: probe
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,6 +104,10 @@ jobs:
             exit 0
           fi
           echo "main HEAD = ${head_sha}"
+          # Exported for the SSM-mirror step below. Written only AFTER the
+          # 40-lowercase-hex validation above, so the mirror can never receive
+          # an error string or a truncated sha.
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
 
           dispatched=0
           # deploy-aws.yml is included so a bot-merged (push-suppressed) commit
@@ -191,3 +196,65 @@ jobs:
             echo "- main HEAD: \`${head_sha}\`"
             echo "- catch-up runs dispatched: ${dispatched}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 2026-09-02 — MIRROR main HEAD into SSM for the deploy-watchdog.
+      #
+      # Why this step is HERE and not in deploy-aws.yml: the watchdog compares
+      # the on-box binary sha against main HEAD, and it asks GitHub for main
+      # HEAD using /tickvault/<env>/operator/github-token. That parameter does
+      # not exist, so the comparison had been dead for its whole life while
+      # `tv-<env>-binary-sha-stale` read OK (treat_missing_data = notBreaching
+      # turns a producer that declines to produce into a healthy-looking
+      # alarm). This mirror removes the credential from the critical path.
+      #
+      # It must NOT move into deploy-aws.yml. That workflow writes GITHUB_SHA,
+      # which IS main HEAD at deploy time, so a mirror written there would
+      # always equal binary-git-sha and the staleness signal could never go
+      # red. The mirror has to advance when MAIN advances, deploy or no
+      # deploy — which is exactly what this every-30-minutes job already does.
+      #
+      # NON-FATAL by design, matching the deploy-aws provenance write: a failed
+      # mirror write must never fail the dispatcher, whose actual job is
+      # backfilling missing runs. The next 30-min firing retries.
+      - name: Configure AWS credentials (mirror write)
+        if: steps.probe.outputs.head_sha != ''
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          role-session-name: tv-github-catchup-mirror-${{ github.run_id }}
+
+      - name: Mirror main HEAD to SSM (deploy-provenance fallback)
+        if: steps.probe.outputs.head_sha != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.probe.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # LOCKSTEP NOTE: the path below hardcodes the single real env (prod)
+          # while terraform reads /tickvault/${var.environment}/deploy/
+          # desired-git-sha (deploy-watchdog-lambda.tf + oidc.tf) — the three
+          # MUST stay in lockstep; a staging env would need this
+          # parameterized. Same convention as the deploy-aws.yml provenance
+          # write it mirrors.
+          #
+          # Re-validate rather than trust the step output: a 40-lowercase-hex
+          # check costs nothing and the value crosses a step boundary.
+          if ! [[ "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::refusing to mirror a non-hex sha to /tickvault/prod/deploy/desired-git-sha"
+            exit 0
+          fi
+          if aws ssm put-parameter \
+              --region "${{ vars.AWS_REGION || 'ap-south-1' }}" \
+              --name "/tickvault/prod/deploy/desired-git-sha" \
+              --type String \
+              --overwrite \
+              --value "${HEAD_SHA}"; then
+            echo "mirrored main HEAD ${HEAD_SHA} to /tickvault/prod/deploy/desired-git-sha"
+          else
+            echo "::warning::mirror write failed — the deploy-watchdog falls back to the previous mirrored value (or to GitHub, if a token is present); the next 30-min firing retries"
+          fi

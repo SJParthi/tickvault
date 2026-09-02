@@ -3836,12 +3836,17 @@ const DRAIN_REPORT_EVERY: u64 = 1_024;
 /// converts the CURRENT worker into a blocking thread while the runtime spins
 /// up a replacement, so the effective worker count is preserved.
 fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        tokio::task::block_in_place(flush)
-    } else {
-        flush()
+    // `try_current`, not `current`: `current()` PANICS when no runtime is
+    // installed, and this helper is now reached from `refold_wal_frames`,
+    // which unit tests call as a plain `#[test]` with no runtime at all. A
+    // panic there would be a test-only failure of a production helper — the
+    // worst shape, because it makes the safe fix look unsafe. No runtime
+    // means nothing to yield to, so the flush simply runs inline.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(flush)
+        }
+        _ => flush(),
     }
 }
 
@@ -9136,6 +9141,40 @@ pub fn refold_wal_frames(
         .seed_watermark_at_least(ist_day_start_secs);
 
     for (frame_seq, wal_received_at_nanos, endpoint, bytes) in frames {
+        // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
+        // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
+        // `DEPTH_FLUSH_ROW_THRESHOLD`; replay had NEITHER, so it appended the
+        // whole staged batch into one ILP buffer and flushed once at the end.
+        // That boot's logs name the result exactly: `rescued: 22324960,
+        // bytes: 4004164571` against `maximum configured allowed size of
+        // 104857600 bytes`, thirteen times. A 4 GB buffer can never be
+        // accepted, so EVERY replayed depth row went to the spill tier
+        // instead of QuestDB -- not lost, but not replayed either -- and the
+        // resident cost took the process past `MemoryHigh` (RESOURCE-02 at
+        // 14.2 GB of a 15 GiB ceiling, RSS peaking 16.65 GB).
+        //
+        // TOP of the loop, not the bottom: the depth arm below `continue`s at
+        // its own end, so a trigger placed after the match would skip exactly
+        // the frames that build the 4 GB buffer -- 22.3M depth rows against
+        // 2.4M tick rows on that boot.
+        //
+        // The live thresholds are reused deliberately rather than a new
+        // replay-specific pair being invented: they are already proven at a
+        // far higher sustained rate, and one number is one thing to keep
+        // true. At that boot's volumes this is ~2,400 flushes across a replay
+        // -- bounded work at boot, against a flush that currently cannot
+        // succeed at all.
+        if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD
+            || u64::try_from(ingest.depth_pending_rows()).unwrap_or(u64::MAX)
+                >= DEPTH_FLUSH_ROW_THRESHOLD
+        {
+            // `LiveIngest::flush` flushes the inline-depth sink first and
+            // unconditionally (see its body), so one call drains both buffers.
+            // A failure here is already loud and already rescues to the spill
+            // tier at its source; the loop carries on, exactly as the live
+            // drain does.
+            blocking_flush(|| ingest.flush());
+        }
         // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
         // sniff. A depth frame goes through the SAME `drain_depth_frame` the
         // live drain uses, with its ORIGINAL receipt, so replay and live
@@ -9930,11 +9969,29 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let rss_now = tickvault_storage::resource_monitor::probe_vmrss_bytes(
                 std::path::Path::new("/proc/self/status"),
             );
-            if wal_catchup_should_stop_for_memory(
-                rss_now,
-                mem_ceiling_bytes,
-                WAL_CATCHUP_RSS_STOP_PCT,
-            ) {
+            // PROGRESS FLOOR — round 0 always runs, exactly as the replay
+            // loop's own `consumed > 0` guarantees one segment per pass.
+            //
+            // MEASURED 2026-09-02, the boot that produced this: STAGE-C's
+            // replay peaked at 10,443,476,992 bytes and this check ran while
+            // that peak was still resident, so the loop stood down at round 0
+            // having drained NOTHING (`rounds = 0, frames = 0`). One minute
+            // later the same process read 1.07 GiB — the peak was a transient
+            // that had already been released. Standing down on it means the
+            // catch-up loop can never run on any boot with a backlog, which
+            // is the one situation it exists for.
+            //
+            // Round 0 is bounded by the same 512 MiB byte budget as every
+            // other round, so the floor cannot itself be the thing that
+            // exhausts memory; it buys one bounded round against a reading
+            // that is systematically taken at the worst possible instant.
+            if rounds > 0
+                && wal_catchup_should_stop_for_memory(
+                    rss_now,
+                    mem_ceiling_bytes,
+                    WAL_CATCHUP_RSS_STOP_PCT,
+                )
+            {
                 catchup_memory_stopped = true;
                 error!(
                     code = ErrorCode::WsSpill01WriterRespawn.code_str(),
@@ -11409,6 +11466,77 @@ mod tests {
         // 10 bytes at 60% is 6, so 5 proceeds and 6 stops.
         assert!(!wal_catchup_should_stop_for_memory(Some(5), Some(10), 60));
         assert!(wal_catchup_should_stop_for_memory(Some(6), Some(10), 60));
+    }
+
+    #[test]
+    fn the_catchup_memory_guard_never_stands_down_on_round_zero() {
+        // MEASURED on the 2026-09-02 boot that produced this floor: STAGE-C's
+        // replay peaked at 10,443,476,992 bytes of a 16,106,127,360 ceiling,
+        // this loop read RSS while that peak was still resident, and stood
+        // down at round 0 having drained NOTHING -- `rounds = 0, frames = 0,
+        // stop_reason = memory`. One minute later the same process measured
+        // 1.07 GiB: the peak was a transient that had already been released.
+        //
+        // Without a floor the guard is self-defeating in exactly the case it
+        // exists for. A boot WITH a backlog is a boot that just ran STAGE-C,
+        // so this reading is ALWAYS taken at the worst instant, so the loop
+        // never runs, so the backlog never drains -- and a permanently
+        // growing deferral is a loss wearing a safety feature's clothes.
+        const RSS_AT_STAGE_C_PEAK: u64 = 10_443_476_992;
+        let rss = Some(RSS_AT_STAGE_C_PEAK);
+        let ceiling = Some(CEILING_15GIB);
+
+        assert!(
+            wal_catchup_should_stop_for_memory(rss, ceiling, WAL_CATCHUP_RSS_STOP_PCT),
+            "fixture must be OVER the line, else this test proves nothing"
+        );
+
+        // Round 0: the floor wins and work proceeds.
+        let rounds = 0u32;
+        assert!(
+            !(rounds > 0
+                && wal_catchup_should_stop_for_memory(rss, ceiling, WAL_CATCHUP_RSS_STOP_PCT)),
+            "round 0 must run: this RSS is STAGE-C's peak, not the steady \
+             state, and standing down on it drains nothing, forever"
+        );
+
+        // Round 1 onward: the bound is real again.
+        for rounds in 1u32..4 {
+            assert!(
+                rounds > 0
+                    && wal_catchup_should_stop_for_memory(rss, ceiling, WAL_CATCHUP_RSS_STOP_PCT),
+                "from round 1 the memory bound must still stop the drain"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catchup_loop_source_gates_the_memory_stop_on_round_zero() {
+        // A test of the predicate alone would pass while the loop called it
+        // unconditionally -- which IS the bug this fixes. Correct arithmetic
+        // nobody calls is the dead-signal shape this repo keeps recording, so
+        // the floor is pinned in the loop's own source.
+        let src = include_str!("dhan_feed_stack.rs");
+        let loop_body = src
+            .split("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .nth(1)
+            .expect("the catch-up loop must exist");
+        // The CALL, not the name: the comment above the loop cites
+        // `wal_catchup_should_stop_for_memory` in prose, and matching that
+        // would compare the floor against a comment instead of the code.
+        let guard_at = loop_body
+            .find("wal_catchup_should_stop_for_memory(")
+            .expect("the loop must consult the memory guard");
+        let floor_at = loop_body.find("if rounds > 0").expect(
+            "the memory stop must be gated on `rounds > 0` -- without the \
+             floor the loop stands down at round 0 on STAGE-C's transient \
+             peak and never drains any backlog at all",
+        );
+        assert!(
+            floor_at < guard_at,
+            "the `rounds > 0` floor must come BEFORE the guard call or it \
+             does not gate it"
+        );
     }
 
     #[test]
@@ -17361,6 +17489,72 @@ mod wal_refold_tests {
             p[base + 12..base + 16].copy_from_slice(&orders.to_le_bytes());
         }
         p
+    }
+
+    /// The bound the replay loop did not have, and the one MEASURED failure
+    /// it produced on 2026-09-02.
+    ///
+    /// The loop appended the whole staged batch into one ILP buffer and
+    /// flushed once at the end. That boot's own log lines name the outcome:
+    /// `rescued: 22324960, bytes: 4004164571` against `maximum configured
+    /// allowed size of 104857600 bytes`, thirteen times over. A 4 GB buffer
+    /// can never be accepted by questdb-rs, so every replayed depth row was
+    /// rescued to the spill tier rather than reaching QuestDB, and holding it
+    /// took the process past `MemoryHigh`.
+    ///
+    /// Two things are pinned, because either alone can be true while the bug
+    /// is back. The SOURCE pin is what makes this a real guard: the trigger
+    /// must sit ABOVE the `match endpoint` — the depth arm `continue`s, so a
+    /// trigger below it is skipped by exactly the frames that build the
+    /// buffer (22.3M depth rows against 2.4M tick rows on that boot), and a
+    /// well-meaning move to the "tidier" bottom of the loop would silently
+    /// restore the defect while every behavioural test still passed.
+    #[test]
+    fn the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let refold_at = production
+            .find("pub fn refold_wal_frames")
+            .expect("refold_wal_frames must exist");
+        let refold_end = production[refold_at..]
+            .find("\nfn ")
+            .map_or(production.len(), |off| refold_at + off);
+        let body = &production[refold_at..refold_end];
+
+        let flush_at = body.find("blocking_flush(|| ingest.flush())").expect(
+            "the replay loop must flush on a size trigger. Without it a \
+                 staged batch appends into ONE ILP buffer until the single \
+                 end-of-batch flush, which questdb-rs refuses past its \
+                 max_buf_size — measured at 4,004,164,571 bytes on 2026-09-02",
+        );
+        assert!(
+            body[..flush_at].contains("ingest.pending_rows() >= FLUSH_ROW_THRESHOLD")
+                && body[..flush_at].contains("DEPTH_FLUSH_ROW_THRESHOLD"),
+            "the flush must be gated on BOTH row thresholds the live drain \
+             uses — a depth-only or tick-only gate leaves the other buffer \
+             unbounded, and depth was the 22.3M-row half"
+        );
+
+        let match_at = body
+            .find("match endpoint {")
+            .expect("the endpoint match must exist");
+        assert!(
+            flush_at < match_at,
+            "the size trigger sits BELOW `match endpoint`, so the depth arm's \
+             `continue` skips it — that is the exact shape of the defect this \
+             test exists to stop, because depth is the half that builds the \
+             buffer"
+        );
+    }
+
+    /// `blocking_flush` is now reached from `refold_wal_frames`, which unit
+    /// tests call with no tokio runtime installed. `Handle::current()` panics
+    /// there, so the helper must ask with `try_current` — otherwise the safe
+    /// fix above becomes a test-only panic in a production helper.
+    #[test]
+    fn blocking_flush_does_not_panic_without_a_runtime() {
+        assert_eq!(blocking_flush(|| 7_u64), 7);
     }
 
     /// TVW4 (2026-09-02): a record that CARRIES the depth-20 endpoint is

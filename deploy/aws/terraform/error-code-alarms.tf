@@ -1079,3 +1079,176 @@ resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
   # above).
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# THE WATCHER OF THE WATCHERS (2026-09-02)
+#
+# Every one of the coded-error filters above reads `$.code` -- the FLAT schema.
+# The agent ships TWO files into this one log group, and only one of them
+# carries that shape:
+#
+#   data/logs/machine/errors.jsonl.2*  ->  {"level":"ERROR","code":"X",...}
+#   data/logs/machine/app.2*           ->  {"level":"ERROR","fields":{"code":"X"}}
+#
+# So 25 of the 27 filters on this log group depend on ONE file reaching
+# CloudWatch (MEASURED live 2026-09-02, not counted from source: one is a bare
+# "DH-906" term filter that matches either schema, and tv-<env>-preopen-ready-
+# secs reads $.fields.ready_at_ist_secs and would survive). If that file's
+# glob stops matching -- exactly the 2026-07-06 incident signature, a
+# data/logs/machine/ reorg that left the agent tailing paths that no longer
+# existed -- every one of them goes permanently silent.
+#
+# And the guard that exists for that class cannot see it:
+# `app_log_ingestion_silent` (log-retention.tf) watches AWS/Logs
+# IncomingLogEvents dimensioned on the LOG GROUP, so it fires only if the
+# WHOLE group goes quiet. With app.log still flowing the group looks perfectly
+# healthy while the alarms it feeds are dead. That is a false OK on the
+# alerting path itself: the thing that tells you your alarms died is blind to
+# the only way they realistically die.
+#
+# The fix is a DETECTOR for the exact signature rather than a restructure.
+# Splitting the two files into separate log groups would give per-group
+# IncomingLogEvents for each, but it invalidates every runbook and saved query
+# that names /tickvault/<env>/app. Making those filters match both schemas
+# would double-count every error and silently break all 25 thresholds. Both
+# "fixes" cost more than the gap. Counting each schema separately costs two
+# metric filters and answers the question directly.
+# ---------------------------------------------------------------------------
+
+# Errors visible in the FLAT schema -- the population those 25 filters can see.
+resource "aws_cloudwatch_log_metric_filter" "log_schema_flat_errors" {
+  name           = "tv-${var.environment}-log-schema-flat-errors"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  # `= *` is CloudWatch's EXISTENCE test (unquoted), the same form the
+  # preopen_ready filter above uses. Anchored on the FIELD rather than on any
+  # message text: prose gets reworded, a field name is the contract.
+  pattern = "{ $.level = \"ERROR\" && $.code = * }"
+  metric_transformation {
+    name      = "tv_log_errors_flat_total"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+    # Sparse by design, like every filter above: billed only in hours that
+    # actually produce datapoints.
+  }
+}
+
+# The same errors as seen in the NESTED schema -- app.log's shape. This is the
+# control. It is what proves the app is still producing errors when the flat
+# count is zero, which is the difference between "a quiet session" and "the
+# stream that feeds 27 alarms has stopped arriving".
+resource "aws_cloudwatch_log_metric_filter" "log_schema_nested_errors" {
+  name           = "tv-${var.environment}-log-schema-nested-errors"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  pattern        = "{ $.level = \"ERROR\" && $.fields.code = * }"
+  metric_transformation {
+    name      = "tv_log_errors_nested_total"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+  }
+}
+
+# Fires ONLY on the divergence, never on either count alone.
+#
+# A quiet session with zero errors of either shape is HEALTHY and must not
+# page -- which is why this cannot be an alarm on the flat count being zero.
+# The signature of the real failure is asymmetric: the app is demonstrably
+# still emitting errors (nested > 0) while the file the alarms read produces
+# none (flat == 0). Only that combination is a defect, so only that
+# combination alarms.
+#
+# The nested threshold is 5 rather than 1 deliberately. At the boundary of a
+# 5-minute period the two files can legitimately land in different windows for
+# one or two events; five errors present in one schema and none at all in the
+# other is not a boundary artifact.
+resource "aws_cloudwatch_metric_alarm" "errcode_stream_silent" {
+  alarm_name        = "tv-${var.environment}-errcode-stream-silent"
+  alarm_description = <<-EOT
+    The log stream that every coded-error alarm depends on has STOPPED arriving,
+    while the app is still producing errors.
+
+    25 of the 27 metric filters on this log group read $.code, which only
+    exists in data/logs/machine/errors.jsonl. This alarm fires when the app.log
+    stream shows errors ($.fields.code) and errors.jsonl shows none -- meaning
+    those 25 alarms are silent and CANNOT fire, whatever breaks next.
+
+    The log group still looks healthy, so app-log-ingestion-silent will NOT
+    catch this. That is why this alarm exists.
+
+    Triage on the box via SSM:
+      sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+      sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+      ls -la /opt/tickvault/data/logs/machine/
+    The agent's collect_list globs must match deploy/aws/cloudwatch-agent.json
+    (machine/errors.jsonl.2* + machine/app.2*). The 2026-07-06 signature is a
+    glob that no longer matches after a log-directory reorg.
+  EOT
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+
+  # No data at all = a session with no errors in EITHER schema = healthy.
+  treat_missing_data = "notBreaching"
+
+  metric_query {
+    id = "verdict"
+    # FILL(flat, 0) is load-bearing, not decoration. A metric filter emits a
+    # datapoint ONLY when a matching line arrives, so in the exact failure this
+    # alarm exists for -- errors.jsonl not arriving -- `flat` has NO datapoints
+    # at all. CloudWatch metric math drops any period where an input is
+    # missing, so a bare `flat < 1` would silently evaluate to nothing and the
+    # alarm would be blind in its own target case. FILL is AWS's documented
+    # tool for "a metric that only reports when the value is non-zero", which
+    # is precisely what a log metric filter is.
+    #
+    # `nested` is deliberately NOT filled: it supplies the timestamp grid, and
+    # in the failure case it is the series that HAS data. A period where
+    # neither file reports anything therefore yields no datapoint at all and
+    # falls through to treat_missing_data below -- a quiet session stays quiet.
+    expression  = "IF(nested >= 5 AND FILL(flat, 0) < 1, 1, 0)"
+    label       = "errors.jsonl stream silent while app.log still has errors"
+    return_data = true
+  }
+
+  metric_query {
+    id = "flat"
+    metric {
+      metric_name = "tv_log_errors_flat_total"
+      namespace   = "Tickvault/Prod"
+      period      = 300
+      stat        = "Sum"
+    }
+  }
+
+  metric_query {
+    id = "nested"
+    metric {
+      metric_name = "tv_log_errors_nested_total"
+      namespace   = "Tickvault/Prod"
+      period      = 300
+      stat        = "Sum"
+    }
+  }
+
+  # `local.app_alarm_actions`, the same indirection every alarm in this repo
+  # uses -- NOT a direct topic reference. A direct `aws_sns_topic.tv_alerts.arn`
+  # resolves to the same topic today and silently stops matching the moment
+  # that local gains a second target; the comment on the preopen-ready alarm
+  # above records the same lesson from its own first draft.
+  alarm_actions = local.app_alarm_actions
+
+  # No ok_actions. Recovery here means an operator repaired the agent or the
+  # glob; a datapoint ageing out of the window is not that, and a green
+  # "recovered" page for an aged-out datapoint is the false-OK class this file
+  # records repeatedly.
+  ok_actions = []
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Purpose     = "watch-the-watchers"
+  }
+}
