@@ -3054,17 +3054,17 @@ pub const fn wal_catchup_should_stop_for_memory(
     ceiling_bytes: Option<u64>,
     stop_pct: u64,
 ) -> bool {
-    let (Some(rss), Some(ceiling)) = (rss_bytes, ceiling_bytes) else {
-        return false;
-    };
-    if ceiling == 0 {
-        return false;
-    }
-    // Multiply-then-compare rather than divide: integer division would floor
-    // the threshold and, at a small ceiling, could floor it to zero and stop
-    // every drain instantly. u128 because ceiling * 100 overflows u64 only
-    // above ~1.8e17 bytes, but the cast costs nothing and removes the question.
-    (rss as u128) * 100 >= (ceiling as u128) * (stop_pct as u128)
+    // DELEGATES to the single canonical definition rather than repeating the
+    // arithmetic. Two guards now ask this question — this loop and the WAL
+    // replay in `ws_frame_spill` — and two copies of a threshold comparison
+    // is exactly how they drift into disagreeing about "close to the ceiling".
+    // The name stays because the CALLER's question is specific ("should the
+    // catch-up drain stand down?"); only the maths is shared.
+    tickvault_storage::resource_monitor::rss_at_or_above_fraction(
+        rss_bytes,
+        ceiling_bytes,
+        stop_pct,
+    )
 }
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///

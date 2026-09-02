@@ -118,6 +118,37 @@ pub fn parse_max_open_files(limits_body: &str) -> Option<u64> {
     None
 }
 
+/// Is resident memory at or above `pct` percent of the ceiling?
+///
+/// PURE and O(1). The one memory question every "stop before we die" guard in
+/// this workspace asks, in ONE place, so two guards can never drift into two
+/// different definitions of "close to the ceiling".
+///
+/// FAIL-OPEN by construction: an unknown RSS or an unknown ceiling returns
+/// `false`, i.e. do not stop. That direction is deliberate — a guard that
+/// cannot read the numbers must not silently halt WAL recovery, which is the
+/// path that gets captured frames back into the database. A missing ceiling is
+/// already reported by `RESOURCE-02`'s own ceiling_source field; this
+/// predicate's job is the comparison, not the diagnosis.
+///
+/// The multiply is done in `u128` so `rss * 100` cannot overflow on a host
+/// with more than ~184 exabytes of RSS — cheap, and it removes the need to
+/// reason about the bound at all.
+#[must_use]
+pub const fn rss_at_or_above_fraction(
+    rss_bytes: Option<u64>,
+    ceiling_bytes: Option<u64>,
+    pct: u64,
+) -> bool {
+    let (Some(rss), Some(ceiling)) = (rss_bytes, ceiling_bytes) else {
+        return false;
+    };
+    if ceiling == 0 {
+        return false;
+    }
+    (rss as u128) * 100 >= (ceiling as u128) * (pct as u128)
+}
+
 /// PURE parser of a `/proc/self/status` file body for `VmRSS` (in bytes). The
 /// line is `VmRSS:\t   12345 kB` — value in KiB. Returns bytes.
 #[must_use]
@@ -649,6 +680,78 @@ pub fn spawn_supervised_resource_monitor(
 
 #[cfg(test)]
 mod tests {
+
+    // ---------------------------------------------------------------------
+    // rss_at_or_above_fraction — the ONE definition of "close to the ceiling"
+    // ---------------------------------------------------------------------
+
+    /// The boundary is inclusive, and the arithmetic must not floor.
+    ///
+    /// Integer DIVISION would be the obvious way to write this and is wrong:
+    /// `ceiling / 100 * pct` floors twice, and at a small ceiling can floor
+    /// the threshold to zero — which would make the guard fire instantly on
+    /// every host with a tiny cgroup, halting WAL recovery permanently. The
+    /// multiply-then-compare form has no such edge.
+    #[test]
+    fn rss_fraction_is_inclusive_at_the_boundary_and_does_not_floor() {
+        // Exactly on the line counts as over it: the guard exists to stop
+        // BEFORE the ceiling, so "at" must not be treated as "under".
+        assert!(rss_at_or_above_fraction(Some(60), Some(100), 60));
+        assert!(!rss_at_or_above_fraction(Some(59), Some(100), 60));
+        assert!(rss_at_or_above_fraction(Some(61), Some(100), 60));
+
+        // A ceiling small enough that `ceiling / 100` floors to 0. A divide-
+        // based implementation says "over" for ANY rss here; this must not.
+        assert!(!rss_at_or_above_fraction(Some(1), Some(50), 60));
+        assert!(rss_at_or_above_fraction(Some(30), Some(50), 60));
+    }
+
+    /// FAIL-OPEN on anything unmeasurable — the deliberate direction.
+    ///
+    /// Both callers use this to decide whether to STOP draining a backlog.
+    /// Failing closed on an unreadable probe would turn a host we cannot
+    /// measure into a host that never recovers its WAL, which is strictly
+    /// worse than the memory risk the guard exists to bound.
+    #[test]
+    fn rss_fraction_fails_open_when_anything_is_unknown() {
+        assert!(!rss_at_or_above_fraction(None, Some(100), 60));
+        assert!(!rss_at_or_above_fraction(Some(99), None, 60));
+        assert!(!rss_at_or_above_fraction(None, None, 60));
+        // A zero ceiling is a nonsense reading, not a ceiling of zero bytes:
+        // treating it literally would make every comparison true forever.
+        assert!(!rss_at_or_above_fraction(Some(1), Some(0), 60));
+    }
+
+    /// The real numbers from the 2026-09-02 boot that produced this guard.
+    ///
+    /// Pinned as a fixture so the constant and the arithmetic are checked
+    /// against the incident rather than against a round number: RSS 13.09 GiB
+    /// against the unit's 15.0 GiB `MemoryHigh`, which is 87.2% — over the
+    /// 60% stand-down line and over the 80% `RESOURCE-02` page line, which is
+    /// exactly the ordering the two thresholds are meant to have.
+    #[test]
+    fn rss_fraction_matches_the_live_boot_that_produced_the_guard() {
+        let rss = Some(14_050_361_344u64);
+        let ceiling = Some(16_106_127_360u64);
+        assert!(
+            rss_at_or_above_fraction(rss, ceiling, 60),
+            "stand-down line"
+        );
+        assert!(
+            rss_at_or_above_fraction(rss, ceiling, 80),
+            "RESOURCE-02 line"
+        );
+        assert!(!rss_at_or_above_fraction(rss, ceiling, 90));
+
+        // u128 internally: a u64-only `rss * 100` would overflow and wrap for
+        // a large RSS, silently reporting "under the line" at the worst moment.
+        assert!(rss_at_or_above_fraction(
+            Some(u64::MAX),
+            Some(u64::MAX),
+            100
+        ));
+    }
+
     use super::*;
 
     /// A unique scratch directory per test, the same shape the sibling
