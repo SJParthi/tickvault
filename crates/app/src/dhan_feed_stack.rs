@@ -112,16 +112,16 @@ use tickvault_core::websocket::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
 };
 use tickvault_core::websocket::pool_supervisor::{
-    CapturedFrame, ConnectionSupervisor, ExtendOutcome, LiveSubscriptionCommand, PoolSupervisor,
-    RingByteBudget, SubscribeGuard, SubscribeGuardRefusal, SubscribeInstrument, WalRingSink,
-    run_connection_with_commands,
+    CapturedFrame, ConnectionSupervisor, ExtendOutcome, FrameSilenceGate, LiveSubscriptionCommand,
+    PoolSupervisor, RingByteBudget, SubscribeGuard, SubscribeGuardRefusal, SubscribeInstrument,
+    WalRingSink, run_connection_with_commands,
 };
 use tickvault_storage::depth_persistence::{
     DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
     DepthWriter, depth_segment_label,
 };
 use tickvault_storage::tick_persistence::TickWriter;
-use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
+use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
 use tracing::{error, info, warn};
@@ -6358,7 +6358,10 @@ pub struct DhanFeedStackParams {
     /// recovered frame can never race a live one.
     ///
     /// Empty on a clean boot, which is the overwhelmingly common case.
-    pub wal_replay_live_feed: Vec<(u64, i64, bytes::Bytes)>,
+    ///
+    /// `(frame_seq, received_at_nanos, endpoint, frame)` — the TVW4 endpoint
+    /// is what routes a replayed depth frame to the depth drain.
+    pub wal_replay_live_feed: Vec<(u64, i64, WalEndpoint, bytes::Bytes)>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -8355,6 +8358,7 @@ pub fn depth200_rebalance_sockets(
         out.push(crate::depth_rebalance::RebalanceSocket {
             tx,
             held: Some(only),
+            pending: None,
         });
     }
     out
@@ -8385,6 +8389,7 @@ pub fn depth20_track_sockets(
             |(_, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
                 tx: tx.clone(),
                 held: instruments.clone(),
+                pending: Vec::new(),
             },
         )
         .collect()
@@ -8526,7 +8531,15 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         let Some(supervisor) = pool.connection_mut(planned.slot.global_index).map(|s| {
             // Take the supervisor's state by value: `run_connection` drives one
             // connection for its whole life and must own its policy object.
-            core::mem::replace(s, ConnectionSupervisor::new(planned.slot, Instant::now()))
+            let mut taken =
+                core::mem::replace(s, ConnectionSupervisor::new(planned.slot, Instant::now()));
+            // The frame watchdog (2026-09-02, audit finding 7) counts data
+            // silence only inside the continuous session: the pre-open and
+            // the post-close are legitimately frame-silent, and an ungated
+            // watchdog would redial all sixteen sockets every five minutes
+            // from 15:40 until the box stops at 17:30.
+            taken.set_frame_silence_gate(FrameSilenceGate::ContinuousSessionIst);
+            taken
         }) else {
             warn!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
@@ -8717,12 +8730,24 @@ pub struct WalRefoldOutcome {
     /// main-feed response codes (each code `c` has `(c − 12) mod 16 ≠ 0`), so
     /// the boundary walk always stops at byte 0 rather than fabricating.
     ///
-    /// What this field is NOT: a recovery. A ring-shed depth frame's rows are
-    /// not re-persisted on replay, because the refold has no depth ingest and
-    /// the record has no endpoint to route by. Re-folding them needs the WAL
-    /// record to carry the endpoint (a format bump) and a depth arm here —
-    /// recorded as open, not claimed done.
+    /// What this field is NOT: a recovery. Since TVW4 (2026-09-02) a frame
+    /// whose record CARRIES a depth endpoint is routed to the depth drain
+    /// (`depth_refolded_rows` / `depth_refused` below) and never lands here.
+    /// This counts the honest residual: a LEGACY v1–v3 record (no endpoint
+    /// byte, recognised only by its header) or a depth frame replayed on a
+    /// lane built WITHOUT a depth sink. Both are un-recovered and say so.
     pub depth_frames: u64,
+    /// Depth LEVEL rows re-appended on replay from TVW4 depth-endpoint records
+    /// (2026-09-02), through the SAME `drain_depth_frame` the live drain uses
+    /// and with the ORIGINAL receipt, so the two cannot produce different rows.
+    /// DEDUP-idempotent for the same reason the tick re-append is: the
+    /// per-packet `capture_seq` is derived from `(frame_seq, packet_index)`,
+    /// both of which replay reproduces exactly.
+    pub depth_refolded_rows: u64,
+    /// Depth packets the replay arm REFUSED — parser rejection, unmapped
+    /// segment code, or an unrepresentable packet index. Captured, durably
+    /// written, and not in the table: real loss, counted and logged.
+    pub depth_refused: u64,
     /// Inline depth rows re-appended on replay (2026-08-28).
     ///
     /// The fold matched `TickWithDepth(tick, _)` and threw the five levels
@@ -8790,7 +8815,7 @@ pub fn is_depth_socket_frame(bytes: &[u8]) -> bool {
 /// The gate-disabled path in `spawn_dhan_feed_stack` deliberately does NOT call
 /// this: `main.rs` reads the identical gate and has already logged the drop
 /// itself, so reporting again would double-count the same frames.
-pub fn report_unfolded_wal_frames(frames: &[(u64, i64, bytes::Bytes)], refusal: &str) {
+pub fn report_unfolded_wal_frames(frames: &[(u64, i64, WalEndpoint, bytes::Bytes)], refusal: &str) {
     if frames.is_empty() {
         return;
     }
@@ -8910,7 +8935,7 @@ fn refold_one_tick(
 /// recovery of every other frame beside it.
 pub fn refold_wal_frames(
     ingest: &mut LiveIngest,
-    frames: &[(u64, i64, bytes::Bytes)],
+    frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
 
@@ -9010,10 +9035,60 @@ pub fn refold_wal_frames(
         .aggregator
         .seed_watermark_at_least(ist_day_start_secs);
 
-    for (frame_seq, wal_received_at_nanos, bytes) in frames {
-        // A depth-socket frame in the live-feed WAL: count it honestly and
-        // move on. See `WalRefoldOutcome::depth_frames` for why it is here,
-        // why it is not corruption, and why it is not recovered.
+    for (frame_seq, wal_received_at_nanos, endpoint, bytes) in frames {
+        // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
+        // sniff. A depth frame goes through the SAME `drain_depth_frame` the
+        // live drain uses, with its ORIGINAL receipt, so replay and live
+        // cannot produce different rows; `capture_seq` is derived from
+        // `(frame_seq, packet_index)`, which replay reproduces exactly, so
+        // the re-append is DEDUP-idempotent. A lane built without a depth
+        // sink falls to the honest `depth_frames` bucket below.
+        match endpoint {
+            WalEndpoint::Depth20 | WalEndpoint::Depth200 => {
+                let (kind, dhan_endpoint) = if *endpoint == WalEndpoint::Depth20 {
+                    (DepthFeedKind::Twenty, DhanEndpointType::Depth20)
+                } else {
+                    (DepthFeedKind::TwoHundred, DhanEndpointType::Depth200)
+                };
+                match ingest.inline_depth.as_mut() {
+                    Some(depth) => {
+                        let frame = CapturedFrame {
+                            seq: *frame_seq,
+                            endpoint: dhan_endpoint,
+                            // Sentinel: a replayed frame came off no live
+                            // socket, and `u8::MAX` is outside every real
+                            // connection index.
+                            connection_index: u8::MAX,
+                            // A dwell anchor only — `drain_depth_frame`
+                            // never reads it; the receipt it DOES use is
+                            // the WAL's `received_at_nanos` beside it.
+                            received_at: std::time::Instant::now(),
+                            // APPROVED: `Bytes::clone` is an atomic refcount bump on a cold boot-replay path, NOT a copy of the frame payload.
+                            bytes: bytes.clone(),
+                        };
+                        let outcome = drain_depth_frame(
+                            depth,
+                            &frame,
+                            *wal_received_at_nanos,
+                            kind,
+                            counters(),
+                        );
+                        out.depth_refolded_rows =
+                            out.depth_refolded_rows.saturating_add(outcome.rows);
+                        out.depth_refused = out.depth_refused.saturating_add(outcome.refused);
+                    }
+                    None => {
+                        out.depth_frames = out.depth_frames.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+            WalEndpoint::MainFeed | WalEndpoint::OrderUpdate => {}
+        }
+        // A depth-socket frame in the live-feed WAL under a LEGACY record (no
+        // endpoint byte): count it honestly and move on. See
+        // `WalRefoldOutcome::depth_frames` for why it is here, why it is not
+        // corruption, and why it is not recovered.
         if is_depth_socket_frame(bytes) {
             out.depth_frames = out.depth_frames.saturating_add(1);
             continue;
@@ -9112,18 +9187,40 @@ pub fn refold_wal_frames(
         .increment(out.non_tick);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "depth_frame")
         .increment(out.depth_frames);
+    // TVW4 (2026-09-02): the two outcomes of the depth arm, on the SAME
+    // metric so one series carries the whole replay verdict. `depth_refolded`
+    // counts LEVEL ROWS (what reached the table), `depth_refused` counts
+    // PACKETS the arm could not persist — real, permanent loss.
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "depth_refolded")
+        .increment(out.depth_refolded_rows);
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "depth_refused")
+        .increment(out.depth_refused);
+    if out.depth_refused > 0 {
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_depth_refused",
+            depth_refused = out.depth_refused,
+            depth_refolded_rows = out.depth_refolded_rows,
+            "WAL replay: depth packets were captured and REFUSED by the depth arm \
+             (parser rejection, unmapped segment, or an unrepresentable packet index) — \
+             their levels are permanently unrecovered, and the segment is archived either way."
+        );
+    }
     if out.depth_frames > 0 {
         // `warn!`, not `error!`: no tick was lost and nothing is corrupt. But
         // the depth rows inside these frames were shed by the ring and are
         // NOT re-persisted here, so this is the one line that records a
-        // depth gap the tick counters cannot see.
+        // depth gap the tick counters cannot see. Since TVW4 this bucket is
+        // the RESIDUAL only: a legacy v1–v3 record (no endpoint byte), or a
+        // depth-endpoint record replayed on a lane built without a depth sink.
         warn!(
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
             depth_frames = out.depth_frames,
             refolded = out.refolded,
-            "WAL replay: depth-socket frames were in the live-feed WAL and were skipped — \
-             they are not ticks and not corrupt, but their depth rows are NOT re-persisted \
-             (the refold has no depth arm and the record carries no endpoint)"
+            depth_refolded_rows = out.depth_refolded_rows,
+            "WAL replay: depth-socket frames were skipped — they are not ticks and not \
+             corrupt, but their depth rows are NOT re-persisted (a legacy record with no \
+             endpoint byte, or no depth sink on this lane)"
         );
     }
     if out.undecodable > 0 {
@@ -9141,6 +9238,27 @@ pub fn refold_wal_frames(
             rows = out.inline_depth_rows,
             "WAL replay: inline depth levels re-appended — until 2026-08-28 the refold \
              discarded them while the live path persisted them"
+        );
+    }
+    // FINDING 12 (2026-09-02): ONE coded line per replay when ticks were LOST.
+    // Emitted HERE, inside the refold, so every caller — the boot refold and
+    // each catch-up round alike — reports the loss on the already-filtered
+    // WS-SPILL-01 code rather than folding it into a per-caller summary that
+    // a filter cannot match. `lost` is real, counted loss: a tick that was
+    // parsed and then REFUSED by the fold, with the segment archived anyway.
+    if out.lost > 0 {
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_lost",
+            lost = out.lost,
+            refolded = out.refolded,
+            undecodable = out.undecodable,
+            depth_refused = out.depth_refused,
+            frames = frames.len(),
+            "WAL replay LOST ticks: {} tick(s) were captured, parsed, and REFUSED by the \
+             fold — they are not in the database, and the segment is archived either way. \
+             The raw frames remain in the WAL archive and can be recovered by hand.",
+            out.lost
         );
     }
 
@@ -9696,7 +9814,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         let mut catchup_not_folded = 0u64;
         while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
             let wal_dir = crate::boot_helpers::ws_wal_dir();
-            let batch = match tickvault_storage::ws_frame_spill::replay_all(&wal_dir) {
+            let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report(
+                &wal_dir,
+                tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_BYTES,
+            ) {
                 Ok(b) => b,
                 Err(err) => {
                     error!(
@@ -9710,7 +9831,36 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     break;
                 }
             };
-            if batch.is_empty() {
+            // FINDING 2 (2026-09-02): a round that DEFERRED segments was logged
+            // inside `replay_all` on the uncoded WS-SPILL-02 arm and then
+            // forgotten. Page ONCE per boot on the already-filtered
+            // WS-SPILL-01 code — a 120-round drain that defers on every round
+            // must produce one line, not 120. Function-local latch: this
+            // loop runs once per lane start, and the static outlives it so
+            // a lane respawn in the same process does not page again.
+            static REPLAY_DEFERRED_PAGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if tickvault_storage::ws_frame_spill::should_page_replay_deferred(
+                batch.deferred_segments,
+                REPLAY_DEFERRED_PAGED.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                REPLAY_DEFERRED_PAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                error!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    source = "replay_deferred",
+                    deferred_segments = batch.deferred_segments,
+                    bytes_replayed = batch.bytes_replayed,
+                    budget_bytes = batch.budget_bytes,
+                    rounds,
+                    "WAL replay DEFERRED segments past its RAM budget — nothing is stranded \
+                     (a deferred segment stays a `*.wal` file and is re-globbed next round or \
+                     next boot), but those frames are on disk rather than in the database \
+                     until then. A deferral on every boot means the WAL is growing faster \
+                     than replay drains it: a capacity problem, not a recovery one. Reported \
+                     once per boot."
+                );
+            }
+            if batch.frames.is_empty() {
                 break;
             }
             // Count what this lane does NOT fold before dropping it.
@@ -9731,14 +9881,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // either way. The counter shares `tv_ws_frame_wal_replay_total`
             // with the boot path so one series answers "how many of these have
             // we seen", regardless of which drain saw them.
-            let batch_len = batch.len();
-            let staged: Vec<(u64, i64, bytes::Bytes)> = batch
+            let batch_len = batch.frames.len();
+            let staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> = batch
+                .frames
                 .into_iter()
                 .filter(|f| f.ws_type == tickvault_storage::ws_frame_spill::WsType::LiveFeed)
                 .map(|f| {
                     (
                         f.frame_seq,
                         f.received_at_nanos,
+                        f.endpoint,
                         bytes::Bytes::from(f.frame),
                     )
                 })
@@ -16831,9 +16983,13 @@ mod wal_refold_tests {
     #[test]
     fn refold_wal_frames_counts_a_depth_frame_as_depth_not_as_unparseable() {
         use tickvault_common::constants::DEEP_DEPTH_FEED_CODE_ASK;
+        // A LEGACY record (pre-TVW4, endpoint unknown → MainFeed): the header
+        // sniff is the only thing that can recognise it, and it is counted,
+        // never recovered.
         let frames = vec![(
             1_u64,
             WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
             bytes::Bytes::from(depth_frame(DEEP_DEPTH_FEED_CODE_ASK, 20)),
         )];
         let out = refold_wal_frames(&mut ingest(), &frames);
@@ -16841,6 +16997,174 @@ mod wal_refold_tests {
         assert_eq!(out.unparseable, 0, "and it is NOT reported as corruption");
         assert_eq!(out.undecodable, 0);
         assert_eq!(out.refolded, 0, "no tick is fabricated from it");
+        assert_eq!(
+            out.depth_refolded_rows, 0,
+            "a legacy record is never recovered"
+        );
+    }
+
+    /// A well-formed depth-20 packet (12-byte header + 20 x 16-byte levels)
+    /// with distinguishable per-level values, mirroring the live-drain test
+    /// fixture. Segment 2 = NSE_FNO, the only segment depth is served on.
+    fn depth20_wal_packet(security_id: u32, feed_code: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 12 + 20 * 16];
+        let len = u16::try_from(p.len()).expect("332 fits u16");
+        p[0..2].copy_from_slice(&len.to_le_bytes());
+        p[2] = feed_code;
+        p[3] = 2;
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        for i in 0..20usize {
+            let base = 12 + i * 16;
+            let price = 100.0_f64 + i as f64;
+            let qty = u32::try_from(10 * (i + 1)).expect("small");
+            let orders = u32::try_from(i + 1).expect("small");
+            p[base..base + 8].copy_from_slice(&price.to_le_bytes());
+            p[base + 8..base + 12].copy_from_slice(&qty.to_le_bytes());
+            p[base + 12..base + 16].copy_from_slice(&orders.to_le_bytes());
+        }
+        p
+    }
+
+    /// A depth-200 packet with a caller-chosen row count (header bytes 8..12
+    /// are the ROW COUNT on this feed).
+    fn depth200_wal_packet(security_id: u32, feed_code: u8, rows: u32) -> Vec<u8> {
+        let n = rows as usize;
+        let mut p = vec![0u8; 12 + n * 16];
+        let len = u16::try_from(p.len()).expect("fits u16");
+        p[0..2].copy_from_slice(&len.to_le_bytes());
+        p[2] = feed_code;
+        p[3] = 2;
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        p[8..12].copy_from_slice(&rows.to_le_bytes());
+        for i in 0..n {
+            let base = 12 + i * 16;
+            let price = 500.0_f64 + i as f64 * 0.25;
+            let qty = u32::try_from(7 * (i + 1)).expect("small");
+            let orders = u32::try_from(i + 2).expect("small");
+            p[base..base + 8].copy_from_slice(&price.to_le_bytes());
+            p[base + 8..base + 12].copy_from_slice(&qty.to_le_bytes());
+            p[base + 12..base + 16].copy_from_slice(&orders.to_le_bytes());
+        }
+        p
+    }
+
+    /// TVW4 (2026-09-02): a record that CARRIES the depth-20 endpoint is
+    /// routed to the depth drain and its levels reach the depth sink — the
+    /// recovery the legacy `depth_frames` bucket could never make.
+    #[test]
+    fn refold_wal_frames_routes_a_tvw4_depth20_record_to_the_depth_writer() {
+        use tickvault_common::constants::DEEP_DEPTH_FEED_CODE_BID;
+        let seq = tickvault_storage::ws_frame_spill::next_frame_seq();
+        let frames = vec![(
+            seq,
+            1_779_355_000_000_000_000_i64,
+            WalEndpoint::Depth20,
+            bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
+        )];
+        let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
+        let out = refold_wal_frames(&mut with_sink, &frames);
+        assert_eq!(
+            out.depth_refolded_rows, 20,
+            "every level is a row — nothing is sampled"
+        );
+        assert_eq!(out.depth_refused, 0);
+        assert_eq!(
+            out.depth_frames, 0,
+            "a routed frame never lands in the residual bucket"
+        );
+        assert_eq!(
+            out.unparseable, 0,
+            "and it is never fed to the main-feed parser"
+        );
+        assert_eq!(out.refolded, 0, "no tick is fabricated from it");
+        assert_eq!(
+            with_sink.depth_pending_rows(),
+            20,
+            "the rows are buffered in the SAME depth sink the live drain uses"
+        );
+    }
+
+    /// The no-sink branch: a depth-endpoint record on a lane built WITHOUT a
+    /// depth sink falls to the honest `depth_frames` bucket — counted, never
+    /// silently dropped, never fed to the wrong parser.
+    #[test]
+    fn refold_wal_frames_counts_a_tvw4_depth_record_when_the_lane_has_no_depth_sink() {
+        use tickvault_common::constants::DEEP_DEPTH_FEED_CODE_BID;
+        let seq = tickvault_storage::ws_frame_spill::next_frame_seq();
+        let frames = vec![(
+            seq,
+            1_779_355_000_000_000_000_i64,
+            WalEndpoint::Depth20,
+            bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
+        )];
+        let out = refold_wal_frames(&mut ingest(), &frames);
+        assert_eq!(
+            out.depth_frames, 1,
+            "no sink: counted as an un-recovered depth frame"
+        );
+        assert_eq!(out.depth_refolded_rows, 0);
+        assert_eq!(out.depth_refused, 0);
+        assert_eq!(out.unparseable, 0);
+        assert_eq!(out.refolded, 0);
+    }
+
+    /// A depth-200 record refolds with its OWN row count — the variable-length
+    /// half of the protocol, read from header bytes 8..12.
+    #[test]
+    fn refold_wal_frames_routes_a_tvw4_depth200_record_with_its_row_count() {
+        use tickvault_common::constants::DEEP_DEPTH_FEED_CODE_ASK;
+        let seq = tickvault_storage::ws_frame_spill::next_frame_seq();
+        let frames = vec![(
+            seq,
+            1_779_355_000_000_000_000_i64,
+            WalEndpoint::Depth200,
+            bytes::Bytes::from(depth200_wal_packet(72_271, DEEP_DEPTH_FEED_CODE_ASK, 7)),
+        )];
+        let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
+        let out = refold_wal_frames(&mut with_sink, &frames);
+        assert_eq!(out.depth_refolded_rows, 7, "seven rows in, seven rows out");
+        assert_eq!(out.depth_refused, 0);
+        assert_eq!(out.depth_frames, 0);
+        assert_eq!(with_sink.depth_pending_rows(), 7);
+    }
+
+    /// FINDING 12 (2026-09-02): a replay that LOST ticks must emit the coded
+    /// WS-SPILL-01 line from INSIDE the refold, so every caller reports it.
+    /// The emit sits on the `out.lost > 0` arm; pin the arm, its code and its
+    /// `source` so a later refactor cannot fold the loss back into a summary.
+    #[test]
+    fn refold_wal_frames_emits_the_coded_replay_lost_line_when_ticks_were_lost() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub fn ").next())
+            .expect("refold_wal_frames body");
+        let arm = body
+            .find("if out.lost > 0 {")
+            .expect("the refold must branch on out.lost > 0");
+        let after = &body[arm..];
+        let end = after.find("\n    }\n").map_or(after.len(), |i| i + 6);
+        let arm_body = &after[..end];
+        // Matched WITHOUT the opening paren: the uncoded-error ratchet in
+        // `error_code_tag_guard` treats this module as production and would
+        // count the literal as an uncoded emit site.
+        assert!(
+            arm_body.contains("error!") && !arm_body.contains("info!"),
+            "a lost tick is an error, never an info summary"
+        );
+        assert!(
+            arm_body.contains("ErrorCode::WsSpill01WriterRespawn.code_str()"),
+            "the loss must ride the already-filtered WS-SPILL-01 code"
+        );
+        assert!(
+            arm_body.contains("source = \"replay_lost\""),
+            "the `source` field is what lets a filter tell this arm from the writer-respawn arm"
+        );
+        assert!(
+            arm_body.contains("lost = out.lost") && arm_body.contains("refolded = out.refolded"),
+            "the line must carry both halves of the verdict"
+        );
     }
 
     /// The boot replay MUST seed the aggregator watermark before it folds a
@@ -16922,7 +17246,12 @@ mod wal_refold_tests {
         // indistinguishable from nothing having happened.
         let mut bytes = vec![0u8; tickvault_common::constants::OI_PACKET_SIZE];
         bytes[0] = tickvault_common::constants::RESPONSE_CODE_OI;
-        let frames = vec![(11u64, WAL_RECEIPT_UNKNOWN_NANOS, bytes::Bytes::from(bytes))];
+        let frames = vec![(
+            11u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
+            bytes::Bytes::from(bytes),
+        )];
         let out = refold_wal_frames(&mut ingest(), &frames);
 
         assert_eq!(out.refolded, 0, "an OI packet carries no tick");
@@ -16998,7 +17327,12 @@ mod wal_refold_tests {
         buf[8..12].copy_from_slice(&100.5f32.to_le_bytes()); // LTP
         buf[14..18].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // LTT
 
-        let frames = vec![(3u64, WAL_RECEIPT_UNKNOWN_NANOS, bytes::Bytes::from(buf))];
+        let frames = vec![(
+            3u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
+            bytes::Bytes::from(buf),
+        )];
 
         let without = refold_wal_frames(&mut ingest(), &frames);
         assert_eq!(
@@ -17058,6 +17392,7 @@ mod wal_refold_tests {
         let frames = vec![(
             1u64,
             WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]),
         )];
         let out = refold_wal_frames(&mut ingest(), &frames);
@@ -17076,6 +17411,7 @@ mod wal_refold_tests {
         let frames = vec![(
             7u64,
             WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[2, 0, 0, 0]),
         )];
         let out = refold_wal_frames(&mut ingest(), &frames);
@@ -18774,6 +19110,7 @@ mod late_seed_tests {
         let frames = vec![(
             1u64,
             WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[8, 0, 0, 0]),
         )];
         report_unfolded_wal_frames(&frames, "token_manager_missing");

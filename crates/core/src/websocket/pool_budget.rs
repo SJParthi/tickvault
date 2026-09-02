@@ -230,6 +230,23 @@ impl DhanEndpointType {
         }
     }
 
+    /// The byte this endpoint writes into a TVW4 WAL record (2026-09-02).
+    ///
+    /// ONE mapping, here, so the sink that captures a frame and the refold that
+    /// replays it can never disagree about which parser the frame belongs to.
+    /// Distinct per variant — pinned by
+    /// `every_endpoint_type_maps_to_a_distinct_wal_endpoint`.
+    #[must_use]
+    pub const fn wal_endpoint(&self) -> tickvault_storage::ws_frame_spill::WalEndpoint {
+        use tickvault_storage::ws_frame_spill::WalEndpoint;
+        match self {
+            Self::MainFeed => WalEndpoint::MainFeed,
+            Self::Depth20 => WalEndpoint::Depth20,
+            Self::Depth200 => WalEndpoint::Depth200,
+            Self::OrderUpdate => WalEndpoint::OrderUpdate,
+        }
+    }
+
     /// Does this endpoint need a CLIENT-originated keepalive ping?
     ///
     /// # The measurement (prod, 2026-08-26, market open)
@@ -1112,5 +1129,46 @@ mod tests {
         assert_eq!(a.endpoint(), DhanEndpointType::Depth200);
         assert_eq!(b.endpoint(), DhanEndpointType::Depth20);
         assert_ne!(a.reason_str(), b.reason_str());
+    }
+
+    /// TVW4 (2026-09-02): the WAL endpoint byte is the ONLY thing that lets a
+    /// replay route a depth frame to the depth parser. Two endpoint types
+    /// sharing a byte would send one of them to the wrong parser on every
+    /// replay, silently; a byte that does not survive `from_u8` would degrade
+    /// to the main feed the same way.
+    #[test]
+    fn every_endpoint_type_maps_to_a_distinct_wal_endpoint() {
+        use tickvault_storage::ws_frame_spill::WalEndpoint;
+        let mut seen = std::collections::BTreeSet::new();
+        for endpoint in DhanEndpointType::ALL {
+            let wal = endpoint.wal_endpoint();
+            assert!(
+                seen.insert(wal.as_u8()),
+                "{endpoint:?} shares WAL endpoint byte {} with another type",
+                wal.as_u8()
+            );
+            assert_eq!(
+                WalEndpoint::from_u8(wal.as_u8()),
+                wal,
+                "{endpoint:?}'s byte must survive the disk round-trip"
+            );
+        }
+        assert_eq!(seen.len(), DhanEndpointType::ALL.len());
+        assert_eq!(
+            DhanEndpointType::MainFeed.wal_endpoint(),
+            WalEndpoint::MainFeed
+        );
+        assert_eq!(
+            DhanEndpointType::Depth20.wal_endpoint(),
+            WalEndpoint::Depth20
+        );
+        assert_eq!(
+            DhanEndpointType::Depth200.wal_endpoint(),
+            WalEndpoint::Depth200
+        );
+        assert_eq!(
+            DhanEndpointType::OrderUpdate.wal_endpoint(),
+            WalEndpoint::OrderUpdate
+        );
     }
 }

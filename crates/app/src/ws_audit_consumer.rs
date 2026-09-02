@@ -11,6 +11,8 @@
 //! shared `ws_event_audit` table (ILP appends are independent), so every
 //! WebSocket producer reuses this exact pattern with no boot refactor.
 
+use tickvault_core::websocket::audit_drop_latch::DropLatch;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{error, info};
 
 /// Bounded capacity for the WS-event audit channel. WS lifecycle events are
@@ -62,24 +64,99 @@ pub fn spawn_live_feed_lifecycle_audit(
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<WsLifecycleEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
     tokio::spawn(async move {
+        // One latch per forwarder: a drop EPISODE is a property of this
+        // channel, and the page for it is said once per episode (see
+        // `record_forward_drop`).
+        let latch = DropLatch::new();
         while let Some(event) = rx.recv().await {
             let now_ist_nanos = chrono::Utc::now()
                 .timestamp_nanos_opt()
                 .unwrap_or_default()
                 .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-            if rows_tx
-                .try_send(lifecycle_row(event, now_ist_nanos))
-                .is_err()
-            {
-                metrics::counter!(
-                    "tv_ws_event_audit_dropped_total",
-                    "reason" => "live_feed_forward"
-                )
-                .increment(1);
+            match rows_tx.try_send(lifecycle_row(event, now_ist_nanos)) {
+                Ok(()) => {
+                    let _ = record_forward_ok(&latch, &event);
+                }
+                Err(TrySendError::Full(_)) => {
+                    let _ = record_forward_drop(&latch, &event, "full");
+                }
+                Err(TrySendError::Closed(_)) => {
+                    let _ = record_forward_drop(&latch, &event, "closed");
+                }
             }
         }
     });
     tx
+}
+
+/// A socket-lifecycle audit row could NOT be handed to the consumer.
+///
+/// Counted EVERY time (the counter is the total), logged ONCE per episode
+/// (the latch's rising edge). Returns whether this call was the one that
+/// logged, so a test can assert the edge without a log subscriber.
+///
+/// # Why this is `error!` and not the bare counter it replaced (2026-09-02)
+///
+/// Before this, the forwarder's drop arm was `metrics::counter!` and nothing
+/// else — a counter that is not EMF-selected and sits on no dashboard. A
+/// wedged consumer therefore cost every socket-lifecycle row of a session
+/// with no operator-visible trace, which is the false-OK class `ws_event_audit`
+/// was created to prevent: the table's only job is to answer "which pool went
+/// dark and when?", and the one time it is most needed is exactly when the
+/// consumer behind it is stalled. The order-update socket's own drop arm has
+/// been `error!` since 2026-07-05; this path never inherited that.
+///
+/// HOT-PATH-02 is the persistence layer's existing filtered loss code (a
+/// `writer queue drop` is what this is); the `source` field scopes it, so no
+/// new metric name and no new alarm.
+fn record_forward_drop(
+    latch: &DropLatch,
+    event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+    reason: &'static str,
+) -> bool {
+    metrics::counter!(
+        "tv_ws_event_audit_dropped_total",
+        "reason" => "live_feed_forward"
+    )
+    .increment(1);
+    let first_of_episode = latch.on_drop();
+    if first_of_episode {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "ws_event_audit_row_dropped",
+            reason,
+            endpoint = event.endpoint.as_str(),
+            connection_index = event.connection_index,
+            event_kind = event.kind.as_str(),
+            event_reason = event.reason,
+            "ws_event_audit: a socket-lifecycle row was DROPPED before it reached the \
+             writer ({reason}) — the audit table is now MISSING this socket's history \
+             and will keep missing rows until the consumer drains. Counted on every \
+             drop, paged once per episode; a recovery line follows when a row lands"
+        );
+    }
+    first_of_episode
+}
+
+/// A socket-lifecycle audit row reached the consumer. Closes an open drop
+/// episode (one `info!` on the falling edge); routine otherwise. Returns
+/// whether this call closed an episode.
+fn record_forward_ok(
+    latch: &DropLatch,
+    event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+) -> bool {
+    let recovered = latch.on_ok();
+    if recovered {
+        info!(
+            endpoint = event.endpoint.as_str(),
+            connection_index = event.connection_index,
+            event_kind = event.kind.as_str(),
+            "ws_event_audit: socket-lifecycle rows are reaching the writer again — the \
+             drop episode is over (rows dropped during it are gone; the count is in \
+             tv_ws_event_audit_dropped_total)"
+        );
+    }
+    recovered
 }
 
 /// Widens one socket lifecycle event into the audit row, at a given instant.
@@ -368,6 +445,51 @@ mod lifecycle_row_tests {
         assert_eq!(
             row.trading_date_ist_nanos, midnight,
             "the LAST nanosecond of a day must still belong to that day"
+        );
+    }
+
+    fn park_event() -> WsLifecycleEvent {
+        WsLifecycleEvent {
+            endpoint: DhanEndpointType::Depth200,
+            connection_index: 2,
+            kind: WsEventKind::Disconnected,
+            reason: "park_fatal",
+        }
+    }
+
+    /// 2026-09-02 (audit finding 9): a forwarder drop is LOUD exactly once per
+    /// episode. The first drop logs; the next thousand are counted and
+    /// silent; a landed row closes the episode; the drop after THAT is a new
+    /// episode and logs again. Before this the arm was a bare counter.
+    #[test]
+    fn a_forward_drop_is_loud_once_per_episode_and_re_arms_on_success() {
+        use super::{record_forward_drop, record_forward_ok};
+        use tickvault_core::websocket::audit_drop_latch::DropLatch;
+
+        let latch = DropLatch::new();
+        let event = park_event();
+
+        assert!(
+            !record_forward_ok(&latch, &event),
+            "a landed row with no open episode is routine, not a recovery"
+        );
+        assert!(
+            record_forward_drop(&latch, &event, "full"),
+            "the FIRST drop of an episode must be the one that logs"
+        );
+        for _ in 0..1_000 {
+            assert!(
+                !record_forward_drop(&latch, &event, "full"),
+                "later drops in the same episode are counted, never re-paged"
+            );
+        }
+        assert!(
+            record_forward_ok(&latch, &event),
+            "the first landed row after a drop closes the episode"
+        );
+        assert!(
+            record_forward_drop(&latch, &event, "closed"),
+            "after a recovery the next drop is a NEW episode and must log again"
         );
     }
 }
