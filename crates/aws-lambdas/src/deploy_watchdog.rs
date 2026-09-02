@@ -63,6 +63,16 @@ const DEFAULT_GH_DESIRED_REF: &str = "main";
 const DEFAULT_GH_DEPLOY_WORKFLOW: &str = "deploy-aws.yml";
 const DEFAULT_GH_DISPATCH_WORKFLOW: &str = "deploy-aws-after-close.yml";
 const DEFAULT_BINARY_SHA_PARAM: &str = "/tickvault/prod/deploy/binary-git-sha";
+/// The SSM MIRROR of main HEAD, written every 30 minutes by
+/// postmerge-catchup.yml -- NOT by deploy-aws.yml.
+///
+/// That distinction is the whole point and is easy to get wrong: deploy-aws
+/// writes GITHUB_SHA, which IS main HEAD at deploy time, so a mirror written
+/// there would always equal `binary-git-sha` and `binary_is_stale` would be
+/// permanently false -- a green signal that can never go red. The mirror has
+/// to advance when MAIN advances, whether or not a deploy followed, which is
+/// exactly what a 30-minute cron that reads `repos/:repo/commits/main` does.
+const DEFAULT_DESIRED_SHA_PARAM: &str = "/tickvault/prod/deploy/desired-git-sha";
 
 /// B9 deploy provenance metric identity — legacy parity
 /// (`_MISMATCH_METRIC_*`). PutMetricData is called DIRECTLY (bypasses the
@@ -123,6 +133,40 @@ pub fn binary_mismatch_value(binary_sha: Option<&str>, desired_sha: Option<&str>
         return None;
     }
     Some(if b == d { 0.0 } else { 1.0 })
+}
+
+/// Pick main HEAD from the GitHub answer, falling back to the SSM mirror.
+///
+/// Why a fallback exists at all: `desired_sha` needs
+/// `/tickvault/<env>/operator/github-token`, and on 2026-09-02 that parameter
+/// did not exist -- so the deploy-provenance comparison had been dead for its
+/// whole life while `tv-<env>-binary-sha-stale` read OK, because
+/// treat_missing_data = notBreaching turns a producer that declines to produce
+/// into a healthy-looking alarm. The mirror removes the credential from the
+/// critical path without removing the check.
+///
+/// The GitHub answer stays PREFERRED, so placing a token later upgrades this
+/// automatically with no further change. "unknown" is rejected as a value
+/// because that is the literal the portal writes for an unresolved sha, and
+/// comparing it would manufacture a mismatch out of an absence.
+///
+/// Returns the sha and a label naming which leg answered, so the fire log
+/// records the source instead of leaving it to be inferred.
+#[must_use]
+pub fn resolve_desired_sha<'a>(
+    from_github: Option<&'a str>,
+    from_ssm_mirror: Option<&'a str>,
+) -> (Option<&'a str>, &'static str) {
+    fn usable(sha: Option<&str>) -> bool {
+        matches!(sha.map(str::trim), Some(t) if !t.is_empty() && !t.eq_ignore_ascii_case("unknown"))
+    }
+    if usable(from_github) {
+        return (from_github, "github");
+    }
+    if usable(from_ssm_mirror) {
+        return (from_ssm_mirror, "ssm-mirror");
+    }
+    (None, "none")
 }
 
 /// Return true iff the ON-BOX running binary is provably older than main
@@ -327,7 +371,7 @@ async fn dispatch_deploy(
 /// every invocation (NOT via the token cache — the value changes on every
 /// deploy and Lambda containers persist across invocations). Legacy
 /// `_binary_sha`.
-async fn binary_sha(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
+async fn read_sha_param(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
     if param.is_empty() {
         return None;
     }
@@ -342,7 +386,7 @@ async fn binary_sha(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
             if val.is_empty() { None } else { Some(val) }
         }
         Err(e) => {
-            warn!(param, error = %e, "could not read binary sha param");
+            warn!(param, error = %e, "could not read sha param");
             None
         }
     }
@@ -455,6 +499,8 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let alerts_topic_arn = std::env::var("ALERTS_TOPIC_ARN").unwrap_or_default();
     let binary_sha_param =
         std::env::var("BINARY_SHA_PARAM").unwrap_or_else(|_| DEFAULT_BINARY_SHA_PARAM.to_string());
+    let desired_sha_param = std::env::var("DESIRED_SHA_PARAM")
+        .unwrap_or_else(|_| DEFAULT_DESIRED_SHA_PARAM.to_string());
 
     let config = crate::clients::sdk_config().await;
     let ssm = crate::clients::ssm(&config);
@@ -465,11 +511,30 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
         .build()?;
 
     let token = cached_param(&ssm, &token_param).await;
-    let desired = desired_sha(&http, &token, &gh_repo, &gh_desired_ref).await;
+    let desired_from_github = desired_sha(&http, &token, &gh_repo, &gh_desired_ref).await;
+    // Only reach for the mirror when GitHub could not answer -- an SSM read
+    // per fire is cheap, but a read nobody needs is still a read, and keeping
+    // GitHub on the fast path means the behaviour is unchanged the day a
+    // token is placed.
+    let desired_from_mirror = if desired_from_github.is_none() {
+        read_sha_param(&ssm, &desired_sha_param).await
+    } else {
+        None
+    };
+    let (resolved, desired_source) = resolve_desired_sha(
+        desired_from_github.as_deref(),
+        desired_from_mirror.as_deref(),
+    );
+    let desired = resolved.map(str::to_string);
+    info!(
+        desired_source,
+        desired = %short8(desired.as_deref()),
+        "resolved main HEAD for the provenance comparison"
+    );
     // Read the on-box binary provenance sha ONCE per fire — used BOTH for
     // the 24h mismatch metric and the ground-truth box-binary staleness
     // check below.
-    let binary = binary_sha(&ssm, &binary_sha_param).await;
+    let binary = read_sha_param(&ssm, &binary_sha_param).await;
     // B9 deploy provenance: sample binary-vs-main drift on every fire (the
     // 24h alarm needs samples; a None value is silently skipped).
     publish_binary_mismatch_metric(&cw, binary.as_deref(), desired.as_deref()).await;
@@ -674,6 +739,67 @@ mod tests {
         assert_eq!(
             binary_mismatch_value(Some("unknown"), Some("deadbee")),
             None
+        );
+    }
+
+    #[test]
+    fn github_wins_when_it_answers_so_a_token_upgrades_this_automatically() {
+        let (sha, src) = resolve_desired_sha(Some("aaaa1111"), Some("bbbb2222"));
+        assert_eq!(sha, Some("aaaa1111"));
+        assert_eq!(src, "github", "the mirror must never shadow a live answer");
+    }
+
+    #[test]
+    fn the_mirror_answers_when_github_cannot() {
+        // The 2026-09-02 shape: /tickvault/prod/operator/github-token does not
+        // exist, so desired_sha() returns None and the comparison was dead.
+        let (sha, src) = resolve_desired_sha(None, Some("bbbb2222"));
+        assert_eq!(sha, Some("bbbb2222"));
+        assert_eq!(src, "ssm-mirror");
+    }
+
+    #[test]
+    fn neither_source_answering_is_reported_as_none_not_as_a_sha() {
+        let (sha, src) = resolve_desired_sha(None, None);
+        assert!(sha.is_none());
+        assert_eq!(src, "none");
+        // And the downstream comparison must still decline rather than guess.
+        assert!(binary_mismatch_value(Some("aaaa1111"), sha).is_none());
+    }
+
+    #[test]
+    fn placeholder_and_blank_values_are_not_treated_as_a_sha() {
+        // "unknown" is the literal the portal writes for an unresolved sha.
+        // Accepting it would compare a real binary against an absence and
+        // publish a fabricated mismatch -- worse than publishing nothing.
+        for junk in ["unknown", "UNKNOWN", "  ", ""] {
+            let (sha, src) = resolve_desired_sha(None, Some(junk));
+            assert!(sha.is_none(), "{junk:?} must not be accepted as a sha");
+            assert_eq!(src, "none");
+        }
+        // Same rule on the GitHub leg, which then falls through to the mirror.
+        let (sha, src) = resolve_desired_sha(Some("unknown"), Some("bbbb2222"));
+        assert_eq!(sha, Some("bbbb2222"));
+        assert_eq!(src, "ssm-mirror");
+    }
+
+    #[test]
+    fn the_mirror_is_not_written_by_the_deploy_workflow() {
+        // The trap this design exists to avoid: deploy-aws.yml writes
+        // GITHUB_SHA, which IS main HEAD at deploy time. A mirror written
+        // there would always equal binary-git-sha, so binary_is_stale would be
+        // permanently false -- a signal that can never go red. The mirror must
+        // come from a source that advances when MAIN advances.
+        let src = include_str!("deploy_watchdog.rs");
+        assert!(
+            src.contains("postmerge-catchup.yml -- NOT by deploy-aws.yml"),
+            "the const doc must keep naming the writer, or the next reader \
+             will move the write into the deploy workflow and silently kill \
+             the signal"
+        );
+        assert_ne!(
+            DEFAULT_DESIRED_SHA_PARAM, DEFAULT_BINARY_SHA_PARAM,
+            "the mirror and the on-box provenance must be different params"
         );
     }
 

@@ -2702,3 +2702,131 @@ agent's `errors.jsonl` glob from matching on a session with live errors and
 confirm the alarm goes red within two periods — or the first real occurrence.
 Until one of those happens this is a well-reasoned detector, not a proven one,
 and it must not be cited as proof that the coded-error path is now watched.
+
+#### ⚠ CORRECTED 2026-09-02 (same day, hours later) — "all 27" is 25 of 27, and one of the survivors is an alarm this same session shipped
+
+§2.3s above says "all 27 coded-error alarms read `$.code`" in four places, and
+the terraform comment and the alarm description said it too. MEASURED against
+the live account with `aws logs describe-metric-filters --log-group-name
+/tickvault/prod/app`:
+
+| Filter pattern | Count | Survives an `errors.jsonl` outage? |
+|---|---:|---|
+| reads `$.code` (flat) | **25** | no |
+| bare term filter `"DH-906"` | 1 | yes — a term filter matches either schema |
+| `$.fields.ready_at_ist_secs` (nested) | 1 | yes |
+| **total on the log group** | **27** | |
+
+So the number was quoted, not counted. The load-bearing half is unchanged and
+is if anything sharper: **zero** filters read the nested schema for a CODED
+error, so an `errors.jsonl` outage still blinds 25 of 27 and the divergence
+alarm is still the only thing that would say so.
+
+**Two things make this worth a dated correction rather than a silent edit.**
+
+First, one of the two survivors is `tv-<env>-preopen-ready-secs` — an alarm
+**§2.3e of this same file shipped hours earlier**, deliberately reading the
+NESTED schema because that was the only route that cost no user-data byte.
+So the session that wrote "all 27 read `$.code`" had itself created a filter
+that does not, and did not notice. A count taken from memory of one's own work
+is not a measurement.
+
+**⚠ And that specific one is not merely a counting error — it means §2.3e's
+alarm has a dependency §2.3e never states.** `tv-<env>-preopen-ready-secs`
+reads `$.fields.ready_at_ist_secs`, which exists only in `app.log`. §2.3e
+presents it as costing "no new EMF name, no user-data byte" and says nothing
+about which of the two shipped files carries it. If the **app.log** glob is the
+one that stops matching, that alarm goes silent — and the divergence alarm
+above cannot report it, because the divergence alarm's own `nested` leg reads
+the same file and would go to zero with it. The `flat < 1` condition would then
+be false, so it stays green. **The 09:12 readiness deadline is therefore
+watched by exactly one filter on the one stream this file's newest alarm cannot
+see fail.** Recorded, not fixed: closing it means either a second filter on the
+flat stream or an inverted divergence alarm, and both need their own dated
+authorization and their own cost line.
+
+Second, this is the second quoted-not-measured number in one evening — the
+first was a CloudWatch alarm count read through an un-paginated
+`--query 'length(MetricAlarms)'`, which truncates at 50 and reported 50 when
+the real figure is 111. Both were published before being checked. The durable
+rule this file keeps re-learning, now on an operator-facing alarm description:
+**a count is a measurement, and a measurement quoted from one's own prose is
+not one.** The terraform comment and the alarm description are corrected in
+place because an operator triaging at 3am should read the true number; this
+section is annotated rather than rewritten because the trail is the point.
+
+### §2.3q addendum — 2026-09-02: the deploy-provenance check gets a source that needs no credential
+
+§2.3q shipped `tv-<env>-deploy-provenance-blind` and closed with: *"It does not
+create the missing parameter — that needs a real GitHub token, which is an
+operator action."* That framing was right about the token and wrong about the
+options: the comparison does not actually need GitHub, it needs **main HEAD**,
+and main HEAD is obtainable without a credential this repository does not have.
+
+The alarm has been in ALARM with actions enabled since 15:11 IST, correctly
+reporting a real blindness. This closes it.
+
+#### The design, and the trap that was avoided
+
+The watchdog compares the on-box binary sha against main HEAD.
+`/tickvault/<env>/operator/github-token` does not exist, so `desired_sha`
+returns `None`, so `binary_mismatch_value` declines, so the metric has never
+had a datapoint and `tv-<env>-binary-sha-stale` (`treat_missing_data =
+notBreaching`) has read OK for its entire life.
+
+**The obvious fix is wrong and was caught before it was built.** Writing the
+mirror from `deploy-aws.yml` looks natural — it already writes
+`binary-git-sha` there. But that workflow writes `GITHUB_SHA`, which **is**
+main HEAD at deploy time, so the mirror would always equal `binary-git-sha`,
+`binary_is_stale` would be permanently false, and the repair would have
+produced a signal that can never go red: a false OK replacing an honest blind
+spot, which is worse than what it replaced.
+
+The mirror must advance when **main** advances, deploy or no deploy. The writer
+is therefore `postmerge-catchup.yml`, which already runs every 30 minutes and
+already resolves `repos/:repo/commits/main` for its own purposes.
+
+| | writer | advances when |
+|---|---|---|
+| `/tickvault/prod/deploy/binary-git-sha` | `deploy-aws.yml`, after a VERIFIED swap | the box's binary changes |
+| `/tickvault/prod/deploy/desired-git-sha` | **`postmerge-catchup.yml`, every 30 min** | **main changes** |
+
+GitHub stays the PREFERRED source (`resolve_desired_sha` tries it first), so
+placing a token later upgrades the check automatically with no further change.
+
+#### ⚠ What this does NOT restore (Rule 11)
+
+The watchdog OR-s two independent staleness signals. This repairs one of them.
+
+- **`binary_stale`** (on-box binary vs main HEAD) — **restored.** The module's
+  own comment calls this the GROUND TRUTH signal, because a green off-hours
+  no-op skip run can never advance `binary-git-sha`. It is the more valuable
+  of the two.
+- **`github_stale`** (main HEAD vs the last successful `deploy-aws` run's
+  head_sha) — **still dead without a token**, because `deployed_sha` also needs
+  GitHub. Its own comment already records that it can be FOOLED by a skip run,
+  so the surviving signal is the one worth having; but "the watchdog works
+  again" would be an overstatement and is not claimed.
+
+Detection latency is up to 30 minutes stale on the mirror plus the watchdog's
+own schedule. The write is non-fatal in both directions: a failed mirror write
+leaves the previous value and the next firing retries; an absent mirror leaves
+the watchdog exactly as blind as it is today, and still saying so.
+
+#### Cost
+
+Zero new alarms, zero new metrics, zero user-data bytes. One SSM String
+parameter (free tier) and one extra `PutParameter` per 30 minutes.
+
+#### What a PR that violates this addendum looks like (REJECT)
+
+- Moves the mirror write into `deploy-aws.yml` (or any deploy-time step) —
+  that makes the signal permanently green, which is the trap above.
+- Makes the mirror the PREFERRED source over GitHub, so a later token stops
+  upgrading the check.
+- Accepts `"unknown"` or a non-40-hex value as a sha from either source — the
+  comparison would then manufacture a mismatch out of an absence.
+- Makes the mirror write fatal to `postmerge-catchup.yml`, whose actual job is
+  backfilling missing runs.
+- Claims the deploy watchdog is fully restored: `github_stale` remains dead
+  until an operator places `/tickvault/prod/operator/github-token`.
