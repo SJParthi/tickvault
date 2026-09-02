@@ -2395,6 +2395,28 @@ const ARCHIVE_SUBDIR: &str = "archive";
 /// and 1/64th of the 32 GiB host, so it cannot itself be the thing that OOMs.
 pub const WAL_REPLAY_MAX_BYTES: usize = 512 * 1024 * 1024;
 
+/// Stop reading further WAL segments once resident memory reaches this
+/// percentage of the host's memory ceiling.
+///
+/// **Why this exists beside `WAL_REPLAY_MAX_BYTES`, which already bounds the
+/// pass.** That budget counts FRAME PAYLOAD BYTES READ. It does not, and
+/// cannot, bound what those bytes MATERIALIZE into: every frame becomes a
+/// `ReplayedFrame` and is then re-folded into rows. On 2026-09-02 a session's
+/// WAL expanded ~512 MiB of frames into 22,248,540 depth rows and roughly
+/// **15 GiB of RSS — about 30x amplification** — crossing the unit's
+/// `MemoryHigh=15G` and taking the process down. The byte budget was doing
+/// exactly what it says and was measuring the wrong quantity.
+///
+/// Measured the same evening, on the boot that produced this constant: the
+/// lane's catch-up loop found RSS **already at 13.09 GiB of a 15.0 GiB
+/// ceiling at round 0** — before it replayed anything — because THIS
+/// function had already run unguarded and materialized the backlog. Bounding
+/// the catch-up loop alone was guarding the second door.
+///
+/// 60% rather than the 80% `RESOURCE-02` pages at: the point of stopping is to
+/// stop BEFORE the page, with room for the refold that follows to allocate.
+pub const WAL_REPLAY_RSS_STOP_PCT: u64 = 60;
+
 /// Counter: segments `replay_all` deferred to the next boot for the budget.
 pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_total";
 
@@ -2473,6 +2495,12 @@ pub struct WalReplayBatch {
     /// The budget this pass ran under, echoed so a log line can carry both
     /// numbers without the caller re-deriving one.
     pub budget_bytes: u64,
+    /// `true` when the pass stopped on the MEMORY guard rather than on the
+    /// byte budget or on running out of segments. Carried out so the caller's
+    /// log line names the real reason: "deferred" reads the same either way,
+    /// and the two have different remedies (more RAM / fewer rows per frame
+    /// versus a bigger byte budget).
+    pub stopped_for_memory: bool,
 }
 
 /// Should THIS deferral page the operator?
@@ -2486,10 +2514,20 @@ pub const fn should_page_replay_deferred(deferred_segments: u64, already_paged: 
     deferred_segments > 0 && !already_paged
 }
 
-// TEST-EXEMPT: covered by replay_all_with_report_counts_deferred_segments_and_bytes + every replay_all test above
-pub fn replay_all_with_report<P: AsRef<Path>>(
+/// [`replay_all_with_report`] with the memory guard's two inputs INJECTED.
+///
+/// Separated for the same reason `replay_all_with_budget` is: what needs
+/// proving is not the percentage, it is that a segment the guard stopped short
+/// of is still a `*.wal` file afterwards — and a test that had to actually
+/// allocate 9 GiB to reach that branch would never be written. `rss_probe` is
+/// called at most once per segment, on the boot cold path.
+// TEST-EXEMPT: covered by replay_stops_on_the_memory_guard_and_defers_the_rest + the wrapper's tests
+pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     wal_dir: P,
     budget_bytes: usize,
+    rss_probe: R,
+    ceiling_bytes: Option<u64>,
+    stop_pct: u64,
 ) -> anyhow::Result<WalReplayBatch> {
     let wal_dir = wal_dir.as_ref();
     if !wal_dir.exists() {
@@ -2530,8 +2568,27 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
     let mut bytes_held = 0usize;
     let mut consumed = 0usize;
 
+    let mut stopped_for_memory = false;
     for path in &segments {
         if bytes_held >= budget_bytes && consumed > 0 {
+            break;
+        }
+        // The MEMORY guard, beside the byte budget and for the reason
+        // `WAL_REPLAY_RSS_STOP_PCT` documents: the budget bounds bytes READ,
+        // this bounds what they turned into.
+        //
+        // `consumed > 0` on BOTH conditions is load-bearing and identical in
+        // intent: every pass reads at least one segment, so a boot that starts
+        // already over the line still makes progress and the backlog drains
+        // across boots instead of livelocking at zero forever.
+        if consumed > 0
+            && crate::resource_monitor::rss_at_or_above_fraction(
+                rss_probe(),
+                ceiling_bytes,
+                stop_pct,
+            )
+        {
+            stopped_for_memory = true;
             break;
         }
         match replay_segment(path) {
@@ -2626,12 +2683,17 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
             consumed_segments = consumed,
             bytes_held,
             budget_bytes,
-            "WAL replay hit its RAM budget and DEFERRED the remaining segments \
-             to the next boot. Nothing is stranded — an unconsumed segment stays \
-             a `*.wal` file and is re-globbed next boot — but those frames are on \
-             disk rather than in the database until then. A budget hit every boot \
-             means the WAL is growing faster than replay drains it, which is a \
-             capacity problem, not a recovery one."
+            stopped_for_memory,
+            stop_pct,
+            "WAL replay DEFERRED the remaining segments to the next boot — on \
+             the MEMORY guard when stopped_for_memory=true, otherwise on the \
+             byte budget. Nothing is stranded: an unconsumed segment stays a \
+             `*.wal` file and is re-globbed next boot, but those frames are on \
+             disk rather than in the database until then. The two have DIFFERENT \
+             remedies, which is why the flag is here: a byte-budget stop means \
+             raise the budget or drain more often; a memory stop means the \
+             frames materialize into more rows than this host can hold at once, \
+             and raising the budget would make it worse, not better."
         );
     }
 
@@ -2691,7 +2753,38 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
         deferred_segments: deferred as u64,
         bytes_replayed: bytes_held as u64,
         budget_bytes: budget_bytes as u64,
+        stopped_for_memory,
     })
+}
+
+/// One replay pass under the REAL host memory guard.
+///
+/// The thin wrapper `replay_all` / `replay_all_with_budget` and every boot
+/// path go through: it resolves this host's memory ceiling ONCE (the same
+/// `resolve_memory_ceiling` the resource monitor and `RESOURCE-02` use, so
+/// the guard and the alarm can never disagree about what the ceiling is) and
+/// reads `/proc/self/status` per segment.
+///
+/// A host where neither probe resolves (non-Linux dev machine) gets
+/// `ceiling_bytes = None`, and `rss_at_or_above_fraction` then fails OPEN —
+/// the pass behaves exactly as it did before this guard existed.
+// TEST-EXEMPT: thin resolve-then-delegate; the guard logic is proven by replay_all_with_report_guarded's tests.
+pub fn replay_all_with_report<P: AsRef<Path>>(
+    wal_dir: P,
+    budget_bytes: usize,
+) -> anyhow::Result<WalReplayBatch> {
+    let ceiling = crate::resource_monitor::resolve_memory_ceiling(
+        Path::new("/sys/fs/cgroup/memory.max"),
+        Path::new("/proc/meminfo"),
+    )
+    .bytes();
+    replay_all_with_report_guarded(
+        wal_dir,
+        budget_bytes,
+        || crate::resource_monitor::probe_vmrss_bytes(Path::new("/proc/self/status")),
+        ceiling,
+        WAL_REPLAY_RSS_STOP_PCT,
+    )
 }
 
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
@@ -4198,6 +4291,131 @@ mod tests {
         assert_eq!(recovered[0].frame, vec![3, 1, 4, 1]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The MEMORY guard must DEFER, never DROP — and must always make progress.
+    ///
+    /// This is the guard added on 2026-09-02 after a live boot measured RSS at
+    /// **13.09 GiB of a 15.0 GiB ceiling before the catch-up loop's round 0**,
+    /// i.e. before it had replayed anything. `WAL_REPLAY_MAX_BYTES` had done
+    /// its job — it bounded the BYTES READ — while the rows those bytes
+    /// materialized into (22,248,540 depth rows from ~512 MiB of frames,
+    /// roughly 30x amplification) went unbounded and took the process out.
+    ///
+    /// Two properties, and the second is the one that makes this safe to ship:
+    ///
+    ///   1. A segment the guard stopped short of is STILL a `*.wal` file, so
+    ///      the next boot re-globs it. Identical to the byte budget's
+    ///      contract, which is why this reuses that path rather than adding
+    ///      one — an unread segment left in `replaying/` would be archived by
+    ///      `confirm_replayed` and its frames destroyed.
+    ///   2. Even with the probe pinned ABOVE the line from the first call, one
+    ///      segment is still read. Without that, a host sitting over the
+    ///      threshold for any other reason would defer everything on every
+    ///      boot forever — a permanent loss wearing a deferral's clothes.
+    #[test]
+    fn replay_stops_on_the_memory_guard_and_defers_the_rest() {
+        let dir = tmp_dir("replay-memory-guard");
+        for _ in 0..3 {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![9u8; 64]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let before = wal_segments_in(&dir).len();
+        assert!(before >= 3, "fixture needs >= 3 segments, found {before}");
+
+        // RSS pinned hard over the line, ceiling known: the guard is armed on
+        // every check. Budget is effectively unlimited, so ONLY the memory
+        // guard can stop this pass — if it did not exist, all 3 are read.
+        let batch = replay_all_with_report_guarded(
+            &dir,
+            usize::MAX,
+            || Some(14_050_361_344), // the RSS the live boot actually reported
+            Some(16_106_127_360),    // the 15.0 GiB MemoryHigh ceiling
+            WAL_REPLAY_RSS_STOP_PCT,
+        )
+        .expect("replay");
+
+        assert!(
+            batch.stopped_for_memory,
+            "the pass must report WHY it stopped: 'deferred' reads the same for \
+             a byte-budget stop and a memory stop, and the two have opposite \
+             remedies — raising the byte budget makes a memory stop WORSE"
+        );
+        assert!(
+            !batch.frames.is_empty(),
+            "progress is mandatory: one segment is always read, or a host that \
+             is over the line for an unrelated reason never drains its WAL"
+        );
+        assert!(
+            batch.deferred_segments > 0,
+            "with 3 segments and the guard armed, the rest must be deferred"
+        );
+        assert_eq!(
+            wal_segments_in(&dir).len(),
+            before - 1,
+            "every DEFERRED segment must still be a `*.wal` file — if the guard \
+             staged them, confirm_replayed would archive frames never replayed"
+        );
+
+        // Below the line, the guard is inert and the remainder is recovered:
+        // the stop was a delay, not a loss.
+        let rest = replay_all_with_report_guarded(
+            &dir,
+            usize::MAX,
+            || Some(1_000_000_000),
+            Some(16_106_127_360),
+            WAL_REPLAY_RSS_STOP_PCT,
+        )
+        .expect("replay");
+        assert!(
+            !rest.stopped_for_memory,
+            "under the line the guard is inert"
+        );
+        assert!(
+            !rest.frames.is_empty(),
+            "the deferred frames must be recoverable on a later boot"
+        );
+    }
+
+    /// An unmeasurable host must behave EXACTLY as it did before the guard.
+    ///
+    /// A dev machine with no cgroup and no `/proc/self/status` resolves both
+    /// inputs to `None`. Failing CLOSED there would halt WAL recovery — the
+    /// path that gets captured frames back into the database — on every host
+    /// the probe cannot read. Fail-open is the deliberate direction.
+    #[test]
+    fn the_memory_guard_is_inert_when_the_host_cannot_be_measured() {
+        let dir = tmp_dir("replay-memory-unmeasurable");
+        for _ in 0..3 {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append(WsType::LiveFeed, vec![3u8; 64]);
+            wait_until_persisted(&spill, 1);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let before = wal_segments_in(&dir).len();
+
+        // No ceiling AND no RSS — the unmeasurable host.
+        let batch = replay_all_with_report_guarded(
+            &dir,
+            usize::MAX,
+            || None,
+            None,
+            WAL_REPLAY_RSS_STOP_PCT,
+        )
+        .expect("replay");
+        assert!(!batch.stopped_for_memory);
+        assert_eq!(
+            batch.deferred_segments, 0,
+            "an unmeasurable host must read every segment, exactly as it did \
+             before this guard existed"
+        );
+        assert_eq!(
+            wal_segments_in(&dir).len(),
+            0,
+            "all {before} segments consumed"
+        );
     }
 
     /// The budget must DEFER, never DROP.
