@@ -4411,3 +4411,63 @@ refuses non-market-data endpoints (`:7993`), and the order-update socket is spaw
 "16" was never countable on this gauge. A full house is **15 on this gauge plus the
 order-update socket**, not 16. The honest fix is to document the ceiling or count the
 sixteenth — not to hunt a socket that was never in this gauge's scope.
+
+## Item 23 — the second-sweep open findings (2026-09-02, operator: "go ahead and fix the remaining open findings dude okay?" + "Once fixed finished and resolved merge and deploy it also dude okay?")
+
+**Status:** IN_PROGRESS. Authority: the operator's 2026-09-02 instructions, given in direct
+response to the Second Sweep Ledger (artifact 849f0cca) which listed fourteen open findings
+with a cost or decision attached to each. That is the §28.2-shape general go-ahead selecting
+an enumerated list. Recorded here BEFORE the code, per the design-first wall.
+
+> **Incident note (2026-09-02 03:52 UTC):** a first implementation pass of every item below
+> was completed by six parallel agents and lost UNCOMMITTED when the remote container was
+> reclaimed during a ~90-minute idle wait on a usage limit. This second pass commits each
+> item as it lands. Recorded so the cost is visible, not hidden.
+
+### Design (Item 23)
+- **F1 depth frames on replay:** WAL record gains an endpoint byte (`TVW4`), the boot replay
+  routes depth-socket frames to the depth writer instead of counting them and moving on.
+  `TVW1..3` records replay exactly as today (endpoint = main feed, the only writer they ever had).
+- **F2/F3/F12 loss signals:** deferred replay segments (once per boot), active-segment pressure
+  prunes and replay `lost` outcomes each gain a coded `error!` under the ALREADY-FILTERED
+  WS-SPILL-01 code with a distinguishing `source` field — $0, no new EMF name, no new alarm.
+- **F4 805 sibling kill:** the redial waits (bounded) for the peer's Close reply before dialing
+  again, so a half-open socket is not counted by the vendor as a sixth connection. The vendor
+  premise stays Assumed and is stated at the site.
+- **F6/F7 alive + frame watchdog:** alive is published on the connected edge; a frame-age
+  watchdog on the feed lane redials a socket that pongs but delivers nothing.
+- **F8 swap ack:** the `ExtendOutcome` acknowledgement shape from Item 22's round is applied to
+  `Swap` so `held` advances on apply, not on queue.
+- **F9/F10:** a dropped `ws_event_audit` row and a persistently failing disk-pressure probe
+  each become an edge-latched coded `error!` under an existing filtered code (HOT-PATH-02 /
+  STORAGE-GAP-05).
+- **F5 memory ceiling:** systemd `MemoryHigh=15G` + `OOMScoreAdjust=-900` on the app unit
+  (never `MemoryMax` — a hard kill is the failure being avoided), RESOURCE-02 resolves the
+  unit's own cgroup and prefers `memory.high` when `memory.max` is unlimited, and a log-filter
+  alarm on RESOURCE-02 (+$0.10/mo, the one new alarm — dated row §2.3p in the noise lock).
+- **F13:** the publisher-less 40 MB tick broadcast is removed.
+- **F14:** the guard holes named on the ledger are closed in `rust_only_guard.rs`.
+- **NOT taken:** F11 (mid-session retention floors) is an operator decision that conflicts
+  with the standing "never delete a tick" instruction; recorded, not changed.
+
+### Edge Cases (Item 23)
+Mixed-version WAL directories (TVW3 + TVW4 segments in one replay); a Close reply that never
+arrives (bounded wait, then redial); a swap ack whose receiver dropped; RESOURCE-02 on a box
+with no cgroup limit (falls back to memory.high, then MemTotal); a prune that deletes a
+segment the replay was about to read.
+
+### Failure Modes (Item 23)
+Every new signal is fail-loud, never fail-open: an unreadable endpoint byte replays as main
+feed (never dropped); a swap ack that is lost un-marks the belief (re-offer is dedup-safe).
+
+### Test Plan (Item 23)
+Scoped `cargo test -p` per crate for every changed function; format round-trips for TVW4
+against TVW3 fixtures; bite-proofs recorded in the commit messages.
+
+### Rollback (Item 23)
+Each finding is its own commit; TVW4 readers accept TVW3 so a rollback of the writer loses
+nothing already on disk.
+
+### Observability (Item 23)
+No new EMF names. One new alarm (RESOURCE-02 log filter). Everything else rides existing
+filtered codes with a `source` field.

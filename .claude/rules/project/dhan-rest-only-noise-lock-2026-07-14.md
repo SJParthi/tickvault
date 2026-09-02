@@ -2186,3 +2186,92 @@ growth; raises the volume size as a fix for the burn without also making the
 shed thresholds absolute (a bigger disk makes a fractional net arm later, not
 sooner); or claims the pressure archiver protects a session while its floor
 remains one day.
+
+### §2.3p — 2026-09-02: the app process had no memory ceiling, and its own early warning could not reach the line it watched
+
+**The verbatim operator authorization (2026-09-02, typed directly in-session —
+preserve EXACTLY, typos included):**
+
+> "go ahead and fix the remaining open findings dude okay?"
+
+> "Once fixed finished and resolved merge and deploy it also dude okay?"
+
+Given in DIRECT response to the Second Sweep Ledger, whose row for this item
+read verbatim **"No memory ceiling on the app process … infra + $0.10/mo"** —
+a list of fourteen open findings each carrying a cost or a decision. That is
+the §28.2-shape general go-ahead selecting an enumerated list, and the $0.10
+was on the row he approved. This dated section is the rule-file edit §3
+demands before any new Dhan-scoped page, recorded BEFORE the terraform.
+
+#### What was measured in source, not inferred
+
+| Claim | Evidence |
+|---|---|
+| The unit set NO memory directive | `grep -n 'Memory\|OOMScore' deploy/systemd/tickvault.service` → **0 lines** before this change; only `LimitNOFILE` / `LimitNPROC` |
+| QuestDB is ranked safer than the app under OOM | `deploy/docker/docker-compose.yml:196` `oom_score_adj: -500`; the app's cgroup carried the kernel default `0`, so the kernel would kill the **app first** |
+| QuestDB's committed ceiling | `mem_limit: ${QDB_MEM_LIMIT:-12g}` + `shm_size: 512m` = **12.5 GiB** |
+| Sidecar ceilings | `tv-alloy` `mem_limit: 384m` + `tv-loki` `mem_limit: 256m` ≈ **0.64 GiB** |
+| What RESOURCE-02 compared against | `resource_monitor.rs::resolve_memory_ceiling`: cgroup `memory.max` first, `/proc/meminfo` `MemTotal` as fallback; with no directive the cgroup reads `max`, so the denominator was **~31.3 GiB** and its 80% line (~25 GiB) sat above anything the kernel tolerates with QuestDB resident |
+| RESOURCE-02 reached a page | `LOG_SINK_ONLY_EXEMPT` in `error_code_alarm_coverage_guard.rs` listed it; `error-code-alarms.tf` had no entry — **log-sink-only** |
+| Emit sites | two: `resource_monitor.rs` (the RSS-vs-ceiling arm) and `subsystem_memory.rs` (the sampler-died respawn arm); both are memory-observability failures, so a plain coded filter is correct |
+| The unit has ONE copy | `user-data.sh.tftpl:243` is a plain `cp` from the repo checkout — not templated, so nothing can drift from the file in git |
+
+**Why the kill order was backwards.** The app is the ONLY tick-capture path.
+An upstream tick that arrives while it is dead is never resent — Dhan's feed
+carries no sequence number and skips a slow consumer forward. QuestDB is
+recoverable: a stalled or restarted database is absorbed by the tick and
+depth spill tiers and re-ingested. Under host exhaustion the kernel picks the
+largest unprotected RSS, which after QuestDB's `-500` was this process.
+
+#### What is authorized
+
+1. **`OOMScoreAdjust=-900` + `MemoryHigh=15G` on `deploy/systemd/tickvault.service`, and explicitly NO `MemoryMax=`.** `MemoryHigh` is a THROTTLE — past it the kernel reclaims aggressively and slows allocation. A `MemoryMax` would turn a spike into an OOM kill of the one process whose death loses ticks, which is the outcome the ranking exists to prevent. Arithmetic for 15G: host usable ~31.3 GiB − QuestDB 12.5 − sidecars 0.64 − OS/page-cache floor 2–4 = **~14.2–16.2 GiB** for the app; its measured envelope is 4.3–11.2 GB, so 15 GiB sits above the envelope and below exhaustion. AL2023 runs no swap, so "before swap" and "before OOM" are the same line. Rollback is a two-line drop-in recorded in the unit itself.
+
+2. **ONE new alarm — family (5) gains a NINETEENTH signal:** `tv-<env>-errcode-resource-02`, a plain coded log-filter on `error-code-alarms.tf`, `eval 3 / dta 1 / period 300`, `ok_recovery = true` (the monitor re-evaluates every cycle and re-emits while RSS stays over the line, so an OK genuinely tracks recovery — the DH-901 shape, not the discrete proc-01 shape). `RESOURCE-02` leaves `LOG_SINK_ONLY_EXEMPT` in the same change, which that guard's stale-entry test requires. The Telegram phrase: *"The trading app's memory is close to its ceiling — it will be slowed, not killed, but check what is growing."*
+
+#### ⚠ Honest limit (Rule 11)
+
+The alarm pages on a line that, before this change, could not be reached. What
+makes it reachable is the resolver preferring a REAL ceiling: until this
+batch, `resolve_memory_ceiling` read `memory.max` → `MemTotal`, and
+`MemoryHigh` writes `memory.high`, not `memory.max` — so with only this unit
+change the resolver would STILL see `max` and fall back to ~31 GiB. **Another
+agent is changing the resolver to prefer `memory.high` in the same batch**;
+this row records the alarm and the unit half, and the two must land together
+or the page keeps measuring against the whole machine. Until the first live
+session on the new unit, "RESOURCE-02 fires at 12 GiB" is what the code must
+do, not what the box has reported.
+
+The throttle does not stop growth either. A queue that grows without bound
+under `MemoryHigh` is a slowed process that still loses ticks upstream; the
+alarm converts that from invisible to a page, and the operator's action is a
+restart in the next quiet window, not a wait.
+
+#### ⚠ Honest cost, and the budget position
+
+One log-filter alarm ≈ **+$0.10/mo**, no new EMF name, no user-data byte.
+
+§2.3n put a maximal month at **~$123.28** against the budget's automatic
+`STOP_EC2_INSTANCES` line of **$117.00** (90% of the $130 `limit_amount`).
+This takes it to **~$123.38 — about $6.38 above the line that switches the
+trading box off** in a maximal month, and under $2 of room against the
+operator's $125 hard cap (Quote 18). The live account is far below it (August
+MTD $48.87, forecast $61.51, measured 2026-08-25), so nothing fires today.
+§2.3n said the next addition "must come with a lever, not just a cost note".
+**The lever is NOT taken here** — the already-approved Quote 10 Elastic IP
+release (−$3.60/mo) and the `limit_amount` decision both remain the
+operator's, and this row does not pretend a ten-cent alarm changed that. It
+is stated rather than absorbed.
+
+#### What a PR that violates §2.3p looks like (REJECT)
+
+- Adds `MemoryMax=` to the unit (turns a spike into a kill of the only
+  tick-capture process).
+- Removes `OOMScoreAdjust=-900`, or sets it at or above QuestDB's `-500`
+  (restores the backwards kill order).
+- Ships the alarm without this dated row, or re-adds `RESOURCE-02` to
+  `LOG_SINK_ONLY_EXEMPT` while the terraform entry stands.
+- Gives the alarm `ok_recovery = false` on the strength of the proc-01
+  precedent — this emitter repeats while the condition persists, so its OK
+  is real.
+- Claims the page fires at 15 GiB before the resolver reads `memory.high`.

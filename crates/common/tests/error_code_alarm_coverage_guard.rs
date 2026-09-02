@@ -261,7 +261,11 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "RESILIENCE-01",
     "RESILIENCE-03",
     "RESOURCE-01",
-    "RESOURCE-02",
+    // RESOURCE-02 LEFT this list 2026-09-02 (second-sweep finding 5): it is
+    // now a `"resource-02"` entry in error-code-alarms.tf, paired with the
+    // MemoryHigh=15G ceiling the systemd unit gained the same day — the page
+    // could not reach its 80% line while the unit set no memory directive
+    // (the resolver fell back to MemTotal). Dated row: noise-lock §2.3p.
     "RESOURCE-03",
     "RISK-GAP-01",
     "RISK-GAP-02",

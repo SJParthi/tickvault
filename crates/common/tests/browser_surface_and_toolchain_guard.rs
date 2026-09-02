@@ -44,6 +44,25 @@ fn repo_root() -> PathBuf {
         .expect("browser_surface_guard: cannot canonicalize repo root")
 }
 
+/// Read a scan target as text, LOSSILY, and PANIC on an I/O failure.
+///
+/// SCOPE FIX #17 (2026-09-02). Five scans in this file read with
+/// `let Ok(body) = read_to_string(..) else { continue }`, and `read_to_string`
+/// rejects the whole file on ONE non-UTF-8 byte — so a Latin-1 `é` in a
+/// comment silently exempted a source file from the browser-surface, spawn,
+/// JS-volume, inline-handler and content-type scans all at once. Lossy
+/// decoding keeps every valid byte scannable; an unreadable file is a guard
+/// FAILURE, never a file to skip, because a skipped file reads as clean.
+fn read_scan_text(root: &Path, path: &str) -> String {
+    let bytes = std::fs::read(root.join(path)).unwrap_or_else(|e| {
+        panic!(
+            "browser_surface_guard: cannot read `{path}`: {e}. A file the enumeration \
+             listed but the guard cannot open must fail the build, not pass it."
+        )
+    });
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Files matching `pathspec` that are tracked **or newly added and not
 /// ignored**.
 ///
@@ -140,10 +159,7 @@ fn browser_code_in_rust_is_pinned_to_the_enumerated_surfaces() {
         if path.ends_with("browser_surface_and_toolchain_guard.rs") {
             continue;
         }
-        let full = root.join(&path);
-        let Ok(body) = std::fs::read_to_string(&full) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         let count = body.matches("<script").count();
         if count > 0 {
             actual.insert(path, count);
@@ -428,9 +444,7 @@ fn every_spawned_binary_is_on_the_allowlist() {
         if SPAWN_SCAN_EXEMPT.contains(&path.as_str()) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         for bin in spawned_literals(&body) {
             seen_any = true;
             if !allowed.contains(&bin.as_str()) {
@@ -704,9 +718,7 @@ fn javascript_volume_inside_script_tags_only_shrinks() {
         if is_the_scanner_itself(&path) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         actual.insert(path, js_line_count(&body));
     }
 
@@ -785,9 +797,7 @@ fn inline_event_handlers_only_shrink() {
             if is_the_scanner_itself(&path) {
                 continue;
             }
-            let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-                continue;
-            };
+            let body = read_scan_text(&root, &path);
             let n = inline_handler_count(&body);
             if n > 0 {
                 actual.insert(path, n);
@@ -851,9 +861,7 @@ fn nothing_serves_a_javascript_content_type() {
         if is_the_scanner_itself(&path) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
+        let body = read_scan_text(&root, &path);
         let lower = body.to_ascii_lowercase();
         for n in needles {
             if lower.contains(n) {

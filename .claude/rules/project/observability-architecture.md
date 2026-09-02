@@ -63,7 +63,7 @@ exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
 watchdog, died with the Groww live feed; see "Retired paging entries" below),
 (the WAL re-injection-abort entry left this list 2026-07-17 — its only
 emit site, the un-consumed `wal_reinject.rs` helper, was deleted in the
-dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01,
+dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01, **RESOURCE-02 (added 2026-09-02** — the process's own resident-memory early warning, the one signal meant to fire BEFORE the OOM killer; it was log-sink-only and, with no memory directive on the systemd unit, its 80% line was measured against MemTotal (~31 GiB) and was unreachable. Paired with the same-day `MemoryHigh=15G` throttle + `OOMScoreAdjust=-900` on the unit; plain coded filter, `ok_recovery = true` because the monitor re-emits while RSS stays over the line. Dated row: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3p**),
 **AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a

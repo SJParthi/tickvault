@@ -754,3 +754,126 @@ code is invisible) and the `ssh` half of H12. H15 is the awkward one: scanning
 `.md` naively would flag this repository's own rule files, which discuss the
 banned runtimes at length — the honest shape is to scan only FENCED CODE BLOCKS
 carrying an interpreter language tag, which is a parser, not a predicate.
+
+## §0.8. 2026-09-02 — SCOPE FIX #17: four holes the second sweep found, and the first attempt at one was a false-positive engine
+
+Operator directive (2026-09-02, given in direct response to the Second Sweep
+Ledger, whose finding-14 row named these holes — typos preserved):
+
+> "go ahead and fix the remaining open findings dude okay?"
+
+> "Once fixed finished and resolved merge and deploy it also dude okay?"
+
+Same shape as §0.5–§0.7: the live tree was and remains CLEAN of all four, so
+these close LATENT holes, and every one is bite-proven in both directions
+because the real-tree tests cannot demonstrate that anything is caught.
+
+### H-a — a non-UTF-8 file was SKIPPED, silently, by nine scans
+
+`read_to_string` fails on ONE invalid byte. Eight sites in
+`rust_only_guard.rs` and five in `browser_surface_and_toolchain_guard.rs`
+read with `.ok()?`, `let Ok(..) else { continue }` or `unwrap_or_default()`
+— so a Latin-1 `é` in a comment took the whole file out of every scan at
+once, and a file with `\xff\xfe` on line 1 and `node app.js` on line 2 was
+invisible. The comment at the loader said this was deliberate ("a guard that
+crashes on one is a guard someone disables"), which is the reassuring-comment
+class §0.2 records.
+
+**Fixed:** `decode_scan_bytes` / `read_scan_text` decode LOSSILY (invalid
+bytes become U+FFFD, which matches nothing; every valid byte around them is
+still scanned) and PANIC on an I/O failure — a listed file the guard cannot
+open is a guard failure, never a file to skip. All thirteen sites use them.
+
+### H-b — a `bash -c` shebang hands bash a program nobody scanned
+
+`#!/usr/bin/env -S bash -c "node app.js"` names an ALLOWED runtime, so
+§0.6's `shebang_runtime` waves it through, and the payload is invisible to
+every line scanner: the line starts with `#!`, `is_command_position`
+matches no arm on that prefix, and the `node` is never counted. The kernel
+runs exactly that `node`.
+
+**Fixed:** `shebang_inline_payload` extracts the program after a SHORT flag
+cluster containing `c` (`-c`, `-ec`, `-ce`) and feeds it to both
+`count_node_invocations` and the interpreter-token scan. `-euo pipefail`
+(no `c`), `--norc` (long option) and a bare `-c` yield no payload — pinned,
+because most of this repo's own scripts open with `-euo pipefail`.
+
+### H-c — every scan enumerated TRACKED files only
+
+A new interpreter script, a `.go` source, a shebang wrapper — none appears
+in `git ls-files` until `git add`, so the guard reported green on exactly
+the change it exists to catch: the first commit of a new runtime. The
+browser guard has carried `--others --exclude-standard` since its own C1
+bite-test; this file's §0 records an untracked `crates/x/src/evil.rs` being
+invisible to every diff source. The lesson was learned and not applied here.
+
+**Fixed:** `git_ls_files_with(extra_args, pathspecs)` and
+`git_ls_files_including_untracked`; the invocation scan, both shebang tests,
+`no_banned_files_outside_allowlist` and `no_rust_spawn_of_banned_interpreter`
+now include untracked-but-not-ignored files. **Deliberately left
+tracked-only, documented at the site:** the stale-entry checks and the
+shrink-only budgets — a budget entry must name a file that is actually in the
+repository, and an untracked scratch file must never satisfy "still tracked".
+
+### H-d — the ban enumerated SCRIPTING languages and stopped
+
+`java`, `go`, `dotnet`, `swift`, `kotlin`, `scala`, `groovy`, `julia`,
+`Rscript` — a whole second toolchain in one `RUN go build` line, and none
+was a banned token or a banned extension. `*.java .kt .kts .scala .go .cs
+.swift .R .r` joined `BANNED_FILE_PATHSPECS` (all nine verified ZERO tracked)
+and the ten runtimes joined `NODE_FAMILY`, because an extension ban is not an
+invocation ban (the 2026-08-01 `pip` lesson, again).
+
+**Deliberately excluded, with the reason in the docblock and pinned by
+test:** `jq` runs the All Green verdict in `ci.yml` (merge-gate-lock §5.1) —
+banning it fails the merge gate on its own implementation; `awk`/`sed` are
+POSIX text tools every script here uses; `perl` already lives in
+`banned_tokens()`; bare `R` is also `chmod -R`.
+
+### ⚠ The first version counted a SENTENCE, and that is the reusable part
+
+A line that begins with a word is command position by definition. `go` and
+`swift` are English words. The first version of this fix counted **"swift
+recovery is expected after a reconnect"** — a real comment — as an
+invocation. That is precisely the false positive this file says a guard
+cannot survive: it would have been allowlisted within the week.
+
+**Fixed** by `PROSE_AMBIGUOUS_RUNTIMES` (`go`, `swift`): those two
+additionally require a toolchain-shaped NEXT token — a flag, a path or source
+file (`main.go`, never a sentence-ending `go.`), or the compiler's own
+subcommand (`build`, `run`, `test`, `mod`, …). A word-START boundary was
+added to `count_node_invocations` at the same time (`go` inside `cargo`,
+`Rscript` inside `myRscript`), with `-` allowed on the left because make's
+`-node` recipe prefix is a real invocation — the existing `guard_self_test`
+caught the first draft rejecting it.
+
+The must-NOT-count fixtures include the real `sudo rm -rf /usr/share/dotnet`
+line from `ci.yml`, `name = "governor"` (the only `Cargo.lock` package with a
+family member as a substring), `java-properties`, a `/java/` URL, `cargo
+build` under `sudo` and `RUN`, `chmod -R`, and `go to the next step`.
+
+### Bite-proofs (untracked plants, never `git add`ed, then removed)
+
+| planted | result |
+|---|---|
+| `scripts/planted-shebang-wrapper` — `#!/usr/bin/env -S bash -c "node /opt/evil.js"` | **FAILS** `node_family_invocations_only_shrink` — `("scripts/planted-shebang-wrapper", 1, 0)` |
+| `scripts/planted.go` | **FAILS** `no_banned_files_outside_allowlist` — `["scripts/planted.go"]` |
+| `scripts/planted-latin1.sh` — `\xff\xfe` on line 1, `node app.js` on line 2 | **FAILS** — `("scripts/planted-latin1.sh", 1, 0)` |
+| `scripts/planted-toolchain.sh` — `RUN go build ./...` + `java -jar x.jar` | **FAILS** — `("scripts/planted-toolchain.sh", 2, 0)` |
+| `scripts/benign-planted.sh` — the five must-not-count lines above | **passes**, 26/26 |
+
+All four hostile plants were planted together and every one was named in
+the failure output; the benign plant passed with the fix in place.
+
+### Still open after this section
+
+- **H12's `ssh` half** — `ssh host "node …"` still needs a bare word
+  consumed, which is the false-positive engine §0.7 refused.
+- **Split-argv `"command": "go"`** — a bare ambiguous runtime with nothing
+  after it on the line counts 0 by construction (pinned: the same line with
+  `node` counts 1). The word IS the sentence; there is nothing to check.
+- **H13 / H14 / H15** — unchanged from §0.7.
+- The `PROSE_AMBIGUOUS_RUNTIMES` subcommand list is an enumeration, the
+  failure shape this file keeps recording. It is bounded by the two
+  compilers' own verb sets rather than by what a script author might write,
+  which is the narrower and therefore safer direction to be wrong in.
