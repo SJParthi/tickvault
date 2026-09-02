@@ -743,6 +743,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_desired_sha_precedence_table() {
+        // The whole contract in one place: GitHub first, mirror second, and a
+        // placeholder is never a sha on either leg. The named cases below
+        // explain WHY each row matters; this one pins that they are the only
+        // rows, so a future edit cannot quietly add a fourth behaviour.
+        const CASES: &[(Option<&str>, Option<&str>, Option<&str>, &str)] = &[
+            (
+                Some("aaaa1111"),
+                Some("bbbb2222"),
+                Some("aaaa1111"),
+                "github",
+            ),
+            (Some("aaaa1111"), None, Some("aaaa1111"), "github"),
+            (None, Some("bbbb2222"), Some("bbbb2222"), "ssm-mirror"),
+            (
+                Some("unknown"),
+                Some("bbbb2222"),
+                Some("bbbb2222"),
+                "ssm-mirror",
+            ),
+            (None, None, None, "none"),
+            (Some(" "), Some("unknown"), None, "none"),
+        ];
+        for (gh, mirror, want_sha, want_src) in CASES {
+            let (sha, src) = resolve_desired_sha(*gh, *mirror);
+            assert_eq!(sha, *want_sha, "github={gh:?} mirror={mirror:?}");
+            assert_eq!(src, *want_src, "github={gh:?} mirror={mirror:?}");
+        }
+    }
+
+    #[test]
     fn github_wins_when_it_answers_so_a_token_upgrades_this_automatically() {
         let (sha, src) = resolve_desired_sha(Some("aaaa1111"), Some("bbbb2222"));
         assert_eq!(sha, Some("aaaa1111"));
