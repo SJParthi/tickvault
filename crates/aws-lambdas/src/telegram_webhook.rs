@@ -269,7 +269,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     // ---- market data capture + loss ----
     (
         "market-data-persistence-loss",
-        "Market prices were lost instead of being saved",
+        "Market prices were LOST — dropped without being rescued to disk",
     ),
     (
         "durable-floor-breach",
@@ -281,7 +281,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     ),
     (
         "ticks-spilling",
-        "Prices are being rescued to disk because saving them is failing",
+        "Prices are being saved to disk instead of the database because the database is behind — nothing is lost, they are replayed",
     ),
     ("ticks-lost-spill", "Rescued prices were lost for good"),
     (
@@ -457,7 +457,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     // ---- coded errors (the error!-to-phone route) ----
     (
         "errcode-dh-901",
-        "🔷 DHAN: sign-in is being refused — the access key is invalid or expired",
+        "🔷 DHAN: the broker sign-in check is failing — usually THEIR server, not our key. Read the status first: 401/403 means the key, 5xx means Dhan is down. Do not replace the key on a 5xx",
     ),
     (
         "errcode-dh-906",
@@ -501,7 +501,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     ),
     (
         "errcode-hot-path-02",
-        "Prices could not be saved and had to be rescued to disk",
+        "The database is behind, so prices are being held on disk and replayed — nothing is lost",
     ),
     (
         "errcode-oms-gap-06",
@@ -525,7 +525,7 @@ pub const ALARM_PHRASES: [(&str, &str); 103] = [
     ),
     (
         "errcode-wal-suspend-01",
-        "The database stopped applying writes — rows are accepted but not stored",
+        "The database is behind on applying writes — rows are accepted but not yet visible; if it does not catch up they stop being stored",
     ),
     (
         "errcode-ws-spill-01",
