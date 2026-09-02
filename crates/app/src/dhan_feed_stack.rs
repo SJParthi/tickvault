@@ -9173,6 +9173,30 @@ pub fn refold_wal_frames(
             // A failure here is already loud and already rescues to the spill
             // tier at its source; the loop carries on, exactly as the live
             // drain does.
+            //
+            // COST, both paths, because only one of them is cheap:
+            //
+            // * Normal path — both offload writers are spawned ABOVE this
+            //   function (`spawn_offload_writer` / `spawn_depth_offload_writer`
+            //   run before either refold call site), so a flush is a bounded
+            //   `try_send` hand-off with no network in it. A slow database
+            //   fills the queue, the producer width-caps, and the rows go to
+            //   the spill tier — non-blocking throughout.
+            //
+            // * Degraded path — if a writer thread could not be spawned (a
+            //   real possibility under exactly the memory pressure this fix
+            //   addresses), the flush is a synchronous ILP round trip bounded
+            //   by `request_timeout=5000`. At this boot's volumes that is up
+            //   to ~2,400 round trips, so a STALLING QuestDB makes boot slow
+            //   in a way one end-of-batch flush did not.
+            //
+            // The trigger is deliberately NOT gated on `writer_is_offloaded()`,
+            // and this is the trade being made: gating it would reinstate the
+            // unbounded buffer in precisely the degraded case, and a 4 GB
+            // buffer OOM-KILLS the process — measured, ten times, with
+            // `StartLimitBurst=8` then leaving the session with no app at all.
+            // A slow boot costs part of a session; an OOM loop costs all of
+            // it. Bounded memory wins.
             blocking_flush(|| ingest.flush());
         }
         // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
