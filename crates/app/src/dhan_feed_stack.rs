@@ -9930,11 +9930,29 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let rss_now = tickvault_storage::resource_monitor::probe_vmrss_bytes(
                 std::path::Path::new("/proc/self/status"),
             );
-            if wal_catchup_should_stop_for_memory(
-                rss_now,
-                mem_ceiling_bytes,
-                WAL_CATCHUP_RSS_STOP_PCT,
-            ) {
+            // PROGRESS FLOOR — round 0 always runs, exactly as the replay
+            // loop's own `consumed > 0` guarantees one segment per pass.
+            //
+            // MEASURED 2026-09-02, the boot that produced this: STAGE-C's
+            // replay peaked at 10,443,476,992 bytes and this check ran while
+            // that peak was still resident, so the loop stood down at round 0
+            // having drained NOTHING (`rounds = 0, frames = 0`). One minute
+            // later the same process read 1.07 GiB — the peak was a transient
+            // that had already been released. Standing down on it means the
+            // catch-up loop can never run on any boot with a backlog, which
+            // is the one situation it exists for.
+            //
+            // Round 0 is bounded by the same 512 MiB byte budget as every
+            // other round, so the floor cannot itself be the thing that
+            // exhausts memory; it buys one bounded round against a reading
+            // that is systematically taken at the worst possible instant.
+            if rounds > 0
+                && wal_catchup_should_stop_for_memory(
+                    rss_now,
+                    mem_ceiling_bytes,
+                    WAL_CATCHUP_RSS_STOP_PCT,
+                )
+            {
                 catchup_memory_stopped = true;
                 error!(
                     code = ErrorCode::WsSpill01WriterRespawn.code_str(),
@@ -11409,6 +11427,77 @@ mod tests {
         // 10 bytes at 60% is 6, so 5 proceeds and 6 stops.
         assert!(!wal_catchup_should_stop_for_memory(Some(5), Some(10), 60));
         assert!(wal_catchup_should_stop_for_memory(Some(6), Some(10), 60));
+    }
+
+    #[test]
+    fn the_catchup_memory_guard_never_stands_down_on_round_zero() {
+        // MEASURED on the 2026-09-02 boot that produced this floor: STAGE-C's
+        // replay peaked at 10,443,476,992 bytes of a 16,106,127,360 ceiling,
+        // this loop read RSS while that peak was still resident, and stood
+        // down at round 0 having drained NOTHING -- `rounds = 0, frames = 0,
+        // stop_reason = memory`. One minute later the same process measured
+        // 1.07 GiB: the peak was a transient that had already been released.
+        //
+        // Without a floor the guard is self-defeating in exactly the case it
+        // exists for. A boot WITH a backlog is a boot that just ran STAGE-C,
+        // so this reading is ALWAYS taken at the worst instant, so the loop
+        // never runs, so the backlog never drains -- and a permanently
+        // growing deferral is a loss wearing a safety feature's clothes.
+        const RSS_AT_STAGE_C_PEAK: u64 = 10_443_476_992;
+        let rss = Some(RSS_AT_STAGE_C_PEAK);
+        let ceiling = Some(CEILING_15GIB);
+
+        assert!(
+            wal_catchup_should_stop_for_memory(rss, ceiling, WAL_CATCHUP_RSS_STOP_PCT),
+            "fixture must be OVER the line, else this test proves nothing"
+        );
+
+        // Round 0: the floor wins and work proceeds.
+        let rounds = 0u32;
+        assert!(
+            !(rounds > 0
+                && wal_catchup_should_stop_for_memory(rss, ceiling, WAL_CATCHUP_RSS_STOP_PCT)),
+            "round 0 must run: this RSS is STAGE-C's peak, not the steady \
+             state, and standing down on it drains nothing, forever"
+        );
+
+        // Round 1 onward: the bound is real again.
+        for rounds in 1u32..4 {
+            assert!(
+                rounds > 0
+                    && wal_catchup_should_stop_for_memory(rss, ceiling, WAL_CATCHUP_RSS_STOP_PCT),
+                "from round 1 the memory bound must still stop the drain"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catchup_loop_source_gates_the_memory_stop_on_round_zero() {
+        // A test of the predicate alone would pass while the loop called it
+        // unconditionally -- which IS the bug this fixes. Correct arithmetic
+        // nobody calls is the dead-signal shape this repo keeps recording, so
+        // the floor is pinned in the loop's own source.
+        let src = include_str!("dhan_feed_stack.rs");
+        let loop_body = src
+            .split("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .nth(1)
+            .expect("the catch-up loop must exist");
+        // The CALL, not the name: the comment above the loop cites
+        // `wal_catchup_should_stop_for_memory` in prose, and matching that
+        // would compare the floor against a comment instead of the code.
+        let guard_at = loop_body
+            .find("wal_catchup_should_stop_for_memory(")
+            .expect("the loop must consult the memory guard");
+        let floor_at = loop_body.find("if rounds > 0").expect(
+            "the memory stop must be gated on `rounds > 0` -- without the \
+             floor the loop stands down at round 0 on STAGE-C's transient \
+             peak and never drains any backlog at all",
+        );
+        assert!(
+            floor_at < guard_at,
+            "the `rounds > 0` floor must come BEFORE the guard call or it \
+             does not gate it"
+        );
     }
 
     #[test]
