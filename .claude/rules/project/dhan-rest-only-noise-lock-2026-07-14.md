@@ -1633,6 +1633,37 @@ first removes both.
   `api_auth_failed` — each alarms a metric with no producer or no EMF entry, so
   none can ever fire). They cost no pages; they cost false confidence.
 
+  > **⚠ CORRECTED 2026-09-02 — "four dead monitors" is wrong; only ONE is dead,
+  > and the other three have live producers.** Checked against the live account
+  > and the source rather than carried forward:
+  >
+  > | Named above | Metric it reads | Rust emit sites | EMF-selected | Verdict |
+  > |---|---|---:|---:|---|
+  > | `order_fill_lag_high` | `tv_order_fill_lag_seconds` | **0** | **no** | **DEAD — confirmed** |
+  > | `seal_writer_dropped` | `tv_seal_writer_drain_dropped_total` | 2 | yes | ALIVE |
+  > | `api_auth_failed` | `tv_api_auth_failed_total` | 4 | log-filter | ALIVE |
+  > | `orders_placed_storm` | `tv_orders_placed_delta_total` | derived from `tv_orders_placed_total` (live emits) | log-filter | ALIVE |
+  >
+  > The three "alive" rows are log-metric-filter alarms or EMF-selected
+  > counters with real producers. The mistake is a specific and repeatable
+  > one: a `grep` for `metrics::counter!` on the same LINE as the metric name
+  > misses every counter built from a `const` identifier, which is the house
+  > style here — the same trap caught `tv_dhan_feed_depth_total` and
+  > `tv_dhan_ws_lag_excluded_total` in the 2026-09-02 sweep before they became
+  > false findings too.
+  >
+  > **Cost of believing the stale row:** it names three monitors as unable to
+  > fire, so a reader budgets work to rebuild watchdogs that already work —
+  > the exact `day_ohlc_tracker` (2026-08-12) failure mode, on an
+  > observability claim instead of a complexity one.
+  >
+  > `order_fill_lag_high` genuinely is dead and stays flagged:
+  > `cloudwatch_app_alarms_wiring.rs` calls it "the ONLY entry in this whole
+  > list with zero emit sites in crates/*/src", and
+  > `cloudwatch_dormant_alarms_guard.rs` records it as dormant pending its
+  > emitter. Live confirmation: it is absent from
+  > `list-metrics --namespace Tickvault/Prod` entirely.
+
 **What a PR that violates §2.3k looks like (REJECT):** restores
 `enable_alarm_actions` before `set_alarm_state` in either gate; drops
 `ok_actions` from the five alarms above as an alternative fix (it silences the
@@ -2275,3 +2306,67 @@ is stated rather than absorbed.
   precedent — this emitter repeats while the condition persists, so its OK
   is real.
 - Claims the page fires at 15 GiB before the resolver reads `memory.high`.
+
+---
+
+## ⚠ CORRECTED 2026-09-02 — every cost note above reasons from a $130 ceiling. The live limit is $150, and the arithmetic has been wrong in the ALARMING direction for eight days.
+
+**No authorization is claimed or needed here.** This records a live
+measurement and retires a dead constraint; it changes no alarm, adds no
+metric, and spends no money.
+
+**Read live from the account, 2026-09-02:**
+
+| Reading | Value | Source |
+|---|---|---|
+| `limit_amount` | **$150.00** | `budgets describe-budgets` |
+| 90% `STOP_EC2_INSTANCES` action line | **$135.00** | derived |
+| Actual spend, month to date | **$2.77** | ActualSpend (2 days in) |
+| AWS forecast, September | **$114.01** | ForecastedSpend |
+
+**What the sections above say instead.** Fifteen separate statements in
+this file reason from `$130` / a `$117.00` action line, and each new cost
+note inherited the figure from the one before it rather than re-reading
+the budget:
+
+| Section | Claim | Against the real $135 line |
+|---|---|---|
+| §2.3j | "~$120.58 — about $3.58 above the line" | **$14.42 UNDER** |
+| §2.3l | "~$122.88 … ~$5.88 past that line" | **$12.12 UNDER** |
+| §2.3m | "~$120.78 — about $3.78 above" | **$14.22 UNDER** |
+| §2.3n | "~$123.28 … under $2 of room" against the $125 cap | the cap is **$150** (Quote 19) |
+| §2.3p | "~$123.38 … about $6.38 above" | **$11.62 UNDER** |
+
+The ceiling moved to $150 on **2026-08-25** — the same day, and in the same
+`daily-universe-scope-expansion-2026-05-27.md` Quote 19, that authorized
+the EBS grow. The operator's words were *"even if we need to reach the max
+150 usd also let su gfo ahead dude but ensure to achieve alwyas O(1)"*.
+Every cost note written after that date still costed against $130.
+
+**Why this is worth a correction rather than an edit-in-place.** These are
+stale in the REASSURING direction's opposite — they overstate the danger —
+and this file's own header warns that a partial or stale disclosure reads
+exactly like a current one. §2.3n went further and set a policy from the
+wrong number: *"the next addition of any size must come with a lever, not
+just a cost note."* That policy was adopted against a margin that did not
+exist. Real observability gaps have been left open on it — §2.3g's
+`tv_wal_suspension_probe_failed_total`, §2.3d's headroom gauge, §2.3f's
+`tv_dhan_feed_xverify_runs_total` — each costing about $0.30/mo against a
+forecast that is **$21 below** the action line.
+
+**This is the second constraint in this file to expire and keep being
+quoted.** The first was the user-data byte budget: §2.3d-ii measured
+"zero bytes free", the boot template was restructured three days later,
+and §2.3d / §2.3f / §2.3g each went on citing the dead figure as a live
+blocker until the 2026-08-26 note retired it. The pattern is identical and
+so is the lesson that note recorded: **a measurement carries a date, and a
+measurement quoted from a quote is not a measurement.** A budget limit is
+one `budgets describe-budgets` call; a byte count is one guard run. Both
+must be re-run at the moment of writing, not inherited from the section
+above.
+
+**Not claimed:** that any of the deferred metrics should now be shipped.
+Each is still an operator decision with its own cost line — what changes
+is only that "we cannot afford it, we are past the shutdown line" has
+stopped being a true reason. The recorded per-section arithmetic is left
+in place as the audit trail; this row is the correction to all of it.
