@@ -88,6 +88,31 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/core/tests/chaos_cascade_triple_failure.rs",
         "cascade_01_triple_failure_live_docker_zero_loss",
     ),
+    // Added 2026-09-03 with the streaming spill-replay repair it proves.
+    //
+    // DIFFERENT SHAPE from the wall-clock harnesses above, so the reason is
+    // its own: this one is not timing-flaky, it is DISK-flaky. It writes a
+    // multi-gigabyte fixture (default 2 GiB, `TV_SPILL_MEMORY_TEST_BYTES`
+    // overrides) and a CI agent that runs out of disk would fail it while
+    // saying nothing whatever about the code -- the textbook flaky gate.
+    //
+    // What it measures is the central claim of that repair: that replaying a
+    // spill file far larger than RAM grows the process by the streaming
+    // window rather than by the file. Measured 2026-09-03 on a 3.22 GB
+    // fixture: peak RSS growth 42.3 MB against a 268.4 MB bound, whole file
+    // delivered. The old whole-file read would have grown by 3.22 GB, which
+    // is what restart-looped production that morning.
+    //
+    // It is NOT the merge condition for that behaviour -- a source guard
+    // (`the_replay_path_never_reads_a_whole_spill_file_into_memory`) fails the
+    // build if the whole-file read returns, and it runs on every PR. This is
+    // the empirical companion, run deliberately:
+    //   cargo test -p tickvault-storage --test spill_replay_memory_bound \
+    //     -- --ignored --nocapture
+    (
+        "crates/storage/tests/spill_replay_memory_bound.rs",
+        "a_multi_gigabyte_spill_file_does_not_grow_the_process",
+    ),
 ];
 
 struct Ignored {

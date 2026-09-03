@@ -1246,11 +1246,13 @@ jobs:
             } >> "$GITHUB_ENV"
             echo "ROLLBACK: tickvault is not active after deploy — rolling back"
             # `reset-failed` BEFORE the restart, and it is the whole reason a
-            # rollback can leave the box dead. The unit sets StartLimitBurst=8
-            # / RestartSec=3, so a binary that exits immediately trips the start
-            # limit within ~24s and systemd then REFUSES every further start
-            # with "Start request repeated too quickly" until the 600s
-            # StartLimitIntervalSec window expires. A bare `systemctl restart`
+            # rollback can leave the box dead. The unit sets StartLimitBurst=5
+            # / RestartSec=3 (was 8/600s until 2026-09-03), so a binary that
+            # exits immediately trips the start limit within ~15s and systemd
+            # then REFUSES every further start with "Start request repeated too
+            # quickly" until the 3600s StartLimitIntervalSec window expires --
+            # an hour, not ten minutes, which makes the `reset-failed` below
+            # MORE load-bearing than it was, not less. A bare `systemctl restart`
             # in that state is a no-op: the good binary is back on disk and
             # nothing runs it.
             #
