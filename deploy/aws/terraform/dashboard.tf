@@ -306,12 +306,25 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          title  = "Database write health — WAL suspended tables / reconnects"
+          title  = "Database write health — WAL suspended / apply lag / reconnects"
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_questdb_wal_suspended_tables", { label = "WAL suspended tables", stat = "Maximum" }],
-            [local.dash_namespace, "tv_questdb_reconnects_total", { label = "reconnects", stat = "Sum" }]
+            [local.dash_namespace, "tv_questdb_reconnects_total", { label = "reconnects", stat = "Sum" }],
+            # On the RIGHT axis deliberately: apply lag is measured in tens of
+            # thousands of transactions while its two neighbours sit at 0-2, so
+            # sharing one axis would flatten them into the baseline and make the
+            # widget useless for the two signals it already carried.
+            #
+            # This metric was ALARMED (tv-<env>-questdb-wal-apply-lag) and charted
+            # NOWHERE until 2026-09-03. That combination is the worst of both: the
+            # operator is paged once the lag crosses 10,000 and has no way to see
+            # it climbing towards that line, or to tell a backlog that drains
+            # overnight from one that is compounding day over day. MEASURED the
+            # day this was added: 97,950 at 06:30 UTC rising to 129,367 by 07:45,
+            # a straight line no alarm state can express.
+            [local.dash_namespace, "tv_questdb_wal_apply_lag_max", { label = "WAL apply lag (txn, right axis)", stat = "Maximum", yAxis = "right" }]
           ]
           period = 300
         }
