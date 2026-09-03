@@ -2590,7 +2590,69 @@ impl TickWriterSink {
             self.rescue(batch, "no ILP sender (QuestDB unreachable)");
             return 0;
         };
-        match sender.flush(&mut batch.buffer) {
+        // 2026-09-03: a bounded retry, the shape `DepthWriter` has carried on
+        // its synchronous path since 2026-08-25. The TICK path has never had
+        // one — on either path — and the measured cost of that is the largest
+        // single loss signal in the session.
+        //
+        // MEASURED 2026-09-03: `HOT-PATH-02` fired **58,746 times**, every one
+        // reading `Could not flush buffer: ... io: Connection reset by peer
+        // (os error 104)`. Each rescued ~120 rows to the spill tier, so the
+        // great majority of the session's ticks are sitting in files on disk
+        // rather than in QuestDB — `SELECT count() FROM ticks WHERE ts IN
+        // today()` read 2,310,693 against roughly 82M ingested. Nothing was
+        // LOST; almost nothing was QUERYABLE.
+        //
+        // A reset is the transport class the buffer survives: the rows are
+        // still in `batch.buffer` (which is exactly why `rescue` below can
+        // spill them), so a second attempt sends the same bytes.
+        //
+        // Retrying is idempotent BY CONSTRUCTION, which is what makes one
+        // attempt safe rather than merely cheap: `DEDUP_KEY_TICKS` carries
+        // `capture_seq`, unique per received frame. The rescue message three
+        // dozen lines below says so in the operator's own words — "safe to
+        // repeat, because the ticks dedup key carries capture_seq". If it is
+        // safe for the operator to re-send by hand, it is safe for us to
+        // re-send once automatically.
+        //
+        // Bounded at ONE, and gated on the first failure being FAST.
+        // `request_timeout` is 5,000 ms, so an unconditional retry makes the
+        // worst case ten seconds. This thread is not the drain — that is the
+        // whole point of the split — so a stall here does not fill the socket
+        // buffer directly. It fills the hand-off QUEUE instead, and a full
+        // queue makes the producer rescue rows the retry existed to save. A
+        // reset returns in microseconds; a timeout consumes the whole budget.
+        let started = std::time::Instant::now();
+        let first = sender.flush(&mut batch.buffer);
+        let first_elapsed = started.elapsed();
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err)
+                if crate::depth_persistence::flush_failure_is_retryable(&err)
+                    && first_elapsed
+                        < crate::depth_persistence::DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                metrics::counter!(
+                    "tv_tick_flush_retries_total",
+                    "feed" => self.feed.as_str(),
+                )
+                .increment(1);
+                sender.flush(&mut batch.buffer)
+            }
+            Err(err) => {
+                if crate::depth_persistence::flush_failure_is_retryable(&err) {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_tick_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
+        };
+        match outcome {
             Ok(()) => {
                 let landed = batch.rows;
                 batch.rows = 0;
