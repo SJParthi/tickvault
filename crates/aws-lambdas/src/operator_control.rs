@@ -536,17 +536,24 @@ pub fn parse_view(stdout: &str) -> Value {
         }
     }
     let get = |k: &str| fields.get(k).cloned().unwrap_or_default();
-    let (spot, chain, contracts) = (get("SPOT_TODAY"), get("CHAIN_TODAY"), get("CONTRACT_TODAY"));
+    let (spot, chain) = (get("SPOT_TODAY"), get("CHAIN_TODAY"));
     json!({
         "app": get("APP"),
         // Official minute candles captured today by the REST pulls — the
-        // three LIVE tables, per table + per feed. See VIEW_COMMANDS.
-        "rows_today": {"spot": spot, "chain": chain, "contracts": contracts},
-        "rows_today_total": sum_counts(&[&spot, &chain, &contracts]),
+        // TWO live tables, per table + per feed. See VIEW_COMMANDS.
+        //
+        // 2026-09-03: `contracts` is GONE from all three fields, not zeroed.
+        // `rest_option_contract_1m` has had no DDL caller and no writer since
+        // the 2026-08-21 Groww removal, so a "contracts: 0" bar would have
+        // said *the leg captured nothing today* about a leg that no longer
+        // exists — and a zero an operator cannot distinguish from a real
+        // outage is worse than an absent field. Rationale + the measurement
+        // live on VIEW_COMMANDS in operator_control_commands.rs.
+        "rows_today": {"spot": spot, "chain": chain},
+        "rows_today_total": sum_counts(&[&spot, &chain]),
         "rows_by_feed": {
             "spot": parse_feed_counts(&get("SPOT_BY_FEED")),
             "chain": parse_feed_counts(&get("CHAIN_BY_FEED")),
-            "contracts": parse_feed_counts(&get("CONTRACT_BY_FEED")),
         },
         "dedup_key_columns": get("DEDUP_KEYS"),
         "recent_errors": errors,
@@ -2576,20 +2583,34 @@ mod tests {
         // The pin REMAINS a content ratchet — any further unreviewed edit to
         // the console HTML still fails the build; it simply no longer claims
         // legacy-byte-identity.
+        //
+        // 2026-09-03 re-bless (47,467 -> 47,634): the Data tab's third bar,
+        // "contracts", is REMOVED along with the two VIEW_COMMANDS queries
+        // that fed it. `rest_option_contract_1m` has had no DDL caller and no
+        // writer since the 2026-08-21 Groww removal — MEASURED on the box the
+        // same day, the table does not exist — so that bar could only ever
+        // render blank, which an operator cannot tell from a real capture
+        // failure. The byte count GREW despite deleting a key because the
+        // reason is recorded at the site; a shorter file that explains
+        // nothing is the worse trade.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "31b3cc9bb1e436d9ae87b7b3844566dd3f969c2a9d07258b72a6db81af67c915"
+            "c3df1ea01b344f93a9ecbe4de2d96ecb69827e7c1fc69d6db3e0d2585232a33d"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_467);
+        assert_eq!(CONSOLE_HTML.len(), 47_634);
     }
 
     // --------------------------------------------------------- class ParseView
     #[test]
     fn test_parses_labeled_snapshot() {
-        // REST-era snapshot (2026-07-16): today's rows in the three LIVE
-        // tables, totals + per-feed split, the 4-column dedup-key count.
+        // REST-era snapshot (2026-07-16; contract leg dropped 2026-09-03):
+        // today's rows in the LIVE tables, totals + per-feed split, the
+        // 4-column dedup-key count. The stdout deliberately still CARRIES
+        // the retired CONTRACT_* labels — a box running an older Lambda
+        // build, or a stale in-flight SSM invocation, can still emit them,
+        // and the parser must ignore an unknown label rather than surface it.
         let stdout = concat!(
             "APP=active\n",
             "SPOT_TODAY=1125\n",
@@ -2605,11 +2626,10 @@ mod tests {
         );
         let out = parse_view(stdout);
         assert_eq!(out["app"], "active");
-        assert_eq!(
-            out["rows_today"],
-            json!({"spot": "1125", "chain": "42000", "contracts": "9000"})
-        );
-        assert_eq!(out["rows_today_total"], "52125");
+        assert_eq!(out["rows_today"], json!({"spot": "1125", "chain": "42000"}));
+        // 43125, NOT 52125: the retired contract label is present in the
+        // stdout above and must contribute nothing.
+        assert_eq!(out["rows_today_total"], "43125");
         assert_eq!(
             out["rows_by_feed"]["spot"],
             json!({"dhan": "750", "groww": "375"})
@@ -2618,7 +2638,10 @@ mod tests {
             out["rows_by_feed"]["chain"],
             json!({"dhan": "21000", "groww": "21000"})
         );
-        assert_eq!(out["rows_by_feed"]["contracts"], json!({"groww": "9000"}));
+        // The retired contract leg renders as ABSENT, never as an empty map:
+        // a `{}` would read as "the leg ran and captured nothing".
+        assert!(out["rows_by_feed"].get("contracts").is_none());
+        assert!(out["rows_today"].get("contracts").is_none());
         assert_eq!(out["dedup_key_columns"], "4");
         assert_eq!(out["recent_errors"].as_array().unwrap().len(), 1);
         assert!(
@@ -2635,24 +2658,19 @@ mod tests {
         let out = parse_view("");
         assert_eq!(out["app"], "");
         assert_eq!(out["dedup_key_columns"], "");
-        assert_eq!(
-            out["rows_today"],
-            json!({"spot": "", "chain": "", "contracts": ""})
-        );
+        assert_eq!(out["rows_today"], json!({"spot": "", "chain": ""}));
         assert_eq!(out["rows_today_total"], "");
-        assert_eq!(
-            out["rows_by_feed"],
-            json!({"spot": {}, "chain": {}, "contracts": {}})
-        );
+        assert_eq!(out["rows_by_feed"], json!({"spot": {}, "chain": {}}));
         assert_eq!(out["recent_errors"], json!([]));
     }
 
     #[test]
     fn test_partial_counts_sum_only_parseable() {
         // One table unreachable (empty value) — the total sums the rest,
-        // never treating an unreachable count as 0-and-green.
+        // never treating an unreachable count as 0-and-green. The retired
+        // CONTRACT_TODAY label is fed in deliberately and must not be summed.
         let out = parse_view("SPOT_TODAY=100\nCHAIN_TODAY=\nCONTRACT_TODAY=23\n");
-        assert_eq!(out["rows_today_total"], "123");
+        assert_eq!(out["rows_today_total"], "100");
     }
 
     #[test]
@@ -2768,13 +2786,18 @@ mod tests {
     #[test]
     fn test_view_commands_target_live_rest_tables() {
         let joined = VIEW_COMMANDS.join("\n");
-        for live in [
-            "rest_spot_1m",
-            "rest_option_chain_1m",
-            "rest_option_contract_1m",
-        ] {
+        for live in ["rest_spot_1m", "rest_option_chain_1m"] {
             assert!(joined.contains(live), "{live}");
         }
+        // 2026-09-03: and it must query NOTHING that has no writer. The view
+        // is the operator's read of "what did we capture today"; a query
+        // against a table that cannot exist renders a blank the operator
+        // cannot tell from a real capture failure. Re-adding this needs the
+        // per-contract leg itself back first — see VIEW_COMMANDS.
+        assert!(
+            !joined.contains("rest_option_contract_1m"),
+            "the view queried a table with no DDL caller and no writer"
+        );
         // Today windows use the house `ts IN today()` convention.
         assert!(joined.contains("ts%20IN%20today()"));
     }
@@ -3671,7 +3694,6 @@ mod tests {
         for (label, table) in [
             ("SPOT_BY_FEED=", "rest_spot_1m"),
             ("CHAIN_BY_FEED=", "rest_option_chain_1m"),
-            ("CONTRACT_BY_FEED=", "rest_option_contract_1m"),
         ] {
             let cmd = VIEW_COMMANDS.iter().find(|c| c.contains(label)).unwrap();
             assert!(cmd.contains("GROUP%20BY%20feed"));

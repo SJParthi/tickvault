@@ -21,16 +21,36 @@
 //! any command below (the retired-hosts absence scan pins that).
 
 /// legacy: `_VIEW_COMMANDS` (handler.py:332-355).
-pub const VIEW_COMMANDS: [&str; 13] = [
+///
+/// **2026-09-03 — the `rest_option_contract_1m` pair is REMOVED (13 → 11).**
+/// That table does not exist and cannot: its only DDL entry point,
+/// `ensure_option_contract_1m_rest_table`, has had ZERO callers since the
+/// 2026-08-21 Groww removal deleted `groww_contract_1m_boot` (the per-contract
+/// 1m leg was a Groww-only leg — `no-rest-except-live-feed-2026-06-27.md` §9,
+/// retired that day).
+///
+/// MEASURED on the box 2026-09-03: `SELECT count() FROM
+/// rest_option_contract_1m` returns `table does not exist`, and QuestDB logged
+/// **61 errors in 30 minutes** naming it — the two lines below, about once a
+/// minute, for a leg that no longer has a writer.
+///
+/// The log noise is the smaller half. `-f` makes curl swallow the 400, so the
+/// field arrived EMPTY and the Data tab rendered a blank "contracts" bar —
+/// which reads as *"the per-contract leg captured nothing today"* when the
+/// truth is *"there is no per-contract leg"*. An operator cannot tell a broken
+/// leg from a removed one, and that is the dead-monitor class the 2026-08-21
+/// removal directive's own REJECT list forbids.
+///
+/// Re-adding these needs the per-contract leg back FIRST (a writer and a DDL
+/// caller, under its own dated authorization) — never the query alone.
+pub const VIEW_COMMANDS: [&str; 11] = [
     r"set +e",
     r#"echo "APP=$(systemctl is-active tickvault 2>/dev/null || echo inactive)""#,
     r"Q='http://127.0.0.1:9000/exp?query='",
     r#"echo "SPOT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20rest_spot_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
     r#"echo "CHAIN_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20rest_option_chain_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
-    r#"echo "CONTRACT_TODAY=$(curl -fsS "${Q}SELECT%20count()%20FROM%20rest_option_contract_1m%20WHERE%20ts%20IN%20today()" 2>/dev/null | tail -1)""#,
     r#"echo "SPOT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20rest_spot_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
     r#"echo "CHAIN_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20rest_option_chain_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
-    r#"echo "CONTRACT_BY_FEED=$(curl -fsS "${Q}SELECT%20feed%2C%20count()%20FROM%20rest_option_contract_1m%20WHERE%20ts%20IN%20today()%20GROUP%20BY%20feed" 2>/dev/null | tail -n +2 | tr '\n' ';')""#,
     r#"echo "DEDUP_KEYS=$(curl -fsS "${Q}SELECT%20count()%20FROM%20table_columns(%27rest_spot_1m%27)%20WHERE%20upsertKey%3Dtrue" 2>/dev/null | tail -1)""#,
     r#"echo "ERRORS_BEGIN""#,
     r"journalctl -u tickvault -p err -n 5 --no-pager 2>/dev/null | tail -5 || true",
