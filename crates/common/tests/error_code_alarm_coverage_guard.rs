@@ -124,14 +124,34 @@ fn strip_hcl_comments(src: &str) -> String {
 /// choice here.
 fn alarmed_codes() -> BTreeSet<&'static str> {
     let tf = strip_hcl_comments(&read(ALARM_TF));
+    // ONLY a filter `pattern` alarms a code. Scanning the whole file counted a
+    // code merely NAMED in another alarm's free-text `desc` as covered.
+    //
+    // That is not hypothetical. `DH-902` (Critical, live emit site at
+    // `oms/engine.rs::engage_halt`, and NOT on the exempt list below) read as
+    // alarmed for months on the strength of one substring inside CHAIN-01's
+    // description: "DH-902/806 class". The old delimiter check accepted it
+    // because the next byte is `/` — neither alphanumeric nor `-`.
+    //
+    // The failure direction is the one this guard exists to prevent: it
+    // reported coverage that does not exist, so the code was neither alarmed
+    // NOR forced onto the exempt list where a human would have had to write
+    // down why. Narrowing the haystack to `pattern` lines is what makes the
+    // guard's own claim true.
+    let haystack: String = tf
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("pattern"))
+        .collect::<Vec<_>>()
+        .join("\n");
     ErrorCode::all()
         .iter()
         .map(|c| c.code_str())
         .filter(|code| {
             // Require the code to be delimited, so `CHAIN-01` does not match
             // inside a hypothetical `CHAIN-011`.
-            tf.match_indices(*code).any(|(idx, _)| {
-                let after = tf.as_bytes().get(idx + code.len()).copied();
+            haystack.match_indices(*code).any(|(idx, _)| {
+                let after = haystack.as_bytes().get(idx + code.len()).copied();
                 !matches!(after, Some(b) if b.is_ascii_alphanumeric() || b == b'-')
             })
         })
@@ -196,6 +216,36 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // real merge: had the entries survived, a later removal of those four
     // alarms would have passed silently — the exact failure mode the test was
     // written to prevent, arrived at by accident rather than intent.
+    //
+    // ADDED 2026-09-03 — and this is an addition to a shrink-only list, so it
+    // needs its reason stated rather than assumed.
+    //
+    // DH-902 is NOT a new code and its coverage did not change. It has been
+    // uncovered since the seed and was MISCOUNTED as alarmed, because
+    // `alarmed_codes()` scanned the whole terraform file and the string
+    // "DH-902/806 class" appears inside CHAIN-01's free-text `desc`. Narrowing
+    // that matcher to `pattern` lines (same commit) is what surfaced it. So
+    // this entry corrects the 2026-08-10 seed; it does not widen the exemption.
+    //
+    // Why log-sink-only is the RIGHT answer here, not a shrug: DH-902's OMS
+    // emit site is `engine.rs::halt_with_alert`, which fires
+    // `OmsAlert::OmsHalted` — and `order_runtime.rs`'s sink matches that
+    // variant and deliberately routes NOTHING, with the contract named in its
+    // own comment (`order-readiness-error-codes.md` §3 + the Dhan noise lock
+    // §2: no Telegram family row exists for the cluster-F alerts, and adding
+    // one would be an unauthorized new Dhan page class). Its cluster-F siblings
+    // DH-903, DH-904, DATA-805 and ORDER-READY-01 are all already on this list
+    // for exactly that reason — DH-902 is the one the substring bug hid.
+    //
+    // Also already covered where it is reachable today: the option-chain leg's
+    // DH-902 entitlement class pages via the CHAIN-01 alarm, whose description
+    // is the very string that caused the false positive.
+    //
+    // What would change this: authorizing live order fire. The OMS is
+    // paper-only (`dry_run: true` hardcoded, sole setter `#[cfg(test)]`), so a
+    // halt today stops a simulated order path. A live-fire enable needs its own
+    // dated quote in the noise lock, and that same quote should give this code
+    // a real alarm.
     "AGGREGATOR-LAG-01",
     "AGGREGATOR-LATE-01",
     "AUTH-GAP-01",
@@ -212,6 +262,7 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "DATA-808",
     "DATA-809",
     "DATA-810",
+    "DH-902",
     "DH-903",
     "DH-904",
     "DH-905",
@@ -446,5 +497,54 @@ fn comment_stripper_does_not_cut_inside_a_pattern_string() {
     assert!(
         out.contains("DH-901"),
         "stripper destroyed the code token: {out}"
+    );
+}
+
+#[test]
+fn only_a_filter_pattern_counts_as_alarmed_never_a_mention_in_prose() {
+    // The bug this pins, found 2026-09-03: `alarmed_codes()` scanned the WHOLE
+    // comment-stripped file, so a code merely NAMED in another alarm's
+    // free-text `desc` counted as covered. DH-902 (Critical, live emit site,
+    // absent from LOG_SINK_ONLY_EXEMPT) read as alarmed for months on the
+    // strength of "DH-902/806 class" inside CHAIN-01's description.
+    //
+    // Bite-tested in BOTH directions against the REAL terraform, because a
+    // fixture would only prove the matcher parses a string I wrote. The
+    // negative half is the one that regresses silently.
+    let alarmed = alarmed_codes();
+    let tf = strip_hcl_comments(&read(ALARM_TF));
+
+    // Positive: DH-901 has a genuine `pattern` and must still count. Without
+    // this, "match nothing" would pass the negative half trivially.
+    assert!(
+        alarmed.contains("DH-901"),
+        "DH-901 has a real filter pattern in {ALARM_TF} but was not counted as \
+         alarmed — the matcher is now too narrow and every code reads as \
+         uncovered, which is a false ALARM storm rather than a false OK"
+    );
+
+    // Negative: DH-902 appears in the file, but only inside a `desc`.
+    assert!(
+        tf.contains("DH-902"),
+        "precondition gone: DH-902 no longer appears anywhere in {ALARM_TF}, so \
+         this test no longer proves the desc-vs-pattern distinction. If the \
+         CHAIN-01 description was reworded, re-point this at whatever code is \
+         now named in prose without its own pattern — do not delete the test"
+    );
+    assert!(
+        !tf.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("pattern") && l.contains("DH-902")),
+        "precondition gone: DH-902 now HAS its own filter pattern. Remove it \
+         from LOG_SINK_ONLY_EXEMPT and re-point this test"
+    );
+    assert!(
+        !alarmed.contains("DH-902"),
+        "REGRESSION: DH-902 is named only inside another alarm's `desc` in \
+         {ALARM_TF}, never in a filter `pattern`, yet alarmed_codes() counted \
+         it as covered. That is the exact substring bug this test exists to \
+         prevent: the guard would report paging coverage that does not exist, \
+         and the code would be neither alarmed NOR forced onto the exemption \
+         list where a human has to write down why"
     );
 }
