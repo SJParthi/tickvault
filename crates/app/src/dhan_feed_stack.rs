@@ -1580,7 +1580,16 @@ impl LiveIngest {
         {
             counters().depth_flush_failed.increment(1);
             error!(
-                code = "TICK-FLUSH-01",
+                // 2026-09-03: the ENUM, not a re-typed string. This was the
+                // last raw `code = "..."` literal in this file, and a literal
+                // is invisible to `error_code_tag_guard` and to any future
+                // rename of the code string — the CloudWatch metric filters
+                // key on that exact string, so a rename that missed this line
+                // would silently stop matching. The variant is named for the
+                // worker-respawn case and is REUSED here deliberately: both
+                // are the tick/depth flush durability family and share one
+                // code string, which is what the filter and the runbook key on.
+                code = ErrorCode::TickFlush01WorkerRespawn.code_str(),
                 // `?err` and NOT `%format!("{err:#}")`: this arm is reachable
                 // from the frame drain via `pending_rows >= FLUSH_ROW_THRESHOLD`,
                 // i.e. up to ~5/s, and it fires exactly when the depth writer is
@@ -4955,6 +4964,18 @@ pub fn drain_main_feed_frame(
     // packet by packet is what stops packets 2..N being silently discarded.
     let mut offset = 0usize;
     let mut packets = 0u32;
+    // 2026-09-03: one `error!` per FRAME for decoded disconnects, not one per
+    // packet. The arm below used to justify being unthrottled with "a
+    // disconnect packet ends the socket, so this is bounded by reconnects, not
+    // by frame rate" — which the walk itself contradicts three lines later: it
+    // does not return, it advances `offset` and keeps decoding. A frame
+    // carrying stacked 10-byte disconnect packets therefore emitted up to
+    // MAX_PACKETS_PER_FRAME formatted error lines SYNCHRONOUSLY on the only
+    // task emptying the socket. That is the drain-stall shape this file
+    // repeatedly guards against: stalled drain -> ring fills -> Dhan skips the
+    // slow consumer forward -> silent upstream tick loss. Every other
+    // high-rate arm here is throttled or counter-only for exactly this reason.
+    let mut disconnect_logged = false;
     while offset < frame.bytes.len() {
         let Some(len) = main_feed_packet_len(&frame.bytes[offset..]) else {
             // Unrecognised code or a trailing partial packet: stop here rather
@@ -5083,20 +5104,28 @@ pub fn drain_main_feed_frame(
             // 805 account block, so "the reason reached no log and no metric"
             // was the part that made it unfixable from outside.
             //
-            // Not throttled: a disconnect packet ends the socket, so this is
-            // bounded by reconnects, not by frame rate.
+            // Throttled to ONE line per frame (see `disconnect_logged` above).
+            // The counter is still incremented per packet, so the real rate
+            // stays visible in `tv_dhan_feed_main_feed_disconnects_total`; only
+            // the formatted log line is latched. Counting without logging is
+            // the house pattern for every other high-rate arm in this walk.
             Ok(ParsedFrame::Disconnect(reason)) => {
                 c.main_feed_disconnects.increment(1);
                 out.disconnects = out.disconnects.saturating_add(1);
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "drain_decoded_disconnect",
-                    reason = ?reason,
-                    "the main feed decoded a DISCONNECT packet inside a frame — \
-                     if this reason is not also on a socket-close line, the \
-                     classifier could not act on it and the reconnect ladder is \
-                     treating a possibly-fatal reason as transient"
-                );
+                if !disconnect_logged {
+                    disconnect_logged = true;
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "drain_decoded_disconnect",
+                        reason = ?reason,
+                        "the main feed decoded a DISCONNECT packet inside a frame — \
+                         if this reason is not also on a socket-close line, the \
+                         classifier could not act on it and the reconnect ladder is \
+                         treating a possibly-fatal reason as transient \
+                         (first per frame; further disconnect packets in this \
+                         frame are counted, not logged)"
+                    );
+                }
             }
             // Non-tick frames are real protocol traffic, not errors: OI and
             // previous-close arrive as their own packets, market-status and
@@ -5117,6 +5146,16 @@ pub fn drain_main_feed_frame(
             // A frame claiming more packets than the protocol can produce is
             // malformed or hostile; stop walking rather than loop on it.
             c.truncated.increment(1);
+            // 2026-09-03: and say HOW MUCH was thrown away, exactly as the two
+            // sibling give-up arms above already do. The 2026-08-21 fix that
+            // added byte accounting ("incremented the outcome counter by 1
+            // whether it discarded one packet or 1,500") covered those two and
+            // missed this third one, leaving the accounting claim stale in the
+            // reassuring direction: this arm can abandon ~1 MB and report the
+            // integer 1.
+            let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
+            c.abandoned_bytes.increment(abandoned);
+            out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
     }
@@ -6844,10 +6883,28 @@ pub const DEPTH_ATTACH_MIN_WINDOW_SECS: u64 = 30 * 60;
 
 /// IST second-of-day past which depth is not worth attaching at all.
 ///
-/// 15:30 IST — the close. The minimum window above must not be able to keep
-/// this task polling into the evening after a 15:25 restart; depth on a closed
-/// market subscribes contracts that will not trade again today.
-pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 = 15 * 3_600 + 30 * 60;
+/// The close. The minimum window above must not be able to keep this task
+/// polling into the evening after a late restart; depth on a closed market
+/// subscribes contracts that will not trade again today.
+///
+/// # 2026-09-03: DERIVED, because the literal drifted
+///
+/// This was `15 * 3_600 + 30 * 60` with a doc that read "15:30 IST — the
+/// close." The close moved to 15:40 on 2026-08-07 (NSE closing auction) and
+/// this did not, so for nearly a month the depth late-attach gave up TEN
+/// MINUTES BEFORE the session actually ended — refusing to attach across the
+/// closing auction, the densest and most information-rich window of the day,
+/// and exactly the window depth is for.
+///
+/// Nothing could have caught it: the constant's own guard asserted
+/// `<= 15 * 3_600 + 30 * 60`, i.e. it re-stated the same stale literal and
+/// therefore agreed with itself. A guard written against a copy of the value
+/// it guards proves only that the copy was made.
+///
+/// It is now `TICK_PERSIST_END_SECS_OF_DAY_IST` — the session end the ingest
+/// gate actually enforces — so the next move carries it along.
+pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 =
+    tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
 
 /// Current IST second-of-day.
 ///
@@ -17368,10 +17425,15 @@ mod tests {
             DEPTH_ATTACH_DEADLINE_IST_SECS < DEPTH_ATTACH_HARD_STOP_IST_SECS,
             "the hard stop must be AFTER the deadline, or the deadline is unreachable"
         );
-        assert!(
-            DEPTH_ATTACH_HARD_STOP_IST_SECS <= 15 * 3_600 + 30 * 60,
-            "the hard stop must not run past the 15:30 IST close — depth on a closed market \
-             subscribes contracts that will not trade again today"
+        // 2026-09-03: against the session-end CONSTANT, not a re-typed literal.
+        // The previous form asserted `<= 15 * 3_600 + 30 * 60` — a second copy
+        // of the very value under test, so it stayed green through the
+        // 2026-08-07 close move while the constant it guarded went stale.
+        assert_eq!(
+            DEPTH_ATTACH_HARD_STOP_IST_SECS,
+            tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST,
+            "the hard stop must BE the session close — earlier abandons the closing \
+             auction, later subscribes contracts that will not trade again today"
         );
         assert!(
             DEPTH_ATTACH_MIN_WINDOW_SECS >= 10 * DEPTH_ATTACH_RETRY_SECS,
@@ -19547,6 +19609,131 @@ mod frame_walk_accounting_tests {
         assert_eq!(
             out.abandoned_bytes, 9,
             "the 9 bytes of the partial packet are lost and must be counted"
+        );
+    }
+
+    /// One 10-byte disconnect packet: code 50 header, disconnect code in the
+    /// last two bytes.
+    fn disconnect_packet(code: u16) -> [u8; 10] {
+        let mut p = [0u8; 10];
+        p[0] = 50; // response code: disconnect
+        p[1] = 10; // message length
+        p[8..10].copy_from_slice(&code.to_le_bytes());
+        p
+    }
+
+    /// The THIRD give-up arm — the packet cap — must account its abandoned
+    /// bytes like the other two.
+    ///
+    /// 2026-09-03: it did not. The 2026-08-21 change that added byte
+    /// accounting fixed the unknown-code and trailing-partial arms and missed
+    /// this one, so a frame stopped at the cap incremented the outcome counter
+    /// by the integer 1 while discarding up to ~1 MB — leaving that change's
+    /// own claim ("say HOW MUCH was thrown away") true of two arms out of
+    /// three, in the reassuring direction.
+    #[test]
+    fn the_packet_cap_arm_reports_its_abandoned_bytes() {
+        let cap = tickvault_common::constants::MAX_PACKETS_PER_FRAME;
+        let packet = disconnect_packet(805);
+        // One packet PAST the cap, so the walk stops with real bytes left.
+        let mut bytes = Vec::with_capacity((cap as usize + 1) * packet.len());
+        for _ in 0..=cap {
+            bytes.extend_from_slice(&packet);
+        }
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(
+            out.disconnects, cap as u64,
+            "every packet up to the cap must be COUNTED — throttling the log              line must never throttle the counter"
+        );
+        assert_eq!(
+            out.abandoned_bytes,
+            packet.len() as u64,
+            "the one packet past the cap is abandoned and must be counted in              bytes, not folded into a bare outcome tally"
+        );
+    }
+
+    /// Stacked disconnect packets are counted per packet and LOGGED ONCE.
+    ///
+    /// 2026-09-03: the arm justified being unthrottled with "a disconnect
+    /// packet ends the socket, so this is bounded by reconnects, not by frame
+    /// rate" — which the walk contradicts three lines later: it does not
+    /// return, it advances and keeps decoding. A frame of stacked disconnect
+    /// packets therefore formatted one `error!` per packet SYNCHRONOUSLY on
+    /// the only task emptying the socket, which is the drain-stall shape that
+    /// ends in upstream tick loss.
+    ///
+    /// The counter is the half that must NOT be throttled, and that is what
+    /// this asserts behaviourally; the log latch itself is not observable from
+    /// here, so it is pinned structurally below.
+    #[test]
+    fn stacked_disconnect_packets_are_counted_per_packet_but_logged_once() {
+        let mut bytes = Vec::new();
+        for code in [805u16, 806, 807] {
+            bytes.extend_from_slice(&disconnect_packet(code));
+        }
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(
+            out.disconnects, 3,
+            "all three disconnect packets must be counted"
+        );
+        assert_eq!(
+            out.abandoned_bytes, 0,
+            "a fully-walked frame abandons nothing"
+        );
+
+        // The latch: the `error!` must sit INSIDE `if !disconnect_logged`, and
+        // the counter must sit OUTSIDE it. A future edit that hoists the log
+        // back out restores the per-packet storm silently.
+        let source = include_str!("dhan_feed_stack.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        let arm = production
+            .split_once("Ok(ParsedFrame::Disconnect(reason)) => {")
+            .expect("the decoded-disconnect arm must exist")
+            .1;
+        let counter_at = arm
+            .find("c.main_feed_disconnects.increment(1);")
+            .expect("the arm must still count every disconnect packet");
+        let latch_at = arm
+            .find("if !disconnect_logged {")
+            .expect("the decoded-disconnect log MUST be latched per frame");
+        let log_at = arm
+            .find("source = \"drain_decoded_disconnect\",")
+            .expect("the arm must still carry its log line");
+        assert!(
+            counter_at < latch_at && latch_at < log_at,
+            "order must be count -> latch -> log: counting outside the latch              keeps the rate visible, logging inside it keeps the drain free"
         );
     }
 }
