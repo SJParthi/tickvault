@@ -282,6 +282,26 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
 /// than assumed — a retention exemption granted on a premise that does not hold
 /// is the failure mode this list must never carry, and it has now been recorded
 /// twice in one day for the same reason.
+///
+/// **CORRECTED 2026-09-03 — the paragraph above is stale in the direction that
+/// matters, and the correction makes the exemption SAFER, not weaker.** The
+/// 2026-08-21 Groww removal deleted `groww_contract_1m_boot` outright, so
+/// `ensure_option_contract_1m_rest_table` now has **ZERO callers anywhere** —
+/// not one caller behind a `false` flag. The table is therefore never CREATED,
+/// which is stronger than never written: MEASURED on the box the same day,
+/// `SELECT count() FROM rest_option_contract_1m` returns `table does not
+/// exist`, and `tables()` lists no name containing "contract".
+///
+/// So the exemption is discharged by absence: there is no table to sweep and
+/// none can appear while nothing calls the DDL. It stays on this list rather
+/// than moving to a sweep list because `OPTION_CONTRACT_1M_REST_TABLE` still
+/// exists as a constant and `partition_retention_coverage_guard` — correctly —
+/// demands a decision for every table-name constant in the crate; pointing a
+/// sweeper at a name that cannot resolve would be the worse answer.
+///
+/// The reusable half: a comment naming a caller is a claim with a date on it,
+/// and this one outlived its caller by thirteen days. Cite the SYMBOL and let
+/// grep settle it — which is exactly how this was caught.
 pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     "instrument_lifecycle",
     "index_constituency",
