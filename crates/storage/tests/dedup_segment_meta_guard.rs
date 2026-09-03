@@ -378,8 +378,21 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
 // per-feed-populate work is a SEPARATE follow-up.
 //
 // Scans EVERY `DEDUP_KEY_*` constant in storage src and fails if any omits the
-// bare `feed` token. The allowlist is EMPTY — there is no persisted table
-// exempt from the rule. Removing `feed` from ANY persisted key fails the build.
+// bare `feed` token. Removing `feed` from ANY persisted key fails the build.
+//
+// CORRECTED 2026-09-03: this said "The allowlist is EMPTY — there is no
+// persisted table exempt from the rule" — three lines above two entries. It
+// was true when written and was never updated when `cross_fill_audit` joined
+// on 2026-07-20 and `table_storage_daily` on 2026-08-29. Both exemptions are
+// SOUND and are justified immediately below; the CLAIM about them was not.
+// The failure direction is the reassuring one: a reader auditing feed-in-key
+// coverage reads "EMPTY — no table is exempt" and stops, never learning that
+// two are, or why. `data-integrity.md` repeated the same sentence and is
+// corrected in the same commit.
+//
+// `feed_not_applicable_entries_each_carry_a_dated_justification` below now
+// fails the build if a THIRD entry is ever added without its reason, which is
+// what the violation message has always demanded and nothing enforced.
 // 2026-07-20 (operator cross-fill visibility directive): `cross_fill_audit`
 // is exempt from the bare-`feed` token because its `lane` column IS the
 // per-feed identity for this table — the row describes the BORROWING broker
@@ -477,4 +490,73 @@ fn self_test_collect_returns_non_empty_bodies() {
             line
         );
     }
+}
+
+/// Every `FEED_NOT_APPLICABLE_KEYS` entry must carry a dated justification in
+/// this file.
+///
+/// The violation message in `every_persisted_table_dedup_key_must_include_feed`
+/// has always instructed: *"add its constant name to FEED_NOT_APPLICABLE_KEYS
+/// WITH a dated operator quote justifying it"*. Nothing enforced the second
+/// half, so an exemption could be added as a bare string and the rule it
+/// escapes would look untouched.
+///
+/// That is not hypothetical here. Both current entries ARE justified — but the
+/// comment three lines above them claimed the list was EMPTY for six weeks,
+/// which is what a silent addition looks like from the outside.
+#[test]
+fn feed_not_applicable_entries_each_carry_a_dated_justification() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dedup_segment_meta_guard.rs"),
+    )
+    .expect("this guard can read its own source");
+
+    // A justification is a COMMENT line naming the table and carrying a date.
+    // Requiring both is what stops a bare re-listing of the name from passing.
+    let dated_comments: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("//"))
+        .filter(|l| {
+            l.as_bytes().windows(10).any(|w| {
+                w[0..2] == *b"20"
+                    && w[2..4].iter().all(u8::is_ascii_digit)
+                    && w[4] == b'-'
+                    && w[5..7].iter().all(u8::is_ascii_digit)
+                    && w[7] == b'-'
+                    && w[8..10].iter().all(u8::is_ascii_digit)
+            })
+        })
+        .collect();
+
+    assert!(
+        !dated_comments.is_empty(),
+        "found no dated comments at all — the scanner broke, not the file"
+    );
+
+    let mut undocumented: Vec<String> = Vec::new();
+    for entry in FEED_NOT_APPLICABLE_KEYS {
+        // `DEDUP_KEY_CROSS_FILL_AUDIT` -> `cross_fill_audit`, the name the
+        // justification prose actually uses.
+        let table = entry
+            .strip_prefix("DEDUP_KEY_")
+            .unwrap_or(entry)
+            .to_ascii_lowercase();
+        if !dated_comments.iter().any(|c| c.contains(&table)) {
+            undocumented.push(format!("{entry} (looked for `{table}`)"));
+        }
+    }
+
+    assert!(
+        undocumented.is_empty(),
+        "EXEMPTION WITHOUT A REASON: {} entry/entries in FEED_NOT_APPLICABLE_KEYS \
+         have no dated comment in this file naming the table:\n    {}\n\n\
+         Every exemption from the 2026-06-28 feed-in-key override must say WHEN \
+         it was granted and WHY that table's identity is not per-feed — the two \
+         existing entries do. An exemption nobody wrote a reason for is \
+         indistinguishable from one nobody decided, which is the state this \
+         whole guard exists to make impossible.",
+        undocumented.len(),
+        undocumented.join("\n    ")
+    );
 }

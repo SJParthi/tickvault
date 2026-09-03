@@ -102,8 +102,13 @@ boot — never a populated-table DROP (SEBI).
 
 Pinned by the NEW
 `dedup_segment_meta_guard::every_persisted_table_dedup_key_must_include_feed`
-(EMPTY allowlist — NO persisted table is exempt; removing `feed` from any key
-fails the build), alongside the existing
+(allowlist of TWO, each with a dated reason — `cross_fill_audit`, whose `lane`
+column IS its per-feed identity, and `table_storage_daily`, whose measured entity
+is a QuestDB table whose bytes span every feed at once; removing `feed` from any
+other key fails the build. **Corrected 2026-09-03:** this read "EMPTY allowlist —
+NO persisted table is exempt", which was true when written and was never updated
+when those two joined on 2026-07-20 and 2026-08-29. The guard's own header
+carried the identical stale sentence three lines above the entries.), alongside the existing
 `per_feed_market_data_dedup_keys_must_include_feed`. Each table self-heals at
 boot via `ALTER … ADD COLUMN IF NOT EXISTS feed` → `UPDATE … SET feed='dhan'
 WHERE feed IS NULL` → `DEDUP ENABLE UPSERT KEYS(…)` (in THAT order, so a re-keyed
