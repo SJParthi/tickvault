@@ -3377,8 +3377,14 @@ mod open_bucket_ordering_tests {
             sealed_state.open_gap_pct != 0.0,
             "the overnight gap was not stamped at the intraday seal"
         );
-        assert!(
-            (sealed_state.open_gap_pct - 0.030_41).abs() < 0.000_5,
+        // Exact, not a tolerance: the column is rounded to 2 decimals at the
+        // source (operator directive 2026-09-03), so the value a reader and
+        // the vendor comparison see is exactly this. The unrounded arithmetic
+        // is pinned separately by the live-NIFTY fixture in
+        // `live_candle_state.rs`; these four tests pin that each seal SITE
+        // stamps at all, which is what actually regressed in 2026-08-26.
+        assert_eq!(
+            sealed_state.open_gap_pct, 0.03,
             "gap pct was {}",
             sealed_state.open_gap_pct
         );
@@ -3402,13 +3408,13 @@ mod open_bucket_ordering_tests {
             20,
         );
         let sealed = cell.force_seal(TfIndex::M1).expect("bucket drained");
-        assert!(
-            (sealed.open_pct - -0.282_63).abs() < 0.000_5,
+        assert_eq!(
+            sealed.open_pct, -0.28,
             "force_seal pre-open pct was {}",
             sealed.open_pct
         );
-        assert!(
-            (sealed.open_gap_pct - 0.030_41).abs() < 0.000_5,
+        assert_eq!(
+            sealed.open_gap_pct, 0.03,
             "force_seal gap pct was {}",
             sealed.open_gap_pct
         );
@@ -3430,8 +3436,8 @@ mod open_bucket_ordering_tests {
         let sealed = cell
             .catch_up_seal(TfIndex::M1, OPEN + 60)
             .expect("bucket end reached");
-        assert!(
-            (sealed.open_pct - -0.282_63).abs() < 0.000_5,
+        assert_eq!(
+            sealed.open_pct, -0.28,
             "catch_up_seal pre-open pct was {}",
             sealed.open_pct
         );
@@ -3487,8 +3493,8 @@ mod open_bucket_ordering_tests {
              ({pct_at_seal}) — the row would persist a percentage that does \
              not describe its own close"
         );
-        assert!(
-            (amended_state.open_pct - -0.282_63).abs() < 0.000_5,
+        assert_eq!(
+            amended_state.open_pct, -0.28,
             "amended pre-open pct was {}",
             amended_state.open_pct
         );

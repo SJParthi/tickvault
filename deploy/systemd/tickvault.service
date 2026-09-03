@@ -235,7 +235,7 @@ LimitNPROC=4096
 # order, so exhaustion takes the recoverable tenant first. It does not make
 # the process unkillable (-1000 would); the kernel still reclaims it last.
 #
-# MemoryHigh=15G is a THROTTLE, not a kill: past it the kernel reclaims this
+# MemoryHigh=20G is a THROTTLE, not a kill: past it the kernel reclaims this
 # cgroup aggressively and slows allocation, and RESOURCE-02 has a reachable
 # ceiling to page against. There is deliberately NO `MemoryMax=` — a hard
 # cap turns a memory spike into an OOM kill of the one process whose death
@@ -265,7 +265,37 @@ LimitNPROC=4096
 # kernel's default ranking. Reverting this file in git and redeploying
 # achieves the same thing.
 OOMScoreAdjust=-900
-MemoryHigh=15G
+# RAISED 15G -> 20G on 2026-09-03, operator-approved, after a live incident.
+#
+# WHAT HAPPENED: a 21 GB depth spill file was read WHOLE into memory by the
+# recovery drain (`tick_spill_replay`, since fixed to stream). Process RSS hit
+# 20.96 GiB. The kernel then reclaimed so aggressively that the watchdog
+# beacon could not deliver its 30-second ping inside `WatchdogSec=60`, and
+# systemd SIGABRTed a process that was alive and working -- once every ~9
+# minutes, all session. `oom_kill` stayed 0 throughout: this was never an OOM.
+#
+# The ~9-minute cycle also slips the [Unit] start limit: 8 starts per 600 s
+# means any cycle >= 75 s never trips it, so the unit loops forever instead of
+# transitioning to `failed` where an alarm could see it.
+#
+# WHY 20G AND NOT MORE: the measured steady working set is 0.29-1.54 GiB in
+# session and ~15.6 GiB during a large replay. The host has ~30 GiB with
+# QuestDB capped at 12 GiB, so 20G leaves the host a real margin. Raising
+# further would trade a cgroup throttle for a HOST OOM, where the kernel
+# picks the victim -- and QuestDB's oom_score_adj of -500 makes this process
+# a worse target than it looks despite OOMScoreAdjust=-900 below.
+#
+# THIS VALUE IS LOAD-BEARING AND MUST STAY IN THE REPOSITORY. It was applied
+# live as a systemd drop-in first; a drop-in is an EXTENSION, not an override,
+# so `systemd-delta` reports nothing and the drift is invisible. A fresh
+# instance provisioned from this file at 15G re-enters the SIGABRT loop.
+#
+# NOTE, because it is not obvious: this ceiling is not only a throttle. With
+# no `MemoryMax=`, `resolve_memory_ceiling` resolves the unit's ceiling FROM
+# `memory.high`, so raising it also raised the WAL catch-up stand-down (60%
+# => 12.88 GB) and the RESOURCE-02 page line (80% => 17.18 GB). Changing this
+# number moves those with it.
+MemoryHigh=20G
 
 # Security hardening
 NoNewPrivileges=true

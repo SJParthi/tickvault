@@ -549,11 +549,11 @@ pub const ALARM_PHRASES: [(&str, &str); 110] = [
     ),
     (
         "errcode-ws-spill-01",
-        "The safety file for incoming market data could not be written",
+        "The safety capture for incoming market data hit a limit — a writer restarted, or replay stood down to protect memory. The server log line names which; on its own this does NOT mean anything was lost",
     ),
     (
         "errcode-ws-spill-02",
-        "An incoming market data frame was dropped before it could be safely stored",
+        "Incoming market data hit a capture limit — EITHER a frame was genuinely dropped, OR replay deferred segments to the next start, which loses nothing. The server log line names which — check it before assuming loss",
     ),
     (
         "errcode-ws-gap-02-swap-emptied-socket",
@@ -1973,6 +1973,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_spill_phrases_never_assert_a_drop_they_cannot_know_happened() {
+        // MEASURED 2026-09-03, 08:32 IST: the operator was paged
+        // "An incoming market data frame was dropped before it could be safely
+        // stored" and "The safety file for incoming market data could not be
+        // written". Neither had happened. The real events were a replay
+        // DEFERRAL (deferred_segments 91, consumed_segments 5, on the byte
+        // budget) and the catch-up drain standing DOWN for memory at 9.1 GB
+        // against a 15 GiB ceiling -- both safety mechanisms working. Every
+        // row was accounted for: dropped == spilled exactly, 405,422 ticks
+        // and 22,538,490 depth rows.
+        //
+        // These two codes are emitted by MANY sites with different meanings --
+        // a genuinely dropped frame (channel full / writer dead), a writer
+        // respawn, a replay deferral, a memory stand-down. The phrase is keyed
+        // on the ALARM name, so it cannot see which one fired. It must
+        // therefore state what is true of ALL of them and never assert loss.
+        //
+        // Alarming in the wrong direction is not the safe direction: an
+        // operator taught that "dropped" sometimes means "deferred" stops
+        // believing the word on the day it is real.
+        for key in ["errcode-ws-spill-01", "errcode-ws-spill-02"] {
+            let phrase = alarm_phrase(key);
+            assert!(
+                phrase.contains("log line names which"),
+                "{key}: the phrase must point at the payload that says which \
+                 emitter fired, since the alarm name alone cannot -- got {phrase:?}"
+            );
+        }
+        assert!(
+            alarm_phrase("errcode-ws-spill-01").contains("does NOT mean anything was lost"),
+            "ws-spill-01 covers writer respawn and memory stand-down as well as \
+             loss; it must not read as a loss report"
+        );
+        let two = alarm_phrase("errcode-ws-spill-02");
+        assert!(
+            two.contains("EITHER") && two.contains("loses nothing"),
+            "ws-spill-02 must name BOTH outcomes -- a real drop and a deferral \
+             -- so it cannot collapse back into an unconditional drop claim"
+        );
     }
 
     #[test]
