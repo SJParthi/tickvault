@@ -234,10 +234,26 @@ fn tokio_worker_count_is_explicit_and_matches_the_app_core_set() {
     );
 }
 
+/// How far a QuestDB worker pool may be oversubscribed beyond its cpuset
+/// width, and only against recorded evidence (see the test below).
+///
+/// 3x, not unbounded: oversubscription is free only while the threads stay
+/// BLOCKED on I/O. Past some multiple they start completing together, burst
+/// CPU, and the 2026-08-18 throttling returns. Nobody has measured where that
+/// point is on this box, so the ceiling is a deliberately conservative bound
+/// rather than a derived one — stated plainly instead of implied.
+const MAX_IO_OVERSUBSCRIPTION: usize = 3;
+
+/// Substrings that together prove the compose file records a REAL throttling
+/// measurement next to an oversubscribed pool, rather than an assertion that
+/// it is fine.
+const THROTTLING_EVIDENCE_MARKERS: [&str; 3] = ["nr_throttled", "nr_periods", "throttled_usec"];
+
 #[test]
 fn questdb_worker_pools_never_exceed_its_cpuset() {
     let compose = read(COMPOSE);
     let cores = questdb_cores().len();
+    let ceiling = cores * MAX_IO_OVERSUBSCRIPTION;
 
     for key in ["QDB_WAL_APPLY_WORKER_COUNT:", "QDB_SHARED_WORKER_COUNT:"] {
         let raw = compose_value_for(&compose, key);
@@ -245,13 +261,51 @@ fn questdb_worker_pools_never_exceed_its_cpuset() {
         let n: usize = raw.parse().unwrap_or_else(|_| {
             panic!("cpu_partition_guard: {key} default {raw:?} must be an integer")
         });
+
+        // The HARD ceiling. Beyond this the pool is oversubscribed past
+        // anything this box has evidence for, whatever the file claims.
         assert!(
-            n <= cores,
-            "{key} defaults to {n} but QuestDB's cpuset is {cores} core(s). This \
-             value has already been wrong twice in the same direction (4 against a \
-             3.0 quota, then 3 against a 2-core reality); workers above the width \
-             of the cpuset buy CFS throttling, never throughput."
+            n <= ceiling,
+            "{key} defaults to {n}, above the {ceiling} ceiling ({cores} cpuset \
+             core(s) x {MAX_IO_OVERSUBSCRIPTION}). This value has already been \
+             wrong twice in the same direction (4 against a 3.0 quota, then 3 \
+             against a 2-core reality). Raising the ceiling needs a measurement \
+             that a pool this wide still parks on I/O rather than bursting CPU."
         );
+
+        // Oversubscription within the ceiling is ALLOWED, but never on an
+        // assertion. It must sit beside a real cgroup reading.
+        //
+        // 2026-09-03: this rule replaced a flat `n <= cores`. That rule was
+        // right for CPU-bound workers and wrong for these. Measured live, all
+        // four workers (wal-apply_0/_1, shared-write_0/_1) sat in D state
+        // simultaneously at 57.6% host iowait, using 1,638 of 6,000 provisioned
+        // IOPS, with nr_throttled 6 of nr_periods 31709 = 0.019% -- against the
+        // 21.8% of 2026-08-18 that set the old limit. A thread blocked on a
+        // disk read has no CPU time to throttle, so capping an I/O-bound pool
+        // at the core count caps THROUGHPUT and buys nothing. The cost was real:
+        // market_depth ran 126,909 transactions behind and was unqueryable for
+        // a whole session.
+        //
+        // What the guard protects is unchanged -- oversubscribing BLINDLY. The
+        // evidence requirement is what keeps that true: the next person to
+        // raise this must go and read cpu.stat, exactly as this change did.
+        if n > cores {
+            for marker in THROTTLING_EVIDENCE_MARKERS {
+                assert!(
+                    compose.contains(marker),
+                    "{key} defaults to {n}, oversubscribing the {cores}-core \
+                     cpuset -- which is legal ONLY beside a recorded cgroup \
+                     throttling measurement, and {COMPOSE} does not contain \
+                     `{marker}`. Read \
+                     /sys/fs/cgroup/system.slice/docker-<id>.scope/cpu.stat on \
+                     the box and record nr_periods, nr_throttled and \
+                     throttled_usec next to the setting. An I/O-bound pool may \
+                     exceed its cores; a CPU-bound one may not, and only a \
+                     measurement tells you which this is."
+                );
+            }
+        }
     }
 }
 
