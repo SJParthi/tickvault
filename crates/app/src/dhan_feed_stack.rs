@@ -9199,7 +9199,7 @@ pub fn refold_wal_frames(
             // and this is the trade being made: gating it would reinstate the
             // unbounded buffer in precisely the degraded case, and a 4 GB
             // buffer OOM-KILLS the process — measured, ten times, with
-            // `StartLimitBurst=8` then leaving the session with no app at all.
+            // the start limit then leaving the session with no app at all.
             // A slow boot costs part of a session; an OOM loop costs all of
             // it. Bounded memory wins.
             blocking_flush(|| ingest.flush());

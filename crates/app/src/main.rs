@@ -1899,13 +1899,15 @@ async fn async_main() -> Result<()> {
 
     // =====================================================================
     // PROCESS-GLOBAL systemd WATCHDOG=1 pinger (2026-07-13, deploy-hang fix
-    // hostile-review round 1 CRITICAL). The unit sets WatchdogSec=60. This
+    // hostile-review round 1 CRITICAL). The unit sets WatchdogSec=150 (was
+    // 60 until 2026-09-03, when its one-missed-ping margin killed a merely
+    // THROTTLED process; the unit records the incident). This
     // thin, FEED-AGNOSTIC, process-lifetime task pings every
     // WATCHDOG_INTERVAL_SECS (30s) from the shared boot prefix, BEFORE the
     // boot path sends READY=1 (the READY site sits below this line in
     // source order; a source-scan ratchet pins that ordering + the absence
     // of any feed gate on this spawn). Sending READY=1 with NOBODY pinging
-    // would ARM the watchdog -> systemd SIGABRTs the process at t+60s ->
+    // would ARM the watchdog -> systemd SIGABRTs the process at t+WatchdogSec ->
     // Restart=always loop -> StartLimitBurst hard-fail minutes after a
     // deploy that reported success (Rule-11 false-OK). PR-C2 (2026-07-13,
     // Dhan live-WS retirement): the Dhan-gated lane/fast-arm

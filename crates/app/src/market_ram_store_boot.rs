@@ -138,29 +138,14 @@ pub const RAM_STORE_SPOT_BUDGET_DENOMINATOR: u64 = 16;
 /// on a specific kernel's choice of sentinel.
 const CGROUP_UNLIMITED_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
 
-/// Parses `MemTotal:` out of `/proc/meminfo`, returning BYTES.
-///
-/// `/proc/meminfo` reports kB (kibibytes, despite the label). Returns `None`
-/// on any shape it does not recognise rather than guessing — a wrong memory
-/// figure produces a wrong budget, which is worse than no budget at all.
-fn parse_meminfo_total_bytes(contents: &str) -> Option<u64> {
-    for line in contents.lines() {
-        let rest = match line.strip_prefix("MemTotal:") {
-            Some(r) => r,
-            None => continue,
-        };
-        let mut parts = rest.split_whitespace();
-        let value: u64 = parts.next()?.parse().ok()?;
-        // The unit is present in every kernel that ships this file, but a
-        // missing unit is treated as kB rather than refused: the value's
-        // magnitude is unambiguous and refusing would lose a real reading.
-        return match parts.next() {
-            Some("kB") | Some("KB") | None => value.checked_mul(1024),
-            _ => None,
-        };
-    }
-    None
-}
+// `parse_meminfo_total_bytes` REMOVED 2026-09-03. It was a SECOND, local
+// parser for `/proc/meminfo`, and `resolve_memory_ceiling` -- which this file
+// now calls -- already reads and parses that file itself. Two hand-rolled
+// readers of the same kernel file, disagreeing about which files to consult at
+// all, is precisely how this site came to size its budget against the whole
+// machine while the unit permitted 20 GiB. Its parsing tests go with it; the
+// equivalent cases live in `resource_monitor`'s own suite, beside the parser
+// that survived.
 
 /// Parses a cgroup memory limit (v1 `memory.limit_in_bytes`, v2
 /// `memory.max`), returning `None` for "unlimited" in either dialect.
@@ -195,20 +180,46 @@ fn budget_from_host_bytes(host_bytes: u64) -> u64 {
 /// limit) and in a Docker dev run (limit set) — the common-runtime property
 /// a hardcoded constant cannot have.
 fn host_memory_limit_bytes() -> Option<u64> {
-    let machine = std::fs::read_to_string("/proc/meminfo")
+    // ⚠ CORRECTED TWICE on 2026-09-03, and the FIRST correction was INERT.
+    //
+    // It began by reading `/sys/fs/cgroup/memory.max` -- the ROOT cgroup. This
+    // process lives in a systemd slice, so that file does not exist for it,
+    // the read failed, the limit read as ABSENT, and the budget was sized
+    // against the machine's whole 30.75 GiB while the unit permits 20.
+    //
+    // The first repair swapped in `resolve_cgroup_memory_max_path()`, which
+    // finds the real slice. It changed NOTHING, because of what that file
+    // contains: the unit sets `MemoryHigh=20G` and deliberately no
+    // `MemoryMax=`, so the slice's `memory.max` reads the literal `"max"`,
+    // `parse_cgroup_limit_bytes` correctly returns `None` for that, and the
+    // function fell through to machine RAM exactly as before. A fix that reads
+    // the right file and still gets the wrong answer -- and the guard written
+    // beside it PASSED, because it only checked that the root path literal was
+    // gone.
+    //
+    // `resolve_memory_ceiling` is the function that already knows the answer:
+    // it reads `memory.high` beside `memory.max` and prefers, in order, the
+    // hard limit, the throttle, then the machine total. `ws_frame_spill` was
+    // repaired with it hours earlier; this site got only half of that, which
+    // is why both now call the SAME function instead of two hand-rolled
+    // approximations of it.
+    //
+    // The cgroup-v1 file is kept as a separate check: `resolve_memory_ceiling`
+    // is v2-shaped, and a v1 host still answers on the older path.
+    let ceiling = tickvault_storage::resource_monitor::resolve_memory_ceiling(
+        &tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path(),
+        std::path::Path::new("/proc/meminfo"),
+    )
+    .bytes();
+
+    let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
         .ok()
         .as_deref()
-        .and_then(parse_meminfo_total_bytes);
+        .and_then(parse_cgroup_limit_bytes);
 
-    let cgroup = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .iter()
-    .filter_map(|p| std::fs::read_to_string(p).ok())
-    .find_map(|c| parse_cgroup_limit_bytes(&c));
-
-    match (machine, cgroup) {
+    // MIN preserved from the original: where two ceilings both bind, the
+    // smaller is what the kernel enforces.
+    match (ceiling, v1) {
         (Some(m), Some(c)) => Some(m.min(c)),
         (Some(m), None) => Some(m),
         (None, Some(c)) => Some(c),
@@ -822,6 +833,128 @@ pub fn spawn_ram_store_stats_task() -> tokio::task::JoinHandle<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Neither memory-ceiling reader may hardcode the ROOT cgroup path.
+    ///
+    /// This process runs in a systemd slice, not the root cgroup, so
+    /// `/sys/fs/cgroup/memory.max` does not exist for it -- both reads fail,
+    /// the cgroup limit reads as absent, and the caller silently sizes itself
+    /// against the machine's whole RAM instead of the limit the unit sets.
+    /// It is a false OK: nothing errors, the number is simply too big.
+    ///
+    /// TWO files had independently hardcoded it (`market_ram_store_boot` and
+    /// `ws_frame_spill`), which is why this is a guard rather than a comment
+    /// at one call site. The v1 path (`/sys/fs/cgroup/memory/memory.limit_in_bytes`)
+    /// is NOT banned -- it is a genuine cgroup-v1 fallback and is not the
+    /// root-cgroup-v2 mistake.
+    ///
+    /// Scans comment-stripped source, because the explanatory comment above
+    /// the repaired call site names the very path being banned.
+    #[test]
+    fn no_memory_ceiling_reader_hardcodes_the_root_cgroup_v2_path() {
+        // Assembled from halves, never written whole: the guard scans this
+        // very file, and a literal here would make it fail on itself. That is
+        // not hypothetical -- the first version did exactly that.
+        let banned = format!("{}{}", "/sys/fs/cgroup/", "memory.max");
+        let banned = banned.as_str();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        // The two files that got this wrong, plus the resolver itself, which
+        // legitimately owns the constant.
+        let owners = ["crates/storage/src/resource_monitor.rs"];
+        let scanned = [
+            "crates/app/src/market_ram_store_boot.rs",
+            "crates/storage/src/ws_frame_spill.rs",
+        ];
+
+        for rel in scanned {
+            let path = root.join(rel);
+            let body =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+            let stripped: String = body
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !stripped.contains(banned),
+                "{rel} hardcodes the ROOT cgroup path {banned}. This process \
+                 is in a systemd slice, so that file does not exist for it and \
+                 the limit reads as absent -- sizing against the whole machine \
+                 instead. Use \
+                 `tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path()`, \
+                 which reads /proc/self/cgroup to find the real slice."
+            );
+        }
+
+        // ⚠ THE HALF THIS GUARD ORIGINALLY MISSED, added 2026-09-03 after a
+        // review found the first repair INERT.
+        //
+        // Banning the root PATH is not enough. The first fix swapped in
+        // `resolve_cgroup_memory_max_path()` -- right file, still wrong answer,
+        // because the unit sets `MemoryHigh` and no `MemoryMax`, so that file
+        // reads the literal "max", parses to None, and the budget fell back to
+        // machine RAM exactly as before. THIS GUARD PASSED on that version.
+        //
+        // So it now also requires the call that actually knows the answer:
+        // `resolve_memory_ceiling`, which reads `memory.high` beside
+        // `memory.max`. A site that resolves the path without it is the inert
+        // shape, and that is the failure worth catching -- a fix that LOOKS
+        // applied is worse than none, because nobody looks again.
+        for rel in scanned {
+            let raw = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+            // PRODUCTION CODE ONLY, comment-stripped. Two self-contaminations
+            // had to be removed before this could bite, and BOTH were found by
+            // bite-testing rather than by reading it:
+            //   * the prose above the repaired call site names
+            //     `resolve_memory_ceiling`, so a raw scan matched a COMMENT;
+            //   * this guard's own assertion message names it too, and that is
+            //     a string literal in CODE, which comment-stripping cannot
+            //     remove.
+            // A guard that matches itself can never fail.
+            let production = raw.split("\nmod tests").next().unwrap_or(&raw);
+            let body: String = production
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if body.contains("resolve_cgroup_memory_max_path") {
+                assert!(
+                    body.contains("resolve_memory_ceiling"),
+                    "{rel} resolves the cgroup PATH but never calls \
+                     `resolve_memory_ceiling`. On this unit `memory.max` reads \
+                     \"max\" (MemoryHigh is set, MemoryMax deliberately is not), \
+                     so parsing that file alone yields None and the caller \
+                     silently falls back to the whole machine's RAM -- the exact \
+                     defect this guard exists to stop, wearing the fix."
+                );
+            }
+        }
+
+        // Non-vacuity: the constant must still exist SOMEWHERE, or this guard
+        // would pass just as well if the resolver were deleted.
+        let owner_has_it = owners.iter().any(|rel| {
+            std::fs::read_to_string(root.join(rel))
+                .map(|b| b.contains(banned))
+                .unwrap_or(false)
+        });
+        assert!(
+            owner_has_it,
+            "the default cgroup-v2 path vanished from the resolver -- this \
+             guard can no longer prove anything"
+        );
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------
@@ -916,25 +1049,6 @@ mod tests {
         // the projection check this budget exists to fail.
         assert!(budget_from_host_bytes(u64::MAX) > RAM_STORE_SPOT_CAPACITY_BUDGET_FALLBACK_BYTES);
         assert_eq!(budget_from_host_bytes(0), 0);
-    }
-
-    #[test]
-    fn meminfo_total_is_parsed_from_a_real_file_shape() {
-        let sample = "MemTotal:       32819668 kB\nMemFree:         1234 kB\n";
-        assert_eq!(
-            parse_meminfo_total_bytes(sample),
-            Some(32_819_668u64 * 1024)
-        );
-    }
-
-    #[test]
-    fn meminfo_refuses_shapes_it_does_not_understand() {
-        // Refusing yields the loud fallback. GUESSING yields a wrong budget
-        // that looks authoritative, which is strictly worse.
-        assert_eq!(parse_meminfo_total_bytes(""), None);
-        assert_eq!(parse_meminfo_total_bytes("MemFree: 100 kB\n"), None);
-        assert_eq!(parse_meminfo_total_bytes("MemTotal:       zzz kB\n"), None);
-        assert_eq!(parse_meminfo_total_bytes("MemTotal:       12 GB\n"), None);
     }
 
     #[test]

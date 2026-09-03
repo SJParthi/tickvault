@@ -165,9 +165,21 @@ locals {
   # re-boots and re-emits roughly every failing boot cycle (each cycle spans
   # TOTP_MAX_RETRIES x 30s windows) -- a repeat-emitter whose OK ~= "stopped
   # firing" (secret reconciled, or the unit stopped). Caveat: if systemd's
-  # StartLimitBurst (8/600s) ever halts the restart loop while the secret is
-  # still wrong, emissions stop and the OK would be an aged-out false
-  # recovery -- borderline, kept ON with this stated residual.
+  # StartLimitBurst (5/3600s since 2026-09-03; was 8/600s) ever halts the
+  # restart loop while the secret is still wrong, emissions stop and the OK
+  # would be an aged-out false recovery.
+  #
+  # ⚠ THAT RESIDUAL GOT LARGER on 2026-09-03 and the caveat text had not
+  # moved with it. At 8/600s the trip point was 600/8 = 75s, and a failing
+  # TOTP boot cycle spans TOTP_MAX_RETRIES x 30s -- well above it -- so the
+  # limit essentially NEVER halted this loop and the false-recovery case was
+  # close to theoretical. At 5/3600s the trip point is 720s, which a failing
+  # boot cycle CAN reach, so the halt is now a normal outcome rather than an
+  # unlikely one. Kept ON, because the alarm firing at all is the signal that
+  # matters; the OK is what must be read with the caveat, and the caveat is
+  # now the common case. The desc below tells the operator to verify the app
+  # is up before treating an OK as recovery, which is the right instruction
+  # under either pair.
   # rest-canary-01 entry RETIRED 2026-07-14 with the REST canary module
   # (operator Dhan noise lock - dhan-rest-only-noise-lock-2026-07-14.md):
   # the retained spot-1m + option-chain legs self-detect a dead Dhan REST
@@ -206,7 +218,7 @@ locals {
       threshold   = 1
       eval        = 3
       dta         = 1
-      ok_recovery = true # round-4 documented ambiguity: repeat-emits per failing boot cycle under systemd Restart=always, so OK ~= stopped firing; if StartLimitBurst (8/600s) halts the loop, the OK would be aged-out - stated residual (see locals header)
+      ok_recovery = true # round-4 documented ambiguity: repeat-emits per failing boot cycle under systemd Restart=always, so OK ~= stopped firing; if StartLimitBurst (5/3600s since 2026-09-03) halts the loop, the OK would be aged-out - now the COMMON case, not a remote one (see locals header)
       desc        = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. CAVEAT on the recovered/OK page: it is trustworthy while the systemd restart loop keeps re-emitting; if systemd's StartLimitBurst halted the unit, the OK only means emissions stopped - verify the app is actually up before treating it as recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
     # RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion): the
