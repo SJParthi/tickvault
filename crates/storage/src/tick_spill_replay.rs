@@ -252,13 +252,91 @@ fn quarantine_spill_file(dir: &Path, path: &Path) -> std::io::Result<std::path::
 /// becomes an unbounded outage of everything sharing that database. The first
 /// non-2xx or transport error therefore ends both the file and the round; the
 /// next round starts over from the same file, losing nothing.
+/// Per-file resume offsets: how many bytes of each spill file are already in
+/// the database.
+///
+/// # Why this REPLACED an in-place compaction
+///
+/// The current hour's spill file is held open by the writer with
+/// `.append(true)`, so it can grow WHILE it is drained. Three answers were
+/// tried on 2026-09-03 and only the third is safe:
+///
+///   1. Truncate the whole file — destroys the appended bytes. Real tick loss.
+///   2. Skip the truncate — destroys nothing and NEVER converges: the whole
+///      file, drained prefix included, is re-POSTed every 300 s at the
+///      database whose slowness caused the spill.
+///   3. Compact in place. This SHIPPED TO PRODUCTION, and an adversarial
+///      review of the DEPLOYED code found it carries defect 1 one level down:
+///      the tail length is snapshotted before the copy, so bytes appended
+///      DURING the copy are never read and are then erased by `set_len`. The
+///      window is the whole copy loop, not one syscall — WIDER than the bug
+///      it replaced.
+///
+/// In-place compaction cannot be repaired. With a concurrent appender there is
+/// no atomic "move the tail and shorten", and any partial failure leaves
+/// [moved tail][stale prefix][new appends] — a torn seam that quarantines the
+/// rest of the file on the next round.
+///
+/// So no bytes are moved and no live file is truncated. The drained offset is
+/// REMEMBERED and the next round starts there: nothing to destroy, nothing
+/// re-sent, and it converges because each round drains only what is new.
+///
+/// # Honest limit
+///
+/// In-memory, so a process restart forgets and re-sends from the start. That
+/// is idempotent — the `ticks` dedup key carries `capture_seq`, so a replayed
+/// row upserts onto itself — and it costs one extra drain of an at-most-hourly
+/// file. Persisting it would need a sidecar with its own crash semantics and
+/// its own race with the appender.
+static RESUME_OFFSETS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::OnceLock::new();
+
+fn resume_offsets() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>
+{
+    RESUME_OFFSETS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The byte offset this file has already been drained to, or 0.
+fn resume_offset_for(path: &Path) -> u64 {
+    resume_offsets()
+        .lock()
+        .map(|m| m.get(path).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Record how far a file has been drained. MONOTONE: never moves backwards, so
+/// a short round cannot un-drain bytes a longer one already delivered.
+fn record_resume_offset(path: &Path, offset: u64) {
+    if let Ok(mut m) = resume_offsets().lock() {
+        let slot = m.entry(path.to_path_buf()).or_insert(0);
+        *slot = (*slot).max(offset);
+    }
+}
+
+/// Forget a file we will never read again, so the map cannot grow without
+/// bound as hours roll over.
+fn forget_resume_offset(path: &Path) {
+    if let Ok(mut m) = resume_offsets().lock() {
+        m.remove(path);
+    }
+}
+
 pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     // ONE buffer for the whole round, reused across files: a fixed cost per
     // round rather than per file, and the thing that makes the peak resident
     // size independent of how large any spill file has grown.
     let mut buf = vec![0_u8; REPLAY_STREAM_BUFFER_BYTES];
-    for path in list_spill_files(dir) {
+    // The writer appends to the file for the CURRENT hour, and `list_spill_files`
+    // sorts by name (hour), so the LAST entry is the only one that can still be
+    // written to. Everything before it has been closed by the hour rollover.
+    // That distinction is what makes the truncate below provably safe: a closed
+    // file has no appender, so emptying it cannot destroy anything.
+    let files = list_spill_files(dir);
+    let last_index = files.len().saturating_sub(1);
+    for (file_index, path) in files.into_iter().enumerate() {
+        let writer_may_still_append = file_index == last_index;
         // Size from METADATA, never from a materialised read. This is the
         // 2026-09-03 fix: `std::fs::read` here held a 21 GB file in RAM.
         let file_len = match std::fs::metadata(&path) {
@@ -274,8 +352,17 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             }
         };
         if file_len == 0 {
+            forget_resume_offset(&path);
             // Already drained. Leave it alone: truncating it again would
             // refresh its mtime every round and it would never age out.
+            outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
+            continue;
+        }
+        // Start where the last round finished, not at 0. See RESUME_OFFSETS:
+        // this is what makes a growing file converge WITHOUT moving bytes or
+        // truncating a file the writer still holds open.
+        let resume_from = resume_offset_for(&path).min(file_len);
+        if resume_from == file_len {
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
@@ -292,9 +379,25 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             }
         };
 
+        if resume_from > 0 {
+            use std::io::Seek as _;
+            if let Err(err) = handle.seek(std::io::SeekFrom::Start(resume_from)) {
+                warn!(
+                    path = %path.display(),
+                    %err,
+                    resume_from,
+                    "tick spill replay could not seek to the resume offset — leaving this file \
+                     for the next round rather than re-sending from the start"
+                );
+                outcome.files_failed = outcome.files_failed.saturating_add(1);
+                continue;
+            }
+        }
+
         let mut accepted: u64 = 0;
         let mut failed = false;
         let mut quarantined = false;
+        let mut over_long_line = false;
         // STREAMING WINDOW STATE.
         //
         // `carry` is the partial line at the FRONT of the buffer, kept from
@@ -353,16 +456,24 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 // split-a-row-across-two-POSTs failure the carry mechanism
                 // above exists to prevent.
                 //
-                // It is accepted rather than fixed, deliberately: holding a
-                // line whole means holding it in RAM, and an unbounded line
-                // is the exact shape that restart-looped production. A 32 MiB
-                // single line is not a legitimate ILP row from any writer here
-                // (the depth writer's rows are ~120 bytes), so this arm is
-                // reached only by a corrupt file. Both halves land at QuestDB,
-                // both are refused, and the file is quarantined — the same
-                // DESTINATION as before, by a different route, with the
-                // difference stated instead of glossed.
-                None => filled,
+                // FIXED 2026-09-03 (it was previously accepted-and-noted).
+                // Splitting is not merely different, it is DANGEROUS: a
+                // truncated ILP line that happens to be missing only its
+                // trailing timestamp is still syntactically valid, so QuestDB
+                // accepts it and stamps its own time. Half a row committed at
+                // the wrong timestamp is worse than either a whole row or no
+                // row, and the second half then quarantines the file anyway.
+                //
+                // A 32 MiB single line is not a legitimate ILP row from any
+                // writer here (the depth writer's rows are ~120 bytes), so
+                // this arm means the file is corrupt. Refuse it: quarantine
+                // preserves every byte on disk for salvage and lets the rest
+                // of the backlog drain, which is strictly better than
+                // committing a fabricated row.
+                None => {
+                    over_long_line = true;
+                    break 'file;
+                }
             };
             let carried = filled.saturating_sub(cut);
             for range in ilp_chunk_ranges(&buf[..cut], REPLAY_MAX_CHUNK_BYTES) {
@@ -451,6 +562,46 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             }
         }
 
+        if over_long_line {
+            // A line longer than the whole read window means a corrupt file,
+            // not a long row. Set it aside INTACT rather than sending half of
+            // it: quarantine preserves every byte for salvage and lets the
+            // backlog behind it drain, while a split row can be silently
+            // accepted with a server-assigned timestamp.
+            match quarantine_spill_file(dir, &path) {
+                Ok(moved) => {
+                    metrics::counter!(REPLAY_QUARANTINED_COUNTER).increment(1);
+                    outcome.files_quarantined = outcome.files_quarantined.saturating_add(1);
+                    error!(
+                        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                        path = %moved.display(),
+                        bytes = file_len,
+                        window = REPLAY_STREAM_BUFFER_BYTES,
+                        "tick spill file contains a line longer than the entire read window, \
+                         which no writer here produces — the file is corrupt. Moved to \
+                         quarantine with every byte intact rather than POSTing a partial row, \
+                         which QuestDB can accept with its own timestamp. Rows already accepted \
+                         from this file ARE in the database; the remainder is on disk and is \
+                         NOT. Salvage by filtering to well-formed lines and re-POSTing, which \
+                         is safe to repeat because the ticks dedup key carries capture_seq."
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    error!(
+                        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                        path = %path.display(),
+                        %err,
+                        "a corrupt tick spill file could not be moved aside — stopping the \
+                         round rather than reporting a queue as drained while it is not"
+                    );
+                    outcome.files_failed = outcome.files_failed.saturating_add(1);
+                    metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
+                    return outcome;
+                }
+            }
+        }
+
         if quarantined {
             // Moved aside, not drained. Continue to the NEXT file — the whole
             // reason this branch exists is that the backlog behind a poison
@@ -508,39 +659,24 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 // so a forward chunked copy can never overwrite a source byte
                 // it has not read yet, and it is bounded by what was appended
                 // during one drain rather than by the file.
-                match compact_drained_prefix(&path, file_len, len_now, &mut buf) {
-                    Ok(kept) => {
-                        info!(
-                            path = %path.display(),
-                            len_before = file_len,
-                            len_now,
-                            kept,
-                            bytes = accepted,
-                            "spilled rows were accepted and the drained prefix was dropped; the \
-                             file GREW while draining, so the bytes appended after the read are \
-                             kept at the front and drain next round. Nothing is destroyed and \
-                             the drained prefix is never re-POSTed."
-                        );
-                        outcome.files_replayed = outcome.files_replayed.saturating_add(1);
-                    }
-                    Err(err) => {
-                        // Could not compact. Fall back to the safe-but-slow
-                        // behaviour rather than the destructive one: leave the
-                        // file whole. A re-POST is idempotent (the dedup key
-                        // carries `capture_seq`); a destroyed append is not
-                        // recoverable.
-                        warn!(
-                            path = %path.display(),
-                            %err,
-                            len_before = file_len,
-                            len_now,
-                            "could not drop the drained prefix of a grown spill file — leaving it \
-                             WHOLE. Nothing is lost; the next round re-POSTs the drained prefix, \
-                             which upserts onto itself."
-                        );
-                        outcome.files_failed = outcome.files_failed.saturating_add(1);
-                    }
-                }
+                // NOTHING IS MOVED AND NOTHING IS TRUNCATED. The in-place
+                // compaction that shipped here was found by an adversarial
+                // review of the DEPLOYED code to carry the very defect it
+                // replaced — it froze the tail length before copying, so bytes
+                // appended DURING the copy were erased by `set_len`. See
+                // RESUME_OFFSETS for why that cannot be repaired in place.
+                record_resume_offset(&path, file_len);
+                info!(
+                    path = %path.display(),
+                    len_before = file_len,
+                    len_now,
+                    resume_from = file_len,
+                    bytes = accepted,
+                    "spilled rows were accepted; the file GREW while draining, so it is left \
+                     BYTE-FOR-BYTE INTACT and the next round resumes at the drained offset. \
+                     Nothing is moved, nothing is truncated, nothing is re-sent."
+                );
+                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
                 continue;
             }
             Ok(_) => {}
@@ -558,8 +694,42 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             }
         }
 
-        // Every chunk accepted. Truncate rather than delete so the retention
-        // sweep can still tell a drained file from an abandoned one.
+        // Every chunk accepted.
+        //
+        // ⚠ THE LAST PLACE AN APPEND COULD STILL BE DESTROYED, closed
+        // 2026-09-03. `File::create` truncates the shared inode, and the
+        // writer can append between the size re-check above and this call —
+        // a race the size check narrows and cannot close. An adversarial
+        // review of the deployed code named it, and it is the third variant
+        // of the same bug found in one day.
+        //
+        // So the truncate now runs ONLY on a file the writer has provably
+        // moved on from: not the last (current-hour) entry. For the live
+        // file the drained offset is recorded instead — the same mechanism
+        // the grown-file branch uses, with the same guarantee: nothing is
+        // touched, so nothing can be lost, and the next round resumes rather
+        // than re-sending.
+        if writer_may_still_append {
+            record_resume_offset(&path, file_len);
+            outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+            outcome.bytes_replayed = outcome.bytes_replayed.saturating_add(accepted);
+            metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(accepted);
+            info!(
+                path = %path.display(),
+                bytes = accepted,
+                resume_from = file_len,
+                "recovered spilled ticks into the database. This is the hour the writer is \
+                 still appending to, so the file is left BYTE-FOR-BYTE INTACT and the next \
+                 round resumes at the drained offset — emptying it here could destroy a \
+                 concurrent append."
+            );
+            continue;
+        }
+
+        // A closed file: no writer holds it, so truncating is safe. Truncate
+        // rather than delete so the retention sweep can still tell a drained
+        // file from an abandoned one.
+        forget_resume_offset(&path);
         match std::fs::File::create(&path) {
             Ok(_) => {
                 outcome.files_replayed = outcome.files_replayed.saturating_add(1);
@@ -598,65 +768,6 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
 /// `reqwest::Error`'s `Display` embeds the request URL, and a proxy-bearing URL
 /// can carry Basic-Auth userinfo — the same hazard `http_client::redact_userinfo`
 /// exists for. The endpoint is ours and fixed, so the KIND is the whole
-/// Drop the first `drained` bytes of `path`, keeping everything after them.
-///
-/// Returns the number of bytes kept.
-///
-/// # Why this exists
-///
-/// A spill file can be appended to WHILE it is being drained — the current
-/// hour's file is held open with `.append(true)`, and an ongoing spill episode
-/// is exactly when this function matters. Truncating the whole file would
-/// destroy those appended bytes; leaving it whole re-POSTs the drained prefix
-/// on every subsequent round and never converges. This does neither: it moves
-/// the undrained tail to the front and shortens the file to it.
-///
-/// # Why a forward copy is safe on one file
-///
-/// Every read is at `drained + n` and its matching write is at `n`, so the
-/// destination offset is always strictly below the source offset. A forward
-/// walk therefore only ever writes over bytes it has already read. Positioned
-/// I/O (`read_at`/`write_at`) is used rather than seeking so the two cursors
-/// cannot drift.
-///
-/// # Complexity
-///
-/// O(bytes appended during one drain), not O(file). Reuses the caller's
-/// streaming buffer, so it allocates nothing.
-fn compact_drained_prefix(
-    path: &Path,
-    drained: u64,
-    len_now: u64,
-    buf: &mut [u8],
-) -> std::io::Result<u64> {
-    use std::os::unix::fs::FileExt as _;
-
-    let keep = len_now.saturating_sub(drained);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-
-    let mut moved: u64 = 0;
-    while moved < keep {
-        let want = usize::try_from(keep - moved)
-            .unwrap_or(usize::MAX)
-            .min(buf.len());
-        let n = file.read_at(&mut buf[..want], drained.saturating_add(moved))?;
-        if n == 0 {
-            // The file shrank under us. Stop and shorten to what was actually
-            // moved rather than claiming bytes that are not there.
-            break;
-        }
-        file.write_all_at(&buf[..n], moved)?;
-        moved = moved.saturating_add(n as u64);
-    }
-
-    file.set_len(moved)?;
-    file.sync_all()?;
-    Ok(moved)
-}
-
 /// diagnostic value.
 #[must_use]
 pub fn describe_send_error(err: &reqwest::Error) -> &'static str {
@@ -901,18 +1012,17 @@ mod tests {
     /// `list_spill_files` does not exclude the hour currently being written,
     /// and `File::create` zeroes the shared inode. Pre-existing with the
     /// whole-file read; streaming widens the window from one syscall to
-    /// The drained prefix goes; the appended tail stays, byte-exact, at the
-    /// front.
+    /// A growing file is left BYTE-FOR-BYTE INTACT and the offset is
+    /// remembered.
     ///
-    /// This is the fix for a defect a hostile review caught on 2026-09-03: the
-    /// grown-file branch used to SKIP the truncate entirely, which destroys
-    /// nothing and never converges — the current hour's file is open with
-    /// `.append(true)`, so during a spill episode it grows every round and the
-    /// whole file was re-POSTed every 300 s at the database whose slowness
-    /// caused the spill.
+    /// Replaces two tests for an in-place compaction DELETED on 2026-09-03
+    /// after an adversarial review of the deployed code proved it could erase
+    /// a concurrent append. Nothing is moved now, so there is nothing to
+    /// corrupt — and this asserts the FILE IS UNCHANGED, which is the property
+    /// that makes an appended row impossible to lose.
     #[test]
-    fn compacting_a_grown_file_keeps_the_tail_and_drops_the_drained_prefix() {
-        let dir = std::env::temp_dir().join(format!("tv-compact-{}", std::process::id()));
+    fn a_grown_file_is_left_intact_and_the_offset_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("tv-resume-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("depth-dhan-000009.ilp");
 
@@ -922,54 +1032,41 @@ mod tests {
         whole.extend_from_slice(appended);
         std::fs::write(&path, &whole).expect("write fixture");
 
-        // A buffer far SMALLER than the tail, so the chunked forward copy
-        // actually loops — a single-shot copy would pass this vacuously.
-        let mut buf = vec![0u8; 7];
-        let kept = super::compact_drained_prefix(
-            &path,
-            drained.len() as u64,
-            whole.len() as u64,
-            &mut buf,
-        )
-        .expect("compaction should succeed");
+        super::record_resume_offset(&path, drained.len() as u64);
 
-        assert_eq!(kept, appended.len() as u64);
         let after = std::fs::read(&path).expect("read back");
         assert_eq!(
             after.as_slice(),
-            appended.as_slice(),
-            "the tail was not preserved byte-exact — a forward copy that \
-             overwrote unread source bytes would corrupt exactly here"
+            whole.as_slice(),
+            "the spill file must be left byte-for-byte intact — every version \
+             of this code that MOVED bytes could destroy a concurrent append"
+        );
+        assert_eq!(super::resume_offset_for(&path), drained.len() as u64);
+
+        super::record_resume_offset(&path, 1);
+        assert_eq!(
+            super::resume_offset_for(&path),
+            drained.len() as u64,
+            "the resume offset moved BACKWARDS — that re-sends rows and invites \
+             a future edit to treat it as a rewind"
         );
 
+        super::forget_resume_offset(&path);
+        assert_eq!(super::resume_offset_for(&path), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file that did NOT grow compacts to empty, which is the same
-    /// destination as the plain truncate it replaces.
+    /// The grown-file branch must NEITHER truncate NOR move bytes.
+    ///
+    /// REPLACES a guard that pinned the opposite ("must compact"), written
+    /// 2026-09-03 and wrong within hours. It passed on the broken version
+    /// because it only checked the branch CALLED the compactor — the same
+    /// false-OK shape as the cgroup guard earlier the same day. This one pins
+    /// the property that actually makes appends safe: the branch touches
+    /// NOTHING on disk. Both destructive answers are banned outright, because
+    /// either erases a concurrent append and both read as the tidy finish.
     #[test]
-    fn compacting_an_ungrown_file_empties_it() {
-        let dir = std::env::temp_dir().join(format!("tv-compact-none-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("depth-dhan-000010.ilp");
-        let body = b"row-1\nrow-2\n";
-        std::fs::write(&path, body).expect("write fixture");
-
-        let mut buf = vec![0u8; 64];
-        let kept =
-            super::compact_drained_prefix(&path, body.len() as u64, body.len() as u64, &mut buf)
-                .expect("compaction should succeed");
-
-        assert_eq!(kept, 0);
-        assert_eq!(std::fs::metadata(&path).expect("stat").len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The grown-file branch must never SKIP without compacting. A skip is
-    /// what made the drained prefix re-POST forever, and it reads as the
-    /// cautious choice, so it is exactly what a future edit would restore.
-    #[test]
-    fn the_grown_file_branch_compacts_rather_than_skipping() {
+    fn the_grown_file_branch_never_destroys_a_concurrent_append() {
         let src = include_str!("tick_spill_replay.rs");
         let stripped: String = src
             .lines()
@@ -984,13 +1081,23 @@ mod tests {
             .expect("the grown-file branch must exist");
         let tail = &stripped[branch..];
         let end = tail.find("Ok(_) => {}").unwrap_or(tail.len());
+        let body = &tail[..end];
+
         assert!(
-            tail[..end].contains("compact_drained_prefix"),
-            "the grown-file branch no longer compacts. Skipping the truncate \
-             destroys nothing and NEVER CONVERGES: the live hour's file grows \
-             every round, so the drained prefix is re-POSTed every 300s at the \
-             database whose slowness caused the spill."
+            body.contains("record_resume_offset"),
+            "the grown-file branch no longer records a resume offset. Without \
+             it the drained prefix is re-POSTed every 300s at the database \
+             whose slowness caused the spill, and it never converges."
         );
+        for destructive in ["set_len", "File::create", "compact_drained_prefix"] {
+            assert!(
+                !body.contains(destructive),
+                "the grown-file branch calls `{destructive}`, which can erase \
+                 bytes the writer appended while the drain ran. The file is \
+                 held open with `.append(true)`; there is no atomic way to \
+                 shorten it, so it must be left BYTE-FOR-BYTE INTACT."
+            );
+        }
     }
 
     /// minutes, so the guard lands with the fix.
@@ -1322,30 +1429,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_spill_dir_truncates_a_file_the_database_accepted() {
-        // THE success arm. Everything else in this module is scaffolding around
-        // this one outcome: rescued ticks reach the database and the file is
-        // left empty rather than deleted, so the retention sweep can still tell
-        // a drained file from an abandoned one.
+    async fn replay_spill_dir_truncates_a_closed_file_and_leaves_the_live_one_intact() {
+        // THE success arm, and the two outcomes are DIFFERENT by design.
+        //
+        // A CLOSED file (the hour rolled; no writer holds it) is emptied, not
+        // deleted, so `prune_spill_files` can still tell a drained file from an
+        // abandoned one.
+        //
+        // The CURRENT file — the last by name, the one the writer is still
+        // appending to — is left BYTE-FOR-BYTE INTACT and its drained offset is
+        // recorded instead. Emptying it would race the appender between the
+        // size check and `File::create`, which is the third variant of the
+        // append-destroying bug found on 2026-09-03. Bounded cost: at most one
+        // hour of spill stays on disk until the rollover makes it closed.
         let dir = temp_dir("ok");
-        let path = dir.join("ticks-dhan-1.ilp");
+        let closed = dir.join("ticks-dhan-1.ilp");
+        let live = dir.join("ticks-dhan-2.ilp");
         let payload = b"ticks value=1i 1\nticks value=2i 2\n";
-        std::fs::write(&path, payload).expect("write");
+        std::fs::write(&closed, payload).expect("write closed");
+        std::fs::write(&live, payload).expect("write live");
 
-        let (url, server) = tiny_server("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", 1);
+        let (url, server) = tiny_server("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", 2);
         let client = crate::http_client::build_probe_client(5).expect("client");
         let outcome = replay_spill_dir(&dir, &url, &client).await;
         let _ = server.join();
 
-        assert_eq!(outcome.files_replayed, 1);
+        assert_eq!(outcome.files_replayed, 2);
         assert_eq!(outcome.files_failed, 0);
-        assert_eq!(outcome.bytes_replayed, payload.len() as u64);
+        assert_eq!(outcome.bytes_replayed, (payload.len() as u64) * 2);
+
         assert_eq!(
-            std::fs::metadata(&path).expect("meta").len(),
+            std::fs::metadata(&closed).expect("meta").len(),
             0,
-            "a drained file must be EMPTY, not absent — prune_spill_files \
+            "a drained CLOSED file must be EMPTY, not absent — prune_spill_files \
              distinguishes the two and fires SPILL-RETENTION-01 on the other"
         );
+        assert_eq!(
+            std::fs::read(&live).expect("read live").as_slice(),
+            payload.as_slice(),
+            "the file the writer is still appending to must be left byte-for-byte \
+             intact — truncating it races the appender and destroys whatever \
+             landed between the size check and the truncate"
+        );
+        assert_eq!(
+            super::resume_offset_for(&live),
+            payload.len() as u64,
+            "the live file's drained offset must be recorded, or the next round \
+             re-sends the whole file and never converges"
+        );
+        super::forget_resume_offset(&live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
