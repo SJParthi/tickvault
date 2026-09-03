@@ -41,8 +41,39 @@ Wants=network-online.target docker.service
 # repeated restarts, so this never trips a legitimate boot. These directives are
 # placed in [Unit] (NOT [Service]) per modern systemd — they govern the unit's
 # start-rate, unlike Restart=/RestartSec= which live in [Service].
-StartLimitIntervalSec=600
-StartLimitBurst=8
+#
+# ⚠ WIDENED 2026-09-03 — the 10-minute window could not see a SLOW loop, and a
+# slow loop is the one that actually happened.
+#
+# The arithmetic the old pair encoded: `failed` needs > 8 restarts inside
+# StartLimitIntervalSec, so ANY cycle at or above 600/8 = 75 seconds never
+# trips it, no matter how many times it repeats. That is not a corner case —
+# it is the normal shape of a memory-driven loop, where the process spends
+# minutes climbing before it is killed.
+#
+# MEASURED 2026-09-03: the app crash-looped from 08:31 to 09:02 IST on ~9-minute
+# cycles (RSS climbing to 20.96 GB, watchdog kill, restart, repeat). Four full
+# cycles. `StartLimitBurst` NEVER FIRED, because 540s > 75s. The unit reported
+# `active (running)` throughout, and the loop was found by reading an RSS chart,
+# not by anything systemd said.
+#
+# New pair: > 5 restarts in 60 min → `failed`, which catches any cycle under
+# 3600/5 = 720 seconds. Today's ~540s loop trips on the sixth restart, roughly
+# 45 minutes in.
+#
+# The burst comes DOWN 8 → 5, deliberately. Raising the window alone would have
+# left the trip point at 3600/8 = 450s — still under today's 540s cycle, i.e. a
+# change that reads like a fix and would not have caught the incident that
+# motivated it.
+#
+# What this COSTS, stated rather than absorbed: `failed` means the app is DOWN
+# and stays down until someone starts it. That is the intended trade and it is
+# not a comfortable one. A looping app captures no ticks anyway AND churns the
+# disk that caused the loop, so the choice is between "down and paging" and
+# "down and silent". The existing market-hours liveness alarm pages on the
+# missing metrics either way; `failed` additionally stops the churn.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
 
 [Service]
 Type=notify
@@ -94,9 +125,34 @@ TimeoutStartSec=infinity
 Restart=always
 RestartSec=3
 
-# Watchdog: app must call sd_notify(WATCHDOG=1) every 30s.
-# If no watchdog ping for 60s (2x interval), systemd kills and restarts.
-WatchdogSec=60
+# Watchdog: app must call sd_notify(WATCHDOG=1) every 30s
+# (boot_helpers::WATCHDOG_INTERVAL_SECS, pinned by a build-time assertion).
+#
+# ⚠ RAISED 2026-09-03, 60 → 150 seconds. This directive KILLED THE APP on a
+# process that was alive, working, and losing nothing.
+#
+# At 60s the margin was exactly ONE missed ping. A 30-second interval inside a
+# 60-second deadline tolerates no slow cycle at all: the beacon has to be
+# scheduled, and win, twice in a row, forever. Under `MemoryHigh` throttling —
+# 371,828 throttle events measured on 2026-09-03 — the kernel is deliberately
+# slowing allocation, the beacon task loses its slot, the second ping is late,
+# and systemd SIGABRTs a process whose only fault was being throttled.
+#
+# That is the wrong instrument for the job. The watchdog exists to catch a HUNG
+# process, not a SLOW one, and a throttled process is slow by design — the
+# throttle is the system working. Killing it converts a recoverable pressure
+# event into a restart loop, and the restart re-reads the same backlog that
+# caused the pressure.
+#
+# 150s = five ping intervals, so four consecutive pings must be missed before a
+# kill. A genuinely hung process still dies, 90 seconds later than before; a
+# throttled one now survives its bad minute. Detection latency traded for not
+# killing healthy work, which is the right direction on a feed whose mandate is
+# to lose nothing.
+#
+# It stays well under TimeoutStopSec=145 + the deploy watchdog's own window, so
+# nothing downstream re-times against it.
+WatchdogSec=150
 
 # Environment
 Environment=RUST_LOG=info
@@ -235,7 +291,7 @@ LimitNPROC=4096
 # order, so exhaustion takes the recoverable tenant first. It does not make
 # the process unkillable (-1000 would); the kernel still reclaims it last.
 #
-# MemoryHigh=15G is a THROTTLE, not a kill: past it the kernel reclaims this
+# MemoryHigh=20G is a THROTTLE, not a kill: past it the kernel reclaims this
 # cgroup aggressively and slows allocation, and RESOURCE-02 has a reachable
 # ceiling to page against. There is deliberately NO `MemoryMax=` — a hard
 # cap turns a memory spike into an OOM kill of the one process whose death
@@ -265,7 +321,37 @@ LimitNPROC=4096
 # kernel's default ranking. Reverting this file in git and redeploying
 # achieves the same thing.
 OOMScoreAdjust=-900
-MemoryHigh=15G
+# RAISED 15G -> 20G on 2026-09-03, operator-approved, after a live incident.
+#
+# WHAT HAPPENED: a 21 GB depth spill file was read WHOLE into memory by the
+# recovery drain (`tick_spill_replay`, since fixed to stream). Process RSS hit
+# 20.96 GiB. The kernel then reclaimed so aggressively that the watchdog
+# beacon could not deliver its 30-second ping inside `WatchdogSec=60`, and
+# systemd SIGABRTed a process that was alive and working -- once every ~9
+# minutes, all session. `oom_kill` stayed 0 throughout: this was never an OOM.
+#
+# The ~9-minute cycle also slips the [Unit] start limit: 8 starts per 600 s
+# means any cycle >= 75 s never trips it, so the unit loops forever instead of
+# transitioning to `failed` where an alarm could see it.
+#
+# WHY 20G AND NOT MORE: the measured steady working set is 0.29-1.54 GiB in
+# session and ~15.6 GiB during a large replay. The host has ~30 GiB with
+# QuestDB capped at 12 GiB, so 20G leaves the host a real margin. Raising
+# further would trade a cgroup throttle for a HOST OOM, where the kernel
+# picks the victim -- and QuestDB's oom_score_adj of -500 makes this process
+# a worse target than it looks despite OOMScoreAdjust=-900 below.
+#
+# THIS VALUE IS LOAD-BEARING AND MUST STAY IN THE REPOSITORY. It was applied
+# live as a systemd drop-in first; a drop-in is an EXTENSION, not an override,
+# so `systemd-delta` reports nothing and the drift is invisible. A fresh
+# instance provisioned from this file at 15G re-enters the SIGABRT loop.
+#
+# NOTE, because it is not obvious: this ceiling is not only a throttle. With
+# no `MemoryMax=`, `resolve_memory_ceiling` resolves the unit's ceiling FROM
+# `memory.high`, so raising it also raised the WAL catch-up stand-down (60%
+# => 12.88 GB) and the RESOURCE-02 page line (80% => 17.18 GB). Changing this
+# number moves those with it.
+MemoryHigh=20G
 
 # Security hardening
 NoNewPrivileges=true

@@ -1087,14 +1087,34 @@ mod tests {
         });
 
         let ping_secs = super::WATCHDOG_INTERVAL_SECS;
-        let minimum_expected = ping_secs.saturating_mul(2);
+
+        // RAISED 2026-09-03 from 2x to 4x, because 2x was measured to be too
+        // tight in production and this assertion passed the whole time.
+        //
+        // At 2x the margin is exactly ONE missed ping. Under `MemoryHigh`
+        // throttling (371,828 events measured on 2026-09-03) the kernel is
+        // deliberately slowing the process; the beacon loses its slot, the
+        // second ping is late, and systemd SIGABRTs a process that is alive
+        // and losing nothing. The watchdog is for a HUNG process, and a
+        // throttled process is slow by design.
+        //
+        // 4x tolerates three consecutive missed pings. A genuinely hung
+        // process still dies, one ping interval later than the old rule would
+        // have allowed at its own minimum.
+        //
+        // The old text said 2x "tolerates a single missed ping without being
+        // killed", which is true and was still not enough — the number was
+        // right about the arithmetic and wrong about the world.
+        let minimum_expected = ping_secs.saturating_mul(4);
         assert!(
             watchdog_sec >= minimum_expected,
             "systemd WatchdogSec={watchdog_sec} is too tight for Rust ping cadence \
              WATCHDOG_INTERVAL_SECS={ping_secs}. Requires WatchdogSec >= {minimum_expected} \
-             (2x ping cadence) to tolerate a single missed ping without being killed. \
-             Either increase WatchdogSec in deploy/systemd/tickvault.service or decrease \
-             WATCHDOG_INTERVAL_SECS in boot_helpers.rs."
+             (4x ping cadence) so THREE consecutive missed pings are tolerated. Two \
+             intervals was the old bar and it killed a merely-throttled process in \
+             production on 2026-09-03. Either increase WatchdogSec in \
+             deploy/systemd/tickvault.service or decrease WATCHDOG_INTERVAL_SECS in \
+             boot_helpers.rs."
         );
     }
 

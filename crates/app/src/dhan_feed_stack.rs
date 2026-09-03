@@ -3027,7 +3027,12 @@ pub const WAL_CATCHUP_MAX_ROUNDS: u32 = 120;
 /// kill "imminent" — so 60% leaves a full fifth of the ceiling between the
 /// drain standing down and the alarm the operator already gets, and the drain
 /// stops on its own before it becomes the thing being alarmed about. On the
-/// live 15 GiB `MemoryHigh` that is ~9 GiB, roughly six times the flat
+/// live `MemoryHigh` that is ~9 GiB at the 15 GiB the ceiling was when this
+/// was written, roughly six times the flat
+/// (CORRECTED 2026-09-03: the live ceiling is now 20 GiB, so the same 60%
+/// lands at ~12.9 GiB. The RATIO is what this paragraph is about and it is
+/// unchanged; the absolute figure moved with the operator-approved raise and
+/// is named here so the next reader is not measuring against a dead number.)
 /// in-session working set, so a healthy boot never reaches it and drains at
 /// full speed.
 ///
@@ -9194,7 +9199,7 @@ pub fn refold_wal_frames(
             // and this is the trade being made: gating it would reinstate the
             // unbounded buffer in precisely the degraded case, and a 4 GB
             // buffer OOM-KILLS the process — measured, ten times, with
-            // `StartLimitBurst=8` then leaving the session with no app at all.
+            // the start limit then leaving the session with no app at all.
             // A slow boot costs part of a session; an OOM loop costs all of
             // it. Bounded memory wins.
             blocking_flush(|| ingest.flush());
