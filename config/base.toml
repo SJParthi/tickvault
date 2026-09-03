@@ -7,9 +7,31 @@
 
 [trading]
 market_open_time = "09:00:00"
-market_close_time = "15:30:00"
+# 2026-09-03: 15:30 -> 15:40, matching TICK_PERSIST_END_SECS_OF_DAY_IST (56_400).
+# The 2026-08-07 move of the session close 15:30 -> 15:40 (NSE closing auction)
+# was applied to the ingest gate and MISSED this value, which has exactly two
+# production consumers and both were wrong for a month:
+#   1. the daily partition-archive window (main.rs -> daily_archive_boot), which
+#      opens at close + 2s. At 15:30:02 the heaviest disk job of the day — S3
+#      verify + DROP across ticks, market_depth and all 24 candle tables — ran
+#      for TEN MINUTES CONCURRENTLY WITH LIVE CAPTURE, against peak closing-
+#      auction volume. `window_open_secs_of_day`'s own comment claims the 2s
+#      buffer means "the sweep still starts after in-flight ticks land"; that
+#      premise died on 2026-08-07. Given the 2026-08-25 disk-full -> 15-table
+#      WAL-suspension incident, this was the highest-risk overlap in the process.
+#   2. the "Market closed — the live price feed has disconnected for the day"
+#      Telegram, which fired at 15:30 while ingest ran on to 15:40 — wrong in
+#      the REASSURING direction, so a genuine feed death at 15:32 arrived after
+#      the all-done card.
+# Pinned by config_close_time_matches_session_end so it cannot drift a third time.
+market_close_time = "15:40:00"
 order_cutoff_time = "15:29:00"
 data_collection_start = "09:00:00"
+# 2026-09-03: NOT moved to 15:40 with the close above, deliberately. Both
+# data_collection_* keys have ZERO production consumers — `validate()` parses
+# them for shape and nothing else reads them (verified by workspace scan).
+# Moving a value nothing consumes would imply it does something. Left as the
+# 2026-08-07 record; delete them, or wire them, in a change that decides which.
 data_collection_end = "15:30:00"
 timezone = "Asia/Kolkata"
 max_orders_per_second = 10

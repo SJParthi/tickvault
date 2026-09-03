@@ -1726,14 +1726,34 @@ pub fn is_post_close_connect(prior_ts_ist_nanos: i64, connect_ts_ist_nanos: i64)
 
 /// A post-close reconnect gets the CLEAN scheduled-stop carve-out only
 /// when the feed streamed through the session close — its last streamed
-/// session minute is at/after this IST seconds-of-day threshold (15:28;
-/// two minutes of slack for end-of-session tick sparsity). A last
-/// streamed minute BEFORE this is a HOLE before close — a clean 15:30
+/// session minute is at/after this IST seconds-of-day threshold (the
+/// close less two minutes of slack for end-of-session tick sparsity). A
+/// last streamed minute BEFORE this is a HOLE before close — a clean
 /// close cannot leave one, so the death was a REAL in-market crash
 /// (round 4, 2026-07-10: a 15:26 crash whose 429-cooldown reconnect
 /// landed at ~15:31 was carved out, rendered "restarts: 0" and let the
 /// day stamp outcome='complete').
-pub const POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS: i64 = 15 * 3600 + 28 * 60; // 55_680
+///
+/// # 2026-09-03: DERIVED, because the literal drifted
+///
+/// This was `15 * 3600 + 28 * 60` — a hardcoded 15:28, justified in its own
+/// doc as "two minutes of slack" before a 15:30 close. The session close moved
+/// to 15:40 on 2026-08-07 and `MARKET_HOURS_END_SECS_OF_DAY_IST` — **thirty
+/// lines up, in this same file** — moved with it. This did not. So
+/// `is_post_close_reconnect` has been testing against 15:40 while this tested
+/// against 15:28, and the "two minutes of slack" silently became TWELVE.
+///
+/// The direction is the dangerous one: a feed that genuinely crashed at 15:31
+/// and reconnected after 15:40 leaves a NINE-MINUTE hole before the close, and
+/// this threshold called it a clean scheduled stop — restarts rendered 0, the
+/// day stamped `outcome='complete'`. That is precisely the false-OK the
+/// constant was introduced to prevent, reintroduced by a literal that could
+/// not follow the close.
+///
+/// Deriving it is the fix. A subtraction from the close survives the next
+/// move; a second literal would not, and this file has now proven that twice.
+pub const POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS: i64 =
+    MARKET_HOURS_END_SECS_OF_DAY_IST as i64 - 2 * 60;
 
 /// Latest streamed session minute as IST seconds-of-day, parsed from the
 /// opaque minute keys (`YYYY-MM-DDTHH:MM:…` — the ts column stores IST
@@ -6320,25 +6340,53 @@ mod tests {
 
     #[test]
     fn test_last_minute_secs_of_day_and_post_close_reconnect_is_real_death() {
-        // Round-4 MEDIUM: only a feed that streamed through ~15:28 keeps
-        // the scheduled-stop carve-out; a hole before close = a REAL
-        // in-market crash (the 15:26-crash → 15:31-reconnect shape).
+        // Round-4 MEDIUM: only a feed that streamed to within two minutes of
+        // the close keeps the scheduled-stop carve-out; a hole before close =
+        // a REAL in-market crash (the crash → post-close-reconnect shape).
+        //
+        // 2026-09-03: asserted RELATIVE to the close, not against a re-typed
+        // 15:28. The old form hardcoded the boundary on both sides — constant
+        // and test — so when the close moved 15:30 → 15:40 on 2026-08-07 the
+        // test kept passing on a threshold that had become twelve minutes of
+        // slack instead of two. A test that restates the literal it guards
+        // proves only that the literal was copied correctly.
+        let close = i64::from(MARKET_HOURS_END_SECS_OF_DAY_IST);
+        let threshold = POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS;
+        assert_eq!(
+            threshold,
+            close - 120,
+            "the carve-out threshold must stay two minutes before the close"
+        );
+
         let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
-        let set: HashSet<String> = [minute(9, 15), minute(12, 0), minute(15, 27)]
-            .into_iter()
-            .collect();
-        assert_eq!(last_minute_secs_of_day(&set), Some(15 * 3600 + 27 * 60));
+        let last = threshold - 60;
+        let set: HashSet<String> = [
+            minute(9, 15),
+            minute(12, 0),
+            minute(last / 3600, (last % 3600) / 60),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(last_minute_secs_of_day(&set), Some(last));
         assert!(
-            post_close_reconnect_is_real_death(Some(15 * 3600 + 27 * 60)),
-            "last minute 15:27 < 15:28 threshold = real in-market death"
+            post_close_reconnect_is_real_death(Some(threshold - 60)),
+            "a last minute one minute BELOW the threshold is a real in-market death"
         );
         assert!(
-            !post_close_reconnect_is_real_death(Some(15 * 3600 + 28 * 60)),
-            "streamed through 15:28 = the clean scheduled-stop shape"
+            !post_close_reconnect_is_real_death(Some(threshold)),
+            "streamed through the threshold = the clean scheduled-stop shape"
         );
         assert!(
-            !post_close_reconnect_is_real_death(Some(15 * 3600 + 29 * 60)),
-            "streamed through 15:29 keeps the carve-out"
+            !post_close_reconnect_is_real_death(Some(close - 60)),
+            "streamed to one minute before the close keeps the carve-out"
+        );
+        // The BITE: a crash nine minutes before the close must never read as
+        // a clean stop. Under the pre-fix 15:28 literal against a 15:40 close
+        // this exact case was carved out — restarts rendered 0 and the day
+        // stamped outcome='complete' on a genuine in-market death.
+        assert!(
+            post_close_reconnect_is_real_death(Some(close - 9 * 60)),
+            "a nine-minute hole before the close is a crash, not a scheduled stop"
         );
         assert!(
             post_close_reconnect_is_real_death(None),
