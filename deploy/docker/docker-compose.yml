@@ -272,79 +272,58 @@ services:
       # 14% of wall time) — with the app itself using 6.7% CPU.
       QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "16777216"
       #
-      # Parallel WAL apply threads: 6 since 2026-09-03 — DELIBERATELY 3x the
-      # 2-core cpuset, because this pool is I/O-bound and a blocked thread
-      # consumes no CPU to throttle. Operator-authorized 2026-09-03.
+      # Parallel WAL apply threads: 2, matching the 2-core cpuset above.
+      #
+      # This value has now been corrected twice in the same direction, and the
+      # pattern is the point: it was 4 ("matches the r8g.xlarge 4 vCPU") while
+      # the quota was 3.0, then 3 to match that quota. Both times the worker
+      # count was sized against a number that was not the real placement
+      # bound. Measured on the box 2026-08-18 at 4 workers: nr_throttled
+      # 18,594 of nr_periods 85,149 = 21.8% of scheduling periods throttled,
+      # 232 seconds of throttled time. Workers above the width of the cpuset
+      # buy CFS throttling and context switches, never throughput.
+      #
+      # ROLLBACK: TV_QDB_WAL_WORKERS=3 in deploy/docker/.env (raise the cpuset
+      # in the same edit, or this simply re-creates the throttling).
       #
       # ---------------------------------------------------------------
-      # WHY THIS LOOKS WRONG, AND THE HISTORY THAT MAKES IT LOOK WRONG
+      # 2026-09-03 — 6 WORKERS WAS TRIED LIVE AND DID NOT WORK. Do not retry
+      # it without a different hypothesis; the measurement is below.
       # ---------------------------------------------------------------
-      # This value was corrected twice in the same direction before today: 4
-      # ("matches the r8g.xlarge 4 vCPU") while the quota was 3.0, then 3 to
-      # match that quota, then 2 to match the cpuset. Measured on the box
-      # 2026-08-18 at 4 workers: nr_throttled 18,594 of nr_periods 85,149 =
-      # 21.8% of scheduling periods throttled, 232 seconds of throttled time.
-      # The rule drawn from it — "workers above the width of the cpuset buy CFS
-      # throttling and context switches, never throughput" — was correct for
-      # the workload it was measured on.
+      # The hypothesis was thread starvation, and the evidence for it looked
+      # strong. Measured mid-session with 2 workers: all four threads
+      # (wal-apply_0/_1, shared-write_0/_1) sat in D state SIMULTANEOUSLY at
+      # 57.6% host iowait and 32.2% idle, using 1,638 IOPS of the 6,000
+      # PROVISIONED, with nr_throttled 6 of nr_periods 31709 = 0.019% — so the
+      # 2026-08-18 throttling argument above genuinely did not apply to this
+      # workload. market_depth was 126,909 transactions behind with
+      # suspended=false and unqueryable for the whole session.
       #
-      # ---------------------------------------------------------------
-      # WHY IT NO LONGER HOLDS — MEASURED 2026-09-03, mid-session, live box
-      # ---------------------------------------------------------------
-      # That rule is true of CPU-BOUND workers. These are not, and the workload
-      # changed AFTER the measurement that set this to 2: Full mode landed
-      # 2026-08-19 (162-byte packets replacing 50 — 3.24x the bytes) and the
-      # ~24,600-instrument universe on 2026-08-21. CFS throttles CPU time; a
-      # thread parked in D state on a disk read has none to throttle.
+      # It was raised to 6 live and measured. RESULT: NO THROUGHPUT GAIN.
       #
-      #   cgroup cpu.stat, this container, live 2026-09-03:
-      #     nr_periods     31709
-      #     nr_throttled   6         <- 0.019%, against 21.8% on 2026-08-18
-      #     throttled_usec 6174      <- 6 MILLISECONDS, against 232 seconds
+      #   lag growth   8.1 txn/sec  ->  7.6 txn/sec   (noise)
+      #   device IOPS  1,638        ->  1,004         (went DOWN)
+      #   throttling   0.019%       ->  0.000%        (harmless, as predicted)
+      #   threads in D 4            ->  8             (all of them, again)
       #
-      #   thread states, same moment (QuestDB pid, name -> state):
-      #     wal-apply_0     D        blocked on disk
-      #     wal-apply_1     D        blocked on disk
-      #     shared-write_0  D        blocked on disk
-      #     shared-write_1  D        blocked on disk
-      #     (27 others)     S        idle
+      # Per-table, it only REDISTRIBUTED capacity rather than adding any:
+      #   candles_1s   15,927 -> 36,409   worse
+      #   candles_5s   11,382 ->  3,297   better
+      #   market_depth        still growing at the same rate
       #
-      #   host, same moment:  57.6% iowait, 32.2% idle, 8.5% user+sys
-      #   device, same moment: 1,638 IOPS of 6,000 PROVISIONED (Quote 17) = 27%
+      # WHAT THAT RULES OUT, which is the useful part: the limit is NOT worker
+      # count, NOT CPU, NOT CPU throttling, NOT provisioned IOPS (6,000, we use
+      # ~1,600), NOT provisioned throughput (500 MiB/s, we use 150-260 MB/s),
+      # NOT free memory (13 GiB free, 13 GiB page cache) and NOT disk space
+      # (181 GB free). Eight threads blocked on a device that is not saturated
+      # means the work is serialized somewhere those threads all share.
       #
-      # All four workers blocked simultaneously. Only four disk requests could
-      # ever be in flight, so the box used a QUARTER of the IOPS it pays $30/mo
-      # for while 27 threads idled and a third of the CPU idled. Throughput =
-      # concurrency / latency: at ~4.6 ms service time, 4-way concurrency caps
-      # apply throughput regardless of how fast the device is. Thread
-      # starvation, not device saturation.
-      #
-      # WHAT IT COST. WAL apply fell behind ~7 txn/sec for the whole session.
-      # On 2026-09-03 `market_depth` sat 126,909 transactions behind with
-      # suspended=false, so `SELECT max(ts) FROM market_depth` returned
-      # YESTERDAY 22:28 while depth arrived at ~7M rows per 5 minutes, and
-      # `ticks` was four hours stale. Nothing was LOST — the rows are durable
-      # in the WAL — but neither table was queryable during the session.
-      #
-      # WHY 6 AND NOT 12. Oversubscribing an I/O-bound pool is free only while
-      # the threads stay blocked. Six doubles in-flight requests (6 apply + 2
-      # shared, against 4 total) toward the 6,000-IOPS ceiling and leaves room
-      # to observe before going further. `cpu_partition_guard` caps this at 3x
-      # the cpuset for exactly that reason.
-      #
-      # THE FAILURE DIRECTION IS THE RECOVERABLE ONE, which is why this is a
-      # safe experiment: the CPU PARTITION block above records that a slow
-      # QuestDB is ABSORBED by the ring -> spill -> DLQ chain, while a
-      # descheduled drain loses ticks at Dhan's side. If this over-subscription
-      # does start throttling, the harm lands on the side that recovers.
-      #
-      # ROLLBACK: TV_QDB_WAL_WORKERS=2 in deploy/docker/.env restores the
-      # 2026-08-18 value, then `docker compose up -d tv-questdb`. Verify with
-      # `cat /sys/fs/cgroup/system.slice/docker-<id>.scope/cpu.stat` — if
-      # nr_throttled/nr_periods climbs back toward 21.8%, the old reasoning has
-      # become true again and 2 is right. The trend is now watchable directly:
-      # the same change charts tv_questdb_wal_apply_lag_max on the dashboard.
-      QDB_WAL_APPLY_WORKER_COUNT: "${TV_QDB_WAL_WORKERS:-6}"
+      # The leading remaining explanation, UNVERIFIED: QuestDB applies a single
+      # table's WAL serially, so worker count sets how many TABLES apply at
+      # once, never how fast the one table that matters applies. If true, no
+      # thread-pool setting can fix market_depth and the only levers are fewer
+      # depth rows or lower per-op storage latency.
+      QDB_WAL_APPLY_WORKER_COUNT: "${TV_QDB_WAL_WORKERS:-2}"
       # QuestDB's GENERAL worker pool, set EXPLICITLY for the same reason.
       #
       # Left unset, QuestDB sizes this pool from the number of CPUs it can SEE,
