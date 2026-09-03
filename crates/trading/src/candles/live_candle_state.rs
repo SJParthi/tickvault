@@ -194,16 +194,106 @@ impl LiveCandleState {
 #[inline]
 #[must_use]
 fn pct_change(value: f64, baseline: f64) -> f64 {
+    // ROUNDED TO 2 DECIMALS -- operator directive 2026-09-03: "always our
+    // percentage should be purely based only two digits after decimal points
+    // which should be matched to Dhan".
+    //
+    // This is the vendor-matching rule, not cosmetics. Dhan publishes
+    // percentage change to 2 decimals, and the daily cross-verification
+    // compares our aggregation against their tape; a column carrying
+    // 0.38198662315043225 where the vendor says 0.38 cannot be compared for
+    // equality at all, only with a tolerance nobody has calibrated.
+    //
+    // Rounded at the SOURCE rather than at each reader: these values are
+    // persisted, spilled to disk, and read back by the console, the API and
+    // the comparator, and a rounding applied at one reader and not another is
+    // how two surfaces come to disagree about the same bar. The precision
+    // discarded here is below the tick size of every instrument we carry.
+    //
+    // `round_to_2dp` is the house helper (`price_precision.rs`) already used
+    // for prices; reusing it means percentages and prices can never round by
+    // two different rules.
+    tickvault_common::price_precision::round_to_2dp(pct_change_raw(value, baseline))
+}
+
+/// The unrounded quotient, split out ONLY so a fixture can still pin the
+/// arithmetic itself.
+///
+/// This is not a second code path: `pct_change` is exactly
+/// `round_to_2dp(pct_change_raw(..))`, and nothing else calls this. It exists
+/// because the 2-decimal rounding costs the live-NIFTY fixture its
+/// discriminating power -- rounded, every drift smaller than 0.005 percentage
+/// points is invisible to an assertion on the stamped column, so a real
+/// arithmetic regression could land green. Keeping the raw value observable
+/// lets that fixture assert BOTH: the vendor-matched 2-decimal value a reader
+/// sees, and the full-precision quotient that proves the formula did not move.
+#[inline]
+#[must_use]
+fn pct_change_raw(value: f64, baseline: f64) -> f64 {
     if !baseline.is_finite() || baseline <= 0.0 || !value.is_finite() {
         return 0.0;
     }
     let pct = (value - baseline) / baseline * 100.0;
-    if pct.is_finite() { pct } else { 0.0 }
+    if !pct.is_finite() {
+        return 0.0;
+    }
+    pct
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveCandleState, pct_change};
+    use super::{LiveCandleState, pct_change, pct_change_raw};
+
+    /// The four percentage columns must carry AT MOST two decimals, because
+    /// Dhan publishes two and the daily cross-verification compares our
+    /// aggregation against their tape. Operator directive 2026-09-03.
+    ///
+    /// MEASURED on the live console the same day, before this rounding:
+    /// `close_pct_from_prev_day` read 0.38198662315043225 and `open_gap_pct`
+    /// read 0.3491612811500996 -- seventeen digits against the vendor's two.
+    #[test]
+    fn every_percentage_carries_at_most_two_decimals() {
+        // The exact live values that prompted the directive.
+        for (value, baseline) in [
+            (24_005.8_f64, 23_914.4_f64),
+            (24_009.9_f64, 23_914.4_f64),
+            (100.0_f64, 3.0_f64),
+            (1.0_f64, 3.0_f64),
+            (0.1_f64, 99_999.0_f64),
+        ] {
+            let pct = pct_change(value, baseline);
+            let rendered = format!("{pct}");
+            if let Some(fraction) = rendered.split_once('.').map(|(_, f)| f) {
+                assert!(
+                    fraction.len() <= 2,
+                    "pct_change({value}, {baseline}) rendered {rendered:?} with \
+                     {} decimals -- Dhan publishes 2, and a column the vendor \
+                     cannot be compared against for equality is a column the \
+                     cross-verification has to guess a tolerance for",
+                    fraction.len()
+                );
+            }
+        }
+    }
+
+    /// Rounding must not turn a real move into a zero, and must not invent one.
+    /// A percentage that rounds to 0.00 is REPORTED as 0.00 -- that is the
+    /// vendor's own resolution, not a suppressed signal -- but the sign and
+    /// magnitude of anything at or above 0.005% must survive intact.
+    #[test]
+    fn rounding_preserves_sign_and_does_not_fabricate_movement() {
+        assert_eq!(pct_change(101.0, 100.0), 1.0);
+        assert_eq!(pct_change(99.0, 100.0), -1.0);
+        // 0.004% rounds to zero: below the vendor's own resolution.
+        assert_eq!(pct_change(100.004, 100.0), 0.0);
+        // 0.006% survives as 0.01, with its sign.
+        assert_eq!(pct_change(100.006, 100.0), 0.01);
+        assert_eq!(pct_change(99.994, 100.0), -0.01);
+        // The guards above the arithmetic are unchanged.
+        assert_eq!(pct_change(100.0, 0.0), 0.0);
+        assert_eq!(pct_change(f64::NAN, 100.0), 0.0);
+        assert_eq!(pct_change(100.0, f64::NAN), 0.0);
+    }
 
     /// Builds a sealed-shaped state carrying real baselines.
     fn sealed(close: f64, session_open: f64, prev_day_close: f64) -> LiveCandleState {
@@ -242,6 +332,23 @@ mod tests {
     ///
     /// Read from production: yesterday's close 24,334.55; today's official
     /// 09:15 open 24,341.95; price at 15:19 IST 24,273.15.
+    ///
+    /// # Why this asserts TWICE per column (2026-09-03)
+    ///
+    /// The 2-decimal rounding the operator ordered would otherwise have
+    /// GUTTED this fixture. Its whole purpose is to fail on an arithmetic
+    /// drift, and against a rounded column every drift smaller than 0.005
+    /// percentage points is invisible: -0.282 63 and -0.284 99 both stamp
+    /// -0.28. Loosening the literals to the rounded values and calling it
+    /// updated would have left a test that still passes and no longer
+    /// guards anything -- the false-OK class this repository keeps
+    /// recording.
+    ///
+    /// So each column is pinned on both sides: the RAW quotient at the
+    /// original tolerance, which is the drift detector, and the STAMPED
+    /// value at exact equality, which is what a reader and the vendor
+    /// comparison actually see. A formula change fails the first; a change
+    /// to the rounding rule fails the second.
     #[test]
     fn the_live_nifty_numbers_produce_the_percentages_the_operator_was_shown() {
         let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
@@ -249,24 +356,59 @@ mod tests {
 
         // PRE-OPEN percentage change: down 0.283% from the 09:15 open.
         assert!(
-            (s.open_pct - -0.282_63).abs() < 0.000_5,
-            "pre-open pct was {}",
-            s.open_pct
+            (pct_change_raw(24_273.15, 24_341.95) - -0.282_63).abs() < 0.000_5,
+            "pre-open pct drifted: {}",
+            pct_change_raw(24_273.15, 24_341.95)
         );
+        assert_eq!(s.open_pct, -0.28, "pre-open pct was {}", s.open_pct);
+
         // The overnight GAP: the 09:15 open was 0.030% above yesterday's
         // close. This is NOT what he calls the pre-open percentage.
         assert!(
-            (s.open_gap_pct - 0.030_41).abs() < 0.000_5,
-            "gap pct was {}",
-            s.open_gap_pct
+            (pct_change_raw(24_341.95, 24_334.55) - 0.030_41).abs() < 0.000_5,
+            "gap pct drifted: {}",
+            pct_change_raw(24_341.95, 24_334.55)
         );
+        assert_eq!(s.open_gap_pct, 0.03, "gap pct was {}", s.open_gap_pct);
+
         // PERCENTAGE CHANGE: versus yesterday's close. The headline
         // number, and the market convention.
         assert!(
-            (s.close_pct_from_prev_day - -0.252_52).abs() < 0.000_5,
+            (pct_change_raw(24_273.15, 24_334.55) - -0.252_52).abs() < 0.000_5,
+            "percentage change drifted: {}",
+            pct_change_raw(24_273.15, 24_334.55)
+        );
+        assert_eq!(
+            s.close_pct_from_prev_day, -0.25,
             "percentage change was {}",
             s.close_pct_from_prev_day
         );
+    }
+
+    /// The rounded wrapper and the raw helper must never be two different
+    /// formulas -- the split exists only so the fixture above can see the
+    /// unrounded value, and a second code path is exactly what would make it
+    /// lie. Swept across the refusal boundaries as well as ordinary values.
+    #[test]
+    fn the_rounded_column_is_always_the_rounded_raw_value() {
+        for (value, baseline) in [
+            (24_273.15_f64, 24_341.95_f64),
+            (24_341.95, 24_334.55),
+            (94.07, 102.26),
+            (100.0, 100.0),
+            (0.0, 100.0),
+            (100.0, 0.0),               // refused: baseline is the sentinel
+            (100.0, -1.0),              // refused: negative baseline flips the sign
+            (f64::NAN, 100.0),          // refused: non-finite value
+            (100.0, f64::NAN),          // refused: non-finite baseline
+            (100.0, f64::MIN_POSITIVE), // refused: quotient overflows
+        ] {
+            assert_eq!(
+                pct_change(value, baseline),
+                tickvault_common::price_precision::round_to_2dp(pct_change_raw(value, baseline)),
+                "the wrapper drifted from the raw helper at ({value}, {baseline})"
+            );
+        }
     }
 
     /// The three columns are three DIFFERENT questions, and an instrument can
