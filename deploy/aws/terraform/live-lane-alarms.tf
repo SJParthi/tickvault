@@ -1255,3 +1255,72 @@ resource "aws_cloudwatch_metric_alarm" "wal_replay_restore_failed" {
   alarm_actions = local.app_alarm_actions
   ok_actions    = []
 }
+
+# ---------------------------------------------------------------------------
+# Candle-fold refusal RATE (§2.3t of dhan-rest-only-noise-lock-2026-07-14.md,
+# operator-authorized 2026-09-03)
+# ---------------------------------------------------------------------------
+#
+# ⚠ THIS IS NOT A TICK-LOSS ALARM, and the description must never say it is.
+# A refused tick IS persisted -- only its candle contribution is skipped. The
+# emitting log line states it verbatim: "The ROWS ARE STILL WRITTEN -- this is
+# not tick loss." This file has already had to withdraw that claim once today;
+# it is not being reintroduced through an alarm description.
+#
+# ⚠ A RATIO, NOT A COUNT, and that is the load-bearing choice. The raw counter
+# scales with market activity -- far higher in the opening burst than at midday
+# -- so any absolute threshold either pages every morning or is invisible at
+# lunch. `100 * refused / ingested` is scale-invariant.
+#
+# Threshold 25% is ~3x the highest share ever measured here (2.41% on
+# 2026-08-27, 7.0% on 2026-08-28, ~8.5% on 2026-09-03). Below that the reading
+# sits inside a range this system has run at for a week; above it, a quarter of
+# all ticks carry timestamps the fold rejects, which is a vendor feed degrading.
+resource "aws_cloudwatch_metric_alarm" "aggregator_refusal_rate_high" {
+  alarm_name        = "tv-${var.environment}-aggregator-refusal-rate-high"
+  alarm_description = "More than a quarter of incoming ticks are being refused a candle bucket. THE ROWS ARE STILL BEING WRITTEN - this is not tick loss and no price data is missing. What it means is that Dhan's timestamps are degrading: ticks stamped for another trading day, or outside a plausible time band, cannot be placed in a minute bucket. Measured baselines here are 2.4%, 7.0% and 8.5%, so a sustained reading above 25% is a vendor data-quality regression, not normal variance. Triage: (1) the 30-second WARN line in the app log breaks the refusals down by reason - stale_trading_day and out_of_band_timestamp are the two abnormal ones; (2) check whether it is one instrument or the whole universe; (3) candles for the refused ticks cannot be rebuilt later, but the ticks themselves are queryable and a backfill from them is possible; (4) nothing in this codebase can fix a vendor's clock - if it persists it is a support ticket."
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 25
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+
+  # No data = no ticks, which is NOT this alarm's question -
+  # `dhan-no-ticks-flowing` owns that. A zero denominator yields no datapoint,
+  # which this setting handles correctly.
+  treat_missing_data = "notBreaching"
+
+  metric_query {
+    id          = "refusal_pct"
+    expression  = "100 * refused / ingested"
+    label       = "Ticks refused a candle bucket (%% of ingest)"
+    return_data = true
+  }
+
+  metric_query {
+    id = "refused"
+    metric {
+      metric_name = "tv_aggregator_tick_refused_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id = "ingested"
+    metric {
+      metric_name = "tv_dhan_feed_ingest_ticks_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. A ratio falling back is the vendor recovering or the window
+  # ageing out - neither is a repair anyone performed.
+  ok_actions = []
+}
