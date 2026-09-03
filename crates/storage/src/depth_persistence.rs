@@ -1036,7 +1036,7 @@ pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW: std::time::Duration =
     std::time::Duration::from_millis(DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS);
 
 #[must_use]
-fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
+pub(crate) fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
     matches!(err.code(), questdb::ErrorCode::SocketError)
 }
 impl DepthWriter {
@@ -2071,7 +2071,65 @@ impl DepthWriterSink {
             self.rescue(batch, "no ILP sender (QuestDB unreachable)");
             return 0;
         };
-        match sender.flush(&mut batch.buffer) {
+        // 2026-09-03: the SAME bounded retry the synchronous path above has
+        // carried since 2026-08-25 — ported here because the synchronous path
+        // is no longer the one that runs.
+        //
+        // That retry was written for `io: Interrupted system call (os error 4)`
+        // costing 8,810 rows on 2026-08-25. Three days later `split_for_offload`
+        // moved every production depth flush onto this thread, and this arm
+        // shipped without it. So the fix has been sitting on the path that was
+        // superseded, and MEASURED on 2026-09-03 the live cost of its absence
+        // was 41,204 coded flush failures in one session, every one reading
+        // `Connection reset by peer (os error 104)` — the identical transport
+        // class, and one the buffer survives intact.
+        //
+        // Retrying is idempotent BY CONSTRUCTION here, which is what makes one
+        // attempt safe rather than merely cheap: `DEDUP_KEY_MARKET_DEPTH`
+        // carries `capture_seq`, unique per received frame, so a first POST
+        // that actually landed before the reset is collapsed by the same
+        // mechanism that makes the operator's manual re-ingest safe to repeat.
+        //
+        // Bounded at ONE, and gated on the first failure being FAST, for the
+        // reason the sync path records — with the thread changed but the
+        // arithmetic intact. `request_timeout` is 5,000 ms; an unconditional
+        // retry makes the worst case ten seconds. This thread is not the
+        // drain, so that no longer stalls the socket — but at
+        // `DEPTH_FLUSH_QUEUE_DEPTH` = 4 and batches arriving several times a
+        // second it overflows the hand-off queue, and the producer then
+        // rescues rows the retry was supposed to save. A reset returns in
+        // microseconds; a timeout consumes the whole budget. The window
+        // separates them with three orders of magnitude to spare.
+        let started = std::time::Instant::now();
+        let first = sender.flush(&mut batch.buffer);
+        let first_elapsed = started.elapsed();
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err)
+                if flush_failure_is_retryable(&err)
+                    && first_elapsed < DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                metrics::counter!(
+                    "tv_depth_flush_retries_total",
+                    "feed" => self.feed.as_str(),
+                )
+                .increment(1);
+                sender.flush(&mut batch.buffer)
+            }
+            Err(err) => {
+                if flush_failure_is_retryable(&err) {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_depth_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
+        };
+        match outcome {
             Ok(()) => {
                 let landed = batch.rows;
                 batch.rows = 0;
@@ -2181,6 +2239,62 @@ mod tests {
 
     /// the sender's own request timeout — that gap is the whole reason a clock
     /// can separate two failures the error class cannot.
+    /// The classifier decides whether a failed flush is worth one more
+    /// attempt. It must say YES to the transport class and NO to everything
+    /// else — a payload QuestDB refused on its merits is refused twice as
+    /// readily as once, and retrying it turns one rejection into two.
+    #[test]
+    fn flush_failure_is_retryable_matches_the_transport_class_only() {
+        use questdb::{Error, ErrorCode};
+
+        // The class that cost 8,810 rows to an EINTR on 2026-08-25 and
+        // 58,746 rescued tick batches to a peer reset on 2026-09-03. The
+        // buffer survives both, so a second attempt sends the same bytes.
+        assert!(
+            flush_failure_is_retryable(&Error::new(
+                ErrorCode::SocketError,
+                "io: Connection reset by peer (os error 104)",
+            )),
+            "a connection reset must be retried — it is the measured live class"
+        );
+        assert!(
+            flush_failure_is_retryable(&Error::new(
+                ErrorCode::SocketError,
+                "io: Interrupted system call (os error 4)",
+            )),
+            "an EINTR must be retried — the 2026-08-25 class"
+        );
+
+        // Everything else is the server's considered answer, or our own bug.
+        for (code, why) in [
+            (
+                ErrorCode::ServerFlushError,
+                "the server read the payload and rejected it; resending is not a fix",
+            ),
+            (
+                ErrorCode::InvalidApiCall,
+                "our own misuse — a retry repeats the mistake",
+            ),
+            (
+                ErrorCode::InvalidTimestamp,
+                "a bad row is bad on the second attempt too",
+            ),
+            (
+                ErrorCode::AuthError,
+                "credentials do not improve by being used again",
+            ),
+            (
+                ErrorCode::ConfigError,
+                "configuration is not a transient condition",
+            ),
+        ] {
+            assert!(
+                !flush_failure_is_retryable(&Error::new(code, "x")),
+                "{code:?} must NOT be retried: {why}"
+            );
+        }
+    }
+
     #[test]
     fn the_retry_window_sits_between_an_eintr_and_the_request_timeout() {
         // Source-scanned rather than built from a config fixture: the number
