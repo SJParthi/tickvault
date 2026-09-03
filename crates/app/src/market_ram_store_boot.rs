@@ -200,13 +200,29 @@ fn host_memory_limit_bytes() -> Option<u64> {
         .as_deref()
         .and_then(parse_meminfo_total_bytes);
 
-    let cgroup = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .iter()
-    .filter_map(|p| std::fs::read_to_string(p).ok())
-    .find_map(|c| parse_cgroup_limit_bytes(&c));
+    // 2026-09-03: these were the ROOT cgroup's files, and this process does
+    // not live in the root cgroup -- systemd puts it in its own slice. On the
+    // production box NEITHER root path exists, so both reads fail, `cgroup`
+    // is `None`, and the budget is sized against the machine's whole 30.75
+    // GiB while the unit only permits 20 GiB. Sizing a RAM budget against
+    // memory the process may not have is how a boot commits itself past its
+    // own throttle.
+    //
+    // `resolve_cgroup_memory_max_path()` reads `/proc/self/cgroup` to find
+    // the slice this process is actually in. Identical defect and identical
+    // repair to `ws_frame_spill::replay_all_with_report`, fixed the same day
+    // -- two places had independently hardcoded the root path, which is why
+    // this is a resolver call now rather than a corrected literal.
+    //
+    // The v1 fallback path is kept: the resolver is v2-shaped, and a v1 host
+    // still answers on the older file.
+    let cgroup =
+        std::iter::once(tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path())
+            .chain(std::iter::once(std::path::PathBuf::from(
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            )))
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .find_map(|c| parse_cgroup_limit_bytes(&c));
 
     match (machine, cgroup) {
         (Some(m), Some(c)) => Some(m.min(c)),
@@ -822,6 +838,80 @@ pub fn spawn_ram_store_stats_task() -> tokio::task::JoinHandle<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Neither memory-ceiling reader may hardcode the ROOT cgroup path.
+    ///
+    /// This process runs in a systemd slice, not the root cgroup, so
+    /// `/sys/fs/cgroup/memory.max` does not exist for it -- both reads fail,
+    /// the cgroup limit reads as absent, and the caller silently sizes itself
+    /// against the machine's whole RAM instead of the limit the unit sets.
+    /// It is a false OK: nothing errors, the number is simply too big.
+    ///
+    /// TWO files had independently hardcoded it (`market_ram_store_boot` and
+    /// `ws_frame_spill`), which is why this is a guard rather than a comment
+    /// at one call site. The v1 path (`/sys/fs/cgroup/memory/memory.limit_in_bytes`)
+    /// is NOT banned -- it is a genuine cgroup-v1 fallback and is not the
+    /// root-cgroup-v2 mistake.
+    ///
+    /// Scans comment-stripped source, because the explanatory comment above
+    /// the repaired call site names the very path being banned.
+    #[test]
+    fn no_memory_ceiling_reader_hardcodes_the_root_cgroup_v2_path() {
+        // Assembled from halves, never written whole: the guard scans this
+        // very file, and a literal here would make it fail on itself. That is
+        // not hypothetical -- the first version did exactly that.
+        let banned = format!("{}{}", "/sys/fs/cgroup/", "memory.max");
+        let banned = banned.as_str();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        // The two files that got this wrong, plus the resolver itself, which
+        // legitimately owns the constant.
+        let owners = ["crates/storage/src/resource_monitor.rs"];
+        let scanned = [
+            "crates/app/src/market_ram_store_boot.rs",
+            "crates/storage/src/ws_frame_spill.rs",
+        ];
+
+        for rel in scanned {
+            let path = root.join(rel);
+            let body =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+            let stripped: String = body
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !stripped.contains(banned),
+                "{rel} hardcodes the ROOT cgroup path {banned}. This process \
+                 is in a systemd slice, so that file does not exist for it and \
+                 the limit reads as absent -- sizing against the whole machine \
+                 instead. Use \
+                 `tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path()`, \
+                 which reads /proc/self/cgroup to find the real slice."
+            );
+        }
+
+        // Non-vacuity: the constant must still exist SOMEWHERE, or this guard
+        // would pass just as well if the resolver were deleted.
+        let owner_has_it = owners.iter().any(|rel| {
+            std::fs::read_to_string(root.join(rel))
+                .map(|b| b.contains(banned))
+                .unwrap_or(false)
+        });
+        assert!(
+            owner_has_it,
+            "the default cgroup-v2 path vanished from the resolver -- this \
+             guard can no longer prove anything"
+        );
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------

@@ -3,7 +3,8 @@
 //! `c1a50504` per the coordinator fast-path decision).
 //!
 //! **The incident this pins closed:** tickvault.service is `Type=notify`
-//! with `WatchdogSec=60`. Both pre-existing `notify_systemd_ready()` sites
+//! with `WatchdogSec=` (150 since 2026-09-03; the guard parses the live
+//! value, it never hardcodes it). Both pre-existing `notify_systemd_ready()` sites
 //! were Dhan-gated (the FAST crash-recovery arm + inside `start_dhan_lane`),
 //! so the Phase-A `dhan_enabled=false` flip (#1496) left every prod boot
 //! stuck `activating` forever — `systemctl restart tickvault` never

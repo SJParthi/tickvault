@@ -69,7 +69,8 @@ pub const REPLAY_MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// MEASURED ON PRODUCTION 2026-09-03: a 21 GB depth spill file put process RSS
 /// at 20,964,align_bytes -- 20.96 GiB. `MemoryHigh` then throttled the process
 /// so hard it could not deliver its 30-second systemd watchdog ping inside
-/// `WatchdogSec=60`, and systemd SIGABRTed a process that was alive and
+/// `WatchdogSec=60` (raised to 150 the same day), and systemd SIGABRTed a
+/// process that was alive and
 /// working, every ~9 minutes. Moving that one file out of the drain's path
 /// dropped RSS to 0.95 GiB and the kill loop stopped. 22x, from one `read`.
 ///
