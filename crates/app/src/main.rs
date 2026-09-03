@@ -1154,6 +1154,24 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_tick_spill_replay_quarantined_total").increment(0);
     metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(0);
 
+    // The two inputs to `aggregator-refusal-rate-high` (2026-09-03).
+    //
+    // This alarm is metric MATH -- `100 * refused / ingested` -- so BOTH sides
+    // must be dense from boot or the ratio has no datapoint to compute. Worse
+    // than a plain unseeded counter: an unseeded DENOMINATOR makes the alarm
+    // silent even while the numerator is publishing perfectly, so the failure
+    // is invisible from the numerator's own chart.
+    //
+    // `ingest_ticks_total` is built lazily inside the frame arm, so a lane that
+    // received nothing never registers it at all -- which is exactly the
+    // session where the ratio would matter most. Caught by
+    // `alarmed_counters_are_seeded_guard`, not by the eye: the alarm looked
+    // correct, and the counters it reads are ones this process emits every
+    // second of a healthy session, which is precisely why the gap is easy to
+    // miss.
+    metrics::counter!("tv_aggregator_tick_refused_total").increment(0);
+    metrics::counter!("tv_dhan_feed_ingest_ticks_total").increment(0);
+
     // Four MORE alarmed counters that were never registered (2026-08-28,
     // found by an adversarial sweep of the loss paths).
     //
