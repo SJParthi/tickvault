@@ -184,7 +184,7 @@
     <!-- DATA -->
     <section data-tab="data" hidden>
       <div class="card"><div class="lbl">official minute rows captured today (per table)</div><div id="bars"></div>
-        <div class="muted" style="margin-top:6px">spot = index minute candles · chain = option-chain snapshots · contracts = per-contract minute candles — all pulled once a minute from the brokers' official records.</div></div>
+        <div class="muted" style="margin-top:6px">spot = index minute candles · chain = option-chain snapshots — both pulled once a minute from the broker's official records.</div></div>
       <div class="card">
         <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
         <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="openQdbConsole()">🗄 Open QuestDB Console</button></div>
@@ -314,10 +314,10 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   Object.values(j.rows_by_feed||{}).forEach(t=>{ Object.keys(t||{}).forEach(f=>{ perFeed[f]=(perFeed[f]||0)+(parseInt(t[f],10)||0); }); });
   const fbKeys=Object.keys(perFeed).sort();
   $('feedsplit').textContent = fbKeys.length ? fbKeys.map(k=>k+': '+perFeed[k].toLocaleString()).join(' | ') : '';
-  // Data-tab bars: today's rows per LIVE table (spot / chain / contracts).
-  // An unreadable count (empty value — box/QuestDB unreachable) renders '—',
-  // never a fabricated 0 bar (Rule 11, review fix M4).
-  const rt=j.rows_today||{}, tkeys=['spot','chain','contracts'];
+  // Data-tab bars: today's rows per LIVE table (spot / chain; contracts
+  // dropped 2026-09-03 — see parse_view). An unreadable count (empty value —
+  // box/QuestDB unreachable) renders '—', never a fabricated 0 bar (Rule 11).
+  const rt=j.rows_today||{}, tkeys=['spot','chain'];
   const vals=tkeys.map(k=>String(rt[k]==null?'':rt[k]).trim()===''?null:(parseInt(rt[k],10)||0));
   const mx=Math.max(1,...vals.map(v=>v||0));
   $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
