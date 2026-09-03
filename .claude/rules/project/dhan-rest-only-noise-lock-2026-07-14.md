@@ -2309,6 +2309,91 @@ is stated rather than absorbed.
 
 ---
 
+### §2.3t — 2026-09-03: the candle-fold refusal rate is charted and unalarmed
+
+**The verbatim operator demand (2026-09-03, typed directly in-session, repeated
+FIVE times — preserve EXACTLY, typos included):**
+
+> "see i want you ti fix and evrythgin resilveign evryhtignd due okay?"
+
+Given each time in DIRECT response to a message whose open-items list named this
+item and stated it needed his authorization: *"An alarm on the refusal rate — it
+is charted but nothing pages you if it doubles. That one needs your say-so: this
+repo requires a dated authorization from you before any new alert is added."*
+That is the §28.2/§28.3 authorization shape this repository already accepts — a
+general go-ahead answering an ENUMERATED ask selects the enumerated work.
+Recorded HERE before the terraform, per the rule-file-first law.
+
+#### What is unwatched
+
+`tv_aggregator_tick_refused_total` is EMF-selected and on the dashboard, and
+**no alarm reads it**. It counts ticks the candle fold would not place in a
+bucket, across six reasons.
+
+**It is NOT tick loss, and the alarm text must not imply it is.** The emitting
+log line says so verbatim: *"The ROWS ARE STILL WRITTEN -- this is not tick
+loss."* A refused tick is persisted; only its candle contribution is skipped.
+What a rise means is that Dhan's timestamps are degrading — the vendor stamping
+ticks for another trading day, or outside a plausible band.
+
+#### ⚠ Why a RATIO and not a count
+
+An absolute threshold on this counter is unusable and would have been the easy
+wrong answer. The count scales with market activity: it is far higher in the
+opening burst than at midday, so any fixed number either pages every morning or
+is invisible at lunch. The alarm therefore uses metric math —
+`100 * refused / ingested` — which is scale-invariant.
+
+#### ⚠ Why 25%, stated as reasoning rather than a round number
+
+MEASURED baselines from this repository's own record:
+
+| Date | Refusal share of ingest |
+|---|---|
+| 2026-08-27 | 2.41% |
+| 2026-08-28 | 7.0% |
+| 2026-09-03 | ~8.5% (176,661 of 2,079,365 in one 10-min window) |
+
+25% is ~3x the highest figure ever observed here. Below that the reading is
+inside a range this system has already run at for a week without harm; above it,
+a quarter of all ticks carry timestamps the fold rejects, which is a vendor feed
+degrading rather than normal variance. A tighter threshold would page on an
+ordinary busy open — the failure this file records repeatedly as the fastest way
+to train an operator to ignore an alarm.
+
+`treat_missing_data = notBreaching`: no ticks at all is not this alarm's
+question, and `dhan-no-ticks-flowing` (§2.3b-i) already owns it. Division by a
+zero ingest yields no datapoint, which that setting handles correctly.
+`ok_actions = []` — a ratio falling back is the vendor recovering or the window
+ageing out, neither of which is a repair anyone performed.
+
+#### Honest cost
+
+**Zero new EMF names** — both inputs are already selected and were read live from
+CloudWatch today. **+1 alarm = $0.10/mo.** Against the ceiling as MEASURED on
+2026-09-02: `limit_amount` **$150**, the 90% `STOP_EC2_INSTANCES` line
+**$135.00**, September forecast **$114.01**. This sits ~$21 under the action
+line. (Every cost note in §2.3j-§2.3p that reasons from a $130 ceiling is stale —
+see the dated correction at the end of this file.)
+
+#### ⚠ What this does NOT do
+
+It does not reduce the refusal rate, and it does not recover a candle. It
+converts a signal that is charted-and-unwatched into one that pages when it
+triples. The refusals themselves originate at Dhan and no code here can fix a
+vendor's timestamp.
+
+#### What a PR that violates §2.3t looks like (REJECT)
+
+- Alarms on the raw COUNT rather than the ratio (fires every market open).
+- Lowers the threshold below the highest measured baseline without a new
+  measurement to justify it.
+- Describes the refusals as tick loss in the alarm text — the rows are written,
+  and this file has already had to withdraw that claim once today.
+- Gives it `ok_actions`.
+- Adds a per-INSTRUMENT dimension (the §2.3 cardinality rule stands).
+
+
 ## ⚠ CORRECTED 2026-09-02 — every cost note above reasons from a $130 ceiling. The live limit is $150, and the arithmetic has been wrong in the ALARMING direction for eight days.
 
 **No authorization is claimed or needed here.** This records a live
