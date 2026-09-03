@@ -53,6 +53,41 @@ use tracing::{error, info, warn};
 /// many.
 pub const REPLAY_MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Bytes of one spill file held in RAM at a time while it is streamed out.
+///
+/// # Why this exists
+///
+/// Until 2026-09-03 this module did `std::fs::read(&path)` — it materialised
+/// the WHOLE file before chunking it. That is fine for the half-gigabyte the
+/// old doc comment assumed, and catastrophic for what the tier actually
+/// permits: `spill_failed_ilp` appends to ONE file per feed per clock-hour,
+/// and the size rail is a SOFT ceiling on the DIRECTORY which
+/// `SpillCeilingVerdict::OverCeilingWithRoom` deliberately allows growth past
+/// whenever free space is above the database reserve. There is no per-FILE cap
+/// anywhere.
+///
+/// MEASURED ON PRODUCTION 2026-09-03: a 21 GB depth spill file put process RSS
+/// at 20,964,align_bytes -- 20.96 GiB. `MemoryHigh` then throttled the process
+/// so hard it could not deliver its 30-second systemd watchdog ping inside
+/// `WatchdogSec=60`, and systemd SIGABRTed a process that was alive and
+/// working, every ~9 minutes. Moving that one file out of the drain's path
+/// dropped RSS to 0.95 GiB and the kill loop stopped. 22x, from one `read`.
+///
+/// # Why 32 MiB
+///
+/// Four times `REPLAY_MAX_CHUNK_BYTES`, so one fill still yields four
+/// full-size POSTs and the 8 MiB pacing is untouched: this changes how much is
+/// READ, never how much is SENT. A `market_depth` line is ~180 bytes, so this
+/// holds ~186,000 of them. Against the app's measured 0.29-1.54 GiB session
+/// working set it is noise; against 21 GB it is the whole fix.
+pub const REPLAY_STREAM_BUFFER_BYTES: usize = 4 * REPLAY_MAX_CHUNK_BYTES;
+
+const _: () = assert!(
+    REPLAY_STREAM_BUFFER_BYTES >= REPLAY_MAX_CHUNK_BYTES,
+    "the read buffer must hold at least one full POST body, or `ilp_chunk_ranges` \
+     can never emit a full-size chunk and the pacing quietly becomes something else"
+);
+
 /// Extension of a replayable spill file. Anything else in the directory is
 /// ignored rather than guessed at.
 pub const SPILL_FILE_EXTENSION: &str = "ilp";
@@ -218,9 +253,15 @@ fn quarantine_spill_file(dir: &Path, path: &Path) -> std::io::Result<std::path::
 /// next round starts over from the same file, losing nothing.
 pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
+    // ONE buffer for the whole round, reused across files: a fixed cost per
+    // round rather than per file, and the thing that makes the peak resident
+    // size independent of how large any spill file has grown.
+    let mut buf = vec![0_u8; REPLAY_STREAM_BUFFER_BYTES];
     for path in list_spill_files(dir) {
-        let payload = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
+        // Size from METADATA, never from a materialised read. This is the
+        // 2026-09-03 fix: `std::fs::read` here held a 21 GB file in RAM.
+        let file_len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
             Err(err) => {
                 warn!(
                     path = %path.display(),
@@ -231,93 +272,164 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 return outcome;
             }
         };
-        if payload.is_empty() {
+        if file_len == 0 {
             // Already drained. Leave it alone: truncating it again would
             // refresh its mtime every round and it would never age out.
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        let mut handle = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    %err,
+                    "tick spill replay could not read a spill file — leaving it for the next round"
+                );
+                outcome.files_failed = outcome.files_failed.saturating_add(1);
+                return outcome;
+            }
+        };
 
         let mut accepted: u64 = 0;
         let mut failed = false;
         let mut quarantined = false;
-        for range in ilp_chunk_ranges(&payload, REPLAY_MAX_CHUNK_BYTES) {
-            let chunk = payload[range].to_vec();
-            let len = chunk.len() as u64;
-            match client.post(url).body(chunk).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    accepted = accepted.saturating_add(len);
+        // STREAMING WINDOW STATE.
+        //
+        // `carry` is the partial line at the FRONT of the buffer, kept from
+        // the previous fill. It is the entire mechanism that keeps an ILP line
+        // whole across a read boundary: a chunk boundary landing mid-line
+        // hands QuestDB half a row and starts the next body with the other
+        // half, corrupting TWO rows rather than splitting one.
+        let mut carry: usize = 0;
+        let mut eof = false;
+        'file: while !eof || carry > 0 {
+            use std::io::Read as _;
+            let cap = buf.len();
+            let mut filled = carry;
+            while !eof && filled < cap {
+                match handle.read(&mut buf[filled..cap]) {
+                    Ok(0) => eof = true,
+                    Ok(n) => filled = filled.saturating_add(n),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(err) => {
+                        warn!(
+                            path = %path.display(),
+                            %err,
+                            offset = accepted,
+                            "tick spill replay could not read a spill file — leaving it for the \
+                             next round. Nothing already accepted is lost: a re-POST of the same \
+                             bytes reproduces the same dedup key, so it upserts onto itself."
+                        );
+                        failed = true;
+                        break 'file;
+                    }
                 }
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if is_permanent_refusal(status) {
-                        // The payload is wrong, not the server. Retrying can
-                        // never change a malformed byte, and the round-stops-
-                        // on-failure rule below would strand every file behind
-                        // this one — which is exactly what stranded 1,662,318
-                        // intact ticks on 2026-08-25. Set it aside and keep
-                        // going.
-                        match quarantine_spill_file(dir, &path) {
-                            Ok(moved) => {
-                                metrics::counter!(REPLAY_QUARANTINED_COUNTER).increment(1);
-                                outcome.files_quarantined =
-                                    outcome.files_quarantined.saturating_add(1);
-                                error!(
-                                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
-                                    path = %moved.display(),
-                                    status,
-                                    bytes = payload.len(),
-                                    "tick spill file PERMANENTLY refused by QuestDB and moved to \
-                                     quarantine so the rest of the backlog can drain. The rows \
-                                     are still on disk and are NOT in the database. Most of the \
-                                     file is usually salvageable — filter to well-formed lines \
-                                     and re-POST, which is safe to repeat because the ticks \
-                                     dedup key carries capture_seq."
-                                );
-                                // Deliberately NOT `failed = true`: this file
-                                // is dealt with, and the whole point is that
-                                // the queue keeps moving.
-                                quarantined = true;
-                                break;
-                            }
-                            Err(err) => {
-                                // Could not set it aside. Treat as transient
-                                // rather than skipping it — a file that stays
-                                // in place while being reported as handled
-                                // would make the queue look drained when it
-                                // is not.
-                                warn!(
-                                    path = %path.display(),
-                                    status,
-                                    %err,
-                                    "tick spill file was permanently refused but could NOT be \
-                                     moved to quarantine — left in place and retried, so the \
-                                     backlog behind it is still blocked"
-                                );
-                                failed = true;
-                                break;
+            }
+            if filled == 0 {
+                break;
+            }
+            // Cut at the LAST newline in the window. Everything before it is
+            // whole lines; everything after is carried to the next fill.
+            let cut = match buf[..filled].iter().rposition(|b| *b == b'\n') {
+                // +1 keeps the newline with the line it terminates, matching
+                // `ilp_chunk_ranges`.
+                Some(nl) => nl.saturating_add(1),
+                // No newline in the FINAL read: a tail torn by a crash
+                // mid-append. POST it whole and let QuestDB judge it — which
+                // is byte-for-byte what this function did before streaming.
+                None if eof => filled,
+                // No newline in a FULL buffer with more file behind it. At
+                // 32 MiB that is not a long line, it is a torn file. The
+                // pre-streaming code POSTed it, was 4xx'd, and quarantined it;
+                // this reaches the same destination without loading it. Fall
+                // through to EOF handling by treating the window as whole.
+                None => filled,
+            };
+            let carried = filled.saturating_sub(cut);
+            for range in ilp_chunk_ranges(&buf[..cut], REPLAY_MAX_CHUNK_BYTES) {
+                let chunk = buf[range].to_vec();
+                let len = chunk.len() as u64;
+                match client.post(url).body(chunk).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        accepted = accepted.saturating_add(len);
+                    }
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        if is_permanent_refusal(status) {
+                            // The payload is wrong, not the server. Retrying can
+                            // never change a malformed byte, and the round-stops-
+                            // on-failure rule below would strand every file behind
+                            // this one — which is exactly what stranded 1,662,318
+                            // intact ticks on 2026-08-25. Set it aside and keep
+                            // going.
+                            match quarantine_spill_file(dir, &path) {
+                                Ok(moved) => {
+                                    metrics::counter!(REPLAY_QUARANTINED_COUNTER).increment(1);
+                                    outcome.files_quarantined =
+                                        outcome.files_quarantined.saturating_add(1);
+                                    error!(
+                                        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                                        path = %moved.display(),
+                                        status,
+                                        bytes = file_len,
+                                        "tick spill file PERMANENTLY refused by QuestDB and moved to \
+                                         quarantine so the rest of the backlog can drain. The rows \
+                                         are still on disk and are NOT in the database. Most of the \
+                                         file is usually salvageable — filter to well-formed lines \
+                                         and re-POST, which is safe to repeat because the ticks \
+                                         dedup key carries capture_seq."
+                                    );
+                                    // Deliberately NOT `failed = true`: this file
+                                    // is dealt with, and the whole point is that
+                                    // the queue keeps moving.
+                                    quarantined = true;
+                                    break 'file;
+                                }
+                                Err(err) => {
+                                    // Could not set it aside. Treat as transient
+                                    // rather than skipping it — a file that stays
+                                    // in place while being reported as handled
+                                    // would make the queue look drained when it
+                                    // is not.
+                                    warn!(
+                                        path = %path.display(),
+                                        status,
+                                        %err,
+                                        "tick spill file was permanently refused but could NOT be \
+                                         moved to quarantine — left in place and retried, so the \
+                                         backlog behind it is still blocked"
+                                    );
+                                    failed = true;
+                                    break 'file;
+                                }
                             }
                         }
+                        warn!(
+                            path = %path.display(),
+                            status,
+                            "tick spill replay was refused by QuestDB — the file is kept intact and \
+                             retried next round"
+                        );
+                        failed = true;
+                        break 'file;
                     }
-                    warn!(
-                        path = %path.display(),
-                        status,
-                        "tick spill replay was refused by QuestDB — the file is kept intact and \
-                         retried next round"
-                    );
-                    failed = true;
-                    break;
+                    Err(err) => {
+                        warn!(
+                            path = %path.display(),
+                            error_kind = %describe_send_error(&err),
+                            "tick spill replay could not reach QuestDB — the file is kept intact and \
+                             retried next round"
+                        );
+                        failed = true;
+                        break 'file;
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        path = %path.display(),
-                        error_kind = %describe_send_error(&err),
-                        "tick spill replay could not reach QuestDB — the file is kept intact and \
-                         retried next round"
-                    );
-                    failed = true;
-                    break;
-                }
+            }
+            // Carry the partial tail to the front for the next fill.
+            carry = carried;
+            if carry > 0 {
+                buf.copy_within(cut..filled, 0);
             }
         }
 
@@ -334,6 +446,51 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             // Stop the whole round: QuestDB is unhappy and the rest of the
             // backlog would only make it unhappier.
             return outcome;
+        }
+
+        // GROWTH CHECK -- added 2026-09-03 with the streaming rewrite.
+        //
+        // `list_spill_files` does NOT exclude the file the writer is currently
+        // appending to: `spill_failed_ilp` opens `<tier>-<feed>-<hour>.ilp`
+        // with `.append(true)`, so the CURRENT hour's file is live while we
+        // drain it. `File::create` below truncates the shared inode to zero,
+        // which would destroy any bytes appended after our last read.
+        //
+        // This was already a bug with the whole-file `read` -- the window was
+        // one syscall. Streaming widens that window from a syscall to minutes
+        // on a large file, so the check lands with the fix rather than after
+        // it. Cost is one `stat`. The failure direction is deliberately safe:
+        // a spurious skip costs one extra round of re-POSTs, which are free
+        // because the dedup key makes them upsert onto themselves; a missed
+        // skip costs real market data.
+        match std::fs::metadata(&path).map(|meta| meta.len()) {
+            Ok(len_now) if len_now != file_len => {
+                outcome.bytes_replayed = outcome.bytes_replayed.saturating_add(accepted);
+                metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(accepted);
+                info!(
+                    path = %path.display(),
+                    len_before = file_len,
+                    len_now,
+                    bytes = accepted,
+                    "spilled rows were accepted, but the file GREW while it was being drained \
+                     — NOT truncating, because that would destroy the bytes appended after the \
+                     read. They drain on the next round."
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    %err,
+                    bytes = accepted,
+                    "could not re-check a drained spill file's size — NOT truncating, so no \
+                     appended bytes can be destroyed. The rows already accepted are in the \
+                     database; the next round re-POSTs them idempotently."
+                );
+                outcome.files_failed = outcome.files_failed.saturating_add(1);
+                return outcome;
+            }
         }
 
         // Every chunk accepted. Truncate rather than delete so the retention
@@ -548,6 +705,98 @@ pub fn spawn_supervised_tick_spill_replay(
 }
 #[cfg(test)]
 mod tests {
+    // ---- 2026-09-03 STREAMING FIX: the tests that bite ----------------------
+
+    /// STRUCTURAL BITE-PROOF for the 2026-09-03 OOM.
+    ///
+    /// MEASURED: a 21 GB depth spill file read whole put process RSS at
+    /// 20.96 GiB; `MemoryHigh` throttling then starved the systemd watchdog
+    /// ping and the app was SIGABRTed every ~9 minutes. Moving that one file
+    /// out of the drain's path dropped RSS to 0.95 GiB. 22x, from one `read`.
+    ///
+    /// This fails the build if anyone puts a whole-file read back on the
+    /// replay path -- including the subtler regression of reading the file
+    /// whole and then handing the slice to a still-bounded helper, which
+    /// would leave every other test in this module green.
+    #[test]
+    fn the_replay_path_never_reads_a_whole_spill_file_into_memory() {
+        let src = include_str!("tick_spill_replay.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        // Comment-stripped: this guard's OWN docstring names the banned call
+        // in order to explain it, and a scanner that cannot tell code from
+        // prose fails on its own explanation. The house convention is to
+        // strip, not to reword the explanation away.
+        let production: String = src
+            .split(test_marker)
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let production = production.as_str();
+        for banned in ["fs::read(", "read_to_end", "read_to_string"] {
+            assert!(
+                !production.contains(banned),
+                "`{banned}` on the replay path materialises a WHOLE spill file. There is no \
+                 per-file cap: `spill_failed_ilp` appends to one file per feed per clock-hour, \
+                 and `SpillCeilingVerdict::OverCeilingWithRoom` lets the directory grow past \
+                 its soft ceiling whenever free space is above the database reserve. On \
+                 2026-09-03 that reached 21 GB and kill-looped the app."
+            );
+        }
+        assert!(
+            production.contains("REPLAY_STREAM_BUFFER_BYTES"),
+            "the bounded read buffer must still be what the replay path reads through"
+        );
+        assert!(
+            production.contains("rposition(|b| *b == b'\\n')"),
+            "the streaming loop must still cut at the LAST newline in its window. Without that \
+             cut a chunk boundary lands mid-line, which hands QuestDB half a row and starts the \
+             next body with the other half -- corrupting TWO rows rather than splitting one."
+        );
+    }
+
+    /// The buffer must hold at least one full POST body, or `ilp_chunk_ranges`
+    /// can never emit a full-size chunk and the 8 MiB pacing quietly becomes
+    /// something else. Also pins that this change altered how much is READ,
+    /// never how much is SENT.
+    #[test]
+    fn the_read_buffer_is_a_whole_multiple_of_the_post_cap() {
+        assert!(REPLAY_STREAM_BUFFER_BYTES >= REPLAY_MAX_CHUNK_BYTES);
+        assert_eq!(REPLAY_STREAM_BUFFER_BYTES % REPLAY_MAX_CHUNK_BYTES, 0);
+        assert!(
+            REPLAY_STREAM_BUFFER_BYTES <= 64 * 1024 * 1024,
+            "the buffer is resident for the life of a round -- a large one re-creates the \
+             memory pressure this constant exists to bound"
+        );
+    }
+
+    /// The truncate must not run when the writer appended during the drain.
+    ///
+    /// `list_spill_files` does not exclude the hour currently being written,
+    /// and `File::create` zeroes the shared inode. Pre-existing with the
+    /// whole-file read; streaming widens the window from one syscall to
+    /// minutes, so the guard lands with the fix.
+    #[test]
+    fn the_truncate_is_gated_on_the_file_not_having_grown() {
+        let src = include_str!("tick_spill_replay.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let create_at = production
+            .find("std::fs::File::create(&path)")
+            .expect("the truncate site must still exist");
+        let guard_at = production
+            .find("Ok(len_now) if len_now != file_len")
+            .expect("the growth check must exist");
+        assert!(
+            guard_at < create_at,
+            "the growth check sits BELOW the truncate, so a file the writer appended to during \
+             the drain is zeroed before the check can refuse it -- destroying rows that were \
+             never POSTed"
+        );
+    }
+
     use super::*;
 
     fn cat(payload: &[u8], ranges: &[std::ops::Range<usize>]) -> Vec<u8> {

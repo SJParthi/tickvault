@@ -2773,8 +2773,23 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
     wal_dir: P,
     budget_bytes: usize,
 ) -> anyhow::Result<WalReplayBatch> {
+    // CORRECTED 2026-09-03. This resolved the ROOT cgroup's `memory.max`, not
+    // this UNIT's -- the exact defect `resolve_cgroup_memory_max_path` was
+    // written to fix on 2026-09-02, applied to the resource monitor and missed
+    // here. Verified live the same day: `/sys/fs/cgroup/memory.max` and
+    // `memory.high` do not exist at the root on this host, so both resolved to
+    // `None` and the guard fell through to `/proc/meminfo` MemTotal -- 30.75
+    // GiB instead of the unit's 20 GiB ceiling. Its 60% stand-down therefore
+    // sat at 19.81 GB rather than 12.88 GB, making the INNERMOST memory guard
+    // on the WAL path the LOOSEST of the three, and it is the one that runs
+    // while a large ILP buffer is being materialised.
+    //
+    // The doc comment above claims this uses "the same `resolve_memory_ceiling`
+    // the resource monitor and RESOURCE-02 use, so the guard and the alarm can
+    // never disagree." That sentence was false for as long as the path was
+    // hardcoded. It is true now.
     let ceiling = crate::resource_monitor::resolve_memory_ceiling(
-        Path::new("/sys/fs/cgroup/memory.max"),
+        &crate::resource_monitor::resolve_cgroup_memory_max_path(),
         Path::new("/proc/meminfo"),
     )
     .bytes();
