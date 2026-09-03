@@ -2439,16 +2439,6 @@ pub const TICK_BROADCAST_CAPACITY: usize = 262_144;
 /// 256 order updates × ~512 bytes each = ~128KB. At ~10 orders/sec = ~25 seconds.
 pub const ORDER_UPDATE_BROADCAST_CAPACITY: usize = 256;
 
-/// Resilience ring buffer capacity for live candle writer.
-/// Holds candles in memory when QuestDB is down, drains on recovery.
-///
-/// Sized for 25K instruments (1 candle/instrument/sec):
-/// - 200,000 candles × ~76 bytes = ~14.5MB RAM
-/// - At 25K candles/sec = 8 seconds before disk spill
-/// - Candle data is lower priority than raw ticks; 8s is sufficient
-///   as disk spill handles overflow seamlessly.
-pub const CANDLE_BUFFER_CAPACITY: usize = 200_000;
-
 // 2026-06-28: the 9 OPTION_CHAIN_* constants were REMOVED with the entire
 // option_chain REST subsystem (operator directive 2026-06-28). They were
 // consumed only by the deleted `crates/core/src/option_chain/` module.
@@ -2462,15 +2452,6 @@ pub const CANDLE_BUFFER_CAPACITY: usize = 200_000;
 /// Default depth batch flush size for QuestDB ILP writes.
 /// Each depth snapshot writes 5 rows (one per level), so effective row count = batch × 5.
 pub const DEPTH_FLUSH_BATCH_SIZE: usize = 200;
-
-/// Resilience ring buffer capacity for depth persistence writer.
-/// Holds depth snapshots in memory when QuestDB is down, drains on recovery.
-///
-/// Sized for 200 instruments (4 connections × 50 instruments):
-/// - 100,000 snapshots × 116 bytes = ~11MB RAM
-/// - At ~250 snapshots/sec = ~6.7 minutes before disk spill
-/// - Depth data arrives at lower rate than ticks; generous headroom.
-pub const DEPTH_BUFFER_CAPACITY: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Pipeline — Tick Validation Constants
