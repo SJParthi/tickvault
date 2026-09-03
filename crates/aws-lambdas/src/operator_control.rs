@@ -2584,22 +2584,29 @@ mod tests {
         // the console HTML still fails the build; it simply no longer claims
         // legacy-byte-identity.
         //
-        // 2026-09-03 re-bless (47,467 -> 47,634): the Data tab's third bar,
-        // "contracts", is REMOVED along with the two VIEW_COMMANDS queries
-        // that fed it. `rest_option_contract_1m` has had no DDL caller and no
-        // writer since the 2026-08-21 Groww removal — MEASURED on the box the
-        // same day, the table does not exist — so that bar could only ever
-        // render blank, which an operator cannot tell from a real capture
-        // failure. The byte count GREW despite deleting a key because the
-        // reason is recorded at the site; a shorter file that explains
-        // nothing is the worse trade.
+        // 2026-09-03 re-bless (47,467 -> 47,435 — SMALLER, which is the point):
+        // the Data tab's third bar, "contracts", is REMOVED along with the two
+        // VIEW_COMMANDS queries that fed it. `rest_option_contract_1m` has had
+        // no DDL caller and no writer since the 2026-08-21 Groww removal —
+        // MEASURED on the box the same day, the table does not exist — so that
+        // bar could only ever render blank, which an operator cannot tell from
+        // a real capture failure.
+        //
+        // The first two attempts at this re-bless landed at 47,634 and 47,490,
+        // and BOTH were caught by `browser_surface_and_toolchain_guard::
+        // javascript_volume_inside_script_tags_only_shrinks` (JS lines 339 ->
+        // 342, then -> 340). It was right to fail them: that budget is
+        // shrink-only, and a change whose whole point is DELETING a bar has no
+        // business growing the frontend carve-out to hold a comment about the
+        // deletion. The reasoning lives in `parse_view` above — a Rust file
+        // under no such budget — and the HTML keeps a one-line pointer to it.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "c3df1ea01b344f93a9ecbe4de2d96ecb69827e7c1fc69d6db3e0d2585232a33d"
+            "80c1e36337f340f6523c5b5501a6f9c128a7b36c0bb66d7a74da24ad435474c3"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_634);
+        assert_eq!(CONSOLE_HTML.len(), 47_435);
     }
 
     // --------------------------------------------------------- class ParseView
