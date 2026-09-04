@@ -2315,6 +2315,10 @@ impl TickWriter {
                         "feed" => self.feed.as_str()
                     )
                     .increment(dropped as u64);
+                    // Counted like a writer hand-off, so a replay confirm waits
+                    // for the rescue thread too — a payload in THIS queue is
+                    // not yet in any file.
+                    crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
                     self.pending = 0;
                     return dropped;
                 }
@@ -2344,7 +2348,7 @@ impl TickWriter {
 
         let landed =
             perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
-        note_rescue_outcome_ticks(landed, range);
+        note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
         dropped
@@ -2354,12 +2358,23 @@ impl TickWriter {
 /// A rescued payload is APPLIED from the WAL's point of view — the spill tier
 /// is durable and re-ingestable — and a failed rescue is the one arm where
 /// captured frames genuinely need the next replay.
-fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64)) {
+/// `in_order` is `true` ONLY on the writer thread, which completes batches in
+/// the order they were handed off. A rescue from the PRODUCER (inline
+/// fallback) or the rescue THREAD can land while earlier batches still sit in
+/// the writer's queue; acking its `max_seq` there would lift the watermark
+/// over rows that are in neither QuestDB nor a spill file — and a crash in
+/// that window (the 2026-09-02 OOM shape) would archive their segments
+/// unread next boot. Out of order, a landing acks nothing: those frames are
+/// re-replayed and collapse on DEDUP, which is the cheap direction.
+fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
     let wm = crate::wal_applied_watermark::applied_watermark();
     if landed {
-        wm.note_ticks_acked(range.1);
+        if in_order {
+            wm.note_ticks_acked(range.1);
+        }
     } else {
         wm.note_unapplied_range(range.0, range.1);
+        wm.note_unlanded();
     }
 }
 
@@ -2509,7 +2524,10 @@ impl TickRescueSink {
             self.feed,
             batch.rows,
         );
-        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq));
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        // The hand-off was counted when the producer queued this payload; the
+        // replay confirm waits for this completion like any writer batch.
+        crate::wal_applied_watermark::applied_watermark().note_ticks_completed();
     }
 }
 // ---------------------------------------------------------------------------
@@ -2774,7 +2792,7 @@ impl TickWriterSink {
             .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         match spill_failed_ilp(&self.spill_dir, batch.buffer.as_bytes(), self.feed, now) {
             Ok(path) => {
-                note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq));
+                note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
                     .increment(rows as u64);
                 metrics::counter!("tv_ticks_spilled_total", "feed" => self.feed.as_str())
@@ -2794,7 +2812,7 @@ impl TickWriterSink {
                 );
             }
             Err(err) => {
-                note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq));
+                note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
                     .increment(rows as u64);
                 error!(
@@ -4784,5 +4802,24 @@ mod tests {
             2,
             "expected exactly two seeded label sets"
         );
+    }
+
+    #[test]
+    fn an_out_of_order_rescue_never_advances_the_watermark() {
+        // The global is shared across the test binary; use ranges far above
+        // anything another test acks so the assertion is about THIS call.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let base = 1u64 << 62;
+        let before = wm.snapshot().hwm_ticks;
+        note_rescue_outcome_ticks(true, (base, base + 10), false);
+        assert_eq!(
+            wm.snapshot().hwm_ticks,
+            before,
+            "a producer-side or rescue-thread landing acks nothing"
+        );
+        let unlanded = wm.unlanded_total();
+        note_rescue_outcome_ticks(false, (base + 20, base + 30), false);
+        assert_eq!(wm.unlanded_total(), unlanded + 1);
+        assert!(wm.snapshot().range_has_unapplied(base + 25, base + 25));
     }
 }

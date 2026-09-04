@@ -1419,6 +1419,7 @@ impl DepthWriter {
                         "feed" => self.feed.as_str()
                     )
                     .increment(rows as u64);
+                    crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
                     // Counted as rescued HERE, not on the thread, because the
                     // caller's log-wording branch reads this field one line
                     // after the call and a queued payload IS on its way to the
@@ -1458,7 +1459,7 @@ impl DepthWriter {
             rows,
             self.spill_min_free_headroom,
         );
-        note_rescue_outcome_depth(landed, range);
+        note_rescue_outcome_depth(landed, range, false);
         if landed {
             self.rescued = self.rescued.saturating_add(rows as u64);
         }
@@ -1629,7 +1630,11 @@ impl DepthWriter {
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                 // The writer thread died. Rescue rather than drop, and say so.
+                // The range rides with the batch and must come back with the
+                // buffer, or the rescue below reports `(0, 0)` and a failed
+                // rescue marks nothing — the tick twin always did this.
                 self.buffer = returned.buffer;
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
                 let dropped = self.discard_pending();
                 DepthOffloadOutcome::SinkGone(dropped)
             }
@@ -1932,19 +1937,25 @@ impl DepthRescueSink {
             batch.rows,
             self.spill_min_free_headroom,
         );
-        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq));
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        crate::wal_applied_watermark::applied_watermark().note_depth_completed();
     }
 }
 
 /// A rescued depth payload is APPLIED from the WAL's point of view — the spill
 /// tier is durable and re-ingestable — and a failed rescue is the one arm where
 /// captured frames genuinely need the next replay.
-fn note_rescue_outcome_depth(landed: bool, range: (u64, u64)) {
+/// See `note_rescue_outcome_ticks`: only the writer thread's own rescue is in
+/// order with the queue; a producer-side or rescue-thread landing acks nothing.
+fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
     let wm = crate::wal_applied_watermark::applied_watermark();
     if landed {
-        wm.note_depth_acked(range.1);
+        if in_order {
+            wm.note_depth_acked(range.1);
+        }
     } else {
         wm.note_unapplied_range(range.0, range.1);
+        wm.note_unlanded();
     }
 }
 
@@ -2260,7 +2271,7 @@ impl DepthWriterSink {
             self.spill_min_free_headroom,
         ) {
             Ok(path) => {
-                note_rescue_outcome_depth(true, (batch.min_seq, batch.max_seq));
+                note_rescue_outcome_depth(true, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
                     .increment(rows as u64);
                 metrics::counter!("tv_depth_rows_spilled_total", "feed" => self.feed.as_str())
@@ -2280,7 +2291,7 @@ impl DepthWriterSink {
                 );
             }
             Err(err) => {
-                note_rescue_outcome_depth(false, (batch.min_seq, batch.max_seq));
+                note_rescue_outcome_depth(false, (batch.min_seq, batch.max_seq), true);
                 if err.kind() == std::io::ErrorKind::StorageFull {
                     metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
                         .increment(1);

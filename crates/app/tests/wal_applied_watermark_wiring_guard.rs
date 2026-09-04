@@ -54,8 +54,10 @@ fn both_lane_confirms_wait_for_the_writer_ack() {
     let src = production("src/dhan_feed_stack.rs");
     for stage in ["\"boot_refold\"", "\"catchup\""] {
         let wait = src
-            .find(&format!("wal_replay_acked({stage})"))
-            .unwrap_or_else(|| panic!("the {stage} confirm must wait on wal_replay_acked"));
+            .find(&format!(
+                "replay_rows_landed(&mut ingest, {stage}, unlanded_before)"
+            ))
+            .unwrap_or_else(|| panic!("the {stage} confirm must wait on replay_rows_landed"));
         let confirm = src[wait..]
             .find("confirm_replayed(")
             .expect("a confirm must follow the ack wait");
@@ -67,7 +69,7 @@ fn both_lane_confirms_wait_for_the_writer_ack() {
         );
     }
     assert!(
-        src.contains("if !blocking_flush(|| wal_replay_acked(\"catchup\")) {"),
+        src.contains("if !replay_rows_landed(&mut ingest, \"catchup\", unlanded_before) {"),
         "a catch-up ack timeout must END the drain rather than re-offer the batch to a sink that is not answering"
     );
 }
@@ -159,4 +161,92 @@ fn the_unfolded_frames_message_no_longer_claims_the_segments_were_archived() {
         body.contains("stay in the replay staging area"),
         "the message must say where the segments actually are"
     );
+}
+
+#[test]
+fn a_refused_boot_replay_never_confirms_the_staged_leftovers() {
+    let main = production("src/main.rs");
+    assert!(
+        main.contains(
+            "ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap"
+        ),
+        "STAGE-C must read the refusal flags off the batch, not infer 'nothing to replay' from an empty frame list"
+    );
+    assert!(
+        main.contains("} else if ws_wal_replay_refused {"),
+        "the confirm branch must be gated on the refusal — a refused pass leaves `replaying/` untouched"
+    );
+}
+
+#[test]
+fn both_lane_confirms_require_empty_producers_and_no_unlanded_batch() {
+    let lane = production("src/dhan_feed_stack.rs");
+    assert_eq!(
+        lane.matches("replay_rows_landed(&mut ingest,").count(),
+        2,
+        "both confirm sites go through replay_rows_landed"
+    );
+    assert!(
+        lane.contains("ingest.writer.pending() == 0 && ingest.depth_pending_rows() == 0"),
+        "rows retained in a producer after a full queue are RAM-only and must block the confirm"
+    );
+    assert_eq!(
+        lane.matches(".unlanded_total()").count(),
+        2,
+        "each refold snapshots the unlanded count before it folds"
+    );
+}
+
+#[test]
+fn the_drain_reset_is_bounded_by_the_ceiling_it_snapshotted_first() {
+    let lane = production("src/dhan_feed_stack.rs");
+    let snap = lane
+        .find("let catchup_ceiling_seq = tickvault_storage::ws_frame_spill::current_frame_seq();")
+        .expect("the catch-up snapshots the frame seq before its first round");
+    let reset = lane
+        .find("wm.reset_unapplied_below(catchup_ceiling_seq);")
+        .expect("the reset is the bounded form");
+    assert!(snap < reset, "snapshot before reset");
+    assert!(
+        !lane.contains("wm.reset_unapplied();"),
+        "the unbounded reset would clear buckets of frames shed during the drain"
+    );
+}
+
+#[test]
+fn the_lane_declares_whether_a_depth_sink_exists() {
+    let lane = production("src/dhan_feed_stack.rs");
+    assert!(lane.contains("wm.mark_depth_tracked();"));
+    assert!(lane.contains("wm.mark_depth_untracked();"));
+}
+
+#[test]
+fn out_of_order_rescues_never_ack_the_watermark() {
+    let ticks = production("../storage/src/tick_persistence.rs");
+    let depth = production("../storage/src/depth_persistence.rs");
+    for (name, src, f) in [
+        ("ticks", &ticks, "note_rescue_outcome_ticks("),
+        ("depth", &depth, "note_rescue_outcome_depth("),
+    ] {
+        let in_order = src
+            .matches(&format!("{f}true, (batch.min_seq, batch.max_seq), true)"))
+            .count()
+            + src
+                .matches(&format!("{f}false, (batch.min_seq, batch.max_seq), true)"))
+                .count();
+        assert_eq!(
+            in_order, 2,
+            "{name}: only the writer thread's own rescue is in order"
+        );
+        assert!(
+            src.contains(&format!("{f}landed, range, false)")),
+            "{name}: the inline producer rescue is out of order"
+        );
+        assert!(
+            src.contains(&format!(
+                "{f}landed, (batch.min_seq, batch.max_seq), false)"
+            )),
+            "{name}: the rescue thread is out of order"
+        );
+    }
 }

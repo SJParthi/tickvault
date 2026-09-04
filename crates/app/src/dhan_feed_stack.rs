@@ -9003,9 +9003,12 @@ pub const WAL_REPLAY_ACK_WAIT_SECS: u64 = 30;
 /// counted and coded; the caller then leaves the segments in `replaying/`,
 /// where the next boot's applied-watermark skips exactly the frames that did
 /// ack and replays the rest.
-fn wal_replay_acked(stage: &'static str) -> bool {
+fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
     let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
-    if wm.wait_for_offload_drained(std::time::Duration::from_secs(WAL_REPLAY_ACK_WAIT_SECS)) {
+    if wm.wait_for_offload_drained(
+        std::time::Duration::from_secs(WAL_REPLAY_ACK_WAIT_SECS),
+        unlanded_before,
+    ) {
         return true;
     }
     metrics::counter!(tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER)
@@ -9018,6 +9021,45 @@ fn wal_replay_acked(stage: &'static str) -> bool {
         "WAL replay: the writer threads did not ack the re-folded batch within the wait, so \
          its segments are NOT confirmed — they stay in `replaying/` and the next boot \
          re-offers whatever did not land. Nothing is archived unread."
+    );
+    false
+}
+
+/// The whole "did this replay batch land" question, in one place: the writer
+/// threads acked everything handed off, nothing landed nowhere since
+/// `unlanded_before`, AND both producers are EMPTY. The last clause is the one
+/// a bare counter wait cannot see — a flush that met a full queue keeps its
+/// rows in the producer's own buffer and reports `Ok`, so the counters balance
+/// while the rows exist only in RAM and the WAL segment about to be archived.
+/// One retry re-flushes those retained rows into a queue that has had a whole
+/// ack wait to drain.
+// TEST-EXEMPT: the three clauses are pinned separately — `wal_replay_acked` by the
+// storage tests on `wait_for_offload_drained`, the producer-empty clause by
+// `wal_applied_watermark_wiring_guard::both_lane_confirms_wait_for_the_writer_ack`.
+fn replay_rows_landed(ingest: &mut LiveIngest, stage: &'static str, unlanded_before: u64) -> bool {
+    for attempt in 0..2u8 {
+        if attempt > 0 {
+            blocking_flush(|| ingest.flush());
+        }
+        if !blocking_flush(|| wal_replay_acked(stage, unlanded_before)) {
+            return false;
+        }
+        if ingest.writer.pending() == 0 && ingest.depth_pending_rows() == 0 {
+            return true;
+        }
+    }
+    metrics::counter!(tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER)
+        .increment(1);
+    error!(
+        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+        source = "replay_rows_retained",
+        stage,
+        tick_rows = ingest.writer.pending(),
+        depth_rows = ingest.depth_pending_rows(),
+        "WAL replay: rows re-folded from the staged segments are still held in the \
+         producer buffers after two flushes (the writer queues stayed full), so the \
+         segments are NOT confirmed — they stay in `replaying/` and the next boot \
+         re-offers them. Nothing is archived while its only copy is in RAM."
     );
     false
 }
@@ -9946,6 +9988,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             );
             report_unfolded_wal_frames(&params.wal_replay_live_feed, "seal_writer_missing");
         } else {
+            let unlanded_before =
+                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
             let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
             if outcome.lost == 0 {
                 info!(
@@ -10029,7 +10073,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // ACK BEFORE CONFIRMING (2026-09-05): `flush` on the offloaded path
             // returns rows handed to a queue. Wait for the writer threads to
             // land or rescue them before the segments leave the replay path.
-            if blocking_flush(|| wal_replay_acked("boot_refold")) {
+            if replay_rows_landed(&mut ingest, "boot_refold", unlanded_before) {
                 tickvault_storage::ws_frame_spill::confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
                 );
@@ -10094,6 +10138,22 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // one state in which the applied-watermark's unapplied buckets can be
         // cleared: everything they guarded has been replayed and confirmed.
         let mut catchup_drained = false;
+        // Every segment this drain can confirm holds frames below THIS point;
+        // a shed from a socket dialed during the drain lands above it and its
+        // bucket must survive the reset at the end.
+        let catchup_ceiling_seq = tickvault_storage::ws_frame_spill::current_frame_seq();
+        {
+            // Tell the watermark whether a main-feed frame has a depth sink to
+            // be applied by at all. Without a sink `hwm_depth` never moves, so
+            // the min-of-both rule would never skip anything — the fix would
+            // be silently inert on a lane that persists ticks only.
+            let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+            if ingest.inline_depth.is_some() {
+                wm.mark_depth_tracked();
+            } else {
+                wm.mark_depth_untracked();
+            }
+        }
         let mem_ceiling_bytes = tickvault_storage::resource_monitor::resolve_memory_ceiling(
             &tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path(),
             std::path::Path::new("/proc/meminfo"),
@@ -10257,12 +10317,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 rounds = rounds.saturating_add(1);
                 continue;
             }
+            let unlanded_before =
+                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
             let outcome = refold_wal_frames(&mut ingest, &staged);
             let flushed = blocking_flush(|| ingest.flush());
-            // ACK BEFORE CONFIRMING — see `wal_replay_acked`. A timeout ends
+            // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
             // the drain rather than re-offering the same batch to a sink that
             // is not answering: the segments stay staged for the next boot.
-            if !blocking_flush(|| wal_replay_acked("catchup")) {
+            if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
                 break;
             }
             tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
@@ -10292,7 +10354,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // Every captured frame is now either in the database, in a spill
             // file, or archived — the unapplied map has nothing left to guard.
             let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
-            wm.reset_unapplied();
+            wm.reset_unapplied_below(catchup_ceiling_seq);
             wm.persist_now();
             info!(
                 rounds,

@@ -1643,6 +1643,14 @@ pub const MAX_PACKET_INDEX: u64 = (1 << PACKET_INDEX_BITS) - 1;
 /// per calendar year, against ≈236 years of headroom.
 static WAL_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The most recently allocated frame sequence, without allocating one. A
+/// catch-up drain snapshots it before its first round: every segment the
+/// drain can confirm holds frames below that point.
+#[must_use]
+pub fn current_frame_seq() -> u64 {
+    WAL_FRAME_SEQ.load(Ordering::Acquire)
+}
+
 pub fn next_frame_seq() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2615,8 +2623,13 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
 /// drive it are not at the mercy of the host's free disk; production must
 /// call THIS one, and `crates/app/tests` pins that it does.
 // TEST-EXEMPT: thin delegate; the fences are proven by replay_all_with_report_at's tests.
-pub fn replay_all_fenced<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
-    replay_all_with_report_fenced(wal_dir, WAL_REPLAY_MAX_BYTES).map(|batch| batch.frames)
+pub fn replay_all_fenced<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<WalReplayBatch> {
+    // The whole batch, not just the frames: a REFUSED pass returns an empty
+    // frame list with a stop flag set, and a caller that only saw the empty
+    // list would read "nothing to replay" and archive whatever an earlier boot
+    // left staged in `replaying/` — unread. The flags are how it tells the
+    // two apart.
+    replay_all_with_report_fenced(wal_dir, WAL_REPLAY_MAX_BYTES)
 }
 
 /// [`replay_all`] with an injectable RAM budget.
@@ -3023,10 +3036,17 @@ const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_watermark
     }
 }
 
-/// Header-only read of the FIRST record's `frame_seq`. `0` for a v1 record,
-/// an empty file, a torn header, or an unreadable path — every one of which
-/// means "unknown", and an unknown range is never skipped.
+/// The FIRST record's `frame_seq`, read and CRC-VERIFIED. `0` for a v1
+/// record, an empty file, a torn or corrupt first record, or an unreadable
+/// path — every one of which means "unknown", and an unknown range is never
+/// skipped. Verified rather than header-only because this value bounds the
+/// PREVIOUS segment's skip range: a bit-flip in the seq bytes that read as a
+/// plausibly lower number would narrow that range and let a segment be
+/// skipped while its real tail sits above the watermark.
 fn first_frame_seq_in_segment(path: &Path) -> u64 {
+    // A frame larger than this in the first record is not a record this
+    // writer produced; refuse to allocate for it.
+    const FIRST_RECORD_PROBE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
     let Ok(mut f) = File::open(path) else {
         return 0;
     };
@@ -3039,14 +3059,74 @@ fn first_frame_seq_in_segment(path: &Path) -> u64 {
             Err(_) => return 0,
         }
     }
-    if filled < WAL_MIN_RECORD_V2 {
-        return 0;
-    }
     let magic = &head[0..4];
-    if magic != WAL_MAGIC_V2 && magic != WAL_MAGIC_V3 && magic != WAL_MAGIC_V4 {
+    let is_v4 = magic == WAL_MAGIC_V4;
+    let is_v3 = magic == WAL_MAGIC_V3;
+    let is_v2 = magic == WAL_MAGIC_V2;
+    let (min_rec, len_off) = if is_v4 {
+        (WAL_MIN_RECORD_V4, 22)
+    } else if is_v3 {
+        (WAL_MIN_RECORD_V3, 21)
+    } else if is_v2 {
+        (WAL_MIN_RECORD_V2, 13)
+    } else {
+        return 0;
+    };
+    if filled < min_rec {
         return 0;
     }
-    head[5..13].try_into().map(u64::from_le_bytes).unwrap_or(0)
+    let Some(frame_seq) = head
+        .get(5..13)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+    else {
+        return 0;
+    };
+    let Some(frame_len) = head
+        .get(len_off..len_off + 4)
+        .and_then(|b| b.try_into().ok())
+        .map(|b| u32::from_le_bytes(b) as usize)
+    else {
+        return 0;
+    };
+    if frame_len > FIRST_RECORD_PROBE_MAX_FRAME_BYTES {
+        return 0;
+    }
+    let record_len = len_off + 4 + frame_len + 4;
+    let mut record = vec![0u8; record_len]; // APPROVED: boot replay skip pass, one record, cold path
+    let copied = filled.min(record_len);
+    record[..copied].copy_from_slice(&head[..copied]);
+    if copied < record_len && std::io::Read::read_exact(&mut f, &mut record[copied..]).is_err() {
+        return 0;
+    }
+    let frame = &record[len_off + 4..len_off + 4 + frame_len];
+    let len_le = &record[len_off..len_off + 4];
+    let ws_byte = record[4];
+    let actual = if is_v4 {
+        crc32_ieee_of(&[
+            &[ws_byte],
+            &record[5..13],
+            &record[13..21],
+            &[record[21]],
+            len_le,
+            frame,
+        ])
+    } else if is_v3 {
+        crc32_ieee_of(&[&[ws_byte], &record[5..13], &record[13..21], len_le, frame])
+    } else {
+        crc32_ieee_of(&[&[ws_byte], &record[5..13], len_le, frame])
+    };
+    let Some(expected) = record
+        .get(record_len - 4..)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return 0;
+    };
+    if actual != expected {
+        return 0;
+    }
+    frame_seq
 }
 
 /// [`replay_all_with_report`] with the disk probe and the per-boot frame count
@@ -7629,7 +7709,43 @@ mod tests {
         std::fs::write(&empty, b"").unwrap();
         assert_eq!(first_frame_seq_in_segment(&empty), 0);
         assert_eq!(first_frame_seq_in_segment(&dir.join("missing.wal")), 0);
+        // A corrupt FIRST record reads as unknown, never as its (possibly
+        // flipped) seq bytes: this value bounds the previous segment's skip
+        // range, so a bit-flip here must widen the range, never narrow it.
+        let corrupt = dir.join("corrupt.wal");
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[7] ^= 0x01; // inside the seq field of the first record
+        std::fs::write(&corrupt, &bytes).unwrap();
+        assert_eq!(first_frame_seq_in_segment(&corrupt), 0);
+        let torn = dir.join("torn.wal");
+        std::fs::write(&torn, &std::fs::read(&p).unwrap()[..WAL_MIN_RECORD_V4 + 2]).unwrap();
+        assert_eq!(first_frame_seq_in_segment(&torn), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_all_fenced_returns_the_batch_so_a_refusal_is_visible_to_the_caller() {
+        // A refused pass must be distinguishable from "nothing to replay": the
+        // boot path confirms on the latter and must not on the former.
+        let dir = tmp_dir("wm-fenced-batch");
+        let batch = replay_all_fenced(&dir).expect("empty dir replays cleanly");
+        assert!(batch.frames.is_empty());
+        assert!(!batch.stopped_for_disk || batch.frames.is_empty());
+        // The flags are the caller's signal; they exist on the returned type.
+        let _ = (
+            batch.stopped_for_disk,
+            batch.stopped_for_frame_cap,
+            batch.skipped_segments,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_frame_seq_reads_the_last_allocation_without_allocating() {
+        let allocated = next_frame_seq();
+        assert_eq!(current_frame_seq(), allocated);
+        assert_eq!(current_frame_seq(), allocated, "a read allocates nothing");
+        assert!(next_frame_seq() > current_frame_seq() - 1);
     }
 }
 

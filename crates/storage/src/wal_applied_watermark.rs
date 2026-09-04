@@ -379,6 +379,11 @@ pub struct AppliedWatermark {
     /// Highest ack received while suspect, per sink.
     suspect_max_ticks: AtomicU64,
     suspect_max_depth: AtomicU64,
+    /// Batches whose rows landed NOWHERE — the ILP write failed AND the
+    /// rescue to the spill tier failed. Monotone. The replay confirm compares
+    /// it before and after a batch: a batch that lost rows must never have its
+    /// WAL segment archived, because the segment is now the ONLY copy.
+    unlanded: AtomicU64,
 }
 
 static APPLIED: AppliedWatermark = AppliedWatermark::new();
@@ -417,6 +422,7 @@ impl AppliedWatermark {
             healthy_depth: AtomicU64::new(0),
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
+            unlanded: AtomicU64::new(0),
         }
     }
 
@@ -536,6 +542,14 @@ impl AppliedWatermark {
         self.depth_untracked.store(true, Ordering::Release);
     }
 
+    /// The lane HAS a depth sink: a main-feed frame is applied only when both
+    /// sinks acked it. Clears a flag persisted by an earlier session that ran
+    /// without one, so enabling depth persistence never inherits the weaker
+    /// rule from the file.
+    pub fn mark_depth_tracked(&self) {
+        self.depth_untracked.store(false, Ordering::Release);
+    }
+
     /// A captured frame at `seq` will NOT be applied by this session (shed at
     /// the ring, append failed, rescue failed). Its bucket is marked so replay
     /// never skips a segment overlapping it. Three atomics, cold arm only.
@@ -616,12 +630,52 @@ impl AppliedWatermark {
     /// remain on disk, so the bucket table starts clean. Called by the lane
     /// ONLY when the catch-up ended with zero deferred segments.
     pub fn reset_unapplied(&self) {
+        self.reset_unapplied_below(u64::MAX);
+    }
+
+    /// [`Self::reset_unapplied`] for the buckets BELOW `ceiling_seq` only.
+    /// The catch-up drain snapshots the frame sequence when it starts; every
+    /// segment it can have confirmed holds frames below that point, so those
+    /// buckets have nothing left to guard — but a frame shed from a socket
+    /// dialed DURING the drain sits in the writer's open segment, above the
+    /// ceiling, and its bucket must survive. `overflowed` is cleared only
+    /// when nothing above the ceiling remains: a wrapped table cannot say
+    /// which ids it lost.
+    pub fn reset_unapplied_below(&self, ceiling_seq: u64) {
+        let ceiling_id = ceiling_seq >> UNAPPLIED_BUCKET_SHIFT;
+        let mut kept = 0usize;
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, boot-time reset
         for i in 0..UNAPPLIED_BUCKETS {
-            self.bucket_ids[i].store(0, Ordering::Release);
-            self.bucket_counts[i].store(0, Ordering::Release);
+            let id = self.bucket_ids[i].load(Ordering::Acquire);
+            if id == 0 {
+                continue;
+            }
+            if id < ceiling_id {
+                self.bucket_ids[i].store(0, Ordering::Release);
+                self.bucket_counts[i].store(0, Ordering::Release);
+            } else {
+                kept += 1;
+            }
         }
-        self.overflowed.store(false, Ordering::Release);
+        if kept == 0 {
+            self.overflowed.store(false, Ordering::Release);
+        }
+    }
+
+    /// A batch's rows landed NOWHERE: the ILP write failed and the rescue to
+    /// the spill tier failed. The bucket mark (made by the caller through
+    /// [`Self::note_unapplied_range`]) keeps the next boot from skipping it;
+    /// this counter keeps THIS boot from archiving it.
+    pub fn note_unlanded(&self) {
+        self.unlanded.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Monotone count of batches that landed nowhere. Snapshot it before a
+    /// replay batch is folded; hand the snapshot to
+    /// [`Self::wait_for_offload_drained`].
+    #[must_use]
+    pub fn unlanded_total(&self) -> u64 {
+        self.unlanded.load(Ordering::Acquire)
     }
 
     /// A batch left the producer for the tick writer thread.
@@ -648,11 +702,18 @@ impl AppliedWatermark {
     /// `flush()` on the offloaded path returns rows HANDED OFF, not rows
     /// landed, and `confirm_replayed` archived on the strength of it.
     #[must_use]
-    pub fn wait_for_offload_drained(&self, timeout: Duration) -> bool {
+    pub fn wait_for_offload_drained(&self, timeout: Duration, unlanded_before: u64) -> bool {
         let target_ticks = self.ticks_handed_off.load(Ordering::Acquire);
         let target_depth = self.depth_handed_off.load(Ordering::Acquire);
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            // A completion is not a landing. A batch whose ILP write failed
+            // AND whose rescue failed still completes — and its rows exist
+            // only in the WAL segment the caller is about to archive. So the
+            // wait is also "nothing was lost since the caller's snapshot".
+            if self.unlanded.load(Ordering::Acquire) != unlanded_before {
+                return false;
+            }
             if self.ticks_completed.load(Ordering::Acquire) >= target_ticks
                 && self.depth_completed.load(Ordering::Acquire) >= target_depth
             {
@@ -1010,22 +1071,22 @@ mod tests {
     fn wait_for_offload_drained_tracks_handed_off_against_completed() {
         let wm = AppliedWatermark::new();
         assert!(
-            wm.wait_for_offload_drained(Duration::from_millis(1)),
+            wm.wait_for_offload_drained(Duration::from_millis(1), 0),
             "nothing pending"
         );
         wm.note_ticks_handed_off();
         wm.note_depth_handed_off();
         assert!(
-            !wm.wait_for_offload_drained(Duration::from_millis(60)),
+            !wm.wait_for_offload_drained(Duration::from_millis(60), 0),
             "two batches in flight"
         );
         wm.note_ticks_completed();
         assert!(
-            !wm.wait_for_offload_drained(Duration::from_millis(60)),
+            !wm.wait_for_offload_drained(Duration::from_millis(60), 0),
             "depth still in flight"
         );
         wm.note_depth_completed();
-        assert!(wm.wait_for_offload_drained(Duration::from_millis(1)));
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), 0));
     }
 
     #[test]
@@ -1143,5 +1204,71 @@ mod tests {
             AppliedSnapshot::load(&dir).is_some(),
             "the live file is written fresh once the symlink is out of the way"
         );
+    }
+
+    #[test]
+    fn unlanded_total_and_note_unlanded_fail_the_ack_wait_for_a_batch_that_landed_nowhere() {
+        let wm = AppliedWatermark::new_for_tests();
+        let before = wm.unlanded_total();
+        wm.note_ticks_handed_off();
+        wm.note_ticks_completed();
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), before));
+        // The writer completed a batch whose ILP write AND rescue failed: the
+        // counters balance, the rows are in the WAL segment only.
+        wm.note_ticks_handed_off();
+        wm.note_unlanded();
+        wm.note_ticks_completed();
+        assert!(
+            !wm.wait_for_offload_drained(Duration::from_millis(1), before),
+            "a completion that landed nowhere must not let the segment be archived"
+        );
+        // A caller that snapshots AFTER the loss is not blocked by it.
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), wm.unlanded_total()));
+    }
+
+    #[test]
+    fn reset_unapplied_below_keeps_buckets_captured_after_the_ceiling() {
+        let wm = AppliedWatermark::new_for_tests();
+        let old = seq(10);
+        let ceiling = seq(10) + (5u64 << UNAPPLIED_BUCKET_SHIFT);
+        let new = ceiling + (1u64 << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied(old);
+        wm.note_unapplied(new);
+        wm.reset_unapplied_below(ceiling);
+        let snap = wm.snapshot();
+        assert!(
+            !snap.range_has_unapplied(old, old),
+            "a bucket below the ceiling was confirmed and is cleared"
+        );
+        assert!(
+            snap.range_has_unapplied(new, new),
+            "a bucket above the ceiling — a shed during the drain — survives"
+        );
+        assert!(!snap.overflowed);
+        wm.reset_unapplied_below(u64::MAX);
+        assert!(!wm.snapshot().range_has_unapplied(new, new));
+    }
+
+    #[test]
+    fn mark_depth_tracked_clears_a_persisted_untracked_flag() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.seed(&AppliedSnapshot {
+            depth_untracked: true,
+            ..AppliedSnapshot::default()
+        });
+        assert!(wm.snapshot().depth_untracked);
+        wm.mark_depth_tracked();
+        assert!(!wm.snapshot().depth_untracked);
+        wm.mark_depth_untracked();
+        assert!(wm.snapshot().depth_untracked);
+    }
+
+    #[test]
+    fn note_unlanded_increments_the_monotone_total() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.unlanded_total(), 0);
+        wm.note_unlanded();
+        wm.note_unlanded();
+        assert_eq!(wm.unlanded_total(), 2, "monotone: it never goes back down");
     }
 }
