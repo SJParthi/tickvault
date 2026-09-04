@@ -943,7 +943,7 @@ async fn async_main() -> Result<()> {
         bytes::Bytes,
     )> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
-    match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
+    match tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path) {
         Ok(recovered) => {
             if recovered.is_empty() {
                 info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");

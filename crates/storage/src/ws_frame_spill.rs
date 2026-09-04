@@ -718,6 +718,9 @@ pub struct WsFrameSpill {
     /// paths hold: there is no `self` to consume. The lock is taken exactly
     /// once, at shutdown, and never on the append path.
     writer: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
+    /// Where this spill's segments live — so `Drop` can release ONLY its own
+    /// open-segment registration, never another spill's in the same process.
+    wal_dir: PathBuf,
     /// The exclusive claim on the WAL directory, held for as long as this spill
     /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
     /// release it on drop so the next process can start. See [`WalDirGuard`].
@@ -786,6 +789,10 @@ impl WsFrameSpill {
         // 3. Only THEN spawn the writer thread, so nothing can append at a
         //    sequence below the high-water mark.
         let disk_high = seed_frame_seq_from_disk(&wal_dir);
+        // The applied-watermark lives beside the segments and is seeded from
+        // its file HERE, before the first sink can persist — otherwise the
+        // first in-session persist would overwrite a good snapshot with zeros.
+        crate::wal_applied_watermark::applied_watermark().bind(&wal_dir);
         if disk_high > 0 {
             tracing::debug!(
                 wal_dir = ?wal_dir,
@@ -882,6 +889,7 @@ impl WsFrameSpill {
             feed_health: None,
             stop,
             writer: std::sync::Mutex::new(Some(writer)),
+            wal_dir,
             _dir_guard: dir_guard,
         })
     }
@@ -928,6 +936,7 @@ impl WsFrameSpill {
             feed_health: None,
             stop: Arc::new(AtomicBool::new(false)),
             writer: std::sync::Mutex::new(None),
+            wal_dir: dir.clone(),
             _dir_guard: dir_guard,
         }
     }
@@ -1224,6 +1233,11 @@ impl WsFrameSpill {
     /// deliberately does not claim to have changed it.
     pub fn shutdown(&self, budget: Duration) -> usize {
         self.stop.store(true, Ordering::Release);
+        // Last chance to record what this session applied. The sink threads
+        // persist at most once a second; a clean stop must not lose the last
+        // second's acks, because that is exactly the tail the next boot would
+        // otherwise replay.
+        crate::wal_applied_watermark::applied_watermark().persist_now();
 
         let deadline = Instant::now() + budget;
 
@@ -1370,6 +1384,8 @@ fn writer_loop(
                 if stop.load(Ordering::Acquire) {
                     flush_on_exit(&mut current, "flush_on_stop");
                     info!("ws-frame-spill-writer stop requested and queue drained; exiting");
+                    // The writer is gone: its last segment is closed and replayable again.
+                    clear_open_segment_under(wal_dir);
                     return Ok(());
                 }
                 continue;
@@ -1389,6 +1405,7 @@ fn writer_loop(
                 // the rotation arm were the two that did not.
                 flush_on_exit(&mut current, "flush_on_close");
                 info!("ws-frame-spill-writer channel closed; exiting");
+                clear_open_segment_under(wal_dir);
                 return Ok(());
             }
         };
@@ -2276,7 +2293,69 @@ fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
         .append(true)
         .open(&path)
         .map_err(|e| anyhow::anyhow!("open WAL segment {:?}: {e}", path))?;
+    set_open_segment(path);
     Ok(BufWriter::with_capacity(WAL_WRITER_BUFFER, f))
+}
+
+/// The segment the writer thread is APPENDING to right now, so a replay that
+/// runs while the writer is live never stages it.
+///
+/// Found 2026-09-04 by reading, not by an incident: the writer opens its first
+/// segment at thread start, which is BEFORE the lane's catch-up drain runs,
+/// and `wal_segments_in` listed every `*.wal` in the live directory. So the
+/// last catch-up round could stage the writer's OPEN segment into `replaying/`
+/// and `confirm_replayed` could then archive it — while the writer kept
+/// appending to the same inode. Every frame written after that point would sit
+/// in a directory the next boot never reads. The current session's first
+/// ~128 MiB of capture, silently outside the recovery path.
+///
+/// A path, not a nanos floor: this is a process-global and the test suite runs
+/// many spills in one process, so a numeric floor from one test would hide
+/// another test's segments. An exact-path match excludes precisely the one
+/// file that is open. Cleared when the writer exits, so a shut-down spill's
+/// last segment is replayable again.
+// Process-global registry initialised ONCE at program start, bounded by the number of live
+// writers (one in production), touched only at segment rotation / writer exit / replay staging.
+// APPROVED: never on the per-frame append path — the Vec is a static, not a per-frame allocation.
+static OPEN_SEGMENTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Registers `path` as the open segment of its directory, replacing any
+/// earlier registration for the same directory. One entry per live spill —
+/// one in production, a handful in the test suite — so the vector is bounded
+/// by the number of writers that exist, and cleared as each one exits.
+fn set_open_segment(path: PathBuf) {
+    if let Ok(mut open) = OPEN_SEGMENTS.lock() {
+        let dir = path.parent();
+        open.retain(|p| p.parent() != dir); // O(1) EXEMPT: bounded by live writers, rotation-time only
+        open.push(path); // APPROVED: rotation-time registration, not the per-frame append
+    }
+}
+
+/// Releases the registration(s) under `wal_dir` ONLY — so a spill going away
+/// never hides or reveals another spill's segment in the same process.
+fn clear_open_segment_under(wal_dir: &Path) {
+    if let Ok(mut open) = OPEN_SEGMENTS.lock() {
+        open.retain(|p| !p.starts_with(wal_dir)); // O(1) EXEMPT: bounded by live writers, exit-time only
+    }
+}
+
+impl Drop for WsFrameSpill {
+    fn drop(&mut self) {
+        // The sender is going away with `self`, so no frame can reach the
+        // writer after this point; the writer exits on its next poll. Release
+        // the registration NOW rather than up to one poll interval later, so
+        // a replay that follows the drop sees the closed segment.
+        if !self.wal_dir.as_os_str().is_empty() {
+            clear_open_segment_under(&self.wal_dir);
+        }
+    }
+}
+
+fn is_open_segment(path: &Path) -> bool {
+    OPEN_SEGMENTS
+        .lock()
+        .map(|open| open.iter().any(|p| p == path)) // O(1) EXEMPT: bounded by live writers, replay-time only
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2455,9 +2534,89 @@ pub const WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER: &str = "tv_wal_replay_truncated
 /// than no number at all.
 pub const WAL_REPLAY_ABANDONED_BYTES_COUNTER: &str = "tv_wal_replay_abandoned_bytes_total";
 
+/// Stop replaying when the WAL volume has less than this free.
+///
+/// MEASURED 2026-09-03: a restart that replays a session's backlog costs
+/// **25–75 GB of disk** — the refold DEDUP-upserts into hour partitions and
+/// rescues whatever the sink cannot land into spill files. Seven restarts
+/// consumed ~300 GB and the volume reached 20 KB free. Replay is recovery; a
+/// recovery that fills the disk destroys the session it was recovering for.
+/// 40 GiB is roughly one restart's worst measured cost with margin, on a
+/// 600 GB volume. Assumed until `tv_spill_dir_free_bytes` deltas across a
+/// restart on the watermarked build re-derive it.
+pub const WAL_REPLAY_DISK_FLOOR_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+
+/// The floor for a volume of `total_bytes`: the 40 GiB constant, or one
+/// eighth of the volume when that is smaller. On the 600 GB box the constant
+/// wins (600/8 = 75 GB > 40 GiB); on a small CI or dev volume the fraction
+/// does, so the fence scales rather than refusing every replay on a host
+/// that never had 40 GiB to begin with.
+#[must_use]
+pub const fn wal_replay_disk_floor_bytes(total_bytes: u64) -> u64 {
+    let eighth = total_bytes / 8;
+    if eighth < WAL_REPLAY_DISK_FLOOR_BYTES {
+        eighth
+    } else {
+        WAL_REPLAY_DISK_FLOOR_BYTES
+    }
+}
+
+/// Total frames one BOOT may replay across STAGE-C and every catch-up round.
+///
+/// ~1.4× the 2.2 M frames a full-session backlog measured on 2026-09-03. A
+/// backlog past this is a capacity problem the next boot inherits, deferred
+/// and counted rather than materialised until something dies.
+pub const WAL_REPLAY_MAX_FRAMES_PER_BOOT: u64 = 3_000_000;
+
+/// Segments the applied-watermark let this pass ARCHIVE UNREAD.
+pub const WAL_REPLAY_SKIPPED_SEGMENTS_COUNTER: &str = "tv_wal_replay_skipped_segments_total";
+/// Frames inside a boundary segment that were read and then dropped as
+/// already applied.
+pub const WAL_REPLAY_SKIPPED_FRAMES_COUNTER: &str = "tv_wal_replay_skipped_frames_total";
+/// Bytes of segment file the skip never read.
+pub const WAL_REPLAY_SKIPPED_BYTES_COUNTER: &str = "tv_wal_replay_skipped_bytes_total";
+/// Passes refused because the volume was under [`WAL_REPLAY_DISK_FLOOR_BYTES`].
+pub const WAL_REPLAY_DISK_FLOOR_STOPS_COUNTER: &str = "tv_wal_replay_disk_floor_stops_total";
+/// Passes refused because [`WAL_REPLAY_MAX_FRAMES_PER_BOOT`] was reached.
+pub const WAL_REPLAY_FRAME_CAP_STOPS_COUNTER: &str = "tv_wal_replay_frame_cap_stops_total";
+/// The lane gave up waiting for the writer threads to ack a replayed batch
+/// before confirming it (the segments stay in `replaying/`).
+pub const WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER: &str = "tv_wal_replay_ack_wait_timeouts_total";
+
+/// Frames returned by every replay pass of this process, for the per-boot cap.
+static WAL_REPLAY_FRAMES_THIS_BOOT: AtomicU64 = AtomicU64::new(0);
+
+/// Kill switch: `TV_WAL_APPLIED_SKIP=0` makes replay ignore the watermark
+/// file (it is still written). Deleting `applied.tvaw` has the same effect.
+pub const WAL_APPLIED_SKIP_ENV: &str = "TV_WAL_APPLIED_SKIP";
+
+fn applied_skip_enabled() -> bool {
+    // APPROVED: one env read per boot-time replay pass, cold path
+    // Any of the usual "off" spellings disables skipping; anything else — including a
+    // typo — keeps the default. The default is the SAFE direction only in the sense
+    // that skipping is proven by the tests; an operator who wants a full replay
+    // should check the boot log line that reports how many segments were skipped.
+    std::env::var(WAL_APPLIED_SKIP_ENV).map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
 pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
     replay_all_with_budget(wal_dir, WAL_REPLAY_MAX_BYTES)
+}
+
+/// The PRODUCTION form of [`replay_all`] — STAGE-C boot replay — fenced by
+/// the disk floor and the per-boot frame cap exactly like every catch-up
+/// round. `replay_all` itself stays unfenced so the sixty-odd fixtures that
+/// drive it are not at the mercy of the host's free disk; production must
+/// call THIS one, and `crates/app/tests` pins that it does.
+// TEST-EXEMPT: thin delegate; the fences are proven by replay_all_with_report_at's tests.
+pub fn replay_all_fenced<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
+    replay_all_with_report_fenced(wal_dir, WAL_REPLAY_MAX_BYTES).map(|batch| batch.frames)
 }
 
 /// [`replay_all`] with an injectable RAM budget.
@@ -2501,6 +2660,16 @@ pub struct WalReplayBatch {
     /// and the two have different remedies (more RAM / fewer rows per frame
     /// versus a bigger byte budget).
     pub stopped_for_memory: bool,
+    /// Segments the applied-watermark archived UNREAD this pass.
+    pub skipped_segments: u64,
+    /// Frames read from boundary segments and dropped as already applied.
+    pub skipped_frames: u64,
+    /// Bytes of segment file the skip never read.
+    pub skipped_bytes: u64,
+    /// `true` when the pass was refused on [`WAL_REPLAY_DISK_FLOOR_BYTES`].
+    pub stopped_for_disk: bool,
+    /// `true` when the pass was refused on [`WAL_REPLAY_MAX_FRAMES_PER_BOOT`].
+    pub stopped_for_frame_cap: bool,
 }
 
 /// Should THIS deferral page the operator?
@@ -2559,6 +2728,64 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // bare live dir) instead of by capture time, breaking cross-source FIFO.
     segments.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot replay — this sort IS the FIFO-order invariant
 
+    // APPLIED-WATERMARK SKIP (2026-09-05). Every segment whose entire sequence
+    // range is below the watermark and overlaps no unapplied bucket is moved
+    // STRAIGHT to `archive/`, unread. The bytes never leave the disk, the
+    // frames never materialise, and nothing is refolded. The remaining
+    // segments are read as before; the boundary one is filtered per frame in
+    // `replay_segment_filtered`. See `wal_applied_watermark` for why every
+    // failure direction of this decision is "replay more".
+    let applied = if applied_skip_enabled() {
+        crate::wal_applied_watermark::AppliedSnapshot::load(wal_dir)
+    } else {
+        None
+    };
+    let mut skipped_segments = 0u64;
+    let mut skipped_bytes = 0u64;
+    if let Some(applied) = applied.as_ref() {
+        let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
+        // A segment's range is `[its first seq, next segment's first seq − 1]`.
+        // The LAST segment has no upper bound and is always read.
+        // O(1) EXEMPT: boot replay, one header read per segment, cold path
+        let firsts: Vec<u64> = segments
+            .iter()
+            .map(|p| first_frame_seq_in_segment(p))
+            .collect(); // APPROVED: boot-time WAL replay, cold path
+        let mut keep: Vec<PathBuf> = Vec::with_capacity(segments.len()); // APPROVED: boot-time WAL replay, cold path
+        for (idx, path) in segments.iter().enumerate() {
+            let lo = firsts[idx];
+            let hi = firsts.get(idx + 1).copied().and_then(|n| n.checked_sub(1));
+            let skip = match hi {
+                Some(hi) if hi > 0 => segment_range_is_applied(applied, lo, hi),
+                _ => false,
+            };
+            if !skip {
+                keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
+                continue;
+            }
+            let Some(name) = path.file_name() else {
+                keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
+                continue;
+            };
+            drop(std::fs::create_dir_all(&archive_dir)); // O(1) EXEMPT: boot replay skip, cold path
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0); // O(1) EXEMPT: boot replay skip, cold path
+            // O(1) EXEMPT: boot replay skip, cold path
+            match std::fs::rename(path, archive_dir.join(name)) {
+                Ok(()) => {
+                    skipped_segments = skipped_segments.saturating_add(1);
+                    skipped_bytes = skipped_bytes.saturating_add(bytes);
+                }
+                Err(err) => {
+                    // Not archived → still a `*.wal` → read it as before.
+                    warn!(segment = ?path, error = %err, "could not archive an applied WAL segment; replaying it instead");
+                    keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
+                }
+            }
+        }
+        segments = keep;
+    }
+    let mut skipped_frames = 0u64;
+
     let mut frames = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut corrupted = 0usize;
     // Bytes of frame payload held so far, and how many segments were actually
@@ -2591,8 +2818,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             stopped_for_memory = true;
             break;
         }
-        match replay_segment(path) {
-            Ok(mut batch) => {
+        match replay_segment_filtered(path, applied.as_ref()) {
+            Ok((mut batch, dropped)) => {
+                skipped_frames = skipped_frames.saturating_add(dropped);
                 for f in &batch {
                     bytes_held = bytes_held.saturating_add(f.frame.len());
                 }
@@ -2697,12 +2925,20 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         );
     }
 
+    metrics::counter!(WAL_REPLAY_SKIPPED_SEGMENTS_COUNTER).increment(skipped_segments);
+    metrics::counter!(WAL_REPLAY_SKIPPED_FRAMES_COUNTER).increment(skipped_frames);
+    metrics::counter!(WAL_REPLAY_SKIPPED_BYTES_COUNTER).increment(skipped_bytes);
+    WAL_REPLAY_FRAMES_THIS_BOOT.fetch_add(frames.len() as u64, Ordering::AcqRel);
     info!(
         wal_dir = ?wal_dir,
         segments = segments.len(),
         replaying_leftovers = leftover_count,
         frames_replayed = frames.len(),
         corrupted_segments = corrupted,
+        skipped_segments,
+        skipped_frames,
+        skipped_bytes,
+        watermark_present = applied.is_some(),
         "WAL replay complete"
     );
 
@@ -2754,7 +2990,138 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         bytes_replayed: bytes_held as u64,
         budget_bytes: budget_bytes as u64,
         stopped_for_memory,
+        skipped_segments,
+        skipped_frames,
+        skipped_bytes,
+        stopped_for_disk: false,
+        stopped_for_frame_cap: false,
     })
+}
+
+/// `true` when the whole `[lo, hi]` range is applied for EVERY sink a frame in
+/// it could feed. A segment mixes main-feed and depth frames, and a
+/// main-feed frame feeds both sinks, so the segment-level decision takes the
+/// stricter of the two.
+fn segment_range_is_applied(
+    applied: &crate::wal_applied_watermark::AppliedSnapshot,
+    lo: u64,
+    hi: u64,
+) -> bool {
+    use crate::wal_applied_watermark::AppliedSink;
+    applied.range_is_applied(AppliedSink::Ticks, lo, hi)
+        && applied.range_is_applied(AppliedSink::Depth, lo, hi)
+}
+
+/// Which watermark a replayed frame answers to, from its TVW4 endpoint.
+const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_watermark::AppliedSink {
+    use crate::wal_applied_watermark::AppliedSink;
+    match endpoint {
+        WalEndpoint::Depth20 | WalEndpoint::Depth200 => AppliedSink::Depth,
+        // Order-update frames have no sink and never advance a watermark; the
+        // tick watermark is the stricter of the two for a main-feed frame.
+        WalEndpoint::MainFeed | WalEndpoint::OrderUpdate => AppliedSink::Ticks,
+    }
+}
+
+/// Header-only read of the FIRST record's `frame_seq`. `0` for a v1 record,
+/// an empty file, a torn header, or an unreadable path — every one of which
+/// means "unknown", and an unknown range is never skipped.
+fn first_frame_seq_in_segment(path: &Path) -> u64 {
+    let Ok(mut f) = File::open(path) else {
+        return 0;
+    };
+    let mut head = [0u8; WAL_MIN_RECORD_V4];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        match std::io::Read::read(&mut f, &mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return 0,
+        }
+    }
+    if filled < WAL_MIN_RECORD_V2 {
+        return 0;
+    }
+    let magic = &head[0..4];
+    if magic != WAL_MAGIC_V2 && magic != WAL_MAGIC_V3 && magic != WAL_MAGIC_V4 {
+        return 0;
+    }
+    head[5..13].try_into().map(u64::from_le_bytes).unwrap_or(0)
+}
+
+/// [`replay_all_with_report`] with the disk probe and the per-boot frame count
+/// INJECTED, so both refusals are testable without a full volume or three
+/// million frames. A refused pass returns an EMPTY batch with the matching
+/// flag set and touches no file: every segment stays a `*.wal`, re-globbed by
+/// the next pass or the next boot.
+// TEST-EXEMPT: covered by replay_refuses_below_the_disk_floor_and_touches_nothing + replay_refuses_past_the_per_boot_frame_cap
+pub fn replay_all_with_report_at<P: AsRef<Path>>(
+    wal_dir: P,
+    budget_bytes: usize,
+    disk: crate::disk_health_watcher::DiskHealthOutcome,
+    frames_so_far: u64,
+) -> anyhow::Result<WalReplayBatch> {
+    let wal_dir = wal_dir.as_ref();
+    let refused = |stopped_for_disk: bool| WalReplayBatch {
+        budget_bytes: budget_bytes as u64,
+        stopped_for_disk,
+        stopped_for_frame_cap: !stopped_for_disk,
+        ..WalReplayBatch::default()
+    };
+    if frames_so_far >= WAL_REPLAY_MAX_FRAMES_PER_BOOT {
+        metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(1);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_frame_cap",
+            frames_so_far,
+            cap = WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+            "WAL replay REFUSED: this boot has already replayed the per-boot frame cap. \
+             Nothing is stranded — every unread segment stays a `*.wal` file for the next \
+             boot — but a backlog this size is a capacity problem, not a recovery one."
+        );
+        return Ok(refused(false));
+    }
+    match disk {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok {
+            free_bytes,
+            total_bytes,
+        } if free_bytes < wal_replay_disk_floor_bytes(total_bytes) => {
+            metrics::counter!(WAL_REPLAY_DISK_FLOOR_STOPS_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "replay_disk_floor",
+                free_bytes,
+                total_bytes,
+                floor_bytes = wal_replay_disk_floor_bytes(total_bytes),
+                wal_dir = ?wal_dir,
+                "WAL replay REFUSED: the volume is under the replay disk floor. A replay \
+                 costs tens of GB of DEDUP churn and spill on this box (measured 25–75 GB \
+                 per restart on 2026-09-03), and a recovery that fills the disk destroys the \
+                 session it was recovering for. Nothing is stranded — every segment stays a \
+                 `*.wal` file — but nothing is recovered until space is freed."
+            );
+            return Ok(refused(true));
+        }
+        // A failed probe is fail-OPEN, exactly as the memory guard is on a
+        // host where `/proc` does not resolve: today's behaviour, counted by
+        // the disk watcher's own probe-failure signal.
+        _ => {}
+    }
+    replay_all_with_report_guarded(
+        wal_dir,
+        budget_bytes,
+        || crate::resource_monitor::probe_vmrss_bytes(Path::new("/proc/self/status")),
+        resolved_memory_ceiling_bytes(),
+        WAL_REPLAY_RSS_STOP_PCT,
+    )
+}
+
+fn resolved_memory_ceiling_bytes() -> Option<u64> {
+    crate::resource_monitor::resolve_memory_ceiling(
+        &crate::resource_monitor::resolve_cgroup_memory_max_path(),
+        Path::new("/proc/meminfo"),
+    )
+    .bytes()
 }
 
 /// One replay pass under the REAL host memory guard.
@@ -2787,18 +3154,50 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
     // The doc comment above claims this uses "the same `resolve_memory_ceiling`
     // the resource monitor and RESOURCE-02 use, so the guard and the alarm can
     // never disagree." That sentence was false for as long as the path was
-    // hardcoded. It is true now.
-    let ceiling = crate::resource_monitor::resolve_memory_ceiling(
-        &crate::resource_monitor::resolve_cgroup_memory_max_path(),
-        Path::new("/proc/meminfo"),
-    )
-    .bytes();
+    // hardcoded. It is true now (`resolved_memory_ceiling_bytes`).
+    //
+    // 2026-09-05: this form carries the MEMORY guard only. The disk floor and
+    // the per-boot frame cap live in `replay_all_with_report_fenced`, which is
+    // what production calls; this one stays unfenced so a fixture on a
+    // small-disk host can still exercise the replay itself.
     replay_all_with_report_guarded(
         wal_dir,
         budget_bytes,
         || crate::resource_monitor::probe_vmrss_bytes(Path::new("/proc/self/status")),
-        ceiling,
+        resolved_memory_ceiling_bytes(),
         WAL_REPLAY_RSS_STOP_PCT,
+    )
+}
+
+/// The PRODUCTION form of [`replay_all_with_report`]: the disk floor and the
+/// per-boot frame cap sit in front of the pass, so a full volume can no longer
+/// be made fuller by recovery. Every catch-up round and the STAGE-C boot
+/// replay (via [`replay_all_fenced`]) come through here.
+///
+/// The counter series below are created on the first pass of every boot,
+/// because the CloudWatch agent drops a counter's first sample and a refusal
+/// is exactly the once-ever event whose first occurrence is the one that
+/// matters.
+// TEST-EXEMPT: probe-then-delegate; the fences are proven by replay_all_with_report_at's tests.
+pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
+    wal_dir: P,
+    budget_bytes: usize,
+) -> anyhow::Result<WalReplayBatch> {
+    metrics::counter!(WAL_REPLAY_SKIPPED_SEGMENTS_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_SKIPPED_FRAMES_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_SKIPPED_BYTES_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_DISK_FLOOR_STOPS_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER).increment(0);
+    metrics::counter!(crate::wal_applied_watermark::APPLIED_INVALID_COUNTER).increment(0);
+    metrics::counter!(crate::wal_applied_watermark::APPLIED_PERSIST_FAILED_COUNTER).increment(0);
+    let wal_dir = wal_dir.as_ref();
+    let disk = crate::disk_health_watcher::probe_disk_free_bytes(wal_dir);
+    replay_all_with_report_at(
+        wal_dir,
+        budget_bytes,
+        disk,
+        WAL_REPLAY_FRAMES_THIS_BOOT.load(Ordering::Acquire),
     )
 }
 
@@ -2813,6 +3212,9 @@ fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+        // Never the segment the writer thread is appending to — see
+        // `OPEN_SEGMENT` for the loss this prevents.
+        .filter(|p| !is_open_segment(p))
         .collect() // APPROVED: boot replay helper, cold path
 }
 
@@ -3362,7 +3764,24 @@ pub fn ws_wal_active_max_bytes<P: AsRef<Path>>(wal_dir: P) -> u64 {
     *RESOLVED.get_or_init(|| resolved)
 }
 
+#[cfg(test)]
 fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
+    replay_segment_filtered(path, None).map(|(frames, _)| frames)
+}
+
+/// [`replay_segment`] with the applied-watermark filter: a record whose
+/// sequence is known-applied for its sink is CRC-verified, counted, and NOT
+/// returned. Returns `(frames, dropped_as_applied)`.
+///
+/// The filter runs AFTER the CRC check on purpose. A corrupt record must end
+/// the walk and be reported whether or not its sequence would have been
+/// skipped; filtering before the check would let corruption inside a skipped
+/// range pass silently.
+fn replay_segment_filtered(
+    path: &Path,
+    applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
+) -> anyhow::Result<(Vec<ReplayedFrame>, u64)> {
+    let mut dropped_as_applied = 0u64;
     let mut f = File::open(path)?;
     let mut buf = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     f.read_to_end(&mut buf)?;
@@ -3595,6 +4014,13 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
             warn!(segment = ?path, offset = i, expected, actual, "CRC mismatch; stopping");
             break;
         }
+        if let Some(applied) = applied
+            && applied.frame_is_applied(applied_sink_for(endpoint), frame_seq)
+        {
+            dropped_as_applied = dropped_as_applied.saturating_add(1);
+            i = record_end;
+            continue;
+        }
         out.push(ReplayedFrame {
             ws_type,
             frame,
@@ -3660,7 +4086,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
              inspection, but nothing will read them again automatically."
         );
     }
-    Ok(out)
+    Ok((out, dropped_as_applied))
 }
 
 // ---------------------------------------------------------------------------
@@ -6855,6 +7281,355 @@ mod tests {
         let now = Instant::now();
         let r = receipt_nanos_from(now);
         assert!(r > 0, "a receipt must be a real epoch value, got {r}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Applied-watermark replay skip (2026-09-05)
+    // -----------------------------------------------------------------------
+
+    /// A 2026-era `capture_seq` base: nanos with the 17 reserved bits zeroed.
+    fn wm_seq(secs: u64) -> u64 {
+        ((1_780_000_000 + secs) * 1_000_000_000) >> PACKET_INDEX_BITS << PACKET_INDEX_BITS
+    }
+
+    /// Writes one segment holding `frames` records at one-second spacing from
+    /// `first_secs`, named so it sorts in chronological order.
+    fn write_wm_segment(
+        dir: &Path,
+        first_secs: u64,
+        frames: u64,
+        endpoint: WalEndpoint,
+    ) -> PathBuf {
+        let mut bytes = Vec::new();
+        for i in 0..frames {
+            bytes.extend_from_slice(&encode_v4_record(
+                WsType::LiveFeed,
+                wm_seq(first_secs + i),
+                7,
+                endpoint,
+                &[0xAB; 32],
+            ));
+        }
+        let path = dir.join(format!("ws-frames-{:020}.wal", wm_seq(first_secs)));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn write_wm_watermark(dir: &Path, snap: &crate::wal_applied_watermark::AppliedSnapshot) {
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.bind(dir);
+        wm.seed(snap);
+        wm.persist_now();
+        assert!(
+            dir.join(crate::wal_applied_watermark::APPLIED_WATERMARK_FILE)
+                .exists()
+        );
+    }
+
+    fn replay_unguarded(dir: &Path) -> WalReplayBatch {
+        replay_all_with_report_guarded(dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("replay")
+    }
+
+    /// BITE-PROOF of the whole change: three segments, every frame acked on
+    /// the previous session, a fresh boot replays NOTHING. The first two
+    /// segments are archived UNREAD; the last one (no upper bound) is read and
+    /// every frame in it is dropped as applied.
+    #[test]
+    fn a_second_boot_after_a_clean_session_replays_zero_frames() {
+        let dir = tmp_dir("wm-clean-session");
+        write_wm_segment(&dir, 0, 10, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 100, 10, WalEndpoint::Depth20);
+        write_wm_segment(&dir, 200, 10, WalEndpoint::MainFeed);
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(300),
+                hwm_depth: wm_seq(300),
+                ..Default::default()
+            },
+        );
+        let batch = replay_unguarded(&dir);
+        assert!(
+            batch.frames.is_empty(),
+            "nothing to replay: {}",
+            batch.frames.len()
+        );
+        assert_eq!(
+            batch.skipped_segments, 2,
+            "two whole segments archived unread"
+        );
+        assert_eq!(
+            batch.skipped_frames, 10,
+            "the unbounded last segment is filtered per frame"
+        );
+        assert!(batch.skipped_bytes > 0);
+        assert!(wal_segments_in(&dir).is_empty(), "no live segment left");
+        assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 2);
+        assert_eq!(
+            wal_segments_in(&dir.join(REPLAYING_SUBDIR)).len(),
+            1,
+            "the read one is staged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a watermark file the pass behaves exactly as it did before
+    /// this change existed — every frame comes back.
+    #[test]
+    fn replay_without_a_watermark_file_replays_everything() {
+        let dir = tmp_dir("wm-absent");
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 100, 5, WalEndpoint::MainFeed);
+        let batch = replay_unguarded(&dir);
+        assert_eq!(batch.frames.len(), 10);
+        assert_eq!(batch.skipped_segments, 0);
+        assert_eq!(batch.skipped_frames, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment overlapping an UNAPPLIED bucket is replayed in full even
+    /// though its whole range sits under the watermark; its neighbours are
+    /// still skipped.
+    #[test]
+    fn replay_never_skips_a_segment_overlapping_the_unapplied_window() {
+        let dir = tmp_dir("wm-unapplied");
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 1_000, 5, WalEndpoint::MainFeed); // ~16 min later
+        write_wm_segment(&dir, 2_000, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 3_000, 5, WalEndpoint::MainFeed);
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(4_000));
+        wm.note_depth_acked(wm_seq(4_000));
+        wm.note_unapplied(wm_seq(1_002)); // a shed inside the second segment
+        write_wm_watermark(&dir, &wm.snapshot());
+        let batch = replay_unguarded(&dir);
+        assert_eq!(
+            batch.frames.len(),
+            5,
+            "exactly the shed segment's frames come back"
+        );
+        assert!(
+            batch
+                .frames
+                .iter()
+                .all(|f| f.frame_seq >= wm_seq(1_000) && f.frame_seq < wm_seq(1_005))
+        );
+        // A segment's range runs up to its SUCCESSOR's first sequence, so the
+        // first segment's range touches the shed bucket too and is read (its
+        // frames are then filtered as applied). Only the third is provably
+        // clear and archived unread. Conservative by construction: the bound
+        // errs towards reading, never towards skipping.
+        assert_eq!(
+            batch.skipped_segments, 1,
+            "only the segment after the shed is archived unread"
+        );
+        assert_eq!(
+            batch.skipped_frames, 10,
+            "the first and last are read and filtered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A main-feed frame feeds BOTH sinks: a depth watermark that lags keeps
+    /// it in the replay set even when the tick watermark is past it.
+    #[test]
+    fn replay_uses_the_lower_watermark_for_main_feed_frames() {
+        let dir = tmp_dir("wm-lower");
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 100, 5, WalEndpoint::MainFeed);
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(500),
+                hwm_depth: wm_seq(50), // depth sink is behind
+                ..Default::default()
+            },
+        );
+        let batch = replay_unguarded(&dir);
+        assert_eq!(
+            batch.frames.len(),
+            5,
+            "the second segment is above the depth watermark"
+        );
+        // The first segment's range extends to the second's first sequence,
+        // which is above the depth watermark, so it is read rather than
+        // archived unread — and every one of its frames is then filtered on
+        // the LOWER watermark. Reading-and-filtering is the conservative arm.
+        assert_eq!(batch.skipped_segments, 0);
+        assert_eq!(batch.skipped_frames, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Frames inside the reorder slack below the watermark are re-replayed,
+    /// never skipped: DEDUP collapses them, and a socket that minted a frame a
+    /// few microseconds before the acked one must not be assumed applied.
+    #[test]
+    fn replay_reorder_slack_replays_frames_just_below_the_watermark() {
+        let dir = tmp_dir("wm-slack");
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed); // seqs 0..4 s
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(4),
+                hwm_depth: wm_seq(4),
+                ..Default::default()
+            },
+        );
+        let batch = replay_unguarded(&dir);
+        // Slack is one second: seq(3) and seq(4) are within it, seq(0..=2) are
+        // below it and dropped.
+        assert_eq!(batch.frames.len(), 2);
+        assert_eq!(batch.skipped_frames, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy v1 record carries no sequence and is NEVER skipped.
+    #[test]
+    fn replay_never_skips_v1_records_with_zero_seq() {
+        let dir = tmp_dir("wm-v1");
+        let mut bytes = encode_v1_record(WsType::LiveFeed, &[1, 2, 3]);
+        bytes.extend_from_slice(&encode_v1_record(WsType::LiveFeed, &[4, 5, 6]));
+        std::fs::write(dir.join("ws-frames-00000000000000000001.wal"), bytes).unwrap();
+        write_wm_segment(&dir, 100, 2, WalEndpoint::MainFeed);
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(999),
+                hwm_depth: wm_seq(999),
+                ..Default::default()
+            },
+        );
+        let batch = replay_unguarded(&dir);
+        assert_eq!(batch.frames.len(), 2, "both v1 frames come back");
+        assert!(batch.frames.iter().all(|f| f.frame_seq == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The segment the writer thread is appending to is invisible to replay
+    /// while the writer is alive, and visible again once it has exited.
+    #[test]
+    fn replay_never_stages_the_writers_open_segment() {
+        let dir = tmp_dir("wm-open-segment");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        spill.append(WsType::LiveFeed, vec![9u8; 16]);
+        wait_until_persisted(&spill, 1);
+        let live: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+            .collect();
+        assert_eq!(live.len(), 1, "one open segment on disk");
+        assert!(
+            is_open_segment(&live[0]),
+            "the writer's segment is registered as open"
+        );
+        let batch = replay_unguarded(&dir);
+        assert!(batch.frames.is_empty(), "an open segment is never read");
+        assert!(live[0].exists(), "and never moved");
+        assert!(wal_segments_in(&dir.join(REPLAYING_SUBDIR)).is_empty());
+        drop(spill);
+        // The writer exits on channel close and clears the registration.
+        for _ in 0..200 {
+            if !is_open_segment(&live[0]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !is_open_segment(&live[0]),
+            "a shut-down writer's segment is replayable"
+        );
+        let batch = replay_unguarded(&dir);
+        assert_eq!(batch.frames.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under the disk floor a pass REFUSES: empty batch, flag set, and every
+    /// segment still a live `*.wal`. A failed probe is fail-open.
+    #[test]
+    fn replay_refuses_below_the_disk_floor_and_touches_nothing() {
+        use crate::disk_health_watcher::DiskHealthOutcome;
+        let dir = tmp_dir("wm-disk-floor");
+        write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let refused = replay_all_with_report_at(
+            &dir,
+            usize::MAX,
+            DiskHealthOutcome::Ok {
+                free_bytes: WAL_REPLAY_DISK_FLOOR_BYTES - 1,
+                total_bytes: 600 * 1024 * 1024 * 1024, // floor = the 40 GiB constant here
+            },
+            0,
+        )
+        .expect("refusal is Ok, not Err");
+        assert!(refused.stopped_for_disk);
+        assert!(!refused.stopped_for_frame_cap);
+        assert!(refused.frames.is_empty());
+        assert_eq!(wal_segments_in(&dir).len(), 1, "nothing moved");
+        let allowed = replay_all_with_report_at(
+            &dir,
+            usize::MAX,
+            DiskHealthOutcome::ProbeFailed { reason: "test" },
+            0,
+        )
+        .expect("replay");
+        assert_eq!(
+            allowed.frames.len(),
+            3,
+            "a failed probe is fail-open, as the memory guard is"
+        );
+        assert!(!allowed.stopped_for_disk);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_refuses_past_the_per_boot_frame_cap() {
+        use crate::disk_health_watcher::DiskHealthOutcome;
+        let dir = tmp_dir("wm-frame-cap");
+        write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let refused = replay_all_with_report_at(
+            &dir,
+            usize::MAX,
+            DiskHealthOutcome::Ok {
+                free_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            },
+            WAL_REPLAY_MAX_FRAMES_PER_BOOT,
+        )
+        .expect("refusal is Ok");
+        assert!(refused.stopped_for_frame_cap);
+        assert!(!refused.stopped_for_disk);
+        assert!(refused.frames.is_empty());
+        assert_eq!(wal_segments_in(&dir).len(), 1, "nothing moved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_disk_floor_scales_down_on_small_volumes_and_caps_at_the_constant() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            wal_replay_disk_floor_bytes(600 * GIB),
+            WAL_REPLAY_DISK_FLOOR_BYTES
+        );
+        assert_eq!(wal_replay_disk_floor_bytes(64 * GIB), 8 * GIB);
+        assert_eq!(wal_replay_disk_floor_bytes(0), 0);
+    }
+
+    /// The header probe: first sequence of a v4 segment, zero for v1/empty.
+    #[test]
+    fn first_frame_seq_in_segment_reads_one_header() {
+        let dir = tmp_dir("wm-first-seq");
+        let p = write_wm_segment(&dir, 42, 3, WalEndpoint::MainFeed);
+        assert_eq!(first_frame_seq_in_segment(&p), wm_seq(42));
+        let v1 = dir.join("v1.wal");
+        std::fs::write(&v1, encode_v1_record(WsType::LiveFeed, &[1])).unwrap();
+        assert_eq!(first_frame_seq_in_segment(&v1), 0);
+        let empty = dir.join("empty.wal");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(first_frame_seq_in_segment(&empty), 0);
+        assert_eq!(first_frame_seq_in_segment(&dir.join("missing.wal")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -4849,6 +4849,10 @@ async fn run_frame_drain(
     // depth thread has usually already drained — the total is the max of the
     // two waits, not the sum.
     ingest.shutdown_depth_offload_writer(offload_deadline);
+    // Both writer threads have joined (or been abandoned, counted): whatever
+    // they acked is final for this session. Persist it now rather than trust
+    // the once-a-second cadence to have caught the last batch.
+    tickvault_storage::wal_applied_watermark::applied_watermark().persist_now();
     publish_fold_depth(&ingest);
     let depth_dropped = ingest.depth_dropped_rows();
     warn!(
@@ -8982,6 +8986,42 @@ pub fn is_depth_socket_frame(bytes: &[u8]) -> bool {
 /// The gate-disabled path in `spawn_dhan_feed_stack` deliberately does NOT call
 /// this: `main.rs` reads the identical gate and has already logged the drop
 /// itself, so reporting again would double-count the same frames.
+/// How long a replay confirm waits for the writer threads to ACK the batch it
+/// just flushed. Generous against one ILP request timeout (5 s) plus the
+/// four-deep hand-off queue behind it; bounded, because a wedged sink must
+/// not hold the boot.
+pub const WAL_REPLAY_ACK_WAIT_SECS: u64 = 30;
+
+/// `true` once every batch handed to the tick and depth writer threads has
+/// been LANDED or RESCUED — the point at which "durably re-captured" is true
+/// and `confirm_replayed` may archive the segments.
+///
+/// Before 2026-09-05 the confirm ran on the strength of `flush()`, which on
+/// the offloaded path returns rows HANDED OFF to a queue, not rows acked. A
+/// process that died with those batches still queued had archived segments
+/// whose rows never reached the database. On timeout this returns `false`,
+/// counted and coded; the caller then leaves the segments in `replaying/`,
+/// where the next boot's applied-watermark skips exactly the frames that did
+/// ack and replays the rest.
+fn wal_replay_acked(stage: &'static str) -> bool {
+    let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+    if wm.wait_for_offload_drained(std::time::Duration::from_secs(WAL_REPLAY_ACK_WAIT_SECS)) {
+        return true;
+    }
+    metrics::counter!(tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER)
+        .increment(1);
+    error!(
+        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+        source = "replay_ack_wait_timeout",
+        stage,
+        wait_secs = WAL_REPLAY_ACK_WAIT_SECS,
+        "WAL replay: the writer threads did not ack the re-folded batch within the wait, so \
+         its segments are NOT confirmed — they stay in `replaying/` and the next boot \
+         re-offers whatever did not land. Nothing is archived unread."
+    );
+    false
+}
+
 pub fn report_unfolded_wal_frames(frames: &[(u64, i64, WalEndpoint, bytes::Bytes)], refusal: &str) {
     if frames.is_empty() {
         return;
@@ -8992,11 +9032,11 @@ pub fn report_unfolded_wal_frames(frames: &[(u64, i64, WalEndpoint, bytes::Bytes
         frames = dropped,
         refusal,
         "{dropped} live-feed frame(s) were recovered from the write-ahead log but will NOT be \
-         folded — the live lane refused to start ({refusal}), and the write-ahead log segments \
-         were already archived, so they will not be offered again on the next boot. The ticks \
-         and candles they contain are NOT in the database. The raw frames are preserved in the \
-         write-ahead log archive and can be recovered manually. If this session followed an \
-         unclean stop during market hours, this is real data loss for that window."
+         folded — the live lane refused to start ({refusal}). Their write-ahead log segments \
+         are NOT archived: boot stopped confirming on the lane's behalf on 2026-08-28, so they \
+         stay in the replay staging area and are re-offered on the next boot that starts the \
+         lane. Until then the ticks and candles they contain are NOT in the database — \
+         deferred, not lost, unless the segments are pruned first."
     );
     metrics::counter!(
         "tv_ws_frame_wal_reinjected_dropped_total",
@@ -9986,7 +10026,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // `test_drain_never_flushes_bare_on_the_async_worker` rejected it --
             // the guard held a line I walked into, which is what it is for.
             let flushed = blocking_flush(|| ingest.flush());
-            tickvault_storage::ws_frame_spill::confirm_replayed(crate::boot_helpers::ws_wal_dir());
+            // ACK BEFORE CONFIRMING (2026-09-05): `flush` on the offloaded path
+            // returns rows handed to a queue. Wait for the writer threads to
+            // land or rescue them before the segments leave the replay path.
+            if blocking_flush(|| wal_replay_acked("boot_refold")) {
+                tickvault_storage::ws_frame_spill::confirm_replayed(
+                    crate::boot_helpers::ws_wal_dir(),
+                );
+            }
             if flushed > 0 {
                 info!(
                     rows = flushed,
@@ -10042,6 +10089,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // WHICH bound bound, which is the difference between "the backlog is
         // big" and "this box cannot drain it".
         let mut catchup_memory_stopped = false;
+        // `true` only when the final pass found NOTHING left on disk — no
+        // frames, no deferred segments, no disk/frame-cap refusal. That is the
+        // one state in which the applied-watermark's unapplied buckets can be
+        // cleared: everything they guarded has been replayed and confirmed.
+        let mut catchup_drained = false;
         let mem_ceiling_bytes = tickvault_storage::resource_monitor::resolve_memory_ceiling(
             &tickvault_storage::resource_monitor::resolve_cgroup_memory_max_path(),
             std::path::Path::new("/proc/meminfo"),
@@ -10099,7 +10151,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 break;
             }
             let wal_dir = crate::boot_helpers::ws_wal_dir();
-            let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report(
+            let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
                 &wal_dir,
                 tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_BYTES,
             ) {
@@ -10146,6 +10198,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
             if batch.frames.is_empty() {
+                catchup_drained = batch.deferred_segments == 0
+                    && !batch.stopped_for_disk
+                    && !batch.stopped_for_frame_cap
+                    && !batch.stopped_for_memory;
                 break;
             }
             // Count what this lane does NOT fold before dropping it.
@@ -10203,6 +10259,12 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             }
             let outcome = refold_wal_frames(&mut ingest, &staged);
             let flushed = blocking_flush(|| ingest.flush());
+            // ACK BEFORE CONFIRMING — see `wal_replay_acked`. A timeout ends
+            // the drain rather than re-offering the same batch to a sink that
+            // is not answering: the segments stay staged for the next boot.
+            if !blocking_flush(|| wal_replay_acked("catchup")) {
+                break;
+            }
             tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
             catchup_frames = catchup_frames.saturating_add(staged.len());
             catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
@@ -10224,6 +10286,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 ticks = outcome.refolded,
                 rows_flushed = flushed,
                 "WAL catch-up drain round complete"
+            );
+        }
+        if catchup_drained {
+            // Every captured frame is now either in the database, in a spill
+            // file, or archived — the unapplied map has nothing left to guard.
+            let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+            wm.reset_unapplied();
+            wm.persist_now();
+            info!(
+                rounds,
+                "WAL catch-up drained the backlog completely — the applied-watermark's \
+                 unapplied map is cleared for this session"
             );
         }
         if rounds > 0 || catchup_memory_stopped {
