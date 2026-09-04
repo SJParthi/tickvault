@@ -1271,4 +1271,127 @@ mod tests {
         wm.note_unlanded();
         assert_eq!(wm.unlanded_total(), 2, "monotone: it never goes back down");
     }
+
+    // The push-scoped pub-fn ratchet matches a test to a function by NAME
+    // prefix. The functions below are all exercised by the scenario tests
+    // above; these pin each one on its own so the ratchet can see it.
+
+    #[test]
+    fn note_ticks_acked_advances_only_the_tick_watermark() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(seq(50));
+        let snap = wm.snapshot();
+        assert_eq!(snap.hwm_ticks, seq(50));
+        assert_eq!(snap.hwm_depth, 0);
+        wm.note_ticks_acked(seq(40));
+        assert_eq!(wm.snapshot().hwm_ticks, seq(50), "monotone");
+    }
+
+    #[test]
+    fn note_depth_acked_advances_only_the_depth_watermark() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_depth_acked(seq(50));
+        let snap = wm.snapshot();
+        assert_eq!(snap.hwm_depth, seq(50));
+        assert_eq!(snap.hwm_ticks, 0);
+    }
+
+    #[test]
+    fn note_ticks_handed_off_is_balanced_by_a_completion() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_handed_off();
+        assert!(!wm.wait_for_offload_drained(Duration::from_millis(1), 0));
+        wm.note_ticks_completed();
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), 0));
+    }
+
+    #[test]
+    fn note_ticks_completed_without_a_hand_off_is_harmless() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_completed();
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), 0));
+    }
+
+    #[test]
+    fn note_depth_handed_off_is_balanced_by_a_completion() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_depth_handed_off();
+        assert!(!wm.wait_for_offload_drained(Duration::from_millis(1), 0));
+        wm.note_depth_completed();
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), 0));
+    }
+
+    #[test]
+    fn note_depth_completed_without_a_hand_off_is_harmless() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_depth_completed();
+        assert!(wm.wait_for_offload_drained(Duration::from_millis(1), 0));
+    }
+
+    #[test]
+    fn frame_is_applied_respects_the_slack_and_the_lower_sink() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.mark_depth_tracked();
+        wm.note_ticks_acked(seq(100));
+        wm.note_depth_acked(seq(60));
+        let snap = wm.snapshot();
+        // Ticks alone would allow 90; the depth sink at 60 (minus 1 s of
+        // slack) is the binding one for a main-feed frame.
+        assert!(snap.frame_is_applied(AppliedSink::Ticks, seq(58)));
+        assert!(!snap.frame_is_applied(AppliedSink::Ticks, seq(90)));
+        assert!(snap.frame_is_applied(AppliedSink::Depth, seq(58)));
+        assert!(!snap.frame_is_applied(AppliedSink::Depth, seq(59) + 1));
+    }
+
+    #[test]
+    fn range_has_unapplied_sees_only_the_marked_bucket() {
+        let wm = AppliedWatermark::new_for_tests();
+        let marked = seq(1_000);
+        wm.note_unapplied(marked);
+        let snap = wm.snapshot();
+        assert!(snap.range_has_unapplied(marked, marked));
+        assert!(snap.range_has_unapplied(marked - 5, marked + 5));
+        let far = marked + (3u64 << UNAPPLIED_BUCKET_SHIFT);
+        assert!(!snap.range_has_unapplied(far, far + 5));
+        assert!(
+            snap.range_has_unapplied(5, 1),
+            "lo > hi fails towards replay"
+        );
+    }
+
+    #[test]
+    fn is_sink_suspect_follows_the_last_probe() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert!(!wm.is_sink_suspect());
+        wm.note_questdb_probe(false);
+        assert!(wm.is_sink_suspect());
+        wm.note_questdb_probe(true);
+        assert!(!wm.is_sink_suspect());
+    }
+
+    #[test]
+    fn note_questdb_probe_clean_re_opens_the_watermark_for_new_acks() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(seq(10));
+        wm.note_questdb_probe(false);
+        wm.note_ticks_acked(seq(20));
+        assert_eq!(wm.snapshot().hwm_ticks, seq(10), "parked while suspect");
+        wm.note_questdb_probe(true);
+        wm.note_ticks_acked(seq(30));
+        assert_eq!(wm.snapshot().hwm_ticks, seq(30), "advancing again");
+    }
+
+    #[test]
+    fn persist_if_due_now_writes_at_most_once_per_interval() {
+        let dir = scratch("persist_due_now");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        wm.note_ticks_acked(seq(5));
+        assert!(wm.persist_if_due_now(), "first persist is always due");
+        assert!(
+            !wm.persist_if_due_now(),
+            "the second inside the interval is not"
+        );
+        assert!(AppliedSnapshot::load(&dir).is_some());
+    }
 }
