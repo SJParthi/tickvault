@@ -184,7 +184,25 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS FRESH-PROVISION default is 500 GB (operator Quote 20, 2026-09-02 —
+/// EBS FRESH-PROVISION default is 600 GB (operator Quote 22, 2026-09-05 —
+/// "See you have the enife access to Aws and db everywhere so you directly
+/// check evryhrinf and go ahead ddude", given against a message that named
+/// the 500 -> 600 grow, its +$9.12/mo permanent cost and the one-way door as
+/// the ONLY way the Quote 21 fresh-start wipe can run: the box booted onto
+/// 20 KB free on 2026-09-04, the SSM agent never registered on the 2026-09-05
+/// 02:53 IST boot, and `claude-code-agent` is DENIED ModifyVolume /
+/// DetachVolume / AttachVolume / ModifyInstanceAttribute, so
+/// `grow-ebs-volume.yml` with the CI credentials is the sole route).
+///
+/// The previous version of this doc ends with "600 GB would push the
+/// forecast past the $135 STOP_EC2_INSTANCES action line". That is now the
+/// situation, deliberately and on the record: read live 2026-09-04 the
+/// September forecast was ALREADY $137.50, above the line, before this grow,
+/// and ~$147 with it. `limit_amount` is NOT raised (Quote 19 caps it at $150
+/// and the operator has not addressed it); the open risk was stated to him.
+///
+/// --- Quote 20 record (2026-09-02), retained verbatim below ---
+/// The 500 GB default was set by operator Quote 20, 2026-09-02 —
 /// the operator asked "isnatnce upgrade or disk upgrade needed?" and then
 /// authorized "whatevr is needed and recommended go ahead dude okay? i just
 /// need the workign finalsied solution dude okay?" against a reply that named
@@ -237,22 +255,22 @@ fn deploy_eip_is_enabled_by_default() {
 /// `user/claude-code-agent` cannot perform `ec2:ModifyVolume`. History:
 /// 10 -> 30 -> [50 approved 2026-07-13, never applied; live verified 30 GiB
 /// 2026-07-19] -> 20 target (2026-07-15) -> 100 (2026-08-08) -> 200
-/// (2026-08-19) -> 300 (2026-08-25) -> 500 (2026-09-02).
+/// (2026-08-19) -> 300 (2026-08-25) -> 500 (2026-09-02) -> 600 (2026-09-05).
 #[test]
-fn deploy_ebs_default_is_500gb() {
+fn deploy_ebs_default_is_600gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 500"),
-        "ebs_gp3_size_gb must default to 500 GB (operator Quote 20, 2026-09-02 \
-         — given after the 300 GB volume reached 2.4 GB free on 2026-09-01 and \
-         the app died mid-session the next day. Raised from the Quote 19 \
-         default of 300, which lasted six days)."
+        vars.contains("type = number default = 600"),
+        "ebs_gp3_size_gb must default to 600 GB (operator Quote 22, 2026-09-05 \
+         — the grow that lets the Quote 21 fresh-start wipe be executed at all \
+         on a box that booted onto 20 KB free. Raised from the Quote 20 \
+         default of 500, which lasted two days)."
     );
-    // 500 is BOTH the default and the validation ceiling, so the next grow
+    // 600 is BOTH the default and the validation ceiling, so the next grow
     // cannot be a drive-by: it needs a validation edit AND its own dated
     // quote. It also needs a LEVER and not merely a cost note — read live on
     // 2026-09-02, limit_amount is $150, the 90% STOP_EC2_INSTANCES action line
@@ -262,26 +280,27 @@ fn deploy_ebs_default_is_500gb() {
     // release (-$3.60/mo) or an operator decision; a ceiling edit cannot help
     // because Quote 19 caps limit_amount at $150, already the live value.
     assert!(
-        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 500"),
-        "the 10-500 GB validation range must stay — with the default AT the \
+        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 600"),
+        "the 10-600 GB validation range must stay — with the default AT the \
          ceiling it is what makes a further grow a deliberate, quoted decision \
          rather than a one-character edit."
     );
     // Inverted pin, unchanged in spirit: gp3 grows online and can never
     // shrink, so over-provisioning is the irreversible mistake and pays for
-    // unused disk every month until an instance recreate. 500 was chosen
-    // because it gives ~70% headroom over the MEASURED ~307 GB session, and
-    // NOT higher: 600 GB would add another $9.12/mo and breach the $135
-    // automatic-stop line outright.
+    // unused disk every month until an instance recreate. 600 was chosen
+    // because 100 GB is what a boot needs to let SSM in and the wipe run, and
+    // NOT higher: 700 GB would add another $9.12/mo on top of a forecast that
+    // already sits above the $135 automatic-stop line.
     // NOTE: the trailing space is load-bearing — `squish` collapses the file to
     // one string, and `ebs_gp3_iops` defaults to 6000, so a bare "default = 600"
-    // matches it and this pin fails on a healthy tree. Caught by running it.
+    // would match it; the 700 pin below has no such collision but keeps the
+    // trailing space for the same reason. Caught by running it.
     assert!(
-        !vars.contains("type = number default = 600 "),
+        !vars.contains("type = number default = 700 "),
         "do not over-provision the fresh volume — gp3 grows online in one \
-         command but can NEVER shrink. 500 GB gives ~70% headroom over the \
-         measured ~307 GB session; 600 GB would push the forecast past the \
-         $135 STOP_EC2_INSTANCES action line. Grow it live if measured volume \
+         command but can NEVER shrink. 600 GB is the Quote 22 ceiling; 700 GB \
+         would add $9.12/mo against a forecast already above the $135 \
+         STOP_EC2_INSTANCES action line. Grow it live if measured volume \
          demands it, with its own dated quote and a lever."
     );
 }
