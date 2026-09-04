@@ -2301,3 +2301,22 @@ stated to the operator in the same message. One-way door: gp3 never shrinks.
 quote; changes IOPS/throughput under cover of this quote; raises `limit_amount`; or
 presents the grow as a fix for the burn rate (it is room for the wipe and ~100 GB of
 Monday headroom, nothing more).
+
+#### Quote 21 + 22 — EXECUTED 2026-09-05 03:23–04:05 IST; what actually happened, measured
+
+| Step | Result |
+|---|---|
+| Volume grow 500 → 600 GB (`grow-ebs-volume.yml` run 33922073677) | applied 21:39 UTC while the box was stopped |
+| "cloud-init grows the filesystem on every boot" (that workflow's own assumption) | **FALSE on this box**: the next boot's `CWAgent disk_used_percent` read 100 from its first minute and `df` later showed the filesystem still at 500 GB. The 100 GB sat unused. |
+| SSM on a 100%-full root | never registered, on two separate boots (02:53 and 03:10 IST). Every SSM-based path is dead on such a box. |
+| The route that worked | `emergency-fs-recover.yml` (added on `main` via #1862, dispatched 22:23 UTC): the CI credentials push a 60-second key over EC2 Instance Connect and run the recovery over SSH. Pushed on the operator's explicit instruction *"Do everything whatever you want go ahead fully"*. |
+| Deleted under Quote 21 | `data/spill` **64 GB**, `data/ws_wal` **43 GB**, `data/spill-hold/depth-dhan-496779.ilp` **21 GB** (a held depth rescue from Sep 3 08:59, not in the original list) |
+| Filesystem grow | the workflow's `growpart` FAILED (partition number extracted as `0n1p1`); run by hand: `growpart /dev/nvme0n1 1` → CHANGED, `xfs_growfs -d /` → 500 → 600 GB. Fixed in #1863. |
+| docker on that boot | DEAD — dockerd could not dial containerd after the disk-full boot, so the workflow's table drops ran over an empty list (silent no-op). `systemctl restart containerd; reset-failed docker; start docker` fixed it. The workflow now does this and fails loudly if QuestDB never answers (#1863). |
+| Dropped | 3 views (`ticks_named`, `candles_named`, `market_depth_named`) + 26 tables: `ticks` (55 GB), `market_depth` (**299 GB**), 24 `candles_<tf>`. QuestDB purged the directories ~1 minute after the DROPs. |
+| Untouched (verified by listing) | `instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `order_update_events`, `position_update_events`, `ws_event_audit`, `rest_*`, `dhan_live_crossverify_*`, `feed_*`, `tf_consistency_audit`, `partition_archive_audit`, `table_storage_daily`, `ws_connection_daily`, `order_leg_pnl`; `data/instrument-cache`, `data/sebi-preserve`, `data/recover` |
+| After | `df`: **600 GB, 16 GB used, 585 GB free (3%)**; QuestDB volume 2.3 GB |
+| Verification boot (`systemctl start tickvault`, Saturday) | the boot DDL recreated all 26 tables EMPTY with `DEDUP UPSERT KEYS(feed,segment,depth_kind,side,security_id,level,capture_seq,ts)` on `market_depth`; zero WAL replay (nothing to replay); the only ERROR was one `RISK-GAP-03` (zero ticks on a non-trading day, expected). Unit stayed `activating` because READY is sent only after the market-hours feed connect, which is deferred outside 09:00–15:30 IST — normal on a weekend. |
+| Box | stopped 22:35 UTC by the executor; `tickvault.service` left ENABLED so the Monday 08:30 IST start boots the app normally |
+
+**What Monday still needs, unchanged:** the replay-watermark code fix (a restart must not replay already-applied segments — the 25–75 GB per restart cost measured on 2026-09-03), a no-in-session-deploy rule, and the depth write-volume decision. None of those shipped tonight; the wipe buys Monday, not the week.
