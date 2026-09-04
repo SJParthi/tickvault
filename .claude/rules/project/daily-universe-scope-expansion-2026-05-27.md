@@ -2251,3 +2251,53 @@ no-in-session-deploy rule, and the depth write-volume decision.
 deletes any row from a SEBI/audit table; grows or shrinks the volume under cover of
 this quote; changes `limit_amount`; deploys or restarts the app in the trading session
 before the replay fix lands; presents the wipe as a fix for the burn rate.
+
+**Quote 22 (2026-09-05, 03:1x IST, EBS grow 500 → 600 GB so the full box can be entered and wiped — preserve EXACTLY, typos included):**
+> "See you have the enife access to Aws and db everywhere so you directly check evryhrinf and go ahead ddude"
+
+Given in DIRECT response to a message that laid out exactly two ways to unblock the
+Quote 21 wipe and recommended one: *"Option B: grow the disk … EC2 → Volumes →
+`vol-0c6ab6e593e39d8c8` → Modify → size **600** GB … Cost **+₹915/month, permanent** (a
+volume can never shrink) … My recommendation: Option B tonight."* The cost had been
+asked for and stated in the preceding exchange (*"How much is the cost extra if I say
+yes now"* → 500→600 GB = $9.12/mo ≈ ₹915 incl GST). This is the fresh dated quote §7
+Mechanical Rule 3 requires before any EBS size change, recorded BEFORE the change.
+
+#### Why a grow at all, when Quote 21 chose a wipe to AVOID one
+
+The wipe cannot be executed from any identity this repository's automation holds while
+the disk is at 20 KB free: the SSM agent never registered on the 02:53 IST boot (12 minutes
+of `send-command` retries, zero app log lines, zero metrics), and `claude-code-agent` is
+DENIED `ec2:DetachVolume` / `AttachVolume` / `ModifyInstanceAttribute` / `GetConsoleOutput`
+/ `ModifyVolume` (all probed live with `--dry-run`, 2026-09-05). The ONLY mutation
+capability that exists in automation is `grow-ebs-volume.yml`, which carries the CI
+credentials — the same route Quote 20 used. 100 GB of new room is what lets cloud-init
+grow the filesystem at boot, the SSM agent start, and the Quote 21 wipe run.
+
+#### The operator's premise, corrected on the record (Rule 11)
+
+The quote says the executor has *"the entire access to AWS and db everywhere"*. It does
+not. The live denials above are the evidence, and the earlier Quote 20 grow went through
+this same workflow for the same reason (its own header records the identical
+`UnauthorizedOperation`). Recorded so the next session does not assume a capability that
+has now been disproven twice.
+
+#### What this authorizes
+
+| Surface | Change |
+|---|---|
+| Root gp3 volume `vol-0c6ab6e593e39d8c8` | **500 → 600 GB**, via `grow-ebs-volume.yml`; IOPS 6000 / 500 MiB/s UNCHANGED |
+| `variables.tf` `ebs_gp3_size_gb` validation ceiling + the workflow's own ceiling | 500 → 600, in lockstep, in the same change |
+| Everything else | UNCHANGED — instance type, AZ, schedule, `limit_amount` |
+
+**Honest cost:** +$9.12/mo → ~₹915/mo incl GST. Read live 2026-09-04: `limit_amount` $150,
+the 90% `STOP_EC2_INSTANCES` line $135, September forecast **$137.50 — already above the
+action line before this grow**; with it ~$147. **This quote does NOT raise `limit_amount`**
+(Quote 19 caps it at $150 and the operator has not addressed it); the risk that the
+budget's automatic action stops the trading box mid-September is therefore OPEN and was
+stated to the operator in the same message. One-way door: gp3 never shrinks.
+
+**What a PR that violates Quote 22 looks like (REJECT):** grows past 600 without a fresh
+quote; changes IOPS/throughput under cover of this quote; raises `limit_amount`; or
+presents the grow as a fix for the burn rate (it is room for the wipe and ~100 GB of
+Monday headroom, nothing more).
