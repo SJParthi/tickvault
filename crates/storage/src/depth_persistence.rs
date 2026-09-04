@@ -929,6 +929,10 @@ pub struct DepthWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Lowest / highest `capture_seq` among the pending rows (`0` = none) —
+    /// the WAL applied-watermark learns the frames a batch covers from these.
+    pending_min_seq: u64,
+    pending_max_seq: u64,
     feed: Feed,
     /// Rows that left the buffer without reaching QuestDB, across this
     /// writer's lifetime.
@@ -1053,6 +1057,8 @@ impl DepthWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    pending_min_seq: 0,
+                    pending_max_seq: 0,
                     feed,
                     dropped: 0,
                     rescued: 0,
@@ -1074,6 +1080,8 @@ impl DepthWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    pending_min_seq: 0,
+                    pending_max_seq: 0,
                     feed,
                     dropped: 0,
                     rescued: 0,
@@ -1102,6 +1110,8 @@ impl DepthWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            pending_min_seq: 0,
+            pending_max_seq: 0,
             feed,
             dropped: 0,
             rescued: 0,
@@ -1201,6 +1211,17 @@ impl DepthWriter {
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
+        let outcome = self.append_row_inner(row);
+        if outcome.is_err() {
+            // Captured to the WAL, never reaching the database from this
+            // session: the next replay must re-offer the frame.
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied(u64::try_from(row.capture_seq).unwrap_or(0));
+        }
+        outcome
+    }
+
+    fn append_row_inner(&mut self, row: &DepthRow) -> Result<()> {
         let feed = self.feed.as_str();
 
         // The `const _` proof below covers the closed SETS. It cannot cover a
@@ -1288,7 +1309,36 @@ impl DepthWriter {
             .context("designated timestamp")?;
 
         self.pending = self.pending.saturating_add(1);
+        self.note_pending_seq(row.capture_seq);
         Ok(())
+    }
+
+    /// Widens the pending sequence range to cover one appended row.
+    fn note_pending_seq(&mut self, capture_seq: i64) {
+        let seq = u64::try_from(capture_seq).unwrap_or(0);
+        if seq == 0 {
+            return;
+        }
+        if self.pending_min_seq == 0 || seq < self.pending_min_seq {
+            self.pending_min_seq = seq;
+        }
+        if seq > self.pending_max_seq {
+            self.pending_max_seq = seq;
+        }
+    }
+
+    /// Takes the pending range, leaving it empty.
+    fn take_pending_range(&mut self) -> (u64, u64) {
+        let r = (self.pending_min_seq, self.pending_max_seq);
+        self.pending_min_seq = 0;
+        self.pending_max_seq = 0;
+        r
+    }
+
+    /// Restores a range the hand-off gave back (queue full / thread gone).
+    fn restore_pending_range(&mut self, range: (u64, u64)) {
+        self.pending_min_seq = range.0;
+        self.pending_max_seq = range.1;
     }
 
     /// Rescues every buffered-but-unflushed row to the depth spill tier, then
@@ -1353,11 +1403,14 @@ impl DepthWriter {
         // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
         // MOVED, and the replacement is the same empty one `offload_flush`
         // already installs on every successful hand-off.
+        let range = self.take_pending_range();
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
             let batch = DepthRescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
                 rows,
+                min_seq: range.0,
+                max_seq: range.1,
             };
             match tx.try_send(batch) {
                 Ok(()) => {
@@ -1366,6 +1419,7 @@ impl DepthWriter {
                         "feed" => self.feed.as_str()
                     )
                     .increment(rows as u64);
+                    crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
                     // Counted as rescued HERE, not on the thread, because the
                     // caller's log-wording branch reads this field one line
                     // after the call and a queued payload IS on its way to the
@@ -1398,13 +1452,15 @@ impl DepthWriter {
             }
         }
 
-        if perform_depth_rescue(
+        let landed = perform_depth_rescue(
             &self.spill_dir,
             self.buffer.as_bytes(),
             self.feed,
             rows,
             self.spill_min_free_headroom,
-        ) {
+        );
+        note_rescue_outcome_depth(landed, range, false);
+        if landed {
             self.rescued = self.rescued.saturating_add(rows as u64);
         }
         self.buffer.clear();
@@ -1508,21 +1564,26 @@ impl DepthWriter {
         // speak the same protocol the sender negotiated, and borrowing rules
         // will not let both happen in one expression.
         let protocol = self.buffer.protocol_version();
+        let (min_seq, max_seq) = self.take_pending_range();
         let batch = DepthFlushBatch {
             buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
             rows,
+            min_seq,
+            max_seq,
         };
         let Some(tx) = self.offload.as_ref() else {
             // Unreachable — `flush` checks. Treated as the gone arm rather than
             // silently succeeding, because "we sent it" when nothing was sent
             // is the one report that must never be wrong.
             self.buffer = batch.buffer;
+            self.restore_pending_range((batch.min_seq, batch.max_seq));
             return DepthOffloadOutcome::SinkGone(rows);
         };
         match tx.try_send(batch) {
             Ok(()) => {
                 self.pending = 0;
                 self.retained_spans = 0;
+                crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
                 metrics::counter!(
                     "tv_depth_flush_offloaded_total",
                     "feed" => self.feed.as_str()
@@ -1531,6 +1592,7 @@ impl DepthWriter {
                 DepthOffloadOutcome::Sent(rows)
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
                 // Backpressure, not loss. Put the rows BACK and keep appending
                 // — the next flush retries. This arm is what makes the bounded
                 // queue safe: without it a full queue would either block the
@@ -1568,7 +1630,11 @@ impl DepthWriter {
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                 // The writer thread died. Rescue rather than drop, and say so.
+                // The range rides with the batch and must come back with the
+                // buffer, or the rescue below reports `(0, 0)` and a failed
+                // rescue marks nothing — the tick twin always did this.
                 self.buffer = returned.buffer;
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
                 let dropped = self.discard_pending();
                 DepthOffloadOutcome::SinkGone(dropped)
             }
@@ -1688,6 +1754,10 @@ impl DepthWriter {
         match outcome {
             Ok(()) => {
                 self.pending = 0;
+                // The synchronous arm acks the watermark itself — see the tick
+                // writer's twin for why.
+                let (_, max_seq) = self.take_pending_range();
+                crate::wal_applied_watermark::applied_watermark().note_depth_acked(max_seq);
                 Ok(())
             }
             Err(err) => {
@@ -1833,6 +1903,9 @@ pub const DEPTH_RESCUE_ABANDONED_COUNTER: &str = "tv_depth_rescue_abandoned_tota
 pub struct DepthRescueBatch {
     buffer: Buffer,
     rows: usize,
+    /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
 }
 
 impl DepthRescueBatch {
@@ -1857,13 +1930,32 @@ impl DepthRescueSink {
     /// [`perform_depth_rescue`] — so an operator cannot tell which path ran,
     /// and should not have to.
     pub fn rescue(&self, batch: &DepthRescueBatch) {
-        perform_depth_rescue(
+        let landed = perform_depth_rescue(
             &self.spill_dir,
             batch.buffer.as_bytes(),
             self.feed,
             batch.rows,
             self.spill_min_free_headroom,
         );
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        crate::wal_applied_watermark::applied_watermark().note_depth_completed();
+    }
+}
+
+/// A rescued depth payload is APPLIED from the WAL's point of view — the spill
+/// tier is durable and re-ingestable — and a failed rescue is the one arm where
+/// captured frames genuinely need the next replay.
+/// See `note_rescue_outcome_ticks`: only the writer thread's own rescue is in
+/// order with the queue; a producer-side or rescue-thread landing acks nothing.
+fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
+    let wm = crate::wal_applied_watermark::applied_watermark();
+    if landed {
+        if in_order {
+            wm.note_depth_acked(range.1);
+        }
+    } else {
+        wm.note_unapplied_range(range.0, range.1);
+        wm.note_unlanded();
     }
 }
 
@@ -1996,6 +2088,9 @@ pub const MAX_DEPTH_RETAINED_FLUSH_SPANS: u32 = 2;
 pub struct DepthFlushBatch {
     buffer: Buffer,
     rows: usize,
+    /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
 }
 
 impl DepthFlushBatch {
@@ -2064,6 +2159,17 @@ impl DepthWriterSink {
     /// retry would have carried a drain-shaped mitigation onto a thread that no
     /// longer has a drain to protect.
     pub fn write(&mut self, batch: &mut DepthFlushBatch) -> usize {
+        let landed = self.write_inner(batch);
+        // The batch is DONE — landed or rescued — whatever the outcome. This
+        // is what the replay confirm waits on, and the watermark file is
+        // refreshed from here at most once a second, off the drain.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        wm.note_depth_completed();
+        wm.persist_if_due_now();
+        landed
+    }
+
+    fn write_inner(&mut self, batch: &mut DepthFlushBatch) -> usize {
         if batch.rows == 0 {
             return 0;
         }
@@ -2133,6 +2239,9 @@ impl DepthWriterSink {
             Ok(()) => {
                 let landed = batch.rows;
                 batch.rows = 0;
+                // ACKED by QuestDB: every captured frame up to this sequence
+                // has its depth rows in the database.
+                crate::wal_applied_watermark::applied_watermark().note_depth_acked(batch.max_seq);
                 landed
             }
             Err(err) => {
@@ -2162,6 +2271,7 @@ impl DepthWriterSink {
             self.spill_min_free_headroom,
         ) {
             Ok(path) => {
+                note_rescue_outcome_depth(true, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
                     .increment(rows as u64);
                 metrics::counter!("tv_depth_rows_spilled_total", "feed" => self.feed.as_str())
@@ -2181,6 +2291,7 @@ impl DepthWriterSink {
                 );
             }
             Err(err) => {
+                note_rescue_outcome_depth(false, (batch.min_seq, batch.max_seq), true);
                 if err.kind() == std::io::ErrorKind::StorageFull {
                     metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
                         .increment(1);
@@ -3289,6 +3400,8 @@ mod tests {
         let mut empty = DepthFlushBatch {
             buffer: Buffer::new(questdb::ingress::ProtocolVersion::V1),
             rows: 0,
+            min_seq: 0,
+            max_seq: 0,
         };
         assert_eq!(sink.write(&mut empty), 0);
         assert!(

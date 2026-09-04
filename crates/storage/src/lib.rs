@@ -277,6 +277,9 @@ pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
+// Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
+// frames whose rows already reached the database. Sibling of `ws_frame_spill`.
+pub mod wal_applied_watermark;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT

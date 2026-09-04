@@ -1603,6 +1603,11 @@ pub struct TickWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Lowest / highest `capture_seq` among the pending rows (`0` = none).
+    /// Carried on every hand-off and rescue so the WAL applied-watermark can
+    /// learn which captured frames this batch covers once it LANDS.
+    pending_min_seq: u64,
+    pending_max_seq: u64,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
     /// Highest `capture_seq` this connection has stamped — the per-connection
@@ -1699,6 +1704,8 @@ impl TickWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    pending_min_seq: 0,
+                    pending_max_seq: 0,
                     feed,
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
@@ -1717,6 +1724,8 @@ impl TickWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    pending_min_seq: 0,
+                    pending_max_seq: 0,
                     feed,
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
@@ -1753,6 +1762,8 @@ impl TickWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            pending_min_seq: 0,
+            pending_max_seq: 0,
             feed,
             last_capture_seq: 0,
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
@@ -1808,6 +1819,10 @@ impl TickWriter {
             Err(err) => Err(err.into()),
         };
         if let Err(err) = &outcome {
+            // The frame was captured to the WAL and will NOT reach the
+            // database from this session: the next replay must re-offer it.
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied(u64::try_from(capture_seq).unwrap_or(0));
             // A LOSS, counted on the ALARMED metric — found 2026-09-01.
             //
             // Until this line the only record of an append failure was the
@@ -1931,7 +1946,36 @@ impl TickWriter {
 
         self.pending = self.pending.saturating_add(1);
         self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
+        self.note_pending_seq(row.capture_seq);
         Ok(())
+    }
+
+    /// Widens the pending sequence range to cover one appended row.
+    fn note_pending_seq(&mut self, capture_seq: i64) {
+        let seq = u64::try_from(capture_seq).unwrap_or(0);
+        if seq == 0 {
+            return;
+        }
+        if self.pending_min_seq == 0 || seq < self.pending_min_seq {
+            self.pending_min_seq = seq;
+        }
+        if seq > self.pending_max_seq {
+            self.pending_max_seq = seq;
+        }
+    }
+
+    /// Takes the pending range, leaving it empty.
+    fn take_pending_range(&mut self) -> (u64, u64) {
+        let r = (self.pending_min_seq, self.pending_max_seq);
+        self.pending_min_seq = 0;
+        self.pending_max_seq = 0;
+        r
+    }
+
+    /// Restores a range the hand-off gave back (queue full / thread gone).
+    fn restore_pending_range(&mut self, range: (u64, u64)) {
+        self.pending_min_seq = range.0;
+        self.pending_max_seq = range.1;
     }
 
     /// Flushes buffered rows over ILP-HTTP with a per-flush server ACK.
@@ -1989,6 +2033,11 @@ impl TickWriter {
         match flushed {
             Some(Ok(())) => {
                 self.pending = 0;
+                // The synchronous arm (offload not wired, or its spawn failed)
+                // acks the watermark itself; otherwise a lane on this path
+                // would never skip a replayed frame.
+                let (_, max_seq) = self.take_pending_range();
+                crate::wal_applied_watermark::applied_watermark().note_ticks_acked(max_seq);
                 Ok(())
             }
             Some(Err(err)) => {
@@ -2120,21 +2169,26 @@ impl TickWriter {
         // speak the same protocol the sender negotiated, and borrowing rules
         // will not let both happen in one expression.
         let protocol = self.buffer.protocol_version();
+        let (min_seq, max_seq) = self.take_pending_range();
         let batch = FlushBatch {
             buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
             rows,
+            min_seq,
+            max_seq,
         };
         let Some(tx) = self.offload.as_ref() else {
             // Unreachable — `flush` checks. Treated as the gone arm rather
             // than silently succeeding, because "we sent it" when nothing was
             // sent is the one report that must never be wrong.
             self.buffer = batch.buffer;
+            self.restore_pending_range((batch.min_seq, batch.max_seq));
             return OffloadOutcome::SinkGone(rows);
         };
         match tx.try_send(batch) {
             Ok(()) => {
                 self.pending = 0;
                 self.retained_spans = 0;
+                crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
                 metrics::counter!(
                     "tv_tick_flush_offloaded_total",
                     "feed" => self.feed.as_str()
@@ -2143,6 +2197,7 @@ impl TickWriter {
                 OffloadOutcome::Sent(rows)
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
                 // Backpressure, not loss. Put the rows BACK and keep
                 // appending — the next flush retries. This is the arm that
                 // makes the bounded queue safe: without it a full queue would
@@ -2188,6 +2243,7 @@ impl TickWriter {
             Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                 // The writer thread died. Rescue rather than drop, and say so.
                 self.buffer = returned.buffer;
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
                 let dropped = self.discard_pending();
                 OffloadOutcome::SinkGone(dropped)
             }
@@ -2243,11 +2299,14 @@ impl TickWriter {
         // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
         // MOVED, and the replacement is the same empty one `offload_flush`
         // already installs on every successful hand-off.
+        let range = self.take_pending_range();
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
             let batch = RescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
                 rows: dropped,
+                min_seq: range.0,
+                max_seq: range.1,
             };
             match tx.try_send(batch) {
                 Ok(()) => {
@@ -2256,6 +2315,10 @@ impl TickWriter {
                         "feed" => self.feed.as_str()
                     )
                     .increment(dropped as u64);
+                    // Counted like a writer hand-off, so a replay confirm waits
+                    // for the rescue thread too — a payload in THIS queue is
+                    // not yet in any file.
+                    crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
                     self.pending = 0;
                     return dropped;
                 }
@@ -2283,10 +2346,35 @@ impl TickWriter {
             }
         }
 
-        perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
+        let landed =
+            perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
+        note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
         dropped
+    }
+}
+
+/// A rescued payload is APPLIED from the WAL's point of view — the spill tier
+/// is durable and re-ingestable — and a failed rescue is the one arm where
+/// captured frames genuinely need the next replay.
+/// `in_order` is `true` ONLY on the writer thread, which completes batches in
+/// the order they were handed off. A rescue from the PRODUCER (inline
+/// fallback) or the rescue THREAD can land while earlier batches still sit in
+/// the writer's queue; acking its `max_seq` there would lift the watermark
+/// over rows that are in neither QuestDB nor a spill file — and a crash in
+/// that window (the 2026-09-02 OOM shape) would archive their segments
+/// unread next boot. Out of order, a landing acks nothing: those frames are
+/// re-replayed and collapse on DEDUP, which is the cheap direction.
+fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
+    let wm = crate::wal_applied_watermark::applied_watermark();
+    if landed {
+        if in_order {
+            wm.note_ticks_acked(range.1);
+        }
+    } else {
+        wm.note_unapplied_range(range.0, range.1);
+        wm.note_unlanded();
     }
 }
 
@@ -2296,7 +2384,7 @@ impl TickWriter {
 /// thread and the inline fallback in [`TickPersistenceWriter::discard_pending`].
 /// Two copies would have drifted, and the copy that drifted would have been the
 /// fallback — the one that only runs on the worst day.
-fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: usize) {
+fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: usize) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2336,6 +2424,7 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                  ticks dedup key carries capture_seq: \
                  curl --data-binary @<path> http://<questdb>:9000/write"
             );
+            true
         }
         Err(err) => {
             // The rescue itself failed (disk full, cap reached, no
@@ -2352,6 +2441,7 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                  are permanently lost and nothing re-inserts them. The raw frames \
                  remain in the write-ahead log for manual recovery."
             );
+            false
         }
     }
 }
@@ -2397,6 +2487,9 @@ pub const TICK_RESCUE_ABANDONED_COUNTER: &str = "tv_tick_rescue_abandoned_total"
 pub struct RescueBatch {
     buffer: Buffer,
     rows: usize,
+    /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
 }
 
 impl RescueBatch {
@@ -2425,12 +2518,16 @@ impl TickRescueSink {
     /// [`perform_tick_rescue`]. An operator cannot tell which path ran, and
     /// should not have to.
     pub fn rescue(&self, batch: &RescueBatch) {
-        perform_tick_rescue(
+        let landed = perform_tick_rescue(
             &self.spill_dir,
             batch.buffer.as_bytes(),
             self.feed,
             batch.rows,
         );
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        // The hand-off was counted when the producer queued this payload; the
+        // replay confirm waits for this completion like any writer batch.
+        crate::wal_applied_watermark::applied_watermark().note_ticks_completed();
     }
 }
 // ---------------------------------------------------------------------------
@@ -2523,6 +2620,9 @@ pub const MAX_RETAINED_FLUSH_SPANS: u32 = 2;
 pub struct FlushBatch {
     buffer: Buffer,
     rows: usize,
+    /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
 }
 
 impl FlushBatch {
@@ -2583,6 +2683,17 @@ impl TickWriterSink {
     /// one-command recovery), so an operator sees no difference between a
     /// synchronous and an offloaded rescue.
     pub fn write(&mut self, batch: &mut FlushBatch) -> usize {
+        let landed = self.write_inner(batch);
+        // The batch is DONE — landed or rescued — whatever the outcome. This
+        // is what the replay confirm waits on, and the watermark file is
+        // refreshed from here at most once a second, off the drain.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        wm.note_ticks_completed();
+        wm.persist_if_due_now();
+        landed
+    }
+
+    fn write_inner(&mut self, batch: &mut FlushBatch) -> usize {
         if batch.rows == 0 {
             return 0;
         }
@@ -2656,6 +2767,9 @@ impl TickWriterSink {
             Ok(()) => {
                 let landed = batch.rows;
                 batch.rows = 0;
+                // ACKED by QuestDB: every captured frame up to this sequence
+                // has its rows in the database.
+                crate::wal_applied_watermark::applied_watermark().note_ticks_acked(batch.max_seq);
                 landed
             }
             Err(err) => {
@@ -2678,6 +2792,7 @@ impl TickWriterSink {
             .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         match spill_failed_ilp(&self.spill_dir, batch.buffer.as_bytes(), self.feed, now) {
             Ok(path) => {
+                note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
                     .increment(rows as u64);
                 metrics::counter!("tv_ticks_spilled_total", "feed" => self.feed.as_str())
@@ -2697,6 +2812,7 @@ impl TickWriterSink {
                 );
             }
             Err(err) => {
+                note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
                     .increment(rows as u64);
                 error!(
@@ -4686,5 +4802,24 @@ mod tests {
             2,
             "expected exactly two seeded label sets"
         );
+    }
+
+    #[test]
+    fn an_out_of_order_rescue_never_advances_the_watermark() {
+        // The global is shared across the test binary; use ranges far above
+        // anything another test acks so the assertion is about THIS call.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let base = 1u64 << 62;
+        let before = wm.snapshot().hwm_ticks;
+        note_rescue_outcome_ticks(true, (base, base + 10), false);
+        assert_eq!(
+            wm.snapshot().hwm_ticks,
+            before,
+            "a producer-side or rescue-thread landing acks nothing"
+        );
+        let unlanded = wm.unlanded_total();
+        note_rescue_outcome_ticks(false, (base + 20, base + 30), false);
+        assert_eq!(wm.unlanded_total(), unlanded + 1);
+        assert!(wm.snapshot().range_has_unapplied(base + 25, base + 25));
     }
 }

@@ -943,8 +943,17 @@ async fn async_main() -> Result<()> {
         bytes::Bytes,
     )> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
-    match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
-        Ok(recovered) => {
+    // A REFUSED pass (disk floor, per-boot frame cap) returns no frames AND
+    // touches nothing — including whatever an earlier boot left staged in
+    // `replaying/`. That must not read as "nothing to replay": the else-branch
+    // below confirms in that case, and confirming archives the staged
+    // leftovers UNREAD. The refusal is most likely on exactly the full-disk
+    // boot, which is the boot that can least afford to lose them.
+    let mut ws_wal_replay_refused = false;
+    match tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path) {
+        Ok(batch) => {
+            ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap;
+            let recovered = batch.frames;
             if recovered.is_empty() {
                 info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
             } else {
@@ -2600,6 +2609,17 @@ async fn async_main() -> Result<()> {
             "STAGE-C.2c: staged write-ahead-log segments are held UNCONFIRMED — the Dhan \
              lane will fold these frames and confirm them itself. A crash before that \
              replays them again next boot rather than losing them."
+        );
+    } else if ws_wal_replay_refused {
+        // The pass was REFUSED before it read anything. Segments an earlier
+        // boot staged are still in `replaying/`, unread; confirming would
+        // archive them with a zero count. Leave them for a boot with the disk
+        // and the frame budget to read them. The refusal itself already
+        // fired a coded error in the storage layer.
+        warn!(
+            "STAGE-C: the WAL replay was refused (disk floor or per-boot frame cap), so \
+             nothing staged is confirmed — `replaying/` is left exactly as found for the \
+             next boot"
         );
     } else {
         // No refold is coming — either the lane will not run (the frames were
