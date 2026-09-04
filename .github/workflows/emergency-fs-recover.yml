@@ -1,0 +1,217 @@
+# emergency-fs-recover.yml — one-off recovery of a prod box whose ROOT FILESYSTEM
+# is 100% full and therefore unreachable over SSM.
+#
+# Authorization: operator Quote 21 (2026-09-05, "Yes wipe") + Quote 22
+# (2026-09-05, "go ahead ddude" for the 500 -> 600 GB grow), both recorded in
+# .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md BEFORE
+# this file was written.
+#
+# WHY THIS EXISTS (measured, not assumed)
+# ------------------------------------------------------------------------
+# grow-ebs-volume.yml grew vol-0c6ab6e593e39d8c8 500 -> 600 GB at 21:39 UTC on
+# 2026-09-04 (run 33922073677) while the box was stopped, and deferred the
+# filesystem half to "cloud-init growpart + resizefs on EVERY boot". The box
+# was then started at 21:40 UTC and the CloudWatch agent's own
+# `disk_used_percent` read **100** from the first minute of that boot — the
+# filesystem did NOT follow the volume on that boot. The SSM agent cannot
+# register on a 100%-full root, so every SSM-based path (deploy-aws.yml,
+# operator-control, grow-ebs-volume.yml step 5) is dead by construction. The
+# automation identity (`claude-code-agent`) is denied ModifyVolume /
+# DetachVolume / AttachVolume / ModifyInstanceAttribute / GetConsoleOutput,
+# and the dev sandbox has no route to port 22.
+#
+# The CI credentials + a GitHub runner DO have a route: port 22 is open on the
+# box's security group and Amazon Linux 2023 ships EC2 Instance Connect, so a
+# runner can push a 60-second SSH key via `ec2-instance-connect
+# send-ssh-public-key` and run the recovery over SSH. That is what this does.
+#
+# FIRST LIVE RUN (33925272407, 2026-09-04 22:23 UTC) — what it proved and what
+# it got wrong, so the next reader trusts the file for the right reasons:
+#   * the SSH route works: key pushed, script ran, SSM registered ~2 min later;
+#   * deleting spill (64 GB) + ws_wal (43 GB) freed 107 GB on the spot;
+#   * growpart FAILED ("partition-number must be a number") because the
+#     partition suffix was extracted as "0n1p1"; fixed below. Run by hand with
+#     "1" the same two commands took the filesystem 500 -> 600 GB in seconds;
+#   * docker.service was DEAD on that boot (dockerd could not dial containerd
+#     after the disk-full boot), so QuestDB never answered and the drop loop
+#     ran over an EMPTY table list — a silent no-op. Fixed below: containerd is
+#     restarted, docker is reset-failed + started, and a QuestDB that never
+#     answers now FAILS the run instead of reporting nothing to drop.
+#
+# WHAT IT DOES ON THE BOX (in order; every step fails loudly)
+#   1. stop + disable tickvault (so the app cannot refill the disk mid-recovery)
+#   2. delete the WAL/spill/DLQ backlog under /opt/tickvault/data (Quote 21 —
+#      the backlog every restart replays)
+#   3. growpart + xfs_growfs so the grown volume is actually usable
+#   4. restart containerd + docker, bring QuestDB up, drop the market-data
+#      tables (ticks, market_depth, every candles_<tf>) and the three console
+#      views over QuestDB's HTTP port — the app's boot DDL recreates them
+#      empty. SEBI/audit/REST tables are NEVER touched.
+#   5. re-enable tickvault (NOT started — the operator-side verification starts
+#      it over SSM once the agent registers), restart the SSM agent, print df.
+#
+# It never stops the instance and never touches the volume, the budget, or
+# any table outside the Quote 21 list. Dispatch requires typing the exact
+# instance id, and every input flows through env: (never template-interpolated
+# into run:).
+
+name: emergency-fs-recover
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_instance_id:
+        description: 'Type the EXACT prod instance id (i-...) to confirm.'
+        required: true
+
+concurrency:
+  group: emergency-fs-recover
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    name: Recover a full root filesystem over EC2 Instance Connect
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check the mutation credentials exist at all
+        env:
+          HAS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_KEY" != "true" ] || [ "$HAS_SECRET" != "true" ]; then
+            echo "::error::AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not set."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Resolve the box and make sure it is running
+        id: box
+        env:
+          CONFIRM: ${{ inputs.confirm_instance_id }}
+        run: |
+          set -euo pipefail
+          IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app \
+                --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ "$IID" != "$CONFIRM" ]; then
+            echo "::error::confirm_instance_id '$CONFIRM' does not match the tv-prod-app instance '$IID' — refusing."
+            exit 1
+          fi
+          STATE=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].State.Name' --output text)
+          echo "instance $IID is $STATE"
+          if [ "$STATE" = "stopped" ]; then
+            aws ec2 start-instances --instance-ids "$IID" >/dev/null
+            echo "started"
+          fi
+          for _ in $(seq 1 40); do
+            STATE=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].State.Name' --output text)
+            [ "$STATE" = "running" ] && break
+            sleep 5
+          done
+          [ "$STATE" = "running" ] || { echo "::error::instance did not reach running (state=$STATE)"; exit 1; }
+          IP=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          AZ=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].Placement.AvailabilityZone' --output text)
+          echo "iid=$IID" >> "$GITHUB_OUTPUT"
+          echo "ip=$IP"   >> "$GITHUB_OUTPUT"
+          echo "az=$AZ"   >> "$GITHUB_OUTPUT"
+          echo "public ip $IP in $AZ"
+
+      - name: Write the on-box recovery script
+        run: |
+          set -euo pipefail
+          cat > recover.sh <<'EOS'
+          set -u
+          echo "=== 0. before ==="; df -B1G / | tail -1
+          echo "=== 1. stop + disable the app ==="
+          sudo systemctl stop tickvault || true
+          sudo systemctl disable tickvault || true
+          echo "UNIT=$(systemctl is-active tickvault) ENABLED=$(systemctl is-enabled tickvault)"
+          echo "=== 2. delete the WAL/spill/DLQ backlog (Quote 21) ==="
+          sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/spill-hold 2>/dev/null || true
+          sudo rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal
+          sudo rm -f /opt/tickvault/data/spill-hold/*.ilp
+          sync
+          echo "AFTER-RM"; df -B1G / | tail -1
+          echo "=== 3. grow the filesystem ==="
+          ROOT=$(findmnt -no SOURCE /); DISK=$(lsblk -no PKNAME "$ROOT")
+          # Only the TRAILING digits are the partition number: /dev/nvme0n1p1 -> "1".
+          # The first live run used 's/[^0-9]*//' and got "0n1p1", which growpart
+          # rejected — the filesystem stayed at its old size while the run said OK.
+          PART=$(lsblk -no KNAME "$ROOT" | sed 's/.*[^0-9]//')
+          echo "root=$ROOT disk=$DISK part=$PART"
+          case "$PART" in ''|*[!0-9]*) echo "FAILED: could not derive a numeric partition number from $ROOT"; exit 1;; esac
+          sudo growpart "/dev/$DISK" "$PART" || echo "growpart-nochange"
+          FSTYPE=$(findmnt -no FSTYPE /)
+          if [ "$FSTYPE" = xfs ]; then sudo xfs_growfs -d / ; else sudo resize2fs "$ROOT"; fi
+          echo "AFTER-GROW"; df -B1G / | tail -1
+          echo "=== 4. containerd + docker + QuestDB up, then drop the market-data tables + console views (Quote 21) ==="
+          # After a disk-full boot dockerd could not dial containerd (first live run);
+          # restarting containerd and clearing docker's failed state fixed it.
+          sudo systemctl restart containerd || true
+          sudo systemctl reset-failed docker docker.socket 2>/dev/null || true
+          sudo systemctl start docker || true
+          sleep 5
+          echo "docker=$(systemctl is-active docker) containerd=$(systemctl is-active containerd)"
+          sudo docker start tv-questdb >/dev/null 2>&1 || true
+          up=0
+          for i in $(seq 1 90); do curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%201' >/dev/null 2>&1 && { up=1; break; }; sleep 2; done
+          if [ "$up" != 1 ]; then echo "FAILED: QuestDB never answered on :9000 — refusing to report an empty drop as success"; sudo docker ps -a; exit 1; fi
+          q() { curl -fsS --max-time 600 -G --data-urlencode "query=$1" http://127.0.0.1:9000/exec 2>&1; }
+          ALL=$(curl -fsS --max-time 30 -G --data-urlencode 'query=SELECT table_name FROM tables()' http://127.0.0.1:9000/exp | tail -n +2 | tr -d '"\r' | sed '/^$/d')
+          echo "TABLES-BEFORE: $(echo "$ALL" | paste -sd' ' -)"
+          for v in ticks_named candles_named market_depth_named; do echo "VIEW $v: $(q "DROP VIEW IF EXISTS $v" | head -c 100)"; done
+          TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || index($0,"candles_")==1' | sort)
+          echo "WIPE-TARGETS $(echo "$TARGETS" | wc -w): $(echo "$TARGETS" | paste -sd' ' -)"
+          failed=0
+          for t in $TARGETS; do
+            R=$(q "DROP TABLE IF EXISTS $t")
+            if echo "$R" | grep -q '"ddl":"OK"'; then echo "DROPPED $t"; else
+              echo "DROP-FAILED $t: $(echo "$R" | head -c 160)"; q "ALTER TABLE $t RESUME WAL" >/dev/null 2>&1 || true
+              R2=$(q "DROP TABLE IF EXISTS $t"); echo "RETRY $t: $(echo "$R2" | head -c 120)"
+              echo "$R2" | grep -q '"ddl":"OK"' || failed=1; fi
+          done
+          echo "TABLES-AFTER: $(curl -fsS -G --data-urlencode 'query=SELECT table_name FROM tables()' http://127.0.0.1:9000/exp | tail -n +2 | tr -d '"\r' | paste -sd' ' -)"
+          sync; sleep 45; echo "AFTER-DROP"; df -B1G / | tail -1
+          [ "$failed" = 0 ] || { echo "FAILED: at least one drop did not succeed"; exit 1; }
+          echo "=== 5. re-enable the app (not started) + wake the SSM agent ==="
+          sudo systemctl enable tickvault || true
+          sudo systemctl restart amazon-ssm-agent || true
+          sleep 5; systemctl is-active amazon-ssm-agent || true
+          echo "FINAL"; df -h / | tail -1
+          EOS
+          echo "script written ($(wc -l < recover.sh) lines)"
+
+      - name: Push a 60-second key via EC2 Instance Connect and run the recovery
+        env:
+          IID: ${{ steps.box.outputs.iid }}
+          IP: ${{ steps.box.outputs.ip }}
+          AZ: ${{ steps.box.outputs.az }}
+        run: |
+          set -uo pipefail
+          ssh-keygen -q -t ed25519 -N '' -f eic_key
+          ok=0
+          for attempt in $(seq 1 30); do
+            OUT=$(aws ec2-instance-connect send-ssh-public-key --instance-id "$IID" --availability-zone "$AZ" \
+                    --instance-os-user ec2-user --ssh-public-key file://eic_key.pub 2>&1)
+            if ! echo "$OUT" | grep -q '"Success": true'; then
+              echo "::error::send-ssh-public-key failed: $OUT"
+              case "$OUT" in *UnauthorizedOperation*|*AccessDenied*) exit 1;; esac
+              sleep 10; continue
+            fi
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
+                   -i eic_key ec2-user@"$IP" 'bash -s' < recover.sh; then ok=1; break; fi
+            echo "ssh attempt $attempt did not complete — sshd may still be starting; retrying in 15s"
+            sleep 15
+          done
+          rm -f eic_key eic_key.pub
+          [ "$ok" = 1 ] || { echo "::error::recovery script never ran to completion"; exit 1; }
