@@ -2206,3 +2206,48 @@ amplification fix — at which point it lands with a measured number behind it r
 a guess. Spending first would hide the defect and the operator would still not have O(1).
 Recorded this way so that a future session reads the authorization AND the reason it was
 held, rather than treating an unspent authorization as an oversight.
+
+**Quote 21 (2026-09-05, 03:2x IST — FRESH START: wipe the market-data tables, spill and WAL backlog; SEBI and audit tables KEPT — preserve EXACTLY):**
+> "Yes wipe"
+
+Given in DIRECT response to a message that named exactly what would be deleted and
+what would not: *"I would wipe only the market data (ticks, depth, candles), the spill
+files and the WAL backlog. Those are the big ones anyway. … Your own rule says the
+SEBI tables are never deleted: instrument history, order audit, position events."* The
+operator's preceding question was whether starting *"very freshly from the scratch … by
+entirely deleting the entire data stored"* would avoid the Sept 4 failure; the answer
+given was **yes for Monday, no for the week after**, and this quote accepts that trade.
+
+#### What this authorizes (the ONLY data-erase under this quote)
+
+| Surface | Disposition |
+|---|---|
+| `ticks`, `market_depth`, every `candles_<tf>` table (the `ticks_named` / `candles_named` console views are dropped and recreated with them) | **DROPPED** on the prod box; the app's boot DDL recreates them empty |
+| `spot_1m_rest`, `option_chain_1m`, `option_contract_1m_rest`, `rest_fetch_audit` | **KEPT** — small, and no part of the disk problem; dropping them buys nothing |
+| `/opt/tickvault/data/{ws_wal,spill,dlq}` | **DELETED** — the WAL backlog that every restart replays, and the spill files. The instrument-cache / mapping artifacts are KEPT so Monday's boot does not fall back to the 4-index universe |
+| `instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `order_update_events`, `position_update_events`, `ws_event_audit`, every other `*_audit` table | **NEVER TOUCHED** — SEBI 5-year retention, §5/§6/§25 bind |
+| The EBS volume (500 GB, Quote 20) | UNCHANGED — no grow, no shrink |
+| `limit_amount` ($150, Quote 19) | UNCHANGED |
+
+#### Why this is recorded as a Monday fix and NOT a fix
+
+MEASURED 2026-09-03/04 (CloudWatch + app log): every app restart replays the WAL backlog
+(~2.2M frames), refolds 15–28M ticks and rescues 10–30M depth rows, and costs **25–75 GB
+of disk per restart**; deferred segments (20–106 per restart) carry the same backlog to
+the next restart, so it never clears. Seven restarts on 2026-09-03 — five dispatched by
+the executing Claude session (two inside market hours with `confirm_market_hours=yes`),
+one unattributed manual instance start at 18:00 IST, one bot after-close deploy —
+consumed ~300 GB; the disk reached 20 KB free at 23:07 IST and 2026-09-04 booted onto
+it (`used_pct:99` at 08:31:31) and persisted nothing all day. The two PRs merged that
+day (#1856, #1857) are NOT the cause.
+
+A wipe removes the backlog and the full disk. It does NOT change the ~140 GB/session
+burn rate (depth ≈ 80%), so the same pressure returns within the week. The follow-ups
+this quote does NOT authorize and which still need their own dated quotes: the
+replay-watermark code fix (a restart must not replay already-applied segments), a
+no-in-session-deploy rule, and the depth write-volume decision.
+
+**What a PR or action that violates Quote 21 looks like (REJECT):** drops, truncates or
+deletes any row from a SEBI/audit table; grows or shrinks the volume under cover of
+this quote; changes `limit_amount`; deploys or restarts the app in the trading session
+before the replay fix lands; presents the wipe as a fix for the burn rate.
