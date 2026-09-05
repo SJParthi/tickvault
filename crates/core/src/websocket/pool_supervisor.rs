@@ -2035,12 +2035,41 @@ pub enum FrameSinkOutcome {
     /// doc did not, and a comment claiming recovery is worse than no comment,
     /// because it tells the next reader not to look.
     ///
-    /// Until a re-fold exists, a ring refusal is PERMANENT LOSS and is alarmed
-    /// as such (`tv-<env>-ws-ring-full`).
+    /// 2026-09-05 correction: "Until a re-fold exists, a ring refusal is
+    /// PERMANENT LOSS" is no longer true. `refold_wal_frames` exists, and a
+    /// ring refusal now marks the frame UNAPPLIED in the applied watermark
+    /// (below), so the next replay is forbidden from skipping its segment and
+    /// re-offers it. A ring refusal is a DEFERRAL, not a loss. The alarm
+    /// stands — a session shedding at the ring is still degraded — but the
+    /// doc claiming permanence would now send a reader looking for a data
+    /// loss that the watermark already prevents.
     RingFull,
-    /// The WAL refused it outright — the queue itself was full, so the frame
-    /// reached neither disk nor the ring. Genuine, immediate capture loss.
+    /// The WAL refused it AND the ring refused it. The frame reached neither
+    /// disk nor the fold: genuine, immediate capture loss, recoverable by
+    /// nothing.
     WalDropped,
+    /// The WAL refused it, but the ring took it — so it IS folded into the
+    /// database this session, and it is NOT replayable.
+    ///
+    /// This arm exists because the previous shape returned early on a WAL
+    /// refusal, BEFORE the ring, which escalated a durability-tier problem
+    /// into a certain data loss: a frame the write-ahead queue could not
+    /// accept was never folded either, even when the database was perfectly
+    /// healthy and would have taken it. The WAL queue filling and QuestDB
+    /// being unwritable are different failures with different causes, and
+    /// treating the first as if it implied the second threw away ticks that
+    /// nothing had to throw away.
+    ///
+    /// Falling through is never worse. A frame that is folded but absent from
+    /// the WAL is lost only if the process dies before the flush — which is
+    /// exactly what the early return guaranteed unconditionally. It is often
+    /// better: a transient WAL-writer stall no longer costs a tick.
+    ///
+    /// What it deliberately does NOT do is mark the frame unapplied. There is
+    /// no WAL record to re-offer, so no segment holds it and the watermark has
+    /// nothing to protect; marking it would only forbid skipping a neighbour
+    /// segment that legitimately could be skipped.
+    CapturedLiveOnly,
 }
 
 /// The only thing a socket read task is permitted to do with a frame.
@@ -2574,7 +2603,7 @@ impl FrameSink for WalRingSink {
         // `append_with_seq`, never `append`: `append` would mint a SECOND
         // sequence internally and the WAL record would then disagree with the
         // one the consumer stamps.
-        if self.spill.append_with_seq_at(
+        let wal_refused = self.spill.append_with_seq_at(
             self.ws_type,
             // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
             frame.clone(),
@@ -2582,10 +2611,14 @@ impl FrameSink for WalRingSink {
             tickvault_storage::ws_frame_spill::receipt_nanos_from(received_at),
             // TVW4: resolved at construction, one copied byte on the hot path.
             self.wal_endpoint,
-        ) == AppendOutcome::Dropped
-        {
+        ) == AppendOutcome::Dropped;
+        if wal_refused {
             self.wal_dropped.increment(1);
-            return FrameSinkOutcome::WalDropped;
+            // DELIBERATELY NOT RETURNING HERE (2026-09-05). The counter keeps
+            // its exact previous meaning — the write-ahead queue refused this
+            // frame — and the frame now goes on to the ring anyway. See
+            // `FrameSinkOutcome::CapturedLiveOnly` for why an early return
+            // turned a durability failure into a certain tick loss.
         }
         // Step 2 — byte budget. Consulted BEFORE `try_send` because a reserve
         // taken after a successful send could not be refused, and one taken
@@ -2600,6 +2633,12 @@ impl FrameSink for WalRingSink {
                 self.ring_bytes_full.increment(1);
                 // Captured to the WAL, never folded by this session: the next
                 // replay must re-offer it. Three atomics, on the shed arm only.
+                // If the WAL ALSO refused it there is no record to re-offer,
+                // so marking it would protect nothing and the honest outcome
+                // is the total-loss one.
+                if wal_refused {
+                    return FrameSinkOutcome::WalDropped;
+                }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
                 return FrameSinkOutcome::RingFull;
             }
@@ -2611,6 +2650,9 @@ impl FrameSink for WalRingSink {
             // instead of to whoever happened to reach the shared pool first.
             RingReserve::SlotsFull => {
                 self.ring_full.increment(1);
+                if wal_refused {
+                    return FrameSinkOutcome::WalDropped;
+                }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
                 return FrameSinkOutcome::RingFull;
             }
@@ -2635,6 +2677,9 @@ impl FrameSink for WalRingSink {
             // reason.
             self.budget.release(len);
             self.ring_full.increment(1);
+            if wal_refused {
+                return FrameSinkOutcome::WalDropped;
+            }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
             return FrameSinkOutcome::RingFull;
         }
@@ -2644,7 +2689,11 @@ impl FrameSink for WalRingSink {
         // granted reservation is a held slot. The arm stays because a closed
         // channel is a real (if terminal) condition, not because capacity can
         // still refuse.
-        FrameSinkOutcome::Captured
+        if wal_refused {
+            FrameSinkOutcome::CapturedLiveOnly
+        } else {
+            FrameSinkOutcome::Captured
+        }
     }
 }
 
@@ -3926,8 +3975,25 @@ where
                                 code = ErrorCode::WsGapConnectionState.code_str(),
                                 endpoint = supervisor.slot().endpoint.as_str(),
                                 pool_index = supervisor.slot().pool_index,
-                                "write-ahead log refused a Dhan frame — that frame is lost; \
-                                 the reader keeps draining so the socket is not also lost"
+                                "write-ahead log refused a Dhan frame AND the ring refused it \
+                                 too — that frame is lost; the reader keeps draining so the \
+                                 socket is not also lost"
+                            );
+                        }
+                        if outcome == FrameSinkOutcome::CapturedLiveOnly {
+                            // Degraded, not lost, and the difference is worth a
+                            // line of its own: the write-ahead queue refused
+                            // this frame but the ring took it, so its ticks DO
+                            // reach the database this session and only a crash
+                            // before the next flush would lose them. Before
+                            // 2026-09-05 this frame was discarded outright.
+                            warn!(
+                                code = ErrorCode::WsGapConnectionState.code_str(),
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                "write-ahead log refused a Dhan frame but the ring accepted it — \
+                                 the frame IS folded into the database this session and is NOT \
+                                 replayable, so only a crash before the next flush loses it"
                             );
                         }
                         if outcome == FrameSinkOutcome::RingFull {

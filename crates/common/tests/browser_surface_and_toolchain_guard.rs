@@ -130,7 +130,7 @@ const SCRIPT_BUDGET: &[(&str, usize)] = &[
     // --- NOT frontend: XSS fixtures + vendor-body parsing ---
     ("crates/api/src/middleware.rs", 1),
     ("crates/aws-lambdas/src/operator_control.rs", 3),
-    ("crates/core/src/notification/events.rs", 12),
+    ("crates/core/src/notification/events.rs", 6),
     ("crates/trading/src/oms/api_client.rs", 1),
 ];
 
@@ -184,7 +184,33 @@ fn browser_code_in_rust_is_pinned_to_the_enumerated_surfaces() {
             Some(&allowed) if *count > allowed => problems.push(format!(
                 "  GREW: {path} has {count} `<script`, budget allows {allowed}"
             )),
+            // SCOPE FIX #18 (2026-09-05): the SHRINK half. This arm used to be
+            // an empty `Some(_) => {}`, so a budget could sit permanently above
+            // the file it bounds — `notification/events.rs` carried 12 against
+            // an actual 6, six units of headroom nobody granted and no reviewer
+            // would see. Its two siblings in this file (JS_VOLUME_BUDGET,
+            // INLINE_HANDLER_BUDGET) are exact and stale-checked; this one was
+            // neither, which made it the loosest bound on the one carve-out
+            // CLAUDE.md calls deliberately shrink-only. An unbounded carve-out
+            // is not a carve-out, and a carve-out that only ratchets one way is
+            // only half a ratchet.
+            Some(&allowed) if *count < allowed => problems.push(format!(
+                "  SHRANK: {path} has {count} `<script` against a budget of {allowed} — \
+                 lower the budget to {count}. The carve-out is shrink-only: headroom that \
+                 is not in use is headroom the next change spends without review."
+            )),
             Some(_) => {}
+        }
+    }
+
+    // A budget entry whose file is gone bounds nothing and hides the fact that
+    // a surface was removed — the same stale-subject class the dedup guard's
+    // exemption list carried until 2026-09-05.
+    for (path, _) in SCRIPT_BUDGET {
+        if !actual.contains_key(*path) && !repo_root().join(path).exists() {
+            problems.push(format!(
+                "  STALE: {path} is in SCRIPT_BUDGET and no longer exists — remove the entry"
+            ));
         }
     }
 
