@@ -61,7 +61,17 @@ pub const DOCKER_RESET_COMMANDS: [&str; 18] = [
     // saved and chose not to.
     r#"QDB='http://127.0.0.1:9000'
 OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
-SEBI='instrument_lifecycle instrument_lifecycle_audit index_constituency order_audit'
+# 2026-09-05: was FOUR names. The other 32 tables the repository's own
+# retention lists declare must never be lost were destroyed with the
+# volume, unexported, while this action printed SEBI-PRESERVED four times
+# and exited 0. The abort rule only ever inspected the four it named, so
+# an operator saw a clean run. This set is now the UNION of
+# DAY_PARTITIONED_TABLES and RETENTION_EXEMPT_TABLES in
+# crates/storage/src/partition_manager.rs — the repo's authoritative
+# never-delete definition — and a lockstep guard derives the expected
+# set from that source rather than restating it, so the two cannot drift
+# and the guard can never again assert a list against itself.
+SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
 if [ -z "$ALL" ]; then
   echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — nothing could be exported. Proceeding, because this action is also the remedy for a wedged QuestDB.'
@@ -126,7 +136,17 @@ pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 12] = [
     // saved and chose not to.
     r#"QDB='http://127.0.0.1:9000'
 OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
-SEBI='instrument_lifecycle instrument_lifecycle_audit index_constituency order_audit'
+# 2026-09-05: was FOUR names. The other 32 tables the repository's own
+# retention lists declare must never be lost were destroyed with the
+# volume, unexported, while this action printed SEBI-PRESERVED four times
+# and exited 0. The abort rule only ever inspected the four it named, so
+# an operator saw a clean run. This set is now the UNION of
+# DAY_PARTITIONED_TABLES and RETENTION_EXEMPT_TABLES in
+# crates/storage/src/partition_manager.rs — the repo's authoritative
+# never-delete definition — and a lockstep guard derives the expected
+# set from that source rather than restating it, so the two cannot drift
+# and the guard can never again assert a list against itself.
+SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
 if [ -z "$ALL" ]; then
   echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — nothing could be exported. Proceeding, because this action is also the remedy for a wedged QuestDB.'

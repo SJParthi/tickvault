@@ -3605,23 +3605,27 @@ fn scope_fix_2026_09_01_self_test() {
 fn every_lambda_declares_the_rust_runtime() {
     const REQUIRED_RUNTIME: &str = "provided.al2023";
     let root = repo_root();
-    let tf_dir = root.join("deploy/aws/terraform");
     let mut resources = 0usize;
     let mut violations: Vec<String> = Vec::new();
 
-    let mut entries: Vec<_> = std::fs::read_dir(&tf_dir)
-        .expect("the terraform directory must exist")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "tf"))
-        .collect();
+    // 2026-09-05 (SCOPE FIX #19, hole TEN): this was `read_dir`, which is
+    // NOT recursive. Hole nine closed managed Lambda runtimes with a
+    // scanner that reads one flat directory — and the very next
+    // structural step any terraform codebase takes is `modules/`. The
+    // first module subdirectory would have silently dropped every Lambda
+    // in it out of the ONLY check that can see a managed runtime, because
+    // the general token scanner is provably blind to `nodejs20.x`: the
+    // digit after `node` fails its word-boundary test.
+    //
+    // Found by planting a module-directory Lambda declaring
+    // `runtime = "nodejs20.x"` and watching all 27 tests stay green.
+    // Same shape as every one of the nine holes before it: the hole was
+    // in WHAT THE SCANNER LOOKED AT, never in its list of banned words.
+    let mut entries: Vec<String> = git_ls_files_including_untracked(&["deploy/aws/**/*.tf"]);
     entries.sort();
 
     for path in entries {
-        let rel = path
-            .strip_prefix(&root)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+        let rel = path;
         let body = read_scan_text(&root, &rel);
         // Walk resource blocks by their opening line, then read forward to the
         // `runtime =` inside that block. A block without one is a violation
@@ -3650,11 +3654,11 @@ fn every_lambda_declares_the_rust_runtime() {
                 Some(decl) if decl.contains(REQUIRED_RUNTIME) => {}
                 Some(decl) => violations.push(format!(
                     "  {}: aws_lambda_function declares {decl} — not {REQUIRED_RUNTIME}",
-                    path.display()
+                    rel
                 )),
                 None => violations.push(format!(
                     "  {}: aws_lambda_function declares NO runtime within its block",
-                    path.display()
+                    rel
                 )),
             }
         }
