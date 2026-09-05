@@ -3050,3 +3050,109 @@ nobody has been able to perform for four weeks.
   automatic action line, without a lever taken in the same change.
 - Reads this section as authorization to raise `limit_amount` — it is not, and
   Quote 19 caps it at $150.
+
+### §2.3u — 2026-09-05: the one gauge that predicts every loss we can actually control was watched by nobody
+
+**The verbatim operator authorization (2026-09-05, typed directly in-session):**
+
+> "go ahead with 1, 2 and 3 dude"
+
+Given in DIRECT response to a message that named exactly three items with their
+costs, of which the third read verbatim: *"**Alarm the ring-backlog gauge** —
+already measured, already charted, watched by nobody. The one signal that
+predicts every loss we can control. ~₹9/month."* That is the §28.2/§28.3
+authorization shape this repository already accepts — a general go-ahead
+answering an ENUMERATED ask selects the enumerated work. Recorded HERE before
+the terraform, per the rule-file-first law.
+
+#### The gap
+
+`tv_dhan_feed_ring_dwell_max_ms` is the worst time any frame waited in the
+frame ring before the fold picked it up. It is **emitted** (`dhan_feed_stack.rs`
+`RING_DWELL_MAX_MS_GAUGE`), **EMF-selected** (`cloudwatch-agent.json`), and
+**charted** (`dashboard.tf:530`, `stat = "Maximum"`). No alarm reads it.
+
+That makes it the most valuable unwatched signal in the lane, because of what
+it measures: not a failure that has already happened, but the **approach** to
+one. Every loss mechanism on our side of the socket — a stalled ILP flush, a
+saturated disk, a fold falling behind a burst — shows up here first, as rising
+dwell, before it shows up anywhere else as an actual drop.
+
+#### The threshold, and why there is no clean band
+
+Three numbers bound the choice, and two of them overlap:
+
+| Quantity | Value | Source |
+|---|---:|---|
+| Normal dwell | milliseconds | the fold is a fixed-offset decode |
+| Inline depth ILP flush ceiling | **5,000 ms** | `request_timeout` on the blocking flush |
+| Ring capacity at the 5,000/sec envelope | ~13,100 ms | `FRAME_RING_CAPACITY` 65,536 |
+| Ring capacity at the 12,500/sec **open burst** | **~5,200 ms** | same, at 12,500 fps |
+
+So at the open, the ring overflows at ~5.2 s — and a *known, bounded, legitimate*
+pause reaches 5.0 s. There is no gap between "normal" and "dangerous" to put a
+threshold in.
+
+**2,000 ms** is therefore chosen as an EARLY WARNING, deliberately below both:
+far above normal, and comfortably before either the flush ceiling or the
+open-burst overflow point. If the inline flush routinely exceeds 2 s that is
+itself the finding — it is a known open item, and an alarm reporting it is
+reporting a real actionable condition, not noise.
+
+**This alarm's job is to fire BEFORE `ws_ring_full`**, which is already alarmed.
+A dwell alarm that fired at the same time as the overflow alarm would be a
+second page for one event, which this file's own §2.3i rejects.
+
+`evaluation_periods = 2` over 300 s: the gauge is a per-window maximum that
+**resets after each publish** (deliberate — a sticky max reads alarming forever
+after one stall), so a single spike in one window is not a page; the condition
+recurring in two consecutive windows is.
+
+`treat_missing_data = notBreaching` and **ungated**: the gauge publishes only
+while the drain runs, and the box is stopped overnight, so no-data is the
+normal off-hours state. The dark-lane case is already owned by
+`dhan-no-ticks-flowing` (§2.3b-i) — a second alarm on the same absence would
+page twice for one outage.
+
+`ok_actions` ARE enabled here, unlike the §2.3g gauges. The difference is real:
+those recover only when an operator frees disk or the datapoint ages out,
+whereas a falling dwell is self-evidently the drain catching up — a genuine
+recovery worth telling.
+
+#### ⚠ Honest cost, and §2.3n's lever rule is NOT satisfied
+
+**+1 alarm ≈ $0.10/mo.** No new EMF name (already selected), no user-data byte.
+
+Read from the repository's own dated **2026-09-05** measurement: `limit_amount`
+**$150**, the 90% `STOP_EC2_INSTANCES` action line **$135.00**, September
+forecast **$130.39** — margin **$4.61**.
+
+§2.3n set a standing rule that *"the next addition of any size must come with a
+LEVER, not just a cost note."* **This change does not carry one**, and that is
+stated rather than absorbed: the operator authorized the spend knowing the
+figure, but the levers remain untaken — the already-approved Quote 10 Elastic IP
+release (−$3.60/mo, execution bundled with an instance recreate) and the
+`limit_amount` decision, which Quote 19 caps at $150, already the live value.
+$0.10 against $4.61 fits; the *rule* still says bring a lever, and no lever was
+brought.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+An alarm on ring dwell does not make the fold faster, and it cannot see the
+loss that matters most: a **read-task** stall is structurally invisible to it,
+because dwell measures the queue BETWEEN the reader and the fold. If the reader
+itself stops polling — the vendor-skip mechanism — frames never enter the ring
+and dwell stays flat. This alarm covers the half of the lane after the ring,
+which is the half we can control; the half before it remains undetectable.
+
+#### What a PR that violates §2.3u looks like (REJECT)
+
+- Raises the threshold above the 5,000 ms inline-flush ceiling — that makes the
+  alarm fire only after the ring has already overflowed at the open, i.e. after
+  `ws_ring_full` has paged, which is a duplicate page and not an early warning.
+- Market-hours-gates it: the gauge is absent off-hours by construction, so a
+  gate adds a Lambda dependency and buys nothing.
+- Sets `treat_missing_data = "breaching"` — pages every night and weekend.
+- Adds a per-CONNECTION or per-INSTRUMENT dimension (the §2.3 cardinality rule
+  stands).
+- Presents it as detection of upstream tick loss. It is not, and cannot be.

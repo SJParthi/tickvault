@@ -119,14 +119,27 @@ impl DailyLagHistogram {
 
     /// Hot-path fold: O(1), zero-alloc (one relaxed `fetch_add` + one
     /// relaxed `fetch_max`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    // APPROVED: production-uncalled since 2026-07-17 (both live-feed folds
-    // deleted — Groww 2026-07-15, Dhan 2026-07-17); retained test-covered as
-    // the fold entry for any future producer (module doc, dashboard tidy).
-    fn record_ns(&self, lag_ns: u64) {
-        let lag_ms = lag_ns / (NANOS_PER_MS as u64);
+    ///
+    /// LIVE since 2026-09-05 via [`record_day_lag_ms`]. Between 2026-07-17
+    /// (when both live-feed folds were deleted) and that date this fold had
+    /// zero production callers — every call site was in this module's own test
+    /// block — so `summary()` returned `None` on every real run and the
+    /// scoreboard's four lag columns persisted the `-1` sentinel throughout.
+    fn record_ms(&self, lag_ms: u64) {
         self.buckets[lag_hist_bucket_index(lag_ms)].fetch_add(1, Ordering::Relaxed);
         self.max_ms.fetch_max(lag_ms, Ordering::Relaxed);
+    }
+
+    /// Nanosecond-input wrapper over [`Self::record_ms`].
+    ///
+    /// Retained because the module's tests exercise the fold in nanoseconds
+    /// and because a future producer measuring in `Instant` deltas wants this
+    /// shape. The live Dhan producer measures in whole milliseconds already,
+    /// so it calls `record_ms` and this wrapper does not sit on the hot path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // APPROVED: ns-input convenience wrapper; the live producer records ms.
+    fn record_ns(&self, lag_ns: u64) {
+        self.record_ms(lag_ns / (NANOS_PER_MS as u64));
     }
 
     /// IST-midnight reset (cold, O(96)).
@@ -193,6 +206,35 @@ fn day_hist(feed: Feed) -> &'static DailyLagHistogram {
         Feed::Dhan => &DHAN_DAY_LAG_HIST,
         Feed::Truedata => &TRUEDATA_DAY_LAG_HIST,
     }
+}
+
+/// Fold ONE delivery-lag sample into today's per-feed distribution.
+///
+/// # Why this exists
+///
+/// The fold's production callers were deleted on **2026-07-17** (Groww
+/// 2026-07-15, Dhan 2026-07-17), and the Dhan feed's 2026-08-09 revival did
+/// not bring one back — every surviving `record_ns` call site was inside this
+/// module's own `#[cfg(test)]` block. So from 2026-07-17 until 2026-09-05
+/// `day_lag_summary` returned `None` on every real run, `apply_day_lag` wrote
+/// the `-1` "not measured" sentinel, and the four `feed_scoreboard_daily` lag
+/// columns held that sentinel on every same-day run. The table looked
+/// instrumented and was structurally empty — the false-OK class this
+/// repository keeps retiring, in the one place that persists delivery lag.
+///
+/// The producer was always there: `record_ws_lag` has computed this exact
+/// value per tick for the CloudWatch histogram. It just never reached the
+/// day fold.
+///
+/// # Performance
+///
+/// Hot path — called once per tick. One relaxed `fetch_add` and one relaxed
+/// `fetch_max` into a `'static` array. O(1), zero allocation, no lock. The
+/// bucket index is arithmetic on the value, never a search. Pinned by
+/// `crates/app/tests/dhat_ws_lag.rs`, which gates the whole `record_ws_lag`
+/// path at zero allocation blocks.
+pub fn record_day_lag_ms(feed: Feed, lag_ms: u64) {
+    day_hist(feed).record_ms(lag_ms);
 }
 
 /// Drain one feed's day-lag distribution for the 15:45 IST scorecard
@@ -319,5 +361,69 @@ mod tests {
             None,
             "reset must clear the TrueData day histogram"
         );
+    }
+
+    /// [`record_day_lag_ms`] must fold in MILLISECONDS, and must route to the
+    /// feed it is handed.
+    ///
+    /// The unit half is the half that matters. The live producer measures
+    /// whole milliseconds (`record_ws_lag`) while this module's own tests
+    /// measure nanoseconds, so the two entry points sit side by side with a
+    /// 1,000,000x difference between their arguments. Handing nanoseconds to
+    /// the millisecond fold would drive every sample into the top bucket and
+    /// still produce a plausible-looking p50/p99/max — silently wrong, with no
+    /// error, no counter and no log line anywhere. That is the same shape as
+    /// the defect this whole fold was wired to fix, so it is pinned here
+    /// rather than left to review.
+    #[test]
+    fn test_record_day_lag_ms_folds_milliseconds_and_routes_by_feed() {
+        // Unit agreement, on LOCAL histograms so it is deterministic
+        // regardless of what sibling tests do to the process globals.
+        let by_ms = DailyLagHistogram::new();
+        let by_ns = DailyLagHistogram::new();
+        by_ms.record_ms(180);
+        by_ns.record_ns(180 * NANOS_PER_MS as u64);
+        let idx = lag_hist_bucket_index(180);
+        assert_eq!(
+            by_ms.buckets[idx].load(Ordering::Relaxed),
+            1,
+            "the ms fold must land 180 ms in the bucket for 180 ms"
+        );
+        assert_eq!(
+            by_ms.buckets[idx].load(Ordering::Relaxed),
+            by_ns.buckets[idx].load(Ordering::Relaxed),
+            "the ms and ns entry points must agree on the bucket for the same \
+             real duration; if they disagree the live producer's whole-\
+             millisecond samples are landing in the wrong bucket"
+        );
+        assert_eq!(
+            by_ms.max_ms.load(Ordering::Relaxed),
+            180,
+            "180 ms in must be 180 ms out — not 180 ns, not 180_000_000"
+        );
+
+        // Routing: the pub wrapper must reach the DHAN histogram specifically.
+        // Safe to touch the global here — every other test in this module uses
+        // either a local instance or the TrueData global.
+        reset_day_lag_histogram(Feed::Dhan);
+        for _ in 0..MIN_LAG_SAMPLES {
+            record_day_lag_ms(Feed::Dhan, 180);
+        }
+        let s = day_lag_summary(Feed::Dhan).expect("dhan day summary after the ms fold");
+        assert_eq!(
+            s.samples,
+            i64::try_from(MIN_LAG_SAMPLES).unwrap_or(i64::MAX),
+            "every folded sample must be counted"
+        );
+        assert_eq!(
+            s.max_ms, 180,
+            "the recorded max must survive the fold in ms"
+        );
+        assert!(
+            s.p50_ms > 0 && s.p50_ms < 1_000,
+            "a 180 ms median must stay sub-second: {}",
+            s.p50_ms
+        );
+        reset_day_lag_histogram(Feed::Dhan);
     }
 }
