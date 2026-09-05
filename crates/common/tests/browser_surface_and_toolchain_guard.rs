@@ -428,6 +428,17 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
         "chronyc",
         "clock-discipline verification for the latency claim",
     ),
+    (
+        "/usr/bin/true",
+        "coreutils no-op, NOT a language runtime. It is what \
+         `infra.rs::spawn_program` substitutes in cfg(test) builds so that \
+         `cargo test` cannot run `docker compose up --force-recreate` (which \
+         tears down every container on the machine) or `xdg-open`. Spawned \
+         once, by the test that proves the substitute exists and ignores the \
+         argv it is handed. Named as a LITERAL on purpose: hiding it behind a \
+         const would keep it off this allowlist and out of a reader's view, \
+         which is the opposite of what this list is for.",
+    ),
 ];
 
 /// Files carrying deliberate spawn FIXTURES rather than real spawns.
@@ -527,7 +538,21 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
     // set gives strictly stronger protection anyway (it rejects `zig` and
     // `cmake` too, which no runtime denylist would have listed) while naming
     // nothing banned.
-    const FROZEN: &[&str] = &["git", "bash", "sh", "docker", "df", "open", "chronyc"];
+    // `/usr/bin/true` joined 2026-09-05, turned by hand as this comment
+    // requires. It is coreutils' no-op -- not a language runtime, not a package
+    // manager -- and it is here because `infra.rs::spawn_program` substitutes it
+    // in cfg(test) builds so `cargo test` can no longer run `docker compose up
+    // --force-recreate` or `xdg-open` against the machine running the tests.
+    const FROZEN: &[&str] = &[
+        "git",
+        "bash",
+        "sh",
+        "docker",
+        "df",
+        "open",
+        "chronyc",
+        "/usr/bin/true",
+    ];
 
     let mut actual: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(b, _)| *b).collect();
     actual.sort_unstable();

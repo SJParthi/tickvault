@@ -2554,7 +2554,26 @@ fn guard_self_test() {
 /// The six that exist launch operator tooling (docker / git / aws CLIs).
 const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
     ("crates/app/src/bin/tv_doctor.rs", 1),
-    ("crates/app/src/infra.rs", 4),
+    // 4 -> 5 on 2026-09-05, and this is the justification the failure message
+    // above demands. `Command::new("open")` (launch Docker Desktop) became
+    // `Command::new(spawn_program("open"))` so a unit test can no longer launch
+    // Docker Desktop on the Mac this repo is developed on -- a hazard CI is
+    // structurally blind to, because a `!cfg!(target_os = "macos")` guard
+    // returns before it on Linux.
+    //
+    // The "validate against an allowlist AT THE CALL SITE" this guard asks for
+    // is satisfied by CONSTRUCTION rather than by a check: `spawn_program` is a
+    // two-line total function whose entire codomain is {its own argument,
+    // TEST_SPAWN_NOOP_PROGRAM}. It cannot synthesise a program name, cannot read
+    // config or env, and its production arm is the identity -- so this site can
+    // only ever spawn the literal `"open"` that was already written here, or a
+    // no-op. That is a narrower set than the literal it replaced could have been
+    // edited into, so the runtime-smuggling risk this budget exists to bound
+    // goes DOWN, not up.
+    //
+    // The other three infra.rs slots are unchanged: two were already non-literal
+    // before the seam, and the seam-routing of them added no new site.
+    ("crates/app/src/infra.rs", 5),
     ("crates/tickvault-logs-mcp/src/tools.rs", 1),
 ];
 

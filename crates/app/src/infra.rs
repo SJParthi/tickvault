@@ -1079,7 +1079,12 @@ async fn ensure_docker_daemon_running() -> bool {
     {
         use tokio::process::Command;
 
-        let launch_result = Command::new("open")
+        // Seam, not a bare spawn: this arm LAUNCHES Docker Desktop, and
+        // `test_ensure_docker_daemon_running_does_not_panic` reaches it. The
+        // `!cfg!(target_os = "macos")` guard above means CI never gets here,
+        // so the hazard is invisible on Linux and real on the Mac this repo
+        // is developed on. See `spawn_program`.
+        let launch_result = Command::new(spawn_program("open"))
             .args(["-a", DOCKER_DESKTOP_APP_NAME])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1128,6 +1133,63 @@ async fn ensure_docker_daemon_running() -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Test-mode spawn seam (side-effect containment, 2026-09-05)
+// ---------------------------------------------------------------------------
+
+/// The binary `spawn_program` substitutes in `cfg(test)` builds.
+///
+/// `true(1)` ignores every argument and exits 0, so the argv this module
+/// builds is passed and discarded rather than acted on. It is POSIX and ships
+/// at this path on both platforms this repo targets (Linux runners, macOS
+/// dev). If it is somehow absent the spawn returns `Err`, which is exactly
+/// what a machine without Docker or a browser already does — so the fallback
+/// is the behaviour these tests had before this seam existed, never a panic
+/// and never the real program.
+#[cfg(test)]
+const TEST_SPAWN_NOOP_PROGRAM: &str = "/usr/bin/true";
+
+/// The binary to actually hand to `Command::new`.
+///
+/// Production: the caller's program, unchanged and untouched.
+///
+/// **`cfg(test)`: a no-op.** Two functions in this module spawn a process with
+/// real, destructive side effects, and this module's unit tests call both:
+///
+/// * [`run_docker_compose_up`] builds an argv ending in `--force-recreate`,
+///   which the `ComposeOutcome` header above records verbatim as "NOT
+///   idempotent — it tears down + recreates every container". Six tests reach
+///   it. On a developer machine with the stack up, `cargo test -p
+///   tickvault-app` would therefore destroy their running QuestDB.
+/// * [`open_in_browser`] runs `open`/`xdg-open`. Five tests reach it through
+///   `open_all_dashboards`, and `DASHBOARD_SERVICES` includes QuestDB on 9000
+///   — so with a local stack up, `cargo test` opens browser windows.
+///
+/// Redirecting the PROGRAM is deliberate, and is what distinguishes this from
+/// the two obvious alternatives:
+///
+/// * `#[ignore]` would delete the coverage of eleven tests against a crate
+///   with a ratcheted coverage floor, and the tests would then run nowhere.
+/// * An early `return` inside each function would skip the spawn, so every
+///   line after it would go uncovered.
+///
+/// Substituting the program keeps **every line executed**: the argv is still
+/// built, a process is still spawned, its exit status is still read, and the
+/// success branch is still taken — which no test could reach before, because
+/// `docker` is absent from CI runners and the real call always errored.
+/// Coverage is therefore non-decreasing by construction.
+#[cfg(test)]
+fn spawn_program(_real: &str) -> &'static str {
+    TEST_SPAWN_NOOP_PROGRAM
+}
+
+/// Production build: hand back exactly what the caller asked for. This arm
+/// compiles to nothing at all in release — the seam has zero runtime cost.
+#[cfg(not(test))]
+fn spawn_program(real: &str) -> &str {
+    real
+}
+
 /// Opens a URL in the default browser.
 ///
 /// Uses `open` on macOS, `xdg-open` on Linux. Best-effort — logs a warning
@@ -1141,7 +1203,7 @@ pub async fn open_in_browser(url: &str) {
         "xdg-open"
     };
 
-    match Command::new(program)
+    match Command::new(spawn_program(program))
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1237,7 +1299,7 @@ async fn resolve_compose_cli() -> Option<ComposeCli> {
 async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> Result<()> {
     use tokio::process::Command;
 
-    let mut cmd = Command::new(cli.program());
+    let mut cmd = Command::new(spawn_program(cli.program()));
     cmd.args(compose_cli_args(
         cli,
         // Resolved, not the bare constant: on the deployed box the constant
@@ -1643,6 +1705,68 @@ mod tests {
     // verify the function signature is correct and it doesn't panic
     // when called with unreachable targets. We skip actual wait.
     // The function is tested indirectly through ensure_infra_running.
+
+    /// The seam's BEHAVIOUR, not its text.
+    ///
+    /// `infra_spawn_seam_guard` proves every destructive site *calls*
+    /// `spawn_program`. That is worth nothing if the function hands back what
+    /// it was given -- the call sites would look guarded and spawn the real
+    /// binary anyway. This asserts the substitution itself, for each of the
+    /// three programs a test can actually reach.
+    #[test]
+    fn spawn_program_substitutes_every_destructive_binary_under_test() {
+        for real in ["docker", "docker-compose", "xdg-open", "open"] {
+            let resolved = spawn_program(real);
+            assert_ne!(
+                resolved, real,
+                "spawn_program returned the REAL binary {real:?} in a cfg(test) \
+                 build -- `cargo test` would spawn it for real, which for \
+                 `docker` means `up --force-recreate` tearing down every \
+                 container on the machine running the tests"
+            );
+            assert_eq!(
+                resolved, TEST_SPAWN_NOOP_PROGRAM,
+                "spawn_program substituted something other than the no-op for \
+                 {real:?}; the substitute must be inert and must ignore the \
+                 argv it is handed"
+            );
+        }
+    }
+
+    /// The no-op must actually exist and actually be inert, or the seam
+    /// silently degrades to the pre-seam error path on this platform.
+    #[tokio::test]
+    async fn the_test_noop_program_exists_and_ignores_the_compose_argv() {
+        // Spawned as a LITERAL, then tied to the const by the assertion below.
+        // `rust_only_guard::non_literal_spawn_sites_only_shrink` budgets
+        // variable-program spawns because a string scan cannot see through
+        // them; there is no reason for this test to spend one of those slots
+        // when an equality assertion pins the same thing more directly.
+        assert_eq!(
+            TEST_SPAWN_NOOP_PROGRAM, "/usr/bin/true",
+            "the no-op path moved; the literal spawned just below no longer \
+             tests the program the seam actually substitutes"
+        );
+        let status = tokio::process::Command::new("/usr/bin/true")
+            .args(["-f", "/nonexistent", "up", "-d", "--force-recreate"])
+            .status()
+            .await;
+        match status {
+            Ok(st) => assert!(
+                st.success(),
+                "{TEST_SPAWN_NOOP_PROGRAM} exited non-zero when handed the \
+                 compose argv; it must ignore every argument and succeed, or \
+                 the tests exercise the failure branch instead of the success \
+                 branch"
+            ),
+            Err(e) => panic!(
+                "{TEST_SPAWN_NOOP_PROGRAM} could not be spawned ({e}). The \
+                 seam then falls back to the pre-seam behaviour -- still safe \
+                 (nothing destructive runs) but the success branch of the \
+                 spawn path goes uncovered on this platform."
+            ),
+        }
+    }
 
     #[tokio::test]
     async fn test_run_docker_compose_up_without_docker_does_not_panic() {
