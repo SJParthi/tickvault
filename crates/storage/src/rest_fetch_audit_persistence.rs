@@ -304,6 +304,14 @@ impl RestFetchAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_rest_fetch_audit_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // 2026-09-05: seed the discard series before the sender is built,
+        // so both the connected and the buffering-locally branch below
+        // register it. Audit rows are discarded only when a flush fails,
+        // which is rare — and the CloudWatch agent drops the first sample
+        // of a series it has never seen, so an unseeded first discard
+        // publishes nothing. That is the same defect that left 104,540
+        // depth rows permanently unclassifiable on 2026-08-28.
+        metrics::counter!("tv_rest_fetch_audit_rows_discarded_total").increment(0);
         let conf = rest_fetch_audit_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

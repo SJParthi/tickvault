@@ -1687,6 +1687,12 @@ fn register_drop_baseline(feed: Feed) {
     // delta baseline, so the one event that invalidates the rescue proof
     // publishes nothing.
     metrics::counter!(TICK_RESCUE_ABANDONED_COUNTER, "writer" => "tick").increment(0);
+    // 2026-09-05: the optional-price drop series. It fires when a tick
+    // carries a non-finite optional price and that field is dropped from
+    // the row — rare by construction, which is exactly what makes the
+    // unseeded first occurrence invisible. Same delta-baseline rule as
+    // every series above it.
+    metrics::counter!("tv_tick_optional_price_dropped_total").increment(0);
 }
 
 impl TickWriter {
