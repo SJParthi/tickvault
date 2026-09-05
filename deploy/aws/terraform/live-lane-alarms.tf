@@ -1324,3 +1324,49 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_refusal_rate_high" {
   # ageing out - neither is a repair anyone performed.
   ok_actions = []
 }
+
+# ---------------------------------------------------------------------------
+# Ring dwell -- the EARLY WARNING for every loss mechanism on our side of the
+# socket. Authorized 2026-09-05, dhan-rest-only-noise-lock-2026-07-14.md §2.3u.
+#
+# The gauge was emitted, EMF-shipped and charted (dashboard.tf) with no alarm
+# reading it -- the most valuable unwatched signal in the lane, because it
+# measures the APPROACH to a loss rather than a loss that already happened.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
+  alarm_name        = "tv-${var.environment}-dhan-ring-dwell-high"
+  alarm_description = "Frames are waiting too long in the Dhan frame ring before the fold picks them up. This fires BEFORE ws-ring-full, which is the point where frames are actually refused - it is the early warning, not the loss. Threshold 2000ms sits far above normal (the fold is a fixed-offset decode, so normal dwell is milliseconds) and deliberately BELOW both the 5000ms inline-depth ILP flush ceiling and the ~5200ms point at which the 65536-frame ring overflows at the 12500/sec open burst. Triage: (1) tv_dhan_feed_ring_resident_pct - how full is the ring. (2) tv_dhan_feed_pending_rows and the QuestDB write path - a stalled ILP flush is the usual cause and blocks the fold for up to 5s. (3) tv_spill_dir_free_bytes - a saturated disk stalls the writer, which backs up the fold. (4) tv_dhan_feed_ingest_ticks_total - is the burst simply large. NOT a detector of upstream vendor tick loss: dwell measures the queue BETWEEN the reader and the fold, so a stalled READ task leaves it flat."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 2000
+  # 2 x 300s. The gauge is a per-window MAXIMUM that resets after each publish
+  # (a sticky max reads alarming forever after one stall), so a single spike in
+  # one window is not a page; the condition recurring in two consecutive
+  # windows is.
+  evaluation_periods = 2
+  metric_name        = "tv_dhan_feed_ring_dwell_max_ms"
+  namespace          = local.app_namespace
+  period             = 300
+  # Maximum, not Average: the worst wait in the window IS the signal, and
+  # averaging would let four healthy scrapes erase one five-second stall.
+  statistic = "Maximum"
+  dimensions = local.app_dimensions
+
+  # The gauge publishes only while the drain runs, and the box is stopped
+  # overnight, so no-data is the normal off-hours state. Breaching here would
+  # page every night and weekend. The dark-lane case is already owned by
+  # dhan-no-ticks-flowing -- a second alarm on the same absence would page
+  # twice for one outage.
+  treat_missing_data = "notBreaching"
+
+  # Ungated, unlike the market-hours alarms: absent off-hours by construction,
+  # so a gate would add a Lambda dependency and buy nothing.
+  actions_enabled = true
+
+  alarm_actions = local.app_alarm_actions
+  # ok_actions ARE set here, unlike the disk gauges: those recover only when an
+  # operator frees space or the datapoint ages out, whereas a falling dwell is
+  # self-evidently the fold catching up -- a genuine recovery worth telling.
+  ok_actions = local.app_alarm_actions
+
+}
