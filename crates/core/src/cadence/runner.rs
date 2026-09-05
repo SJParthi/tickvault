@@ -324,6 +324,14 @@ where
     // for a runner that never started would be a worse lie than silence.
     metrics::counter!("tv_cadence_boundary_skipped_total").increment(0);
     metrics::counter!("tv_cadence_gate_denials_total").increment(0);
+    // 2026-09-05: the ladder-exhausted series was the one sibling the
+    // 2026-08-29 sweep did not reach, and it is the most consequential of
+    // the four. A skipped boundary is one missed tick of the schedule; an
+    // exhausted retry ladder is a fetch this session GAVE UP on. Unseeded,
+    // the first give-up of a session is consumed as the delta baseline and
+    // publishes nothing, so the episode that matters is the one that
+    // cannot be seen.
+    metrics::counter!("tv_cadence_ladder_exhausted_total").increment(0);
     for reason in ["clean_exit", "panic", "cancelled", "unknown"] {
         metrics::counter!("tv_cadence_runner_respawn_total", "reason" => reason).increment(0);
     }

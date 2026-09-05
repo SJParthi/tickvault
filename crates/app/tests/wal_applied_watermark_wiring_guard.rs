@@ -250,3 +250,113 @@ fn out_of_order_rescues_never_ack_the_watermark() {
         );
     }
 }
+
+/// The replay CONFIRM must consult `is_sink_suspect`, not only the drain.
+///
+/// # The seam this closes
+///
+/// Two mechanisms guard replayed rows and, until 2026-09-05, they disagreed
+/// about the same event.
+///
+/// `note_ticks_acked` parks an ack into `suspect_max_ticks` instead of
+/// advancing `hwm` while the sink is suspect, because a WAL-SUSPENDED QuestDB
+/// table keeps ACKing ILP writes while silently not applying them — the
+/// measured 2026-08-25 lie, 26 tables at once. That protects the SKIP
+/// decision.
+///
+/// It did not protect the ARCHIVE decision. `wait_for_offload_drained` reads
+/// `unlanded` and the completed counters and nothing else, and
+/// `is_sink_suspect` existed with ZERO production callers. On a boot into that
+/// state the ILP write returns `Ok`, no rescue runs, `unlanded` never moves,
+/// `ticks_completed` advances, the wait returns true — and `confirm_replayed`
+/// renames every staged segment into `archive/`, which is never re-globbed.
+/// The rows are then in no table, no spill file and no `replaying/` directory:
+/// permanent loss, on exactly the boot that most needs the WAL.
+///
+/// A source scan rather than a behavioural test because the failure is an
+/// ABSENT call — the code that loses the data is the code that is not there,
+/// and no runtime assertion can see a check nobody wrote.
+#[test]
+fn the_replay_confirm_refuses_a_suspect_sinks_ack() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dhan_feed_stack.rs"),
+    )
+    .expect("dhan_feed_stack.rs must be readable");
+
+    // Strip line comments FIRST.
+    //
+    // The first version of this test did not, and failed on its own subject:
+    // the gate's doc comment NAMES `wait_for_offload_drained` while explaining
+    // why the suspect check precedes it, so the ordering assertion found the
+    // prose rather than the call. That is the identical defect repaired in
+    // `wal_replay_confirm_symmetry_guard` earlier the same day — a source scan
+    // that reads comments as code reports on the documentation.
+    let stripped: String = src
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let src = stripped;
+
+    let start = src
+        .find("fn wal_replay_acked(")
+        .expect("wal_replay_acked must exist — it is the only confirm gate");
+    let body = &src[start..];
+    let end = body.find("\nfn ").map_or(body.len(), |i| i + 1);
+    let body = &body[..end];
+
+    let suspect = body.find("is_sink_suspect()").expect(
+        "wal_replay_acked must consult `is_sink_suspect()`. Without it a \
+             WAL-suspended QuestDB's ACK is taken for a landing and \
+             `confirm_replayed` archives segments whose rows were never \
+             applied — into `archive/`, which is never re-globbed.",
+    );
+    let drained = body.find("wait_for_offload_drained").expect(
+        "wal_replay_acked must still wait for the offload drain — the suspect \
+         check replaces nothing, it is an ADDITIONAL refusal",
+    );
+    assert!(
+        suspect < drained,
+        "the suspect check must come BEFORE the drain wait. After it, a \
+         suspect sink still spends the full wait and can still return true on \
+         the completed counters — the refusal has to short-circuit."
+    );
+    assert!(
+        body[..suspect].contains("return false")
+            || body[suspect..].starts_with("is_sink_suspect()"),
+        "the suspect arm must lead to a refusal, not a log-and-continue"
+    );
+
+    // The refusal must be distinguishable from the timeout arm in triage: the
+    // two have the same OUTCOME (segments stay in `replaying/`) and completely
+    // different causes — slow writers versus writers whose "ok" is a lie.
+    assert!(
+        body.contains(r#"source = "replay_sink_suspect""#),
+        "the suspect refusal needs its own `source` field — sharing the \
+         timeout's would make a lying sink read as a slow one"
+    );
+    assert!(
+        body.contains("WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER"),
+        "the refusal must be counted; an unrecorded refusal looks identical to \
+         a boot with nothing to replay"
+    );
+}
+
+/// The suspect-refusal counter must be SEEDED, like every other loss series.
+#[test]
+fn the_sink_suspect_refusal_counter_is_seeded_at_zero() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../storage/src/ws_frame_spill.rs"),
+    )
+    .expect("ws_frame_spill.rs must be readable");
+    assert!(
+        src.contains("metrics::counter!(WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER).increment(0)"),
+        "seed the counter at construction. An unincremented counter is ABSENT \
+         from the exporter, not zero, and an absent series reads as health — \
+         when it may mean the single refusal is the only sample there will \
+         ever be."
+    );
+}

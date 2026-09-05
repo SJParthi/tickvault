@@ -342,6 +342,7 @@ pub struct DepthRow {
 /// dropping a partition that is still being written.
 #[must_use]
 pub fn market_depth_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in market_depth_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_TABLE} (\
             feed SYMBOL, \
@@ -379,12 +380,14 @@ const MARKET_DEPTH_COLUMNS: &[(&str, &str)] = &[
 /// Never a DROP. Pure, so the statement set is unit-testable without QuestDB.
 #[must_use]
 pub fn market_depth_ensure_statements() -> Vec<String> {
-    let mut out = vec![market_depth_create_ddl()];
+    let mut out = vec![market_depth_create_ddl()]; // APPROVED: boot DDL statement list, never per row
     for (col, ty) in MARKET_DEPTH_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
         out.push(format!(
             "ALTER TABLE {MARKET_DEPTH_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
         ));
     }
+    // APPROVED: DEDUP ENABLE statement, boot only
     out.push(format!(
         "ALTER TABLE {MARKET_DEPTH_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_MARKET_DEPTH})"
     ));
@@ -401,6 +404,7 @@ pub fn market_depth_ensure_statements() -> Vec<String> {
 /// prevent. The consequence is named in the log rather than left implicit.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line — the guard reads only the line immediately above).
 pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
+    // APPROVED: QuestDB base URL, once per ensure_market_depth_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -493,6 +497,7 @@ pub const ILP_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// owns retry cadence) and a bounded `request_timeout` so a hung flush cannot
 /// wedge the drain.
 fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
+    // APPROVED: ILP conf string, once per DepthWriter::new
     format!(
         "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
@@ -987,6 +992,7 @@ fn temp_depth_spill_dir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    // APPROVED: temp spill dir path, built once at wiring or in tests
     std::env::temp_dir().join(format!(
         "tv-depth-spill-test-{nanos}-{:?}",
         std::thread::current().id()
@@ -1498,7 +1504,7 @@ impl DepthWriter {
         let sink = DepthWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
-            spill_dir: self.spill_dir.clone(),
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
             spill_min_free_headroom: self.spill_min_free_headroom,
         };
         self.offload = Some(tx);
@@ -1514,7 +1520,7 @@ impl DepthWriter {
     ) -> (DepthRescueSink, std::sync::mpsc::Receiver<DepthRescueBatch>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_RESCUE_QUEUE_DEPTH);
         let sink = DepthRescueSink {
-            spill_dir: self.spill_dir.clone(),
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             spill_min_free_headroom: self.spill_min_free_headroom,
             feed: self.feed,
         };
@@ -1795,6 +1801,7 @@ impl DepthWriter {
                          raw frames remain in the write-ahead log"
                     );
                 }
+                // APPROVED: flush-FAILURE error context, never the append path
                 Err(anyhow::anyhow!(err)).context(format!(
                     "market_depth flush failed; {dropped} row(s) discarded"
                 ))
@@ -2053,6 +2060,28 @@ fn perform_depth_rescue(
 /// span-based bound can react.
 pub const MAX_DEPTH_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
+/// The queue is bounded in COUNT; this bounds it in BYTES.
+///
+/// `DEPTH_FLUSH_QUEUE_DEPTH` slots each holding up to
+/// `MAX_DEPTH_PRODUCER_BUFFER_BYTES` is 128 MiB that can be in flight to the
+/// writer at once, and until now that product was asserted NOWHERE — the two
+/// constants could be raised independently and nothing would notice until the
+/// host did. This is the exact pair that reached 4,004,164,571 bytes in a
+/// single slot on 2026-09-02 and OOM-killed the process ten times in a loop;
+/// the per-batch size trigger fixed the cause, and this fixes the arithmetic
+/// that let the cause exist.
+///
+/// The ceiling is deliberately the SAME `QUESTDB_MAX_BUF_SIZE_BYTES` the
+/// per-buffer assert uses, because a queue that can hold more bytes than the
+/// database will ever accept in one request is holding rows it cannot deliver.
+const _: () = assert!(
+    DEPTH_FLUSH_QUEUE_DEPTH * MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES * 2,
+    "the depth offload queue can hold more bytes in flight than twice QuestDB's \
+     maximum request buffer — raise one of these deliberately, with a memory \
+     figure, or lower the other"
+);
+
 // Same headroom rule as the tick path: the producer ceiling must sit at or
 // below half the questdb-rs `max_buf_size` wedge, or the rescue arm only fires
 // after every flush is already failing permanently -- making the rescue path
@@ -2245,7 +2274,7 @@ impl DepthWriterSink {
                 landed
             }
             Err(err) => {
-                let why = format!("{err}");
+                let why = format!("{err}"); // APPROVED: rescue arm after a flush already failed, never per row
                 self.rescue(batch, &why);
                 0
             }

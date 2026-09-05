@@ -911,9 +911,22 @@ pub enum IngestOutcome {
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
     SeqUnrepresentable,
-    /// The aggregator refused the tick (insane price, garbage timestamp, or
-    /// slot table exhausted). Nothing was folded and nothing was written —
-    /// each of those three means the tick itself is unusable.
+    /// The aggregator HARD-refused the tick: insane price, or a garbage
+    /// timestamp. Nothing was folded and nothing was written — either means
+    /// the tick itself is unusable.
+    ///
+    /// ⚠ CORRECTED 2026-09-05. This read "insane price, garbage timestamp, or
+    /// slot table exhausted ... nothing was written", and the third one is
+    /// FALSE: `hard_refusal` is `refused_price || refused_timestamp` ONLY, and
+    /// `slot_exhausted` sits in the candle-only group, where the append still
+    /// runs and the outcome is `WrittenOutOfSession`. An instrument past the
+    /// slot cap keeps a COMPLETE tick record and loses only its candles.
+    ///
+    /// The rot ran in the alarming direction, which is the expensive one: a
+    /// reader auditing slot exhaustion would have reported row loss that does
+    /// not happen, and gone looking for a tick-loss bug that does not exist.
+    /// The code twenty lines up already explains the real behaviour — only
+    /// this variant's doc disagreed with it.
     AggregatorRefused,
     /// The tick fell OUTSIDE the candle session, so no bucket could open — but
     /// the tick itself is perfectly valid and IS written to `ticks`.
@@ -9005,6 +9018,42 @@ pub const WAL_REPLAY_ACK_WAIT_SECS: u64 = 30;
 /// ack and replays the rest.
 fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
     let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+
+    // A SUSPECT sink's "ok" is not a landing — refuse to confirm on it.
+    //
+    // 2026-09-05. `note_ticks_acked` already parks an ack into
+    // `suspect_max_ticks` instead of advancing `hwm` while the sink is suspect,
+    // because a WAL-SUSPENDED QuestDB table keeps ACKing ILP writes while
+    // silently not applying them — the measured 2026-08-25 lie, 26 tables at
+    // once. That parking protects the SKIP decision.
+    //
+    // It did not protect the ARCHIVE decision. `wait_for_offload_drained` reads
+    // `unlanded` and the completed counters and nothing else; `is_sink_suspect`
+    // existed with ZERO production callers. So on a boot into that state the
+    // ILP write returns `Ok`, no rescue runs, `unlanded` never moves,
+    // `ticks_completed` advances, the wait returns true — and `confirm_replayed`
+    // renames every staged segment into `archive/`, which is never re-globbed.
+    // The rows are in no table, no spill file and no `replaying/` directory.
+    // That is permanent loss on exactly the boot that most needs the WAL.
+    //
+    // Refusing here costs a deferral: the segments stay in `replaying/` and the
+    // next boot re-offers them, which is the same shape as the timeout arm
+    // below and is idempotent by the DEDUP key. The failure direction is
+    // "replay more", which is the only safe one.
+    if wm.is_sink_suspect() {
+        metrics::counter!(
+            tickvault_storage::ws_frame_spill::WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER
+        )
+        .increment(1);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_sink_suspect",
+            stage,
+            "WAL replay: the sink is SUSPECT (QuestDB reported suspended tables), so its              write acks cannot be trusted as landings. The segments are NOT confirmed —              they stay in `replaying/` and the next boot re-offers them. Nothing is              archived unread. Clear the QuestDB suspension and restart."
+        );
+        return false;
+    }
+
     if wm.wait_for_offload_drained(
         std::time::Duration::from_secs(WAL_REPLAY_ACK_WAIT_SECS),
         unlanded_before,

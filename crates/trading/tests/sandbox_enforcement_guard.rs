@@ -153,3 +153,162 @@ fn test_sandbox_deadline_aligned_with_live_trading_earliest_date() {
          date gates re-arm together, never one alone."
     );
 }
+
+/// The gate must be INSIDE `place_order`, and above the network call.
+///
+/// # Why the four `contains()` checks above are not enough
+///
+/// Every assertion in this file before this one asks whether a string exists
+/// ANYWHERE in `engine.rs`. That is a question about the file, not about the
+/// code path a live order takes. An adversarial sweep on 2026-09-05 named the
+/// bypass precisely: lift the `#[cfg(not(test))]` block out of `place_order`
+/// into a helper that only the paper path calls. Every literal those four
+/// tests look for is still in the file — the comparison, the error variant,
+/// the message, the `cfg` — so all four stay green while a live order walks
+/// straight past the gate.
+///
+/// This is the same class as `capture_at_receipt_order_guard`, which on the
+/// same day was found reporting "the frame is refused before the ring" about
+/// code that forwards it: presence and position cannot see structure. It
+/// matters more here, because the thing on the other side of this gate is
+/// real money.
+///
+/// So this test asks the two structural questions instead:
+///
+///   1. is the gate inside `place_order`'s own body, and
+///   2. does it sit above the first thing that could reach the broker?
+///
+/// The sibling `dhan_exit_order_lockout_guard` already pins its exit methods
+/// this way with a `// LIVE-EXIT-ARM` sentinel. The entry path had no
+/// equivalent until now.
+#[test]
+fn the_sandbox_gate_is_inside_place_order_and_above_the_network_call() {
+    let source = fs::read_to_string(ENGINE_RS).expect("engine.rs must be readable");
+
+    // Bound the window to `place_order`'s own body. A gate in a neighbouring
+    // function is exactly the bypass this test exists to reject.
+    let fn_start = source
+        .find("pub async fn place_order(&mut self, request: PlaceOrderRequest)")
+        .expect(
+            "place_order must exist with this signature — if it was renamed, \
+             update this guard rather than deleting it",
+        );
+    let body = &source[fn_start..];
+    let fn_end = body.find("\n    }\n").map_or(body.len(), |i| i + 6);
+    let body = &body[..fn_end];
+
+    assert!(
+        body.len() > 500,
+        "extracted place_order body is implausibly short ({} bytes) — the \
+         scanner is broken and every assertion below would pass vacuously",
+        body.len()
+    );
+
+    let gate = body
+        .find("if now_secs < SANDBOX_DEADLINE_EPOCH_SECS")
+        .expect(
+            "THE SANDBOX GATE IS NO LONGER INSIDE `place_order`.\n\n\
+         The literal may still be somewhere in engine.rs — the four presence \
+         checks above would still pass — but a live order no longer walks \
+         through it. Moving this block into a helper that only the paper path \
+         calls is the exact bypass this test was written to reject.\n\n\
+         The gate must be in `place_order`'s own body, above the broker call.",
+        );
+
+    let cfg = body[..gate].rfind("#[cfg(not(test))]").expect(
+        "the sandbox gate inside place_order is no longer wrapped in \
+         `#[cfg(not(test))]` — production must always run it",
+    );
+    assert!(
+        gate - cfg < 400,
+        "the `#[cfg(not(test))]` nearest the gate is {} bytes above it — too \
+         far to be its wrapper. A gate compiled out of production, or wrapped \
+         by something else, is not a gate.",
+        gate - cfg
+    );
+
+    // The refusal must come BEFORE anything that can reach the broker. The
+    // token fetch is the first such step; the readiness gate sits between.
+    for (needle, what) in [
+        ("get_access_token", "the token fetch"),
+        ("DhanPlaceOrderRequest", "building the broker request"),
+    ] {
+        if let Some(at) = body.find(needle) {
+            assert!(
+                gate < at,
+                "the sandbox gate runs AFTER {what} in place_order. A gate \
+                 below the network call is a gate the order has already \
+                 passed."
+            );
+        }
+    }
+
+    let ret = body[gate..]
+        .find("return Err(OmsError::SandboxEnforcement)")
+        .expect("the gate inside place_order must REFUSE, not log and continue");
+    assert!(
+        ret < 800,
+        "the gate's refusal is {ret} bytes below its condition — too far to be \
+         its body. A condition whose branch does something else is not a gate."
+    );
+}
+
+/// The rule above, as a pure function, proven against a KNOWN BAD input.
+///
+/// A guard that has never been shown to FAIL is not a guard, and this one
+/// protects the last automatic stop before real money.
+#[test]
+fn the_structural_rule_rejects_the_hoisted_gate_bypass() {
+    fn gate_is_in_body(body: &str) -> bool {
+        let Some(gate) = body.find("if now_secs < SANDBOX_DEADLINE_EPOCH_SECS") else {
+            return false;
+        };
+        let Some(cfg) = body[..gate].rfind("#[cfg(not(test))]") else {
+            return false;
+        };
+        if gate - cfg >= 400 {
+            return false;
+        }
+        body[gate..]
+            .find("return Err(OmsError::SandboxEnforcement)")
+            .is_some_and(|r| r < 800)
+    }
+
+    let good = r#"
+        #[cfg(not(test))]
+        {
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                return Err(OmsError::SandboxEnforcement);
+            }
+        }
+        let token = self.get_access_token().await?;
+    "#;
+    assert!(gate_is_in_body(good), "the shipped shape must pass");
+
+    // THE BYPASS: the gate has been hoisted into a helper. Every literal the
+    // four presence checks look for is still in the FILE — just not here.
+    let hoisted = r#"
+        self.check_live_order_gates(OrderEndpoint::Place, &correlation_id)?;
+        let token = self.get_access_token().await?;
+    "#;
+    assert!(
+        !gate_is_in_body(hoisted),
+        "a place_order body with no gate MUST be rejected — this is the exact \
+         bypass, and accepting it makes this file decoration"
+    );
+
+    // Present but neutered: the condition is there, the refusal is not.
+    let neutered = r#"
+        #[cfg(not(test))]
+        {
+            if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
+            }
+        }
+    "#;
+    assert!(
+        !gate_is_in_body(neutered),
+        "a condition that counts but does not refuse must be rejected"
+    );
+}

@@ -3580,6 +3580,109 @@ fn scope_fix_2026_09_01_self_test() {
 /// reconnect" in a real comment, because a line that begins with a word is
 /// command position by definition. A guard whose first act is a false
 /// positive gets allowlisted within a week.
+/// SCOPE FIX #18 (2026-09-05) — HOLE NINE: a managed Lambda runtime.
+///
+/// `count_node_invocations_in_line` requires a WORD boundary after the runtime
+/// name, and `nodejs20.x` puts `j` there. So `runtime = "nodejs20.x"` in a
+/// `.tf` file is scanned, matched against `node`, and REJECTED by `word_end` —
+/// the same for `ruby3.2`, `java21`, `dotnet8`, `go1.x`. Only `python3.12`
+/// survives, and only because the python matcher allows one digit suffix.
+///
+/// The tree is clean today: all 13 `aws_lambda_function` resources declare
+/// `provided.al2023` with a `bootstrap` handler, which is what makes every
+/// production Lambda a Rust binary. But that was a MEASUREMENT, never an
+/// enforcement — the only pins were two POSITIVE `contains("provided.al2023")`
+/// assertions covering 2 of the 13 files. A fourteenth Lambda declaring
+/// `runtime = "nodejs20.x"` would have passed every guard in this file and put
+/// a JavaScript runtime into production infrastructure under a rule whose
+/// whole point is that there is none.
+///
+/// This is the same shape as scope fixes #8 through #17 and the reason is
+/// identical every time: the hole was in what the guard LOOKED AT, not in its
+/// token list. So this test does not add a token — it asks the question
+/// directly of the thing that decides, which is the terraform.
+#[test]
+fn every_lambda_declares_the_rust_runtime() {
+    const REQUIRED_RUNTIME: &str = "provided.al2023";
+    let root = repo_root();
+    let mut resources = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+
+    // 2026-09-05 (SCOPE FIX #19, hole TEN): this was `read_dir`, which is
+    // NOT recursive. Hole nine closed managed Lambda runtimes with a
+    // scanner that reads one flat directory — and the very next
+    // structural step any terraform codebase takes is `modules/`. The
+    // first module subdirectory would have silently dropped every Lambda
+    // in it out of the ONLY check that can see a managed runtime, because
+    // the general token scanner is provably blind to `nodejs20.x`: the
+    // digit after `node` fails its word-boundary test.
+    //
+    // Found by planting a module-directory Lambda declaring
+    // `runtime = "nodejs20.x"` and watching all 27 tests stay green.
+    // Same shape as every one of the nine holes before it: the hole was
+    // in WHAT THE SCANNER LOOKED AT, never in its list of banned words.
+    let mut entries: Vec<String> = git_ls_files_including_untracked(&["deploy/aws/**/*.tf"]);
+    entries.sort();
+
+    for path in entries {
+        let rel = path;
+        let body = read_scan_text(&root, &rel);
+        // Walk resource blocks by their opening line, then read forward to the
+        // `runtime =` inside that block. A block without one is a violation
+        // too: terraform defaults nothing here, so an absent runtime is a
+        // resource that would fail to apply, and a silent skip would let this
+        // guard pass on a file it could not actually read.
+        let lines: Vec<&str> = body.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("resource \"aws_lambda_function\"") {
+                continue;
+            }
+            resources += 1;
+            let mut runtime: Option<&str> = None;
+            for probe in lines.iter().skip(i + 1).take(60) {
+                if probe.contains("resource \"") {
+                    break;
+                }
+                if let Some(rest) = probe.split_once("runtime") {
+                    if rest.1.trim_start().starts_with('=') {
+                        runtime = Some(probe.trim());
+                        break;
+                    }
+                }
+            }
+            match runtime {
+                Some(decl) if decl.contains(REQUIRED_RUNTIME) => {}
+                Some(decl) => violations.push(format!(
+                    "  {}: aws_lambda_function declares {decl} — not {REQUIRED_RUNTIME}",
+                    rel
+                )),
+                None => violations.push(format!(
+                    "  {}: aws_lambda_function declares NO runtime within its block",
+                    rel
+                )),
+            }
+        }
+    }
+
+    assert!(
+        resources >= 13,
+        "expected at least the 13 known aws_lambda_function resources, found {resources} — \
+         the scanner is broken and would pass vacuously"
+    );
+    assert!(
+        violations.is_empty(),
+        "MANAGED LAMBDA RUNTIME (scope fix #18 — hole nine):\n{}\n\n\
+         `rust-only-forever-lock-2026-07-19.md` requires every executable in the product \
+         path to be Rust. A Lambda declaring a managed runtime (`nodejs20.x`, `python3.12`, \
+         `java21`, `go1.x`, `ruby3.2`, `dotnet8`) puts another language into production, and \
+         the invocation scanner CANNOT see it: it needs a word boundary after the runtime \
+         name and a version digit is not one. Build the handler as a Rust binary and declare \
+         `runtime = \"{REQUIRED_RUNTIME}\"` with `handler = \"bootstrap\"`, or add a dated \
+         operator quote to the lock file FIRST and then relax this test.",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn scope_fix_2026_09_02_self_test() {
     // ---- H-a: a non-UTF-8 file is scanned, not skipped -------------------

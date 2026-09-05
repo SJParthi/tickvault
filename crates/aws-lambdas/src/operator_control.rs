@@ -3368,6 +3368,71 @@ mod tests {
             );
         }
     }
+    /// The set of tables this action MUST export, DERIVED from the
+    /// repository's own authoritative never-delete lists rather than restated
+    /// here.
+    ///
+    /// # Why derived, and not a list
+    ///
+    /// Until 2026-09-05 this guard carried a hardcoded four-name array — the
+    /// SAME four the shell block used. It therefore asserted a list against
+    /// itself and could not, even in principle, notice that 32 other tables
+    /// the repository declares as never-delete were being destroyed with the
+    /// volume while the action printed `SEBI-PRESERVED` four times and exited
+    /// 0. A guard that restates its subject is a copy, not a check.
+    ///
+    /// The authority is `partition_manager.rs`: `DAY_PARTITIONED_TABLES` (the
+    /// audit and daily-data tables the retention sweep detaches but never
+    /// drops) plus `RETENTION_EXEMPT_TABLES` (the pinned-timestamp masters it
+    /// never touches at all). `HOUR_PARTITIONED_TABLES` — `ticks` and
+    /// `market_depth` — is deliberately EXCLUDED: that is the market data this
+    /// action exists to destroy, and exporting it would turn a recovery tool
+    /// into an out-of-disk incident.
+    ///
+    /// Adding a table to either list now makes this test fail until the shell
+    /// block exports it too. That is the point.
+    fn never_delete_tables() -> Vec<String> {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../storage/src/partition_manager.rs"),
+        )
+        .expect("partition_manager.rs must be readable — it is the authority for this test");
+
+        let mut out = Vec::new();
+        for konst in ["DAY_PARTITIONED_TABLES", "RETENTION_EXEMPT_TABLES"] {
+            let start = src
+                .find(konst)
+                .unwrap_or_else(|| panic!("{konst} must exist — if it was renamed, update this"));
+            let body = &src[start..];
+            let end = body
+                .find("\n];")
+                .unwrap_or_else(|| panic!("{konst} must be a terminated slice literal"));
+            let mut found = 0usize;
+            for line in body[..end].lines() {
+                let line = line.trim();
+                // A quoted entry at the start of a line is a table name; a
+                // quote inside a `//` comment is prose and must not count.
+                if line.starts_with("//") {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix('"') {
+                    if let Some((name, _)) = rest.split_once('"') {
+                        out.push(name.to_owned());
+                        found += 1;
+                    }
+                }
+            }
+            assert!(
+                found >= 5,
+                "parsed only {found} entries from {konst} — the parser is broken and this \
+                 guard would pass while exporting almost nothing"
+            );
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// The 2026-08-25 finding: `wipe-questdb` allowlists only market-data
     /// tables, so the 5-year regulatory tables survive it — while
     /// `docker-reset` and `docker-nuke-bare` delete the whole QuestDB volume
@@ -3379,12 +3444,12 @@ mod tests {
     /// check while preserving nothing.
     #[test]
     fn destructive_actions_export_the_sebi_tables_before_destroying_the_volume() {
-        const SEBI: [&str; 4] = [
-            "instrument_lifecycle",
-            "instrument_lifecycle_audit",
-            "index_constituency",
-            "order_audit",
-        ];
+        let sebi = never_delete_tables();
+        assert!(
+            sebi.len() >= 30,
+            "derived only {} never-delete tables — the derivation is broken",
+            sebi.len()
+        );
         for (name, cmds) in [
             ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
             ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
@@ -3415,9 +3480,9 @@ mod tests {
             }
 
             let block = cmds.join("\n");
-            for t in SEBI {
+            for t in &sebi {
                 assert!(
-                    block.contains(t),
+                    block.contains(t.as_str()),
                     "{name} must export the regulatory table `{t}` before destroying the volume"
                 );
             }

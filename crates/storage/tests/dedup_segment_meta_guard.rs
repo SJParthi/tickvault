@@ -361,22 +361,27 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
 // CORRECTED 2026-09-03: this said "The allowlist is EMPTY — there is no
 // persisted table exempt from the rule" — three lines above two entries. It
 // was true when written and was never updated when `cross_fill_audit` joined
-// on 2026-07-20 and `table_storage_daily` on 2026-08-29. Both exemptions are
+// on 2026-07-20 and `table_storage_daily` on 2026-08-29. Both exemptions were
 // SOUND and are justified immediately below; the CLAIM about them was not.
+// (2026-09-05: `cross_fill_audit` is gone — one entry remains.)
 // The failure direction is the reassuring one: a reader auditing feed-in-key
 // coverage reads "EMPTY — no table is exempt" and stops, never learning that
 // two are, or why. `data-integrity.md` repeated the same sentence and is
 // corrected in the same commit.
 //
 // `feed_not_applicable_entries_each_carry_a_dated_justification` below now
-// fails the build if a THIRD entry is ever added without its reason, which is
-// what the violation message has always demanded and nothing enforced.
-// 2026-07-20 (operator cross-fill visibility directive): `cross_fill_audit`
-// is exempt from the bare-`feed` token because its `lane` column IS the
-// per-feed identity for this table — the row describes the BORROWING broker
-// lane (`dhan`/`groww`), so a Dhan and a Groww event for the same minute are
-// already DISTINCT rows via `lane` (which is in the key). Adding a redundant
-// `feed` column would duplicate `lane` under a second name.
+// fails the build if a further entry is ever added without its reason, which
+// is what the violation message has always demanded and nothing enforced.
+// 2026-09-05: the `cross_fill_audit` entry is REMOVED, and it is worth one
+// line why rather than a silent deletion. Its 2026-07-20 justification was
+// sound — the table's `lane` column WAS its per-feed identity — but
+// `DEDUP_KEY_CROSS_FILL_AUDIT` is declared nowhere in the storage crate: the
+// table went with the Groww feed removal and the exemption stayed. An
+// exemption for a name that does not exist costs nothing today and pre-exempts
+// whatever is given that name tomorrow, unreviewed, because the reasoning
+// above it already reads as settled. `feed_not_applicable_entries_each_name_a\
+// _constant_that_still_exists` now fails the build on that shape; if a
+// cross-fill table returns, re-add the entry with a fresh dated reason.
 // 2026-08-29 (per-table disk-footprint measurement): `table_storage_daily` is
 // exempt because its measured ENTITY is a QuestDB table, not a feed. One row
 // records how many bytes `market_depth` occupies on disk — and `market_depth`
@@ -386,10 +391,7 @@ fn per_feed_market_data_dedup_keys_must_include_feed() {
 // multiplies when summed — worse than no column) or inventing a per-feed
 // attribution QuestDB does not expose. `table_name` IS the identity here, and
 // it is in the key.
-const FEED_NOT_APPLICABLE_KEYS: &[&str] = &[
-    "DEDUP_KEY_CROSS_FILL_AUDIT",
-    "DEDUP_KEY_TABLE_STORAGE_DAILY",
-];
+const FEED_NOT_APPLICABLE_KEYS: &[&str] = &["DEDUP_KEY_TABLE_STORAGE_DAILY"];
 
 #[test]
 fn every_persisted_table_dedup_key_must_include_feed() {
@@ -482,6 +484,51 @@ fn self_test_collect_returns_non_empty_bodies() {
 /// That is not hypothetical here. Both current entries ARE justified — but the
 /// comment three lines above them claimed the list was EMPTY for six weeks,
 /// which is what a silent addition looks like from the outside.
+/// A feed-in-key exemption must name a constant that EXISTS.
+///
+/// `DEDUP_KEY_CROSS_FILL_AUDIT` is in `FEED_NOT_APPLICABLE_KEYS` and is
+/// declared NOWHERE in `crates/*/src` — the table it exempted was never built,
+/// or was removed. The exemption outlived it, and nothing noticed, because the
+/// list is only ever read to SKIP names: a skip for a name that never appears
+/// costs nothing and says nothing.
+///
+/// What it costs is later. The next person to add a `cross_fill_audit` table
+/// inherits a feed-in-key exemption they never asked for and no reviewer sees,
+/// because the justification comment above the list already reads as though
+/// the decision was made. That is precisely the stale-row class this file's
+/// own 2026-09-03 correction records, one level up: there the stale claim was
+/// in prose, here it is in the enforcement itself.
+///
+/// The sibling `feed_not_applicable_entries_each_carry_a_dated_justification`
+/// checks that an entry has a REASON. This checks that it has a SUBJECT.
+#[test]
+fn feed_not_applicable_entries_each_name_a_constant_that_still_exists() {
+    let decls = collect_dedup_key_declarations();
+    assert!(
+        !decls.is_empty(),
+        "no DEDUP_KEY_* declarations found — the scanner is broken and this test \
+         would pass vacuously"
+    );
+    let declared: std::collections::BTreeSet<&str> =
+        decls.iter().map(|(_, _, name, _)| name.as_str()).collect();
+
+    let stale: Vec<&str> = FEED_NOT_APPLICABLE_KEYS
+        .iter()
+        .copied()
+        .filter(|name| !declared.contains(name))
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "STALE feed-in-key exemption(s): {stale:?}\n\n\
+         Each name in FEED_NOT_APPLICABLE_KEYS exempts a DEDUP key from the operator's \
+         2026-06-28 feed-in-key override. These names match no constant in the storage \
+         crate, so they exempt nothing today — and pre-exempt whatever is given that name \
+         tomorrow, silently. Remove the entry (and its justification comment) when its \
+         table goes; re-add it with a fresh dated reason if the table returns."
+    );
+}
+
 #[test]
 fn feed_not_applicable_entries_each_carry_a_dated_justification() {
     let src = std::fs::read_to_string(

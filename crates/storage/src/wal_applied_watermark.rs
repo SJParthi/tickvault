@@ -349,6 +349,14 @@ pub struct AppliedWatermark {
     hwm_depth: AtomicU64,
     depth_untracked: AtomicBool,
     overflowed: AtomicBool,
+    /// Conservative upper bound on the sequences the bucket table FAILED to
+    /// record. `overflowed` alone says "something is unprotected"; without a
+    /// height there is no way to tell whether a later confirmed drain covered
+    /// it, so `reset_unapplied_below` used to clear the flag on the strength
+    /// of `kept == 0` — a count of the buckets it DID record, which is exactly
+    /// the set that excludes these. See that function for the loss this
+    /// prevents.
+    overflow_high_seq: AtomicU64,
     bucket_ids: [AtomicU64; UNAPPLIED_BUCKETS],
     bucket_counts: [AtomicU64; UNAPPLIED_BUCKETS],
     ticks_handed_off: AtomicU64,
@@ -407,6 +415,7 @@ impl AppliedWatermark {
             hwm_depth: AtomicU64::new(0),
             depth_untracked: AtomicBool::new(false),
             overflowed: AtomicBool::new(false),
+            overflow_high_seq: AtomicU64::new(0),
             bucket_ids: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
             bucket_counts: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
             ticks_handed_off: AtomicU64::new(0),
@@ -461,6 +470,13 @@ impl AppliedWatermark {
             self.depth_untracked.store(true, Ordering::Release);
         }
         if snap.overflowed {
+            // A persisted flag carries no HEIGHT — the file format has one
+            // bit, not a sequence — so this process cannot know how far the
+            // previous one failed to record. Seed the height at the maximum
+            // so `reset_unapplied_below` can never clear it here, and the
+            // boot replays rather than skipping. Fails towards replay, which
+            // costs time; the alternative costs data.
+            self.overflow_high_seq.store(u64::MAX, Ordering::Release);
             self.overflowed.store(true, Ordering::Release);
         }
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, boot-time seed
@@ -579,6 +595,15 @@ impl AppliedWatermark {
         if self.bucket_ids[slot].load(Ordering::Acquire) == id {
             self.mark_slot(slot);
         } else {
+            // The table could not record this frame. Remember how HIGH the
+            // loss reached, conservatively as the TOP of the bucket, so a
+            // later confirmed drain can only clear the flag once it has
+            // provably passed it. Storing the bucket top rather than the
+            // seq keeps this an upper bound on every frame the bucket
+            // would have held.
+            let bucket_top = ((id + 1) << UNAPPLIED_BUCKET_SHIFT).saturating_sub(1);
+            self.overflow_high_seq
+                .fetch_max(bucket_top, Ordering::AcqRel);
             self.overflowed.store(true, Ordering::Release);
         }
     }
@@ -607,6 +632,12 @@ impl AppliedWatermark {
         let first = lo >> UNAPPLIED_BUCKET_SHIFT;
         let last = hi >> UNAPPLIED_BUCKET_SHIFT;
         if last.saturating_sub(first) >= UNAPPLIED_BUCKETS as u64 {
+            // Same reasoning as the collision arm in `note_unapplied`: this whole
+            // range goes unrecorded, so remember its TOP before failing towards
+            // replay. Without it the flag below is the only trace, and a later
+            // confirmed drain would clear that on the strength of a bucket count
+            // that never included these frames.
+            self.overflow_high_seq.fetch_max(hi, Ordering::AcqRel);
             self.overflowed.store(true, Ordering::Release);
             return;
         }
@@ -657,7 +688,21 @@ impl AppliedWatermark {
                 kept += 1;
             }
         }
-        if kept == 0 {
+        // `kept` counts the buckets this table DID record at or above the
+        // ceiling. It is silent about the ones it could NOT record, and
+        // those are precisely what `overflowed` exists to flag — so
+        // clearing on `kept == 0` alone erased the only protection the
+        // unrecorded frames had. A later ack then lifted the high-water
+        // mark past them, `range_has_unapplied` answered false, and the
+        // replay renamed their whole segment to archive/ UNREAD: silent,
+        // permanent loss of every tick and depth row in it, with no
+        // counter anywhere. Found by an adversarial sweep on 2026-09-05,
+        // the same day this module landed, and reproduced before fixing.
+        //
+        // The flag may only be cleared once the confirmed ceiling has
+        // provably passed everything the table failed to record.
+        if kept == 0 && self.overflow_high_seq.load(Ordering::Acquire) < ceiling_seq {
+            self.overflow_high_seq.store(0, Ordering::Release);
             self.overflowed.store(false, Ordering::Release);
         }
     }
@@ -1247,6 +1292,111 @@ mod tests {
         assert!(!snap.overflowed);
         wm.reset_unapplied_below(u64::MAX);
         assert!(!wm.snapshot().range_has_unapplied(new, new));
+    }
+
+    /// The 2026-09-05 loss, pinned. An adversarial sweep found this on the day
+    /// the module landed and reproduced it before it was fixed.
+    ///
+    /// The chain: a bucket-id collision makes `note_unapplied` set `overflowed`
+    /// and store NOTHING. `reset_unapplied_below` then clears `overflowed`
+    /// because `kept == 0` — but `kept` counts only buckets it DID record, and
+    /// the collided frame is by definition not among them. With the only trace
+    /// erased, a later ack lifts the high-water mark past the frame,
+    /// `range_has_unapplied` answers false, and the replay renames the whole
+    /// segment to `archive/` unread. Every tick and depth row in it is gone,
+    /// permanently, with no counter anywhere.
+    #[test]
+    fn a_collided_bucket_survives_a_reset_that_has_not_passed_it() {
+        let wm = AppliedWatermark::new_for_tests();
+        // Two ids that land in the SAME slot: the table is indexed modulo
+        // UNAPPLIED_BUCKETS, so ids exactly that far apart collide.
+        let first = seq(10);
+        let colliding = first + ((UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied(first);
+        wm.note_unapplied(colliding);
+        assert!(
+            wm.snapshot().overflowed,
+            "a colliding id must set the overflow flag — it could not be recorded"
+        );
+
+        // A drain confirms everything up to a ceiling BELOW the collided
+        // frame. The first bucket is legitimately cleared; the collided one
+        // was never stored, so `kept` is 0.
+        wm.reset_unapplied_below(first + (1u64 << UNAPPLIED_BUCKET_SHIFT));
+
+        assert!(
+            wm.snapshot().overflowed,
+            "the flag MUST survive: the confirmed ceiling has not passed the \
+             frame the table failed to record. Clearing here is the silent \
+             permanent segment loss this test exists to prevent."
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(colliding, colliding),
+            "the collided frame must still read as unapplied, so its segment \
+             is replayed rather than archived unread"
+        );
+    }
+
+    #[test]
+    fn a_reset_that_passes_the_overflow_height_may_clear_the_flag() {
+        // The other direction, so the fix cannot be "never clear it", which
+        // would make every later boot replay everything forever.
+        let wm = AppliedWatermark::new_for_tests();
+        let first = seq(10);
+        let colliding = first + ((UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied(first);
+        wm.note_unapplied(colliding);
+        assert!(wm.snapshot().overflowed);
+
+        // Now the drain confirms PAST the collided frame's bucket top.
+        wm.reset_unapplied_below(colliding + (2u64 << UNAPPLIED_BUCKET_SHIFT));
+        assert!(
+            !wm.snapshot().overflowed,
+            "once the confirmed ceiling has provably passed everything the \
+             table failed to record, skipping is safe again"
+        );
+    }
+
+    #[test]
+    fn an_over_wide_unapplied_range_survives_a_reset_below_its_top() {
+        // The second overflow arm: a range spanning more buckets than the
+        // table holds records nothing at all.
+        let wm = AppliedWatermark::new_for_tests();
+        let lo = seq(10);
+        let hi = lo + (((UNAPPLIED_BUCKETS + 8) as u64) << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied_range(lo, hi);
+        assert!(wm.snapshot().overflowed);
+
+        wm.reset_unapplied_below(lo + (4u64 << UNAPPLIED_BUCKET_SHIFT));
+        assert!(
+            wm.snapshot().overflowed,
+            "a reset below the range's top must not clear it — the frames \
+             between the ceiling and `hi` were never recorded"
+        );
+
+        wm.reset_unapplied_below(hi + 1);
+        assert!(
+            !wm.snapshot().overflowed,
+            "a reset past the range's top may clear it"
+        );
+    }
+
+    #[test]
+    fn a_persisted_overflow_flag_can_never_be_cleared_by_this_process() {
+        // The file format carries one BIT, not a height, so a loaded flag
+        // must be treated as unbounded: this process cannot know how far the
+        // previous one failed to record.
+        let wm = AppliedWatermark::new_for_tests();
+        wm.seed(&AppliedSnapshot {
+            overflowed: true,
+            ..AppliedSnapshot::default()
+        });
+        wm.reset_unapplied_below(u64::MAX);
+        assert!(
+            wm.snapshot().overflowed,
+            "a persisted overflow has no known height and must fail towards \
+             replay for the life of the process"
+        );
     }
 
     #[test]

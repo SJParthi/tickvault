@@ -877,3 +877,77 @@ the failure output; the benign plant passed with the fix in place.
   failure shape this file keeps recording. It is bounded by the two
   compilers' own verb sets rather than by what a script author might write,
   which is the narrower and therefore safer direction to be wrong in.
+
+## §0.9. 2026-09-05 — SCOPE FIX #19: hole TEN, and it was inside the fix for hole nine
+
+Same operator directive as §0.5–§0.8. An adversarial sweep was told to read the
+guard first, understand exactly what it scans, and find a way a non-Rust
+runtime could still enter. It found one, and it was **three days old**.
+
+### The hole
+
+§0.8's SCOPE FIX #18 closed managed Lambda runtimes — the first check in this
+file able to see `runtime = "nodejs20.x"` at all. It enumerated the terraform
+files with `std::fs::read_dir`, which is **not recursive**.
+
+Every `.tf` in this repository is flat in `deploy/aws/terraform/`, so the check
+was correct on the tree it was written against. But the next structural step
+any terraform codebase takes is a `modules/` subdirectory, and the first one
+would have silently dropped every Lambda inside it out of the **only** check
+that can see a managed runtime.
+
+**Nothing else covers it.** The general token scanner is *provably* blind here:
+`node` inside `nodejs20.x` is followed by a digit, which fails
+`is_command_position`'s word-boundary test. The guard's own panic message says
+so. Bite-tested: a planted `modules/planted/main.tf` declaring
+`runtime = "nodejs20.x"` left `node_family_invocations_only_shrink` **GREEN**
+while the recursive version of the Lambda check FAILED naming the file.
+
+### The fix
+
+`git_ls_files_including_untracked(&["deploy/aws/**/*.tf"])` — recursive, and
+untracked-inclusive per SCOPE FIX #17, so a `.tf` that has not been `git add`ed
+is scanned too. That closes both halves at once: the first commit of a new
+module is exactly when this matters.
+
+### The pattern, now ten for ten
+
+| # | hole | what the scanner did not LOOK AT |
+|---|---|---|
+| 1–8 | §0.1–§0.4 | extensions, shebangs, spawn forms, cargo config, lockfiles, embedded interpreters |
+| 9 | §0.5–§0.8 | argv arrays, YAML sequences, wrapper prefixes, per-package cargo config, non-UTF-8, untracked files, toolchain languages, Lambda runtimes |
+| **10** | **this** | **a subdirectory** |
+
+**Ten holes, ten times the same shape**, and this one is the sharpest statement
+of it: the hole was not merely in what the scanner looked at, it was in what
+the *newest fix* looked at — introduced by the change that closed the previous
+hole, three days earlier. A guard's own scope is as much a claim as its word
+list, and it goes stale the same way.
+
+### A second finding, recorded and NOT fixed — it is an operator decision
+
+Container images are unbounded on **identity**. `docker_image_digest_guard`
+checks that images are digest-PINNED, never what they are; `ci_action_names`
+explicitly skips `docker://`; and no `IMAGE_ALLOWLIST` exists anywhere. The
+tree already runs a JVM (`questdb/questdb`) and two Go services
+(`grafana/loki`, `grafana/alloy`) beside the Rust process.
+
+Vendor CI action **names** were bounded by `CI_ACTION_ALLOWLIST` on exactly the
+argument that a new vendor runtime should fail the build rather than arrive
+unannounced. That argument applies verbatim to images. A shrink-only
+`CONTAINER_IMAGE_ALLOWLIST` would close it at the same cost.
+
+**Not taken here** because whether third-party service images are in scope at
+all is a scope question, not an executor's: the operator's directive is about
+the workspace codebase, and QuestDB is a database he chose, not code we wrote.
+Recorded so the next session decides deliberately rather than rediscovering it.
+
+### What a PR that violates §0.9 looks like (REJECT)
+
+- Reverts the Lambda scan to `read_dir`, or any non-recursive enumeration.
+- Drops the untracked-inclusive listing (the first commit of a module is the
+  case that matters).
+- Exempts a Lambda from the runtime check instead of building its handler in
+  Rust.
+- Claims the general token scanner covers managed runtimes — it cannot, by
+  word boundary, and the bite-test above is the evidence.
