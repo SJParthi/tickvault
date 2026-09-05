@@ -2397,6 +2397,143 @@ fn mask_phone(phone: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A `metrics::Recorder` that records counter increments in memory, so a
+    /// test can assert on a counter the production code emits.
+    ///
+    /// WHY THIS EXISTS, and why it adds no dependency. Three
+    /// `test_disabled_service_*` tests below used to end after a `notify()`
+    /// call with no assertion at all — they proved only that a disabled
+    /// notifier does not panic. The property that actually matters is
+    /// stronger and was untested: a disabled notifier must COUNT every alert
+    /// it drops. A notifier that silently swallows alerts is the exact
+    /// false-OK class this repository keeps retiring, and the counter is the
+    /// only evidence that a dropped page ever existed.
+    ///
+    /// Asserting on it needs a recorder. `metrics-util`'s debugging recorder
+    /// is not a workspace dependency and adding one needs operator approval,
+    /// so this implements the six-method `Recorder` trait directly against
+    /// `metrics`, which `tickvault-core` already depends on. Roughly sixty
+    /// lines, no new dependency root, no version decision.
+    ///
+    /// Scoped with `metrics::with_local_recorder`, NOT a global install:
+    /// `metrics` permits one global recorder per process, so a global install
+    /// would let whichever test ran first win and silently neuter the rest
+    /// under `cargo test`'s parallel harness.
+    #[derive(Clone, Default)]
+    struct CapturingRecorder {
+        counters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl CapturingRecorder {
+        /// Total recorded for `name`, summed across every label set.
+        ///
+        /// Summed deliberately: a caller asserting "the drop was counted"
+        /// cares that it was counted, not which label carried it, and the
+        /// label-specific form is available via `count_labelled` when the
+        /// reason IS the assertion.
+        fn count(&self, name: &str) -> u64 {
+            self.counters
+                .lock()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.as_str() == name || k.starts_with(&format!("{name}{{")))
+                        .map(|(_, v)| *v)
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+
+        /// Total recorded for `name` carrying `label=value`.
+        fn count_labelled(&self, name: &str, label: &str, value: &str) -> u64 {
+            let needle = format!("{label}={value}");
+            self.counters
+                .lock()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.starts_with(name) && k.contains(&needle))
+                        .map(|(_, v)| *v)
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+    }
+
+    /// One counter handle. Keyed by the rendered `name{label=value,...}` so
+    /// two label sets of the same metric stay distinguishable.
+    struct CapturedCounter {
+        key: String,
+        counters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for CapturedCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut m) = self.counters.lock() {
+                *m.entry(self.key.clone()).or_insert(0) += value;
+            }
+        }
+        fn absolute(&self, value: u64) {
+            if let Ok(mut m) = self.counters.lock() {
+                m.insert(self.key.clone(), value);
+            }
+        }
+    }
+
+    fn render_key(key: &metrics::Key) -> String {
+        let labels: Vec<String> = key
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        if labels.is_empty() {
+            key.name().to_string()
+        } else {
+            format!("{}{{{}}}", key.name(), labels.join(","))
+        }
+    }
+
+    impl metrics::Recorder for CapturingRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(std::sync::Arc::new(CapturedCounter {
+                key: render_key(key),
+                counters: std::sync::Arc::clone(&self.counters),
+            }))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
     #[test]
     fn test_disabled_service_is_not_active() {
         let service = NotificationService::disabled();
@@ -2616,20 +2753,49 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_service_notify_does_not_panic() {
+    fn test_disabled_service_counts_every_dropped_alert() {
+        // RENAMED + rewritten 2026-09-05. This was
+        // `test_disabled_service_notify_does_not_panic` and ended after the
+        // three `notify()` calls with NO assertion at all — it proved only
+        // that a disabled notifier does not panic, which `notify()`'s NoOp
+        // arm cannot do (it is a counter increment and a return).
+        //
+        // The property that actually matters: a disabled notifier must
+        // COUNT every alert it drops. A notifier that silently swallows
+        // alerts leaves a dropped page with no evidence it ever existed —
+        // the false-OK class this repository keeps retiring.
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        // Fire-and-forget on a no-op service must not panic.
-        service.notify(NotificationEvent::StartupComplete {
-            mode: "LIVE",
-            spot_1m_enabled: true,
-            spot_1m_indices: 4,
-            chain_1m_enabled: true,
-            chain_1m_underlyings: 3,
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::StartupComplete {
+                mode: "LIVE",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            });
+            service.notify(NotificationEvent::ShutdownComplete);
+            service.notify(NotificationEvent::Custom {
+                message: "test".to_string(),
+            });
         });
-        service.notify(NotificationEvent::ShutdownComplete);
-        service.notify(NotificationEvent::Custom {
-            message: "test".to_string(),
-        });
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            3,
+            "a disabled notifier must count EVERY dropped alert — one per notify()"
+        );
+        // The reason label is load-bearing: an operator triaging a silent
+        // Telegram needs `noop_mode` (SSM was unavailable at boot) told
+        // apart from a coalescer drop or a send failure. Asserting the
+        // total equals the labelled count pins that the NoOp arm returns
+        // without touching any other drop reason.
+        assert_eq!(
+            recorder.count("tv_telegram_dropped_total"),
+            3,
+            "the NoOp arm must return immediately — no other drop reason may fire"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2746,15 +2912,31 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_service_handles_critical_events() {
+    fn test_disabled_service_counts_dropped_critical_alerts() {
+        // RENAMED + rewritten 2026-09-05 (was
+        // `test_disabled_service_handles_critical_events`, assertion-free).
+        // Severity must not change the accounting: a CRITICAL page dropped
+        // because SSM was unavailable at boot is exactly the one an
+        // operator most needs a counter for, so it is counted on the same
+        // footing as an Info event.
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        service.notify(NotificationEvent::AuthenticationFailed {
-            reason: "timeout".to_string(),
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::AuthenticationFailed {
+                reason: "timeout".to_string(),
+            });
+            service.notify(NotificationEvent::TokenRenewalFailed {
+                attempts: 3,
+                reason: "timeout".to_string(),
+            });
         });
-        service.notify(NotificationEvent::TokenRenewalFailed {
-            attempts: 3,
-            reason: "timeout".to_string(),
-        });
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            2,
+            "Critical events dropped by a disabled notifier must still be counted"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3102,22 +3284,36 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_disabled_service_all_critical_events_safe() {
+    fn test_disabled_service_counts_mixed_severity_drops() {
+        // RENAMED + rewritten 2026-09-05 (was
+        // `test_disabled_service_all_critical_events_safe`, assertion-free).
+        // A mixed batch — two auth-family Criticals and a WS disconnect —
+        // must produce one counted drop each. The count is what tells an
+        // operator how much they did NOT hear about.
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        // Every event variant must be safe to fire on a disabled service
-        service.notify(NotificationEvent::AuthenticationFailed {
-            reason: "test".to_string(),
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::AuthenticationFailed {
+                reason: "test".to_string(),
+            });
+            service.notify(NotificationEvent::TokenRenewalFailed {
+                attempts: 99,
+                reason: "catastrophic".to_string(),
+            });
+            service.notify(NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            });
+            // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
+            // notify calls removed alongside the deleted variants.
         });
-        service.notify(NotificationEvent::TokenRenewalFailed {
-            attempts: 99,
-            reason: "catastrophic".to_string(),
-        });
-        service.notify(NotificationEvent::WebSocketDisconnected {
-            connection_index: 0,
-            reason: "reset".to_string(),
-        });
-        // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
-        // notify calls removed alongside the deleted variants.
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            3,
+            "every dropped alert is counted regardless of event family"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3505,28 +3701,48 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_disabled_service_websocket_events_safe() {
+    fn test_disabled_service_counts_dropped_ws_episode_events() {
+        // RENAMED + rewritten 2026-09-05 (was
+        // `test_disabled_service_websocket_events_safe`, assertion-free).
+        //
+        // WS lifecycle events are the ones that carry an `episode_key()`
+        // and would fold into a live-edited episode bubble on an ACTIVE
+        // service. This pins that the NoOp arm is consulted FIRST: all five
+        // are counted as plain drops, none reaches the episode dispatcher
+        // (which would `tokio::spawn` and panic outside a runtime — this is
+        // a plain `#[test]`, so a regression that routed them to the
+        // coalescer would fail here loudly rather than silently).
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        service.notify(NotificationEvent::WebSocketConnected {
-            connection_index: 0,
-            subscribed_count: 5_000,
-            capacity: 5_000,
-            last_activity_secs_ago: Some(1),
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::WebSocketConnected {
+                connection_index: 0,
+                subscribed_count: 5_000,
+                capacity: 5_000,
+                last_activity_secs_ago: Some(1),
+            });
+            service.notify(NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "test".to_string(),
+            });
+            service.notify(NotificationEvent::WebSocketReconnected {
+                connection_index: 0,
+                reason: None,
+                down_secs: 0,
+                attempts: 0,
+            });
+            service.notify(NotificationEvent::ShutdownInitiated {
+                class: crate::notification::events::ShutdownClass::ExternalStop,
+            });
+            service.notify(NotificationEvent::ShutdownComplete);
         });
-        service.notify(NotificationEvent::WebSocketDisconnected {
-            connection_index: 0,
-            reason: "test".to_string(),
-        });
-        service.notify(NotificationEvent::WebSocketReconnected {
-            connection_index: 0,
-            reason: None,
-            down_secs: 0,
-            attempts: 0,
-        });
-        service.notify(NotificationEvent::ShutdownInitiated {
-            class: crate::notification::events::ShutdownClass::ExternalStop,
-        });
-        service.notify(NotificationEvent::ShutdownComplete);
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            5,
+            "WS episode-family events must be counted as drops, not silently coalesced"
+        );
     }
 
     // -----------------------------------------------------------------------
