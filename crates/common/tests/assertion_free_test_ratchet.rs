@@ -72,7 +72,21 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// `..._notify_does_not_panic`, so `NO_PANIC_NAME_MARKERS` had already exempted
 /// it from the count. Converting a name-exempt test improves the test and
 /// moves this number not at all — so measure, never subtract.
-const ASSERTION_FREE_BUDGET: usize = 180;
+///
+/// 180 -> 165 on 2026-09-05: the whole `crates/app/src/infra.rs` cluster.
+/// Four were DELETED as genuinely vacuous -- one whose body was 100% comments
+/// and called nothing, one that asserted `cfg!(target_os)` (i.e. tested rustc,
+/// not us), an exact duplicate of its neighbour, and a "test" whose entire body
+/// was a fn-pointer coercion kept only to silence dead_code (now an
+/// `#[allow(dead_code)]`, which is the honest way to say that). Ten were RENAMED:
+/// they DO exercise the function, so the code path is real and the coverage is
+/// unchanged -- only the name was over-promising. One gained a REAL assertion.
+///
+/// The renames are the interesting half. `..._returns_bool` cannot fail: the
+/// signature already guarantees it. `..._with_reachable_mock` was worse than
+/// vacuous -- its own comment said it used a port that is NOT reachable, so the
+/// name contradicted the body. A name is the only thing most readers check.
+const ASSERTION_FREE_BUDGET: usize = 165;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [
