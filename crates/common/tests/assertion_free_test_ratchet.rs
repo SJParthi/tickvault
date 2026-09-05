@@ -41,7 +41,16 @@
 //!    `macro_rules!`.
 //! 3. `.unwrap()` and `.expect()` COUNT as assertions — they fail the test on
 //!    `Err`/`None`, which is a real check even if a blunt one.
-
+//! 4. An assertion can be SYNTACTICALLY present and SEMANTICALLY vacuous, and
+//!    this scanner cannot tell. Found by bite-proof on 2026-09-05:
+//!    `assert!(snapshot.vwap.is_finite())` on an `IndicatorSnapshot` can NEVER
+//!    fail, because `IndicatorSnapshot::sanitize_nan_inf` clamps every
+//!    non-finite field to `0.0` before the caller sees it. Two tests were
+//!    written that way, counted as asserting, and passed with the guard they
+//!    existed to protect deleted. The rule that follows: on any value that
+//!    passes through a sanitizer, assert the VALUE (`> 0.0`, `== 104.0`), not
+//!    its finiteness — `0.0` is what a sanitized NaN looks like, so zero is
+//!    the failure signal.
 use std::path::{Path, PathBuf};
 
 use tickvault_common::source_scan::strip_rust_comments;
@@ -55,7 +64,7 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// a panic, NAME it so (`..._no_panic`, `..._never_panics`,
 /// `..._degrades_without_panic`) and this scanner will not count it — which is
 /// the point: the name is what tells the next reader what was proven.
-const ASSERTION_FREE_BUDGET: usize = 185;
+const ASSERTION_FREE_BUDGET: usize = 183;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [
