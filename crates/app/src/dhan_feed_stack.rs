@@ -6441,10 +6441,38 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
     match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
         Some(WsLag::Measured(ms)) => {
             handles.histogram_for(connection_index).record(ms);
+            // Also fold into the DAY distribution the 15:45 scoreboard
+            // persists. Added 2026-09-05: the fold lost its last production
+            // caller on 2026-07-17 and the 2026-08-09 Dhan revival did not
+            // bring one back, so `feed_scoreboard_daily.lag_p50/p99/max/samples`
+            // wrote the -1 "not measured" sentinel on every same-day run in
+            // between. The value was computed here the whole time and simply
+            // never reached the table.
+            //
+            // The cast is exact, not merely bounded: `ws_lag_ms` builds this
+            // number as an i64 count of whole milliseconds and widens it to
+            // f64, so the fractional part is always zero and every reachable
+            // magnitude is far below 2^53. `max(0.0)` is belt-and-braces —
+            // the negative case is a separate arm below.
+            // APPROVED: exact round-trip of a whole-millisecond i64; see above.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let day_ms = ms.max(0.0) as u64;
+            tickvault_core::pipeline::feed_lag_monitor::record_day_lag_ms(
+                tickvault_common::feed::Feed::Dhan,
+                day_ms,
+            );
         }
         Some(WsLag::ClampedNegative) => {
             handles.histogram_for(connection_index).record(0.0);
             handles.excluded_clamped_negative.increment(1);
+            // Counted as a zero-lag sample in the day distribution too, so the
+            // scoreboard's sample count matches the histogram's. Dropping it
+            // here instead would make the two disagree for a reason no reader
+            // could reconstruct.
+            tickvault_core::pipeline::feed_lag_monitor::record_day_lag_ms(
+                tickvault_common::feed::Feed::Dhan,
+                0,
+            );
         }
         None => {
             handles.excluded_implausible_ltt.increment(1);
