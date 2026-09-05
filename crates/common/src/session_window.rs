@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn the_window_opens_at_0900_exactly() {
+    fn nanos_in_session_window_opens_at_0900_exactly() {
         assert!(
             !nanos_in_session_window(at(9 * 3600 - 1)),
             "08:59:59 is out"
@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_accepted_instant_is_1539_59_and_1540_is_out() {
+    fn nanos_in_session_window_last_accepted_instant_is_1539_59() {
         // This is the assertion that stops someone "fixing" 56_400 to 56_340.
         assert!(
             nanos_in_session_window(at(15 * 3600 + 39 * 60)),
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn a_negative_stamp_is_refused_not_moduloed_into_the_window() {
+    fn nanos_in_session_window_refuses_a_negative_stamp_rather_than_moduloing_it() {
         // -1 ns would modulo to a seconds-of-day of 0 or 86_399 depending on
         // sign rules; neither is a truth about the row. Refuse.
         assert!(!nanos_in_session_window(-1));
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn both_stamps_must_be_in_window() {
+    fn verdict_requires_both_stamps_in_window() {
         let good = at(10 * 3600);
         let bad = at(16 * 3600);
         assert_eq!(verdict(good, Some(good)), WindowVerdict::InWindow);
@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn a_null_receipt_does_not_refuse_a_good_row() {
+    fn verdict_treats_a_null_receipt_as_unknown_not_as_a_refusal() {
         // The documented decision: NULL means "cannot tell", not "out".
         assert_eq!(verdict(at(10 * 3600), None), WindowVerdict::InWindow);
         // ...but a bad ts is still refused with no receipt to lean on.
@@ -193,7 +193,31 @@ mod tests {
     }
 
     #[test]
-    fn refusal_and_labels_are_consistent() {
+    /// The label strings are an OPERATOR-FACING contract: they are the
+    /// `reason` dimension on `tv_ticks_out_of_window_refused_total`, so a
+    /// rename silently splits one series into two and the old one goes flat
+    /// rather than to zero -- which reads as "the problem stopped".
+    #[test]
+    fn reason_strings_are_stable_and_distinct() {
+        assert_eq!(WindowVerdict::InWindow.reason(), "in_window");
+        assert_eq!(WindowVerdict::TsOutOfWindow.reason(), "ts_out_of_window");
+        assert_eq!(
+            WindowVerdict::ReceivedAtOutOfWindow.reason(),
+            "received_at_out_of_window"
+        );
+        let all = [
+            WindowVerdict::InWindow.reason(),
+            WindowVerdict::TsOutOfWindow.reason(),
+            WindowVerdict::ReceivedAtOutOfWindow.reason(),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two verdicts must never share a metric label");
+            }
+        }
+    }
+
+    fn is_refusal_and_reason_agree_on_every_variant() {
         assert!(!WindowVerdict::InWindow.is_refusal());
         assert!(WindowVerdict::TsOutOfWindow.is_refusal());
         assert!(WindowVerdict::ReceivedAtOutOfWindow.is_refusal());
@@ -206,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_the_same_one_the_constants_name() {
+    fn nanos_in_session_window_uses_the_constants_that_name_the_window() {
         // Anti-drift: if someone edits either constant, this test says so
         // rather than the window silently moving under every writer.
         assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 32_400, "09:00");
