@@ -329,8 +329,6 @@ fn forget_resume_offset(path: &Path) {
     }
 }
 
-/// Counter for spill lines the replay refused because their ILP timestamp sits
-
 /// A `&'static str` label for the spill directory being replayed.
 ///
 /// Static, not the path itself: a non-literal label VALUE drops
