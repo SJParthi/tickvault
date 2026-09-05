@@ -121,6 +121,27 @@ const MAX_BLOCKS: u64 = 256;
 /// and the budget still looks nearly met.
 const SESSION_EPOCH_SECS: u32 = 1_786_800_000;
 
+/// A RECEIPT instant that lands inside the same trading session (UTC nanos).
+///
+/// The third instance of the bug this file already documents twice, and the
+/// first one the older two could not catch (2026-09-05).
+///
+/// `SESSION_EPOCH_SECS` above fixed the LTT after `1_000` — January 1970 — made
+/// the aggregator refuse every tick and the budget measure the REFUSAL path.
+/// The RECEIPT was left at `1_000_000` ns: also January 1970, and after
+/// `from_parsed_tick` adds `IST_UTC_OFFSET_NANOS` it reads as **05:30:00 IST**.
+///
+/// That was inert until the session-window gate began refusing any row whose
+/// `ts` OR `received_at` falls outside 09:00-15:39:59.999 IST. With a 1970
+/// receipt every frame is refused, so both frame gates would measure the
+/// refusal path while still reporting a pass — the exact failure their own
+/// comments were written about, arriving through the one clock nobody had
+/// reason to look at.
+///
+/// UTC, not IST: `from_parsed_tick` ADDS the offset, so this is
+/// `SESSION_EPOCH_SECS` minus 5h30m, landing on 13:20:00 IST.
+const SESSION_RECEIPT_NANOS: i64 = (SESSION_EPOCH_SECS as i64 - 19_800) * 1_000_000_000;
+
 /// A tick shaped like a real Quote packet for one of the index instruments.
 fn tick(security_id: u64, price: f32, exchange_ts: u32) -> ParsedTick {
     ParsedTick {
@@ -227,6 +248,91 @@ fn gate_is_not_vacuous() {
     );
 }
 
+/// The REFUSAL path must not allocate either — the pre-open case.
+///
+/// Added 2026-09-05, and it exists because fixing one bug hid another.
+///
+/// The session-window gate refuses any row whose `ts` or `received_at` falls
+/// outside 09:00-15:39:59.999 IST. Its first version called
+/// `metrics::counter!(NAME, "feed" => .., "reason" => ..)` at the refusal
+/// site; both label values are non-literal, which drops the macro to its
+/// allocating arm — the mechanism CLAUDE.md records from `record_ws_lag`. CI
+/// measured 10,010 blocks over 10,000 ticks against a ceiling of 500.
+///
+/// It looked like a rare path. It is not: OUTSIDE the session window EVERY
+/// tick is a refusal, so the pre-open burst — the busiest stretch of the
+/// morning — allocated once per tick on the drain task.
+///
+/// The gates above can no longer catch a regression here, because giving them
+/// an in-window receipt (the whole point of `SESSION_RECEIPT_NANOS`) means
+/// they never take the refusal arm. This one feeds a receipt at 05:30 IST on
+/// purpose, so every frame is refused and the budget measures exactly the path
+/// production takes before 09:00.
+#[test]
+fn out_of_window_refusal_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    fn quote_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 50];
+        buf[0] = 4;
+        buf[1..3].copy_from_slice(&50u16.to_le_bytes());
+        buf[3] = 0;
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&ltp.to_le_bytes());
+        buf[14..18].copy_from_slice(&ltt.to_le_bytes());
+        buf
+    }
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(200);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&quote_packet(
+                13 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                SESSION_EPOCH_SECS + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            bytes: bytes.into(),
+        }
+    }
+
+    // 1_000_000 ns is January 1970, which after the IST offset reads as
+    // 05:30:00 IST -- deliberately out of window, so every row is refused.
+    const PRE_OPEN_RECEIPT_NANOS: i64 = 1_000_000;
+
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    let c = counters();
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), PRE_OPEN_RECEIPT_NANOS, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500;
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for (n, f) in frames.iter().enumerate() {
+        let _ = drain_main_feed_frame(&mut ingest, f, PRE_OPEN_RECEIPT_NANOS, 1_000 + n as u64, c);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert!(
+        stats.total_blocks <= 500,
+        "the REFUSAL path allocated {} blocks over {} ticks (ceiling 500). \
+         Outside 09:00-15:39 IST every tick takes this path, so a per-tick \
+         allocation here is a per-tick allocation through the whole pre-open.",
+        stats.total_blocks,
+        FRAMES * 4
+    );
+}
+
 /// The FRAME seam — the function the original allocation actually lived in.
 ///
 /// # Why this test exists on top of the one above
@@ -310,7 +416,7 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
     // Warm-up OUTSIDE the window, same reasoning as the fold gate: first touch
     // of an instrument allocates its slot and registers its metric keys.
     for n in 0..4u64 {
-        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), 1_000_000, 1_000, c);
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
     }
 
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, as above
@@ -333,7 +439,13 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
 
     let profiler = dhat::Profiler::builder().testing().build();
     for (n, f) in frames.iter().enumerate() {
-        let _ = drain_main_feed_frame(&mut ingest, f, 1_000_000 + n as i64, 1_000 + n as u64, c);
+        let _ = drain_main_feed_frame(
+            &mut ingest,
+            f,
+            SESSION_RECEIPT_NANOS + n as i64,
+            1_000 + n as u64,
+            c,
+        );
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
@@ -384,7 +496,7 @@ fn frame_drain_gate_is_not_vacuous() {
             received_at: std::time::Instant::now(),
             bytes: buf.into(),
         },
-        1_000_000,
+        SESSION_RECEIPT_NANOS,
         1_000,
         counters(),
     );
@@ -489,7 +601,7 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
     // slot and registers its metric keys, and that cost is per-universe, not
     // per-tick.
     for n in 0..4u64 {
-        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), 1_000_000, 1_000, c);
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
     }
 
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks
@@ -502,7 +614,7 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
     let mut folded = 0u64;
     let mut depth_rows = 0u64;
     for f in &frames {
-        let out = drain_main_feed_frame(&mut ingest, f, 1_000_000, 1_000, c);
+        let out = drain_main_feed_frame(&mut ingest, f, SESSION_RECEIPT_NANOS, 1_000, c);
         folded += out.folded;
         depth_rows += out.inline_depth_rows;
     }

@@ -183,6 +183,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_tf_verify_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
+    (
+        "tv_ticks_out_of_window_refused_total",
+        "logged — VERIFIED 2026-09-05 by running this guard, not by reading the code. The emit is `counter.increment(1)` on a pre-resolved `metrics::Counter` held in an `OutOfWindowCounters` struct field, and the throttled `warn!` (code=STORAGE-GAP-01) sits on the next lines of the same `note()` body. That is the const -> struct field -> method chain already allowlisted three entries above for tv_dhan_feed_ingest_seq_refused_total: the scanner follows a const NAME alias and a local `let h = metrics::counter!(..)` handle, so it locates the emit inside `OutOfWindowCounters::new` — where no log sits — instead of at `note()`. The handles are pre-resolved because the macro form allocated ONCE PER TICK on the drain task (DHAT measured 10,010 blocks over 10,000 ticks against a ceiling of 500, CI-caught 2026-09-05); the all-literal macro form is allocation-free and passes this guard, and was rejected because it cannot carry the `feed` label that every sibling loss counter carries and that the pluggable-feed contract needs. NOT EMF-shipped, deliberately: this counter measures the gate WORKING (outside 09:00-15:39:59 IST every tick increments it), so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note.",
+    ),
 ];
 
 fn repo_root() -> PathBuf {

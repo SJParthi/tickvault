@@ -55,6 +55,7 @@ pub mod order_types;
 pub mod price_precision;
 pub mod sanitize;
 pub mod segment;
+pub mod session_window;
 pub mod source_scan;
 pub mod tick_types;
 pub mod trading_calendar;
