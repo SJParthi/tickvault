@@ -443,7 +443,7 @@ pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi>(
             }
             Err(e) => {
                 // legacy: page-don't-crash (logger.exception + continue).
-                error!(error = %e, rule = %env.start_rule_name, "events:DisableRule failed");
+                error!(code = "LAMBDA-AWS-02", error = %e, rule = %env.start_rule_name, "events:DisableRule failed");
                 disable_err = e;
             }
         }
@@ -509,11 +509,17 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
     now_utc: DateTime<Utc>,
 ) -> Result<Value, String> {
     if env.instance_id.is_empty() {
-        error!("INSTANCE_ID env var is empty — cannot guard instance");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "INSTANCE_ID env var is empty — cannot guard instance"
+        );
         return Ok(json!({"ok": false, "reason": "missing INSTANCE_ID"}));
     }
     if env.alerts_topic_arn.is_empty() {
-        error!("ALERTS_TOPIC_ARN env var is empty — cannot page operator");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "ALERTS_TOPIC_ARN env var is empty — cannot page operator"
+        );
         return Ok(json!({"ok": false, "reason": "missing ALERTS_TOPIC_ARN"}));
     }
 

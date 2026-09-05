@@ -385,7 +385,7 @@ pub async fn instance_info<E: Ec2Api>(
 ) -> (String, Option<DateTime<Utc>>) {
     match ec2.describe(instance_id).await {
         Err(exc) => {
-            error!(error = %exc, "describe_instances failed");
+            error!(code = "LAMBDA-AWS-01", error = %exc, "describe_instances failed");
             ("unknown".to_string(), None)
         }
         Ok(None) => ("not-found".to_string(), None),
@@ -397,7 +397,7 @@ pub async fn instance_info<E: Ec2Api>(
 pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option<String> {
     match ec2.describe(instance_id).await {
         Err(exc) => {
-            error!(error = %exc, "describe_instances for public IP failed");
+            error!(code = "LAMBDA-AWS-01", error = %exc, "describe_instances for public IP failed");
             None
         }
         Ok(desc) => desc.and_then(|d| d.public_ip).filter(|ip| !ip.is_empty()),
@@ -471,6 +471,7 @@ pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> StartAttem
             let kind = classify_start_failure(&exc);
             match kind {
                 StartFailureKind::CapacityRefusal => error!(
+                    code = "LAMBDA-START-02",
                     error = %exc,
                     "self-heal start_instances REFUSED — AWS has no capacity for this \
                      instance type in the instance's availability zone. Retrying cannot \
@@ -480,7 +481,7 @@ pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> StartAttem
                      volume is zone-locked and does not follow, so snapshot first."
                 ),
                 StartFailureKind::Other => {
-                    error!(error = %exc, "self-heal start_instances FAILED");
+                    error!(code = "LAMBDA-START-02", error = %exc, "self-heal start_instances FAILED");
                 }
             }
             StartAttempt::Failed(kind)
@@ -496,7 +497,7 @@ pub async fn try_self_stop<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
             true
         }
         Err(exc) => {
-            error!(error = %exc, "self-heal stop_instances FAILED");
+            error!(code = "LAMBDA-START-02", error = %exc, "self-heal stop_instances FAILED");
             false
         }
     }
@@ -625,7 +626,10 @@ session. If you are NOT using it right now, press \
 'Stop instance' on the portal — it bills every hour it runs.",
             )
             .await?;
-            error!("stop_check FAILED — running, launch_time unknown — paged");
+            error!(
+                code = "LAMBDA-START-01",
+                "stop_check FAILED — running, launch_time unknown — paged"
+            );
             return Ok(json!({
                 "mode": "stop_check", "state": state, "alerted": true, "self_stopped": false
             }));
@@ -662,8 +666,8 @@ on the portal, or run \
             .await?;
         }
         error!(
-            self_stopped,
-            "stop_check FAILED — instance running past stop — paged"
+            code = "LAMBDA-START-01",
+            self_stopped, "stop_check FAILED — instance running past stop — paged"
         );
         return Ok(json!({
             "mode": "stop_check", "state": state, "alerted": true, "self_stopped": self_stopped
@@ -725,7 +729,10 @@ it bills every hour it runs."
                 ),
             )
             .await?;
-            error!("curfew_check — running, launch_time unknown — paged, not stopped");
+            error!(
+                code = "LAMBDA-START-01",
+                "curfew_check — running, launch_time unknown — paged, not stopped"
+            );
             return Ok(json!({
                 "mode": "curfew_check", "state": state, "stopped": false, "alerted": true
             }));
@@ -761,7 +768,10 @@ with no keep-alive, and my stop attempt FAILED. Press \
                 ),
             )
             .await?;
-            error!("curfew_check — stop attempt FAILED — manual stop paged");
+            error!(
+                code = "LAMBDA-START-02",
+                "curfew_check — stop attempt FAILED — manual stop paged"
+            );
         }
         return Ok(json!({
             "mode": "curfew_check", "state": state, "stopped": self_stopped, "alerted": true
@@ -796,7 +806,7 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
                 ),
             )
             .await?;
-            error!(launch_time = %lt, "check — running but launched LATE — paged");
+            error!(code = "LAMBDA-START-01", launch_time = %lt, "check — running but launched LATE — paged");
             return Ok(json!({
                 "mode": "check", "state": state, "alerted": true, "self_started": false
             }));
@@ -888,7 +898,7 @@ failed. Market opens 9:15 AM. Start it NOW: portal 'Start instance' or \
         .await?;
     }
     let self_started = attempt.started();
-    error!(state = %state, self_started, "check FAILED — operator paged");
+    error!(code = "LAMBDA-START-01", state = %state, self_started, "check FAILED — operator paged");
     Ok(json!({
         "mode": "check", "state": state, "alerted": true, "self_started": self_started
     }))

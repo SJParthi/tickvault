@@ -232,7 +232,7 @@ async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
         }
         Err(e) => {
             // The param NAME is safe to log; the value never is.
-            error!(param = name, error = %e, "ssm get_parameter failed");
+            error!(code = "LAMBDA-AWS-01", param = name, error = %e, "ssm get_parameter failed");
             String::new()
         }
     }
@@ -360,8 +360,10 @@ async fn dispatch_deploy(
     let ok = status == 201 || status == 204;
     if !ok {
         error!(
+            code = "LAMBDA-AWS-02",
             workflow = dispatch_workflow,
-            status, "workflow_dispatch failed"
+            status,
+            "workflow_dispatch failed"
         );
     }
     ok
@@ -423,6 +425,7 @@ async fn publish_binary_mismatch_metric(
         // (deploy-watchdog-lambda.tf) is a term filter over this log group
         // that matches on it, so rewording the string silences the alarm.
         error!(
+            code = "LAMBDA-PROV-01",
             binary_sha_known = binary.is_some(),
             desired_sha_known = desired.is_some(),
             "binary/main mismatch metric skipped — a sha is unknown"
@@ -448,7 +451,9 @@ async fn publish_binary_mismatch_metric(
         .await
     {
         Ok(_) => info!(metric = MISMATCH_METRIC_NAME, value, "published"),
-        Err(e) => error!(metric = MISMATCH_METRIC_NAME, error = %e, "put_metric_data failed"),
+        Err(e) => {
+            error!(code = "LAMBDA-AWS-02", metric = MISMATCH_METRIC_NAME, error = %e, "put_metric_data failed")
+        }
     }
 }
 
@@ -467,7 +472,7 @@ async fn publish(sns: &aws_sdk_sns::Client, topic_arn: &str, subject: &str, mess
         .send()
         .await
     {
-        error!(error = %e, "sns publish failed");
+        error!(code = "LAMBDA-NOTIFY-01", error = %e, "sns publish failed");
     }
 }
 

@@ -138,11 +138,17 @@ pub fn truncate_subject(subject: &str) -> String {
 /// (checked in this order) BEFORE any AWS client is built.
 pub fn guard_config(instance_id: &str, topic_arn: &str) -> Result<(), Value> {
     if instance_id.is_empty() {
-        error!("EC2_INSTANCE_ID env var is empty — cannot stop instance");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "EC2_INSTANCE_ID env var is empty — cannot stop instance"
+        );
         return Err(json!({"ok": false, "reason": "missing EC2_INSTANCE_ID"}));
     }
     if topic_arn.is_empty() {
-        error!("ALERTS_TOPIC_ARN env var is empty — cannot send operator alert");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "ALERTS_TOPIC_ARN env var is empty — cannot send operator alert"
+        );
         return Err(json!({"ok": false, "reason": "missing ALERTS_TOPIC_ARN"}));
     }
     Ok(())
@@ -199,7 +205,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         .send()
         .await
         .map_err(|e| {
-            error!(error = %e, "ec2:StopInstances failed — instance may still be running");
+            error!(code = "LAMBDA-AWS-02", error = %e, "ec2:StopInstances failed — instance may still be running");
             e
         })?;
     let state_changes: Vec<StateTransition> = stop_result
@@ -231,7 +237,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             // EC2 is already stopped (good!) but the operator may not know —
             // the Lambda self-error alarm in TF catches this and pages via
             // the same tv_alerts pipe.
-            error!(error = %e, "sns:Publish to operator alerts topic failed");
+            error!(code = "LAMBDA-NOTIFY-01", error = %e, "sns:Publish to operator alerts topic failed");
             e
         })?;
     info!(message_id = ?publish.message_id(), "operator alert published");

@@ -731,6 +731,7 @@ pub async fn handle(_event: serde_json::Value) -> Result<serde_json::Value, lamb
             // One coded ERROR line, then propagate. The message carries the
             // failing stage and never the token, PIN or TOTP.
             tracing::error!(
+                code = "LAMBDA-MINT-01",
                 stage = err.stage(),
                 reason = %err,
                 "Dhan token mint FAILED — consumers will keep serving a stale token \

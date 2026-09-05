@@ -1261,21 +1261,21 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         "start" => match shell.ec2_start().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
         "stop" => match shell.ec2_stop().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
         "reboot" => match shell.ec2_reboot().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
@@ -1289,7 +1289,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1305,7 +1305,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1321,7 +1321,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1393,7 +1393,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1436,7 +1436,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     )
                 }
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1474,7 +1474,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1484,7 +1484,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             let state = match shell.instance_state().await {
                 Ok(s) => s,
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     return action_failed(&action);
                 }
             };
