@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 111] = [
+pub const ALARM_PHRASES: [(&str, &str); 112] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -340,6 +340,10 @@ pub const ALARM_PHRASES: [(&str, &str); 111] = [
     (
         "dhan-worst-socket-deaf",
         "🔷 DHAN: one market data connection looks alive but has stopped delivering prices",
+    ),
+    (
+        "dhan-ring-dwell-high",
+        "🔷 DHAN: prices are waiting too long in the incoming buffer — this is the early warning that comes BEFORE prices start being refused",
     ),
     (
         "dhan-wal-dropped",
