@@ -1423,7 +1423,25 @@ fn maybe_sync_segment(
         }
         Err(err) => {
             metrics::counter!("tv_wal_fsync_errors_total").increment(1);
-            report_io_error("fsync", &err);
+            // Deliberately NOT `report_io_error`. That helper says "reopening
+            // segment; thread stays alive", which is true of a WRITE failure
+            // and false of this one: a failed sync reopens nothing, loses
+            // nothing that was already written, and does not endanger the
+            // thread. Its consequence is narrower and worth naming exactly —
+            // the records are still in the page cache and still survive a
+            // process death; what is gone is the BOUND on the power-loss
+            // window, which silently reverts to the kernel's writeback policy.
+            // Routing it through the write-error helper would also have
+            // inflated `tv_ws_frame_spill_write_errors_total` with events that
+            // are not write errors.
+            warn!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                stage = "fsync",
+                error = %err,
+                "WAL segment sync FAILED — records already written are still \
+                 in the page cache and still survive a process kill, but the \
+                 power-loss window is no longer bounded by the sync interval"
+            );
         }
     }
     Instant::now()
@@ -1453,7 +1471,17 @@ fn flush_on_exit(current: &mut Option<BufWriter<File>>, stage: &'static str) {
         Ok(()) => metrics::counter!("tv_wal_fsync_total").increment(1),
         Err(err) => {
             metrics::counter!("tv_wal_fsync_errors_total").increment(1);
-            report_io_error("fsync_on_exit", &err);
+            // Same reasoning as the periodic arm, with a sharper consequence:
+            // this is the LAST sync of the process, so a failure here means a
+            // clean shutdown did not, after all, put the final records beyond
+            // a power cut.
+            warn!(
+                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                stage = "fsync_on_exit",
+                error = %err,
+                "final WAL sync FAILED at shutdown — the last records are \
+                 flushed to the kernel but not forced to the device"
+            );
         }
     }
 }
