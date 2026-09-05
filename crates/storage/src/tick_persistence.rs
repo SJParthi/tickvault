@@ -1616,6 +1616,9 @@ pub struct TickWriter {
     pending_max_seq: u64,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
+    /// Pre-resolved session-window refusal counters -- see
+    /// [`OutOfWindowCounters`] for why they are resolved once.
+    out_of_window: OutOfWindowCounters,
     /// Highest `capture_seq` this connection has stamped — the per-connection
     /// monotonicity witness (`0` before the first row).
     last_capture_seq: i64,
@@ -1651,45 +1654,113 @@ pub struct TickWriter {
     retained_spans: u32,
 }
 
-/// Counts and reports a session-window refusal, throttled to powers of two.
+/// Pre-resolved refusal counters -- one handle per reason, per writer.
 ///
-/// Deliberately a LOG and not an EMF metric (2026-09-05). The house guard
-/// `loss_counter_visibility_guard` demands every `*_refused_total` reach some
-/// operator surface, and offers three ways; this takes the log, because the
-/// EMF route would be the wrong trade twice over:
+/// PRE-RESOLVED, and that is the whole point (2026-09-05). The first version
+/// called `metrics::counter!(NAME, "feed" => .., "reason" => ..)` at the
+/// refusal site, and DHAT caught it in CI: 10,010 blocks over 10,000 ticks
+/// against a ceiling of 500 -- one allocation PER TICK on the live path.
 ///
-///   * this counter measures the gate WORKING. Every tick before 09:00 and
-///     after 15:39:59 increments it, so the series is large and always-on and
-///     would chart normal behaviour, not a defect; and
-///   * an EMF name costs ~$0.30/mo against a September forecast of $130.39
-///     with the budget's automatic `STOP_EC2_INSTANCES` line at $135.00 —
-///     $4.61 of margin. The noise lock's standing rule is that the next
-///     addition of any size comes with a LEVER, not just a cost note, and
-///     this change carries no lever.
+/// The mechanism is the one CLAUDE.md already records from `record_ws_lag`: a
+/// non-literal label value drops the `metrics!` macro to its allocating arm.
+/// Both of ours are non-literal (the metric name is a `const`, the reason is a
+/// variable), so every call built a fresh label vector.
 ///
-/// Powers of two so a pre-open storm cannot flood the sink; the running total
-/// rides in the line so a throttled message still states the true magnitude.
-fn note_out_of_window_refusal(feed: Feed, reason: &'static str) {
-    static SEEN: AtomicU64 = AtomicU64::new(0);
-    metrics::counter!(
-        TICK_OUT_OF_WINDOW_COUNTER,
-        "feed" => feed.as_str(),
-        "reason" => reason,
-    )
-    .increment(1);
-    let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-    if total.is_power_of_two() {
-        warn!(
-            code = ErrorCode::StorageGapTickDedupSegment.code_str(),
-            feed = feed.as_str(),
-            reason,
-            refused_total = total,
-            "a tick row was REFUSED by the session-window gate and not written. \
-             This is a deliberate refusal, NOT tick loss: the operator's rule is \
-             that every persisted row carries a ts AND a received_at inside \
-             09:00:00-15:39:59.999 IST. Throttled to powers of two; \
-             refused_total is the true running count."
-        );
+/// It looked harmless because a refusal "should be rare". It is not: OUTSIDE
+/// 09:00-15:39 IST EVERY tick is a refusal, so the pre-open burst -- the
+/// busiest stretch of the morning -- would have allocated once per tick, on
+/// the drain task, in exactly the window the operator asked us to be strict
+/// about.
+///
+/// Resolving the three handles once at construction makes the refusal path a
+/// counter increment and nothing else. Gated by
+/// `dhat_live_ingest_seam::out_of_window_refusal_does_not_allocate_per_tick`,
+/// which feeds a 05:30 IST receipt so every frame is refused -- the gates that
+/// measure the FOLD cannot cover this path, because their receipt is
+/// deliberately in-window.
+#[derive(Debug)]
+struct OutOfWindowCounters {
+    ts_out: metrics::Counter,
+    received_at_out: metrics::Counter,
+    band: metrics::Counter,
+}
+
+impl OutOfWindowCounters {
+    fn new(feed: Feed) -> Self {
+        use tickvault_common::session_window::WindowVerdict;
+        let make = |reason: &'static str| {
+            let c = metrics::counter!(
+                TICK_OUT_OF_WINDOW_COUNTER,
+                "feed" => feed.as_str(),
+                "reason" => reason,
+            );
+            // Seed at 0 here rather than in `register_drop_baseline`: the
+            // CloudWatch agent drops the first sample of a series it has never
+            // seen, so an unseeded counter publishes nothing on the one sample
+            // that matters. Same discipline, one place.
+            c.increment(0);
+            c
+        };
+        Self {
+            ts_out: make(WindowVerdict::TsOutOfWindow.reason()),
+            received_at_out: make(WindowVerdict::ReceivedAtOutOfWindow.reason()),
+            band: make(TICK_TS_OUT_OF_BAND_REASON),
+        }
+    }
+
+    /// Allocation-free on the common path: pick a pre-resolved handle,
+    /// increment, and log only on a power of two.
+    ///
+    /// The `warn!` lives HERE, beside the increment, and not in a helper --
+    /// because a log three functions away is a log nobody finds from the
+    /// counter. That is a readability argument, and it is the only one:
+    /// an earlier version of this comment claimed the placement also satisfied
+    /// `loss_counter_visibility_guard`, and it does NOT. Verified 2026-09-05 by
+    /// running it: the scanner resolves a `const` name alias and a local
+    /// `let h = metrics::counter!(..)` handle, but not `const -> struct field ->
+    /// method`, so it locates the emit inside `OutOfWindowCounters::new` --
+    /// where no log sits -- rather than here. That is the same chain already
+    /// allowlisted for `tv_dhan_feed_ingest_seq_refused_total`, and this
+    /// counter is allowlisted beside it for the same reason.
+    ///
+    /// Deliberately a log and not an EMF metric. The guard offers three routes;
+    /// this takes the log because (a) the counter measures the gate WORKING --
+    /// every pre-open tick increments it, so an EMF series would chart normal
+    /// behaviour, not a defect -- and (b) an EMF name costs ~0.30 USD/mo
+    /// against a September forecast of 130.39 with the automatic
+    /// STOP_EC2_INSTANCES line at 135.00, i.e. 4.61 of margin, and the noise
+    /// lock's standing rule is that the next addition comes with a LEVER, not a
+    /// cost note. This change carries no lever.
+    ///
+    /// Powers of two, so a pre-open storm costs one line per doubling rather
+    /// than one per tick; the running total rides in the line so a throttled
+    /// message still states the true magnitude. ~14 emissions over 10,000
+    /// refusals, far inside the DHAT ceiling of 500.
+    fn note(&self, reason: &'static str) {
+        use tickvault_common::session_window::WindowVerdict;
+        let counter = if reason == WindowVerdict::TsOutOfWindow.reason() {
+            &self.ts_out
+        } else if reason == WindowVerdict::ReceivedAtOutOfWindow.reason() {
+            &self.received_at_out
+        } else {
+            &self.band
+        };
+        counter.increment(1);
+
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if total.is_power_of_two() {
+            warn!(
+                code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+                reason,
+                refused_total = total,
+                "a tick row was REFUSED by the session-window gate and not \
+                 written. This is a deliberate refusal, NOT tick loss: the \
+                 operator's rule is that every persisted row carries a ts AND a \
+                 received_at inside 09:00:00-15:39:59.999 IST. Throttled to \
+                 powers of two; refused_total is the true running count."
+            );
+        }
     }
 }
 
@@ -1789,6 +1860,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
+                    out_of_window: OutOfWindowCounters::new(feed),
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
@@ -1809,6 +1881,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
+                    out_of_window: OutOfWindowCounters::new(feed),
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
@@ -1847,6 +1920,7 @@ impl TickWriter {
             pending_min_seq: 0,
             pending_max_seq: 0,
             feed,
+            out_of_window: OutOfWindowCounters::new(feed),
             last_capture_seq: 0,
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
             offload: None,
@@ -1956,7 +2030,7 @@ impl TickWriter {
                             .contains(&s)
                     });
                     if !in_band {
-                        note_out_of_window_refusal(self.feed, TICK_TS_OUT_OF_BAND_REASON);
+                        self.out_of_window.note(TICK_TS_OUT_OF_BAND_REASON);
                         return Ok(());
                     }
                 }
@@ -1965,7 +2039,7 @@ impl TickWriter {
                     row.received_at_ist_nanos,
                 );
                 if verdict.is_refusal() {
-                    note_out_of_window_refusal(self.feed, verdict.reason());
+                    self.out_of_window.note(verdict.reason());
                     return Ok(());
                 }
                 self.append_row(&row)
