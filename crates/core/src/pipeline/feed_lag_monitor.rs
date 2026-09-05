@@ -119,14 +119,26 @@ impl DailyLagHistogram {
 
     /// Hot-path fold: O(1), zero-alloc (one relaxed `fetch_add` + one
     /// relaxed `fetch_max`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    // APPROVED: production-uncalled since 2026-07-17 (both live-feed folds
-    // deleted — Groww 2026-07-15, Dhan 2026-07-17); retained test-covered as
-    // the fold entry for any future producer (module doc, dashboard tidy).
-    fn record_ns(&self, lag_ns: u64) {
-        let lag_ms = lag_ns / (NANOS_PER_MS as u64);
+    ///
+    /// LIVE since 2026-09-05 via [`record_day_lag_ms`]. Before that this fold
+    /// had zero production callers — every call site was in this module's own
+    /// test block — so `summary()` returned `None` on every real run and the
+    /// scoreboard's four lag columns persisted the `-1` sentinel forever.
+    fn record_ms(&self, lag_ms: u64) {
         self.buckets[lag_hist_bucket_index(lag_ms)].fetch_add(1, Ordering::Relaxed);
         self.max_ms.fetch_max(lag_ms, Ordering::Relaxed);
+    }
+
+    /// Nanosecond-input wrapper over [`Self::record_ms`].
+    ///
+    /// Retained because the module's tests exercise the fold in nanoseconds
+    /// and because a future producer measuring in `Instant` deltas wants this
+    /// shape. The live Dhan producer measures in whole milliseconds already,
+    /// so it calls `record_ms` and this wrapper does not sit on the hot path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // APPROVED: ns-input convenience wrapper; the live producer records ms.
+    fn record_ns(&self, lag_ns: u64) {
+        self.record_ms(lag_ns / (NANOS_PER_MS as u64));
     }
 
     /// IST-midnight reset (cold, O(96)).
@@ -195,6 +207,33 @@ fn day_hist(feed: Feed) -> &'static DailyLagHistogram {
     }
 }
 
+/// Fold ONE delivery-lag sample into today's per-feed distribution.
+///
+/// # Why this exists
+///
+/// Until 2026-09-05 nothing in production called the fold at all. Every
+/// `record_ns` call site was inside this module's own `#[cfg(test)]` block,
+/// so `day_lag_summary` returned `None` on every real run, `apply_day_lag`
+/// wrote the `-1` "not measured" sentinel, and the four
+/// `feed_scoreboard_daily` lag columns held that sentinel every day since
+/// they shipped. The table looked instrumented and was structurally empty —
+/// the false-OK class this repository keeps retiring, in the one place that
+/// persists delivery lag.
+///
+/// The producer was always there: `record_ws_lag` has computed this exact
+/// value per tick for the CloudWatch histogram. It just never reached the
+/// day fold.
+///
+/// # Performance
+///
+/// Hot path — called once per tick. One relaxed `fetch_add` and one relaxed
+/// `fetch_max` into a `'static` array. O(1), zero allocation, no lock. The
+/// bucket index is arithmetic on the value, never a search. Pinned by
+/// `crates/app/tests/dhat_ws_lag.rs`, which gates the whole `record_ws_lag`
+/// path at zero allocation blocks.
+pub fn record_day_lag_ms(feed: Feed, lag_ms: u64) {
+    day_hist(feed).record_ms(lag_ms);
+}
 /// Drain one feed's day-lag distribution for the 15:45 IST scorecard
 /// (non-destructive — re-runs read the same day data; the midnight reset
 /// owns the day boundary). `None` below the 50-sample floor.

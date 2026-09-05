@@ -297,6 +297,39 @@ where
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `pool_supervisor::IDLE_POLL_INTERVAL`.
 pub const SUBSCRIBE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the CLIENT KEEPALIVE PING may take to reach the socket.
+///
+/// # Why this is separate from `SUBSCRIBE_SEND_TIMEOUT`
+///
+/// This send is awaited on the task that OWNS THE SOCKET — the one loop whose
+/// only job is to keep calling `recv()`. At the shared 10 s bound it was the
+/// single largest term in the worst-case time the socket goes unread (~15 s,
+/// alongside the 5 s top-up budget). Dhan's distribution layer classifies
+/// clients fast / normal / slow and skips a slow consumer forward to "the
+/// latest available state"; the feed carries no sequence number, so ticks lost
+/// that way are invisible to every counter we own. A reader that stops polling
+/// for ten seconds is how that classification is earned.
+///
+/// # Why shortening the SHARED constant instead would have been wrong
+///
+/// `SUBSCRIBE_SEND_TIMEOUT` also bounds `send_subscribe` and
+/// `send_unsubscribe` — including the BOOT subscribe, whose failure raises
+/// `SubscribeFailed` into the reconnect ladder and can PARK a socket at dial
+/// time. Tightening it globally would trade a latency problem for a
+/// won't-start problem. Found by adversarial review before this landed.
+///
+/// # Why 1 s is safe here specifically, and not merely shorter
+///
+/// A failed keepalive ping is ALREADY a no-op by design: the caller matches
+/// `Ok(()) | Err(SocketFailure) => {}` and the idle watchdog keeps governing
+/// the socket exactly as it did before this ping existed. So the only thing a
+/// tighter bound can cost is a ping that would have succeeded between 1 s and
+/// 10 s — on a socket that is, by construction, already in trouble at that
+/// point. Against Dhan's 40 s silent-socket close and the 27 s idle threshold,
+/// one second is ample for a healthy write.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; same shape as `SUBSCRIBE_SEND_TIMEOUT` above.
+pub const PING_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Counter: control / non-data frames observed and skipped (ping, pong, text,
 /// raw). Labels: `endpoint`, `kind`.
 pub const CONTROL_FRAME_METRIC: &str = "tv_dhan_ws_control_frames_total";
@@ -1469,7 +1502,7 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         // 51,000 rows/s is exactly the small invisible cost Principle #1 exists
         // to stop. Dhan needs no payload — the frame itself is the probe.
         let send = stream.send(Message::Ping(bytes::Bytes::from_static(&[])));
-        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
+        match tokio::time::timeout(PING_SEND_TIMEOUT, send).await {
             Ok(Ok(())) => {
                 metrics::counter!(
                     CLIENT_KEEPALIVE_PING_METRIC,
@@ -1767,6 +1800,57 @@ fn ws_bytes_to_bytes(payload: WsBytes) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keepalive ping must NOT share the subscribe timeout.
+    ///
+    /// This send is awaited on the socket-owning task, so its bound is the
+    /// largest term in the worst-case time the socket goes unread — and a
+    /// reader that stops polling is what Dhan's backpressure layer classifies
+    /// as a slow consumer, which is skipped forward with no sequence number
+    /// for us to detect the loss.
+    ///
+    /// The guard exists in BOTH directions, and the second is the one that
+    /// matters. Collapsing them by pointing the ping back at
+    /// `SUBSCRIBE_SEND_TIMEOUT` re-opens the 10 s stall. But "fixing" it the
+    /// other way — pointing SUBSCRIBE at the 1 s ping bound — is worse: that
+    /// constant also bounds the BOOT subscribe, whose failure raises
+    /// `SubscribeFailed` into the reconnect ladder and can PARK a socket at
+    /// dial time. So this asserts the split, not merely that the ping is fast.
+    #[test]
+    fn the_keepalive_ping_has_its_own_send_bound() {
+        assert!(
+            PING_SEND_TIMEOUT < SUBSCRIBE_SEND_TIMEOUT,
+            "the ping bound must stay strictly tighter than the subscribe bound: it is \
+             awaited on the socket-owning task, the subscribe bound is not"
+        );
+        assert!(
+            SUBSCRIBE_SEND_TIMEOUT >= Duration::from_secs(10),
+            "SUBSCRIBE_SEND_TIMEOUT must stay >= 10s. It bounds the BOOT subscribe, and a \
+             short bound there turns ordinary write latency into SubscribeFailed -> \
+             reconnect ladder -> a parked socket. Tighten the PING bound instead."
+        );
+
+        let src = include_str!("connection.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        // Anchor on the ping body itself, not the file: a match elsewhere in
+        // the file would let this pass while the ping still used the shared
+        // bound, which is the way a source scan goes vacuous.
+        let ping_body = production
+            .split("let send = stream.send(Message::Ping(")
+            .nth(1)
+            .and_then(|s| s.split("Ok(Ok(())) =>").next())
+            .expect("send_ping must still send a Ping frame");
+        assert!(
+            ping_body.contains("timeout(PING_SEND_TIMEOUT"),
+            "send_ping must await on PING_SEND_TIMEOUT, not the shared subscribe bound"
+        );
+        assert!(
+            !ping_body.contains("SUBSCRIBE_SEND_TIMEOUT"),
+            "send_ping must not reference SUBSCRIBE_SEND_TIMEOUT at all"
+        );
+    }
     use tickvault_common::constants::{
         DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL,
         DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, RESPONSE_CODE_FULL, RESPONSE_CODE_OI,
