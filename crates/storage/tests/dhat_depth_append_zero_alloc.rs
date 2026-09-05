@@ -135,4 +135,25 @@ fn dhat_depth_append_row_is_zero_allocation_across_every_label_combination() {
          `sanitize_ilp_symbol` returning Cow::Owned for input it currently passes through. \
          Keep every symbol a &'static str from a closed set."
     );
+
+    // NON-VACUITY, and it is not a formality.
+    //
+    // Since 2026-09-05 `append_row` carries the session-window gate, which
+    // refuses a row whose `ts_nanos` sits outside 09:00:00-15:39:59.999 IST
+    // and returns `Ok(())`. If this fixture's stamp ever drifts out of that
+    // window the loop above would measure the REFUSAL path -- a counter
+    // increment -- while still passing its allocation budget, and the thing
+    // it was written to guard would be silently unmeasured.
+    //
+    // That is not hypothetical: the five DHAT gates in
+    // `crates/app/tests/dhat_live_ingest_seam.rs` were all measuring exactly
+    // that on 2026-09-05, because their receipt fixture was 1_000_000 ns
+    // (05:30 IST). The fixture here is 09:16:40 IST; this assertion is what
+    // makes a future edit that moves it fail loudly instead of quietly.
+    assert!(
+        writer.pending() > 0,
+        "VACUOUS: not one row reached the buffer, so this gate measured the \
+         session-window refusal path rather than the append path. Check that \
+         the fixture's ts_nanos is inside 09:00:00-15:39:59.999 IST."
+    );
 }

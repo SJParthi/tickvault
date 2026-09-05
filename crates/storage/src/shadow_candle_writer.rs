@@ -42,6 +42,7 @@
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -123,6 +124,113 @@ const SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS: u64 = 0;
 // Value unchanged ("dhan") → DEDUP key + replay-stability byte-identical.
 pub const CANDLE_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
 
+/// Counter for candle rows refused by the session-window gate.
+///
+/// A REFUSAL, not a loss. `tv_dhan_feed_seals_dropped_total` means "a sealed
+/// candle was discarded and is gone", and it feeds AGGREGATOR-DROP-01; this
+/// means "a bar whose BUCKET falls outside 09:00-15:39:59 IST, which we
+/// declined to write".
+pub const CANDLE_OUT_OF_WINDOW_COUNTER: &str = "tv_candle_rows_out_of_window_refused_total";
+
+/// The two reason labels the candle gate reports.
+///
+/// # Why `bucket_` and not `ts_` or `arrival_`
+///
+/// A candle's `ts` is its BUCKET-OPEN instant (`shadow_seal_columns.rs` sets
+/// `timestamp_ist_nanos = bucket_start_ist_secs * 1e9`), not an event time and
+/// not an arrival time. Saying `ts_out_of_window` would invite the reader to
+/// look for a tick clock that does not exist here.
+///
+/// # ⚠ Why the gate reads the BUCKET and NEVER a seal or receipt clock
+///
+/// This is the trap an adversarial review was commissioned to find, and it is
+/// real. A bucket cannot be sealed before its last second has elapsed: the
+/// 15:39 one-minute bar has exclusive end 15:40:00, and `catch_up_seal` only
+/// releases it once the watermark passes `bucket_end + CATCHUP_LATENESS_MARGIN`
+/// = **15:40:02** — two seconds PAST the window's exclusive end. The close-time
+/// `force_seal_all` runs later still, after every socket sender is dropped, and
+/// the boot recovery drain replays spilled seals the NEXT MORNING.
+///
+/// So a gate on any seal or receipt clock would have silently discarded the
+/// FINAL BAR of every emitted timeframe, every session, plus every rescued bar
+/// — while reporting success. Gating the bucket is safe by construction:
+/// `TfIndex::bucket_start` anchors every bucket at
+/// `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (09:00) and is monotone within the
+/// day, so the first emitted bucket is 09:00:00 and the last one-minute bucket
+/// opens at 15:39:00 — both inside the window at its inclusive and exclusive
+/// edges respectively.
+///
+/// That anchoring also disposes of a second worry: a DAILY bar does NOT stamp
+/// midnight. `bucket_start` returns the session open for D1, so its `ts` is
+/// 09:00:00 IST and it would pass this gate — which matters because D1 could
+/// be re-enabled by a future dated quote.
+pub const CANDLE_OUT_OF_WINDOW_REASONS: [&str; 2] =
+    ["bucket_out_of_window", "bucket_out_of_plausible_band"];
+
+/// Pre-resolved candle refusal counters.
+///
+/// # Why no `feed` label, unlike every sibling loss counter
+///
+/// `ShadowCandleWriter` is the FEED-AGNOSTIC write boundary by design — its
+/// own doc says so, and `row.feed` is stamped verbatim from whichever seal
+/// arrived, with no match on it anywhere. The writer therefore has no feed of
+/// its own to bind a handle to, and resolving one PER ROW is exactly the
+/// allocating-arm mistake that cost 10,010 blocks over 10,000 ticks on the
+/// tick path on 2026-09-05.
+///
+/// The trade is deliberate and cheap here: this counter is a TRIPWIRE that
+/// should read zero forever (a bucket outside the session is not a thing the
+/// aggregator can currently produce), so per-feed attribution buys nothing,
+/// while a per-row allocation on the seal path would be a real regression.
+#[derive(Debug)]
+struct CandleOutOfWindowCounters {
+    bucket_out: metrics::Counter,
+    band: metrics::Counter,
+}
+
+impl CandleOutOfWindowCounters {
+    fn new() -> Self {
+        let make = |reason: &'static str| {
+            let c = metrics::counter!(CANDLE_OUT_OF_WINDOW_COUNTER, "reason" => reason);
+            // Seed at 0: the CloudWatch agent drops the first sample of a
+            // series it has never seen, so an unseeded counter publishes
+            // nothing on the one sample that matters.
+            c.increment(0);
+            c
+        };
+        Self {
+            bucket_out: make(CANDLE_OUT_OF_WINDOW_REASONS[0]),
+            band: make(CANDLE_OUT_OF_WINDOW_REASONS[1]),
+        }
+    }
+
+    /// Allocation-free: pick a pre-resolved handle, increment, log on a power
+    /// of two. The `warn!` sits beside the increment for the same readability
+    /// reason recorded on the tick path.
+    fn note(&self, reason: &'static str) {
+        let counter = if reason == CANDLE_OUT_OF_WINDOW_REASONS[0] {
+            &self.bucket_out
+        } else {
+            &self.band
+        };
+        counter.increment(1);
+
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if total.is_power_of_two() {
+            warn!(
+                reason,
+                refused_total = total,
+                "a candle row was REFUSED by the session-window gate and not \
+                 written. This should read ZERO in normal operation: every \
+                 bucket the aggregator opens is anchored at 09:00 IST and \
+                 monotone within the day, so a refusal here means a bucket \
+                 was built from a clock nobody expected."
+            );
+        }
+    }
+}
+
 /// ILP writer for the 21 plain `candles_<tf>` tables.
 ///
 /// Single producer (the async writer task is the sole owner) —
@@ -146,6 +254,10 @@ pub struct ShadowCandleWriter {
     /// back with `.expose_secret()` only at `Sender` construction.
     /// Read by `reconnect()` (the broken-pipe recovery path) — no
     /// longer dead since the candle-writer reconnect landed 2026-06-30.
+    /// Pre-resolved session-window refusal counters. See
+    /// [`CANDLE_OUT_OF_WINDOW_REASONS`] for why this gate reads the BUCKET
+    /// and never a seal clock.
+    out_of_window: CandleOutOfWindowCounters,
     ilp_conf_string: SecretString,
 }
 
@@ -179,6 +291,7 @@ impl ShadowCandleWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: SecretString::from(conf_string),
+            out_of_window: CandleOutOfWindowCounters::new(),
         })
     }
 
@@ -194,6 +307,7 @@ impl ShadowCandleWriter {
             buffer: Buffer::new(ProtocolVersion::V1),
             pending_count: 0,
             ilp_conf_string: SecretString::from(String::new()),
+            out_of_window: CandleOutOfWindowCounters::new(),
         }
     }
 
@@ -274,6 +388,57 @@ impl ShadowCandleWriter {
     /// feed anywhere in this method, so a novel feed string flows through
     /// unchanged. `append_seal` is the thin `BufferedSeal` adapter over this.
     pub fn append_row(&mut self, row: &ShadowSealRow) -> Result<()> {
+        // ---- SESSION-WINDOW GATE (BUCKET clock only) ---------------------
+        //
+        // Returns Ok(()) on refusal: the caller escalates an Err to the seal
+        // spill/DLQ tier and AGGREGATOR-DROP-01, so an Err here would report
+        // a deliberate refusal as lost data and page on it.
+        //
+        // Reads `row.timestamp_ist_nanos`, which is the BUCKET-OPEN instant --
+        // never the seal instant. See CANDLE_OUT_OF_WINDOW_REASONS for the
+        // proof that gating any seal clock would discard the final bar of
+        // every session.
+        //
+        // ## ⚠ HONEST STATUS, established 2026-09-05 by an adversarial sweep:
+        // ## this gate is DEFENCE IN DEPTH, not enforcement. It cannot fire today.
+        //
+        // Two upstream facts make every bucket that reaches this writer
+        // in-window by construction:
+        //   * `tf_index::bucket_start` CLAMPS the bucket-open to
+        //     `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (32_400 = 09:00), so no
+        //     bucket can open earlier -- including D1, which stamps 09:00
+        //     rather than midnight; and
+        //   * `MultiTfAggregator::consume` refuses the tick outright
+        //     (`out_of_session`) unless its fold clock is inside
+        //     `[CANDLE_SESSION_OPEN.., MARKET_CLOSE_SECS_OF_DAY_IST)` =
+        //     `[09:00, 15:40)` -- byte-identical to the persist window.
+        //
+        // So a folded bar's `timestamp_ist_nanos` is always >= 09:00 and always
+        // < 15:40, and this check cannot refuse one. It is kept anyway, at two
+        // integer compares per seal, because the redundancy is the point: the
+        // fold window is a `trading`-crate constant and this is a `storage`
+        // writer, and the day someone widens one the other still holds the
+        // operator's rule. What must NOT happen is this comment reading as
+        // though candles were previously unguarded and are now guarded -- they
+        // were guarded, one layer up, by a different crate.
+        {
+            let secs = row.timestamp_ist_nanos.div_euclid(1_000_000_000);
+            let in_band = u32::try_from(secs).is_ok_and(|s| {
+                (tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+                    ..=tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+                    // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+                    .contains(&s)
+            });
+            if !in_band {
+                self.out_of_window.note(CANDLE_OUT_OF_WINDOW_REASONS[1]);
+                return Ok(());
+            }
+            if !tickvault_common::session_window::row_is_in_an_open_window(row.timestamp_ist_nanos)
+            {
+                self.out_of_window.note(CANDLE_OUT_OF_WINDOW_REASONS[0]);
+                return Ok(());
+            }
+        }
         self.buffer
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
@@ -611,9 +776,9 @@ mod tests {
         // replay forever and the buffer can never grow across cycles toward
         // the questdb-rs 100 MiB max_buf_size cliff.
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
-        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("append");
         assert!(w.flush().is_err(), "disconnected flush fails");
         assert_eq!(
@@ -627,7 +792,7 @@ mod tests {
         assert_eq!(w.buffer_row_count(), 0);
         // The next cycle starts clean: a fresh append contains ONLY the new
         // row's bytes — no poisoned replay of the failed batch.
-        w.append_seal(&mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0))
+        w.append_seal(&mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0))
             .expect("append after discard");
         assert_eq!(w.pending_count(), 1);
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -640,10 +805,10 @@ mod tests {
     #[test]
     fn test_append_seal_increments_pending_count() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert_eq!(w.pending_count(), 1);
-        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("append");
         assert_eq!(w.pending_count(), 2);
     }
@@ -656,7 +821,7 @@ mod tests {
                 u64::from(13 + i),
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i,
+                1_716_023_700 + i,
                 100.0 + i as f64,
             );
             w.append_seal(&s).expect("append");
@@ -669,7 +834,7 @@ mod tests {
     fn test_append_seal_writes_bytes_to_the_buffer() {
         let mut w = ShadowCandleWriter::for_test();
         assert_eq!(w.buffer_byte_count(), 0);
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert!(
             w.buffer_byte_count() > 0,
@@ -680,7 +845,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_target_table_name_for_m1() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let bytes = w.buffer_bytes();
         let s = std::str::from_utf8(bytes).expect("ILP wire format is utf-8");
@@ -701,7 +866,7 @@ mod tests {
         // the dispatch contract end-to-end.
         for tf in TfIndex::ALL {
             let mut w = ShadowCandleWriter::for_test();
-            w.append_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0))
+            w.append_seal(&mk_seal(13, 0, tf, 1_716_023_700, 100.0))
                 .expect("append");
             let bytes = w.buffer_bytes();
             let s = std::str::from_utf8(bytes).expect("ILP wire format is utf-8");
@@ -721,7 +886,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append");
@@ -739,7 +904,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append");
@@ -763,7 +928,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
             Feed::Truedata,
         ))
@@ -790,7 +955,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append idx_i");
@@ -798,7 +963,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_NSE_EQ,
             TfIndex::M1,
-            1_716_001_500,
+            1_716_024_300,
             200.0,
         ))
         .expect("append nse_eq");
@@ -811,7 +976,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_security_id() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         // ILP int columns format: `security_id=13i`
@@ -824,7 +989,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_ohlc_values() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         // OHLC are f64 fields written as ILP doubles; questdb-rs emits
@@ -842,7 +1007,7 @@ mod tests {
         // `close_pct_from_prev_day` but NOT the oi/volume pct columns —
         // spot has no OI and indices no volume, so those stay dropped.
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(
@@ -862,7 +1027,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_volume_oi_tickcount_columns() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(s.contains("volume="), "volume column missing in {s}");
@@ -893,7 +1058,7 @@ mod tests {
     #[test]
     fn test_flush_returns_err_when_disconnected_with_pending_rows() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert_eq!(w.pending_count(), 1);
         let result = w.flush();
@@ -916,7 +1081,7 @@ mod tests {
                 u64::from(13 + i),
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i,
+                1_716_023_700 + i,
                 100.0 + i as f64,
             );
             w.append_seal(&s).expect("append");
@@ -941,7 +1106,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append");
@@ -971,7 +1136,7 @@ mod tests {
         // moment QuestDB comes back the backlog commits. Proven here by two
         // consecutive failed flushes both retaining the identical buffer.
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let bytes = w.buffer_byte_count();
         assert!(w.flush().is_err(), "first flush fails (no conf)");
@@ -1026,7 +1191,7 @@ mod tests {
         let mut w = ShadowCandleWriter::for_test();
         let novel_row = ShadowSealRow {
             table_name: TfIndex::M1.table_name(),
-            timestamp_ist_nanos: 1_716_000_900_i64 * 1_000_000_000,
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
             security_id: 4242,
             segment: "NSE_EQ",
             feed: "future_test_feed",
@@ -1070,7 +1235,7 @@ mod tests {
                 13,
                 EXCHANGE_SEGMENT_NSE_EQ,
                 TfIndex::M1,
-                1_716_000_900,
+                1_716_023_700,
                 100.0,
                 *feed,
             ))
@@ -1104,7 +1269,7 @@ mod tests {
             let mut w = ShadowCandleWriter::for_test();
             let row = ShadowSealRow {
                 table_name: tf.table_name(),
-                timestamp_ist_nanos: 1_716_000_900_i64 * 1_000_000_000,
+                timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
                 security_id: 4242,
                 segment: "NSE_EQ",
                 feed: novel_feed,
@@ -1152,7 +1317,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_NSE_EQ,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
             Feed::Truedata,
         );
@@ -1167,6 +1332,86 @@ mod tests {
             a.buffer_bytes(),
             b.buffer_bytes(),
             "append_seal and append_row must produce identical ILP bytes"
+        );
+    }
+
+    /// THE TRAP, pinned: the final bar of the session must be WRITTEN.
+    ///
+    /// A one-minute bucket opening at 15:39:00 has exclusive end 15:40:00 and
+    /// is only released by `catch_up_seal` once the watermark passes
+    /// 15:40:02 -- two seconds PAST the window's exclusive end. Any gate that
+    /// consulted the seal instant would discard this bar every single
+    /// session, silently, while reporting success. This test is what stops a
+    /// future edit from "tightening" the gate into that.
+    #[test]
+    fn the_final_bucket_of_the_session_is_written_even_though_it_seals_after_1540() {
+        let midnight = 1_715_990_400_u32;
+        let mut w = ShadowCandleWriter::for_test();
+        // 15:39:00 IST -- the last one-minute bucket the session can open.
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, midnight + 56_340, 100.0))
+            .expect("append");
+        assert_eq!(
+            w.pending_count(),
+            1,
+            "the 15:39 bar seals at ~15:40:02, AFTER the window closes. It is \
+             gated on its BUCKET, which is 15:39:00 and in window, so it must \
+             be written. Gating a seal clock here loses the close every day."
+        );
+    }
+
+    /// The first bucket of the session, at the inclusive edge.
+    #[test]
+    fn the_first_bucket_at_0900_is_written() {
+        let midnight = 1_715_990_400_u32;
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, midnight + 32_400, 100.0))
+            .expect("append");
+        assert_eq!(w.pending_count(), 1, "09:00:00 is IN, inclusively");
+    }
+
+    /// A bucket genuinely outside the session is refused -- as Ok, never Err.
+    ///
+    /// An `Err` would route through the seal spill/DLQ escalation and
+    /// AGGREGATOR-DROP-01, reporting a deliberate refusal as lost data.
+    #[test]
+    fn an_out_of_session_bucket_is_refused_as_ok_never_as_a_loss() {
+        let midnight = 1_715_990_400_u32;
+        let mut w = ShadowCandleWriter::for_test();
+        // 16:00:00 IST -- past the close.
+        assert!(
+            w.append_seal(&mk_seal(13, 0, TfIndex::M1, midnight + 57_600, 100.0))
+                .is_ok(),
+            "a refusal is Ok(()): an Err escalates to the DLQ and pages"
+        );
+        assert_eq!(w.pending_count(), 0, "and nothing reaches the buffer");
+    }
+
+    /// A corrupt far-future bucket whose TIME OF DAY looks in-session.
+    #[test]
+    fn a_far_future_bucket_that_looks_in_window_is_refused() {
+        let mut w = ShadowCandleWriter::for_test();
+        // 2_600_000_000 s is year 2052; its seconds-of-day is 51_200 = 14:13:20.
+        assert_eq!(2_600_000_000_u32 % 86_400, 51_200, "fixture precondition");
+        assert!(
+            w.append_seal(&mk_seal(13, 0, TfIndex::M1, 2_600_000_000, 100.0))
+                .is_ok()
+        );
+        assert_eq!(w.pending_count(), 0, "the band check must refuse it");
+    }
+
+    /// Candle reasons say `bucket_`, because that is the clock being read.
+    #[test]
+    fn every_candle_reason_names_the_bucket_clock_and_is_distinct() {
+        for reason in CANDLE_OUT_OF_WINDOW_REASONS {
+            assert!(
+                reason.starts_with("bucket_"),
+                "{reason} must say bucket: a candle's ts is its bucket-open \
+                 instant, not an event time and not an arrival time"
+            );
+        }
+        assert_ne!(
+            CANDLE_OUT_OF_WINDOW_REASONS[0], CANDLE_OUT_OF_WINDOW_REASONS[1],
+            "two reasons must never share a metric label"
         );
     }
 }

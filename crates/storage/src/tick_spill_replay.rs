@@ -41,7 +41,14 @@ use std::path::{Path, PathBuf};
 
 use reqwest::Client;
 use tickvault_common::error_code::ErrorCode;
+use tickvault_trading::candles::multi_tf_aggregator::{
+    MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+};
 use tracing::{error, info, warn};
+
+/// Nanoseconds in one second. Local because `session_window`'s copy is private
+/// and this is the only arithmetic in this module that needs it.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Maximum bytes per `/write` POST.
 ///
@@ -322,6 +329,136 @@ fn forget_resume_offset(path: &Path) {
     }
 }
 
+/// Counter for spill lines the replay refused because their ILP timestamp sits
+
+/// A `&'static str` label for the spill directory being replayed.
+///
+/// Static, not the path itself: a non-literal label VALUE drops
+/// `metrics::counter!` to its allocating arm, and this loop runs once per
+/// chunk. The label answers the only question worth asking of this counter --
+/// were the refused rows ticks or depth -- and an unrecognised directory says
+/// so rather than guessing.
+fn dir_label(dir: &Path) -> &'static str {
+    let p = dir.to_string_lossy();
+    if p.ends_with("ticks") {
+        "ticks"
+    } else if p.ends_with("depth") {
+        "depth"
+    } else {
+        "other"
+    }
+}
+
+/// Drop the lines of one ILP chunk whose trailing timestamp is outside every
+/// open window, and return the survivors.
+///
+/// # Why this exists — the one path that can still write an ungated row
+///
+/// The session-window gate lives in the three WRITERS
+/// (`TickWriter::append_tick_with_seq`, `DepthWriter::append_row`,
+/// `ShadowCandleWriter::append_row`), so every row that enters an ILP buffer
+/// today has already passed it. Replay does not go through a writer: it streams
+/// bytes off disk and POSTs them to `/write` verbatim. A spill file written by a
+/// pre-gate binary therefore lands in `ticks` or `market_depth` unchecked — and
+/// the operator's rule is about what is IN the table, not about which code path
+/// put it there.
+///
+/// # Fail OPEN, deliberately, and this is the whole safety argument
+///
+/// A line is dropped ONLY when it is positively identified as out of window.
+/// Anything this parser does not fully understand is KEPT. The two errors are
+/// not symmetric: keeping an out-of-window row reproduces today's behaviour,
+/// while dropping a row we merely failed to parse destroys captured market data
+/// that the rescue tier exists to protect.
+///
+/// # How a timestamp is identified
+///
+/// An ILP line is `table,tags fields timestamp`. Every FIELD is `key=value`, so
+/// the only trailing token that can be a bare integer is the timestamp — a line
+/// with no timestamp at all (QuestDB then stamps server time) ends in something
+/// like `quantity=100i`, which contains `=` and is left alone. Both conditions
+/// must hold before a line is even a candidate.
+///
+/// The value is IST epoch nanoseconds, the same quantity the writers gate on:
+/// they append with `.at(TimestampNanos::new(row.ts_ist_nanos))`.
+///
+/// # Complexity
+///
+/// O(bytes in the chunk), one pass, no per-line allocation. This is the cold
+/// replay path — boot and a periodic drain — never the frame drain.
+fn retain_lines_in_open_window(chunk: &[u8]) -> (Vec<u8>, u64) {
+    let mut kept = Vec::with_capacity(chunk.len());
+    let mut dropped: u64 = 0;
+    for line in chunk.split_inclusive(|b| *b == b'\n') {
+        if line_is_positively_out_of_window(line) {
+            dropped = dropped.saturating_add(1);
+        } else {
+            kept.extend_from_slice(line);
+        }
+    }
+    (kept, dropped)
+}
+
+/// True only when the line carries a parseable ILP timestamp that is BOTH a
+/// plausible epoch AND outside every open window. Every other shape returns
+/// `false` (keep it).
+///
+/// # Why the plausibility band is load-bearing, not belt-and-braces
+///
+/// A spill file's tail can be TORN — the writer was appending when the process
+/// died, so the last line may end mid-timestamp: `... ltp=1.0 17160237`. That
+/// truncated prefix still parses as an `i64`, and as nanoseconds it lands in
+/// 1970 — comfortably outside every open window. Judging on the window alone
+/// would therefore DELETE a real captured tick because its timestamp was cut
+/// short by a crash, which is the exact loss the rescue tier exists to prevent.
+///
+/// So a value is only judged when its magnitude says it really is an epoch.
+/// Anything below the band (torn, zero, a synthetic `1`, a stray integer) is
+/// KEPT and POSTed, and QuestDB judges it — the module's pre-existing torn-tail
+/// contract, unchanged.
+///
+/// The band is the same one the aggregator gates ticks on
+/// (`MIN_PLAUSIBLE_EXCHANGE_TS_SECS` ..= `MAX_PLAUSIBLE_EXCHANGE_TS_SECS`), so
+/// there is ONE definition of "this integer is a real market timestamp" in the
+/// workspace rather than a second one invented here.
+fn line_is_positively_out_of_window(line: &[u8]) -> bool {
+    let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+    let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some(last) = trimmed.rsplit(|b| *b == b' ').next() else {
+        return false;
+    };
+    // A field is `key=value`; only the timestamp is a bare integer.
+    if last.is_empty() || last.contains(&b'=') {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(last) else {
+        return false;
+    };
+    let Ok(nanos) = text.parse::<i64>() else {
+        return false;
+    };
+    if !nanos_are_a_plausible_epoch(nanos) {
+        return false;
+    }
+    !tickvault_common::session_window::row_is_in_an_open_window(nanos)
+}
+
+/// True when `nanos` is large enough to be a real market timestamp rather than
+/// a torn prefix, a zero, or a synthetic fixture value.
+///
+/// O(1): two integer compares against const bounds, no allocation.
+fn nanos_are_a_plausible_epoch(nanos: i64) -> bool {
+    let secs = nanos.div_euclid(NANOS_PER_SECOND);
+    // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer
+    // compares, not a scan.
+    u32::try_from(secs).is_ok_and(|s| {
+        (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS).contains(&s)
+    })
+}
+
 pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     // ONE buffer for the whole round, reused across files: a fixed cost per
@@ -395,6 +532,14 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         }
 
         let mut accepted: u64 = 0;
+        // Bytes CONSUMED from the file that were deliberately refused by the
+        // window filter and therefore never sent. Tracked separately because
+        // `accepted` drives the resume offset and so must count every byte we
+        // are done with, while `bytes_replayed` reports what actually reached
+        // QuestDB. Folding refusals into the success metric would make it
+        // claim rows it declined to write -- the class of false-OK this
+        // repository has had to withdraw before.
+        let mut refused_bytes: u64 = 0;
         let mut failed = false;
         let mut quarantined = false;
         let mut over_long_line = false;
@@ -477,8 +622,43 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             };
             let carried = filled.saturating_sub(cut);
             for range in ilp_chunk_ranges(&buf[..cut], REPLAY_MAX_CHUNK_BYTES) {
-                let chunk = buf[range].to_vec();
-                let len = chunk.len() as u64;
+                let raw = &buf[range];
+                // `len` counts the bytes CONSUMED from the file, not the bytes
+                // sent: it drives the resume offset, so a refused line must
+                // still advance it or the round would re-read the same bytes
+                // forever and never converge.
+                let len = raw.len() as u64;
+                let (chunk, refused_lines) = retain_lines_in_open_window(raw);
+                refused_bytes =
+                    refused_bytes.saturating_add(len.saturating_sub(chunk.len() as u64));
+                if refused_lines > 0 {
+                    metrics::counter!(
+                        "tv_spill_replay_rows_out_of_window_refused_total",
+                        "dir" => dir_label(dir)
+                    )
+                    .increment(refused_lines);
+                    warn!(
+                        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+                        refused_lines,
+                        path = %path.display(),
+                        "spill replay REFUSED lines whose ILP timestamp is a plausible epoch \
+                         OUTSIDE every open window. These are rows a pre-gate binary spilled; \
+                         the gate now lives in the writers, so anything spilled after \
+                         2026-09-05 is already in window. The refusal is deliberate and is NOT \
+                         tick loss: the row would have been refused at the writer too. Note \
+                         the file is still DRAINED -- a fully-refused closed file is truncated \
+                         like any other, because leaving it would re-refuse the same bytes \
+                         every round forever. A torn or unparseable stamp is never judged; it \
+                         is POSTed and QuestDB decides."
+                    );
+                }
+                if chunk.is_empty() {
+                    // Every line in this chunk was out of window. Nothing to
+                    // POST, but the bytes are consumed: count them accepted so
+                    // the resume offset advances past them.
+                    accepted = accepted.saturating_add(len);
+                    continue;
+                }
                 match client.post(url).body(chunk).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         accepted = accepted.saturating_add(len);
@@ -634,8 +814,11 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         // skip costs real market data.
         match std::fs::metadata(&path).map(|meta| meta.len()) {
             Ok(len_now) if len_now > file_len => {
-                outcome.bytes_replayed = outcome.bytes_replayed.saturating_add(accepted);
-                metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(accepted);
+                outcome.bytes_replayed = outcome
+                    .bytes_replayed
+                    .saturating_add(accepted.saturating_sub(refused_bytes));
+                metrics::counter!("tv_tick_spill_replayed_bytes_total")
+                    .increment(accepted.saturating_sub(refused_bytes));
 
                 // The writer appended while we drained. Both obvious answers
                 // are wrong, and the first version of this shipped one of them.
@@ -712,8 +895,11 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         if writer_may_still_append {
             record_resume_offset(&path, file_len);
             outcome.files_replayed = outcome.files_replayed.saturating_add(1);
-            outcome.bytes_replayed = outcome.bytes_replayed.saturating_add(accepted);
-            metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(accepted);
+            outcome.bytes_replayed = outcome
+                .bytes_replayed
+                .saturating_add(accepted.saturating_sub(refused_bytes));
+            metrics::counter!("tv_tick_spill_replayed_bytes_total")
+                .increment(accepted.saturating_sub(refused_bytes));
             info!(
                 path = %path.display(),
                 bytes = accepted,
@@ -733,8 +919,11 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         match std::fs::File::create(&path) {
             Ok(_) => {
                 outcome.files_replayed = outcome.files_replayed.saturating_add(1);
-                outcome.bytes_replayed = outcome.bytes_replayed.saturating_add(accepted);
-                metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(accepted);
+                outcome.bytes_replayed = outcome
+                    .bytes_replayed
+                    .saturating_add(accepted.saturating_sub(refused_bytes));
+                metrics::counter!("tv_tick_spill_replayed_bytes_total")
+                    .increment(accepted.saturating_sub(refused_bytes));
                 info!(
                     path = %path.display(),
                     bytes = accepted,
@@ -941,6 +1130,154 @@ pub fn spawn_supervised_tick_spill_replay(
 #[cfg(test)]
 mod tests {
     // ---- 2026-09-03 STREAMING FIX: the tests that bite ----------------------
+
+    /// IST epoch nanos for a seconds-of-day on an arbitrary real trading date.
+    fn ist_at(secs_of_day: i64) -> i64 {
+        // 2024-05-18 IST-epoch midnight, chosen because 1_716_023_700 (09:15)
+        // is the base every other fixture in this workspace counts from.
+        1_715_990_400_i64
+            .saturating_add(secs_of_day)
+            .saturating_mul(1_000_000_000)
+    }
+
+    fn tick_line(secs_of_day: i64) -> String {
+        format!(
+            "ticks,segment=NSE_FNO,feed=dhan ltp=100.5,volume=10i {}\n",
+            ist_at(secs_of_day)
+        )
+    }
+
+    #[test]
+    fn an_out_of_window_spill_line_is_refused_and_an_in_window_one_survives() {
+        let mut chunk = String::new();
+        chunk.push_str(&tick_line(12 * 3600)); // 12:00 — keep
+        chunk.push_str(&tick_line(22 * 3600)); // 22:00 — refuse
+        chunk.push_str(&tick_line(9 * 3600)); //  09:00 — keep, boundary
+        let (kept, dropped) = retain_lines_in_open_window(chunk.as_bytes());
+
+        assert_eq!(dropped, 1, "exactly the 22:00 line is refused");
+        let kept = String::from_utf8(kept).expect("utf8");
+        assert_eq!(kept.lines().count(), 2);
+        assert!(!kept.contains(&ist_at(22 * 3600).to_string()));
+        assert!(kept.contains(&ist_at(12 * 3600).to_string()));
+        assert!(kept.contains(&ist_at(9 * 3600).to_string()));
+    }
+
+    #[test]
+    fn a_line_with_no_timestamp_is_kept_because_we_cannot_judge_it() {
+        // QuestDB stamps server time for a line with no trailing timestamp.
+        // The last token is then a FIELD (`key=value`), never a bare integer.
+        // Dropping it would destroy a row on the strength of not understanding
+        // it, which is the one error this filter must never make.
+        let chunk = b"ticks,segment=NSE_EQ,feed=dhan ltp=100.5,volume=10i\n";
+        let (kept, dropped) = retain_lines_in_open_window(chunk);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept, chunk, "kept byte-for-byte");
+    }
+
+    #[test]
+    fn an_unparseable_or_torn_line_is_kept_never_dropped() {
+        // Fail OPEN. Each of these is a shape the parser does not fully
+        // understand; keeping them reproduces today's behaviour, while dropping
+        // them loses captured market data.
+        for raw in [
+            &b"not ilp at all\n"[..],
+            &b"ticks,segment=NSE_EQ ltp=1.0 notanumber\n"[..],
+            &b"ticks,segment=NSE_EQ ltp=1.0 \n"[..],
+            &b"\n"[..],
+            &b"ticks,segment=NSE_EQ ltp=1.0 17160237"[..], // torn tail, no newline
+            &[0xff, 0xfe, b' ', b'1', b'2', b'3', b'\n'][..], // invalid utf8
+        ] {
+            let (kept, dropped) = retain_lines_in_open_window(raw);
+            assert_eq!(dropped, 0, "must keep: {raw:?}");
+            assert_eq!(kept, raw, "must keep byte-for-byte: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_torn_tail_carrying_an_out_of_window_stamp_is_still_refused() {
+        // The final read of a crash-torn file has no trailing newline. The
+        // stamp is still a stamp, so the judgement still applies.
+        let line = format!(
+            "ticks,segment=NSE_EQ,feed=dhan ltp=1.0 {}",
+            ist_at(23 * 3600)
+        );
+        let (kept, dropped) = retain_lines_in_open_window(line.as_bytes());
+        assert_eq!(dropped, 1);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn a_torn_timestamp_is_kept_because_its_magnitude_is_not_an_epoch() {
+        // BITE: this is the fail-open half of the contract, and it is the half
+        // that costs real data when it is wrong. `17160237` is a crash-truncated
+        // prefix of a nanosecond stamp. It parses cleanly as an integer and, read
+        // as nanoseconds, lands in 1970 -- out of window by any measure. Judging
+        // on the window alone would DELETE a captured tick because a crash cut
+        // its timestamp short.
+        let torn = b"ticks,segment=NSE_EQ ltp=1.0 17160237\n";
+        assert!(
+            !line_is_positively_out_of_window(torn),
+            "a torn timestamp must never be judged"
+        );
+
+        // The same line with a COMPLETE out-of-window stamp IS judged, so the
+        // guard above is not simply disabling the gate.
+        let complete = format!("ticks,segment=NSE_EQ ltp=1.0 {}\n", ist_at(23 * 3600));
+        assert!(
+            line_is_positively_out_of_window(complete.as_bytes()),
+            "a complete out-of-window stamp must still be refused"
+        );
+    }
+
+    #[test]
+    fn the_plausible_epoch_band_is_the_aggregator_band_not_a_second_one() {
+        // One definition of "this integer is a real market timestamp" in the
+        // workspace. If the aggregator's band moves, this moves with it.
+        let below = (i64::from(MIN_PLAUSIBLE_EXCHANGE_TS_SECS) - 1) * NANOS_PER_SECOND;
+        let at_min = i64::from(MIN_PLAUSIBLE_EXCHANGE_TS_SECS) * NANOS_PER_SECOND;
+        let at_max = i64::from(MAX_PLAUSIBLE_EXCHANGE_TS_SECS) * NANOS_PER_SECOND;
+        let above = (i64::from(MAX_PLAUSIBLE_EXCHANGE_TS_SECS) + 1) * NANOS_PER_SECOND;
+
+        assert!(!nanos_are_a_plausible_epoch(below));
+        assert!(nanos_are_a_plausible_epoch(at_min));
+        assert!(nanos_are_a_plausible_epoch(at_max));
+        assert!(!nanos_are_a_plausible_epoch(above));
+
+        // The shapes that actually turn up on a torn tail.
+        assert!(!nanos_are_a_plausible_epoch(0));
+        assert!(!nanos_are_a_plausible_epoch(1));
+        assert!(!nanos_are_a_plausible_epoch(-1));
+        assert!(!nanos_are_a_plausible_epoch(i64::MIN));
+        assert!(!nanos_are_a_plausible_epoch(i64::MAX));
+    }
+
+    #[test]
+    fn the_filter_preserves_every_byte_of_every_surviving_line() {
+        // Concatenation, not reconstruction: the filter must never normalise
+        // whitespace, re-order tags, or drop a `\r`. A rewritten line is a
+        // different row.
+        let odd = format!(
+            "ticks,segment=NSE_FNO,feed=dhan  ltp=1.0,x=\"a b\" {}\r\n",
+            ist_at(11 * 3600)
+        );
+        let (kept, dropped) = retain_lines_in_open_window(odd.as_bytes());
+        assert_eq!(dropped, 0);
+        assert_eq!(kept, odd.as_bytes(), "surviving lines are copied verbatim");
+    }
+
+    #[test]
+    fn dir_label_is_static_and_names_the_two_real_spill_dirs() {
+        assert_eq!(
+            dir_label(Path::new(crate::tick_persistence::TICK_SPILL_DIR)),
+            "ticks"
+        );
+        assert_eq!(
+            dir_label(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR)),
+            "depth"
+        );
+        assert_eq!(dir_label(Path::new("/tmp/whatever")), "other");
+    }
 
     /// STRUCTURAL BITE-PROOF for the 2026-09-03 OOM.
     ///
