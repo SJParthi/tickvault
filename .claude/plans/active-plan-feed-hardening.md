@@ -4471,3 +4471,89 @@ nothing already on disk.
 ### Observability (Item 23)
 No new EMF names. One new alarm (RESOURCE-02 log filter). Everything else rides existing
 filtered codes with a `source` field.
+
+## Item 24 — a restart must never replay frames it already applied (2026-09-05, operator: "Make this clean and make it to work" after "Yes wipe")
+
+**Status: IMPLEMENTED on branch `claude/rust-o1-aws-audit-im57xo`; awaiting the PR.**
+Authorization: the operator's "Do everything whatever you want go ahead fully" and
+"Make this clean and make it to work" (2026-09-05, in direct response to the Sept 3/4
+forensics that named the restart-replay as the cause and the replay-watermark as the fix).
+Rule-file record: `daily-universe-scope-expansion-2026-05-27.md` Quote 21 lists this exact
+follow-up ("the replay-watermark code fix (a restart must not replay already-applied
+segments)") as the work Monday's wipe does NOT cover.
+
+- [x] **24a — `crates/storage/src/wal_applied_watermark.rs`**: a 2 KiB CRC-checked
+  `applied.tvaw` beside the segments holding `hwm_ticks`/`hwm_depth` (highest `capture_seq`
+  ACKED by QuestDB or DURABLY RESCUED, per sink) plus a fixed 128-slot bucket table of
+  captured-but-unapplied sequences (4.6-minute buckets). RAM = atomics; persisted tmp+rename
+  at most once a second from the sink threads and at shutdown. Every failure direction is
+  "replay more".
+- [x] **24b — producers**: `TickWriter`/`DepthWriter` track the pending `capture_seq` range;
+  `FlushBatch`/`RescueBatch` (and depth twins) carry it; the sinks ack on landed OR rescued,
+  mark the range unapplied on a failed rescue; `RingFull` sheds in `pool_supervisor` and a
+  failed ILP append mark the frame unapplied; the synchronous flush arms ack too.
+- [x] **24c — consumer**: `replay_all_with_report_guarded` archives a segment UNREAD when its
+  range `[first_seq, next.first_seq − 1]` is below the slack-adjusted watermark for BOTH sinks
+  and overlaps no unapplied bucket; the boundary/last segment is read and filtered per frame
+  (`replay_segment_filtered`). `capture_seq` derivation untouched → DEDUP idempotency
+  unchanged.
+- [x] **24d — open-segment exclusion**: the writer's currently-open segment is registered
+  (`OPEN_SEGMENTS`, per directory) and never listed by `wal_segments_in`, so a catch-up round
+  can no longer stage — and confirm can no longer archive — the file the writer is still
+  appending to (found by reading, 2026-09-04).
+- [x] **24e — fences on the PRODUCTION entry points only** (`replay_all_fenced`,
+  `replay_all_with_report_fenced`): a disk floor (`min(40 GiB, volume/8)`) and a per-boot
+  frame cap (3,000,000). `replay_all` / `replay_all_with_report` stay unfenced for the
+  sixty-odd fixtures that drive them; a small-disk dev host would otherwise refuse every test.
+- [x] **24f — confirm only after ACK**: both lane confirm sites wait (≤30 s, polled) for the
+  writer threads' handed-off == completed counters before `confirm_replayed`; on timeout the
+  catch-up ENDS and the segments stay staged. The stale "segments were already archived"
+  sentence in `report_unfolded_wal_frames` is corrected (boot stopped confirming on the lane's
+  behalf on 2026-08-28).
+- [x] **24g — reset after a full drain**: when the catch-up's last pass finds nothing left
+  (no frames, no deferrals, no disk/cap/memory stop) the unapplied map is cleared and
+  persisted.
+- [ ] **24h — live verification (first restart on the new build)**:
+  `tv_wal_replay_skipped_segments_total > 0`, `tv_wal_replay_recovered_total ≈ 0` after a
+  clean session, `tv_spill_dir_free_bytes` flat across the restart.
+
+### Design (Item 24)
+See the module header of `wal_applied_watermark.rs`. Segment-level skip needs the whole
+range under the LOWER of the two watermarks (a main-feed frame feeds both sinks) unless the
+lane runs without a depth sink (`mark_depth_untracked`). One second of reorder slack;
+frames inside it are re-replayed and DEDUP-collapsed. Bucket-table wrap sets `overflowed`
+→ no skipping until the next full drain clears it.
+
+### Edge Cases (Item 24)
+v1/v2 records (`frame_seq == 0`) are never skipped; a watermark ahead of the wall clock by
+more than a day is rejected; a segment whose successor starts inside an unapplied bucket is
+read (conservative bound); a `replaying/` leftover from a boot that died before confirm is
+skipped straight to `archive/` if fully acked; a failed disk probe is fail-open like the
+memory guard; `TV_WAL_APPLIED_SKIP=0` or deleting `applied.tvaw` restores full replay.
+
+### Failure Modes (Item 24)
+Persist failure → counter + warn, RAM kept, next boot replays more. Sink never acks → hwm
+frozen → no skips. Ack-wait timeout → coded WS-SPILL-01 `source=replay_ack_wait_timeout`,
+no confirm, drain ends. Disk floor / frame cap → coded WS-SPILL-01 `source=replay_disk_floor`
+/ `replay_frame_cap`, nothing moved. WAL-suspended silent ACKs still advance the watermark
+(unchanged exposure; `wal_suspension_watcher` owns it).
+
+### Test Plan (Item 24)
+`wal_applied_watermark` unit tests (roundtrip + crc, persist/load, buckets, overflow, cadence,
+drained-wait); `ws_frame_spill` tests: `a_second_boot_after_a_clean_session_replays_zero_frames`
+(bite-proof), unapplied-window, lower-watermark, slack, v1, open-segment exclusion, disk floor,
+frame cap, header probe, floor arithmetic. Existing WAL chaos/guard suites unchanged and green.
+
+### Rollback (Item 24)
+Kill switch `TV_WAL_APPLIED_SKIP=0`; deleting `applied.tvaw`; an older binary ignores the
+file. No schema, DEDUP-key or WAL record-format change. Skipped segments are ARCHIVED, not
+deleted (3-day retention), so manual replay remains possible.
+
+### Observability (Item 24)
+Counters (pre-registered at 0 on the first fenced pass): `tv_wal_replay_skipped_segments_total`,
+`_skipped_frames_total`, `_skipped_bytes_total`, `_disk_floor_stops_total`,
+`_frame_cap_stops_total`, `_ack_wait_timeouts_total`, `tv_wal_applied_watermark_invalid_total`,
+`tv_wal_applied_watermark_persist_failed_total` (paired with a `warn!`). No new EMF names and
+no new alarm in this change: every refusal rides the already-filtered WS-SPILL-01 code with a
+`source` field. The boot `info!` "WAL replay complete" now carries skipped segments/frames/bytes
+and `watermark_present`.

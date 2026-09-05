@@ -2598,6 +2598,9 @@ impl FrameSink for WalRingSink {
             RingReserve::BytesFull => {
                 self.ring_full.increment(1);
                 self.ring_bytes_full.increment(1);
+                // Captured to the WAL, never folded by this session: the next
+                // replay must re-offer it. Three atomics, on the shed arm only.
+                tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
                 return FrameSinkOutcome::RingFull;
             }
             // Counted on `ring_full` ONLY, deliberately. That is exactly what
@@ -2608,6 +2611,7 @@ impl FrameSink for WalRingSink {
             // instead of to whoever happened to reach the shared pool first.
             RingReserve::SlotsFull => {
                 self.ring_full.increment(1);
+                tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
                 return FrameSinkOutcome::RingFull;
             }
         }
@@ -2631,6 +2635,7 @@ impl FrameSink for WalRingSink {
             // reason.
             self.budget.release(len);
             self.ring_full.increment(1);
+            tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
             return FrameSinkOutcome::RingFull;
         }
         // Reaching here with the class slot caps summing to the channel's

@@ -883,7 +883,17 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // mid-incident); the growth signal below fires only on a
                     // sustained climb and so cannot answer "how far behind now".
                     emit_wal_apply_lag_gauge(&rows);
-                    emit_wal_lag(&lag_tracker.observe(&rows));
+                    let growing = lag_tracker.observe(&rows);
+                    emit_wal_lag(&growing);
+                    // The applied watermark must not trust an ILP ack from a
+                    // table that is suspended, lagging, or invisible: such an
+                    // ack is the 2026-08-25 lie (rows ACKed, never applied),
+                    // and a watermark that believed it would archive WAL
+                    // segments unread. Clean = every row parsed, none
+                    // suspended, no growing lag.
+                    crate::wal_applied_watermark::applied_watermark().note_questdb_probe(
+                        skipped == 0 && delta.currently_suspended == 0 && growing.is_empty(),
+                    );
                     // Attempt recovery, CONDITIONALLY. The module header
                     // above says a resume is an operator decision because it
                     // "can replay into a still-broken disk" — which is right,
@@ -897,6 +907,9 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     attempt_auto_resume(&questdb, &rows, &mut resume_ledger).await;
                 }
                 Err(failure) => {
+                    // A probe that cannot see is not a clean probe: park the
+                    // watermark's acks until it can (see the Ok arm).
+                    crate::wal_applied_watermark::applied_watermark().note_questdb_probe(false);
                     // A failed probe leaves the gauge holding its last value.
                     // That is right for one tick and WRONG for an outage: a
                     // stale `0` reads as "no tables suspended" while the
