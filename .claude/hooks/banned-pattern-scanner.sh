@@ -135,29 +135,64 @@ scan_prod_code() {
 #   crates/storage/src/ws_frame_spill.rs    — per-frame WAL append
 # (crates/app/src/groww_bridge.rs — the per-tick Groww NDJSON consume path — was
 #  DELETED 2026-07-15 with the Groww live feed; its alternative is removed below.)
-# ⚠ SCOPE HOLE, RECORDED 2026-09-05 — three per-tick files are NOT scanned.
-#  The lines below used to read "tick_persistence.rs + tick_row_builder.rs were
-#  DELETED 2026-07-17 ... their alternatives are removed". That was true when
-#  written and stopped being true on 2026-08-26: tick_persistence.rs (143 KB)
-#  and depth_persistence.rs (72 KB) came BACK with the Dhan live-WS revival and
-#  the full-depth capture authorization, and crates/app/src/dhan_feed_stack.rs
-#  is the frame drain itself. All three are per-tick and none is in the include
-#  regex below, so the hot-path bans have never applied to them.
-#  Measured 2026-09-05, non-test lines: dhan_feed_stack.rs ~44 hits,
-#  tick_persistence.rs ~15, depth_persistence.rs ~13. Adding the paths without
-#  triaging those first would fail the very next commit that touches them, so
-#  the honest sequence is triage-then-widen, in its own change, NOT a silent
-#  regex edit. Recorded here rather than in a plan file because this is where
-#  the next reader of the include regex will look.
+#   crates/storage/src/tick_persistence.rs   — per-tick ILP append + flush
+#   crates/storage/src/depth_persistence.rs  — per-depth-row ILP append + flush
+#
+# 2026-09-05 — the two persistence writers were ADDED on this date, and the
+# lines they replace used to read "tick_persistence.rs + tick_row_builder.rs
+# were DELETED 2026-07-17 ... their alternatives are removed". That was true
+# when written and stopped being true on 2026-08-26, when both files came back
+# with the Dhan live-WS revival and the full-depth capture authorization. So a
+# stale comment stood where a reader would go looking for exactly this, and the
+# zero-allocation bans had never applied to the two per-row writers — one of
+# which carries a measured 1,530,651,649 rows per session.
+# Triaged before widening: 21 pre-existing hits, ALL boot DDL, ILP-conf,
+# once-per-process wiring, or a rescue arm reached only after a flush has
+# already failed. Zero were on a per-row path (`TickRow::from_parsed_tick` and
+# `DepthWriter::append_row_inner` are hit-free). Each now carries its own
+# `// APPROVED:` line with the reason.
+#
+# ⚠ STILL OUT OF SCOPE: crates/app/src/dhan_feed_stack.rs, which contains the
+#  frame drain itself. Its drain span was verified hit-free the same day, and
+#  all ~42 of its hits are boot, socket-dial, depth-attach or shutdown — but
+#  the file is ~11,600 lines and roughly 80% of it is NOT hot, so a FILE-level
+#  include is the wrong instrument: it would demand ~42 exemptions on code that
+#  was never on the tick path, and an allowlist that size teaches the next
+#  reader to add a forty-third. Covering it properly needs region scoping
+#  (the `// O(1) EXEMPT: begin/end` block shape this repo already uses,
+#  inverted to mark the HOT region) plus a test pinning that the marked region
+#  still contains the drain. That is its own change, not a regex edit.
 # Cold path within core (auth/, instrument/, notification/, historical/) is NOT hot path.
 # Cold path within trading (oms/) — order placement is network-I/O-bound, not
 # per-tick latency-critical (pre-existing documented exclusion, kept).
 # NOTE: keep this regex a flat '|'-separated list of alternatives with NO
 # nested groups — hot-path-scanner-selftest.sh splits it on '|' to verify
 # every alternative matches at least one real file.
-HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$'
+HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/depth_persistence\.rs$'
 HOT_PATH_EXCLUDE_REGEX='^crates/trading/src/oms/'
 
+# 2026-09-05: scan_hot_path no longer delegates to scan_prod_code. Two
+# reasons, both found by dry-running the widened include set:
+#
+#  1. COMMENT LINES. scan_prod_code drops `///` and `//!` but keeps plain
+#     `//`. crates/app/src/dhan_feed_stack.rs:1606 is a `//` comment whose
+#     text explains why `?err` is used INSTEAD of `format!` — the scanner
+#     flagged the prose that records the rule. Exempting it would invite
+#     someone to delete the explanation to silence the guard.
+#  2. MULTI-LINE MACROS. The same-line `// APPROVED:` escape does not
+#     survive `cargo fmt` on a macro opener: rustfmt hoists a trailing
+#     comment after `format!(` onto the next line, INSIDE the macro, where
+#     a same-line grep can never see it. Every marker on a wrapped
+#     `format!(` would silently stop working at the next fmt run.
+#
+# So this scan strips comment lines and looks BACK up to 5 lines for the
+# marker — the same shape scan_hot_path_sync_fs has used since Wave 1.
+# The look-back is scoped to the HOT-PATH bans only; the universal bans
+# (unwrap/expect/println) keep their stricter same-line escape.
+#
+# grep is deliberately BASIC, not -E: the patterns below are written as
+# `\.clone()` / `Vec::new()`, where `()` is a literal pair. Under -E it
+# would be an empty group that matches every line.
 scan_hot_path() {
   local pattern="$1"
   local description="$2"
@@ -169,7 +204,66 @@ scan_hot_path() {
     return
   fi
 
-  scan_prod_code "$pattern" "$description" "$hot_path_files"
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    local full_path="$PROJECT_DIR/$file"
+    [ ! -f "$full_path" ] && continue
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/)'; then
+      continue
+    fi
+
+    local prod_code
+    prod_code=$(extract_prod_code "$full_path")
+    [ -z "$prod_code" ] && continue
+
+    # `<line_num>: <code>` — drop entries whose code is a comment.
+    local code_only
+    code_only=$(echo "$prod_code" | grep -vE '^[0-9]+:[[:space:]]*(///|//!|//)' || true)
+
+    local hits
+    hits=$(echo "$code_only" | grep "$pattern" || true)
+    [ -z "$hits" ] && continue
+
+    while IFS= read -r hit; do
+      [ -z "$hit" ] && continue
+      local hit_line_num
+      hit_line_num=$(echo "$hit" | cut -d: -f1)
+      [ -z "$hit_line_num" ] && continue
+
+      local exempt=0
+      local hit_text
+      hit_text=$(sed -n "${hit_line_num}p" "$full_path" 2>/dev/null)
+      # SAME LINE ONLY for the incidental markers. `// TODO` and
+      # `// SAFETY:` must never exempt from a distance: a TODO five lines
+      # above an unrelated `.clone()` would silently waive it, which is a
+      # LOOSENING of the pre-2026-09-05 behaviour rather than a fix.
+      if echo "$hit_text" | grep -qE '// (SAFETY:|TODO|test)|// O\(1\) EXEMPT:'; then
+        exempt=1
+      fi
+      # DELIBERATE markers may sit ONE line above: a wrapped macro
+      # (rustfmt hoists a trailing comment off a `format!(` opener) or a
+      # marker on the enclosing fn.
+      local j
+      # Window is 0..1 deliberately, NOT the 5 that scan_hot_path_sync_fs uses:
+      # the marker is always ON the hit line or DIRECTLY above it, and a wider
+      # window lets an `// APPROVED:` written for one line silently waive an
+      # unrelated allocation added under it later.
+      for j in 0 1; do
+        [ "$exempt" = "1" ] && break
+        local back_line_num=$((hit_line_num - j))
+        [ "$back_line_num" -lt 1 ] && break
+        local back_text
+        back_text=$(sed -n "${back_line_num}p" "$full_path" 2>/dev/null)
+        if echo "$back_text" | grep -qE '// APPROVED:|HOT-PATH-EXEMPT:'; then
+          exempt=1
+        fi
+      done
+      [ "$exempt" = "1" ] && continue
+
+      VIOLATIONS=$((VIOLATIONS + 1))
+      REPORT="${REPORT}\n  [BANNED] ${description} in ${file}:\n    ${hit}"
+    done <<< "$hits"
+  done <<< "$hot_path_files"
 }
 
 echo "=== Banned Pattern Scanner ===" >&2
