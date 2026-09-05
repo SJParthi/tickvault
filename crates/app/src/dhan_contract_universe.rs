@@ -60,8 +60,17 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 /// Directory the day's contract artifact lives in.
 ///
-/// The same directory the mapping artifact uses, so one cleanup and one
-/// retention policy covers both.
+/// The same directory the mapping artifact uses, so ONE retention sweep covers
+/// both -- `dhan_universe::sweep_stale_artifacts`, which runs at the end of the
+/// daily build and removes artifacts older than its retention window.
+///
+/// 2026-09-05: this comment previously read "so one cleanup and one retention
+/// policy covers both" while NO such policy existed anywhere -- every
+/// `remove_file` touching this directory was inside a `#[cfg(test)]` block. The
+/// shared directory was a precondition for a single policy, and the comment
+/// asserted the policy itself. A reader auditing disk growth would have
+/// believed these files were managed and looked elsewhere. The sweep named
+/// above is what makes the sentence true.
 const CONTRACT_DIR: &str = "data/instrument-cache";
 
 /// Path of the day's contract artifact.

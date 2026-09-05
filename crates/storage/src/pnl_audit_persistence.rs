@@ -305,6 +305,20 @@ impl PnlAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_pnl_audit_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seed the discard series at zero BEFORE the first row can be dropped.
+        //
+        // Two readers depend on this. The local exporter shows an ABSENT series
+        // for a counter never incremented, and an absent series reads as "no
+        // data" -- which a reader takes for health, when it may mean the first
+        // discard is the only sample there will ever be. And if this name is
+        // ever EMF-selected, the CloudWatch agent computes counters as deltas
+        // and DROPS the first sample of a series it has never seen, so the one
+        // episode that matters would publish nothing at all. Seeding here makes
+        // the harmless zero that baseline. Same discipline as
+        // `OrderAuditWriter::new` and `SpillDropCounters::new`; the counter is
+        // BARE at its only emit site in `discard_pending`, so this creates the
+        // identical series rather than a phantom sibling.
+        metrics::counter!("tv_pnl_audit_rows_discarded_total").increment(0);
         let conf = pnl_audit_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -397,6 +411,27 @@ impl PnlAuditWriter {
             .at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
+        // COUNTED AT APPEND, NOT AT ACK -- and the name does not say so.
+        //
+        // This increments when the row enters the BUFFER, before any flush. A
+        // failed flush discards the batch, so on a bad day this reads a number
+        // of rows the table does not contain. That is not hypothetical: on
+        // 2026-08-25 a disk-full session left this at 6 with the table EMPTY,
+        // and the operator found out by asking why his order was missing.
+        //
+        // The truth is derivable and the arithmetic is the point:
+        //   acked = <this> - <the *_rows_discarded_total sibling>
+        // Every failure path routes through `discard_pending`, which counts
+        // what it drops (pinned for every writer in the crate by
+        // `ilp_overflow_bound_guard::every_flushing_writer_declares_its_failure_treatment`),
+        // so the subtraction always closes.
+        //
+        // Deliberately NOT moved to the flush-success arm: this counter carries
+        // a per-row LABEL that a batch-sized increment at ack time cannot
+        // preserve, and re-pointing a live series at a different quantity makes
+        // its history incomparable across the change. Recording what it means
+        // is the honest fix; a second acked series is an operator decision with
+        // its own CloudWatch cost line.
         metrics::counter!("tv_pnl_audit_rows_total", "snapshot_kind" => r.snapshot_kind.as_str())
             .increment(1);
         Ok(())

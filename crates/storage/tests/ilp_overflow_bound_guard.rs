@@ -272,3 +272,188 @@ fn the_order_and_position_discard_counters_are_distinguishable() {
          unlabelled total, which is the state this test exists to end"
     );
 }
+
+/// Every `*_rows_discarded_total` counter must be SEEDED at zero before its
+/// writer can drop a row.
+///
+/// # Why an absent series is worse than a zero one
+///
+/// A counter never incremented does not appear on the local exporter at all,
+/// and an absent series reads as "no data" — which a reader takes for health
+/// when it may mean the single discard episode is the only sample there will
+/// ever be. If the name is EMF-selected, it is worse still: the CloudWatch
+/// agent computes counters as deltas and DROPS the first sample of a series it
+/// has never seen, so the one episode that matters publishes nothing. That
+/// exact rule cost 104,540 depth rows their classification on 2026-08-28.
+///
+/// Found by a sweep on 2026-09-05: five order/audit writers count rows at
+/// APPEND time under a `*_rows_total` name, so the discard counter is the only
+/// thing that can correct them — and two of the five had never registered
+/// theirs. The subtraction that makes those counters honest was silently
+/// unavailable for exactly the writers whose rows are hardest to re-create.
+///
+/// Discovered, not listed: a hardcoded set of writers is the staleness this
+/// file already had to repair once today.
+#[test]
+fn every_discard_counter_is_seeded_before_its_writer_can_drop_a_row() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let entries = std::fs::read_dir(&src_dir).expect("crates/storage/src must be readable");
+
+    let mut unseeded: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".rs") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("a listed source file must be readable");
+        let src = String::from_utf8_lossy(&bytes);
+
+        // Every discard-counter NAME this file mentions, however it is spelled
+        // at the emit site (bare, labelled, or via a helper).
+        for metric in discard_counter_names(&src) {
+            checked += 1;
+            // The seed is the same name incremented by a literal zero. Matching
+            // on the pair rather than on `increment(0)` alone is what stops a
+            // seed for a DIFFERENT counter in the same file from counting.
+            if GROWW_BRANCH_EXEMPT.contains(&metric.as_str()) {
+                continue;
+            }
+            if is_seeded(&src, &metric) {
+                continue;
+            }
+            unseeded.push(format!("{name}::{metric}"));
+        }
+    }
+
+    assert!(
+        checked >= 6,
+        "found only {checked} discard counters — the discovery is broken, not \
+         the code"
+    );
+    assert!(
+        unseeded.is_empty(),
+        "these discard counters are never registered at zero: {unseeded:?}\n\n\
+         Add `metrics::counter!(\"<name>\").increment(0);` to the writer's \
+         constructor, before any row can be appended. Until then the series is \
+         ABSENT rather than zero — which reads as health on the local exporter, \
+         and which the CloudWatch agent's dropped-first-sample rule turns into \
+         total silence on the one episode that matters."
+    );
+}
+
+/// Every `tv_*_rows_discarded_total` literal a source file mentions.
+fn discard_counter_names(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = src;
+    while let Some(i) = rest.find("\"tv_") {
+        let after = &rest[i + 1..];
+        if let Some(end) = after.find('"') {
+            let name = &after[..end];
+            if name.ends_with("_rows_discarded_total") && !out.iter().any(|n| n == name) {
+                out.push(name.to_owned());
+            }
+            rest = &after[end..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Discard counters whose emit site is on a branch with NO production caller.
+///
+/// The Groww feed was removed entirely on 2026-08-21 (operator directive,
+/// recorded in `websocket-connection-scope-lock.md`). These three names sit on
+/// the `feed == "groww"` arm of a per-feed name resolver, and every caller that
+/// reaches that arm is a test: `OPTION_CHAIN_1M_FEED_GROWW` has zero
+/// production occurrences outside its own definition and branch.
+///
+/// They are NOT seeded on purpose, and that is the opposite of an oversight. A
+/// seeded counter publishes a permanently-zero series, and a permanently-zero
+/// series for a feed that cannot write implies a live path that was deleted —
+/// manufacturing exactly the false-OK the seeding rule exists to prevent.
+///
+/// The stale-entry test below is what stops this list becoming the staleness it
+/// is exempting: an entry naming a counter no source file mentions any more
+/// must be removed in the same change that removes the branch.
+const GROWW_BRANCH_EXEMPT: [&str; 3] = [
+    "tv_groww_chain1m_rows_discarded_total",
+    "tv_groww_spot1m_rows_discarded_total",
+    "tv_groww_contract1m_rows_discarded_total",
+];
+
+/// Whether `metric` is registered at zero somewhere in `src`.
+///
+/// Checks BOTH spellings, because the first version of this scan checked only
+/// one and reported a false positive on the first run:
+///
+///   * the string literal, `counter!("name").increment(0)`; and
+///   * a `const NAME: &str = "metric"` whose IDENTIFIER is what the seed
+///     actually passes — the shape `ilp_overflow.rs` uses, and the shape that
+///     made this scan claim a correctly-seeded counter was unseeded.
+///
+/// That literal-vs-const blind spot is the same one the EMF seeding sweep had
+/// to be corrected for on 2026-09-05. A scan that only knows one spelling
+/// reports on its own vocabulary, not on the code.
+fn is_seeded(src: &str, metric: &str) -> bool {
+    let mut needles: Vec<String> = vec![format!("\"{metric}\"")];
+    // Resolve `const IDENT: &str = "metric";` to IDENT, so a seed written
+    // against the constant counts.
+    for (i, _) in src.match_indices(&format!("= \"{metric}\"")) {
+        let head = &src[..i];
+        if let Some(decl) = head.rfind("const ") {
+            let after = &head[decl + "const ".len()..];
+            if let Some((ident, _)) = after.split_once(':') {
+                let ident = ident.trim();
+                if !ident.is_empty() && !ident.contains(char::is_whitespace) {
+                    needles.push(ident.to_owned());
+                }
+            }
+        }
+    }
+    needles.iter().any(|n| {
+        src.match_indices(n.as_str()).any(|(i, _)| {
+            src[i..]
+                .split_once(')')
+                .is_some_and(|(_, r)| r.trim_start().starts_with(".increment(0)"))
+        })
+    })
+}
+
+/// The Groww exemptions must name counters that still exist.
+///
+/// Without this, deleting the Groww branch would leave three entries silently
+/// exempting nothing — and the next counter that happened to take one of those
+/// names would inherit an exemption nobody granted it.
+#[test]
+fn groww_branch_exemptions_each_name_a_counter_that_still_exists() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut all = String::new();
+    for entry in std::fs::read_dir(&src_dir)
+        .expect("crates/storage/src must be readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("a listed source file must be readable");
+        all.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    let stale: Vec<&str> = GROWW_BRANCH_EXEMPT
+        .iter()
+        .filter(|m| !all.contains(**m))
+        .copied()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "STALE exemption(s) naming counters no source mentions: {stale:?}\n\n\
+         Remove them in the same change that removed the branch, or the next \
+         counter to take one of these names inherits an exemption nobody \
+         granted it."
+    );
+}
