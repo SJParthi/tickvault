@@ -209,30 +209,77 @@ mod risk_mutations {
         );
     }
 
+    /// The four `rejects_*` tests below share this shape.
+    ///
+    /// REWRITTEN 2026-09-05. Each previously read, in full:
+    ///
+    /// ```ignore
+    /// let mut engine = RiskEngine::new(10.0, 100, 1_000_000.0);
+    /// engine.update_market_price(1, 0.0);
+    /// // Zero price should be silently rejected
+    /// ```
+    ///
+    /// — a comment where the assertion should be. Four tests named
+    /// `..._rejects_zero/negative/nan/infinity` observed no rejection, in the
+    /// file whose entire purpose is killing mutants: a mutant that DELETED the
+    /// `!is_finite() || <= 0.0` guard in `update_market_price_in_segment`
+    /// survived all four, because nothing looked at anything afterwards.
+    ///
+    /// The guard has no public accessor (`marks_rejected` is private), so the
+    /// observable is the mark's own consumer: unrealized P&L. Set a GOOD mark,
+    /// read the P&L, push the BAD one, read again. Refusal means the good mark
+    /// is still in place and the number is UNCHANGED. If the guard were
+    /// removed, a stored `0.0` would swing P&L to a full-notional loss and a
+    /// stored NaN would poison the sum — either way the assertion fails, which
+    /// is the point.
+    fn assert_bad_mark_is_refused(bad_price: f64, label: &str) {
+        let mut engine = RiskEngine::new(10.0, 100, 1_000_000.0);
+        // A real position, so the mark has something to price.
+        engine.record_fill(1, 10, 100.0, 1);
+        engine.update_market_price(1, 120.0);
+
+        let good = engine.total_unrealized_pnl();
+        assert!(
+            good.is_finite() && good != 0.0,
+            "the fixture must produce a non-zero finite P&L before the bad \
+             mark, or the assertion below proves nothing (got {good})"
+        );
+
+        engine.update_market_price(1, bad_price);
+        let after = engine.total_unrealized_pnl();
+
+        assert!(
+            after.is_finite(),
+            "P&L became non-finite after a {label} mark — the mark was STORED, \
+             not refused, and it has poisoned the sum that feeds the \
+             daily-loss auto-halt"
+        );
+        assert_eq!(
+            after, good,
+            "P&L moved after a {label} mark ({good} -> {after}). The refusal \
+             in update_market_price_in_segment did not happen, so the halt is \
+             now evaluating against a price the market never produced."
+        );
+    }
+
     #[test]
     fn mutation_risk_update_market_price_rejects_zero() {
-        let mut engine = RiskEngine::new(10.0, 100, 1_000_000.0);
-        engine.update_market_price(1, 0.0);
-        // Zero price should be silently rejected
+        assert_bad_mark_is_refused(0.0, "zero");
     }
 
     #[test]
     fn mutation_risk_update_market_price_rejects_negative() {
-        let mut engine = RiskEngine::new(10.0, 100, 1_000_000.0);
-        engine.update_market_price(1, -100.0);
-        // Negative price should be silently rejected
+        assert_bad_mark_is_refused(-100.0, "negative");
     }
 
     #[test]
     fn mutation_risk_update_market_price_rejects_nan() {
-        let mut engine = RiskEngine::new(10.0, 100, 1_000_000.0);
-        engine.update_market_price(1, f64::NAN);
+        assert_bad_mark_is_refused(f64::NAN, "NaN");
     }
 
     #[test]
     fn mutation_risk_update_market_price_rejects_infinity() {
-        let mut engine = RiskEngine::new(10.0, 100, 1_000_000.0);
-        engine.update_market_price(1, f64::INFINITY);
+        assert_bad_mark_is_refused(f64::INFINITY, "infinite");
     }
 }
 

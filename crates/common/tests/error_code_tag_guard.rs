@@ -32,14 +32,7 @@ fn every_error_macro_tagged_with_a_known_code_carries_code_field() {
     // unreadable or moved directory made scan_dir return silently, so the guard
     // passed having inspected ZERO files while reporting green.
     let mut scanned_files: usize = 0;
-    for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
-        let src_dir = root.join("crates").join(crate_name).join("src");
-        assert!(
-            src_dir.is_dir(),
-            "error-code tag guard is BLIND: {src_dir:?} is not a directory. A \
-             missing crate root used to be skipped silently. Repoint the crate \
-             list or fix the workspace root."
-        );
+    for (_crate_name, src_dir) in crates_with_src(&root) {
         scan_dir(
             &src_dir,
             &tagged_prefixes,
@@ -203,9 +196,7 @@ fn tagged_prefix_set_is_non_empty() {
 fn scan_corpus_exists_and_is_substantial() {
     let root = workspace_root();
     let mut total = 0usize;
-    for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
-        let src_dir = root.join("crates").join(crate_name).join("src");
-        assert!(src_dir.is_dir(), "scan corpus missing: {src_dir:?}");
+    for (_crate_name, src_dir) in crates_with_src(&root) {
         let mut violations: Vec<String> = Vec::new();
         let tagged = BTreeSet::new();
         scan_dir(&src_dir, &tagged, &mut violations, &mut total);
@@ -291,6 +282,40 @@ fn scan_corpus_exists_and_is_substantial() {
 /// per the rule the line above states.
 const UNCODED_ERROR_BUDGET: usize = 82;
 
+/// Per-crate uncoded-error budgets, for the crates the six-name list never
+/// reached.
+///
+/// ADDED 2026-09-05, and deliberately NOT folded into `UNCODED_ERROR_BUDGET`.
+///
+/// Widening the corpus admits pre-existing debt. Adding it to the shared
+/// number would have raised 82 to 125 — and the doc above says, in its own
+/// words, "Do NOT raise the budget", for the good reason that a ratchet
+/// allowed to sit above the truth is a ceiling somebody padded once. Keeping
+/// the new debt in its own named figure means the six-crate ratchet is
+/// untouched and still only shrinks, while the newly visible debt is a number
+/// somebody has to look at rather than a rounding error inside a bigger one.
+///
+/// A crate with no entry here gets a budget of ZERO. That is the fail-closed
+/// half: a NEW crate cannot arrive carrying uncoded errors invisibly, which is
+/// exactly how these two arrived.
+///
+/// `aws-lambdas` = 43 (measured 2026-09-05: 44 production `error!` sites, one
+/// of which — `operator_control.rs` `HTTP-CLIENT-01` — already carries a
+/// `code =` field). These are not peripheral: `start_watchdog.rs` (11 sites)
+/// boots the prod box every morning, `budget_killswitch.rs` (4) and
+/// `hard_stop_guard.rs` (3) can STOP it, and `telegram_webhook.rs` (3) is how
+/// the operator is reached. Every CloudWatch metric filter pages on `$.code`,
+/// so all 43 are failures in the paging machinery that cannot themselves page.
+///
+/// `tickvault-logs-mcp` = 0. It has no `error!` sites today, so it starts at
+/// the fail-closed default and can never acquire one silently.
+const UNCODED_ERROR_BUDGET_BY_CRATE: [(&str, usize); 2] =
+    [("aws-lambdas", 43), ("tickvault-logs-mcp", 0)];
+
+/// The six crates the original hardcoded list covered. Their debt is pooled in
+/// `UNCODED_ERROR_BUDGET` — the historical ratchet, preserved exactly.
+const ORIGINAL_CORPUS_CRATES: [&str; 6] = ["common", "storage", "core", "trading", "api", "app"];
+
 /// Sites where an `error!` carries no code and that is CORRECT.
 ///
 /// Empty today, deliberately: nothing has yet been examined closely enough to
@@ -301,16 +326,20 @@ const UNCODED_ERROR_ALLOWLIST: [&str; 0] = [];
 #[test]
 fn uncoded_error_sites_may_only_shrink() {
     let root = workspace_root();
-    let mut uncoded: Vec<String> = Vec::new();
+    let mut original_corpus: Vec<String> = Vec::new();
     let mut scanned = 0usize;
+    // Per-crate for the newly covered ones, so each carries its own number and
+    // the six-crate ratchet below is untouched by the widening.
+    let mut per_crate: Vec<(String, Vec<String>)> = Vec::new();
 
-    for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
-        let src_dir = root.join("crates").join(crate_name).join("src");
-        assert!(
-            src_dir.is_dir(),
-            "uncoded-error corpus missing: {src_dir:?}"
-        );
-        collect_uncoded(&src_dir, &mut uncoded, &mut scanned);
+    for (crate_name, src_dir) in crates_with_src(&root) {
+        if ORIGINAL_CORPUS_CRATES.contains(&crate_name.as_str()) {
+            collect_uncoded(&src_dir, &mut original_corpus, &mut scanned);
+        } else {
+            let mut sites: Vec<String> = Vec::new();
+            collect_uncoded(&src_dir, &mut sites, &mut scanned);
+            per_crate.push((crate_name, sites));
+        }
     }
 
     assert!(
@@ -320,7 +349,8 @@ fn uncoded_error_sites_may_only_shrink() {
          repo once passed while reading zero."
     );
 
-    let count = uncoded.len();
+    // --- the six-crate historical ratchet, unchanged ------------------------
+    let count = original_corpus.len();
     assert!(
         count <= UNCODED_ERROR_BUDGET,
         "{count} production `error!` site(s) carry NO `code =` field, over the \
@@ -332,7 +362,7 @@ fn uncoded_error_sites_may_only_shrink() {
          Give the site the ErrorCode that fits, or — if it genuinely should \
          not have one — add it to UNCODED_ERROR_ALLOWLIST with the reason. Do \
          NOT raise the budget.\n\nSites:\n{}",
-        uncoded.join("\n")
+        original_corpus.join("\n")
     );
 
     assert_eq!(
@@ -342,6 +372,53 @@ fn uncoded_error_sites_may_only_shrink() {
          that is allowed to sit above the truth is a ceiling somebody padded \
          once, and it stops ratcheting the moment it does."
     );
+
+    // --- the newly covered crates, each against its own budget --------------
+    //
+    // A crate with no entry gets ZERO. That is the fail-closed half: this is
+    // exactly how `aws-lambdas` and `tickvault-logs-mcp` sat unscanned for
+    // months behind a hardcoded six-name list while the guard reported success.
+    for (crate_name, sites) in &per_crate {
+        let budget = UNCODED_ERROR_BUDGET_BY_CRATE
+            .iter()
+            .find(|(name, _)| *name == crate_name.as_str())
+            .map_or(0, |(_, b)| *b);
+        let found = sites.len();
+
+        assert!(
+            found <= budget,
+            "crate `{crate_name}` has {found} production `error!` site(s) with \
+             NO `code =` field, over its budget of {budget}.\n\n\
+             If this crate is new: it starts at ZERO by design — an uncoded \
+             error reaches the log sink and nothing else, because every \
+             CloudWatch metric filter that pages an operator matches on \
+             `$.code`. Give each site the ErrorCode that fits. Adding an entry \
+             to UNCODED_ERROR_BUDGET_BY_CRATE is admitting debt, so it needs a \
+             dated reason at the constant saying why the debt is acceptable \
+             today.\n\nSites:\n{}",
+            sites.join("\n")
+        );
+
+        assert_eq!(
+            found, budget,
+            "crate `{crate_name}` is budgeted {budget} uncoded `error!` site(s) \
+             but only {found} remain. Lower it to {found} in this same change — \
+             same rule as the pooled budget above."
+        );
+    }
+
+    // Anti-vacuity on the widening itself: every name in the by-crate table
+    // must correspond to a crate that actually exists, or the table is
+    // recording a budget for something that cannot be measured.
+    for (name, _) in UNCODED_ERROR_BUDGET_BY_CRATE {
+        assert!(
+            per_crate.iter().any(|(c, _)| c == name),
+            "UNCODED_ERROR_BUDGET_BY_CRATE names `{name}`, which discovery did \
+             not find under crates/*/src. Remove the stale entry — a budget \
+             for a crate that no longer exists enforces nothing and hides the \
+             fact that nothing is being enforced."
+        );
+    }
 }
 
 /// Walk `dir`, recording every production `error!` with no `code =` field.
@@ -402,4 +479,54 @@ fn collect_uncoded(dir: &Path, out: &mut Vec<String>, scanned: &mut usize) {
             idx = end_idx + 1;
         }
     }
+}
+/// Every crate under `crates/` that has a `src/` directory, discovered from the
+/// filesystem rather than listed.
+///
+/// ADDED 2026-09-05. All three tests in this file previously walked the SAME
+/// hardcoded array — `["common","storage","core","trading","api","app"]` — and
+/// the workspace has EIGHT crates. `aws-lambdas` and `tickvault-logs-mcp` were
+/// therefore never scanned, and nothing said so: the guard reported success
+/// having never looked at them, which is worse than failing, because the output
+/// asserted completeness.
+///
+/// aws-lambdas is not a peripheral crate. It holds the Dhan token minter, the
+/// budget kill-switch that can STOP THE PROD BOX, the start watchdog that boots
+/// it each morning, and the Telegram webhook. Measured on the day this landed:
+/// **44 production `error!` sites, exactly ONE of which carried a `code =`
+/// field.** Every CloudWatch metric filter that pages an operator matches on
+/// `$.code`, so 43 failures in the components that page the operator could not
+/// themselves page anyone.
+///
+/// Deriving the list from the filesystem means a crate cannot be omitted by
+/// forgetting to add it; a new crate arrives with a budget of ZERO (see
+/// `uncoded_budget_for`) instead of vanishing. Same shape as the fail-closed
+/// discovery in `scripts/test-coverage-guard.sh`.
+fn crates_with_src(root: &Path) -> Vec<(String, PathBuf)> {
+    let crates_dir = root.join("crates");
+    let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(&crates_dir)
+        .unwrap_or_else(|e| panic!("cannot read {crates_dir:?}: {e}"))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let src = path.join("src");
+            if !src.is_dir() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?.to_string();
+            Some((name, src))
+        })
+        .collect();
+    out.sort();
+
+    // Anti-vacuity: the workspace has eight crates and six were being scanned
+    // when this was written. A discovery that returns fewer than the six it
+    // replaced would be a silent regression to a narrower corpus.
+    assert!(
+        out.len() >= 6,
+        "crate discovery found only {} crate(s) with a src/ dir under {crates_dir:?} — \
+         the guard would enforce almost nothing. This assert exists because the \
+         hardcoded list it replaced was silently short by two.",
+        out.len()
+    );
+    out
 }
