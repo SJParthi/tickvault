@@ -32,14 +32,36 @@ fi
 
 echo "master : $CSV"
 echo "rows   : $(( $(wc -l < "$CSV") - 1 ))"
-echo "today  : $(date +%Y-%m-%d)  (IST assumed to be the box timezone)"
+echo "today  : $(TZ=Asia/Kolkata date +%Y-%m-%d)  (IST, pinned with TZ= -- not the box timezone)"
 echo
 
-awk -F',' -v TODAY="$(date +%Y-%m-%d)" '
+awk -F',' -v TODAY="$(TZ=Asia/Kolkata date +%Y-%m-%d)" '
 function col(name,   i){ for(i=1;i<=NF;i++){ if(toupper($i)==name) return i } return 0 }
 NR==1{
-  C_INSTR=col("INSTRUMENT_TYPE")
-  if(C_INSTR==0){ C_INSTR=col("INSTRUMENT") }
+  # CORRECTED 2026-09-05 -- this script had NEVER produced a valid number.
+  #
+  # It preferred INSTRUMENT_TYPE and fell back to INSTRUMENT. The detailed
+  # master carries BOTH, so the fallback never fired -- and the two columns
+  # speak different vocabularies. MEASURED on the live master (md5
+  # 8cc89cf74ca43f15efb9eea5e24a9062, 200,289 rows), the NSE distributions are:
+  #
+  #   INSTRUMENT      (col 5) : OPTSTK 64892  OPTIDX 11822  EQUITY 9899
+  #                             FUTSTK 647    INDEX 119     FUTIDX 18
+  #   INSTRUMENT_TYPE (col 10): OP 76714      OPTFUT 23666  CUR OP 11300
+  #                             DBT 4437      ES 3152       ...
+  #
+  # The literal "OPTSTK" does not appear in INSTRUMENT_TYPE on any NSE row, so
+  # the OPTSTK match below could only ever hit rows from an exchange that
+  # happens to echo the long code there -- and the script then exits 4 with
+  # "no NSE OPTSTK rows found", or silently counts another exchange book.
+  #
+  # INSTRUMENT is the column the enum in docs/dhan-ref/08-annexure-enums.md
+  # section 6 describes, and the column production actually reads
+  # (master_csv.rs:282 COL_INSTRUMENT, classified at :77-87). Read it
+  # unconditionally; keep the reverse fallback only for a hypothetical compact
+  # master that lacks it.
+  C_INSTR=col("INSTRUMENT")
+  if(C_INSTR==0){ C_INSTR=col("INSTRUMENT_TYPE") }
   C_EXP=col("SM_EXPIRY_DATE")
   if(C_EXP==0){ C_EXP=col("EXPIRY_DATE") }
   C_UND=col("UNDERLYING_SYMBOL")
