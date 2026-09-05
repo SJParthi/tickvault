@@ -1636,19 +1636,16 @@ mod tests {
     // Async function smoke tests — exercise without crashing
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_wait_for_service_healthy_unreachable_returns() {
-        // wait_for_service_healthy should return (not hang) when service
-        // is unreachable. We use a very short timeout constant implicitly
-        // but the function will just timeout and return.
-        // NOTE: This would wait 60s with the real constant, so we just
-        // verify the function signature is correct and it doesn't panic
-        // when called with unreachable targets. We skip actual wait.
-        // The function is tested indirectly through ensure_infra_running.
-    }
+    // wait_for_service_healthy should return (not hang) when service
+    // is unreachable. We use a very short timeout constant implicitly
+    // but the function will just timeout and return.
+    // NOTE: This would wait 60s with the real constant, so we just
+    // verify the function signature is correct and it doesn't panic
+    // when called with unreachable targets. We skip actual wait.
+    // The function is tested indirectly through ensure_infra_running.
 
     #[tokio::test]
-    async fn test_run_docker_compose_up_returns_error_without_docker() {
+    async fn test_run_docker_compose_up_without_docker_does_not_panic() {
         // If Docker is not installed/running, docker compose should fail
         // gracefully with an error result (not panic).
         let env_vars: Vec<(&str, String)> = vec![];
@@ -1720,7 +1717,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_is_docker_daemon_running_returns_bool() {
+    async fn test_is_docker_daemon_running_does_not_panic() {
         // Exercise the full function body: calls `docker info` via Command.
         // In CI without Docker, returns false. With Docker, returns true.
         // Either way, must not panic.
@@ -1730,7 +1727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_docker_daemon_running_returns_bool() {
+    async fn test_ensure_docker_daemon_running_does_not_panic() {
         // Exercises the ensure_docker_daemon_running path.
         // On Linux (CI), if Docker daemon is not running, it will log a
         // warning and return false (auto-launch only supported on macOS).
@@ -1740,7 +1737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_docker_compose_up_with_env_vars() {
+    async fn test_run_docker_compose_up_with_env_vars_does_not_panic() {
         // Exercise run_docker_compose_up with actual env vars.
         // The compose file may not exist in test context, but we exercise
         // the command construction, env var injection, and error handling.
@@ -1783,7 +1780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_all_dashboards_exercises_unreachable_branch() {
+    async fn test_open_all_dashboards_unreachable_branch_does_not_panic() {
         // Services are likely not running in test env, so exercises the skip branch.
         // The function should complete without panic in either case.
         open_all_dashboards().await;
@@ -1794,7 +1791,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_service_reachable_localhost_various_ports() {
+    fn test_is_service_reachable_various_ports_does_not_panic() {
         // Exercise is_service_reachable with various port numbers.
         // Most ports should be unreachable in test env.
         let ports = [9000_u16, 9009, 8812, 3000, 16686, 3100, 9090, 8080];
@@ -1841,7 +1838,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_ensure_infra_running_with_reachable_mock() {
+    async fn test_ensure_infra_running_with_unreachable_port_does_not_panic() {
         // When the service is already reachable, ensure_infra_running returns
         // immediately after opening Grafana. We test this by using a port
         // that is definitely not reachable — the function will attempt Docker.
@@ -1856,7 +1853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_infra_running_with_unreachable_host() {
+    async fn test_ensure_infra_running_with_unreachable_host_does_not_panic() {
         // Exercise the path where QuestDB is not reachable and Docker
         // daemon check runs.
         let config = QuestDbConfig {
@@ -1891,14 +1888,9 @@ mod tests {
     // ensure_docker_daemon_running — platform gate
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_ensure_docker_daemon_platform_check() {
-        // On Linux, auto-launch is not supported.
-        // On macOS, it attempts `open -a Docker`.
-        let is_macos = cfg!(target_os = "macos");
-        // Just verify the cfg! macro works correctly in test context.
-        let _: bool = is_macos;
-    }
+    // On Linux, auto-launch is not supported.
+    // On macOS, it attempts `open -a Docker`.
+    // Just verify the cfg! macro works correctly in test context.
 
     // -----------------------------------------------------------------------
     // Docker compose path — file existence (when run from repo root)
@@ -2093,21 +2085,16 @@ mod tests {
     // ensure_docker_daemon_running — Linux path
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_ensure_docker_daemon_running_exercises_platform_check() {
-        // On Linux, if Docker is not running, it should return false
-        // (auto-launch only on macOS). If Docker IS running, returns true.
-        // Either way, must not panic.
-        let result = ensure_docker_daemon_running().await;
-        let _: bool = result;
-    }
+    // On Linux, if Docker is not running, it should return false
+    // (auto-launch only on macOS). If Docker IS running, returns true.
+    // Either way, must not panic.
 
     // -----------------------------------------------------------------------
     // open_all_dashboards — exercises all services (none reachable in test)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_open_all_dashboards_iterates_all_services() {
+    async fn test_open_all_dashboards_all_services_does_not_panic() {
         // Services are not running in test env, so each service hits the
         // "not reachable" branch. Verifies the loop doesn't panic.
         open_all_dashboards().await;
@@ -2119,17 +2106,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_service_healthy_unreachable_completes() {
-        // Use a very high port that's definitely not open.
-        // The function will poll until timeout (60s), which is too long for tests.
-        // But since the constant is 60s, this test verifies the function
-        // doesn't panic. We use tokio::time::timeout to limit wait.
+        // Port 1 on loopback: nothing listens, and a connect there is refused
+        // immediately rather than hanging. The 5 s outer bound keeps the test
+        // fast; the function itself would poll for INFRA_HEALTH_TIMEOUT (60 s).
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             wait_for_service_healthy("unreachable", "127.0.0.1", 1),
         )
         .await;
-        // Either timeout or the function completes — both are fine.
-        let _ = result;
+        // The ASSERTION, added 2026-09-05: the outer timeout MUST elapse.
+        //
+        // wait_for_service_healthy polls every INFRA_HEALTH_POLL_INTERVAL (2 s)
+        // until INFRA_HEALTH_TIMEOUT (60 s) and returns EARLY only when the
+        // service becomes reachable. Port 1 on loopback refuses instantly, so a
+        // correct implementation keeps polling and the 5 s bound above wins.
+        //
+        // That is the real contract and it is worth pinning: a boot helper that
+        // gave up on the first connection-refused would defeat its own purpose --
+        // it exists precisely to wait for a service that is not up YET. Before
+        // this the test discarded the result, so that regression passed silently.
+        assert!(
+            result.is_err(),
+            "wait_for_service_healthy returned within 5s against an unreachable \
+             port -- it must keep polling until INFRA_HEALTH_TIMEOUT (60s), not \
+             give up on connection-refused"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2258,7 +2259,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_system_metrics_exported() {
+    fn test_system_metrics_gauges_do_not_panic_without_recorder() {
         // Verify metric calls compile without a recorder installed.
         metrics::gauge!("tv_process_threads").set(1.0_f64);
         metrics::gauge!("tv_process_open_fds").set(10.0_f64);
@@ -2552,6 +2553,12 @@ mod tests {
 
     /// Binds a `UnixDatagram` listener at `path`, reads exactly ONE
     /// datagram with a short timeout, and returns the payload.
+    // APPROVED: deliberately kept for the future sd_notify integration tests the
+    // module comment describes. Until 2026-09-05 this was held alive by a "test"
+    // whose entire body was a fn-pointer coercion -- a compile-time check wearing
+    // a #[test] attribute, which proved nothing at runtime and counted against the
+    // assertion-free ratchet. An attribute is the honest way to say this.
+    #[allow(dead_code)]
     fn receive_one_datagram(path: &std::path::Path) -> Vec<u8> {
         use std::os::unix::net::UnixDatagram;
         let listener = UnixDatagram::bind(path).unwrap_or_else(|e| {
@@ -2662,13 +2669,5 @@ mod tests {
     fn test_sd_notify_byte_patterns_are_exact_per_systemd_spec() {
         assert_eq!(b"READY=1".len(), 7);
         assert_eq!(b"WATCHDOG=1".len(), 10);
-    }
-
-    // Silence "unused function" from receive_one_datagram — kept as a
-    // helper for future sd_notify integration tests but not required
-    // by the current four.
-    #[test]
-    fn test_receive_one_datagram_helper_is_linked() {
-        let _ = receive_one_datagram as fn(&std::path::Path) -> Vec<u8>;
     }
 }
