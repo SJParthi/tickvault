@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn the_muhurat_window_is_1800_to_1930_exclusive() {
+    fn nanos_in_muhurat_window_is_1800_to_1930_exclusive() {
         assert!(
             !nanos_in_muhurat_window(at(18 * 3600 - 1)),
             "17:59:59 is out"
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_windows_never_overlap_so_a_row_is_never_ambiguous() {
+    fn nanos_in_any_open_window_never_sees_the_two_windows_overlap() {
         // The regular session ends 15:40 and Muhurat opens 18:00. If these ever
         // touched, a row inside both would be accepted for the wrong reason and
         // an operator reading `reason` would be told the wrong session.
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn a_muhurat_evening_row_is_refused_on_an_ordinary_day_and_kept_on_a_muhurat_day() {
+    fn row_is_in_an_open_window_refuses_a_muhurat_evening_row_on_an_ordinary_day() {
         // THE regression this closes. Diwali evening, 18:30 IST: the box
         // connects (main.rs widens `should_connect_ws` for Muhurat), frames
         // arrive, and every one of them would be refused by a window that only
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn the_muhurat_flag_widens_the_window_and_never_narrows_it() {
+    fn verdict_in_widens_with_the_muhurat_flag_and_never_narrows() {
         // A Muhurat day must not cost the regular session. The flag is a
         // widening only -- `nanos_in_any_open_window` is an OR whose first
         // term is the regular window, so this holds by construction; the test
