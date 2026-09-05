@@ -35,7 +35,8 @@
 //! allocation, no lookup, no branch on instrument. Safe on the hot path.
 
 use crate::constants::{
-    SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 
 /// Nanoseconds in one second. Local rather than imported: `constants.rs` has no
@@ -146,6 +147,65 @@ pub fn nanos_in_session_window(ist_nanos: i64) -> bool {
         && secs_of_day < i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST)
 }
 
+/// Seconds-of-day for an IST epoch-nanosecond stamp, or `None` if the stamp is
+/// negative.
+///
+/// A negative IST stamp is a pre-1970 clock or a corrupt widening. It is
+/// rejected here rather than left to a modulo, which on a negative input would
+/// produce a plausible-looking seconds-of-day and let a corrupt row through.
+fn secs_of_day(ist_nanos: i64) -> Option<i64> {
+    if ist_nanos < 0 {
+        return None;
+    }
+    Some((ist_nanos / NANOS_PER_SECOND) % i64::from(SECONDS_PER_DAY))
+}
+
+/// True when an IST epoch-nanosecond stamp falls inside the MUHURAT evening
+/// session, [18:00, 19:30) IST.
+///
+/// NSE trades a ceremonial ~1-hour session on Diwali. The box connects for it —
+/// `main.rs` computes `is_muhurat` from the calendar and installs it via
+/// [`crate::muhurat::init_muhurat_session`] — so without this the whole session
+/// would connect, receive, and persist nothing: a live connection storing zero
+/// data, which is the false-OK class the charter forbids.
+#[must_use]
+pub fn nanos_in_muhurat_window(ist_nanos: i64) -> bool {
+    match secs_of_day(ist_nanos) {
+        None => false,
+        Some(s) => {
+            s >= i64::from(MUHURAT_PERSIST_START_SECS_OF_DAY_IST)
+                && s < i64::from(MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+        }
+    }
+}
+
+/// True when the stamp is inside ANY window open on this day — the regular
+/// session always, plus the Muhurat evening session when `muhurat_active`.
+///
+/// PURE by design: the flag is a parameter, never a global read, so every
+/// window decision stays unit-testable in isolation and cannot be perturbed by
+/// another test in the same process setting the boot `OnceLock`. The global is
+/// read exactly once, in [`row_is_in_an_open_window`], which is what the
+/// writers call.
+#[must_use]
+pub fn nanos_in_any_open_window(ist_nanos: i64, muhurat_active: bool) -> bool {
+    nanos_in_session_window(ist_nanos) || (muhurat_active && nanos_in_muhurat_window(ist_nanos))
+}
+
+/// The window predicate a WRITER should call: the regular session, widened to
+/// the Muhurat evening session on a Muhurat day.
+///
+/// Reads the boot-installed flag ([`crate::muhurat::current`]) so a future
+/// fourth writer cannot silently be Muhurat-blind by calling the narrow form.
+/// That read is one `OnceLock` load — O(1), no allocation, safe on the hot
+/// path; the DHAT gates on the tick seam and the depth append cover it.
+///
+/// Off a Muhurat day the flag is `false` and this is exactly
+/// [`nanos_in_session_window`].
+#[must_use]
+pub fn row_is_in_an_open_window(ist_nanos: i64) -> bool {
+    nanos_in_any_open_window(ist_nanos, crate::muhurat::current())
+}
 /// The window verdict for a row carrying a designated timestamp and an
 /// OPTIONAL receipt timestamp, both IST epoch nanoseconds.
 ///
@@ -163,11 +223,32 @@ pub fn nanos_in_session_window(ist_nanos: i64) -> bool {
 /// this to a refusal later without losing the ability to find them.
 #[must_use]
 pub fn verdict(ts_ist_nanos: i64, received_at_ist_nanos: Option<i64>) -> WindowVerdict {
-    if !nanos_in_session_window(ts_ist_nanos) {
+    verdict_in(
+        ts_ist_nanos,
+        received_at_ist_nanos,
+        crate::muhurat::current(),
+    )
+}
+
+/// The pure form of [`verdict`] — the Muhurat flag as a parameter, no global.
+///
+/// Every test in this module uses THIS one. The `OnceLock` behind
+/// [`crate::muhurat::current`] is set once per process, so a test that read it
+/// would be at the mercy of whichever other test in the same binary installed
+/// it first — an order-dependent window decision, which is worse than no test.
+#[must_use]
+pub fn verdict_in(
+    ts_ist_nanos: i64,
+    received_at_ist_nanos: Option<i64>,
+    muhurat_active: bool,
+) -> WindowVerdict {
+    if !nanos_in_any_open_window(ts_ist_nanos, muhurat_active) {
         return WindowVerdict::TsOutOfWindow;
     }
     match received_at_ist_nanos {
-        Some(r) if !nanos_in_session_window(r) => WindowVerdict::ReceivedAtOutOfWindow,
+        Some(r) if !nanos_in_any_open_window(r, muhurat_active) => {
+            WindowVerdict::ReceivedAtOutOfWindow
+        }
         _ => WindowVerdict::InWindow,
     }
 }
@@ -175,6 +256,16 @@ pub fn verdict(ts_ist_nanos: i64, received_at_ist_nanos: Option<i64>) -> WindowV
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every test below asks the window question on a NON-Muhurat day, which
+    /// is 364 days of the year and the only shape whose expectations are
+    /// stable. Routed through the pure form on purpose: reading the boot
+    /// `OnceLock` here would make each assertion depend on whether some other
+    /// test in this binary installed the flag first, and an order-dependent
+    /// window decision is worse than no test at all.
+    fn verdict(ts_ist_nanos: i64, received_at_ist_nanos: Option<i64>) -> WindowVerdict {
+        verdict_in(ts_ist_nanos, received_at_ist_nanos, false)
+    }
 
     /// IST epoch nanos for a given seconds-of-day, on an arbitrary day.
     fn at(secs_of_day: i64) -> i64 {
@@ -291,6 +382,31 @@ mod tests {
     /// 198.69s (`websocket-connection-scope-lock.md` §E). A 15:39:30 print
     /// delivered 35 seconds late lands at 15:40:05 -- past the window's
     /// exclusive end. It MUST still be written.
+    ///
+    /// ## ⚠ Scope of "kept", corrected 2026-09-05 by an adversarial sweep
+    ///
+    /// This keeps the print in `ticks`. It does **not** put it in a candle.
+    /// The two paths read DIFFERENT CLOCKS for the same decision:
+    ///
+    /// | | window | clock |
+    /// |---|---|---|
+    /// | this gate | `[09:00, 15:40)` | the EXCHANGE stamp, `row.ts_ist_nanos` |
+    /// | the fold (`MultiTfAggregator::consume`) | `[09:00, 15:40)` — identical | `tf_index::fold_clock_ist_secs`, which PREFERS the receipt when it is within ±300 s |
+    ///
+    /// So for exactly this tick the fold clock is the 15:40:05 receipt, which
+    /// is `>= MARKET_CLOSE_SECS_OF_DAY_IST`, and the aggregator returns
+    /// `out_of_session`: the print lands in `ticks` and is absent from the
+    /// 15:39 bar of every timeframe. The converse holds too — a receipt
+    /// running AHEAD of a just-out-of-window exchange stamp is folded into a
+    /// candle while this gate refuses the tick.
+    ///
+    /// Deliberately NOT reconciled here. Making the two agree means choosing
+    /// one clock for both, which is plan item W1b/W2 ("candles bucket on
+    /// `received_at`") — REMAINING and explicitly blocked. Widening this
+    /// change to settle it would alter candle bucketing on a path the operator
+    /// has separately scoped. Recorded instead, because an earlier version of
+    /// this comment said the print "is kept" without qualification, and that
+    /// reads as a guarantee about the candle it is not.
     #[test]
     fn a_late_delivered_closing_print_is_kept_not_discarded() {
         let event = at(15 * 3600 + 39 * 60 + 30); // 15:39:30, in window
@@ -323,5 +439,97 @@ mod tests {
         // rather than the window silently moving under every writer.
         assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 32_400, "09:00");
         assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 56_400, "15:40 exclusive");
+    }
+
+    #[test]
+    fn the_muhurat_window_is_1800_to_1930_exclusive() {
+        assert!(
+            !nanos_in_muhurat_window(at(18 * 3600 - 1)),
+            "17:59:59 is out"
+        );
+        assert!(nanos_in_muhurat_window(at(18 * 3600)), "18:00:00 is in");
+        assert!(
+            nanos_in_muhurat_window(at(19 * 3600 + 30 * 60 - 1)),
+            "19:29:59 is in"
+        );
+        assert!(
+            !nanos_in_muhurat_window(at(19 * 3600 + 30 * 60)),
+            "19:30:00 is OUT — the end is exclusive, exactly like the regular window"
+        );
+        assert!(
+            !nanos_in_muhurat_window(-1),
+            "a negative stamp is refused before any modulo can make it look plausible"
+        );
+    }
+
+    #[test]
+    fn the_two_windows_never_overlap_so_a_row_is_never_ambiguous() {
+        // The regular session ends 15:40 and Muhurat opens 18:00. If these ever
+        // touched, a row inside both would be accepted for the wrong reason and
+        // an operator reading `reason` would be told the wrong session.
+        for s in [
+            15 * 3600 + 39 * 60 + 59,
+            15 * 3600 + 40 * 60,
+            17 * 3600,
+            18 * 3600,
+        ] {
+            let regular = nanos_in_session_window(at(s));
+            let muhurat = nanos_in_muhurat_window(at(s));
+            assert!(
+                !(regular && muhurat),
+                "seconds-of-day {s} sits in BOTH windows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_muhurat_evening_row_is_refused_on_an_ordinary_day_and_kept_on_a_muhurat_day() {
+        // THE regression this closes. Diwali evening, 18:30 IST: the box
+        // connects (main.rs widens `should_connect_ws` for Muhurat), frames
+        // arrive, and every one of them would be refused by a window that only
+        // knows 09:00-15:39 -- a live connection persisting nothing, which is
+        // the false-OK the charter forbids.
+        let evening = at(18 * 3600 + 30 * 60);
+
+        assert!(
+            !nanos_in_any_open_window(evening, false),
+            "on an ordinary day 18:30 is out of window and must stay out"
+        );
+        assert!(
+            nanos_in_any_open_window(evening, true),
+            "on a Muhurat day 18:30 must be ACCEPTED"
+        );
+
+        assert_eq!(
+            verdict_in(evening, Some(evening), false),
+            WindowVerdict::TsOutOfWindow
+        );
+        assert_eq!(
+            verdict_in(evening, Some(evening), true),
+            WindowVerdict::InWindow
+        );
+    }
+
+    #[test]
+    fn the_muhurat_flag_widens_the_window_and_never_narrows_it() {
+        // A Muhurat day must not cost the regular session. The flag is a
+        // widening only -- `nanos_in_any_open_window` is an OR whose first
+        // term is the regular window, so this holds by construction; the test
+        // exists so a future rewrite into a match on the flag cannot silently
+        // trade one session for the other.
+        for s in [
+            9 * 3600,
+            12 * 3600,
+            15 * 3600 + 39 * 60 + 59,
+            18 * 3600,
+            19 * 3600,
+        ] {
+            let narrow = nanos_in_any_open_window(at(s), false);
+            let wide = nanos_in_any_open_window(at(s), true);
+            assert!(
+                !narrow || wide,
+                "seconds-of-day {s} was accepted on an ordinary day and REFUSED on a Muhurat day"
+            );
+        }
     }
 }

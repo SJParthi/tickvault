@@ -398,6 +398,29 @@ impl ShadowCandleWriter {
         // never the seal instant. See CANDLE_OUT_OF_WINDOW_REASONS for the
         // proof that gating any seal clock would discard the final bar of
         // every session.
+        //
+        // ## ⚠ HONEST STATUS, established 2026-09-05 by an adversarial sweep:
+        // ## this gate is DEFENCE IN DEPTH, not enforcement. It cannot fire today.
+        //
+        // Two upstream facts make every bucket that reaches this writer
+        // in-window by construction:
+        //   * `tf_index::bucket_start` CLAMPS the bucket-open to
+        //     `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (32_400 = 09:00), so no
+        //     bucket can open earlier -- including D1, which stamps 09:00
+        //     rather than midnight; and
+        //   * `MultiTfAggregator::consume` refuses the tick outright
+        //     (`out_of_session`) unless its fold clock is inside
+        //     `[CANDLE_SESSION_OPEN.., MARKET_CLOSE_SECS_OF_DAY_IST)` =
+        //     `[09:00, 15:40)` -- byte-identical to the persist window.
+        //
+        // So a folded bar's `timestamp_ist_nanos` is always >= 09:00 and always
+        // < 15:40, and this check cannot refuse one. It is kept anyway, at two
+        // integer compares per seal, because the redundancy is the point: the
+        // fold window is a `trading`-crate constant and this is a `storage`
+        // writer, and the day someone widens one the other still holds the
+        // operator's rule. What must NOT happen is this comment reading as
+        // though candles were previously unguarded and are now guarded -- they
+        // were guarded, one layer up, by a different crate.
         {
             let secs = row.timestamp_ist_nanos.div_euclid(1_000_000_000);
             let in_band = u32::try_from(secs).is_ok_and(|s| {
@@ -410,7 +433,8 @@ impl ShadowCandleWriter {
                 self.out_of_window.note(CANDLE_OUT_OF_WINDOW_REASONS[1]);
                 return Ok(());
             }
-            if !tickvault_common::session_window::nanos_in_session_window(row.timestamp_ist_nanos) {
+            if !tickvault_common::session_window::row_is_in_an_open_window(row.timestamp_ist_nanos)
+            {
                 self.out_of_window.note(CANDLE_OUT_OF_WINDOW_REASONS[0]);
                 return Ok(());
             }

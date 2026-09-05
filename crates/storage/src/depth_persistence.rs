@@ -1303,6 +1303,28 @@ impl DepthWriter {
             // It IS out of window, but "an old WAL format is being replayed"
             // and "we are outside market hours" are different operational
             // facts and must not share a label.
+            //
+            // ## Why depth REFUSES this and ticks ACCEPT the same situation
+            //
+            // `session_window::verdict` treats a `None` receipt on a TICK as
+            // "unknown, not a refusal" and writes the row. This arm refuses.
+            // That looks inconsistent and is not, because the missing value
+            // does not play the same role in the two tables:
+            //
+            //   * a tick carries TWO clocks. A pre-TVW3 tick still has its
+            //     EXCHANGE stamp, which is a real observation of when the
+            //     trade happened, so only the delivery time is unknown and
+            //     the row is worth keeping.
+            //   * depth carries ONE. `ts_nanos` IS the receipt, so a record
+            //     with no receipt has no usable timestamp at all -- the value
+            //     here is the bare IST offset, i.e. 1970-01-01 05:30.
+            //
+            // Writing it would not preserve an observation, it would FABRICATE
+            // one, and it would open a 1970 partition that retention and
+            // archival -- both keyed on the trading day -- can never reach.
+            // The refusal is counted under its own reason so an operator can
+            // tell "an old WAL format is being replayed" from "we are outside
+            // market hours"; the bytes stay on disk in the WAL segment.
             if row.ts_nanos == tickvault_common::constants::IST_UTC_OFFSET_NANOS {
                 self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[1]);
                 return Ok(());
@@ -1323,7 +1345,7 @@ impl DepthWriter {
                 self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[2]);
                 return Ok(());
             }
-            if !tickvault_common::session_window::nanos_in_session_window(row.ts_nanos) {
+            if !tickvault_common::session_window::row_is_in_an_open_window(row.ts_nanos) {
                 self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[0]);
                 return Ok(());
             }

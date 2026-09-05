@@ -1,27 +1,60 @@
 //! Muhurat-session persist flag — CCL-06 (permutation-coverage audit §140).
 //!
-//! On a Diwali Muhurat date the live feed CONNECTS (`main.rs` sets
-//! `should_connect_ws = ... || is_muhurat`), but the tick-processor persist
-//! gate only accepts the regular `[09:00, 15:30)` IST window, so the whole ~1h
-//! evening Muhurat session (~18:00–19:30 IST) was silently DROPPED before
-//! persist/seal/broadcast — a live connection storing ZERO data (audit Rule 11
-//! false-OK). This module carries the boot-computed "is today a Muhurat
-//! session?" flag so the tick processor can additionally accept ticks inside
-//! the Muhurat window (`MUHURAT_PERSIST_*_SECS_OF_DAY_IST`).
+//! On a Diwali Muhurat date NSE trades a ceremonial ~1-hour evening session
+//! (~18:00–19:30 IST). Every persistence window in this system names the
+//! REGULAR session, `[09:00, 15:40)` IST, so without a widening the whole
+//! Muhurat session is refused: a connection that receives and stores nothing,
+//! which is the audit Rule 11 false-OK.
+//!
+//! This module carries the boot-computed "is today a Muhurat session?" flag.
+//! `main.rs` computes it from the day's calendar
+//! (`TradingCalendar::is_muhurat_trading_today`, itself driven by
+//! `[trading] muhurat_trading_dates` in config) and installs it once via
+//! [`init_muhurat_session`].
+//!
+//! ## ⚠ CORRECTED 2026-09-05 — this header described a consumer that no longer
+//! ## exists, and for months there was no consumer at all
+//!
+//! It previously said the flag exists "so the tick processor can additionally
+//! accept ticks inside the Muhurat window", and that `main.rs` sets
+//! `should_connect_ws = ... || is_muhurat`. Both symbols are **gone**:
+//! `run_tick_processor` died with the 2026-07-17 dead-WS sweep, and
+//! `should_connect_ws` has zero occurrences in the repository outside this
+//! sentence. So the flag was **write-only** — installed at boot by `main.rs`
+//! and read by nothing, with `MUHURAT_PERSIST_{START,END}_SECS_OF_DAY_IST`
+//! sitting in the dead-const allowlist to prove it.
+//!
+//! That is the `scan_silence` shape the O(1) table records: a sensor wired at
+//! one end. It reads greener than an absent mechanism, because the name exists
+//! and the boot line runs.
+//!
+//! ## Who reads it now
+//!
+//! [`current`] is read by `session_window::row_is_in_an_open_window` and
+//! `session_window::verdict`, which are what the tick, depth and candle
+//! writers call. So the widening is wired end to end, and both constants are
+//! live again.
+//!
+//! **NOT claimed: that a Muhurat session would actually be captured today.**
+//! The box is force-stopped outside Mon–Fri 08:30–17:30 IST
+//! (`hard_stop_guard::in_up_window`, plus the 17:30 EventBridge stop), so no
+//! process exists at 18:00–19:30 to receive a frame — and the single
+//! configured date, 2026-11-08, is a Sunday, when the box never starts. This
+//! module makes the DATA path correct; the SCHEDULE remains an operator
+//! decision, and it is the binding constraint.
 //!
 //! ## Why a process-global transport
 //!
-//! The flag is computed ONCE at boot from the day's calendar
-//! (`TradingCalendar::is_muhurat_trading_today`), but the tick processor is
-//! spawned in a deep, separate scope of `crates/app/src/main.rs` — threading a
-//! `bool` through ~20 function signatures would be huge churn. Instead boot
-//! calls [`init_muhurat_session`] once, and each spawn site reads [`current`]
-//! to obtain the flag it passes EXPLICITLY into `run_tick_processor(..)`.
+//! The flag is computed ONCE at boot but the writers are constructed in deep,
+//! separate scopes; threading a `bool` through ~20 signatures would be churn
+//! for a value that never changes after boot. The globals-reading wrappers are
+//! one `OnceLock` load — O(1), allocation-free, safe on the hot path.
 //!
-//! This mirrors the [`crate::always_on`] GIFT-Nifty exemption transport exactly.
-//! The processor takes the flag as an explicit argument (NOT by reading this
-//! global), so its gate logic stays fully unit-testable in isolation — tests
-//! pass their own bool and never touch this `OnceLock`.
+//! The window PREDICATES stay pure and take the flag as a parameter
+//! (`nanos_in_any_open_window`, `verdict_in`), so every window decision is
+//! unit-testable in isolation. A test that read this `OnceLock` would depend
+//! on whichever other test in the same binary installed it first, and an
+//! order-dependent window decision is worse than no test.
 
 use std::sync::OnceLock;
 

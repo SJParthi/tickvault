@@ -2132,6 +2132,15 @@ impl TickWriter {
 
     /// Appends one prepared [`TickRow`] to the ILP buffer (no flush).
     ///
+    /// **`pub(crate)`, and that visibility is the point.** This is the raw
+    /// append: it does NOT consult the session window. The gate lives one
+    /// level up in [`TickWriter::append_tick_with_seq`], so a caller reaching
+    /// this directly writes an ungated row. It was `pub` until 2026-09-05 with
+    /// no caller outside this crate — an open door nobody had walked through
+    /// yet, which is exactly when a door is cheap to close. Narrowing it means
+    /// a future bypass has to be written inside `tickvault-storage`, where the
+    /// gate's own tests live and where a reviewer is looking for it.
+    ///
     /// ILP requires every SYMBOL before any field column, so `segment` and
     /// `feed` are written first. Both are routed through `sanitize_ilp_symbol`
     /// (defence in depth against line-protocol injection) even though both come
@@ -2140,7 +2149,7 @@ impl TickWriter {
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_row(&mut self, row: &TickRow) -> Result<()> {
+    pub(crate) fn append_row(&mut self, row: &TickRow) -> Result<()> {
         let feed = self.feed.as_str();
         self.buffer
             .table(TICKS_TABLE)

@@ -215,7 +215,7 @@ fn the_session_window_gate_is_wired_into_the_depth_write_path() {
     let body = depth_append_body(&src);
 
     assert!(
-        body.contains("nanos_in_session_window"),
+        body.contains("row_is_in_an_open_window"),
         "the session-window gate is GONE from `DepthWriter::append_row`. Depth \
          is 24x the tick row volume -- the largest payload in the process -- so \
          an ungated depth writer defeats the operator's window rule at the one \
@@ -330,7 +330,7 @@ fn the_session_window_gate_is_wired_into_the_candle_write_path() {
     let body = &src[start..(start + 3000).min(src.len())];
 
     assert!(
-        body.contains("nanos_in_session_window"),
+        body.contains("row_is_in_an_open_window"),
         "the session-window gate is GONE from the candle write path."
     );
     assert!(
