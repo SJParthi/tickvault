@@ -37,7 +37,7 @@ const USER_DATA: &str = include_str!("../../../deploy/aws/cloudwatch-agent.json"
 /// comparator read a table only the Groww feed could fill, so with one broker
 /// it could only ever compare against nothing. A retention bound on a writer
 /// that no longer exists is not coverage.
-const BOUNDED_WRITERS: [(&str, &str); 3] = [
+const BOUNDED_WRITERS: [(&str, &str); 4] = [
     (
         "ws_event_audit_persistence",
         include_str!("../src/ws_event_audit_persistence.rs"),
@@ -49,6 +49,13 @@ const BOUNDED_WRITERS: [(&str, &str); 3] = [
     (
         "feed_scoreboard_persistence",
         include_str!("../src/feed_scoreboard_persistence.rs"),
+    ),
+    // 2026-09-05: found MISSING by `the_bounded_writer_list_names_every_writer_that_calls_the_bound`
+    // on its first run. It had been calling `discard_if_overflowing` while absent
+    // from this array, which is the proof the hardcoded list was not maintained.
+    (
+        "ws_connection_daily_persistence",
+        include_str!("../src/ws_connection_daily_persistence.rs"),
     ),
 ];
 
@@ -69,6 +76,139 @@ fn every_retaining_writer_bounds_what_it_retains() {
          re-sent and re-rejected forever, so the table is dead for the process \
          lifetime while the log reads like a transient failure. Call \
          `ilp_overflow::discard_if_overflowing` from the flush-failure arm."
+    );
+}
+
+/// Every flushing writer in the crate must DECLARE how it treats its buffer on
+/// a failed flush — discovered, not listed.
+///
+/// # Why this exists beside the test above
+///
+/// That test iterates `BOUNDED_WRITERS`, a hardcoded array. Its name promises
+/// "EVERY retaining writer", and an adversarial sweep on 2026-09-05 showed the
+/// promise was not kept: seventeen files in `crates/storage/src` define a
+/// flush, the array named three, and `ws_connection_daily_persistence` was
+/// already calling `discard_if_overflowing` without being in it — proof the
+/// list was not being maintained. A new `*_persistence.rs` that retained an
+/// unbounded buffer across a failed flush would have been green forever.
+///
+/// A list cannot answer a question about a set it does not enumerate. So this
+/// test enumerates the set and requires each member to fall into exactly one
+/// of two documented treatments:
+///
+///   * **bounded retain** — calls `ilp_overflow::discard_if_overflowing`, so
+///     the buffer survives a transient outage but cannot grow without limit;
+///   * **discard** — calls `discard_pending`, so nothing is retained at all.
+///
+/// A writer with NEITHER retains without a bound, which is the defect. There
+/// is deliberately no exemption list: the two treatments are exhaustive, and
+/// an exemption would be the same staleness one level up.
+#[test]
+fn every_flushing_writer_declares_its_failure_treatment() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let entries = std::fs::read_dir(&src_dir).expect("crates/storage/src must be readable");
+
+    let mut flushing = 0usize;
+    let mut bounded = 0usize;
+    let mut undeclared: Vec<String> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with("_persistence.rs") {
+            continue;
+        }
+        // Lossy: one bad byte must not silently drop a writer from the sweep.
+        let bytes = std::fs::read(&path).expect("a listed source file must be readable");
+        let body = String::from_utf8_lossy(&bytes);
+        if !body.contains("fn flush") {
+            continue;
+        }
+        flushing += 1;
+
+        let bounded_retain = body.contains("discard_if_overflowing");
+        let discards = body.contains("discard_pending");
+        if bounded_retain {
+            bounded += 1;
+        }
+        if !bounded_retain && !discards {
+            undeclared.push(name.to_owned());
+        }
+    }
+
+    assert!(
+        flushing >= 15,
+        "found only {flushing} flushing writers — the discovery is broken and \
+         this test would pass vacuously"
+    );
+    assert!(
+        bounded >= 3,
+        "found only {bounded} bounded-retain writers — the discriminator is \
+         broken; every writer would read as 'discards' and nothing would be \
+         checked"
+    );
+    assert!(
+        undeclared.is_empty(),
+        "these ILP writers flush but declare NO treatment for a failed flush: \
+         {undeclared:?}\n\n\
+         A writer that neither bounds its retention \
+         (`ilp_overflow::discard_if_overflowing`) nor drops it \
+         (`discard_pending`) keeps appending into a buffer that a sustained \
+         QuestDB outage grows without limit — and a server-side reject poisons \
+         it permanently, so the same rows are re-sent and re-rejected for the \
+         process lifetime while the log reads like a transient failure.\n\n\
+         Pick one and call it from the flush-failure arm. There is no \
+         exemption list here on purpose: the two treatments are exhaustive, \
+         and an exemption would go stale exactly like the hardcoded array this \
+         test was added to replace."
+    );
+}
+
+/// `BOUNDED_WRITERS` must not go stale in the other direction either: every
+/// file that actually calls the bound has to be in it.
+///
+/// This is the half that was already broken when the sweep looked —
+/// `ws_connection_daily_persistence` called `discard_if_overflowing` and was
+/// not listed, so the array had silently stopped describing the code.
+#[test]
+fn the_bounded_writer_list_names_every_writer_that_calls_the_bound() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let entries = std::fs::read_dir(&src_dir).expect("crates/storage/src must be readable");
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut found = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with("_persistence.rs") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("a listed source file must be readable");
+        if !String::from_utf8_lossy(&bytes).contains("discard_if_overflowing") {
+            continue;
+        }
+        found += 1;
+        let stem = name.trim_end_matches(".rs");
+        if !BOUNDED_WRITERS.iter().any(|(listed, _)| *listed == stem) {
+            missing.push(stem.to_owned());
+        }
+    }
+
+    assert!(
+        found >= 4,
+        "found only {found} writers calling the bound — the discovery is broken"
+    );
+    assert!(
+        missing.is_empty(),
+        "these writers call `discard_if_overflowing` but are NOT in \
+         BOUNDED_WRITERS: {missing:?}\n\n\
+         The array has stopped describing the code, so the test that iterates \
+         it is checking a subset while its name promises every writer. Add \
+         them."
     );
 }
 

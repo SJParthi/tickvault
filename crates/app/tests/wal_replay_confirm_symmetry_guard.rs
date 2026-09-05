@@ -31,9 +31,33 @@
 
 use std::path::PathBuf;
 
+/// Strip `//` line comments so PROSE about the confirm can neither satisfy
+/// nor break an assertion about the CODE.
+///
+/// `main.rs` carries three comment mentions of `confirm_replayed` beside
+/// the one real call. The count below is an EQUALITY, so the concrete
+/// bypass an adversarial sweep named on 2026-09-05 is: delete the real
+/// call and write one comment containing the full
+/// `ws_frame_spill::confirm_replayed(` literal. The count stays 1, the
+/// guard stays green, and staged WAL segments re-replay every boot —
+/// the 25-75 GB per restart this guard exists to prevent.
+///
+/// A guard that reads comments is reading documentation, not code.
+fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn main_rs() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+    strip_line_comments(&raw)
 }
 
 #[test]
