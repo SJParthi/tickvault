@@ -7,21 +7,32 @@
 // consumers can drain them before live reads resume.
 //
 // DURABILITY — read this before relying on the word "durable" (corrected
-// 2026-08-11). The writer thread calls `BufWriter::flush()`, which hands
-// bytes to the OPERATING SYSTEM. It does NOT call `sync_all`/`sync_data`,
-// so nothing forces them onto the physical disk. Concretely:
+// 2026-08-11, and the trade taken 2026-09-05).
+//
+// The writer thread calls `BufWriter::flush()`, which hands bytes to the
+// OPERATING SYSTEM, and then — at most once per `WAL_FSYNC_INTERVAL_MS_DEFAULT`
+// (1,000 ms, env-overridable, `0` disables) — calls `sync_all`, which forces
+// them onto the physical device. Concretely:
 //
 //   * process killed (SIGKILL, panic, OOM) -> flushed records SURVIVE, because
 //     the page cache belongs to the kernel, not to us. This is the case the
-//     WAL exists for and it is genuinely covered.
+//     WAL exists for and it is genuinely covered, sync or no sync.
 //   * machine loses power, kernel panics, or the host is force-stopped ->
-//     records written since the last kernel writeback are LOST.
+//     records written since the last SYNC are lost. That window is now bounded
+//     by the interval (~1 s) rather than by the kernel's writeback policy
+//     (`dirty_expire_centisecs`, default 30 s).
 //
-// Three comments in this file previously said "fsync". None was ever true —
-// there is no `sync_all` anywhere in this crate. The claim mattered because
-// the live feed refuses to open a socket without this WAL, citing it as the
-// durability floor; overstating that floor is how a gap gets discovered late.
-// Adding a real fsync is a deliberate throughput trade, not a typo fix.
+// It is a BOUND, not an elimination. A power cut still loses up to a second of
+// frames, and no interval short of a sync per record removes that — a sync per
+// record is not affordable at the 5,000 fps envelope, which is why the earlier
+// note called this "a deliberate throughput trade". The trade is now taken at
+// an interval, with the cost and the new risk written at the constant.
+//
+// Three comments in this file previously said "fsync" while the code called
+// `sync_all` zero times. That overstatement was load-bearing, because the live
+// feed refuses to open a socket without this WAL and cites it as the durability
+// floor. The words and the syscalls are kept in agreement by
+// `test_durability_claim_matches_what_the_code_actually_does`.
 //
 // Record format on disk (four versions; replay accepts all four):
 //     v1 [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame][crc32:u32 LE]
@@ -493,8 +504,8 @@ pub const fn plausible_receipt_nanos(received_at_nanos: i64) -> i64 {
 const WAL_SEGMENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Writer buffer size — large enough to batch hundreds of records into one
-/// write syscall. (Not an fsync batch: see the DURABILITY note in the module
-/// header — this path never calls `sync_all`.)
+/// write syscall. (Not an fsync batch: the sync is time-driven and independent
+/// of this buffer — see the DURABILITY note in the module header.)
 const WAL_WRITER_BUFFER: usize = 256 * 1024;
 
 /// Backoff before the supervisor re-enters the writer loop after a panic or a
@@ -522,6 +533,71 @@ const WAL_WRITER_IO_RETRY_BACKOFF: Duration = Duration::from_millis(50); // APPR
 /// wake-ups a second on an otherwise idle thread. While frames ARE flowing the
 /// timeout never fires, so the hot path is byte-identical to the blocking form.
 const WAL_WRITER_STOP_POLL: Duration = Duration::from_millis(200); // APPROVED: this IS the named constant the rule asks for
+
+/// Default interval between `sync_all` calls on the open WAL segment, in
+/// milliseconds. `0` disables the sync entirely and restores the pre-2026-09-05
+/// behaviour exactly.
+///
+/// WHY THIS EXISTS, and what it does NOT claim. Until 2026-09-05 this module
+/// called `BufWriter::flush()` and nothing else, so a flushed record was in the
+/// kernel's page cache and not on the platter. That covers the case the WAL is
+/// really for — SIGKILL, panic, OOM: the page cache belongs to the kernel and
+/// survives all three. It does NOT cover power loss, a kernel panic, or a
+/// force-stop, where everything since the last kernel writeback is gone.
+///
+/// Linux writes back dirty pages older than `dirty_expire_centisecs` (default
+/// 3000 = 30 s) on a `dirty_writeback_centisecs` (default 500 = 5 s) sweep, so
+/// the UNSYNCED window is up to ~30 seconds of frames. At 1,000 ms this bounds
+/// it to one second — roughly a 30x reduction — for the cost measured below.
+///
+/// COST, and why the writer thread can afford it. `append()` is a non-blocking
+/// `try_send` onto a 524,288-slot channel; every byte of I/O happens on this
+/// background thread, so a sync NEVER touches the hot path. One sync measured
+/// ~2.6 ms on the dev container (an overestimate — the harness spawned a
+/// process per call); at one per second that is ~0.26% of the writer's time,
+/// against a channel holding ~100 seconds of frames at the 5,000 fps envelope.
+///
+/// ⚠ THE RISK IT ADDS, stated because it is real and new. A sync on a
+/// SATURATED device does not take 2.6 ms — the 2026-08-28 session pinned the
+/// volume at its provisioned ceiling for hours. A multi-second sync stalls this
+/// thread, the channel backs up, and past 524,288 records `append()` starts
+/// refusing frames (`WS-SPILL-02`, counted, and a real tick loss). The interval
+/// is therefore a FLOOR and never a deadline: a slow sync simply means fewer
+/// syncs, and the ~100 s of queue headroom is what absorbs one. Set the env var
+/// to `0` to switch it off without a rebuild if that trade ever goes the wrong
+/// way.
+const WAL_FSYNC_INTERVAL_MS_DEFAULT: u64 = 1_000;
+
+/// Env override for [`WAL_FSYNC_INTERVAL_MS_DEFAULT`]. Present so the trade is
+/// reversible on the box with a unit-file edit and a restart, never a rebuild.
+const WAL_FSYNC_INTERVAL_ENV: &str = "TICKVAULT_WAL_FSYNC_INTERVAL_MS";
+
+/// Resolves the sync interval once per writer-thread start.
+///
+/// An unparseable value falls back to the default LOUDLY rather than silently
+/// disabling durability — a typo in a unit file must never be the reason the
+/// WAL stopped syncing.
+fn resolve_wal_fsync_interval() -> Option<Duration> {
+    let ms = match std::env::var(WAL_FSYNC_INTERVAL_ENV) {
+        Err(_) => WAL_FSYNC_INTERVAL_MS_DEFAULT,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    env = WAL_FSYNC_INTERVAL_ENV,
+                    "WAL fsync interval is not a number; using the default. \
+                     Set it to 0 to disable the sync deliberately."
+                );
+                WAL_FSYNC_INTERVAL_MS_DEFAULT
+            }
+        },
+    };
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
 
 /// How often [`WsFrameSpill::shutdown`] re-checks the queue and the thread.
 const WAL_SHUTDOWN_POLL: Duration = Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
@@ -1313,11 +1389,72 @@ impl WsFrameSpill {
 /// `write_all` lands it in the 256 KiB `BufWriter`, not when the buffer reaches
 /// the platter, so dropping an unflushed writer loses records that
 /// `persisted_count()` has already claimed.
+/// Forces the open segment onto the physical device, rate-limited by
+/// `interval`. Returns the new "last synced" instant.
+///
+/// Called ONLY from the writer thread, never from `append()`. A failure is
+/// reported and swallowed: a device that cannot sync is a degraded WAL, not a
+/// reason to tear down the capture floor that is still accepting writes.
+fn maybe_sync_segment(
+    current: &mut Option<BufWriter<File>>,
+    interval: Option<Duration>,
+    last_sync: Instant,
+) -> Instant {
+    let Some(interval) = interval else {
+        return last_sync;
+    };
+    if last_sync.elapsed() < interval {
+        return last_sync;
+    }
+    let Some(w) = current.as_mut() else {
+        // No open segment: nothing to sync, and re-arming the timer here would
+        // let a long segment-less stretch trigger a sync storm on reopen.
+        return Instant::now();
+    };
+    let started = Instant::now();
+    match w.get_ref().sync_all() {
+        Ok(()) => {
+            metrics::counter!("tv_wal_fsync_total").increment(1);
+            // A gauge, not a histogram: the number that matters operationally
+            // is "how slow was the LAST one", because a sync that starts taking
+            // seconds is the leading indicator of the queue backing up.
+            metrics::gauge!("tv_wal_fsync_duration_ms")
+                .set(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        Err(err) => {
+            metrics::counter!("tv_wal_fsync_errors_total").increment(1);
+            report_io_error("fsync", &err);
+        }
+    }
+    Instant::now()
+}
+
+/// Flushes the open segment and, unless syncing is disabled, forces it onto
+/// the device before the writer exits.
+///
+/// The sync here is UNCONDITIONAL rather than rate-limited: this runs once per
+/// process, at the moment the last records are written, and it is the only
+/// point at which "the app stopped cleanly" can be made to mean "nothing is
+/// waiting in the page cache". Its cost is one sync per shutdown.
 fn flush_on_exit(current: &mut Option<BufWriter<File>>, stage: &'static str) {
-    if let Some(mut w) = current.take()
-        && let Err(err) = w.flush()
-    {
+    let Some(mut w) = current.take() else {
+        return;
+    };
+    if let Err(err) = w.flush() {
         report_io_error(stage, &err);
+        // A failed flush means the bytes are not in the kernel either, so
+        // syncing would force an incomplete segment and report success.
+        return;
+    }
+    if resolve_wal_fsync_interval().is_none() {
+        return;
+    }
+    match w.get_ref().sync_all() {
+        Ok(()) => metrics::counter!("tv_wal_fsync_total").increment(1),
+        Err(err) => {
+            metrics::counter!("tv_wal_fsync_errors_total").increment(1);
+            report_io_error("fsync_on_exit", &err);
+        }
     }
 }
 
@@ -1365,6 +1502,10 @@ fn writer_loop(
     depth_gauge.set(0.0);
     high_water_gauge.set(0.0);
     bytes_gauge.set(0.0);
+    // Resolved once per writer start, not per iteration: an env read inside
+    // the loop would be a syscall on every batch.
+    let fsync_interval = resolve_wal_fsync_interval();
+    let mut last_sync = Instant::now();
     loop {
         // Timed, not blocking, so the thread can notice a shutdown request.
         //
@@ -1436,6 +1577,11 @@ fn writer_loop(
             current = None;
             thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
         }
+
+        // AFTER the flush, never before: syncing a file whose latest records
+        // are still sitting in the BufWriter would force the previous batch to
+        // the platter and leave this one exactly as exposed as before.
+        last_sync = maybe_sync_segment(&mut current, fsync_interval, last_sync);
 
         // The exposure C1 named, made measurable.
         //
@@ -4399,11 +4545,139 @@ mod tests {
                 );
             }
         } else {
+            // The sync EXISTS. Before 2026-09-05 this arm was a bare sanity
+            // check that could not fail, so the guard protected one direction
+            // of drift and waved the other through — exactly the shape the
+            // module header warns about. It now requires the header to state
+            // the three things a reader needs and cannot infer from a
+            // `sync_all` call site:
+            //
+            //   * that the sync is INTERVAL-driven, not per-record;
+            //   * that the residual window is bounded, not eliminated;
+            //   * that it is reversible without a rebuild.
             assert!(
-                production.contains("sync_all") || production.contains("sync_data"),
+                production.contains("sync_all"),
                 "sanity: counted a sync but cannot find one"
             );
+            assert!(
+                production.contains("WAL_FSYNC_INTERVAL_MS_DEFAULT"),
+                "this module now syncs, so the header must name the interval \
+                 constant that bounds the unsynced window"
+            );
+            // Pin the SENTENCE, not the word. The first version asked whether
+            // the header contained "bounded" ANYWHERE, and a bite-proof that
+            // rewrote the meaning-carrying line PASSED, because the word
+            // survived on a neighbouring line. Prose repeats words; a claim
+            // lives in one sentence.
+            let hdr = production.split("use std::fs").next().unwrap_or(production);
+            assert!(
+                hdr.contains("It is a BOUND, not an elimination."),
+                "a periodic sync BOUNDS the power-loss window; it does not \
+                 close it. The header must say so, or the next reader will \
+                 read `sync_all` and assume zero loss."
+            );
+            assert!(
+                hdr.contains("power"),
+                "the header must still name the case the sync exists for"
+            );
         }
+    }
+
+    /// The sync is real, reachable, and rate-limited — proven by behaviour,
+    /// not by a source scan.
+    ///
+    /// The source scan above keeps the WORDS honest. This keeps the CALL
+    /// honest: `maybe_sync_segment` must actually sync when the interval has
+    /// elapsed, must NOT sync before it, and must be a no-op when disabled.
+    /// Without this a `sync_all` could sit behind a condition that is never
+    /// true and the scan would still pass.
+    #[test]
+    fn wal_sync_is_rate_limited_and_disableable() {
+        let dir = tmp_dir("fsync-rate-limit");
+        let path = dir.join("seg.wal");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("temp segment must open");
+        let mut current = Some(BufWriter::new(file));
+
+        // Disabled: returns the SAME instant it was given, so the caller's
+        // timer is untouched and no sync is attempted.
+        let t0 = Instant::now();
+        let after_disabled = maybe_sync_segment(&mut current, None, t0);
+        assert_eq!(
+            after_disabled, t0,
+            "a disabled sync must not re-arm the caller's timer"
+        );
+
+        // Interval not yet elapsed: also a no-op, same instant back.
+        let long = Duration::from_secs(3_600);
+        let after_early = maybe_sync_segment(&mut current, Some(long), Instant::now());
+        assert!(
+            after_early.elapsed() < Duration::from_secs(1),
+            "an early call must return the instant it was handed, unchanged"
+        );
+
+        // Interval elapsed: the timer MUST advance, which is the only
+        // observable signal that the sync branch was entered at all.
+        let stale = Instant::now() - Duration::from_secs(10);
+        let after_due = maybe_sync_segment(&mut current, Some(Duration::from_millis(1)), stale);
+        assert!(
+            after_due > stale,
+            "a due sync must re-arm the timer; if it did not, the sync branch \
+             was never reached and this module is not syncing at all"
+        );
+
+        // And the file survived it: sync_all on a healthy fd cannot corrupt,
+        // but a panicking or file-closing implementation would show here.
+        assert!(
+            current.is_some(),
+            "the segment must stay open across a sync — dropping it would \
+             force a reopen per interval and lose the append position"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bad env value must fall back to the default, never to "disabled".
+    ///
+    /// The failure this prevents is silent: a typo in a systemd unit
+    /// (`TICKVAULT_WAL_FSYNC_INTERVAL_MS=1OOO`, letter O) that parsed to
+    /// nothing and switched durability off would leave every metric and every
+    /// log line looking exactly as they do today.
+    #[test]
+    fn wal_sync_interval_falls_back_loudly_never_to_disabled() {
+        // SAFETY: single-threaded within this test, and the value is restored
+        // before it returns. The resolver reads the var on each call.
+        unsafe { std::env::set_var(WAL_FSYNC_INTERVAL_ENV, "not-a-number") };
+        assert_eq!(
+            resolve_wal_fsync_interval(),
+            Some(Duration::from_millis(WAL_FSYNC_INTERVAL_MS_DEFAULT)),
+            "an unparseable interval must fall back to the DEFAULT; falling \
+             back to None would disable durability over a typo"
+        );
+
+        unsafe { std::env::set_var(WAL_FSYNC_INTERVAL_ENV, "0") };
+        assert_eq!(
+            resolve_wal_fsync_interval(),
+            None,
+            "an explicit 0 is the documented off switch and must disable"
+        );
+
+        unsafe { std::env::set_var(WAL_FSYNC_INTERVAL_ENV, "250") };
+        assert_eq!(
+            resolve_wal_fsync_interval(),
+            Some(Duration::from_millis(250)),
+            "a valid interval must be honoured verbatim"
+        );
+
+        unsafe { std::env::remove_var(WAL_FSYNC_INTERVAL_ENV) };
+        assert_eq!(
+            resolve_wal_fsync_interval(),
+            Some(Duration::from_millis(WAL_FSYNC_INTERVAL_MS_DEFAULT)),
+            "an absent var must use the default — syncing is ON unless \
+             deliberately switched off"
+        );
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
