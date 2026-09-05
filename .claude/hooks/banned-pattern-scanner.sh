@@ -135,10 +135,20 @@ scan_prod_code() {
 #   crates/storage/src/ws_frame_spill.rs    — per-frame WAL append
 # (crates/app/src/groww_bridge.rs — the per-tick Groww NDJSON consume path — was
 #  DELETED 2026-07-15 with the Groww live feed; its alternative is removed below.)
-# (crates/storage/src/tick_persistence.rs + tick_row_builder.rs — the per-tick
-#  ILP append/row-build chain — were DELETED 2026-07-17 in the stage-2 dead-WS
-#  sweep (PR #1631); their alternatives are removed below per the zero-match
-#  guard in hot-path-scanner-selftest.sh.)
+# ⚠ SCOPE HOLE, RECORDED 2026-09-05 — three per-tick files are NOT scanned.
+#  The lines below used to read "tick_persistence.rs + tick_row_builder.rs were
+#  DELETED 2026-07-17 ... their alternatives are removed". That was true when
+#  written and stopped being true on 2026-08-26: tick_persistence.rs (143 KB)
+#  and depth_persistence.rs (72 KB) came BACK with the Dhan live-WS revival and
+#  the full-depth capture authorization, and crates/app/src/dhan_feed_stack.rs
+#  is the frame drain itself. All three are per-tick and none is in the include
+#  regex below, so the hot-path bans have never applied to them.
+#  Measured 2026-09-05, non-test lines: dhan_feed_stack.rs ~44 hits,
+#  tick_persistence.rs ~15, depth_persistence.rs ~13. Adding the paths without
+#  triaging those first would fail the very next commit that touches them, so
+#  the honest sequence is triage-then-widen, in its own change, NOT a silent
+#  regex edit. Recorded here rather than in a plan file because this is where
+#  the next reader of the include regex will look.
 # Cold path within core (auth/, instrument/, notification/, historical/) is NOT hot path.
 # Cold path within trading (oms/) — order placement is network-I/O-bound, not
 # per-tick latency-critical (pre-existing documented exclusion, kept).
