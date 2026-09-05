@@ -2967,3 +2967,86 @@ binary behind the mirror and still pages — while removing the docs-only case.
 Not done tonight deliberately: it is a third change to a watchdog repaired
 hours earlier, under time pressure, on an alarm that cannot fire for at least
 24 hours. Recording it so the next session decides rather than rediscovers.
+
+## ⚠ MEASURED 2026-09-05 — the September forecast is $130.39 against an automatic shutdown at $135.00. Every cost note above is stale AGAIN, and this time in the dangerous direction.
+
+**This section authorizes NOTHING.** It records a live reading and withdraws a
+figure this file has been quoting for three days. No alarm is added, no metric
+is selected, no money is spent by writing it down.
+
+**Read live from the account, 2026-09-05** (`budgets describe-budgets`,
+account 208384284948):
+
+| Reading | Value |
+|---|---:|
+| `limit_amount` | **$150.00** |
+| Automatic `STOP_EC2_INSTANCES` action line (90%) | **$135.00** |
+| Second automatic action line (100%) | $150.00 |
+| September actual, 5 days in | $22.01 |
+| **September forecast** | **$130.39** |
+| **Margin to the automatic shutdown of the trading box** | **$4.61** |
+
+Both action thresholds re-confirmed in `budget.tf` (`action_threshold_value`
+90 and 100, `PERCENTAGE`), so the $135.00 line is derived from the live limit,
+not carried forward.
+
+#### What moved, and why it matters more than the number
+
+The dated correction above this one recorded a September forecast of
+**$114.01** on 2026-09-02 and used it to retire the "we cannot afford it"
+reason, correctly, at the time. **Three days later the forecast is $16.38
+higher** — consistent with the Quote 22 grow to 600 GB (+$9.12/mo) and the
+disk activity that followed it feeding into the projection.
+
+So the correction that retired a stale-and-alarming figure has itself gone
+stale in the **reassuring** direction, which is the worse one. A reader
+trusting it today believes there is $21 of room and would add alarms freely;
+there is $4.61, and the thing on the other side of it is an AUTOMATIC stop of
+the production trading box mid-month.
+
+**This is the third time a constraint in this file has expired while still
+being quoted** — after the user-data byte budget (measured "zero free",
+restructured three days later, quoted as a live blocker four times) and the
+$130 ceiling (raised to $150 on 2026-08-25, costed against $130 in fifteen
+statements). The lesson the 2026-09-02 note wrote down is now demonstrated on
+that note itself: **a measurement carries a date, and a measurement quoted
+from a quote is not a measurement.** A budget limit is one
+`budgets describe-budgets` call. Re-run it at the moment of writing.
+
+#### The consequence for §2.3n's standing rule
+
+§2.3n requires that "the next addition of any size must come with a LEVER, not
+just a cost note." At $4.61 of margin that rule is now binding in practice
+rather than in principle: five alarms at ~$0.10/mo each would consume roughly
+11% of the remaining room before the box switches itself off.
+
+The levers are unchanged and **none is an executor's to take**:
+
+| Lever | Save | Why it is not taken here |
+|---|---:|---|
+| Release the Elastic IP (Quote 10, approved in principle 2026-07-19) | ~$3.60/mo | Execution is bundled with an instance recreate — an operator action on the live trading box |
+| Raise `limit_amount` | — | Quote 19 caps it at $150 and it is already there; going above needs a fresh dated quote |
+| Trim CloudWatch alarms | varies | Each has its own dated authorization; removing one is a page the operator chose to have |
+| Cut Cost Explorer polling | ~$2.38/mo | Verified minimal 2026-08-22 (~198 requests/mo, in-window only); cutting it removes the in-session spend guard |
+
+#### ⚠ And the standing caveat that makes the $135 line uncertain in BOTH directions
+
+`budgets:DescribeBudgetActionsForBudget` has returned `AccessDenied` for
+`user/claude-code-agent` on every attempt since 2026-08-08, and the last
+successful read (2026-07-31) found BOTH `STOP_EC2_INSTANCES` actions in
+`EXECUTION_FAILURE`. So whether the $135 line throws at all is **Unknown**,
+and neither answer is comfortable: if the actions are broken the box bills
+past the cap unchecked, and if they were repaired the box stops mid-September.
+`tv_hard_stop_guard` — this repository's own hourly guard — enforces the
+ceiling independently and IS verifiable, so the ceiling is not arithmetic
+about nothing; but the native action's state is a one-IAM-statement read that
+nobody has been able to perform for four weeks.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Quotes the $114.01 forecast, or any figure above, without re-running
+  `budgets describe-budgets` at the moment of writing.
+- Adds an EMF name or an alarm while the live forecast is within ~$5 of the
+  automatic action line, without a lever taken in the same change.
+- Reads this section as authorization to raise `limit_amount` — it is not, and
+  Quote 19 caps it at $150.
