@@ -366,7 +366,31 @@ const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 1] = ["candles_7d"];
 /// SEBI 5-year retention obligation and must never be auto-dropped; the
 /// other audit tables were already retired with their own boot wiring in
 /// #T2. This list is ONLY the instrument / misc / greeks tables.
-const RETIRED_QUESTDB_TABLES: [&str; 18] = [
+/// # ⚠ A name here is DROPPED at boot. Verify it has no live writer first.
+///
+/// 2026-09-05: `market_depth` was in this list and had been since #T4, when
+/// depth genuinely had no writer. Depth came back on 2026-08-15 and is now the
+/// LARGEST table in the process — measured 1,530,651,649 rows/session, 24x the
+/// tick volume — while its name sat in a `DROP TABLE IF EXISTS` sweep. It was
+/// the only one of the eighteen names with a live `CREATE TABLE IF NOT EXISTS`
+/// anywhere in the tree.
+///
+/// It never fired, for one reason: the versioned marker file suppresses the
+/// sweep after its first successful run. That is not a safety property. Two
+/// documented, ordinary actions re-arm it — bumping `LEGACY_DROP_SWEEP_VERSION`
+/// (which this list's own workflow expects whenever the list is extended), and
+/// the operator `rm`-ing the marker, which the doc comment on
+/// `drop_legacy_candle_objects` explicitly tells them to do. Either would drop
+/// a populated depth table at the next boot, before `ensure_market_depth_table`
+/// runs, and a successful DROP logs nothing alarming.
+///
+/// `deep_market_depth` stays: it has no live DDL and no writer, so dropping it
+/// is the cleanup this list is for.
+///
+/// Pinned by `retired_drop_list_never_names_a_live_table` — a name that gains a
+/// `CREATE TABLE IF NOT EXISTS` anywhere in `crates/*/src` now fails the build
+/// rather than waiting for a marker bump to notice.
+const RETIRED_QUESTDB_TABLES: [&str; 17] = [
     // #T3 — instrument tables
     "fno_underlyings",
     "derivative_contracts",
@@ -374,7 +398,8 @@ const RETIRED_QUESTDB_TABLES: [&str; 18] = [
     "instrument_build_metadata",
     "index_constituents",
     // #T4 — misc tables
-    "market_depth",
+    // `market_depth` REMOVED 2026-09-05 — it has a live writer again; see the
+    // note on this constant.
     "previous_close",
     "nse_holidays",
     // PR #3 — greeks tables
@@ -943,8 +968,9 @@ mod tests {
     }
 
     #[test]
-    fn test_retired_questdb_tables_count_is_eighteen_and_unique() {
-        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 18);
+    fn test_retired_questdb_tables_count_is_seventeen_and_unique() {
+        // 18 -> 17 on 2026-09-05: `market_depth` removed, it has a live writer.
+        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 17);
         let mut seen = std::collections::HashSet::new();
         for table in RETIRED_QUESTDB_TABLES {
             assert!(seen.insert(table), "duplicate retired table: {table}");
@@ -963,6 +989,133 @@ mod tests {
                 "approved retired table missing from the drop list: {expected}"
             );
         }
+    }
+
+    /// A name in the DROP list must have NO live writer anywhere in the tree.
+    ///
+    /// # Why a scan and not a hand-checked list
+    ///
+    /// `market_depth` sat in this list from #T4, when depth had no writer, and
+    /// stayed there through the 2026-08-15 revival that made it the largest
+    /// table in the process. Nothing noticed, because nothing was looking: the
+    /// list is checked by a count test and a name-presence test, and neither
+    /// asks the only question that matters — is this table still dead?
+    ///
+    /// The sweep never fired only because a marker file suppresses it after its
+    /// first run. That is luck, not a bound: bumping the sweep version (the
+    /// documented workflow for EXTENDING this list) and `rm`-ing the marker (the
+    /// documented workflow for re-running it) each re-arm it, and a successful
+    /// DROP of a populated table logs nothing alarming.
+    ///
+    /// So the question is asked mechanically, of the code rather than of a
+    /// reviewer: a `CREATE TABLE IF NOT EXISTS <name>` anywhere in `crates/*/src`
+    /// means something intends to write it, and a table something intends to
+    /// write must not be in a boot-time drop sweep.
+    #[test]
+    fn retired_drop_list_never_names_a_live_table() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        // Every tracked .rs under crates/*/src, concatenated once.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "ls-files",
+                "--",
+                "crates/*/src/**/*.rs",
+                "crates/*/src/*.rs",
+            ])
+            .output()
+            .expect("git ls-files must run");
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let mut corpus = String::new();
+        let mut files = 0usize;
+        for rel in listing.lines().filter(|l| !l.is_empty()) {
+            // This file DEFINES the list, so its own doc comments naming a
+            // table must not be mistaken for a writer.
+            if rel.ends_with("shadow_persistence.rs") {
+                continue;
+            }
+            if let Ok(body) = std::fs::read_to_string(root.join(rel)) {
+                corpus.push_str(&body);
+                files += 1;
+            }
+        }
+        assert!(
+            files >= 50,
+            "only {files} source files read — the scan is broken, not the code"
+        );
+
+        // Resolve `const NAME: &str = "table";` FIRST.
+        //
+        // The first version of this guard matched the table name as a LITERAL
+        // after `CREATE TABLE IF NOT EXISTS`, and it passed green on the very
+        // defect it was written for: the real DDL is
+        // `"CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_TABLE} ("`, where the name
+        // is a const IDENTIFIER interpolated by `format!`. That is the house
+        // style, and it is the third time in one day a literal-only scan in
+        // this workspace reported on its own vocabulary rather than on the
+        // code. A scan that cannot read the codebase's own idiom is not a scan.
+        let mut aliases: Vec<(String, String)> = Vec::new();
+        for (i, _) in corpus.match_indices("const ") {
+            let after = &corpus[i + "const ".len()..];
+            let Some((decl, rest)) = after.split_once('=') else {
+                continue;
+            };
+            let Some((ident, ty)) = decl.split_once(':') else {
+                continue;
+            };
+            let ident = ident.trim();
+            if !ty.contains("str") || ident.is_empty() || ident.contains(char::is_whitespace) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            if let Some(v) = rest.strip_prefix('"').and_then(|r| r.split_once('"')) {
+                aliases.push((ident.to_owned(), v.0.to_owned()));
+            }
+        }
+        assert!(
+            aliases.len() >= 20,
+            "resolved only {} string consts — the const resolver is broken, \
+             which would make this guard silently blind",
+            aliases.len()
+        );
+
+        // A table is LIVE if its own name, or any const identifier holding that
+        // name, follows `CREATE TABLE IF NOT EXISTS`. Test code is deliberately
+        // NOT excluded: a false positive costs someone removing a dead name
+        // from a cleanup list, a false negative drops a populated table.
+        let live: Vec<&str> = RETIRED_QUESTDB_TABLES
+            .iter()
+            .filter(|t| {
+                let mut names: Vec<String> = vec![(*t).to_string()];
+                names.extend(
+                    aliases
+                        .iter()
+                        .filter(|(_, v)| v == *t)
+                        .map(|(ident, _)| format!("{{{ident}}}")),
+                );
+                names
+                    .iter()
+                    .any(|n| corpus.contains(&format!("CREATE TABLE IF NOT EXISTS {n}")))
+            })
+            .copied()
+            .collect();
+
+        assert!(
+            live.is_empty(),
+            "these tables are in the boot DROP sweep AND have a live \
+             CREATE TABLE IF NOT EXISTS: {live:?}\n\n\
+             A drop sweep is for tables nothing writes any more. A name that \
+             regained a writer must be REMOVED from the list — the marker file \
+             that suppresses the sweep today is not a bound: bumping the sweep \
+             version or removing the marker re-arms it, and dropping a \
+             populated table logs nothing alarming."
+        );
     }
 
     #[test]
