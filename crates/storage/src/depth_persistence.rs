@@ -342,6 +342,7 @@ pub struct DepthRow {
 /// dropping a partition that is still being written.
 #[must_use]
 pub fn market_depth_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in market_depth_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_TABLE} (\
             feed SYMBOL, \
@@ -379,12 +380,14 @@ const MARKET_DEPTH_COLUMNS: &[(&str, &str)] = &[
 /// Never a DROP. Pure, so the statement set is unit-testable without QuestDB.
 #[must_use]
 pub fn market_depth_ensure_statements() -> Vec<String> {
-    let mut out = vec![market_depth_create_ddl()];
+    let mut out = vec![market_depth_create_ddl()]; // APPROVED: boot DDL statement list, never per row
     for (col, ty) in MARKET_DEPTH_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
         out.push(format!(
             "ALTER TABLE {MARKET_DEPTH_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
         ));
     }
+    // APPROVED: DEDUP ENABLE statement, boot only
     out.push(format!(
         "ALTER TABLE {MARKET_DEPTH_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_MARKET_DEPTH})"
     ));
@@ -401,6 +404,7 @@ pub fn market_depth_ensure_statements() -> Vec<String> {
 /// prevent. The consequence is named in the log rather than left implicit.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line — the guard reads only the line immediately above).
 pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
+    // APPROVED: QuestDB base URL, once per ensure_market_depth_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -493,6 +497,7 @@ pub const ILP_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// owns retry cadence) and a bounded `request_timeout` so a hung flush cannot
 /// wedge the drain.
 fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
+    // APPROVED: ILP conf string, once per DepthWriter::new
     format!(
         "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
@@ -987,6 +992,7 @@ fn temp_depth_spill_dir() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    // APPROVED: temp spill dir path, built once at wiring or in tests
     std::env::temp_dir().join(format!(
         "tv-depth-spill-test-{nanos}-{:?}",
         std::thread::current().id()
@@ -1498,7 +1504,7 @@ impl DepthWriter {
         let sink = DepthWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
-            spill_dir: self.spill_dir.clone(),
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
             spill_min_free_headroom: self.spill_min_free_headroom,
         };
         self.offload = Some(tx);
@@ -1514,7 +1520,7 @@ impl DepthWriter {
     ) -> (DepthRescueSink, std::sync::mpsc::Receiver<DepthRescueBatch>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_RESCUE_QUEUE_DEPTH);
         let sink = DepthRescueSink {
-            spill_dir: self.spill_dir.clone(),
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             spill_min_free_headroom: self.spill_min_free_headroom,
             feed: self.feed,
         };
@@ -1795,6 +1801,7 @@ impl DepthWriter {
                          raw frames remain in the write-ahead log"
                     );
                 }
+                // APPROVED: flush-FAILURE error context, never the append path
                 Err(anyhow::anyhow!(err)).context(format!(
                     "market_depth flush failed; {dropped} row(s) discarded"
                 ))
@@ -2267,7 +2274,7 @@ impl DepthWriterSink {
                 landed
             }
             Err(err) => {
-                let why = format!("{err}");
+                let why = format!("{err}"); // APPROVED: rescue arm after a flush already failed, never per row
                 self.rescue(batch, &why);
                 0
             }

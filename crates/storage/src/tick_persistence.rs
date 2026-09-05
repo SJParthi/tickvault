@@ -482,6 +482,7 @@ impl TickRow {
 /// `TIMESTAMP(ts) PARTITION BY HOUR WAL`). Pure — no I/O.
 #[must_use]
 pub fn ticks_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in ticks_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {TICKS_TABLE} (\
             feed SYMBOL, \
@@ -534,12 +535,14 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
 /// Pure, so the statement set is unit-testable without a live QuestDB.
 #[must_use]
 pub fn ticks_ensure_statements() -> Vec<String> {
-    let mut out = vec![ticks_create_ddl()];
+    let mut out = vec![ticks_create_ddl()]; // APPROVED: boot DDL statement list, never per row
     for (col, ty) in TICKS_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
         out.push(format!(
             "ALTER TABLE {TICKS_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
         ));
     }
+    // APPROVED: DEDUP ENABLE statement, boot only
     out.push(format!(
         "ALTER TABLE {TICKS_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TICKS})"
     ));
@@ -556,6 +559,7 @@ pub fn ticks_ensure_statements() -> Vec<String> {
 // ticks_ensure_statements(), and the 200 / 500 / unreachable arms are exercised
 // by the mock-HTTP tokio tests below.
 pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
+    // APPROVED: QuestDB base URL, once per ensure_ticks_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -1461,6 +1465,7 @@ pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64) -> usize {
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
 fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
+    // APPROVED: ILP conf string, once per TickWriter::new
     format!(
         "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
@@ -1586,6 +1591,7 @@ pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: O
         MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
     };
     if (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+        // O(1) EXEMPT: RangeInclusive::contains — two integer comparisons on a const range, not a Vec scan (the scanner greps `.contains(&` and cannot tell them apart)
         .contains(&exchange_timestamp)
     {
         return ltt_nanos;
@@ -2048,6 +2054,7 @@ impl TickWriter {
             }
             Some(Err(err)) => {
                 let dropped = self.discard_pending();
+                // APPROVED: flush-FAILURE error context, never the append path
                 Err(anyhow::Error::new(err).context(format!(
                     "ticks ILP flush failed — {dropped} pending row(s) discarded \
                      (poisoned-buffer defence)"
@@ -2113,7 +2120,7 @@ impl TickWriter {
         let sink = TickWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
-            spill_dir: self.spill_dir.clone(),
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
         };
         self.offload = Some(tx);
         (self, sink, rx)
@@ -2148,7 +2155,7 @@ impl TickWriter {
     ) -> (TickRescueSink, std::sync::mpsc::Receiver<RescueBatch>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(RESCUE_QUEUE_DEPTH);
         let sink = TickRescueSink {
-            spill_dir: self.spill_dir.clone(),
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             feed: self.feed,
         };
         self.rescue = Some(tx);
@@ -2779,7 +2786,7 @@ impl TickWriterSink {
                 landed
             }
             Err(err) => {
-                let why = format!("{err}");
+                let why = format!("{err}"); // APPROVED: rescue arm after a flush already failed, never per row
                 self.rescue(batch, &why);
                 0
             }
