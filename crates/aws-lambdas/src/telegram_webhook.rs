@@ -1170,14 +1170,14 @@ where
                 if status >= 400 {
                     let head: String = body.chars().take(200).collect();
                     failures.push(format!("http {status}: {head}"));
-                    error!(status, body = %head, "Telegram POST returned an error status");
+                    error!(code = "LAMBDA-NOTIFY-01", status, body = %head, "Telegram POST returned an error status");
                 } else {
                     sent += 1;
                 }
             }
             Err(err) => {
                 failures.push(err.clone());
-                error!(error = %err, "Failed to relay one message to Telegram");
+                error!(code = "LAMBDA-NOTIFY-01", error = %err, "Failed to relay one message to Telegram");
             }
         }
         // Cheap rate-limit cushion. Telegram allows ~30 msg/sec per bot;
@@ -1258,7 +1258,10 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     let (token, chat_id) = match get_credentials().await {
         Ok(pair) => pair,
         Err(err) => {
-            error!("Failed to fetch Telegram credentials from SSM");
+            error!(
+                code = "LAMBDA-NOTIFY-01",
+                "Failed to fetch Telegram credentials from SSM"
+            );
             return Err(err);
         }
     };

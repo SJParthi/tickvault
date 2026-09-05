@@ -255,6 +255,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                 {
                     reset_failures += 1;
                     tracing::error!(
+                        code = "LAMBDA-AWS-02",
                         alarm = %name,
                         error = %err,
                         "could not pre-reset this alarm to OK before arming. Arming \
@@ -266,6 +267,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                 if let Err(err) = cw.enable_alarm_actions().alarm_names(name).send().await {
                     arm_failures += 1;
                     tracing::error!(
+                        code = "LAMBDA-AWS-02",
                         alarm = %name,
                         error = %err,
                         "could not arm this alarm -- the others are armed independently, \

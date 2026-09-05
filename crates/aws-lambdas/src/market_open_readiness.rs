@@ -257,7 +257,7 @@ async fn instance_state(
     {
         Ok(resp) => resp,
         Err(e) => {
-            error!(error = %e, "describe_instances failed");
+            error!(code = "LAMBDA-AWS-01", error = %e, "describe_instances failed");
             return ("unknown".to_string(), None, true);
         }
     };
@@ -324,7 +324,7 @@ async fn boot_metric_seen(
     {
         Ok(resp) => resp,
         Err(e) => {
-            error!(error = %e, "get_metric_data failed");
+            error!(code = "LAMBDA-AWS-01", error = %e, "get_metric_data failed");
             return (false, true);
         }
     };
@@ -385,7 +385,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                     .await
                     .map(|_| ())
                     .map_err(|e| {
-                        error!(error = %e, "sns publish FAILED - raising so the Errors alarm pages");
+                        error!(code = "LAMBDA-NOTIFY-01", error = %e, "sns publish FAILED - raising so the Errors alarm pages");
                         e.to_string()
                     })
             }

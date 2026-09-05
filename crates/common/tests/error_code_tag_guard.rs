@@ -299,18 +299,29 @@ const UNCODED_ERROR_BUDGET: usize = 82;
 /// half: a NEW crate cannot arrive carrying uncoded errors invisibly, which is
 /// exactly how these two arrived.
 ///
-/// `aws-lambdas` = 43 (measured 2026-09-05: 44 production `error!` sites, one
-/// of which — `operator_control.rs` `HTTP-CLIENT-01` — already carries a
-/// `code =` field). These are not peripheral: `start_watchdog.rs` (11 sites)
-/// boots the prod box every morning, `budget_killswitch.rs` (4) and
-/// `hard_stop_guard.rs` (3) can STOP it, and `telegram_webhook.rs` (3) is how
-/// the operator is reached. Every CloudWatch metric filter pages on `$.code`,
-/// so all 43 are failures in the paging machinery that cannot themselves page.
+/// `aws-lambdas` = 0.
+///
+/// It was 43 when this table was introduced, hours earlier the same day:
+/// 44 production `error!` sites, one of which — `operator_control.rs`
+/// `HTTP-CLIENT-01` — already carried a `code =` field. They are not
+/// peripheral: `start_watchdog.rs` (11 sites) boots the prod box every
+/// morning, `budget_killswitch.rs` (4) and `hard_stop_guard.rs` (3) can STOP
+/// it, and `telegram_webhook.rs` (3) is how the operator is reached. Every
+/// CloudWatch metric filter pages on `$.code`, so all 43 were failures in the
+/// paging machinery that could not themselves page.
+///
+/// All 43 now carry a `LAMBDA-*` code (nine codes, grouped by operator
+/// ACTION rather than by call site — see
+/// `docs/error-runbooks/lambda-ops-error-codes.md`). The entry stays at 0
+/// rather than being deleted so the `assert_eq!` below keeps proving the
+/// count is still zero: removing the row would fall back to the same
+/// fail-closed default and enforce the same thing, but the row records that
+/// this crate WAS measured and IS at zero, which a missing row cannot say.
 ///
 /// `tickvault-logs-mcp` = 0. It has no `error!` sites today, so it starts at
 /// the fail-closed default and can never acquire one silently.
 const UNCODED_ERROR_BUDGET_BY_CRATE: [(&str, usize); 2] =
-    [("aws-lambdas", 43), ("tickvault-logs-mcp", 0)];
+    [("aws-lambdas", 0), ("tickvault-logs-mcp", 0)];
 
 /// The six crates the original hardcoded list covered. Their debt is pooled in
 /// `UNCODED_ERROR_BUDGET` — the historical ratchet, preserved exactly.

@@ -1003,6 +1003,86 @@ pub enum ErrorCode {
     /// Severity::Medium, auto-triage-safe (operator directive
     /// 2026-07-20 — native-retry / cross-fill hedge).
     Cadence05RecoveryDegraded,
+
+    // ------------------------------------------------------------------
+    // LAMBDA-* — the AWS Lambda operations family (2026-09-05)
+    //
+    // `crates/aws-lambdas` was never scanned by `error_code_tag_guard`,
+    // which walked a hardcoded six-name crate list against an eight-crate
+    // workspace. MEASURED on the day this family landed: 44 production
+    // `error!` sites, exactly ONE carrying a `code =` field. They sit in
+    // `start_watchdog.rs` (boots the prod box each morning),
+    // `budget_killswitch.rs` and `hard_stop_guard.rs` (which can STOP it),
+    // and `telegram_webhook.rs` (how the operator is reached) — so these
+    // were failures in the paging machinery that could not themselves page,
+    // because every CloudWatch metric filter matches on `$.code`.
+    //
+    // NINE codes for 43 sites, grouped by OPERATOR ACTION rather than by
+    // call site: every site inside a group has the same remedy, and the
+    // detail that differs (which API, which action, which alarm) already
+    // rides as a structured field on the existing `error!`.
+    //
+    // All NINE are deliberately Severity::Medium, and that is forced rather
+    // than chosen: `error_code_alarm_coverage_guard` fails the build for a
+    // new High/Critical code that has neither a CloudWatch alarm nor an
+    // entry on a shrink-only exemption ratchet. A new alarm costs money
+    // against a measured margin to the automatic STOP_EC2_INSTANCES line
+    // and needs a dated operator quote, and padding a shrink-only ratchet
+    // is exactly what that ratchet exists to prevent. Medium touches
+    // neither guard, so this family costs $0.00.
+    //
+    // HONEST CONSEQUENCE, stated rather than buried: Medium makes these 43
+    // failures countable and greppable BY CODE. It does not make them page
+    // anyone. Promoting any of them to a paging severity is a separate,
+    // operator-gated change.
+    /// LAMBDA-START-01: the prod box is not in the state the schedule says
+    /// it should be — not running when it should be, still running past the
+    /// stop time, launched late, or running with an unreadable launch time.
+    /// This is a statement about the BOX, not about our automation.
+    /// Severity::Medium.
+    LambdaStart01BoxNotRunning,
+    /// LAMBDA-START-02: our own start/stop self-heal failed — `StartInstances`
+    /// or `StopInstances` returned an error, including an availability-zone
+    /// capacity refusal that no retry can satisfy. Distinct from
+    /// LAMBDA-START-01 because the remedy differs: there the box is wrong,
+    /// here the thing that fixes the box is broken. Severity::Medium.
+    LambdaStart02SelfHealFailed,
+    /// LAMBDA-AWS-01: a READ-ONLY AWS call failed (`DescribeInstances`,
+    /// `GetMetricData`, `GetParameter`). The check that depended on it is
+    /// degraded; nothing was changed. Severity::Medium.
+    LambdaAws01ReadCallFailed,
+    /// LAMBDA-AWS-02: a MUTATING AWS call failed (`StopInstances`,
+    /// `DisableRule`, `PutMetricData`, alarm state/action changes, workflow
+    /// dispatch). Split from LAMBDA-AWS-01 because a failed write can leave
+    /// the box or an alarm in an unintended state, while a failed read only
+    /// blinds a check. Severity::Medium.
+    LambdaAws02WriteCallFailed,
+    /// LAMBDA-CONFIG-01: a required environment variable is empty, so the
+    /// Lambda cannot do its job at all. This is a deploy/terraform defect,
+    /// not a runtime one — the same input will fail on every invocation
+    /// until the environment is fixed. Severity::Medium.
+    LambdaConfig01RequiredEnvMissing,
+    /// LAMBDA-NOTIFY-01: the operator could not be reached — an SNS publish,
+    /// a Telegram POST, a message relay, or the credential read that
+    /// precedes them failed. The condition that prompted the notification
+    /// still stands and is now unreported. Severity::Medium.
+    LambdaNotify01OperatorUnreachable,
+    /// LAMBDA-PORTAL-01: an operator-control-portal action failed. The
+    /// operator asked for something and did not get it; the portal response
+    /// carries which action. Severity::Medium.
+    LambdaPortal01ActionFailed,
+    /// LAMBDA-PROV-01: the deploy-provenance comparison was skipped because
+    /// a sha is unknown, so `tv-<env>-binary-sha-stale` cannot fire. This is
+    /// the blindness recorded in `dhan-rest-only-noise-lock-2026-07-14.md`
+    /// §2.3q made greppable by code. Severity::Medium.
+    LambdaProv01ShaUnknown,
+    /// LAMBDA-MINT-01: the Dhan access-token mint failed, so every consumer
+    /// keeps serving the previously published token until the next run.
+    /// Deliberately NOT DH-901: that code is the in-app token CONSUMER's
+    /// failure and carries its own alarm, and conflating producer with
+    /// consumer would make an existing alarm fire for a different component.
+    /// Severity::Medium.
+    LambdaMint01TokenMintFailed,
 }
 
 impl ErrorCode {
@@ -1192,6 +1272,15 @@ impl ErrorCode {
             Self::Cadence02DecisionSkipped => "CADENCE-02",
             Self::Cadence03SchedulerDegraded => "CADENCE-03",
             Self::Cadence05RecoveryDegraded => "CADENCE-05",
+            Self::LambdaStart01BoxNotRunning => "LAMBDA-START-01",
+            Self::LambdaStart02SelfHealFailed => "LAMBDA-START-02",
+            Self::LambdaAws01ReadCallFailed => "LAMBDA-AWS-01",
+            Self::LambdaAws02WriteCallFailed => "LAMBDA-AWS-02",
+            Self::LambdaConfig01RequiredEnvMissing => "LAMBDA-CONFIG-01",
+            Self::LambdaNotify01OperatorUnreachable => "LAMBDA-NOTIFY-01",
+            Self::LambdaPortal01ActionFailed => "LAMBDA-PORTAL-01",
+            Self::LambdaProv01ShaUnknown => "LAMBDA-PROV-01",
+            Self::LambdaMint01TokenMintFailed => "LAMBDA-MINT-01",
         }
     }
 
@@ -1446,6 +1535,23 @@ impl ErrorCode {
             // cross-fill recovery machinery degraded — cross-fill / the
             // honest gap is the floor; nothing fabricated. Medium.
             Self::Cadence05RecoveryDegraded => Severity::Medium,
+
+            // LAMBDA-* (2026-09-05): the AWS Lambda operations family.
+            // ALL NINE are Medium, and that is FORCED, not chosen — see the
+            // block comment at the variants. A High or Critical code here
+            // makes `error_code_alarm_coverage_guard` demand either a new
+            // CloudWatch alarm (money, against a measured margin, needing a
+            // dated operator quote) or an entry on a shrink-only exemption
+            // ratchet. Medium touches neither, so this family costs nothing.
+            Self::LambdaStart01BoxNotRunning
+            | Self::LambdaStart02SelfHealFailed
+            | Self::LambdaAws01ReadCallFailed
+            | Self::LambdaAws02WriteCallFailed
+            | Self::LambdaConfig01RequiredEnvMissing
+            | Self::LambdaNotify01OperatorUnreachable
+            | Self::LambdaPortal01ActionFailed
+            | Self::LambdaProv01ShaUnknown
+            | Self::LambdaMint01TokenMintFailed => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1620,6 +1726,20 @@ impl ErrorCode {
                 "docs/error-runbooks/futidx-4-error-codes.md"
             }
             // Dual-feed scoreboard PR-A (2026-07-10)
+            // LAMBDA-* (2026-09-05): one runbook for the whole family — the
+            // nine codes are grouped by operator ACTION, so one page holds
+            // nine short sections rather than nine near-identical files.
+            Self::LambdaStart01BoxNotRunning
+            | Self::LambdaStart02SelfHealFailed
+            | Self::LambdaAws01ReadCallFailed
+            | Self::LambdaAws02WriteCallFailed
+            | Self::LambdaConfig01RequiredEnvMissing
+            | Self::LambdaNotify01OperatorUnreachable
+            | Self::LambdaPortal01ActionFailed
+            | Self::LambdaProv01ShaUnknown
+            | Self::LambdaMint01TokenMintFailed => {
+                "docs/error-runbooks/lambda-ops-error-codes.md"
+            }
             Self::Scoreboard01AggregationDegraded => {
                 "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
             }
@@ -1904,6 +2024,15 @@ impl ErrorCode {
             Self::Cadence01LaneDegraded,
             Self::Cadence02DecisionSkipped,
             Self::Cadence03SchedulerDegraded,
+            Self::LambdaStart01BoxNotRunning,
+            Self::LambdaStart02SelfHealFailed,
+            Self::LambdaAws01ReadCallFailed,
+            Self::LambdaAws02WriteCallFailed,
+            Self::LambdaConfig01RequiredEnvMissing,
+            Self::LambdaNotify01OperatorUnreachable,
+            Self::LambdaPortal01ActionFailed,
+            Self::LambdaProv01ShaUnknown,
+            Self::LambdaMint01TokenMintFailed,
             Self::Cadence05RecoveryDegraded,
         ]
     }
@@ -2317,7 +2446,11 @@ mod tests {
                 // 2026-08-25: the tick spill tier's replay path — a rescued
                 // file QuestDB will never accept, set aside so the rest of
                 // the backlog can drain.
-                || s.starts_with("TICK-SPILL-");
+                || s.starts_with("TICK-SPILL-")
+                // 2026-09-05: the AWS Lambda operations family — 43 uncoded
+                // `error!` sites in crates/aws-lambdas, which no guard
+                // scanned until the crate list became filesystem discovery.
+                || s.starts_with("LAMBDA-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
