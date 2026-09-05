@@ -1349,7 +1349,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
   period             = 300
   # Maximum, not Average: the worst wait in the window IS the signal, and
   # averaging would let four healthy scrapes erase one five-second stall.
-  statistic = "Maximum"
+  statistic  = "Maximum"
   dimensions = local.app_dimensions
 
   # The gauge publishes only while the drain runs, and the box is stopped
@@ -1368,5 +1368,4 @@ resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
   # operator frees space or the datapoint ages out, whereas a falling dwell is
   # self-evidently the fold catching up -- a genuine recovery worth telling.
   ok_actions = local.app_alarm_actions
-
 }

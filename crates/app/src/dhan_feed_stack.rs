@@ -6442,10 +6442,11 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
         Some(WsLag::Measured(ms)) => {
             handles.histogram_for(connection_index).record(ms);
             // Also fold into the DAY distribution the 15:45 scoreboard
-            // persists. Added 2026-09-05: this fold had NO production caller,
-            // so `feed_scoreboard_daily.lag_p50/p99/max/samples` wrote the -1
-            // "not measured" sentinel every single day since the columns
-            // shipped. The value was computed here the whole time and simply
+            // persists. Added 2026-09-05: the fold lost its last production
+            // caller on 2026-07-17 and the 2026-08-09 Dhan revival did not
+            // bring one back, so `feed_scoreboard_daily.lag_p50/p99/max/samples`
+            // wrote the -1 "not measured" sentinel on every same-day run in
+            // between. The value was computed here the whole time and simply
             // never reached the table.
             //
             // The cast is exact, not merely bounded: `ws_lag_ms` builds this

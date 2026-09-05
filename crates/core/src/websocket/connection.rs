@@ -1801,6 +1801,14 @@ fn ws_bytes_to_bytes(payload: WsBytes) -> Bytes {
 mod tests {
     use super::*;
 
+    use tickvault_common::constants::{
+        DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL,
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, RESPONSE_CODE_FULL, RESPONSE_CODE_OI,
+        RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TWENTY_DEPTH_PACKET_SIZE,
+        TWO_HUNDRED_DEPTH_PACKET_SIZE,
+    };
+    use tickvault_common::types::{ExchangeSegment, SecurityId};
+
     /// The keepalive ping must NOT share the subscribe timeout.
     ///
     /// This send is awaited on the socket-owning task, so its bound is the
@@ -1851,13 +1859,6 @@ mod tests {
             "send_ping must not reference SUBSCRIBE_SEND_TIMEOUT at all"
         );
     }
-    use tickvault_common::constants::{
-        DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL,
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, RESPONSE_CODE_FULL, RESPONSE_CODE_OI,
-        RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TWENTY_DEPTH_PACKET_SIZE,
-        TWO_HUNDRED_DEPTH_PACKET_SIZE,
-    };
-    use tickvault_common::types::{ExchangeSegment, SecurityId};
 
     /// EVERY endpoint's URL must yield a request-target starting with `/`.
     ///
