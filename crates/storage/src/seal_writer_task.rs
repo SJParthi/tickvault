@@ -932,7 +932,7 @@ mod tests {
         let mut pipeline =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
         pipeline.submit(
-            mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0),
+            mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0),
             jan1_noon_utc(),
         );
         let mut writer = ShadowCandleWriter::for_test();
@@ -954,7 +954,7 @@ mod tests {
                     13 + i,
                     0,
                     TfIndex::M1,
-                    1_716_000_900 + i as u32,
+                    1_716_023_700 + i as u32,
                     100.0 + i as f64,
                 ),
                 jan1_noon_utc(),
@@ -982,7 +982,7 @@ mod tests {
                     13 + i,
                     0,
                     TfIndex::M1,
-                    1_716_000_900 + i as u32,
+                    1_716_023_700 + i as u32,
                     100.0 + i as f64,
                 ),
                 now,
@@ -1018,8 +1018,8 @@ mod tests {
         let mut pipeline =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0), now);
-        pipeline.submit(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0), now);
+        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0), now);
+        pipeline.submit(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0), now);
         let mut writer = ShadowCandleWriter::for_test();
 
         let outcome = drain_once(&mut pipeline, &mut writer, 16, now);
@@ -1039,7 +1039,7 @@ mod tests {
 
         // A SECOND failed cycle must not accumulate the first cycle's bytes:
         // the buffer is bounded to one drain batch forever.
-        pipeline.submit(mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0), now);
+        pipeline.submit(mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0), now);
         let outcome2 = drain_once(&mut pipeline, &mut writer, 16, now);
         assert_eq!(outcome2.ring_seals_popped, 1);
         assert_eq!(outcome2.rescued_to_spill, 1);
@@ -1082,7 +1082,7 @@ mod tests {
                     13 + i,
                     0,
                     TfIndex::M1,
-                    1_716_000_900 + i as u32,
+                    1_716_023_700 + i as u32,
                     100.0 + i as f64,
                 ),
                 now,
@@ -1140,7 +1140,7 @@ mod tests {
                     13 + i,
                     0,
                     TfIndex::M1,
-                    1_716_000_900 + i as u32,
+                    1_716_023_700 + i as u32,
                     100.0 + i as f64,
                 ),
                 now,
@@ -1211,8 +1211,8 @@ mod tests {
         let mut pipeline =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0), now);
-        pipeline.submit(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0), now);
+        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0), now);
+        pipeline.submit(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0), now);
         let mut writer = ShadowCandleWriter::for_test();
         drain_once(&mut pipeline, &mut writer, 16, now);
         assert_eq!(
@@ -1239,7 +1239,7 @@ mod tests {
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(64, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
         for i in 0..10 {
-            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900 + i, 100.0), now);
+            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700 + i, 100.0), now);
         }
         let mut writer = ShadowCandleWriter::for_test();
 
@@ -1270,7 +1270,7 @@ mod tests {
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(64, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
         for i in 0..3 {
-            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900 + i, 100.0), now);
+            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700 + i, 100.0), now);
         }
         let mut writer = ShadowCandleWriter::for_test();
 
@@ -1293,7 +1293,7 @@ mod tests {
         let mut pipeline =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0), now);
+        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0), now);
         let mut writer = ShadowCandleWriter::for_test();
 
         let outcome = drain_once(&mut pipeline, &mut writer, 16_384, now);
@@ -1311,8 +1311,8 @@ mod tests {
         let mut pipeline =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0), now);
-        pipeline.submit(mk_seal(13, 1, TfIndex::M1, 1_716_001_500, 200.0), now);
+        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0), now);
+        pipeline.submit(mk_seal(13, 1, TfIndex::M1, 1_716_024_300, 200.0), now);
         let mut writer = ShadowCandleWriter::for_test();
         let outcome = drain_once(&mut pipeline, &mut writer, 16, now);
         assert_eq!(outcome.ring_seals_popped, 2);

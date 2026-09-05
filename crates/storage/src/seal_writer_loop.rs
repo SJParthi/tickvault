@@ -725,9 +725,9 @@ mod tests {
         let (spill, dlq) = temp_pair("progress-real");
         let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
         let tx = runner.sender();
-        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("ok");
-        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("ok");
         let outcome = runner.run_one_cycle(chrono::Utc::now().timestamp());
         let mut p = SealWriterProgress::default();
@@ -814,11 +814,11 @@ mod tests {
 
         // Push 3 seals BEFORE starting the loop so the very first
         // tick has work to do.
-        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("ok");
-        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("ok");
-        tx.try_send(mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0))
+        tx.try_send(mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0))
             .expect("ok");
 
         let task = tokio::spawn(run_seal_writer_loop(
@@ -867,9 +867,9 @@ mod tests {
         // Give the spawned task a moment to enter `select!`
         tokio::time::sleep(Duration::from_millis(20)).await;
         // Push seals THEN cancel
-        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("ok");
-        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("ok");
         cancel_tx.send(true).expect("send");
         let outcome = tokio::time::timeout(Duration::from_millis(500), task)
@@ -914,7 +914,7 @@ mod tests {
         // A seal is buffered BEFORE the sender dies, so the assertion covers
         // both halves of the contract: the loop must exit, and it must take
         // the buffer with it rather than stranding it.
-        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("submit before the sender dies");
         drop(cancel_tx);
 
@@ -1078,7 +1078,7 @@ mod tests {
                 13,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i * 60,
+                1_716_023_700 + i * 60,
                 100.0 + f64::from(i),
             ))
             .expect("queue seal");

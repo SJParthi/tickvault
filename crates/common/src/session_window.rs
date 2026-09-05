@@ -77,8 +77,53 @@ impl WindowVerdict {
     }
 
     /// True when the row must NOT be written.
+    ///
+    /// # Only the DESIGNATED timestamp refuses. The receipt never does.
+    ///
+    /// CORRECTED 2026-09-05 by an adversarial review, and the first version of
+    /// this function was WRONG in the most expensive possible direction.
+    ///
+    /// It returned `true` for [`Self::ReceivedAtOutOfWindow`] too. The two
+    /// clocks differ by DELIVERY LAG, and this repository's own measured Dhan
+    /// lag (`websocket-connection-scope-lock.md` §E, 2026-07-06) is p50
+    /// **1.38 s**, p95 **14.93 s**, p99 **46.37 s**, max **198.69 s**. So a
+    /// trade stamped by the exchange at 15:39:30 -- squarely in window, and
+    /// part of the closing-auction stretch -- that reached us at 15:40:05 was
+    /// REFUSED, silently and permanently: the caller returns `Ok(())` and does
+    /// not mark the frame unapplied, so no replay ever re-offers it.
+    ///
+    /// At the measured p99 that discards the last ~46 seconds of every
+    /// session for the slowest 1% of ticks; at the measured max, the last
+    /// ~3.3 minutes. The module doc above warns in as many words against
+    /// discarding "the closing-auction prints" -- and the receipt leg
+    /// discarded them anyway.
+    ///
+    /// The distinction that fixes it: `ts` says WHAT THE ROW IS -- an event
+    /// that happened at that instant -- while `received_at` says how fast our
+    /// network was. A real print must never be dropped because the vendor was
+    /// slow, which is the operator's first principle ("not even a single tick
+    /// should be missed"). So the receipt is COUNTED and LOGGED, never
+    /// refused: see [`Self::is_noteworthy`].
+    ///
+    /// The operator's rule was "ts and received_at always between 9 am and
+    /// 3.39 pm". Its purpose is to stop OUT-OF-SESSION data polluting the
+    /// tables -- a restart at 18:00, a replay the next morning -- and `ts`
+    /// alone achieves that completely, because `ts` is the designated
+    /// timestamp every partition, query and retention sweep keys on.
     #[must_use]
     pub const fn is_refusal(self) -> bool {
+        matches!(self, Self::TsOutOfWindow)
+    }
+
+    /// True when the verdict is worth counting -- a refusal, OR an accepted
+    /// row whose receipt fell outside the window.
+    ///
+    /// Separate from [`Self::is_refusal`] so the late-arrival case stays
+    /// VISIBLE without being destructive. A rising
+    /// `received_at_out_of_window` count is the honest signal that the vendor
+    /// is delivering the close late; it is not a reason to delete the close.
+    #[must_use]
+    pub const fn is_noteworthy(self) -> bool {
         !matches!(self, Self::InWindow)
     }
 }
@@ -172,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict_requires_both_stamps_in_window() {
+    fn verdict_classifies_each_clock_independently() {
         let good = at(10 * 3600);
         let bad = at(16 * 3600);
         assert_eq!(verdict(good, Some(good)), WindowVerdict::InWindow);
@@ -180,7 +225,7 @@ mod tests {
         assert_eq!(
             verdict(good, Some(bad)),
             WindowVerdict::ReceivedAtOutOfWindow,
-            "an in-window ts does NOT excuse an out-of-window receipt"
+            "a late receipt is REPORTED distinctly -- it is counted, not refused"
         );
     }
 
@@ -192,7 +237,6 @@ mod tests {
         assert_eq!(verdict(at(2 * 3600), None), WindowVerdict::TsOutOfWindow);
     }
 
-    #[test]
     /// The label strings are an OPERATOR-FACING contract: they are the
     /// `reason` dimension on `tv_ticks_out_of_window_refused_total`, so a
     /// rename silently splits one series into two and the old one goes flat
@@ -217,16 +261,60 @@ mod tests {
         }
     }
 
-    fn is_refusal_and_reason_agree_on_every_variant() {
+    /// The never-running test that encoded the DEFECT.
+    ///
+    /// Until 2026-09-05 this function had NO `#[test]` attribute -- a stray
+    /// duplicate `#[test]` sat above the previous test instead, so that one
+    /// ran twice and this one never ran at all. It asserted
+    /// `ReceivedAtOutOfWindow.is_refusal()`, which is exactly the behaviour an
+    /// adversarial review then proved was destroying the close of every
+    /// session. A test that does not run cannot be wrong out loud; it is just
+    /// wrong quietly, and it took an outside reader to notice.
+    #[test]
+    fn only_the_designated_timestamp_refuses_a_row() {
         assert!(!WindowVerdict::InWindow.is_refusal());
         assert!(WindowVerdict::TsOutOfWindow.is_refusal());
-        assert!(WindowVerdict::ReceivedAtOutOfWindow.is_refusal());
-        assert_eq!(WindowVerdict::InWindow.reason(), "in_window");
-        assert_eq!(WindowVerdict::TsOutOfWindow.reason(), "ts_out_of_window");
-        assert_eq!(
-            WindowVerdict::ReceivedAtOutOfWindow.reason(),
-            "received_at_out_of_window"
+        assert!(
+            !WindowVerdict::ReceivedAtOutOfWindow.is_refusal(),
+            "a late RECEIPT must never delete a real print -- the two clocks \
+             differ by delivery lag, measured p99 46.37s on this very feed"
         );
+        // ...but it must still be COUNTED, or the lateness is invisible.
+        assert!(!WindowVerdict::InWindow.is_noteworthy());
+        assert!(WindowVerdict::TsOutOfWindow.is_noteworthy());
+        assert!(WindowVerdict::ReceivedAtOutOfWindow.is_noteworthy());
+    }
+
+    /// The closing-auction scenario, in the numbers this repository measured.
+    ///
+    /// Dhan lag on 2026-07-06: p50 1.38s, p95 14.93s, p99 46.37s, max
+    /// 198.69s (`websocket-connection-scope-lock.md` §E). A 15:39:30 print
+    /// delivered 35 seconds late lands at 15:40:05 -- past the window's
+    /// exclusive end. It MUST still be written.
+    #[test]
+    fn a_late_delivered_closing_print_is_kept_not_discarded() {
+        let event = at(15 * 3600 + 39 * 60 + 30); // 15:39:30, in window
+        let arrival = at(15 * 3600 + 40 * 60 + 5); // 15:40:05, out of window
+        let v = verdict(event, Some(arrival));
+        assert_eq!(v, WindowVerdict::ReceivedAtOutOfWindow);
+        assert!(
+            !v.is_refusal(),
+            "refusing this discards the closing auction whenever the vendor \
+             is >30s late, which the measured p99 says happens every session"
+        );
+        assert!(
+            v.is_noteworthy(),
+            "and it must be counted so lateness shows"
+        );
+    }
+
+    /// The pollution case the operator's rule actually exists to stop.
+    #[test]
+    fn an_out_of_session_event_is_still_refused_however_it_arrived() {
+        // A restart at 18:00 replaying an 18:00 event: ts decides, and refuses.
+        assert!(verdict(at(18 * 3600), Some(at(18 * 3600))).is_refusal());
+        // Even if it somehow arrived inside the window, the EVENT is out.
+        assert!(verdict(at(18 * 3600), Some(at(10 * 3600))).is_refusal());
     }
 
     #[test]

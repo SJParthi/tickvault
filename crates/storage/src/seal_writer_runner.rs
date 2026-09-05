@@ -869,7 +869,7 @@ mod tests {
                 13 + i,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i as u32,
+                1_716_023_700 + i as u32,
                 100.0 + i as f64,
             );
             tx.try_send(s).expect("try_send");
@@ -898,7 +898,7 @@ mod tests {
                 13 + i,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i as u32,
+                1_716_023_700 + i as u32,
                 100.0 + i as f64,
             ))
             .expect("try_send");
@@ -923,9 +923,9 @@ mod tests {
         let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
         let tx_a = runner.sender();
         let tx_b = runner.sender();
-        tx_a.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        tx_a.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("a");
-        tx_b.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        tx_b.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("b");
         let outcome = runner.run_one_cycle(jan1_noon_utc());
         assert_eq!(outcome.submitted_from_mpsc, 2);
@@ -938,9 +938,9 @@ mod tests {
         let (spill, dlq) = temp_pair("mpsc-full");
         let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 2, 16);
         let tx = runner.sender();
-        let s1 = mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
-        let s3 = mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0);
+        let s1 = mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        let s3 = mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0);
         tx.try_send(s1).expect("ok 1");
         tx.try_send(s2).expect("ok 2");
         let result = tx.try_send(s3);
@@ -964,15 +964,15 @@ mod tests {
         let tx = runner.sender();
         let now = jan1_noon_utc();
 
-        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("ok");
         let o1 = runner.run_one_cycle(now);
         assert_eq!(o1.submitted_from_mpsc, 1);
         assert_eq!(o1.drain.ring_seals_popped, 1);
 
-        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        tx.try_send(mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("ok");
-        tx.try_send(mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0))
+        tx.try_send(mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0))
             .expect("ok");
         let o2 = runner.run_one_cycle(now);
         assert_eq!(o2.submitted_from_mpsc, 2);
@@ -995,7 +995,7 @@ mod tests {
                 13 + i,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i as u32,
+                1_716_023_700 + i as u32,
                 100.0 + i as f64,
             ))
             .expect("ok");

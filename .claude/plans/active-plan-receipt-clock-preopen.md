@@ -406,6 +406,109 @@ needs its own dated authorization under the noise lock.
 
 ---
 
+- [x] **W6** Enforce the session window on the WRITE path — ticks, depth, candles
+  - Files: `crates/common/src/session_window.rs`,
+    `crates/storage/src/tick_persistence.rs`,
+    `crates/storage/src/depth_persistence.rs`,
+    `crates/storage/src/shadow_candle_writer.rs`,
+    `crates/storage/tests/session_window_gate_guard.rs`,
+    `crates/storage/tests/dhat_depth_append_zero_alloc.rs`,
+    `crates/common/tests/loss_counter_visibility_guard.rs`
+  - Tests: `session_window_gate_guard` (10, all bite-proven),
+    `session_window` unit (10), `tick_persistence` (66),
+    `depth_persistence` (59), `shadow_candle_writer` (36),
+    `dhat_depth_append_zero_alloc` (1),
+    `dhat_live_ingest_seam::out_of_window_refusal_does_not_allocate_per_tick`
+  - **Why this belongs to W1/W2 and not to a new plan:** W1b/W2 move candles
+    onto the receipt clock; this establishes what the window MEANS on every
+    write path first, so the two clocks are gated by one shared predicate
+    (`session_window::verdict` / `nanos_in_session_window`) instead of three
+    private opinions. `TICK_PERSIST_{START,END}_SECS_OF_DAY_IST` had named
+    this window for months with **no reader on any write path** —
+    `dhan_feed_stack.rs` says so in its own words: *"A row outside the window
+    is written because NOTHING STOPS THE WRITER."*
+
+  - **The three gates, and why each reads what it reads:**
+
+    | Table | Gate reads | Because |
+    |---|---|---|
+    | `ticks` | `row.ts_ist_nanos` AND `row.received_at_ist_nanos` | two genuine clocks; both must be in window |
+    | `market_depth` | `row.ts_nanos` only | depth has exactly ONE clock — its designated `ts` IS the receipt; the depth protocol carries no exchange timestamp field at all |
+    | `candles_<tf>` | `row.timestamp_ist_nanos` only | that is the BUCKET-OPEN instant, never the seal instant |
+
+  - **The last-bar trap, which is the whole design constraint on the candle
+    gate.** A candle row is BUILT at the seal, long after its bucket opens:
+    the M1 bucket opening 15:39:00 seals at watermark 15:40:02
+    (`CATCHUP_LATENESS_MARGIN_SECS = 2`), and `force_seal_all` at close plus
+    the boot recovery drain are later still. A gate testing when the row was
+    built — a wall clock, or a receipt stamp — would discard the final bar of
+    every session, every day, and D1 with it. Pinned by
+    `the_candle_gate_reads_the_bucket_and_never_the_seal_instant` and by
+    `the_final_bucket_of_the_session_is_written_even_though_it_seals_after_1540`.
+
+  - **A refusal is not a loss, and the distinction is load-bearing.** Every
+    refusal arm returns `Ok(())`. An `Err` from these writers is routed by the
+    caller into `note_unapplied` + `tv_{ticks,depth_rows}_dropped_total`, which
+    are ALARMED: returning `Err` would page the operator on every ordinary
+    pre-open row and train the one alarm that reports real loss into noise.
+    It would also hold the applied watermark back forever, since a re-offered
+    frame is refused again.
+
+  - **Two defects found in this work by adversarial review, both fixed:**
+    1. **C1 (severe, in already-pushed code).** `verdict` refused when EITHER
+       clock was out of window, so a 15:39:30 exchange print arriving 15:40:05
+       — inside the measured Dhan p99 delivery lag of 46 s — was silently
+       discarded. `is_refusal` is now narrowed to `TsOutOfWindow` alone, with
+       `is_noteworthy` counting the rest.
+    2. **M1.** A stray duplicate `#[test]` attribute left
+       `is_refusal_and_reason_agree_on_every_variant` with no attribute at all,
+       so it never ran — and it encoded the wrong invariant.
+
+  - **A guard that had stopped guarding, found by bite-proofing.** The first
+    version of the depth refusal assertion asked whether `return Ok(())`
+    appeared anywhere in the refusal region; a planted `Err` in one of three
+    arms PASSED. It now counts one `Ok` per counted arm and bans `return Err`
+    outright. Bite-proven in both directions, as were the depth gate removal,
+    the candle clock swap, the candle `feed` label, and double seeding.
+
+  - **Fixture archaeology, disclosed rather than quietly patched.** Fifteen
+    test fixtures across five modules used timestamps that are not plausible
+    epochs at all — `1` nanosecond, `34_200` (read as 09:30 seconds-of-day but
+    actually **1970-01-01**), `1_700_000_000` (03:43 IST once stamped). They
+    were free until something read them. Two of the repaired tests
+    (`runner_boot_drain_reports_pending_honestly_when_db_is_down`,
+    `real_rescue_path_end_to_end_is_recovered`) had begun reporting three
+    commits against a dead database — they were measuring the new band check,
+    not the database. Bases are now named constants with the arithmetic shown.
+
+  - **Observability.** Three counters —
+    `tv_{ticks,depth_rows,candle_rows}_out_of_window_refused_total` — each
+    labelled by reason, seeded at 0 beside their handles (one seed site, so it
+    cannot fall behind the reason vocabulary; the previous two-site version
+    already listed only two of three reasons), and logged by a throttled
+    power-of-two `warn!` carrying the true running total. Deliberately NOT
+    EMF-shipped: they measure the gate WORKING, so a series would chart normal
+    behaviour rather than a defect, and each name costs ~$0.30/mo against a
+    September forecast of $130.39 with the automatic `STOP_EC2_INSTANCES` line
+    at $135.00 — $4.61 of margin, and the noise lock's standing rule is that
+    the next addition arrives with a LEVER, not a cost note. All three are
+    allowlisted in `loss_counter_visibility_guard` with that reasoning stated.
+
+  - **Allocation.** All handles are pre-resolved; `note()` scans three
+    `&'static str` and increments. The macro form allocated ONCE PER TICK on
+    the drain task — DHAT measured 10,010 blocks over 10,000 ticks against a
+    ceiling of 500, caught by CI on 2026-09-05. The candle counter carries no
+    `feed` label for the same reason: `row.feed` varies per row there, and a
+    non-literal label value drops `metrics::counter!` to its allocating arm.
+
+  - **NOT claimed.** This gates the three market-data write paths. It does not
+    gate `tick_spill_replay::replay_spill_dir`, which POSTs raw ILP bytes
+    straight to QuestDB and so bypasses every gate for spill files written
+    before this change. And Muhurat sessions (18:00–19:30 IST) would be
+    refused across all 26 tables — `MUHURAT_PERSIST_{START,END}_SECS_OF_DAY_IST`
+    exist and `muhurat::current()` has **zero production readers**. Both are
+    flagged here, unfixed, rather than discovered later.
+
 ## Scenarios
 
 | # | Scenario | Expected |

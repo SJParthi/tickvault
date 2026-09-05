@@ -1679,18 +1679,26 @@ pub struct TickWriter {
 /// measure the FOLD cannot cover this path, because their receipt is
 /// deliberately in-window.
 #[derive(Debug)]
-struct OutOfWindowCounters {
-    ts_out: metrics::Counter,
-    received_at_out: metrics::Counter,
-    band: metrics::Counter,
+pub(crate) struct OutOfWindowCounters {
+    /// The reason vocabulary this writer uses, parallel to `handles`.
+    ///
+    /// Carried rather than hard-coded because DEPTH speaks a different one.
+    /// `ticks` has two clocks and says `ts_out_of_window`; `market_depth` has
+    /// exactly ONE clock -- its designated `ts` IS the arrival stamp, there is
+    /// no exchange timestamp anywhere in the depth protocol -- so it says
+    /// `arrival_out_of_window`. Reusing the tick words there would tell an
+    /// operator the EXCHANGE stamped the row out of window, which is not a
+    /// thing depth can even express.
+    reasons: [&'static str; 3],
+    /// Pre-resolved handles, index-aligned with `reasons`.
+    handles: [metrics::Counter; 3],
 }
 
 impl OutOfWindowCounters {
-    fn new(feed: Feed) -> Self {
-        use tickvault_common::session_window::WindowVerdict;
+    pub(crate) fn new(feed: Feed, counter: &'static str, reasons: [&'static str; 3]) -> Self {
         let make = |reason: &'static str| {
             let c = metrics::counter!(
-                TICK_OUT_OF_WINDOW_COUNTER,
+                counter,
                 "feed" => feed.as_str(),
                 "reason" => reason,
             );
@@ -1702,14 +1710,17 @@ impl OutOfWindowCounters {
             c
         };
         Self {
-            ts_out: make(WindowVerdict::TsOutOfWindow.reason()),
-            received_at_out: make(WindowVerdict::ReceivedAtOutOfWindow.reason()),
-            band: make(TICK_TS_OUT_OF_BAND_REASON),
+            reasons,
+            handles: [make(reasons[0]), make(reasons[1]), make(reasons[2])],
         }
     }
 
     /// Allocation-free on the common path: pick a pre-resolved handle,
     /// increment, and log only on a power of two.
+    ///
+    /// The scan is over exactly THREE `&'static str` of at most 26 bytes, so
+    /// it is O(1) with a fixed bound and no allocation -- the DHAT gates on
+    /// both the tick seam and `dhat_depth_append_zero_alloc` hold it to that.
     ///
     /// The `warn!` lives HERE, beside the increment, and not in a helper --
     /// because a log three functions away is a log nobody finds from the
@@ -1720,32 +1731,32 @@ impl OutOfWindowCounters {
     /// `let h = metrics::counter!(..)` handle, but not `const -> struct field ->
     /// method`, so it locates the emit inside `OutOfWindowCounters::new` --
     /// where no log sits -- rather than here. That is the same chain already
-    /// allowlisted for `tv_dhan_feed_ingest_seq_refused_total`, and this
-    /// counter is allowlisted beside it for the same reason.
+    /// allowlisted for `tv_dhan_feed_ingest_seq_refused_total`, and both of
+    /// these counters are allowlisted beside it for the same reason.
     ///
     /// Deliberately a log and not an EMF metric. The guard offers three routes;
-    /// this takes the log because (a) the counter measures the gate WORKING --
-    /// every pre-open tick increments it, so an EMF series would chart normal
-    /// behaviour, not a defect -- and (b) an EMF name costs ~0.30 USD/mo
-    /// against a September forecast of 130.39 with the automatic
-    /// STOP_EC2_INSTANCES line at 135.00, i.e. 4.61 of margin, and the noise
-    /// lock's standing rule is that the next addition comes with a LEVER, not a
-    /// cost note. This change carries no lever.
+    /// this takes the log because (a) these counters measure the gate WORKING
+    /// -- outside 09:00-15:39:59 IST every row increments one of them, so an
+    /// EMF series would chart normal behaviour, not a defect -- and (b) an EMF
+    /// name costs ~0.30 USD/mo against a September forecast of 130.39 with the
+    /// automatic STOP_EC2_INSTANCES line at 135.00, i.e. 4.61 of margin, and
+    /// the noise lock's standing rule is that the next addition comes with a
+    /// LEVER, not a cost note. This change carries no lever.
     ///
     /// Powers of two, so a pre-open storm costs one line per doubling rather
-    /// than one per tick; the running total rides in the line so a throttled
-    /// message still states the true magnitude. ~14 emissions over 10,000
-    /// refusals, far inside the DHAT ceiling of 500.
-    fn note(&self, reason: &'static str) {
-        use tickvault_common::session_window::WindowVerdict;
-        let counter = if reason == WindowVerdict::TsOutOfWindow.reason() {
-            &self.ts_out
-        } else if reason == WindowVerdict::ReceivedAtOutOfWindow.reason() {
-            &self.received_at_out
-        } else {
-            &self.band
-        };
-        counter.increment(1);
+    /// than one per row; the running total rides in the line so a throttled
+    /// message still states the true magnitude.
+    pub(crate) fn note(&self, reason: &'static str) {
+        let mut idx = self.reasons.len() - 1;
+        let mut i = 0;
+        while i < self.reasons.len() {
+            if self.reasons[i] == reason {
+                idx = i;
+                break;
+            }
+            i += 1;
+        }
+        self.handles[idx].increment(1);
 
         static SEEN: AtomicU64 = AtomicU64::new(0);
         let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -1754,11 +1765,11 @@ impl OutOfWindowCounters {
                 code = ErrorCode::StorageGapTickDedupSegment.code_str(),
                 reason,
                 refused_total = total,
-                "a tick row was REFUSED by the session-window gate and not \
-                 written. This is a deliberate refusal, NOT tick loss: the \
-                 operator's rule is that every persisted row carries a ts AND a \
-                 received_at inside 09:00:00-15:39:59.999 IST. Throttled to \
-                 powers of two; refused_total is the true running count."
+                "a row was REFUSED or flagged by the session-window gate. A \
+                 refusal is deliberate, NOT data loss: the operator's rule is \
+                 that every persisted row sits inside 09:00:00-15:39:59.999 \
+                 IST. Throttled to powers of two; refused_total is the true \
+                 running count across every gated writer in this process."
             );
         }
     }
@@ -1779,6 +1790,36 @@ pub const TICK_OUT_OF_WINDOW_COUNTER: &str = "tv_ticks_out_of_window_refused_tot
 /// date at all". Folding it into either would hide a corrupt-frame signal
 /// inside an ordinary pre-open count.
 pub const TICK_TS_OUT_OF_BAND_REASON: &str = "ts_out_of_plausible_band";
+
+/// The three reason labels `ticks` reports, in the order the counter handles
+/// are resolved.
+///
+/// Index 2 is the fallback arm of [`OutOfWindowCounters::note`], so the band
+/// reason must sit there: an unrecognised reason is counted as the most
+/// alarming of the three rather than silently attributed to a time-of-day
+/// refusal.
+pub const TICK_OUT_OF_WINDOW_REASONS: [&str; 3] = [
+    tickvault_common::session_window::WindowVerdict::TsOutOfWindow.reason(),
+    tickvault_common::session_window::WindowVerdict::ReceivedAtOutOfWindow.reason(),
+    TICK_TS_OUT_OF_BAND_REASON,
+];
+
+/// Build the session-window counters for a TICK writer.
+///
+/// Exists so [`TICK_OUT_OF_WINDOW_COUNTER`] is named exactly ONCE outside its
+/// own declaration. That is not tidiness: `loss_counter_visibility_guard`
+/// treats every line mentioning a counter const as an emit site and asks
+/// whether a log sits within twelve lines AFTER it. Spelling the const at the
+/// three struct-literal sites put it nine lines above the `error!` in the
+/// ILP-connect failure arm, so the guard reported this counter as reachable on
+/// the strength of a log about a completely different event. An accidental
+/// pass is worse than a recorded exemption -- it retires the question without
+/// answering it. With the const named only here, the guard's verdict is honest
+/// (no log is near, because the real one is in `note()` two indirections away)
+/// and the allowlist row states the reason in the open.
+fn tick_out_of_window_counters(feed: Feed) -> OutOfWindowCounters {
+    OutOfWindowCounters::new(feed, TICK_OUT_OF_WINDOW_COUNTER, TICK_OUT_OF_WINDOW_REASONS)
+}
 
 /// Publish a zero on this feed's drop series before any row can be written.
 ///
@@ -1822,18 +1863,15 @@ fn register_drop_baseline(feed: Feed) {
     // delta baseline, so the one event that invalidates the rescue proof
     // publishes nothing.
     metrics::counter!(TICK_RESCUE_ABANDONED_COUNTER, "writer" => "tick").increment(0);
-    // 2026-09-05: the session-window refusal series, BOTH reasons. Same
-    // delta-baseline rule as every counter above -- and it bites harder here,
-    // because on a healthy weekday `received_at_out_of_window` should fire
-    // exactly zero times, so its first-ever increment is the one that matters
-    // and would otherwise be swallowed as the baseline.
-    for reason in [
-        tickvault_common::session_window::WindowVerdict::TsOutOfWindow.reason(),
-        tickvault_common::session_window::WindowVerdict::ReceivedAtOutOfWindow.reason(),
-    ] {
-        metrics::counter!(TICK_OUT_OF_WINDOW_COUNTER, "feed" => feed.as_str(), "reason" => reason)
-            .increment(0);
-    }
+    // 2026-09-05: the session-window refusal series is seeded in
+    // `OutOfWindowCounters::new`, not here. It was seeded in BOTH places for
+    // half a day, and the copy here listed only TWO of the three reasons --
+    // `ts_out_of_plausible_band` was missing, so on the one shape that matters
+    // (a garbage epoch) the first increment would still have been swallowed as
+    // the CloudWatch delta baseline. Two seed sites for one series is how that
+    // happens: the second one is written from memory of the first. Seeding
+    // lives with the handles, which is the only place that cannot fall behind
+    // the reason vocabulary, because it IS the reason vocabulary.
     // 2026-09-05: the optional-price drop series. It fires when a tick
     // carries a non-finite optional price and that field is dropped from
     // the row — rare by construction, which is exactly what makes the
@@ -1860,7 +1898,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
-                    out_of_window: OutOfWindowCounters::new(feed),
+                    out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
@@ -1881,7 +1919,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
-                    out_of_window: OutOfWindowCounters::new(feed),
+                    out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
@@ -1920,7 +1958,7 @@ impl TickWriter {
             pending_min_seq: 0,
             pending_max_seq: 0,
             feed,
-            out_of_window: OutOfWindowCounters::new(feed),
+            out_of_window: tick_out_of_window_counters(feed),
             last_capture_seq: 0,
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
             offload: None,
@@ -2038,8 +2076,14 @@ impl TickWriter {
                     row.ts_ist_nanos,
                     row.received_at_ist_nanos,
                 );
-                if verdict.is_refusal() {
+                // COUNT first, REFUSE second, and they are not the same set.
+                // A late RECEIPT is noteworthy but never a refusal -- see
+                // `WindowVerdict::is_refusal`, which records why refusing it
+                // was destroying the closing auction at the measured p99 lag.
+                if verdict.is_noteworthy() {
                     self.out_of_window.note(verdict.reason());
+                }
+                if verdict.is_refusal() {
                     return Ok(());
                 }
                 self.append_row(&row)
