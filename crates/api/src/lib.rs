@@ -388,6 +388,72 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
 mod tests {
     use super::*;
 
+    /// Assert that a built router actually SERVES the configured origin, and
+    /// that an origin which was NOT configured is not echoed back.
+    ///
+    /// ADDED 2026-09-05. The three `build_router*` tests below previously ended
+    /// in `let _router = build_router(state, &origins, ..);` and asserted
+    /// nothing — so "build a router with custom origins" was proven only to
+    /// the extent that it did not panic. Nothing connected the origin list a
+    /// caller passes to what a browser is actually told, which is the only
+    /// property that matters on port 3001 (publicly funnelled).
+    ///
+    /// The negative half is the security half: a layer that reflected every
+    /// Origin back, or answered `*`, would satisfy the positive assertion
+    /// alone while allowing every site on the internet.
+    async fn assert_origin_is_allowed_on_the_wire(router: Router, configured_origin: &str) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // An origin no test configures anywhere, so a pass here cannot be luck.
+        const UNCONFIGURED: &str = "https://attacker.example.net";
+
+        let allow_header = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let configured = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(axum::http::header::ORIGIN, configured_origin)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            allow_header(&configured).as_deref(),
+            Some(configured_origin),
+            "a configured origin must be echoed in access-control-allow-origin; \
+             without this the origin list a caller passes is never proven to \
+             reach the wire"
+        );
+
+        let stranger = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(axum::http::header::ORIGIN, UNCONFIGURED)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let got = allow_header(&stranger);
+        assert!(
+            got.as_deref() != Some(UNCONFIGURED) && got.as_deref() != Some("*"),
+            "an UNCONFIGURED origin was allowed (header: {got:?}). A layer that \
+             reflects any Origin, or answers `*`, opens the API to every site \
+             on the internet — and would pass the positive assertion above."
+        );
+    }
+
     /// Helper: render the resolved origins as strings so assertions read as
     /// the operator would state them.
     fn resolved(origins: &[String]) -> Vec<String> {
@@ -573,8 +639,8 @@ mod tests {
         let _router = build_router(state, &[], true);
     }
 
-    #[test]
-    fn test_build_router_with_custom_origins() {
+    #[tokio::test]
+    async fn test_build_router_with_custom_origins() {
         let state = state::SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -607,7 +673,8 @@ mod tests {
             "http://localhost:3000".to_string(),
             "https://dashboard.example.com".to_string(),
         ];
-        let _router = build_router(state, &origins, true);
+        let router = build_router(state, &origins, true);
+        assert_origin_is_allowed_on_the_wire(router, "https://dashboard.example.com").await;
     }
 
     // -------------------------------------------------------------------
@@ -1121,8 +1188,8 @@ mod tests {
     // build_router: unknown route returns 404
     // -------------------------------------------------------------------
 
-    #[test]
-    fn test_build_router_live_mode_with_origins() {
+    #[tokio::test]
+    async fn test_build_router_live_mode_with_origins() {
         let state = state::SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -1153,7 +1220,8 @@ mod tests {
         );
         let origins = vec!["http://localhost:3000".to_string()];
         // dry_run=false exercises the live-mode auth path (auto-generates token)
-        let _router = build_router(state, &origins, false);
+        let router = build_router(state, &origins, false);
+        assert_origin_is_allowed_on_the_wire(router, "http://localhost:3000").await;
     }
 
     #[tokio::test]
