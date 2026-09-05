@@ -3422,11 +3422,43 @@ where
     // idleness the instant it comes up.
     ticker.tick().await;
 
-    // Per-socket count of frames the ring refused, used only to throttle the
-    // log below. Scoped to this drain call, so a reconnect starts the ladder
-    // again — deliberate: a fresh connection that immediately backs up is
-    // worth hearing about even if the previous one already reported.
+    // Per-socket counts of the three degraded frame outcomes, used ONLY to
+    // throttle the logs below. Scoped to this drain call, so a reconnect
+    // starts each ladder again — deliberate: a fresh connection that
+    // immediately backs up is worth hearing about even if the previous one
+    // already reported.
+    //
+    // ALL THREE are throttled, and the two that were not are the reason this
+    // comment is now three counters instead of one.
+    //
+    // Until 2026-09-05 only `ring_full_seen` existed. The `WalDropped` and
+    // `CapturedLiveOnly` arms logged UNCONDITIONALLY, once per frame — on
+    // THIS task, the one that owns the socket and must never stop polling
+    // `recv()`. That is worse than it sounds, because of WHEN those two arms
+    // fire: the write-ahead queue refuses a frame exactly when its writer
+    // thread is stalled behind a saturated device (`ws_frame_spill.rs`
+    // "writer stalled"), which is the 2026-08-25 disk-pinned condition. So a
+    // saturated disk converted itself into 5,000-12,500 field-captured,
+    // JSON-formatted tracing events per second injected into the socket read
+    // loop. `tracing_appender::non_blocking` keeps the WRITE off this thread;
+    // it does not keep the FORMATTING off it, and its bounded queue then
+    // drops — so the storm also erased the evidence that it happened.
+    //
+    // Self-amplifying, and invisible: a read task that stops polling is what
+    // Dhan's backpressure layer classifies as a slow consumer, and a slow
+    // consumer is skipped forward to "the latest available state" with no
+    // sequence number for us to detect the gap.
+    //
+    // The rule was already written down, twenty lines below, on the arm that
+    // did follow it: "A slow consumer must not be able to drown the log it is
+    // being reported in." These two arms sat in the same `match` and did not.
+    // The counters `tv_dhan_ws_wal_dropped_total` and the ring-full pair carry
+    // the exact counts, so throttling the LINES loses no quantity — only
+    // per-frame granularity on two outcomes whose per-frame detail nobody can
+    // read at 12,500/sec anyway.
     let mut ring_full_seen: u64 = 0;
+    let mut wal_dropped_seen: u64 = 0;
+    let mut captured_live_only_seen: u64 = 0;
 
     // When we last sent a client keepalive ping on this socket.
     //
@@ -3971,14 +4003,30 @@ where
                             // Loud, but the reader does NOT stop draining:
                             // stopping would cost the pong and turn one lost
                             // frame into a disconnect.
-                            error!(
-                                code = ErrorCode::WsGapConnectionState.code_str(),
-                                endpoint = supervisor.slot().endpoint.as_str(),
-                                pool_index = supervisor.slot().pool_index,
-                                "write-ahead log refused a Dhan frame AND the ring refused it \
-                                 too — that frame is lost; the reader keeps draining so the \
-                                 socket is not also lost"
-                            );
+                            //
+                            // Throttled by powers of two for the reason the
+                            // counter declaration gives at length: this arm
+                            // fires when the WAL writer is stalled behind a
+                            // saturated disk, i.e. thousands of times a
+                            // second, ON the task that owns the socket. An
+                            // unthrottled line here turns a disk problem into
+                            // a read-task stall, which is the one failure that
+                            // costs ticks upstream where no counter can see
+                            // them. The count is not lost: it is carried
+                            // exactly by `tv_dhan_ws_wal_dropped_total` and
+                            // repeated in the field below.
+                            wal_dropped_seen = wal_dropped_seen.saturating_add(1);
+                            if wal_dropped_seen.is_power_of_two() {
+                                error!(
+                                    code = ErrorCode::WsGapConnectionState.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    lost_on_this_socket = wal_dropped_seen,
+                                    "write-ahead log refused a Dhan frame AND the ring refused \
+                                     it too — that frame is lost; the reader keeps draining so \
+                                     the socket is not also lost"
+                                );
+                            }
                         }
                         if outcome == FrameSinkOutcome::CapturedLiveOnly {
                             // Degraded, not lost, and the difference is worth a
@@ -3987,14 +4035,26 @@ where
                             // reach the database this session and only a crash
                             // before the next flush would lose them. Before
                             // 2026-09-05 this frame was discarded outright.
-                            warn!(
-                                code = ErrorCode::WsGapConnectionState.code_str(),
-                                endpoint = supervisor.slot().endpoint.as_str(),
-                                pool_index = supervisor.slot().pool_index,
-                                "write-ahead log refused a Dhan frame but the ring accepted it — \
-                                 the frame IS folded into the database this session and is NOT \
-                                 replayable, so only a crash before the next flush loses it"
-                            );
+                            //
+                            // Throttled for the same reason as the arm above,
+                            // and it needs it MORE: this outcome is the common
+                            // one under a stalled WAL writer (the ring is
+                            // healthy, only the write-ahead queue is full), so
+                            // it is the arm that would actually produce the
+                            // per-frame storm.
+                            captured_live_only_seen = captured_live_only_seen.saturating_add(1);
+                            if captured_live_only_seen.is_power_of_two() {
+                                warn!(
+                                    code = ErrorCode::WsGapConnectionState.code_str(),
+                                    endpoint = supervisor.slot().endpoint.as_str(),
+                                    pool_index = supervisor.slot().pool_index,
+                                    degraded_on_this_socket = captured_live_only_seen,
+                                    "write-ahead log refused a Dhan frame but the ring accepted \
+                                     it — the frame IS folded into the database this session and \
+                                     is NOT replayable, so only a crash before the next flush \
+                                     loses it"
+                                );
+                            }
                         }
                         if outcome == FrameSinkOutcome::RingFull {
                             // 2026-08-11: this outcome used to bump a counter
@@ -7997,5 +8057,88 @@ mod tests {
              to ~15 ms at the worst permitted slew — three orders of magnitude inside a \
              one-second bucket."
         );
+    }
+
+    /// EVERY degraded frame outcome must throttle its log line.
+    ///
+    /// This is not a style rule. The three arms live on the task that OWNS
+    /// THE SOCKET, and two of them fire exactly when the write-ahead writer
+    /// is stalled behind a saturated disk — thousands of times a second. An
+    /// unthrottled line there spends the read task on `tracing` field capture
+    /// and JSON formatting instead of on `recv()`, which is what Dhan's
+    /// backpressure layer classifies as a slow consumer; a slow consumer is
+    /// skipped forward to "the latest available state", and with no sequence
+    /// number in the protocol those ticks are gone with nothing to count
+    /// them. The log storm also overruns `non_blocking`'s bounded queue, so
+    /// it erases its own evidence.
+    ///
+    /// `RingFull` carried this throttle from 2026-08-11 and its comment
+    /// states the rule — "A slow consumer must not be able to drown the log
+    /// it is being reported in." `WalDropped` and `CapturedLiveOnly` sat in
+    /// the SAME `match` without it until 2026-09-05. That is why this guard
+    /// checks all three by name rather than trusting the rule to be read.
+    #[test]
+    fn every_degraded_frame_outcome_throttles_its_log() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        // Anchor on the match arms themselves. Each arm's span runs to the
+        // start of the next one, so a throttle belonging to a NEIGHBOUR can
+        // never satisfy the arm under test — the failure mode that would make
+        // this guard pass vacuously.
+        let arms = [
+            (
+                "FrameSinkOutcome::WalDropped",
+                "wal_dropped_seen",
+                "FrameSinkOutcome::CapturedLiveOnly",
+            ),
+            (
+                "FrameSinkOutcome::CapturedLiveOnly",
+                "captured_live_only_seen",
+                "FrameSinkOutcome::RingFull",
+            ),
+            (
+                "FrameSinkOutcome::RingFull",
+                "ring_full_seen",
+                "\n        }",
+            ),
+        ];
+
+        for (outcome, counter, next) in arms {
+            let arm_start = production
+                .rfind(&format!("if outcome == {outcome} {{"))
+                .unwrap_or_else(|| panic!("the {outcome} arm must exist on the read task"));
+            let rest = &production[arm_start..];
+            let arm = rest.split(next).next().unwrap_or(rest);
+
+            assert!(
+                arm.contains(&format!("{counter}.is_power_of_two()")),
+                "the {outcome} arm must gate its log on {counter}.is_power_of_two(). \
+                 It runs on the socket-owning task; an unthrottled line there converts a \
+                 stalled disk into a stalled reader, and a stalled reader is what gets us \
+                 skipped forward by the vendor with no sequence number to detect it."
+            );
+            assert!(
+                arm.contains(&format!("{counter} = {counter}.saturating_add(1)")),
+                "the {outcome} arm must advance {counter} with saturating_add — a wrapping \
+                 counter would silently restart the power-of-two ladder and re-open the storm"
+            );
+        }
+
+        // The counters must be per-drain-call locals, so a reconnect restarts
+        // each ladder. A `static` would make the first backed-up socket of the
+        // session silence every later one.
+        for counter in [
+            "ring_full_seen",
+            "wal_dropped_seen",
+            "captured_live_only_seen",
+        ] {
+            assert!(
+                production.contains(&format!("let mut {counter}: u64 = 0;")),
+                "{counter} must be a per-drain-call local: a process-wide counter would let \
+                 one early storm mute every socket for the rest of the session"
+            );
+        }
     }
 }

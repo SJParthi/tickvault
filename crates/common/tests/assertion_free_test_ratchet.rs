@@ -64,7 +64,15 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// a panic, NAME it so (`..._no_panic`, `..._never_panics`,
 /// `..._degrades_without_panic`) and this scanner will not count it — which is
 /// the point: the name is what tells the next reader what was proven.
-const ASSERTION_FREE_BUDGET: usize = 183;
+///
+/// 183 → 180 on 2026-09-05: four `test_disabled_service_*` tests in
+/// `notification/service.rs` now assert that a disabled notifier COUNTS every
+/// alert it drops. The budget moved by THREE, not four, and the reason is
+/// worth knowing before the next drop: one of them was named
+/// `..._notify_does_not_panic`, so `NO_PANIC_NAME_MARKERS` had already exempted
+/// it from the count. Converting a name-exempt test improves the test and
+/// moves this number not at all — so measure, never subtract.
+const ASSERTION_FREE_BUDGET: usize = 180;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [
