@@ -25,16 +25,30 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
     // verification tail (next elements) is unchanged and still proves the
     // counts actually reached zero — a botched wipe reports WIPE-PARTIAL,
     // never a silent success.
+    //
+    // 2026-09-05: `market_depth` was MISSING from both halves -- the target
+    // predicate and the verification tail -- so `wipe-questdb` truncated
+    // everything else and printed WIPE-COMPLETE with the LARGEST table in the
+    // process untouched (measured 1,530,651,649 rows/session, 299 GB). That is
+    // a false OK on a destructive tool, and it is why the 2026-09-05 wipe had
+    // to drop the table by hand over EC2 Instance Connect after this action
+    // reported success. Quote 21 of that day names `market_depth` in the
+    // authorized wipe set explicitly, so the omission was a defect against the
+    // operator's own written scope, not a deliberate carve-out.
+    //
+    // It is in BOTH halves now. Verification-only would have been worse than
+    // useless: the tool would report WIPE-PARTIAL forever while never
+    // truncating the table it complains about.
     r#"QDB='http://127.0.0.1:9000'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" | tail -n +2 | tr -d '"\r' | sed '/^$/d')
-TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || index($0,"candles_")==1 || $0=="prev_day_ohlcv" || $0=="rest_spot_1m" || $0=="rest_option_chain_1m" || $0=="rest_option_contract_1m" || $0=="rest_fetch_audit"' | sort)
+TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || index($0,"candles_")==1 || $0=="prev_day_ohlcv" || $0=="rest_spot_1m" || $0=="rest_option_chain_1m" || $0=="rest_option_contract_1m" || $0=="rest_fetch_audit"' | sort)
 echo "WIPE-TARGETS $(printf '%s\n' "$TARGETS" | sed '/^$/d' | wc -l | tr -d ' ') $(printf '%s\n' "$TARGETS" | sed '/^$/d' | paste -sd' ' -)"
 for t in $TARGETS; do
   if curl -fsS --max-time 30 --get --data-urlencode "query=TRUNCATE TABLE $t" "$QDB/exec" >/dev/null; then echo "TRUNCATED $t"; else echo "TRUNCATE-FAILED $t"; fi
 done"#,
     r#"systemctl enable tickvault || true"#,
     r#"systemctl start tickvault || true"#,
-    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); C=$(qc candles_1m); S=$(qc rest_spot_1m); O=$(qc rest_option_chain_1m); K=$(qc rest_option_contract_1m); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} candles_1m=${C:-?} rest_spot_1m=${S:-?} rest_option_chain_1m=${O:-?} rest_option_contract_1m=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
+    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); D=$(qc market_depth); C=$(qc candles_1m); P=$(qc prev_day_ohlcv); S=$(qc rest_spot_1m); O=$(qc rest_option_chain_1m); K=$(qc rest_option_contract_1m); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} market_depth=${D:-?} candles_1m=${C:-?} prev_day_ohlcv=${P:-?} rest_spot_1m=${S:-?} rest_option_chain_1m=${O:-?} rest_option_contract_1m=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${D:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${P:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
 ];
 
 /// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.
