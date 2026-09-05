@@ -2255,3 +2255,136 @@ rules:
       salvages the well-formed lines per the runbook (safe to repeat — the
       ticks dedup key carries capture_seq). No auto-action: the blocking
       condition is already resolved by the quarantine itself.
+
+  # ------------------------------------------------------------------
+  # LAMBDA-* — the AWS Lambda operations family (2026-09-05)
+  #
+  # 43 production `error!` sites in crates/aws-lambdas carried no code at
+  # all until this family landed, because error_code_tag_guard walked a
+  # hardcoded six-name crate list against an eight-crate workspace. They
+  # sit in the components that page the operator, so these were failures
+  # in the paging machinery that could not themselves page.
+  #
+  # EVERY one of the nine is `escalate`, and none carries an auto-action.
+  # That is deliberate rather than lazy: every remedy in this family is
+  # either an AWS console/CLI action on the PROD BOX (start, stop, an IAM
+  # or terraform change) or a credential rotation. Auto-triage exists to
+  # restart a component that is safe to restart; nothing here is.
+  # ------------------------------------------------------------------
+
+  - name: lambda-start-01-box-state-wrong-escalate
+    match:
+      code: LAMBDA-START-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      LAMBDA-START-01 = the prod box is not in the state the schedule says
+      it should be. A box that did not start costs a whole trading session;
+      one still running past 17:30 bills. Escalate — the remedy is an
+      operator start/stop decision, never an automatic one.
+
+  - name: lambda-start-02-self-heal-failed-escalate
+    match:
+      code: LAMBDA-START-02
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      LAMBDA-START-02 = the automation that fixes the box is itself broken.
+      Retrying is what already failed, and an AZ capacity refusal can never
+      be satisfied by a retry in the same zone. Escalate.
+
+  - name: lambda-aws-01-read-call-failed-escalate
+    match:
+      code: LAMBDA-AWS-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      LAMBDA-AWS-01 = a read-only AWS call failed, so a check is BLINDED
+      but nothing was changed. Escalate rather than auto-act: a blinded
+      check is not a failed check, and the operator must confirm what it
+      was watching is healthy by another route before standing down.
+
+  - name: lambda-aws-02-write-call-failed-escalate
+    match:
+      code: LAMBDA-AWS-02
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      LAMBDA-AWS-02 = a mutating AWS call failed, so the box or an alarm may
+      be in an unintended state — a failed DisableRule leaves the morning
+      auto-start armed after a budget stop, a failed alarm change leaves an
+      alarm armed overnight or disarmed all session. Escalate.
+
+  - name: lambda-config-01-required-env-missing-escalate
+    match:
+      code: LAMBDA-CONFIG-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      LAMBDA-CONFIG-01 = a deploy/terraform defect, not a runtime one: the
+      same input fails on EVERY invocation until the environment is fixed.
+      A kill-switch that cannot read the instance id cannot stop the box.
+      Escalate; a retry cannot help, hence the longer cooldown.
+
+  - name: lambda-notify-01-operator-unreachable-escalate
+    match:
+      code: LAMBDA-NOTIFY-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      LAMBDA-NOTIFY-01 = the alerting path itself broke, so whatever
+      prompted the notification is still true and now unreported. Escalate,
+      and look for the PRECEDING error in the same invocation — that is the
+      one nobody was told about.
+
+  - name: lambda-portal-01-action-failed-escalate
+    match:
+      code: LAMBDA-PORTAL-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      LAMBDA-PORTAL-01 = the operator asked the control portal for something
+      and did not get it. Escalate to the person who asked. Most portal
+      actions dispatch SSM to the box, so a stopped box or an unregistered
+      SSM agent fails all of them.
+
+  - name: lambda-prov-01-sha-unknown-escalate
+    match:
+      code: LAMBDA-PROV-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      LAMBDA-PROV-01 = the deploy-provenance comparison was skipped, so the
+      stale-binary alarm CANNOT fire — it sits OK on no-data. While this
+      fires the box could be running old code and nothing would say so.
+      Escalate; the remedy is a credential or mirror fix, never a retry.
+
+  - name: lambda-mint-01-token-mint-failed-escalate
+    match:
+      code: LAMBDA-MINT-01
+    action: escalate
+    runbook_path: docs/error-runbooks/lambda-ops-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      LAMBDA-MINT-01 = the daily Dhan token mint failed, so every consumer
+      serves the previous token until the next run. Escalate and do NOT
+      auto-retry a mint: Dhan permits ONE active token per account, so a
+      retry racing another minter invalidates whichever token currently
+      works.

@@ -72,13 +72,13 @@ fn flush_persist_broadcast_failures_must_use_error_level() {
     // unreadable or moved directory made the walker return silently, so the
     // guard passed having inspected ZERO files while reporting green.
     let mut scanned_files: usize = 0;
-    for crate_name in ["common", "storage", "core", "trading", "api", "app"] {
-        let src_dir = root.join("crates").join(crate_name).join("src");
-        assert!(
-            src_dir.is_dir(),
-            "error-level guard is BLIND: {src_dir:?} is not a directory. A \
-             missing crate root used to be skipped silently."
-        );
+    // CHANGED 2026-09-05: this was the SAME hardcoded six-name array that left
+    // `aws-lambdas` and `tickvault-logs-mcp` unscanned in the sibling guard
+    // `error_code_tag_guard.rs` — two crates out of eight, one of which holds
+    // the budget kill-switch that can stop the prod box. A `warn!` on a flush
+    // failure there would never have been seen. Discovery from the filesystem
+    // means a crate cannot be omitted by forgetting to add it.
+    for src_dir in crate_src_dirs(&root) {
         scan_rust_files_recursive(&src_dir, &mut violations, &mut scanned_files);
     }
 
@@ -175,4 +175,33 @@ fn phrases_list_is_non_empty_and_lowercase() {
             "phrases are compared case-insensitively — store them lower-cased"
         );
     }
+}
+
+/// Every `crates/*/src` directory, discovered from the filesystem.
+///
+/// ADDED 2026-09-05. See the note at the call site: the hardcoded six-name
+/// array this replaces was short by two crates, and the guard reported success
+/// while never looking at them — which is worse than failing, because the
+/// output asserted completeness.
+fn crate_src_dirs(root: &Path) -> Vec<PathBuf> {
+    let crates_dir = root.join("crates");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&crates_dir)
+        .unwrap_or_else(|e| panic!("cannot read {crates_dir:?}: {e}"))
+        .filter_map(|entry| {
+            let src = entry.ok()?.path().join("src");
+            src.is_dir().then_some(src)
+        })
+        .collect();
+    out.sort();
+
+    // Anti-vacuity: six were being scanned when this was written, so a
+    // discovery returning fewer is a silent regression to a narrower corpus.
+    assert!(
+        out.len() >= 6,
+        "crate discovery found only {} src dir(s) under {crates_dir:?} — the \
+         guard would enforce almost nothing. This assert exists because the \
+         hardcoded list it replaced was silently short by two.",
+        out.len()
+    );
+    out
 }

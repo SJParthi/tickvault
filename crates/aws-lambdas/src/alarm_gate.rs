@@ -106,6 +106,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                 .await
             {
                 tracing::error!(
+                    code = "LAMBDA-AWS-02",
                     alarm = %alarm_name,
                     error = %err,
                     "could not reset the alarm to OK before arming it — arming anyway. \

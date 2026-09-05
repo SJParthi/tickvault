@@ -317,45 +317,70 @@ pub fn build_router_with_auth(
 }
 // O(1) EXEMPT: end
 
+/// Resolves the configured allowed origins into parsed CORS header values.
+///
+/// Split out of [`build_cors_layer`] so the resolution is TESTABLE: `CorsLayer`
+/// exposes no getter for the origins it was built with, so a test that only
+/// calls `build_cors_layer` can assert nothing beyond "it did not panic" — which
+/// is what the five tests below did before 2026-09-05. On a port that is
+/// publicly funnelled, an origin list that silently resolved to something wider
+/// than intended would have been invisible to the suite.
+///
+/// Contract:
+/// * empty input        -> the localhost dev defaults
+/// * all inputs invalid -> the localhost dev defaults (never an empty list,
+///                         because `CorsLayer::allow_origin([])` allows nothing
+///                         and would take the API dark rather than fail loudly)
+/// * mixed valid/invalid -> only the valid ones, invalid dropped individually
+///
+/// A wildcard is NEVER synthesised here; if the operator configures one it is
+/// their explicit choice, and `cors_origins_are_never_empty_and_never_a_wildcard`
+/// pins that this function does not invent one on any fallback path.
+// O(1) EXEMPT: begin — cold path, called once at boot
+fn resolve_cors_origins(allowed_origins: &[String]) -> Vec<axum::http::HeaderValue> {
+    use axum::http::HeaderValue;
+
+    // `from_static` is infallible for these string literals.
+    let defaults = || {
+        vec![
+            HeaderValue::from_static("http://localhost:3000"),
+            HeaderValue::from_static("http://localhost:3001"),
+        ]
+    };
+
+    if allowed_origins.is_empty() {
+        return defaults();
+    }
+
+    let parsed: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|o| o.parse::<HeaderValue>().ok())
+        .collect();
+
+    if parsed.is_empty() {
+        defaults()
+    } else {
+        parsed
+    }
+}
+// O(1) EXEMPT: end
+
 /// Builds a CORS layer from configured allowed origins.
 ///
 /// If the list is empty, falls back to permissive localhost defaults for dev safety.
 // O(1) EXEMPT: begin — cold path, called once at boot
 fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
-    use axum::http::{HeaderValue, Method, header};
-
-    let origins: Vec<&str> = if allowed_origins.is_empty() {
-        vec!["http://localhost:3000", "http://localhost:3001"]
-    } else {
-        allowed_origins.iter().map(String::as_str).collect()
-    };
-
-    let parsed: Vec<HeaderValue> = origins
-        .iter()
-        .filter_map(|o| o.parse::<HeaderValue>().ok())
-        .collect();
+    use axum::http::{Method, header};
 
     // B3: Restrict methods to GET/POST/DELETE and headers to Authorization/Content-Type.
     // Prevents CSRF-style attacks from permitted origins using arbitrary methods/headers.
     let methods = [Method::GET, Method::POST, Method::DELETE];
     let headers = [header::AUTHORIZATION, header::CONTENT_TYPE];
 
-    if parsed.is_empty() {
-        // Fallback: if all origins failed to parse, allow localhost defaults.
-        // HeaderValue::from_static is infallible for string literals.
-        CorsLayer::new()
-            .allow_origin([
-                HeaderValue::from_static("http://localhost:3000"),
-                HeaderValue::from_static("http://localhost:3001"),
-            ])
-            .allow_methods(methods)
-            .allow_headers(headers)
-    } else {
-        CorsLayer::new()
-            .allow_origin(parsed)
-            .allow_methods(methods)
-            .allow_headers(headers)
-    }
+    CorsLayer::new()
+        .allow_origin(resolve_cors_origins(allowed_origins))
+        .allow_methods(methods)
+        .allow_headers(headers)
 }
 // O(1) EXEMPT: end
 
@@ -363,9 +388,87 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
 mod tests {
     use super::*;
 
+    /// Assert that a built router actually SERVES the configured origin, and
+    /// that an origin which was NOT configured is not echoed back.
+    ///
+    /// ADDED 2026-09-05. The three `build_router*` tests below previously ended
+    /// in `let _router = build_router(state, &origins, ..);` and asserted
+    /// nothing — so "build a router with custom origins" was proven only to
+    /// the extent that it did not panic. Nothing connected the origin list a
+    /// caller passes to what a browser is actually told, which is the only
+    /// property that matters on port 3001 (publicly funnelled).
+    ///
+    /// The negative half is the security half: a layer that reflected every
+    /// Origin back, or answered `*`, would satisfy the positive assertion
+    /// alone while allowing every site on the internet.
+    async fn assert_origin_is_allowed_on_the_wire(router: Router, configured_origin: &str) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // An origin no test configures anywhere, so a pass here cannot be luck.
+        const UNCONFIGURED: &str = "https://attacker.example.net";
+
+        let allow_header = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let configured = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(axum::http::header::ORIGIN, configured_origin)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            allow_header(&configured).as_deref(),
+            Some(configured_origin),
+            "a configured origin must be echoed in access-control-allow-origin; \
+             without this the origin list a caller passes is never proven to \
+             reach the wire"
+        );
+
+        let stranger = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(axum::http::header::ORIGIN, UNCONFIGURED)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let got = allow_header(&stranger);
+        assert!(
+            got.as_deref() != Some(UNCONFIGURED) && got.as_deref() != Some("*"),
+            "an UNCONFIGURED origin was allowed (header: {got:?}). A layer that \
+             reflects any Origin, or answers `*`, opens the API to every site \
+             on the internet — and would pass the positive assertion above."
+        );
+    }
+
+    /// Helper: render the resolved origins as strings so assertions read as
+    /// the operator would state them.
+    fn resolved(origins: &[String]) -> Vec<String> {
+        resolve_cors_origins(origins)
+            .iter()
+            .map(|h| h.to_str().unwrap_or("<non-utf8>").to_string())
+            .collect()
+    }
+
+    const LOCALHOST_DEFAULTS: [&str; 2] = ["http://localhost:3000", "http://localhost:3001"];
+
     #[test]
     fn test_build_cors_layer_empty_origins_uses_defaults() {
-        // Should not panic — falls back to localhost defaults
+        assert_eq!(resolved(&[]), LOCALHOST_DEFAULTS.to_vec());
+        // The layer itself must still build on the same input.
         let _cors = build_cors_layer(&[]);
     }
 
@@ -375,13 +478,21 @@ mod tests {
             "http://localhost:3000".to_string(),
             "http://example.com".to_string(),
         ];
+        assert_eq!(
+            resolved(&origins),
+            vec!["http://localhost:3000", "http://example.com"],
+            "both configured origins must survive resolution, in order"
+        );
         let _cors = build_cors_layer(&origins);
     }
 
     #[test]
     fn test_build_cors_layer_all_invalid_origins_falls_back() {
-        // Invalid origins that can't parse to HeaderValue — should fall back to defaults
+        // Invalid origins that can't parse to HeaderValue — should fall back to
+        // defaults, NEVER to an empty list (an empty allow_origin allows nothing
+        // and would take the API dark instead of failing loudly).
         let origins = vec!["\x00invalid".to_string(), "\x01bad".to_string()];
+        assert_eq!(resolved(&origins), LOCALHOST_DEFAULTS.to_vec());
         let _cors = build_cors_layer(&origins);
     }
 
@@ -391,13 +502,57 @@ mod tests {
             "http://localhost:3000".to_string(),
             "\x00invalid".to_string(),
         ];
+        assert_eq!(
+            resolved(&origins),
+            vec!["http://localhost:3000"],
+            "an unparseable origin is dropped individually — it must not \
+             discard the valid sibling, and must not trigger the defaults"
+        );
         let _cors = build_cors_layer(&origins);
     }
 
     #[test]
     fn test_build_cors_layer_single_valid_origin() {
         let origins = vec!["https://my-dashboard.example.com".to_string()];
+        assert_eq!(
+            resolved(&origins),
+            vec!["https://my-dashboard.example.com"],
+            "a single configured origin must be the ONLY one allowed — the \
+             localhost defaults must not be appended to it"
+        );
         let _cors = build_cors_layer(&origins);
+    }
+
+    /// The two properties that matter on a publicly funnelled port, asserted
+    /// over every shape the resolver can be handed.
+    #[test]
+    fn cors_origins_are_never_empty_and_never_a_wildcard() {
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["\x00invalid".to_string()],
+            vec!["\x00a".to_string(), "\x01b".to_string()],
+            vec!["http://localhost:3000".to_string()],
+            vec![
+                "https://ops.example.com".to_string(),
+                "\x00invalid".to_string(),
+            ],
+            vec![String::new()],
+        ];
+        for case in cases {
+            let out = resolved(&case);
+            assert!(
+                !out.is_empty(),
+                "resolve_cors_origins returned an EMPTY list for {case:?} — \
+                 CorsLayer::allow_origin([]) allows nothing, so the API would \
+                 go dark silently instead of failing loudly"
+            );
+            assert!(
+                !out.iter().any(|o| o == "*"),
+                "resolve_cors_origins SYNTHESISED a wildcard for {case:?} — a \
+                 wildcard may only ever come from explicit operator config, \
+                 never from a fallback path (port 3001 is publicly funnelled)"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -484,8 +639,8 @@ mod tests {
         let _router = build_router(state, &[], true);
     }
 
-    #[test]
-    fn test_build_router_with_custom_origins() {
+    #[tokio::test]
+    async fn test_build_router_with_custom_origins() {
         let state = state::SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -518,7 +673,8 @@ mod tests {
             "http://localhost:3000".to_string(),
             "https://dashboard.example.com".to_string(),
         ];
-        let _router = build_router(state, &origins, true);
+        let router = build_router(state, &origins, true);
+        assert_origin_is_allowed_on_the_wire(router, "https://dashboard.example.com").await;
     }
 
     // -------------------------------------------------------------------
@@ -1032,8 +1188,8 @@ mod tests {
     // build_router: unknown route returns 404
     // -------------------------------------------------------------------
 
-    #[test]
-    fn test_build_router_live_mode_with_origins() {
+    #[tokio::test]
+    async fn test_build_router_live_mode_with_origins() {
         let state = state::SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -1064,7 +1220,8 @@ mod tests {
         );
         let origins = vec!["http://localhost:3000".to_string()];
         // dry_run=false exercises the live-mode auth path (auto-generates token)
-        let _router = build_router(state, &origins, false);
+        let router = build_router(state, &origins, false);
+        assert_origin_is_allowed_on_the_wire(router, "http://localhost:3000").await;
     }
 
     #[tokio::test]

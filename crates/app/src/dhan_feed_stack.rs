@@ -5763,6 +5763,62 @@ fn drain_depth_frame(
     // `enumerate` is load-bearing, not cosmetic — see the `capture_seq`
     // derivation inside the loop.
     for (packet_index, packet_bytes) in iter.by_ref().enumerate() {
+        // Hostile-frame bound. Same one the main-feed walk has carried since it
+        // was written, and this walk did not until 2026-08-28.
+        //
+        // ⚠ CORRECTED 2026-09-05 — this lived INSIDE the level loop, not here.
+        //
+        // `packets_walked` was incremented at the bottom of `for (idx, level)`,
+        // so it counted LEVELS while its own comment reasoned about PACKETS.
+        // The consequence is that the bound could never fire, on any frame the
+        // transport will accept:
+        //
+        //   depth-20 : 256 KiB / 332 B  =   789 packets ×  20 =  15,780 levels
+        //   depth-200: 512 KiB / 3212 B =   163 packets × 200 =  32,600 levels
+        //
+        // Both are far under `MAX_PACKETS_PER_FRAME` (70,000), so the ONLY
+        // protection this walk had against a malformed or hostile frame was
+        // inert — present in the source, reachable by no input. The old
+        // comment's "a real frame tops out near 43,000 packets" is the 12-byte
+        // header-only figure; a real depth packet is 332 or 3,212 bytes, so
+        // that headroom claim was describing a frame shape that cannot occur.
+        //
+        // Counting PACKETS is what makes the cap meaningful: a frame stuffed
+        // with thousands of tiny malformed packets is exactly the shape the
+        // per-packet parse arms below would otherwise walk one by one.
+        //
+        // HONEST LIMIT, and it is not what the fix claims to remove. Counting
+        // packets does NOT make this reachable through the transport: the
+        // 512 KiB frame cap divided by the 12-byte minimum packet is 43,690,
+        // still under 70,000. So on the socket path this remains a bound that
+        // cannot fire — which is the correct state for a hostile-input guard
+        // and is asserted by
+        // `the_depth_packet_cap_cannot_fire_on_a_well_formed_frame`.
+        //
+        // What changed is that it now counts the quantity it names, so it is
+        // a real bound on any frame that did NOT come through the transport
+        // cap — the WAL replay path feeds this same function from disk — and
+        // it stays correct if a frame cap is raised later, which has already
+        // happened once (connection.rs records the 2026-08-14 raise). Before,
+        // a raise would have started truncating legitimate frames at ~350
+        // packets while recording `+1` for thousands of lost level rows.
+        //
+        // Checked BEFORE the packet is decoded, so the bound holds even when
+        // every packet in the frame is refused — the level loop is never
+        // reached on those, which is precisely why the old placement could be
+        // starved.
+        //
+        // Counted as a REFUSAL, not silently: abandoning the tail of a frame is
+        // the same class of loss the `stop_reason` check below reports, and it
+        // must be visible for the same reason.
+        packets_walked = packets_walked.saturating_add(1);
+        if packets_walked >= MAX_PACKETS_PER_FRAME {
+            out.refused = out.refused.saturating_add(1);
+            c.depth_refused.increment(1);
+            c.depth_rows.increment(out.rows);
+            return out;
+        }
+
         // PER-PACKET `capture_seq`, exactly as `ingest_tick_at` derives it.
         //
         // A Dhan frame STACKS packets, and `capture_seq` is a DEDUP key column.
@@ -5903,33 +5959,6 @@ fn drain_depth_frame(
             } else {
                 out.refused = out.refused.saturating_add(1);
                 c.depth_refused.increment(1);
-            }
-
-            // Same bound the main-feed walk has carried since it was written, and
-            // this walk did not (2026-08-28).
-            //
-            // The main-feed walk stops at `MAX_PACKETS_PER_FRAME` because "a frame
-            // claiming more packets than the protocol can produce is malformed or
-            // hostile". Every word of that applies here and the check was simply
-            // absent: the only thing bounding this loop was the frame's own byte
-            // length, which is attacker-influenced in exactly the way a packet
-            // count is.
-            //
-            // It cannot fire on a well-formed frame, which is the point. The
-            // largest depth frame the transport accepts is 512 KiB and the
-            // smallest depth packet is a 12-byte header, so a real frame tops out
-            // near 43,000 packets — comfortably under this cap. A frame that
-            // reaches it is not a busy market.
-            //
-            // Counted as a REFUSAL, not silently: abandoning the tail of a frame
-            // is the same class of loss the `stop_reason` check below reports, and
-            // it must be visible for the same reason.
-            packets_walked = packets_walked.saturating_add(1);
-            if packets_walked >= MAX_PACKETS_PER_FRAME {
-                out.refused = out.refused.saturating_add(1);
-                c.depth_refused.increment(1);
-                c.depth_rows.increment(out.rows);
-                return out;
             }
         }
     }
@@ -13869,6 +13898,51 @@ mod tests {
             "the depth frame walk must stop at the same cap the main-feed walk \
              uses; without it the loop is bounded only by the frame's own byte \
              length, which is attacker-influenced"
+        );
+        // 2026-09-05: the comparison being WRITTEN was never the hard part —
+        // it was written, and it counted the wrong thing. `packets_walked` was
+        // incremented inside `for (idx, level)`, so it tallied LEVELS, and no
+        // frame the transport accepts can reach 70,000 levels (depth-20 tops
+        // out near 15,780; depth-200 near 32,600). The bound was inert.
+        //
+        // Pin the LOOP, not just the token. The packet loop's body is indented
+        // 8 spaces and the level loop's is 12, so the increment must appear at
+        // exactly 8 and must appear BEFORE the level loop opens. Both halves
+        // matter: indentation alone would accept a copy placed after the level
+        // loop in a later packet-loop statement, and ordering alone would
+        // accept the original 12-space placement.
+        //
+        // Comments are STRIPPED before either search. On its first run this
+        // assertion failed on the prose above, which names `for (idx, level)`
+        // while explaining that the increment must not live there — the third
+        // time in one day a source scan in this repo matched its own
+        // explanation. A guard that a comment can satisfy, or trip, is reading
+        // text rather than code.
+        let code: String = body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let increment = "\n        packets_walked = packets_walked.saturating_add(1);";
+        let at = code.find(increment).unwrap_or_else(|| {
+            panic!(
+                "the packet cap must be counted in the PACKET loop (8-space \
+                 body). Found no 8-space `packets_walked` increment in \
+                 drain_depth_frame — if it is indented 12 it is inside the \
+                 LEVEL loop, where it counts levels and the cap can never fire."
+            )
+        });
+        let level_loop = code
+            .find("for (idx, level)")
+            .expect("drain_depth_frame must still walk levels");
+        assert!(
+            at < level_loop,
+            "the packet cap is counted AFTER the level loop opens, so it \
+             tallies levels rather than packets and cannot fire on any frame \
+             the transport accepts"
         );
         assert!(
             body.contains("c.depth_refused.increment(1);"),

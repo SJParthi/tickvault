@@ -1261,21 +1261,21 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         "start" => match shell.ec2_start().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
         "stop" => match shell.ec2_stop().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
         "reboot" => match shell.ec2_reboot().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
@@ -1289,7 +1289,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1305,7 +1305,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1321,7 +1321,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1393,7 +1393,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1436,7 +1436,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     )
                 }
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1474,7 +1474,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1484,7 +1484,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             let state = match shell.instance_state().await {
                 Ok(s) => s,
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     return action_failed(&action);
                 }
             };
@@ -3253,7 +3253,8 @@ mod tests {
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
         // (a) dynamic table discovery — no hardcoded 6-table list.
         assert!(joined.contains("SELECT table_name FROM tables()"));
-        assert!(joined.contains("$0==\"ticks\" || index($0,\"candles_\")==1"));
+        assert!(joined.contains("$0==\"ticks\""));
+        assert!(joined.contains("index($0,\"candles_\")==1"));
         // (b) every feed's capture/replay source removed (feed-agnostic).
         for needle in ["/ws_wal", "/groww", "/spill", "/dlq", "live-ticks.ndjson"] {
             assert!(
@@ -3267,6 +3268,86 @@ mod tests {
         // (d) honest completion marker — never a fake OK.
         assert!(joined.contains("WIPE-COMPLETE"));
         assert!(joined.contains("WIPE-PARTIAL"));
+    }
+
+    /// Every equality-arm table in the wipe TARGET predicate must also be
+    /// counted by the verification tail, and vice versa.
+    ///
+    /// # The defect this closes (2026-09-05)
+    ///
+    /// `market_depth` was in NEITHER half. The action truncated everything
+    /// else and printed `WIPE-COMPLETE` with the largest table in the process
+    /// untouched — a measured 1,530,651,649 rows/session, 299 GB — which is
+    /// why that day's wipe had to drop the table by hand over EC2 Instance
+    /// Connect *after* this tool reported success. Quote 21 of the same day
+    /// names `market_depth` in the authorized wipe set, so the tool was
+    /// failing against the operator's own written scope.
+    ///
+    /// A symmetry test alone would NOT have caught it — absent from both
+    /// halves is symmetric. So this asserts symmetry AND names the two
+    /// market-data tables whose omission is the expensive one. Symmetry is
+    /// what stops the next addition from landing in one half only; the named
+    /// pair is what stops this specific regression.
+    #[test]
+    fn test_wipe_targets_and_verification_name_the_same_tables() {
+        let joined = WIPE_QUESTDB_COMMANDS.join("\n");
+
+        // The two market-data tables that carry essentially all the bytes.
+        // `ticks` was always present; `market_depth` was the omission.
+        for t in ["ticks", "market_depth"] {
+            assert!(
+                joined.contains(&format!("$0==\"{t}\"")),
+                "wipe TARGET predicate does not name `{t}` — the action would \
+                 report WIPE-COMPLETE while leaving it fully populated"
+            );
+            assert!(
+                joined.contains(&format!("$(qc {t})")),
+                "wipe VERIFICATION tail does not count `{t}` — WIPE-COMPLETE \
+                 would be printed without ever checking it reached zero"
+            );
+        }
+
+        // Symmetry, discovered rather than listed: every `$0=="X"` equality
+        // arm in the predicate must have a `$(qc X)` in the tail, and every
+        // `$(qc X)` must have an arm. `candles_` is matched by `index(...)==1`
+        // (a prefix, not an equality arm) and is verified via `candles_1m`
+        // alone, so it is excluded from both directions deliberately.
+        let mut targets: Vec<String> = Vec::new();
+        for part in joined.split("$0==\"").skip(1) {
+            if let Some(end) = part.find('"') {
+                targets.push(part[..end].to_string());
+            }
+        }
+        let mut verified: Vec<String> = Vec::new();
+        for part in joined.split("$(qc ").skip(1) {
+            if let Some(end) = part.find(')') {
+                verified.push(part[..end].to_string());
+            }
+        }
+        assert!(
+            targets.len() >= 6 && verified.len() >= 6,
+            "wipe predicate/verification parse looks vacuous (targets={}, \
+             verified={}) — the scanner, not the commands, is broken",
+            targets.len(),
+            verified.len()
+        );
+        for t in &targets {
+            assert!(
+                verified.contains(t),
+                "wipe TARGETS `{t}` but never verifies it reached zero — \
+                 WIPE-COMPLETE would be printed on an untested table"
+            );
+        }
+        for v in &verified {
+            if v == "candles_1m" {
+                continue; // matched by the `index($0,"candles_")==1` prefix arm
+            }
+            assert!(
+                targets.contains(v),
+                "wipe VERIFIES `{v}` but never truncates it — the action would \
+                 report WIPE-PARTIAL forever on a table it does not touch"
+            );
+        }
     }
 
     #[test]
