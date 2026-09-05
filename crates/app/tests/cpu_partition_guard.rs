@@ -393,3 +393,114 @@ fn expand_cpu_list_parses_both_syntaxes() {
     assert_eq!(expand_cpu_list("0-3"), BTreeSet::from([0, 1, 2, 3]));
     assert_eq!(expand_cpu_list("0,2-3"), BTreeSet::from([0, 2, 3]));
 }
+
+/// The memory drop-in must NEVER lower `MemoryHigh` on a host that can reach
+/// the unit's own value.
+///
+/// # Why this shape and not a budget formula
+///
+/// `MemoryHigh` is a THROTTLE, not a reservation, and the unit's value
+/// deliberately overcommits: its own comment records that 15G re-entered a
+/// SIGABRT loop, so 20G was measured, not estimated. A drop-in that "budgeted"
+/// the app against QuestDB's share would compute ~17G on the locked 32 GiB
+/// host and LOWER the ceiling there — and because `resolve_memory_ceiling`
+/// reads `memory.high` when no `MemoryMax=` is set, that would silently move
+/// the WAL catch-up stand-down (60%) and the RESOURCE-02 page line (80%) down
+/// with it. Tuning the live box was never the goal.
+///
+/// The goal is narrower: on a host where the unit's value EXCEEDS physical RAM,
+/// the throttle is inert and takes both derived thresholds with it — three
+/// safety nets disabled while every surface reads healthy. The drop-in exists
+/// only for that case.
+///
+/// So the property pinned here is the one that protects the locked host: the
+/// comparison must be `unit < MemTotal → no drop-in`. An inverted or widened
+/// comparison would start writing a lower ceiling on r8g.xlarge.
+#[test]
+fn the_memory_dropin_only_fires_when_the_unit_value_exceeds_host_ram() {
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/aws/host-tuning/apply-host-tuning.sh"),
+    )
+    .expect("apply-host-tuning.sh must be readable");
+
+    assert!(
+        script.contains(r#"[ "$tv_unit_high_g" -lt "$tv_mem_g" ]"#),
+        "the reachable-host arm must compare the UNIT value against MemTotal \
+         with `-lt`. Widening it (`-le`, or a budget subtraction) starts \
+         writing a lower MemoryHigh on the locked 32 GiB host, which moves the \
+         WAL stand-down and the RESOURCE-02 page line down with it."
+    );
+    assert!(
+        script.contains("91-memory-guard.conf"),
+        "the drop-in must have its own filename, separate from the CPU guard's \
+         90-cpu-guard.conf — one file serving both would make removing either \
+         remove the other"
+    );
+
+    // The value is READ from the unit, never restated in the script. A second
+    // copy of that number is drift waiting to happen, and this script would be
+    // the copy nobody updates when the unit is retuned.
+    assert!(
+        script.contains("/etc/systemd/system/tickvault.service"),
+        "the script must READ MemoryHigh from the installed unit"
+    );
+    assert!(
+        !script.contains("MemoryHigh=20G"),
+        "the script must not hardcode the unit's current value — it reads it"
+    );
+
+    // Unreadable inputs must change NOTHING. A ceiling derived from a guessed
+    // MemTotal is worse than the unit's own value.
+    assert!(
+        script.contains(r#"[ -z "$tv_unit_high_g" ] || [ "$tv_mem_g" -le 0 ]"#),
+        "an unreadable unit value or an unreadable MemTotal must skip, never \
+         derive a ceiling from a guess"
+    );
+
+    // The host-grew-back path, the same shape the CPU guard already has.
+    assert!(
+        script.contains("removed the memory escape hatch"),
+        "a host that grows back must have its drop-in REMOVED, or the lowered \
+         ceiling outlives the reason for it"
+    );
+
+    // QuestDB's share must reuse the deploy formula rather than invent a
+    // second one; two derivations that disagree hand the same RAM twice.
+    assert!(
+        script.contains("tv_qdb_g=$(( tv_mem_g * 4 / 10 ))")
+            && script.contains(r#"[ "$tv_qdb_g" -gt 12 ] && tv_qdb_g=12"#),
+        "the QuestDB share must reproduce deploy-aws.yml's 4/10-capped-at-12 \
+         formula exactly"
+    );
+}
+
+/// The unit keeps a fixed `MemoryHigh` and no `MemoryMax`.
+///
+/// `MemoryMax` would turn a memory spike into an OOM kill of the only
+/// tick-capture process — the outcome `OOMScoreAdjust=-900` exists to avoid.
+#[test]
+fn the_unit_throttles_memory_and_never_hard_caps_it() {
+    let unit = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/systemd/tickvault.service"),
+    )
+    .expect("tickvault.service must be readable");
+
+    assert!(
+        unit.lines().any(|l| l.starts_with("MemoryHigh=")),
+        "the unit must carry a MemoryHigh throttle — it is also the ceiling \
+         `resolve_memory_ceiling` reads, so removing it disables the WAL \
+         stand-down and the RESOURCE-02 page line as well"
+    );
+    assert!(
+        !unit.lines().any(|l| l.starts_with("MemoryMax=")),
+        "MemoryMax turns a spike into an OOM kill of the one process whose \
+         death loses ticks. Throttle and page, never kill."
+    );
+    assert!(
+        unit.contains("OOMScoreAdjust=-900"),
+        "the app must rank BELOW QuestDB (-500) in the kill order, so host \
+         exhaustion takes the recoverable tenant first"
+    );
+}

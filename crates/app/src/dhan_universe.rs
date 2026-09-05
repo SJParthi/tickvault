@@ -653,6 +653,169 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 /// through the existing [`MAX_FAILED_INDEX_LIST_FRACTION`] gate instead of
 /// silently shipping a short universe. [`MAX_CONSTITUENTS_TOTAL`] bounds the
 /// accumulation at ~42 MB in BYTES, which the count-free version lacked.
+/// How many days of instrument artifacts stay on disk.
+///
+/// Every reader takes TODAY's date (`mapping_artifact_path(date_ist)` and its
+/// three siblings), and the documented fallback when today's file is missing is
+/// the four hardcoded index SIDs -- never yesterday's file. So correctness
+/// needs a window of ONE day and every day beyond that is forensics: what the
+/// universe actually WAS on a day whose session behaved oddly.
+///
+/// Seven keeps a full trading week, which is the span over which a
+/// "the contract set looked wrong on Tuesday" question is asked and answered.
+///
+/// This is NOT the SEBI record. `instrument_lifecycle`,
+/// `instrument_lifecycle_audit` and `index_constituency` are QuestDB tables
+/// written a few lines above this sweep, they are never-delete under the
+/// 2026-05-27 lock, and nothing here touches them. These JSON files are the
+/// rider-to-lane handoff.
+const ARTIFACT_RETENTION_DAYS: i64 = 7;
+
+/// The artifact filename prefixes this sweep is allowed to delete.
+///
+/// An allowlist rather than a `*.json` glob, and that is the whole safety
+/// argument: a glob deletes whatever a future change happens to put in this
+/// directory, and it would do it silently on a path that already runs
+/// unattended once a day. A name this list does not know is left alone.
+const SWEEPABLE_PREFIXES: [&str; 4] = [
+    "dhan-nse-mapping-",
+    "dhan-fno-underlyings-",
+    "dhan-ntm-spot-",
+    "dhan-contracts-",
+];
+
+/// The date a sweepable artifact filename carries, or `None`.
+///
+/// `Some` requires ALL of: a known prefix, a `.json` or `.json.tmp` suffix, and
+/// exactly `YYYY-MM-DD` between them. Anything else returns `None` and is
+/// therefore never deleted -- a file that does not parse is kept, never removed
+/// on a guess.
+///
+/// `.json.tmp` is swept too: a crash between `write` and `rename` leaves one
+/// beside the real file forever, and it is the same artifact by another name.
+fn sweepable_artifact_date(file_name: &str) -> Option<&str> {
+    let rest = SWEEPABLE_PREFIXES
+        .iter()
+        .find_map(|p| file_name.strip_prefix(p))?;
+    // Order is NOT load-bearing here and the first draft of this comment said
+    // it was: `.json` is a prefix of `.json.tmp` as a string, but these are
+    // SUFFIX checks, and a name ending `.json.tmp` does not end in `.json`.
+    // Reversing the two arms was tried and changed nothing. Longest first is
+    // kept as a reading convention, not as a correctness argument.
+    let date = rest
+        .strip_suffix(".json.tmp")
+        .or_else(|| rest.strip_suffix(".json"))?;
+    // ISO dates sort lexically, which is why the caller can compare them as
+    // strings. That only holds for a fixed-width, zero-padded shape, so the
+    // shape is checked rather than assumed.
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let digits_ok = [0, 1, 2, 3, 5, 6, 8, 9]
+        .iter()
+        .all(|&i| b[i].is_ascii_digit());
+    digits_ok.then_some(date)
+}
+
+/// The oldest date this sweep keeps, as `YYYY-MM-DD`.
+#[must_use]
+fn artifact_retention_cutoff(today_ist: &str) -> Option<String> {
+    let today = chrono::NaiveDate::parse_from_str(today_ist, "%Y-%m-%d").ok()?;
+    Some(
+        today
+            .checked_sub_signed(chrono::TimeDelta::days(ARTIFACT_RETENTION_DAYS))?
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+/// What one sweep did. Returned rather than logged inside so the decision
+/// logic is testable without a filesystem.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepTally {
+    removed: usize,
+    bytes: u64,
+    /// Files whose names this sweep does not recognise. Counted, never removed.
+    skipped_unknown: usize,
+    /// Removals the filesystem refused. Counted, never fatal.
+    failed: usize,
+}
+
+/// Deletes instrument artifacts older than [`ARTIFACT_RETENTION_DAYS`].
+///
+/// # Why this exists
+///
+/// Four files land in `data/instrument-cache` every trading day and NOTHING
+/// removed them. Every `remove_file` touching this directory was inside a
+/// `#[cfg(test)]` block; the only production deletion is the operator's manual
+/// `rm -rf` in the wipe runbook. Worse, two comments asserted the opposite --
+/// `dhan_contract_universe.rs` said the shared directory meant "one cleanup and
+/// one retention policy covers both", and a test in this file said "same
+/// directory, so one cleanup path covers both". Both described a policy that
+/// did not exist. A reader auditing disk growth would have read them, believed
+/// the artifacts were managed, and looked elsewhere.
+///
+/// The volume is small next to the ~140 GB a session writes -- the four files
+/// are order 10 MB/day, dominated by the contract artifact's ~22,000 rows --
+/// so this is unbounded growth on a disk that has no room to spare, not an
+/// imminent outage. It is fixed because "grows forever" and "is bounded" are
+/// different claims and only one of them was true.
+///
+/// # Failure posture
+///
+/// Every failure is counted and logged; none propagates. A sweep that cannot
+/// run costs disk, and a build that aborts because a stale file would not
+/// delete costs the session its universe -- strictly worse.
+///
+/// O(files in the directory), once per day, on the cold daily-rider path.
+fn sweep_stale_artifacts(today_ist: &str) -> SweepTally {
+    let mut tally = SweepTally::default();
+    let Some(cutoff) = artifact_retention_cutoff(today_ist) else {
+        // An unparseable date means the caller is broken, not the disk. Delete
+        // nothing rather than compute a cutoff from a guess.
+        return tally;
+    };
+    let Ok(entries) = std::fs::read_dir(MAPPING_DIR) else {
+        // No directory yet is the normal first-boot state, not an error.
+        return tally;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            tally.skipped_unknown += 1;
+            continue;
+        };
+        let Some(date) = sweepable_artifact_date(name) else {
+            tally.skipped_unknown += 1;
+            continue;
+        };
+        // Lexical compare is a real date compare for zero-padded ISO dates,
+        // and the shape check above is what makes that true.
+        if date >= cutoff.as_str() {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tally.removed += 1;
+                tally.bytes = tally.bytes.saturating_add(bytes);
+            }
+            Err(err) => {
+                tally.failed += 1;
+                warn!(
+                    path = %path.display(),
+                    %err,
+                    "stale instrument artifact could not be removed — it stays on disk; \
+                     this costs space, never correctness"
+                );
+            }
+        }
+    }
+    tally
+}
+
 async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinOutcome> {
     let client = build_hardened_csv_client().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -895,6 +1058,23 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         ),
     }
     persist_constituents(questdb, date, &outcome).await;
+
+    // Retention, LAST: after every artifact for today has landed and after the
+    // SEBI tables above are written. Ordering is the safety property -- a sweep
+    // that ran first could delete the only artifact a failed build would have
+    // left the lane, and the lane's fallback is four index SIDs.
+    let swept = sweep_stale_artifacts(date);
+    if swept.removed > 0 || swept.failed > 0 {
+        info!(
+            removed = swept.removed,
+            bytes = swept.bytes,
+            failed = swept.failed,
+            skipped_unknown = swept.skipped_unknown,
+            retention_days = ARTIFACT_RETENTION_DAYS,
+            "stale instrument artifacts swept"
+        );
+    }
+
     Ok(outcome)
 }
 
@@ -1640,8 +1820,160 @@ mod tests {
         assert_eq!(
             a.parent(),
             mapping_artifact_path("2026-08-21").parent(),
-            "same directory, so one cleanup path covers both"
+            "same directory, so the one retention sweep covers both"
         );
+    }
+
+    #[test]
+    fn only_the_four_known_artifact_names_are_ever_sweepable() {
+        // The safety property. A `*.json` glob would delete whatever a future
+        // change puts in this directory, silently, on an unattended daily path.
+        assert_eq!(
+            sweepable_artifact_date("dhan-nse-mapping-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        assert_eq!(
+            sweepable_artifact_date("dhan-contracts-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        assert_eq!(
+            sweepable_artifact_date("dhan-fno-underlyings-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        assert_eq!(
+            sweepable_artifact_date("dhan-ntm-spot-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        // A crash between write and rename leaves this beside the real file
+        // forever. Same artifact, another name.
+        assert_eq!(
+            sweepable_artifact_date("dhan-contracts-2026-08-21.json.tmp"),
+            Some("2026-08-21"),
+            "the .tmp leftover is the same artifact and must be sweepable"
+        );
+        // Everything this sweep does not KNOW, it must not touch.
+        for foreign in [
+            "plan-snapshot-2026-08-21.json",
+            "token-cache.json",
+            "notes.txt",
+            "dhan-nse-mapping.json",
+            "2026-08-21.json",
+            "",
+        ] {
+            assert_eq!(
+                sweepable_artifact_date(foreign),
+                None,
+                "{foreign} is not a known artifact and must never be deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filename_whose_date_is_not_a_real_shape_is_kept_not_guessed_at() {
+        // Lexical comparison is only a date comparison for a fixed-width
+        // zero-padded ISO date. A name that does not have that shape cannot be
+        // compared, so it is kept -- never removed on a guess.
+        for bad in [
+            "dhan-contracts-2026-8-21.json",   // not zero-padded
+            "dhan-contracts-2026_08_21.json",  // wrong separator
+            "dhan-contracts-20260821.json",    // no separators
+            "dhan-contracts-2026-08-2a.json",  // non-digit
+            "dhan-contracts-2026-08-211.json", // too long
+            "dhan-contracts-.json",            // empty
+        ] {
+            assert_eq!(
+                sweepable_artifact_date(bad),
+                None,
+                "{bad} has no parseable date and must be kept"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cutoff_keeps_today_and_the_retention_window_and_drops_what_precedes_it() {
+        let cutoff = artifact_retention_cutoff("2026-08-21").expect("a real date parses");
+        assert_eq!(
+            cutoff, "2026-08-14",
+            "seven days back from the 21st, month arithmetic included"
+        );
+        // Today is always kept: the lane reads it THIS session.
+        assert!("2026-08-21" >= cutoff.as_str());
+        // The oldest kept day is the cutoff itself.
+        assert!("2026-08-14" >= cutoff.as_str());
+        // One day older goes.
+        assert!("2026-08-13" < cutoff.as_str());
+        // Month and year boundaries, where naive string arithmetic breaks.
+        assert_eq!(
+            artifact_retention_cutoff("2026-01-03").as_deref(),
+            Some("2025-12-27"),
+            "crossing a year boundary must not produce a same-year date"
+        );
+        assert_eq!(
+            artifact_retention_cutoff("2026-03-03").as_deref(),
+            Some("2026-02-24"),
+            "crossing February must use real calendar arithmetic"
+        );
+        assert_eq!(
+            artifact_retention_cutoff("not-a-date"),
+            None,
+            "an unparseable date must yield NO cutoff, so the sweep deletes nothing"
+        );
+    }
+
+    #[test]
+    fn the_sweep_removes_only_what_is_both_known_and_old() {
+        // The end-to-end shape, on a real directory. Written into MAPPING_DIR
+        // because that is the only directory the sweep reads; the dates are far
+        // enough in the past that they can never collide with a real run.
+        if std::fs::create_dir_all(MAPPING_DIR).is_err() {
+            return; // a sandbox with no write access must not fail the suite
+        }
+        let old_known = std::path::Path::new(MAPPING_DIR).join("dhan-contracts-1999-01-01.json");
+        let old_tmp =
+            std::path::Path::new(MAPPING_DIR).join("dhan-nse-mapping-1999-01-01.json.tmp");
+        let old_foreign = std::path::Path::new(MAPPING_DIR).join("plan-snapshot-1999-01-01.json");
+        let recent_known = std::path::Path::new(MAPPING_DIR).join("dhan-contracts-1999-01-08.json");
+        for p in [&old_known, &old_tmp, &old_foreign, &recent_known] {
+            if std::fs::write(p, b"{}").is_err() {
+                return;
+            }
+        }
+
+        // Sweeping as if today were 1999-01-08: the cutoff is 1999-01-01, so
+        // the 01-01 files are AT the cutoff and kept.
+        let at_cutoff = sweep_stale_artifacts("1999-01-08");
+        assert_eq!(
+            at_cutoff.removed, 0,
+            "a file exactly at the cutoff is inside the window and must be kept"
+        );
+        assert!(old_known.exists(), "kept at the boundary");
+
+        // One day later the 01-01 files fall out; the 01-08 one and the
+        // foreign name stay.
+        let past_cutoff = sweep_stale_artifacts("1999-01-09");
+        assert_eq!(
+            past_cutoff.removed, 2,
+            "both the .json and its .tmp sibling go, and nothing else"
+        );
+        assert!(!old_known.exists());
+        assert!(!old_tmp.exists());
+        assert!(
+            old_foreign.exists(),
+            "an unknown name is counted, never deleted — this is the whole \
+             safety argument for the allowlist"
+        );
+        assert!(
+            past_cutoff.skipped_unknown >= 1,
+            "the unknown name must be COUNTED, so a directory quietly filling \
+             with something this sweep cannot manage is visible"
+        );
+        assert!(
+            recent_known.exists(),
+            "a known artifact inside the window must survive"
+        );
+
+        let _ = std::fs::remove_file(&old_foreign);
+        let _ = std::fs::remove_file(&recent_known);
     }
 
     #[test]

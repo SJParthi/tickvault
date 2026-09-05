@@ -444,6 +444,27 @@ impl OrderAuditWriter {
             .at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
+        // COUNTED AT APPEND, NOT AT ACK -- and the name does not say so.
+        //
+        // This increments when the row enters the BUFFER, before any flush. A
+        // failed flush discards the batch, so on a bad day this reads a number
+        // of rows the table does not contain. That is not hypothetical: on
+        // 2026-08-25 a disk-full session left this at 6 with the table EMPTY,
+        // and the operator found out by asking why his order was missing.
+        //
+        // The truth is derivable and the arithmetic is the point:
+        //   acked = <this> - <the *_rows_discarded_total sibling>
+        // Every failure path routes through `discard_pending`, which counts
+        // what it drops (pinned for every writer in the crate by
+        // `ilp_overflow_bound_guard::every_flushing_writer_declares_its_failure_treatment`),
+        // so the subtraction always closes.
+        //
+        // Deliberately NOT moved to the flush-success arm: this counter carries
+        // a per-row LABEL that a batch-sized increment at ack time cannot
+        // preserve, and re-pointing a live series at a different quantity makes
+        // its history incomparable across the change. Recording what it means
+        // is the honest fix; a second acked series is an operator decision with
+        // its own CloudWatch cost line.
         metrics::counter!("tv_order_audit_rows_total", "event" => r.event.as_str()).increment(1);
         Ok(())
     }

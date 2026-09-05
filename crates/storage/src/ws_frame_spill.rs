@@ -2591,6 +2591,21 @@ pub const WAL_REPLAY_FRAME_CAP_STOPS_COUNTER: &str = "tv_wal_replay_frame_cap_st
 /// before confirming it (the segments stay in `replaying/`).
 pub const WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER: &str = "tv_wal_replay_ack_wait_timeouts_total";
 
+/// Replay confirmations refused because the sink was SUSPECT at the time.
+///
+/// Distinct from the ack-wait timeout above, and the distinction is the point:
+/// a timeout means the writers were slow, this means the writers said "ok" and
+/// the watermark does not believe them. Same outcome — segments stay in
+/// `replaying/` — but a completely different cause, so triage must be able to
+/// tell them apart.
+///
+/// Deliberately NOT EMF-selected: the margin to the budget's automatic
+/// `STOP_EC2_INSTANCES` line is $4.61/month, and adding a CloudWatch name is
+/// the operator's cost decision. It is on the local exporter and in the log
+/// line's `source` field, which is what triage reads.
+pub const WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER: &str =
+    "tv_wal_replay_sink_suspect_refusals_total";
+
 /// Frames returned by every replay pass of this process, for the per-boot cap.
 static WAL_REPLAY_FRAMES_THIS_BOOT: AtomicU64 = AtomicU64::new(0);
 
@@ -3269,6 +3284,7 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
     metrics::counter!(WAL_REPLAY_DISK_FLOOR_STOPS_COUNTER).increment(0);
     metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(0);
     metrics::counter!(WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER).increment(0);
+    metrics::counter!(WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER).increment(0);
     metrics::counter!(crate::wal_applied_watermark::APPLIED_INVALID_COUNTER).increment(0);
     metrics::counter!(crate::wal_applied_watermark::APPLIED_PERSIST_FAILED_COUNTER).increment(0);
     let wal_dir = wal_dir.as_ref();
