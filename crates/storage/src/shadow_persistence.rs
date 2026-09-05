@@ -372,8 +372,8 @@ const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 1] = ["candles_7d"];
 /// depth genuinely had no writer. Depth came back on 2026-08-15 and is now the
 /// LARGEST table in the process — measured 1,530,651,649 rows/session, 24x the
 /// tick volume — while its name sat in a `DROP TABLE IF EXISTS` sweep. It was
-/// the only one of the eighteen names with a live `CREATE TABLE IF NOT EXISTS`
-/// anywhere in the tree.
+/// the only one of the eighteen names THEN on the list (now seventeen) with a
+/// live `CREATE TABLE IF NOT EXISTS` anywhere in the tree.
 ///
 /// It never fired, for one reason: the versioned marker file suppresses the
 /// sweep after its first successful run. That is not a safety property. Two
