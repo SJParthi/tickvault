@@ -55,7 +55,7 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// a panic, NAME it so (`..._no_panic`, `..._never_panics`,
 /// `..._degrades_without_panic`) and this scanner will not count it — which is
 /// the point: the name is what tells the next reader what was proven.
-const ASSERTION_FREE_BUDGET: usize = 190;
+const ASSERTION_FREE_BUDGET: usize = 185;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [
@@ -121,11 +121,20 @@ pub(crate) fn classify_tests(src: &str) -> Vec<(String, bool)> {
         // Walk forward to the `fn` line, tolerating further attributes.
         let mut j = i + 1;
         let mut fn_line = None;
+        // A `#[should_panic]` sits BETWEEN `#[test]` and `fn`, so it never
+        // reaches the body string. It is a real assertion — the strongest one
+        // in the file when it carries `expected = ".."` — and a scanner that
+        // counted such a test as assertion-free would open with a false
+        // positive, which is how a guard gets allowlisted instead of obeyed.
+        let mut should_panic = false;
         while j < lines.len() && j <= i + 15 {
             let ft = lines[j].trim();
             if ft.starts_with("fn ") || ft.starts_with("async fn ") {
                 fn_line = Some(j);
                 break;
+            }
+            if ft.starts_with("#") && ft.contains("should_panic") {
+                should_panic = true;
             }
             if !ft.starts_with('#') && !ft.is_empty() {
                 break;
@@ -168,9 +177,9 @@ pub(crate) fn classify_tests(src: &str) -> Vec<(String, bool)> {
             continue;
         }
 
-        let asserts = ASSERTION_MARKERS.iter().any(|m| body.contains(m))
-            || body.contains("?;")
-            || body.contains("#[should_panic]");
+        let asserts = should_panic
+            || ASSERTION_MARKERS.iter().any(|m| body.contains(m))
+            || body.contains("?;");
         out.push((name, !asserts));
     }
     out
@@ -283,6 +292,12 @@ mod t {
     async fn unwrap_counts_as_an_assertion() {
         f().await.unwrap();
     }
+
+    #[test]
+    #[should_panic(expected = \"must be > 0\")]
+    fn should_panic_is_an_assertion() {
+        let _ = f(0);
+    }
 }
 ";
     let got = classify_tests(src);
@@ -292,9 +307,10 @@ mod t {
             ("asserts_something".to_string(), false),
             ("asserts_nothing".to_string(), true),
             ("unwrap_counts_as_an_assertion".to_string(), false),
+            ("should_panic_is_an_assertion".to_string(), false),
         ],
         "classifier must distinguish asserting from assertion-free, and must \
-         treat .unwrap() as an assertion"
+         treat .unwrap() and a #[should_panic] attribute as assertions"
     );
 
     assert!(
