@@ -2053,6 +2053,28 @@ fn perform_depth_rescue(
 /// span-based bound can react.
 pub const MAX_DEPTH_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
+/// The queue is bounded in COUNT; this bounds it in BYTES.
+///
+/// `DEPTH_FLUSH_QUEUE_DEPTH` slots each holding up to
+/// `MAX_DEPTH_PRODUCER_BUFFER_BYTES` is 128 MiB that can be in flight to the
+/// writer at once, and until now that product was asserted NOWHERE — the two
+/// constants could be raised independently and nothing would notice until the
+/// host did. This is the exact pair that reached 4,004,164,571 bytes in a
+/// single slot on 2026-09-02 and OOM-killed the process ten times in a loop;
+/// the per-batch size trigger fixed the cause, and this fixes the arithmetic
+/// that let the cause exist.
+///
+/// The ceiling is deliberately the SAME `QUESTDB_MAX_BUF_SIZE_BYTES` the
+/// per-buffer assert uses, because a queue that can hold more bytes than the
+/// database will ever accept in one request is holding rows it cannot deliver.
+const _: () = assert!(
+    DEPTH_FLUSH_QUEUE_DEPTH * MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES * 2,
+    "the depth offload queue can hold more bytes in flight than twice QuestDB's \
+     maximum request buffer — raise one of these deliberately, with a memory \
+     figure, or lower the other"
+);
+
 // Same headroom rule as the tick path: the producer ceiling must sit at or
 // below half the questdb-rs `max_buf_size` wedge, or the rescue arm only fires
 // after every flush is already failing permanently -- making the rescue path
