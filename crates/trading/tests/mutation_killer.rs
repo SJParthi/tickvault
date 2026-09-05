@@ -333,7 +333,7 @@ mod indicator_mutations {
     fn mutation_indicator_rsi_bounded_after_warmup() {
         let mut engine = IndicatorEngine::new(default_params());
         // Feed enough ticks to warm up RSI (>14 ticks)
-        for i in 0..30 {
+        for i in 0u8..30 {
             let price = 100.0 + (i as f32) * 0.5;
             let tick = make_tick(1, price, price + 1.0, price - 1.0, 1000);
             engine.update(&tick);
@@ -390,20 +390,129 @@ mod indicator_mutations {
         }
     }
 
+    /// A zero-volume tick must not corrupt VWAP, and VWAP must still be right
+    /// on the next tick that does carry volume.
+    ///
+    /// Every instrument that has not yet traded carries volume 0, so `0 / 0`
+    /// is the NORMAL first case for VWAP, not an edge case.
+    ///
+    /// ⚠ HONEST LIMIT, established by bite-proof rather than assumed. Removing
+    /// BOTH VWAP guards (`if volume > 0.0` on the accumulation and
+    /// `vwap_cumulative_vol > 0.0` on the division) leaves this test PASSING,
+    /// and that is not a weakness in the assertions — it is a fact about the
+    /// code:
+    ///
+    /// * with the accumulation ungated, `pv += typical * 0.0` and
+    ///   `vol += 0.0` both add zero, so the cumulative STATE stays `0.0` and
+    ///   is never poisoned;
+    /// * the division then yields `0.0 / 0.0` = NaN in a LOCAL, which
+    ///   `IndicatorSnapshot::sanitize_nan_inf` clamps to `0.0` — the same
+    ///   value the guarded path returns.
+    ///
+    /// So the guarded and unguarded answers are observationally IDENTICAL at
+    /// the snapshot boundary. No test at this boundary can tell them apart.
+    /// The guards remain correct defence-in-depth; this test pins the
+    /// BEHAVIOUR (0.0 with no volume, the true price once there is volume),
+    /// which is what a consumer depends on.
+    ///
+    /// The first draft asserted `snap.vwap.is_finite()`. That is VACUOUS on
+    /// any snapshot field, because `sanitize_nan_inf` runs first — a check
+    /// that cannot fail, counted as an assertion by the ratchet. Stated here
+    /// because the same trap applies to every `is_finite()` on a snapshot.
     #[test]
     fn mutation_indicator_zero_volume_tick() {
         let mut engine = IndicatorEngine::new(default_params());
-        let tick = make_tick(1, 100.0, 100.0, 100.0, 0);
-        let snap = engine.update(&tick);
-        // Should not panic, VWAP should handle zero volume
-        let _ = snap;
+
+        let no_volume = engine.update(&make_tick(1, 100.0, 100.0, 100.0, 0));
+        assert_eq!(
+            no_volume.last_traded_price, 100.0,
+            "the tick must be ACCEPTED — otherwise this test passes by \
+             virtue of refusal and proves nothing about VWAP"
+        );
+        assert_eq!(
+            no_volume.vwap, 0.0,
+            "with no volume there is nothing to weight, so VWAP is 0.0; a \
+             non-zero value here means volume was invented"
+        );
+
+        // A real trade. On an unpoisoned engine VWAP is now the typical
+        // price; on a poisoned one the cumulative terms are NaN, which
+        // `sanitize_nan_inf` presents as 0.0.
+        let traded = engine.update(&make_tick(1, 100.0, 100.0, 100.0, 500));
+        assert_eq!(
+            traded.vwap, 100.0,
+            "VWAP after one 500-lot trade at 100.0 must be 100.0; 0.0 here \
+             means the zero-volume tick divided by zero and NaN propagated"
+        );
     }
 
+    /// A non-finite price must be REFUSED, and refusing it must not damage
+    /// state the engine had already built.
+    ///
+    /// This is the §28.4 ingest gate, and the failure it prevents is not a
+    /// panic — it is silent permanent corruption. Wilder smoothing is
+    /// absorbing (`atr = atr*(1-wf) + tr*wf`), so ONE NaN tick poisons `atr`,
+    /// `adx` and `vwap` for the process lifetime, and `sanitize_nan_inf` then
+    /// presents the result as `0.0` — a plausible number, not an error.
+    ///
+    /// The old body was `let _ = engine.update(&tick);` under "Should not
+    /// panic". Deleting the entire gate left it passing, because the damage
+    /// is only visible on the NEXT good tick — which it never sent.
+    ///
+    /// Note what is NOT asserted: `is_finite()` on any snapshot field. The
+    /// snapshot is sanitized, so that check cannot fail and would make this
+    /// test look stronger than it is.
     #[test]
     fn mutation_indicator_nan_price_handled() {
         let mut engine = IndicatorEngine::new(default_params());
-        let tick = make_tick(1, f32::NAN, f32::NAN, f32::NAN, 1000);
-        // Should not panic
-        let _ = engine.update(&tick);
+
+        // Build real state. Without this the test cannot tell "refused the
+        // NaN" from "had nothing to damage". The prices must MOVE or ATR is
+        // legitimately zero and the assertion below would be vacuous.
+        for i in 0u8..40 {
+            let price = 100.0 + f32::from(i % 7);
+            let _ = engine.update(&make_tick(1, price, price + 2.0, price - 2.0, 1_000));
+        }
+        let before = engine.update(&make_tick(1, 104.0, 106.0, 102.0, 1_000));
+        assert!(
+            before.atr > 0.0 && before.vwap > 0.0,
+            "the warm-up produced no ATR/VWAP to damage, so this test could \
+             not detect poisoning: atr = {}, vwap = {}",
+            before.atr,
+            before.vwap
+        );
+
+        // The poison tick: refused, and reported not-warm so the strategy
+        // evaluator returns an unconditional Hold rather than trading on it.
+        let poisoned = engine.update(&make_tick(1, f32::NAN, f32::NAN, f32::NAN, 1_000));
+        assert!(
+            !poisoned.is_warm,
+            "a non-finite tick must return is_warm=false"
+        );
+
+        // The half that catches a deleted gate: the next good tick must still
+        // compute on undamaged state. A poisoned engine yields NaN, which the
+        // sanitizer presents as 0.0 — so ZERO is the failure signal here.
+        let after = engine.update(&make_tick(1, 104.0, 106.0, 102.0, 1_000));
+        assert_eq!(
+            after.last_traded_price, 104.0,
+            "the good tick's own price did not survive: {}",
+            after.last_traded_price
+        );
+        assert!(
+            after.atr > 0.0,
+            "ATR collapsed to zero after the refused tick — Wilder smoothing \
+             is absorbing, so a NaN admitted once never washes out: {}",
+            after.atr
+        );
+        assert!(
+            after.vwap > 0.0,
+            "VWAP collapsed to zero after the refused tick: {}",
+            after.vwap
+        );
+        assert_eq!(
+            after.is_warm, before.is_warm,
+            "the refused tick changed the instrument's warm state"
+        );
     }
 }
