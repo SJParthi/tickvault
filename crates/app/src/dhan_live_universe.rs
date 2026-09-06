@@ -565,6 +565,16 @@ pub fn resolve_live_universe(
                     "reason" => failure.ntm_reason()
                 )
                 .increment(1);
+                // COLLAPSE-ALARM-EXEMPT: this is a WIDENING, not a collapse.
+                // The NTM narrowing was asked for and could not be applied, so
+                // the session falls THROUGH to the full master-sourced set —
+                // strictly more instruments than requested, never fewer. The
+                // collapse alarm exists to page when the universe drops to the
+                // 4 index SIDs; firing it here would page on a session that is
+                // subscribing ~4,600 instruments instead of ~870, which is a
+                // config observation, not an outage. The fallback COUNTER
+                // (`tv_dhan_live_universe_master_fallback_total{reason}`)
+                // carries this event.
                 tracing::error!(
                     code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                     detail = failure.detail(),
@@ -590,6 +600,10 @@ pub fn resolve_live_universe(
                     "reason" => failure.fno_reason()
                 )
                 .increment(1);
+                // COLLAPSE-ALARM-EXEMPT: same shape as the NTM arm above — a
+                // WIDENING. The narrowed indices+F&O-underlyings set was asked
+                // for and is unavailable, so the session falls through to the
+                // full master. More than requested, never less; not a collapse.
                 tracing::error!(
                     code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                     detail = failure.detail(),
@@ -639,6 +653,37 @@ pub fn resolve_live_universe(
                         code =
                             tickvault_common::error_code::ErrorCode::WsGapConnectionState
                                 .code_str(),
+                        // LOAD-BEARING FIELD — DO NOT REMOVE.
+                        //
+                        // `tv-<env>-errcode-ws-gap-03-universe-collapse` matches
+                        // `{ $.code = "WS-GAP-03" && $.level = "ERROR"
+                        //    && $.source = "fell_back_to_indices" }`
+                        // (`error-code-alarms.tf:708`). WS-GAP-03 has ~50 emit
+                        // sites, so the `source` term is what stops the alarm
+                        // paging on ordinary reconnect churn — and it is
+                        // therefore also what decides whether it can fire AT ALL.
+                        //
+                        // This field was MISSING here until 2026-09-06, and this
+                        // is the arm that actually runs: the sibling arm below
+                        // (master read OK, no usable widening) carried `source`
+                        // and could page; THIS arm — today's artifact absent or
+                        // unreadable, the overwhelmingly common case — could not.
+                        //
+                        // Proven on the box, 2026-09-05: the artifact was missing,
+                        // this line fired twice with fields {code, detail, path}
+                        // and no `source`, the session ran on 4 instruments
+                        // instead of ~22,996, ZERO ticks were captured all day —
+                        // and `describe-alarm-history` for the collapse alarm and
+                        // for `tv-prod-live-universe-fallback` returns EMPTY. The
+                        // operator was never paged for the failure both alarms
+                        // exist to catch.
+                        //
+                        // The module doc above stated the opposite ("the OUTCOME
+                        // is covered"), which is the false-OK class this
+                        // repository keeps paying for: an alarm that is enabled,
+                        // documented as covering the case, and structurally
+                        // unable to match it.
+                        source = UniverseSource::FellBackToIndices.as_str(),
                         detail = failure.detail(),
                         path = %path.display(),
                         "live universe: today's mapping artifact is unusable — falling back \
@@ -785,6 +830,31 @@ const MAPPING_POLL_INTERVAL_MS: u64 = 500;
 /// metric filter and an alarm. So the OUTCOME is covered; what is missing is
 /// the ability to see the near-misses that did not collapse.
 ///
+/// **⚠ CORRECTED 2026-09-06 — "the OUTCOME is covered" was FALSE for the arm
+/// that actually runs, and it cost a whole trading session.**
+///
+/// `resolve_live_universe` has TWO fallback arms. The one reached when the
+/// master was read but produced no usable widening carried
+/// `source = selection.source.as_str()` and could match the alarm. The one
+/// reached when today's artifact is ABSENT or unreadable — the common case, and
+/// the one this very counter exists to describe — carried only
+/// `{code, detail, path}`. The alarm's filter requires `$.source`, so that arm
+/// was structurally unable to fire.
+///
+/// Measured on the box, 2026-09-05: the artifact was missing, the uncovered arm
+/// fired twice, the session ran on **4 instruments instead of ~22,996**, and
+/// `tv_dhan_feed_ingest_ticks_total` finished the day at **0**.
+/// `describe-alarm-history` returns EMPTY for BOTH
+/// `tv-prod-errcode-ws-gap-03-universe-collapse` and
+/// `tv-prod-live-universe-fallback` across that entire day. Nobody was paged
+/// for the failure both alarms exist to catch.
+///
+/// The `source` field is now on both arms and pinned by
+/// [`tests::every_ws_gap_03_error_in_this_module_carries_the_source_the_alarm_filters_on`].
+/// The paragraph above is left standing rather than rewritten because the
+/// failure it describes is the reusable part: a documented, enabled alarm that
+/// cannot match its own emit site reads greener than no alarm at all.
+///
 /// The reusable lesson is the one this correction exists for: a MEASUREMENT
 /// copied into a justification carries no date, and this one outlived the
 /// thing it measured by a week while still stopping work.
@@ -855,6 +925,14 @@ pub async fn await_mapping_artifact(
     // fallback. Fail fast and say why.
     if !cfg.enabled {
         metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "rider_disabled").increment(1);
+        // COLLAPSE-ALARM-EXEMPT: a PREDICTION, not the outcome. This function
+        // only decides how long to wait; it subscribes nothing. Every one of
+        // its three give-up arms returns straight into `resolve_live_universe`,
+        // which reads the same absent artifact and emits the collapse line that
+        // DOES carry `source = fell_back_to_indices`. Labelling the prediction
+        // too would page twice for one collapse, and would page even in the
+        // race where the rider lands the artifact between the give-up and the
+        // read — a page for a session that widened correctly.
         tracing::error!(
             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             path = %path.display(),
@@ -885,6 +963,9 @@ pub async fn await_mapping_artifact(
         if tickvault_common::market_hours::now_ist_secs_of_day() >= MAPPING_WAIT_NEVER_PAST_IST_SECS
         {
             metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "pre_open_cutoff").increment(1);
+            // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at
+            // the top of this function. `resolve_live_universe` emits the
+            // labelled collapse line immediately after this returns.
             tracing::error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 waited_secs = started.elapsed().as_secs_f64(),
@@ -910,6 +991,9 @@ pub async fn await_mapping_artifact(
     }
 
     metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "timed_out").increment(1);
+    // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at the top
+    // of this function. `resolve_live_universe` emits the labelled collapse
+    // line immediately after this returns.
     tracing::error!(
         code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
         waited_secs = started.elapsed().as_secs_f64(),
@@ -923,6 +1007,158 @@ pub async fn await_mapping_artifact(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every `WS-GAP-03` error in this module must carry the `source` field the
+    /// CloudWatch filter selects on.
+    ///
+    /// `tv-<env>-errcode-ws-gap-03-universe-collapse` matches
+    /// `{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "..." }`.
+    /// `WS-GAP-03` has ~50 emit sites across the workspace, so the `source`
+    /// term is the only thing keeping that alarm off ordinary reconnect churn
+    /// — which makes an emit site WITHOUT it invisible to the alarm rather
+    /// than merely under-labelled.
+    ///
+    /// That is not hypothetical. Until 2026-09-06 the missing-artifact arm of
+    /// `resolve_live_universe` omitted it. On 2026-09-05 that arm fired twice,
+    /// the session collapsed from ~22,996 instruments to 4, the day captured
+    /// ZERO ticks, and `describe-alarm-history` for the collapse alarm is
+    /// EMPTY for that entire day.
+    ///
+    /// Deliberately a SOURCE SCAN rather than a log-capture assertion: what
+    /// broke was a missing field in one arm among several, and the only
+    /// property worth pinning is "no arm is missing it". A behavioural test
+    /// would have to enumerate the arms, which is the thing that went wrong.
+    ///
+    /// Two arms legitimately have no `source`, and both are labelled at the
+    /// site with `COLLAPSE-ALARM-EXEMPT:` plus a reason — the house
+    /// `// APPROVED:` shape, so the exemption travels with the code instead of
+    /// living in a line-number list that goes stale on the next edit:
+    ///
+    /// * the NTM and F&O narrowing arms, which fall through to a WIDER set —
+    ///   labelling them would page on a session subscribing MORE than asked;
+    /// * the three give-up arms of `await_mapping_artifact`, which predict a
+    ///   collapse that `resolve_live_universe` then emits, labelled, moments
+    ///   later — labelling them would page twice for one event.
+    #[test]
+    fn every_ws_gap_03_error_in_this_module_carries_the_source_the_alarm_filters_on() {
+        let src = include_str!("dhan_live_universe.rs");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut covered = 0usize;
+        let mut exempt = 0usize;
+
+        // The needle is SPLIT on purpose — do not join it back into one
+        // literal. Written whole it reads to `error_code_tag_guard` as a real
+        // emit site (the guard matches the bare macro name too, so the split has
+        // to fall INSIDE the word), and the assertion message below mentions the
+        // tracked code, so that guard reports this scanner as a macro call
+        // missing its `code` field. It failed CI exactly that way on
+        // 2026-09-06. Splitting the needle removes the false match rather than
+        // suppressing a true-looking one with the guard's `APPROVED` escape
+        // hatch, which the next reader would take to mean "this emit site is
+        // allowed to have no code field".
+        let needle = concat!("tracing::err", "or!(");
+        for (idx, _) in src.match_indices(needle) {
+            // Take the macro invocation by matching parens from the opening
+            // one, so a nested call or a string containing a paren cannot end
+            // the block early.
+            let rest = &src[idx..];
+            let open = rest.find('(').expect("match_indices guarantees a paren");
+            let mut depth = 0i32;
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices().skip(open) {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let block = &rest[..end];
+            if !block.contains("WsGapConnectionState") {
+                continue;
+            }
+            // Strip line comments before looking for the field. The collapse
+            // arm carries a long comment that QUOTES the alarm's filter
+            // pattern (`$.source = "fell_back_to_indices"`), so a naive
+            // substring check counts that site as covered even after the real
+            // field is deleted — proven by bite-test on 2026-09-06, where
+            // removing the field left this guard green. A check satisfied by
+            // prose about a field is the same false-OK class as the alarm this
+            // guard exists to protect.
+            let code_only: String = block
+                .lines()
+                .filter_map(|l| l.split("//").next())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if code_only.contains("source =") {
+                covered += 1;
+                continue;
+            }
+
+            // An exemption counts ONLY when it is the comment block directly
+            // above this macro: walk back over contiguous `//` lines and stop
+            // at the first line that is not one. A marker on a different site
+            // is separated by code and therefore cannot be borrowed.
+            // `idx` sits mid-line (after the indentation), so trim back to the
+            // last COMPLETE line first — otherwise the walk stops immediately
+            // on the macro's own leading whitespace and never sees the comment.
+            let head = &src[..idx];
+            let head = match head.rfind('\n') {
+                Some(p) if !head.ends_with('\n') => &head[..p],
+                _ => head,
+            };
+            let attached_marker = head
+                .lines()
+                .rev()
+                .take_while(|l| l.trim_start().starts_with("//"))
+                .any(|l| l.contains("COLLAPSE-ALARM-EXEMPT"));
+            if attached_marker {
+                exempt += 1;
+                continue;
+            }
+
+            let line = src[..idx].matches('\n').count() + 1;
+            offenders.push(format!(
+                "line {line}: {}",
+                block
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+                    .replace('\n', " ")
+            ));
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "{} WS-GAP-03 error site(s) in dhan_live_universe.rs carry neither a `source` field \
+             nor an attached `// COLLAPSE-ALARM-EXEMPT:` reason, so \
+             tv-<env>-errcode-ws-gap-03-universe-collapse CANNOT match them — the alarm reads \
+             green while the universe collapses:\n  {}\n\nEither add `source = \
+             UniverseSource::<variant>.as_str(),` (the site reports an actual collapse) or an \
+             attached exemption comment saying why it does not.",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+
+        // Non-vacuity, both halves. A scanner that stopped matching would pass
+        // silently, and so would an edit that quietly exempted every site.
+        assert!(
+            covered >= 1,
+            "no WS-GAP-03 site in this module carries `source` — the collapse alarm has \
+             nothing left to match and this guard is passing vacuously"
+        );
+        assert!(
+            exempt >= 1,
+            "no exempt site found — the scanner is no longer reaching the widening and \
+             wait-give-up arms, so it is no longer guarding them either"
+        );
+    }
 
     /// An index listed TWICE in the artifact is subscribed ONCE.
     ///

@@ -1113,6 +1113,13 @@ pub struct LiveIngest {
     /// tail batch for a box that never stops, which is the worse failure on a
     /// host whose auto-stop is a cost control.
     writer_done: Option<std::sync::mpsc::Receiver<()>>,
+    /// Previous closes, one per instrument, fed from the response-code-6
+    /// packets this drain used to decode and discard.
+    ///
+    /// It lives HERE rather than beside the leaderboard because the drain is
+    /// the only place the packet is seen, and because a store reached through
+    /// `&mut self` on a single-owner path needs no concurrent map.
+    prev_close: crate::prev_close_store::PrevCloseStore,
 }
 
 impl LiveIngest {
@@ -1236,7 +1243,60 @@ impl LiveIngest {
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+            prev_close: crate::prev_close_store::PrevCloseStore::new(),
         }
+    }
+
+    /// The previous-close store, for the gainer-eligibility filter.
+    ///
+    /// Exposed read-only: the drain is the sole writer, and a second writer
+    /// would be able to overwrite a real close with a value that never came
+    /// off the wire.
+    #[must_use]
+    pub const fn prev_close(&self) -> &crate::prev_close_store::PrevCloseStore {
+        &self.prev_close
+    }
+
+    /// Records a previous close observed on a response-code-6 packet.
+    ///
+    /// Separate from [`Self::prev_close`] so the store stays write-only
+    /// through this one door.
+    pub fn record_previous_close(
+        &mut self,
+        security_id: u64,
+        segment: tickvault_common::types::ExchangeSegment,
+        previous_close: f64,
+    ) -> crate::prev_close_store::RecordOutcome {
+        self.prev_close.record(security_id, segment, previous_close)
+    }
+
+    /// Clears every previous close for a new trading day.
+    ///
+    /// The failure mode if this is never called is QUIET: every gain would be
+    /// computed against yesterday's close, so the whole ranking would sit
+    /// shifted by the overnight gap and nothing would say so.
+    // Dormant for the same reason its sibling is: `VolumeLeaderboard::
+    // reset_daily` has no production caller either (grep returns one hit, a
+    // test). The whole ranking subsystem is unwired, and both resets become
+    // live in the SAME change that wires it — this is not a reset nobody
+    // needs, it is a reset whose consumer has not arrived.
+    //
+    // A second reason it is not urgent today: the prod box stops at 17:30 IST
+    // every weekday and starts at 08:30, so the lane process never spans a day
+    // boundary, and a grep for a daily-rollover hook anywhere in this file
+    // returns exactly one line — this method's own body.
+    //
+    // That second reason is recorded as WEAK on purpose. This repository's own
+    // O(1) table twice calls "bounded by the deploy schedule, not by the code"
+    // insufficient — the Groww per-contract map and the intent ledger both
+    // carry that note and neither was ever fixed. The difference here is
+    // direction: those grew without bound, this is a reset that is currently
+    // unnecessary. If the box ever runs past midnight, every gain would be
+    // computed against yesterday's close and NOTHING would say so, which is
+    // why the method exists now rather than being added under pressure later.
+    // WIRING-EXEMPT: consumer not yet wired — lands with the leaderboard, whose own reset_daily is equally dormant.
+    pub fn reset_prev_close_daily(&mut self) {
+        self.prev_close.reset_daily();
     }
 
     /// Cumulative aggregator refusals by reason: (price, timestamp, slot,
@@ -5238,10 +5298,48 @@ pub fn drain_main_feed_frame(
                     );
                 }
             }
-            // Non-tick frames are real protocol traffic, not errors: OI and
-            // previous-close arrive as their own packets, market-status and
-            // disconnect are control. Counted so the traffic mix is visible,
-            // deliberately not folded — none of them carries an LTP.
+            // The previous close arrives on its OWN packet (response code 6),
+            // never on the tick.
+            //
+            // CORRECTED 2026-09-06: this packet used to fall into the catch-all
+            // arm below, whose comment said previous-close is "deliberately not
+            // folded". That was right while nothing needed the value and became
+            // wrong the moment the volume ranking gained a GAINER-eligibility
+            // filter: `eligible_gain_pct(ltp, prev_close)` had no second
+            // argument, and a caller defaulting it to 0.0 would have admitted
+            // the entire universe while looking like it was filtering. Recorded
+            // rather than edited away, because the arm was CORRECT when written
+            // — it is the requirement that moved, not the code that was wrong.
+            //
+            // Still counted as non-tick traffic: it carries no LTP and opens no
+            // candle, so the frame mix must keep reading the same. This adds a
+            // store write, not a fold.
+            Ok(ParsedFrame::PreviousClose {
+                security_id,
+                exchange_segment_code,
+                previous_close,
+                ..
+            }) => {
+                c.non_tick.increment(1);
+                // f32 -> f64 through the house widener, never `f64::from`:
+                // a plain widening turns 10.20_f32 into 10.19999980926514
+                // (STORAGE-GAP-02), and this value is a DIVISOR — the error
+                // would land in every gain computed against it.
+                let widened = tickvault_common::price_precision::f32_to_f64_clean(previous_close);
+                // A segment code the enum does not know is refused rather than
+                // mapped to a default: filing a close under the wrong segment
+                // is the I-P1-11 collision this key exists to prevent, and a
+                // wrong divisor is worse than a missing one.
+                if let Some(segment) =
+                    tickvault_common::types::ExchangeSegment::from_byte(exchange_segment_code)
+                {
+                    ingest.record_previous_close(security_id, segment, widened);
+                }
+            }
+            // Non-tick frames are real protocol traffic, not errors: OI
+            // arrives as its own packet, market-status and disconnect are
+            // control. Counted so the traffic mix is visible, deliberately not
+            // folded — none of them carries an LTP.
             Ok(_) => c.non_tick.increment(1),
             Err(_) => {
                 // The dispatcher already counts unknown response codes and
@@ -20120,6 +20218,136 @@ mod frame_walk_accounting_tests {
 
     /// One 10-byte disconnect packet: code 50 header, disconnect code in the
     /// last two bytes.
+    /// `record_previous_close` is the store's ONE write door on `LiveIngest`,
+    /// and `prev_close` is the read side. They are separate so a second writer
+    /// cannot overwrite a real close with a value that never came off the wire.
+    #[test]
+    fn record_previous_close_writes_what_prev_close_reads_back() {
+        use tickvault_common::types::ExchangeSegment;
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert_eq!(
+            ingest.record_previous_close(77, ExchangeSegment::NseFno, 412.25),
+            crate::prev_close_store::RecordOutcome::Stored
+        );
+        assert_eq!(
+            ingest.prev_close().get(77, ExchangeSegment::NseFno),
+            Some(412.25)
+        );
+        // The refusals belong to the store and must survive the wrapper.
+        assert_eq!(
+            ingest.record_previous_close(78, ExchangeSegment::NseFno, 0.0),
+            crate::prev_close_store::RecordOutcome::RejectedValue
+        );
+        assert_eq!(ingest.prev_close().tracked(), 1);
+    }
+
+    /// `reset_prev_close_daily` is dormant by design — see the WIRING-EXEMPT
+    /// note at its definition — so this test is the only thing keeping it
+    /// honest until its consumer arrives. The failure mode it guards is QUIET:
+    /// a process that spans midnight would compute every gain against
+    /// yesterday's close and say nothing.
+    #[test]
+    fn reset_prev_close_daily_clears_the_store_it_owns() {
+        use tickvault_common::types::ExchangeSegment;
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        ingest.record_previous_close(77, ExchangeSegment::NseFno, 412.25);
+        assert_eq!(ingest.prev_close().tracked(), 1);
+        ingest.reset_prev_close_daily();
+        assert_eq!(ingest.prev_close().tracked(), 0);
+        assert_eq!(ingest.prev_close().get(77, ExchangeSegment::NseFno), None);
+    }
+
+    /// A response-code-6 previous-close packet: 8-byte header, f32 close at
+    /// offset 8, u32 previous OI at 12.
+    fn previous_close_packet(security_id: u32, segment_code: u8, previous_close: f32) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[0] = 6; // response code: previous close
+        p[1] = 16; // message length
+        p[3] = segment_code;
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        p[8..12].copy_from_slice(&previous_close.to_le_bytes());
+        p
+    }
+
+    /// The packet the drain used to decode and throw away.
+    ///
+    /// Until 2026-09-06 previous-close packets fell into the catch-all arm,
+    /// counted and dropped. That was correct while nothing needed the value —
+    /// and it meant the gainer-eligibility filter had no second argument, so a
+    /// caller that defaulted it to zero would have admitted the whole universe
+    /// while looking like it was filtering. This asserts the value now reaches
+    /// the store, and that the frame mix still reads the same.
+    #[test]
+    fn a_previous_close_packet_reaches_the_store_and_stays_non_tick_traffic() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert_eq!(
+            ingest.prev_close().tracked(),
+            0,
+            "nothing is tracked before the packet arrives"
+        );
+
+        let bytes = previous_close_packet(4242, 2, 250.5).to_vec();
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+
+        assert_eq!(
+            ingest
+                .prev_close()
+                .get(4242, tickvault_common::types::ExchangeSegment::NseFno),
+            Some(250.5),
+            "the close must reach the store under its composite key"
+        );
+        assert_eq!(
+            out.folded, 0,
+            "a previous-close packet opens no candle and must not count as folded"
+        );
+        assert_eq!(
+            out.unparseable, 0,
+            "it is real protocol traffic, not garbage"
+        );
+    }
+
+    /// An unknown segment code must not be mapped to a default.
+    ///
+    /// Filing a close under the wrong segment is the I-P1-11 collision the
+    /// composite key exists to prevent, and a wrong divisor is worse than a
+    /// missing one: every gain computed against it would be silently wrong
+    /// rather than absent. Code 6 is the documented GAP in Dhan's mapping.
+    #[test]
+    fn a_previous_close_with_an_unknown_segment_is_refused_not_defaulted() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let bytes = previous_close_packet(4242, 6, 250.5).to_vec();
+        drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+        assert_eq!(
+            ingest.prev_close().tracked(),
+            0,
+            "an unknown segment code stores nothing at all"
+        );
+    }
+
     fn disconnect_packet(code: u16) -> [u8; 10] {
         let mut p = [0u8; 10];
         p[0] = 50; // response code: disconnect
