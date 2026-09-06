@@ -513,10 +513,10 @@ make questdb                         # localhost:9000 (QuestDB web console)
 > | storage | 90.1 |
 > | tickvault-logs-mcp | 87.3 |
 > | aws-lambdas | 81.1 |
-> | **app** | **68.3** |
+> | **app** | **72.6** |
 > | *(any crate not listed)* | *default 63.0* |
 >
-> **`app` at 68.3 is the number to carry, and it is the largest crate in the
+> **`app` at 72.6 is the number to carry, and it is the largest crate in the
 > workspace** (133,924 lines — see the 2026-09-06 correction under CURRENT
 > CONTEXT). Roughly three lines in ten of the biggest crate may be uncovered
 > and CI still passes green. A session that reads "100% code coverage" in the

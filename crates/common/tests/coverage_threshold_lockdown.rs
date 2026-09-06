@@ -73,7 +73,14 @@ const PINNED_CRATE_FLOORS: &[(&str, f64)] = &[
     ("trading", 96.9),
     ("storage", 90.1),
     ("api", 98.6),
-    ("app", 68.3),
+    // app pin 68.3 -> 72.6 (2026-09-06): up-only ratchet from TWO independent
+    // CI Coverage & Perf measurements on different trees — main @ e1a1584cd
+    // (run 34016077307) 73.07% and PR #1874 @ d20e43313 (run 34027561018)
+    // 72.92%. Min 72.92; 72.6 leaves 0.32 of margin rather than the formula's
+    // 0.12, matching what the 2026-07-20 app ratchet actually did and what the
+    // `common` correction above argues for. Editing this pin in the same PR IS
+    // the visible review this test exists to force. Rationale in the TOML.
+    ("app", 72.6),
     ("aws-lambdas", 81.1),
     // 2026-07-20: 80.0 -> 87.3 - the ratchet promised above (first CI Coverage & Perf measurement 87.64 on runs 29739772946 + 29745302463; PR #1694).
     ("tickvault-logs-mcp", 87.3),
