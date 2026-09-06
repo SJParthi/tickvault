@@ -38,7 +38,13 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // and OMITTED every live growing table, so the retention sweep visited nothing
 // real → unbounded active-table growth (a storage/cost runaway). `ticks` is the
 // only live HOUR-partitioned table.
-pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth"];
+// 2026-09-06: `top_volume_rank` joins the HOUR sweep. It is snapshot data at
+// the same order as the other two — ~13.4M rows and ~860 MB per session at
+// the authorized 250-contract ceiling across both option families — so it
+// belongs with `ticks` and `market_depth` rather than in the DAY list of
+// small audit tables. Leaving it EXEMPT would have been the quiet mistake:
+// an exempt table grows forever, and this one grows nearly a gigabyte a day.
+pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth", "top_volume_rank"];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
 /// past the hot window. The 5 live **candle** tables (`candles_1m` …
@@ -799,9 +805,24 @@ mod tests {
     /// `market_depth` is its own `RetentionClass::Depth` (see
     /// `partition_archive::retention_class`), because at ~21 GB/day the
     /// 35-day market-data window would commit 735 GB on a 100 GB root.
+    /// Renamed again on 2026-09-06 when `top_volume_rank` joined, for the
+    /// same reason the 2026-08-15 rename happened: a test whose name asserts
+    /// two entries while its body asserts three teaches the next reader
+    /// something false without them ever opening it.
+    ///
+    /// `top_volume_rank` earns the HOUR list on volume, not on kind: ~13.4M
+    /// rows and ~860 MB per session at the authorized 250-contract ceiling
+    /// across both option families. That is the same order as the other two,
+    /// and an order above every table in the DAY list. The quiet mistake
+    /// available here was `RETENTION_EXEMPT_TABLES` — exempt means never
+    /// swept, and a never-swept table that grows most of a gigabyte a day is
+    /// the disk-fill class that cost 2026-09-04 an entire trading session.
     #[test]
-    fn test_hour_partitioned_list_is_ticks_and_market_depth() {
-        assert_eq!(HOUR_PARTITIONED_TABLES, &["ticks", "market_depth"]);
+    fn test_hour_partitioned_list_is_ticks_depth_and_top_volume_rank() {
+        assert_eq!(
+            HOUR_PARTITIONED_TABLES,
+            &["ticks", "market_depth", "top_volume_rank"]
+        );
     }
 
     #[test]

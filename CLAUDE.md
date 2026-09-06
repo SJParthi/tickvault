@@ -298,6 +298,7 @@ not links in the library dependency order.)*
 | `disk_health_watcher.rs` / `oom_monitor.rs` / `resource_monitor.rs` / `wal_suspension_watcher.rs` | Host + QuestDB resource watchdogs |
 | `tick_persistence.rs` | `ticks` ILP append + flush, the tick spill/replay tier. RE-ADDED 2026-08-26 to this table; live since the 2026-08-09 revival |
 | `depth_persistence.rs` | `market_depth` ILP append + flush, the depth spill tier. RE-ADDED 2026-08-26; ~24x the tick row volume and the largest payload in the process |
+| `top_volume_rank_persistence.rs` | `top_volume_rank` — the queryable record of which option contracts were busiest at each 1s/5s snapshot, and whether each actually held a depth subscription (`subscribed`). ADDED 2026-09-06 (operator: *"only using db i can see this"*). HOUR-partitioned, `RetentionClass::MarketData` (15-day window, ~13 GB resident) |
 | `boot_probe.rs` / `http_client.rs` | Boot-time QuestDB probe + shared HTTP client |
 
 ### crates/api — HTTP Server (12 routes)
