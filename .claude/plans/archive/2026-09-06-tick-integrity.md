@@ -278,3 +278,29 @@ edit cannot buy room.
 quoted** — after the user-data byte budget and the $130 ceiling. The rule the
 2026-09-02 correction wrote down applies to itself: a budget limit is one
 `budgets describe-budgets` call; re-run it at the moment of writing.
+
+---
+
+## ARCHIVED 2026-09-06 — merged as PR #1874, squash commit `6d85b4217`
+
+Archived per `plan-enforcement.md` rule 7. Active-plan count was at the cap of **5**
+when this landed; archiving takes it to 4. That cap is not bookkeeping — the
+design-first wall (`design-first-wall.md` V7) BLOCKS every implementation push past it,
+and this repository has reached 107 stale active plans once before, which made the wall
+vacuous because any change matched some stale plan.
+
+**Shipped:** the depth arrival-grace fix (the one real defect), the machine-checked
+park-policy table, the `app` coverage ratchet 68.3 -> 72.6 with nine corrected document
+numbers and a drift guard, and the CLAUDE.md count corrections.
+
+**NOT shipped, both operator decisions and neither started:**
+
+| Item | Why it stopped |
+|---|---|
+| CPU cpuset overlap on core 2 | Real, but any disjoint layout takes a core from QuestDB or the app. Needs a measurement on the box, not a guess. |
+| `tv_depth_rescue_inline_fallback_total` EMF name (~$0.30/mo) | September forecast **$142.24** against the automatic `STOP_EC2_INSTANCES` line at **$135.00** — a NEGATIVE margin. `dhan-rest-only-noise-lock` §2.3n requires a LEVER, not a cost note, and neither lever (the approved EIP release, or `limit_amount`, already at its Quote 19 cap) is an executor's to take. |
+
+**The finding worth carrying forward:** seven of nine planned items did not exist. Every
+one was sourced from a comment or an earlier session's note rather than from the call
+path. Verify each item against the tree at the moment work STARTS on it, not at the
+moment it is written down.
