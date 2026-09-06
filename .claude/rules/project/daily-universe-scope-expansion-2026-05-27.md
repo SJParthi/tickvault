@@ -483,7 +483,19 @@ raised in the same change.
 **What the extra 100 GB actually buys, arithmetically:** at the depth table's
 measured 72 B/row the modelled load is ~21 GB/day at one snapshot/second and
 ~104 GB/day at five. 100 → 200 GB therefore buys roughly **+4.8 days at the low
-estimate and +1 day at the high one**. It widens the runway; it does not remove the
+estimate and +1 day at the high one**.
+
+> **⚠ CORRECTED 2026-09-06 — only the "+1 day at the high one" half was ever
+> true.** The one-snapshot-per-second figure was `Assumed`; the first live
+> session measured **1,530,651,649** depth rows (2026-08-24) against a
+> 288,000,000-row model at 1/s — an implied **5.31 updates/second**, i.e. the
+> HIGH column. Read the low column as wrong by 5.2×. Worse, 72 B/row × rows is a
+> LOGICAL floor (110 GB/session), not disk consumption: the measured burn is
+> **~307 GB/session**, 2.8× that, once ticks, 24 candle frames, the WAL and the
+> spill tiers are counted. Full derivation:
+> `websocket-connection-scope-lock.md` § "SETTLED 2026-09-06". The cost of
+> trusting the low column was 2026-09-04 — a full trading day captured, stored
+> and rescued nothing on a 100%-full volume. It widens the runway; it does not remove the
 need for the pressure-triggered archival landing alongside it, and neither does it
 make a full disk impossible.
 breached; kill-ceiling $100).
