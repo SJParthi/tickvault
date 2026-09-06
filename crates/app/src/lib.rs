@@ -182,6 +182,7 @@ pub mod rest_candle_fold;
 /// signal kind × runtime source × IST clock × trading calendar →
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
+pub mod volume_leaderboard;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).
