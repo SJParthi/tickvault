@@ -3721,6 +3721,36 @@ fn prune_wal_dir_at(
             outcome.kept += 1; // foreign file — never touched
             continue;
         }
+        // NEVER the segment the writer currently holds open (2026-09-06).
+        //
+        // This function was extracted for the ARCHIVE directory, where no
+        // segment is ever open — the local binding is still called
+        // `archive_dir` — and then reused verbatim for the ACTIVE directory,
+        // where exactly one always is. `wal_segments_in` (the replay
+        // enumerator) has filtered on this predicate since it was written;
+        // this loop never did.
+        //
+        // Unlinking an open segment is SILENT and PERMANENT. On Linux the
+        // writer keeps a valid handle to the now-nameless inode, so
+        // `write_all`, `flush` and `sync_all` all keep returning `Ok`;
+        // `persist_record_resilient` counts the frame persisted, `append`
+        // returns `Spilled`, and no caller ever calls `note_unapplied`. Every
+        // frame from that moment until the next 128 MiB rotation is gone with
+        // no error, no counter and an applied-watermark that still believes
+        // the range is recoverable — the one failure shape capture-at-receipt
+        // exists to make impossible.
+        //
+        // Reachability is narrow, which is why it survived: the age pass
+        // needs a segment open past `WS_WAL_ACTIVE_RETENTION_SECS` (48 h,
+        // against a box that stops daily), and the byte pass deletes
+        // oldest-first so it reaches the newest file only once nearly the
+        // whole set is gone. Narrow is not zero, the predicate already
+        // exists, and the cost of using it is one comparison per pass on a
+        // six-hourly cold path.
+        if is_open_segment(&path) {
+            outcome.kept += 1;
+            continue;
+        }
         let age = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -6721,6 +6751,62 @@ mod tests {
             "the current session's segments must never be touched — they are \
              the crash-recovery copy that replay actually reads"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_active_prune_never_unlinks_the_segment_the_writer_holds_open() {
+        // Unlinking the OPEN segment is silent, permanent loss. On Linux the
+        // writer keeps a valid handle to the nameless inode, so every write,
+        // flush and sync after it still returns Ok, the frame is counted
+        // persisted, and nothing calls `note_unapplied` -- so the applied
+        // watermark goes on believing the range is recoverable while every
+        // frame until the next rotation is gone.
+        //
+        // `wal_segments_in` has filtered on `is_open_segment` since it was
+        // written; this prune never did, because it was extracted for the
+        // ARCHIVE directory -- where nothing is ever open -- and then reused
+        // for the ACTIVE one, where exactly one always is. Its local binding
+        // is still named `archive_dir`, which is the tell.
+        let dir = tmp_dir("active-prune-open-segment");
+        let now = SystemTime::now();
+
+        // BOTH passes, because they select different victims: the age pass
+        // takes anything past retention, the byte pass takes oldest-first.
+        // The open segment is planted OLD so it is eligible for both.
+        let open = plant_active_file(&dir, "ws-frames-00000000000000000030.wal", now, 259_200);
+        let closed = plant_active_file(&dir, "ws-frames-00000000000000000031.wal", now, 259_200);
+        set_open_segment(open.clone());
+
+        // Age pass: retention would delete both.
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        assert!(
+            open.exists(),
+            "the AGE pass unlinked the open segment -- every frame written \
+             from here to the next rotation is lost with no error and no counter"
+        );
+        assert!(
+            !closed.exists(),
+            "non-vacuous: a closed segment past retention must still be deleted, \
+             or this test would pass on a prune that does nothing at all"
+        );
+        assert_eq!(outcome.deleted, 1);
+
+        // Byte pass: a zero ceiling would delete everything left.
+        let outcome = prune_active_segments_at(&dir, u64::MAX, 0, now);
+        assert!(
+            open.exists(),
+            "the BYTE pass unlinked the open segment. It deletes oldest-first, \
+             so the open file is reached once the rest of the set is gone -- \
+             which is precisely the state a full disk produces"
+        );
+        assert_eq!(
+            outcome.size_deleted, 0,
+            "nothing but the open segment remained, and it must not be counted \
+             as deleted"
+        );
+
+        clear_open_segment_under(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
