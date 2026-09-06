@@ -183,12 +183,139 @@ fn enforced_floors() -> Vec<(String, f64)> {
 /// is recording a supersession (e.g. testing.md's "storage 91.2 -> 90.1 on
 /// 2026-07-17: truthful re-baseline"), which is house convention and must not be
 /// rewritten; only CURRENT claims are compared.
+/// Extract every CURRENT `<crate> <number>` floor claim from one line of prose.
+///
+/// Split out of the doc scan so the self-test below can drive it with fixtures.
+/// A guard whose parser is only exercised by the real documents cannot be shown
+/// to reject anything -- it passes for as long as the documents happen to agree.
+fn floor_claims_on_line(raw: &str, floors: &[(String, f64)]) -> Vec<(String, f64)> {
+    // Markdown decoration is stripped BEFORE scanning so a pipe-table row, a
+    // blockquote and a bolded cell all reduce to the same `<crate> <number>`
+    // shape. `->` is folded to the unicode arrow FIRST, because blanking `>`
+    // would otherwise turn `->` into `-` and destroy the supersession marker
+    // this scan depends on.
+    let line = raw
+        .replace("->", "\u{2192}")
+        .replace(['|', '>', '*', '`'], " ");
+    let line = line.as_str();
+    let mut out = Vec::new();
+
+    for (crate_name, _) in floors {
+        let needle = format!("{crate_name} ");
+        let mut from = 0usize;
+        while let Some(hit) = line[from..].find(&needle) {
+            let start = from + hit;
+            from = start + needle.len();
+            // Require a word boundary on the left so `api 98.6` inside
+            // `aws-lambdas api 98.6` style prose cannot double-match, and
+            // `core` cannot match inside `tickvault-core`.
+            if start > 0 {
+                let prev = line[..start].chars().next_back().unwrap_or(' ');
+                if prev.is_alphanumeric() || prev == '-' || prev == '_' {
+                    continue;
+                }
+            }
+            // `trim_start` because the markdown normalisation above turns
+            // `| app | 72.6 |` into a run of spaces: the needle consumes
+            // exactly ONE, so without this the reader lands on a space, parses
+            // no number, and the row is silently not compared. That is how
+            // adding CLAUDE.md first raised the count by ONE instead of by its
+            // nine table rows.
+            let rest = line[from..].trim_start();
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            // Only a `<crate> <number>` shape is a floor claim.
+            let Ok(claimed) = num.parse::<f64>() else {
+                continue;
+            };
+            if !num.contains('.') {
+                continue;
+            }
+            // A dated supersession is house convention and must not be
+            // rewritten: `storage 91.2 -> 90.1 on 2026-07-17` records that 91.2
+            // USED to be the floor. Skip only THAT match -- the number
+            // immediately followed by an arrow -- never the whole line.
+            //
+            // The line-wide skip this replaces was exploitable, and the exploit
+            // is the reason the check moved: any line carrying an arrow
+            // ANYWHERE was skipped entire, so `app 11.1 (ratchet 60.0 -> 70.0)`
+            // -- a current claim wrong by 61 points, beside an unrelated arrow
+            // -- passed green.
+            if rest[num.len()..].trim_start().starts_with('\u{2192}') {
+                continue;
+            }
+            out.push((crate_name.clone(), claimed));
+        }
+    }
+    out
+}
+
+/// The parser must find real claims, tolerate real history, and reject neither
+/// by accident.
+#[test]
+fn floor_claim_parser_self_test() {
+    let floors = enforced_floors();
+    let claims = |l: &str| floor_claims_on_line(l, &floors);
+
+    // MUST be seen -- every documented shape in the four scanned files.
+    assert_eq!(claims("- app 72.6"), vec![("app".into(), 72.6)]);
+    assert_eq!(claims("> | common | 99.4 |"), vec![("common".into(), 99.4)]);
+    assert_eq!(
+        claims("> | **app** | **72.6** |"),
+        vec![("app".into(), 72.6)]
+    );
+    assert_eq!(
+        claims("| tickvault-logs-mcp | 87.3 |"),
+        vec![("tickvault-logs-mcp".into(), 87.3)]
+    );
+
+    // MUST be seen -- the exploit the line-wide arrow skip let through.
+    assert_eq!(
+        claims("app 11.1 (ratchet 60.0 -> 70.0)"),
+        vec![("app".into(), 11.1)],
+        "a current claim beside an UNRELATED arrow must still be compared -- \
+         skipping the whole line is what let `app 11.1` pass green"
+    );
+
+    // MUST NOT be seen -- dated supersessions, both arrow spellings. These are
+    // house convention (testing.md carries one verbatim) and rewriting them
+    // would destroy the audit trail this repository keeps on purpose.
+    assert!(claims("storage 91.2 \u{2192} 90.1 on 2026-07-17").is_empty());
+    assert!(claims("app 68.3 -> 72.6 in this PR").is_empty());
+
+    // MUST be seen -- the unnamed-crate row. `default` is a real key in
+    // crate-coverage-thresholds.toml, so the fallback floor is validated too.
+    // Asserted here because the first version of this self-test expected the
+    // OPPOSITE and the parser was right: worth pinning the true behaviour so
+    // nobody "fixes" it back.
+    assert_eq!(
+        claims("| *(any crate not listed)* | *default 63.0* |"),
+        vec![("default".into(), 63.0)]
+    );
+
+    // MUST NOT be seen -- prose that merely contains a crate name.
+    assert!(claims("the app is the largest crate in the workspace").is_empty());
+    assert!(
+        claims("tickvault-core 91.6").is_empty(),
+        "the left word boundary must stop `core` matching inside a crate path"
+    );
+}
+
 #[test]
 fn every_documented_coverage_floor_matches_the_enforced_floor() {
     const DOCS: &[&str] = &[
         "docs/architecture/guarantees.md",
         "docs/architecture/100-percent-compliance-audit.md",
         ".claude/rules/project/testing.md",
+        // CLAUDE.md carries its OWN eight-crate floor table, and it is the file
+        // the SESSION PROTOCOL makes every session read at startup -- so a stale
+        // floor there is the one most likely to be believed. It was unguarded
+        // until 2026-09-06 for a purely mechanical reason: its table is markdown
+        // pipe rows inside a blockquote (`> | **app** | **72.6** |`), which the
+        // old `<crate> <number>` scan could not see through.
+        "CLAUDE.md",
     ];
 
     let floors = enforced_floors();
@@ -197,63 +324,47 @@ fn every_documented_coverage_floor_matches_the_enforced_floor() {
 
     for doc in DOCS {
         let body = read(doc);
-        for (lineno, line) in body.lines().enumerate() {
-            // Dated supersession records are history, not current claims.
-            if line.contains("->") || line.contains('\u{2192}') {
-                continue;
-            }
-            for (crate_name, floor) in &floors {
-                let needle = format!("{crate_name} ");
-                let mut from = 0usize;
-                while let Some(hit) = line[from..].find(&needle) {
-                    let start = from + hit;
-                    from = start + needle.len();
-                    // Require a word boundary on the left so `api 98.6` inside
-                    // `aws-lambdas api 98.6` style prose cannot double-match,
-                    // and `core` cannot match inside `tickvault-core`.
-                    if start > 0 {
-                        let prev = line[..start].chars().next_back().unwrap_or(' ');
-                        if prev.is_alphanumeric() || prev == '-' || prev == '_' {
-                            continue;
-                        }
-                    }
-                    let rest = &line[from..];
-                    let num: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit() || *c == '.')
-                        .collect();
-                    // Only a `<crate> <number>` shape is a floor claim.
-                    let Ok(claimed) = num.parse::<f64>() else {
-                        continue;
-                    };
-                    if !num.contains('.') {
-                        continue;
-                    }
-                    compared += 1;
-                    if (claimed - floor).abs() > f64::EPSILON {
-                        wrong.push(format!(
-                            "{doc}:{} claims `{crate_name} {claimed}` but the enforced \
-                             floor is {floor}",
-                            lineno + 1
-                        ));
-                    }
+        for (lineno, raw) in body.lines().enumerate() {
+            for (crate_name, claimed) in floor_claims_on_line(raw, &floors) {
+                let floor = floors
+                    .iter()
+                    .find(|(n, _)| *n == crate_name)
+                    .map(|(_, f)| *f)
+                    .unwrap_or_default();
+                compared += 1;
+                if (claimed - floor).abs() > f64::EPSILON {
+                    wrong.push(format!(
+                        "{doc}:{} claims `{crate_name} {claimed}` but the enforced \
+                         floor is {floor}",
+                        lineno + 1
+                    ));
                 }
             }
         }
     }
 
-    // 22 is the MEASURED count, not a round number, and it is deliberately not
-    // lower. An adversarial sweep on 2026-09-06 showed the previous floor of 18
-    // sat exactly at "still passes after losing the crate this guard was written
-    // for": `app` supplies 4 of the 22, every one of them preceded by `(`, so a
-    // single plausible-looking tightening of the boundary check silently dropped
-    // all four, left compared at exactly 18, and let `app 11.1` -- wrong by 61
-    // points -- pass green. A floor must be ABOVE the count that survives losing
-    // a crate, never equal to it.
+    // 31 is the MEASURED count on 2026-09-06, not a round number, and it is
+    // deliberately not lower.
+    //
+    // The rule this floor follows: it must sit ABOVE the count that survives
+    // losing a whole input, never equal to it. Measured both ways today —
+    // 31 with CLAUDE.md, 22 without it — so a silent loss of the largest
+    // contributor cannot slide under the bar.
+    //
+    // The previous floor of 18 failed exactly that rule. An adversarial sweep
+    // showed it sat at "still passes after losing the crate this guard was
+    // written for": `app` supplied 4 of the 22, every one preceded by `(`, so a
+    // single plausible-looking tightening of the boundary check dropped all
+    // four, left compared at exactly 18, and let `app 11.1` -- wrong by 61
+    // points -- pass green.
+    //
+    // An EXACT figure is the point, not brittleness: a doc edit that removes a
+    // floor claim should fail this build and be re-measured deliberately, which
+    // is the whole reason this guard exists.
     assert!(
-        compared >= 22,
+        compared >= 31,
         "coverage-floor doc scan compared only {compared} claims across {} \
-         documents — expected at least 22 (each carries a full floor list). A \
+         documents — expected at least 31 (each carries a full floor list). A \
          scan that matches nothing passes vacuously, which is the exact \
          false-OK this guard exists to prevent.",
         DOCS.len()
