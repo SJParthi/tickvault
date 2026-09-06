@@ -758,4 +758,50 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn nanos_in_any_open_window_with_arrival_grace_admits_only_the_tail_it_names() {
+        // Named for the function so the pub-fn guard can see its test, and
+        // written as the one-line contract: the graced window is the ungraced
+        // one plus exactly ARRIVAL_GRACE_TAIL_SECS at the END, and nothing else
+        // moves.
+        let end = i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let grace = i64::from(ARRIVAL_GRACE_TAIL_SECS);
+        for (sod, want) in [
+            (i64::from(TICK_PERSIST_START_SECS_OF_DAY_IST) - 1, false),
+            (i64::from(TICK_PERSIST_START_SECS_OF_DAY_IST), true),
+            (end - 1, true),
+            (end, true),
+            (end + grace - 1, true),
+            (end + grace, false),
+        ] {
+            assert_eq!(
+                nanos_in_any_open_window_with_arrival_grace(at(sod), false),
+                want,
+                "seconds-of-day {sod}: the graced window is [09:00, 15:40+{grace})"
+            );
+        }
+    }
+
+    #[test]
+    fn arrival_row_is_in_an_open_window_agrees_with_the_pure_form() {
+        // The wrapper's only job is to supply the boot Muhurat flag. Asserting
+        // a fixed expectation here would make this test depend on whichever
+        // other test in this binary installed the `OnceLock` first, so instead
+        // it asserts the property that actually matters and is order-blind:
+        // the wrapper must not narrow, widen or otherwise differ from the pure
+        // form evaluated with the SAME flag.
+        let flag = crate::muhurat::current();
+        for sod in [
+            0_i64, 32_399, 32_400, 56_399, 56_400, 56_639, 56_640, 64_800, 86_399,
+        ] {
+            assert_eq!(
+                arrival_row_is_in_an_open_window(at(sod)),
+                nanos_in_any_open_window_with_arrival_grace(at(sod), flag),
+                "seconds-of-day {sod}: the wrapper disagreed with the pure form \
+                 it delegates to, so a writer calling it gets a different window \
+                 than the one this module's tests pin"
+            );
+        }
+    }
 }
