@@ -61,7 +61,7 @@ tokio = { workspace = true }
 # the CVE-fix version deliberately: raising it to match the workspace pin
 # would couple a security floor to an unrelated upgrade decision.
 # SECURITY-FLOOR: AWS-LC X.509 Name Constraints Bypass + CRL scope check (HIGH)
-aws-lc-sys = "0.44.0"
+aws-lc-sys = "0.45.0"
 # SECURITY-FLOOR: transitive of aws-lc-sys; floor tracks the same advisories
 aws-lc-rs = "1.17.0"
 # SECURITY-FLOOR: CRLs-not-authoritative (Moderate) + name-constraints (Low x2)
