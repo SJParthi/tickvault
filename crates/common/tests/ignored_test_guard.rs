@@ -113,6 +113,35 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/storage/tests/spill_replay_memory_bound.rs",
         "a_multi_gigabyte_spill_file_does_not_grow_the_process",
     ),
+    // Added 2026-09-06 with the volume-leaderboard ranking sweep it measures.
+    //
+    // SAME SHAPE as the three wall-clock harnesses above, and added for the
+    // same reason: it times a full `rank` + `rank_distinct_underlying` pass
+    // over 20,220 stock-option contracts -- the measured live count -- and
+    // prints the number. A wall-clock figure on a shared CI runner is a flake,
+    // and a flaky gate teaches people to ignore gates.
+    //
+    // It exists because the number it produces was WRONG in the design notes
+    // before it was written. The cost had been asserted as "~60 us, 0.0012%
+    // duty" by borrowing the 2.8 ns/instrument constant from the
+    // `scan_silence` harness above -- a LINEAR scan -- and applying it to a
+    // `sort_unstable_by`. That is an invalid transfer between two different
+    // complexity classes, and it was the number used to argue a min-heap
+    // design away. Measured here instead: 900.406 us for `rank(top 250)` and
+    // 899.543 us for `rank_distinct_underlying(5)`, a 0.018% duty cycle at
+    // the 5-second cadence -- so the conclusion survived and the evidence for
+    // it was overstated 15x.
+    //
+    // It is NOT the merge condition for any behaviour. The ranking, the
+    // family split, the monotonicity gate, the capacity cap and the
+    // non-finite refusal are each pinned by ordinary tests in the same file
+    // that run on every PR. Run this one deliberately:
+    //   cargo test -p tickvault-app --lib -- --ignored --nocapture \
+    //     volume_leaderboard::tests::rank_sweep_cost_at_the_authorized_ceiling
+    (
+        "crates/app/src/volume_leaderboard.rs",
+        "rank_sweep_cost_at_the_authorized_ceiling",
+    ),
 ];
 
 struct Ignored {
