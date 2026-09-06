@@ -1391,6 +1391,48 @@ cheap half — and it survives the correction, because both pools scaled by the
 same wrong factor. The update rate is the unmeasured multiplier and still swings
 the answer 5×; it is **Assumed**, and the first live session measures it.
 
+> ### ✅ SETTLED 2026-09-06 — the Assumed multiplier is now MEASURED, and it is the HIGH column
+>
+> The paragraph above closes by saying the update rate "is **Assumed**, and the
+> first live session measures it." That session happened, and the measurement has
+> been sitting in `depth_persistence.rs`'s own module header since 2026-08-24
+> without ever being carried back to this table.
+>
+> | | rows/session |
+> |---|---:|
+> | This table's model at **1 update/s** | 288,000,000 |
+> | This table's model at **5 updates/s** | 1,440,000,000 |
+> | **MEASURED, 2026-08-24** | **1,530,651,649** |
+>
+> Implied rate: **5.31 updates/second** — slightly ABOVE this table's own high
+> column. At 72 B/row that is **110.2 GB/session** of logical depth rows: the
+> high column (104 GB) was right to within 6%, and **the low column (21 GB) is
+> understated 5.2×**.
+>
+> **That matters because the LOW column is the one the sizing decisions quote.**
+> `daily-universe-scope-expansion-2026-05-27.md` reasons that a 100 → 200 GB grow
+> "buys roughly +4.8 days at the low estimate and +1 day at the high one." Only
+> the second half was ever true. The same paragraph in this file says a 100 GB
+> root is "~4.8 days at the low estimate and ~23 hours at the high one" — it is
+> ~23 hours, full stop.
+>
+> **And 110 GB is not the disk burn.** The measured consumption is **~307 GB per
+> session** (booted 2026-09-01 at ~309.6 GB free, ended at 2.4 GB), i.e. **2.8×**
+> the logical depth rows once ticks, 24 candle frames, the raw-frame WAL, the
+> spill tiers and QuestDB's own write amplification are counted. A row-width
+> model is a floor on disk consumption, never an estimate of it — and this table
+> has been read as the latter.
+>
+> **What it cost.** On 2026-09-03 the volume reached 0 bytes free; on 2026-09-04
+> the box booted onto a full disk, captured **zero** ticks all day, and dropped
+> **2,000,238** frames before the write-ahead log — permanent loss, because a WAL
+> that cannot append cannot rescue. A 600 GB volume against a 307 GB session is
+> under two sessions of room, not the ~28 days the low column implies.
+>
+> Nothing about the SCOPE changes here — this is the measurement the table asked
+> for, recorded where the table is, so the next disk decision starts from the
+> right column.
+
 Against a **100 GB root** that is **~4.8 days at the low estimate and ~23 hours
 at the high one** — not the ~1.4 days and ~7 hours the wrong figure implied. gp3
 grows online in one command and `variables.tf` permits up to 200 GB.
