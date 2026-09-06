@@ -123,6 +123,10 @@ pub mod feed_scoreboard_persistence;
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
 pub mod tf_consistency_audit_persistence;
+/// Top-volume ranking snapshots (operator 2026-09-06): one row per
+/// (snapshot, timeframe, family, contract) recording which option contracts
+/// were the busiest and whether each actually held a depth subscription.
+pub mod top_volume_rank_persistence;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_audit_persistence` module DELETED — the Rust WRITER
 // only; the `tick_conservation_audit` QuestDB TABLE is RETAINED on disk
