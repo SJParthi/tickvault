@@ -1,7 +1,7 @@
 //! Ratchet guard for the B7 coverage-honesty sweep (2026-07-03).
 //!
 //! The executable truth is `quality/crate-coverage-thresholds.toml` — ratcheted
-//! per-crate LINE-coverage floors (app 68.3 … common 99.4; floors only move up,
+//! per-crate LINE-coverage floors (app 72.6 … common 99.4; floors only move up,
 //! 100% is the target), enforced post-merge by `scripts/coverage-gate.sh`. The
 //! B7 directive replaced every FALSE "100% coverage enforced" documentation
 //! claim with that honest wording, aligned `make coverage` to the SAME per-crate
@@ -45,7 +45,7 @@ fn coverage_claims_in_ci_yml_are_honest() {
 }
 
 /// CLAUDE.md must not claim a 100% minimum for all crates — the enforced
-/// floors are 68.3–99.4 (target 100%).
+/// floors are 72.6–99.4 (target 100%).
 #[test]
 fn claude_md_does_not_claim_100pct_minimum_for_all_crates() {
     let claude_md = read("CLAUDE.md");
@@ -122,5 +122,139 @@ fn groww_e2e_lane_retired_with_live_feed() {
         "groww_live_pipeline_e2e.rs was deleted 2026-07-15 with the Groww \
          live feed; a revived live-pipeline E2E needs a fresh dated operator \
          quote first"
+    );
+}
+
+/// Reads the enforced floors out of `quality/crate-coverage-thresholds.toml`.
+///
+/// Deliberately a hand-rolled scan rather than a TOML dependency: this crate
+/// does not depend on a TOML parser and adding one to satisfy a guard would be
+/// a new dependency root for a 20-line job (CLAUDE.md CARGO rule — new deps
+/// need operator approval).
+fn enforced_floors() -> Vec<(String, f64)> {
+    let body = read("quality/crate-coverage-thresholds.toml");
+    let mut out = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        // Strip any trailing inline comment before parsing the number.
+        let value = value.split('#').next().unwrap_or("").trim();
+        if let Ok(parsed) = value.parse::<f64>() {
+            out.push((name.to_string(), parsed));
+        }
+    }
+    assert!(
+        out.len() >= 9,
+        "coverage-floor parser found only {} entries in \
+         quality/crate-coverage-thresholds.toml — expected the default plus 8 \
+         crates. A parser that silently finds nothing would let this whole \
+         guard pass vacuously (audit-findings Rule 11: no false-OK signals).",
+        out.len()
+    );
+    out
+}
+
+/// Every documented coverage floor must equal the enforced floor.
+///
+/// WHY THIS EXISTS (2026-09-06). The `app` floor was ratcheted 68.3 -> 72.6 in
+/// this PR, and the sweep that preceded it found **nine stale floor numbers
+/// across three live documents**, some of them two ratchets behind:
+///
+/// | document | app | core | storage | common |
+/// |---|---|---|---|---|
+/// | `guarantees.md` | ok | ok | ok | 99.5 (stale since 2026-08-18) |
+/// | `100-percent-compliance-audit.md` | 63.3 | 90.2 | 91.2 | 99.5 |
+/// | `testing.md` | 63.3 | 90.2 | 91.2 | 99.5 |
+///
+/// Nothing checked them, so each ratchet since 2026-07-17 left the prose
+/// further behind the gate. This repository has already paid for that failure
+/// mode twice in adjacent files — the $130 budget ceiling quoted in fifteen
+/// places after it moved to $150, and the user-data byte budget cited as a live
+/// blocker four times after it was freed — and the lesson recorded both times is
+/// the same: a number that is only ever quoted is not evidence.
+///
+/// The check tolerates DATED HISTORY. A line carrying `->` or the unicode arrow
+/// is recording a supersession (e.g. testing.md's "storage 91.2 -> 90.1 on
+/// 2026-07-17: truthful re-baseline"), which is house convention and must not be
+/// rewritten; only CURRENT claims are compared.
+#[test]
+fn every_documented_coverage_floor_matches_the_enforced_floor() {
+    const DOCS: &[&str] = &[
+        "docs/architecture/guarantees.md",
+        "docs/architecture/100-percent-compliance-audit.md",
+        ".claude/rules/project/testing.md",
+    ];
+
+    let floors = enforced_floors();
+    let mut compared = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+
+    for doc in DOCS {
+        let body = read(doc);
+        for (lineno, line) in body.lines().enumerate() {
+            // Dated supersession records are history, not current claims.
+            if line.contains("->") || line.contains('\u{2192}') {
+                continue;
+            }
+            for (crate_name, floor) in &floors {
+                let needle = format!("{crate_name} ");
+                let mut from = 0usize;
+                while let Some(hit) = line[from..].find(&needle) {
+                    let start = from + hit;
+                    from = start + needle.len();
+                    // Require a word boundary on the left so `api 98.6` inside
+                    // `aws-lambdas api 98.6` style prose cannot double-match,
+                    // and `core` cannot match inside `tickvault-core`.
+                    if start > 0 {
+                        let prev = line[..start].chars().next_back().unwrap_or(' ');
+                        if prev.is_alphanumeric() || prev == '-' || prev == '_' {
+                            continue;
+                        }
+                    }
+                    let rest = &line[from..];
+                    let num: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
+                        .collect();
+                    // Only a `<crate> <number>` shape is a floor claim.
+                    let Ok(claimed) = num.parse::<f64>() else {
+                        continue;
+                    };
+                    if !num.contains('.') {
+                        continue;
+                    }
+                    compared += 1;
+                    if (claimed - floor).abs() > f64::EPSILON {
+                        wrong.push(format!(
+                            "{doc}:{} claims `{crate_name} {claimed}` but the enforced \
+                             floor is {floor}",
+                            lineno + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        compared >= 18,
+        "coverage-floor doc scan compared only {compared} claims across {} \
+         documents — expected at least 18 (each carries a full floor list). A \
+         scan that matches nothing passes vacuously, which is the exact \
+         false-OK this guard exists to prevent.",
+        DOCS.len()
+    );
+    assert!(
+        wrong.is_empty(),
+        "documented coverage floors have drifted from \
+         quality/crate-coverage-thresholds.toml (the executable truth). Ratcheting \
+         a floor means updating the prose in the SAME PR:\n  {}",
+        wrong.join("\n  ")
     );
 }
