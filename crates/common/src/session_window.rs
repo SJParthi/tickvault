@@ -400,13 +400,34 @@ mod tests {
     /// running AHEAD of a just-out-of-window exchange stamp is folded into a
     /// candle while this gate refuses the tick.
     ///
+    /// ⚠ AND IT IS NOT A SILENT LOSS — verified in source 2026-09-06, because
+    /// an earlier version of this note omitted the half that matters and so
+    /// read like an unhandled gap. `MultiTfAggregator::consume` returning
+    /// `out_of_session` is a CANDLE-ONLY refusal in `dhan_feed_stack`:
+    /// `hard_refusal` is `refused_price || refused_timestamp` and nothing
+    /// else, so the tick falls through to `append_tick_with_seq` and the ROW
+    /// IS WRITTEN, then counted as
+    /// `tv_aggregator_tick_refused_total{reason="out_of_session"}` and
+    /// reported as a delta by the 30-second `AGGREGATOR-DROP-01` line. The
+    /// divergence is therefore observable, bounded and deliberate: the tick
+    /// is in `ticks`, absent from the bar, and a counter says how often.
+    ///
+    /// The affected band is bounded on BOTH sides, which is why it is small.
+    /// The fold falls back to the exchange stamp once the lag exceeds
+    /// `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300 s), so only an exchange stamp in
+    /// `[15:35:00, 15:40:00)` with a receipt at or past 15:40 diverges at all;
+    /// at Dhan's measured p99 lag of 46 s the band actually reached is about
+    /// `[15:39:14, 15:40:00)`. A lag beyond 300 s folds correctly.
+    ///
     /// Deliberately NOT reconciled here. Making the two agree means choosing
     /// one clock for both, which is plan item W1b/W2 ("candles bucket on
-    /// `received_at`") — REMAINING and explicitly blocked. Widening this
-    /// change to settle it would alter candle bucketing on a path the operator
-    /// has separately scoped. Recorded instead, because an earlier version of
-    /// this comment said the print "is kept" without qualification, and that
-    /// reads as a guarantee about the candle it is not.
+    /// `received_at`"): W1b is REMAINING with its design settled, and W2 is
+    /// blocked on W1b. (An earlier version of this note called W1b itself
+    /// "blocked", which it is not.) Widening this change to settle it would
+    /// alter candle bucketing on a path the operator has separately scoped,
+    /// and the 2026-08-28 receipt-clock directive is what puts the receipt in
+    /// the fold clock in the first place — so the current behaviour is that
+    /// directive's own consequence, not a defect against it.
     #[test]
     fn a_late_delivered_closing_print_is_kept_not_discarded() {
         let event = at(15 * 3600 + 39 * 60 + 30); // 15:39:30, in window

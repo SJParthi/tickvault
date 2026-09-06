@@ -29,6 +29,28 @@
 //!   testing a different pair of numbers than the ones that reach the table —
 //!   the sentinel-LTT fallback makes `ts` become the receipt, and only the
 //!   built row knows that.
+//!
+//! ## SCOPE BOUNDARY -- what this gate deliberately does NOT cover
+//!
+//! The gate is wired into the four LIVE-CAPTURE write paths: `ticks`,
+//! `market_depth`, the shadow candle tables, and the spill-replay round that
+//! can re-offer rows a pre-gate binary wrote. It is NOT wired into
+//! `dhan_rest_1m_tape` (`dhan_live_crossverify_persistence::append_rest_tape`,
+//! called once per day from the post-close cross-verification sweep), and that
+//! omission is deliberate rather than an oversight.
+//!
+//! That table is the VENDOR's own tape, stored -- in its call site's words --
+//! "BEFORE any judgement is applied to it". Its entire purpose is to preserve
+//! what the exchange said so a comparison verdict can be re-derived later.
+//! Filtering it through OUR window would destroy exactly the evidence it exists
+//! to hold, and would do so silently: a vendor bar we refused would be
+//! indistinguishable from a vendor bar that never existed. It is also a
+//! different class of row -- a once-daily REST record in its own table, not a
+//! live tick -- so nothing about it reaches the tick or depth loss counters.
+//!
+//! Stated here because a reader who finds four gated writers can reasonably
+//! conclude the gate is universal. It is not, and the fifth writer is
+//! ungated on purpose.
 
 use tickvault_common::source_scan::strip_rust_comments;
 
@@ -333,10 +355,27 @@ fn the_session_window_gate_is_wired_into_the_candle_write_path() {
         body.contains("row_is_in_an_open_window"),
         "the session-window gate is GONE from the candle write path."
     );
+    // EVERY refusal arm returns Ok, not just one -- the same hardening the
+    // DEPTH guard above already carries, applied here 2026-09-06 after an
+    // adversarial sweep pointed out that this assertion had been left in the
+    // weak form the depth one was fixed out of. `body.contains("return Ok(())")`
+    // over a region holding TWO such returns is satisfied by whichever arm you
+    // did not break. That is verbatim the defect the depth guard's own comment
+    // records being caught by a bite test; the candle guard was simply never
+    // given the same treatment. Consequence is bounded -- the candle gate
+    // cannot fire today (the fold's own window is byte-identical and
+    // `bucket_start` clamps to 09:00) -- but a guard whose weakness is known
+    // and left in place is worse than one nobody has looked at.
+    let oks = body.matches("return Ok(())").count();
     assert!(
-        body.contains("return Ok(())"),
-        "a candle window refusal must `return Ok(())` -- an Err is a loss on \
-         every caller of this writer."
+        oks >= 2,
+        "candle window-refusal arms must EACH `return Ok(())` -- found {oks}. \
+         An Err is a loss on every caller of this writer."
+    );
+    assert!(
+        !body.contains("return Err"),
+        "a candle window refusal returns Err. The caller turns that into a \
+         real loss signal; a row outside the window is a REFUSAL, not a loss."
     );
 }
 
@@ -394,5 +433,161 @@ fn the_candle_refusal_counter_carries_no_feed_label() {
         block.contains("increment(0)"),
         "the candle refusal handles are no longer seeded at 0; the CloudWatch \
          agent would swallow the first increment as its delta baseline."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The REPLAY path. Added 2026-09-06 after an adversarial sweep found it was
+// the ONE gated write path with no wiring guard at all.
+//
+// The gap was not subtle and not theoretical: replacing
+// `let (chunk, refused_lines) = retain_lines_in_open_window(raw);` with
+// `let chunk = raw;` left EVERY test in the module passing, because they all
+// call the filter DIRECTLY and none of them proves the drain calls it. The
+// module's own doc calls this "the one path that can still write an ungated
+// row" -- so the one path that most needed a wiring pin was the one that had
+// none, while the three writers each had two.
+// ---------------------------------------------------------------------------
+
+fn replay_src() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tick_spill_replay.rs");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    strip_rust_comments(&raw)
+}
+
+#[test]
+fn the_session_window_gate_is_wired_into_the_spill_replay_path() {
+    let src = replay_src();
+
+    // The filter must EXIST...
+    assert!(
+        src.contains("fn retain_lines_in_open_window("),
+        "retain_lines_in_open_window is gone -- spill replay POSTs raw ILP bytes \
+         straight to QuestDB, so without it a file written by a pre-gate binary \
+         re-introduces exactly the rows the three writers now refuse."
+    );
+
+    // ...and, the half that was missing, it must be CALLED FROM THE DRAIN.
+    // Scoped to the POST loop rather than the whole file, so a call that only
+    // appears inside `mod tests` cannot satisfy it.
+    let loop_at = src
+        .find("pub async fn replay_spill_dir(")
+        .expect("replay_spill_dir must exist");
+    let tests_at = src.find("\nmod tests {").unwrap_or(src.len());
+    assert!(
+        loop_at < tests_at,
+        "replay_spill_dir moved below the test module; this scan is now meaningless"
+    );
+    let production = &src[loop_at..tests_at];
+
+    assert!(
+        production.contains("retain_lines_in_open_window(raw)"),
+        "replay_spill_dir no longer filters each chunk through \
+         retain_lines_in_open_window. Every unit test in that module calls the \
+         filter directly and would still pass -- this assertion is the only \
+         thing standing between a deleted call and an ungated write path."
+    );
+
+    // And it must gate what is SENT, not merely compute a number. A call whose
+    // result is dropped is the same defect wearing a function call.
+    let call_at = production
+        .find("retain_lines_in_open_window(raw)")
+        .expect("checked above");
+    let after = &production[call_at..];
+    let post_at = after
+        .find("client.post(url)")
+        .expect("replay_spill_dir no longer POSTs after filtering");
+    let send_body = &after[..post_at];
+    assert!(
+        send_body.contains("chunk.is_empty()"),
+        "the filtered chunk is no longer checked for emptiness before the POST; \
+         an all-refused chunk would be sent as an empty body."
+    );
+    assert!(
+        after[..post_at].contains("body(chunk)") || after.contains("body(chunk)"),
+        "the POST no longer sends the FILTERED chunk -- filtering and then \
+         posting `raw` is the defect this guard exists to catch."
+    );
+}
+
+#[test]
+fn the_replay_filter_judges_only_a_plausible_epoch() {
+    let src = replay_src();
+    let at = src
+        .find("fn line_is_positively_out_of_window(")
+        .expect("line_is_positively_out_of_window must exist");
+    let end = src[at..]
+        .find("\nfn nanos_are_a_plausible_epoch(")
+        .expect("nanos_are_a_plausible_epoch must follow it");
+    let body = &src[at..at + end];
+
+    assert!(
+        body.contains("if !nanos_are_a_plausible_epoch(nanos)"),
+        "the plausibility band is gone from line_is_positively_out_of_window. \
+         Without it a crash-torn timestamp (`... ltp=1.0 17160237`) parses as an \
+         integer, reads as 1970 in nanoseconds, and a REAL captured tick is \
+         DELETED because a crash cut its stamp short. The band is what makes \
+         this filter fail OPEN."
+    );
+
+    // The band must be the aggregator's, not a second one invented here.
+    assert!(
+        src.contains("MIN_PLAUSIBLE_EXCHANGE_TS_SECS")
+            && src.contains("MAX_PLAUSIBLE_EXCHANGE_TS_SECS"),
+        "the replay filter no longer uses the aggregator's plausible-epoch \
+         constants. Two definitions of \"this integer is a real market \
+         timestamp\" in one workspace will drift, and the one that drifts \
+         silently is the one that deletes data."
+    );
+}
+
+/// The replay refusal counter must be SEEDED at zero before the round can
+/// increment it for real.
+///
+/// # The defect class (2026-08-28, measured on the live box)
+///
+/// The CloudWatch agent computes a counter as the DELTA between consecutive
+/// samples and DROPS the first sample of a series it has never seen. A counter
+/// whose first increment IS the event therefore publishes nothing on the one
+/// round that matters, and an ABSENT series is indistinguishable from a healthy
+/// zero one. `tv_depth_rows_spilled_total` was hidden exactly this way while its
+/// sibling `tv_depth_rows_dropped_total` counted 104,540 — leaving no way to
+/// tell whether those rows had been rescued or lost.
+///
+/// This guard is ORDERED rather than merely present: the seed must appear
+/// between the function signature and the first real `.increment(refused_lines)`.
+/// A seed placed after the counting site would register the series only on a
+/// round that had already published its first, dropped, sample.
+#[test]
+fn the_replay_refusal_counter_is_seeded_before_it_can_count() {
+    let src = replay_src();
+    const METRIC: &str = "tv_spill_replay_rows_out_of_window_refused_total";
+
+    let fn_start = src
+        .find("pub async fn replay_spill_dir(")
+        .expect("replay_spill_dir must exist -- the replay round is the seeding site");
+    let body = &src[fn_start..];
+
+    let first_real_count = body
+        .find(".increment(refused_lines)")
+        .expect("the replay round must still COUNT refusals -- otherwise this guard is vacuous");
+
+    let seed_region = &body[..first_real_count];
+    assert!(
+        seed_region.contains(METRIC) && seed_region.contains(".increment(0)"),
+        "`{METRIC}` must be seeded with `.increment(0)` inside `replay_spill_dir` BEFORE the \
+         first `.increment(refused_lines)`. Without the seed the CloudWatch agent drops the \
+         first sample, so the very first session that refuses spilled rows publishes nothing \
+         -- the `tv_depth_rows_spilled_total` failure of 2026-08-28, repeated."
+    );
+
+    // The label must be the `&'static str` helper, never a formatted value: a
+    // non-literal label value drops `metrics::counter!` to its allocating arm,
+    // and this runs once per replay round on the boot path.
+    assert!(
+        seed_region.contains("\"dir\" => dir_label(dir)"),
+        "the seed must carry the same `dir_label(dir)` label as the real count, or it registers \
+         a DIFFERENT series and the real one is still unseeded."
     );
 }

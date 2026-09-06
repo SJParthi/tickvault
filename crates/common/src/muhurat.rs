@@ -96,9 +96,24 @@ mod tests {
 
     #[test]
     fn current_before_init_is_false_then_reflects_init() {
-        // NOTE: a single test owns the OnceLock to avoid cross-test races.
+        // NOTE: this test OWNS the OnceLock for the whole lib-test binary, and
+        // the assertion below is what makes that ownership load-bearing: it can
+        // only hold while this is the FIRST call in the process. Every other
+        // test in this crate therefore routes through the pure forms
+        // (`session_window::nanos_in_any_open_window` / `verdict_in`), which
+        // take the flag as a parameter. The wrappers that DO read the global
+        // are covered by `tests/muhurat_widening_wiring.rs` -- a separate
+        // integration binary with its own OnceLock, precisely so installing the
+        // flag there cannot race this.
+        //
         // Before init → false (today's behaviour, no Muhurat widening).
-        assert!(!current(), "uninitialised Muhurat flag must be false");
+        assert!(
+            !current(),
+            "uninitialised Muhurat flag must be false. If this fires, another \
+             test in the tickvault-common LIB test binary called \
+             init_muhurat_session first -- move it to its own integration test \
+             binary rather than relaxing this assertion."
+        );
 
         // After init → reflects the set value.
         init_muhurat_session(true);

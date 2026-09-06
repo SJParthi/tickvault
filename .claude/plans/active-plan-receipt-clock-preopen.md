@@ -373,7 +373,45 @@ needs its own dated authorization under the noise lock.
     is 0 until a regular-session trade prints. Semantically correct — there
     is no baseline yet — but indistinguishable from "flat" on a chart.
 
-- [ ] **W5** Per-minute additive ATM re-fit from 09:16  *(REMAINING)*
+- [x] **W5** Per-minute additive ATM re-fit from 09:16
+      *(ALREADY BUILT AND LIVE — checkbox corrected 2026-09-06)*
+  - **This item was UNCHECKED while the Design section above it said, in bold,
+    "✅ ALREADY BUILT AND LIVE — this plan item was WRONG". The plan
+    contradicted itself, and the two halves had been disagreeing since
+    2026-08-28.** Settled from the CODE rather than from either prose, by
+    symbol rather than by line number (the house rule — a line number in an
+    uncompiled document is a claim with no way to stay true):
+
+    | Symbol the draft said was missing | Occurrences |
+    |---|---|
+    | `send_unsubscribe` (`core/src/websocket/connection.rs`) | 2 |
+    | `SubscribeGuard::try_swap` (`pool_supervisor.rs`) | 1 |
+    | `LiveSubscriptionCommand::Swap` (`pool_supervisor.rs`) | 15 |
+    | `run_depth_rebalance` (`app/src/depth_rebalance.rs`) | 1 |
+    | `is_quiet` (the edge-trigger) | 8 |
+
+    The per-minute cadence is real too: `secs_until_next_rebalance` sleeps to
+    `REBALANCE_OFFSET_SECS = 8` past each minute, and `REBALANCE_HEARTBEAT_SECS`
+    stamps liveness from a separate ticker. Spawned in production from
+    `dhan_feed_stack::spawn_depth_rebalance`, which the attach loop reaches on
+    its only success return.
+
+  - **Why a stale UNCHECKED box is worth a correction and not a silent tick.**
+    An unchecked item is an instruction to a future session to go and build the
+    thing. The Design section already spells out what that costs here: a second
+    re-fit loop racing the first over the same five depth-200 sockets, both
+    issuing `Swap` against one `SubscribeGuard`. That is strictly worse than
+    the surplus work — it is a correctness bug manufactured by a checkbox.
+    Same class as the `day_ohlc_tracker` row this repo records: a stale record
+    does not merely fail to inform, it actively produces false findings.
+
+  - **Scope note, checked rather than assumed.** W5 is the DEPTH-200 ATM
+    re-fit (the operator's 2026-08-26 directive: NIFTY/BANKNIFTY ATM CE/PE,
+    every minute, edge-triggered). It is NOT the main-feed contract top-up,
+    whose separate `CONTRACT_TOPUP_CUTOFF_IST_SECS = 09:30` bound this item's
+    original draft cited. Those are two different mechanisms on two different
+    socket pools, and conflating them is how this box would have been ticked
+    for the wrong reason.
   - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/core/src/websocket/pool_supervisor.rs`, `crates/common/src/config.rs`, `config/base.toml`
   - Tests: T13, T14, T15
   - **Research complete 2026-08-28. What already exists, and what does not:**
