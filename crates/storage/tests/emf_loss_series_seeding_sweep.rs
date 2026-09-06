@@ -540,11 +540,18 @@ fn the_resolver_follows_all_four_house_shapes() {
 #[test]
 fn the_resolver_follows_the_generic_constructor_shape() {
     // The const, the call that hands it over, and the constructor that seeds.
+    //
+    // Every closing brace in this fixture is INDENTED deliberately, and it is
+    // load-bearing rather than cosmetic. `assertion_free_test_ratchet` extracts
+    // a test body up to the first line that is EXACTLY the fn's closing brace
+    // at column 0, so a bare `}` inside this raw string truncates the body
+    // before the asserts below and reports this test as proving nothing. It did
+    // exactly that when first written, and CI caught it. Keep them indented.
     let seeding = r#"
 pub const TV_X_OUT_OF_WINDOW: &str = "tv_x_out_of_window_refused_total";
 fn build(feed: Feed) -> OutOfWindowCounters {
     OutOfWindowCounters::new(feed, TV_X_OUT_OF_WINDOW, REASONS)
-}
+    }
     pub(crate) fn new(feed: Feed, counter: &'static str) -> Self {
         let make = |reason: &'static str| {
             let c = metrics::counter!(counter, "reason" => reason);
