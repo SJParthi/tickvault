@@ -87,7 +87,7 @@ unrecoverable — the main feed carries no sequence number.
     by removing `split_for_offload`); extend the existing `:12120` boot-site guard to pin the
     failure arm's disposition
 
-- [ ] **Item 2 — Make the window-gate refusals visible**
+- [~] **Item 2 — Make the window-gate refusals visible** (BLOCKED: operator budget decision — see Execution record)
   - `grep -rn out_of_window_refused_total deploy/` returns ZERO. Both counters exist, are seeded,
     and reach no EMF selector, no dashboard, no alarm. The size of the loss is Unknown today.
   - Add both names to `deploy/aws/cloudwatch-agent.json` and chart them. Do NOT alarm: every
@@ -95,7 +95,7 @@ unrecoverable — the main feed carries no sequence number.
   - Files: `deploy/aws/cloudwatch-agent.json`, `deploy/aws/terraform/dashboard.tf`
   - Tests: EMF selector lockstep guard; producer-exists guard
 
-- [ ] **Item 3 — `ARRIVAL_GRACE_TAIL_SECS` for arrival-clocked rows only**
+- [x] **Item 3 — `ARRIVAL_GRACE_TAIL_SECS` for arrival-clocked rows only**
   - Depth carries ONE clock (`ts_nanos` IS the arrival stamp) and sentinel-LTT ticks fall back to
     the receipt. Those rows are judged on the wall clock, so a genuinely late vendor delivery past
     15:40 describing in-session activity is refused. Grace 240s, derived from the measured max
@@ -113,13 +113,13 @@ unrecoverable — the main feed carries no sequence number.
   - Files: `deploy/docker/docker-compose.yml` (or the env default), `deploy/systemd/tickvault.service`
   - Tests: cpuset lockstep guard — app and QuestDB sets must be disjoint
 
-- [ ] **Item 5 — Depth rescue queue 2 → 8**
+- [x] **Item 5 — WITHDRAWN AS WRONG (see Execution record): deepening trades crash-durability for latency**
   - Makes the inline `perform_depth_rescue` on the drain rare without changing no-drop semantics,
     so the 2026-08-15 "nothing wiped off" lock is untouched. Cost ~192 MiB.
   - Files: `crates/storage/src/depth_persistence.rs`
   - Tests: constant ratchet with its memory derivation
 
-- [ ] **Item 6 — Counter for the stacked-disconnect frame discard**
+- [x] **Item 6 — WITHDRAWN: already shipped 2026-09-02 (#1842)**
   - `connection.rs` drops the WHOLE frame when data is stacked ahead of a disconnect control
     packet; the code says those bytes are "gone rather than deferred". Log-only today.
   - Files: `crates/core/src/websocket/connection.rs`
@@ -131,7 +131,7 @@ unrecoverable — the main feed carries no sequence number.
   - Files: `crates/core/src/websocket/pool_supervisor.rs`
   - Tests: respawn fires once and only once; the flap damper still bounds it
 
-- [ ] **Item 8 — Correct the stale CLAUDE.md claims**
+- [x] **Item 8 — Correct the stale CLAUDE.md claims**
   - Test count is 11,714 (not ~7,250); coverage floors are 63.0–99.4 (not 100%), with `app` at 68.3.
   - Files: `CLAUDE.md`
   - Tests: none — documentation truth-sync
@@ -199,3 +199,32 @@ Item 5's refusals stay on the existing `DEPTH_RESCUE_INLINE_FALLBACK_COUNTER`. I
 missing discard counter. Item 7 counts respawns. No new alarm is added by this plan: the budget's
 September forecast is $130.39 against an automatic `STOP_EC2_INSTANCES` line at $135.00, so any new
 alarm needs a lever first — that decision is Item 7 of the operator's list and is NOT taken here.
+
+---
+
+## Execution record — 2026-09-06
+
+Written as the work landed, including the items that turned out not to exist. Four of
+the eight were sourced from a stale reading and are withdrawn; that ratio is the finding.
+
+| Item | Outcome |
+|---|---|
+| 1 — blocking HTTP on the drain | **WITHDRAWN before work started.** Already fixed 2026-08-29 (#1833). The comment that claimed otherwise was written 2026-08-26 (#1824) — three days BEFORE the fix. |
+| 1a — harden the spawn failure + annotate the stale comment | IN PROGRESS |
+| 2 — make the window refusals visible in CloudWatch | **BLOCKED on an operator decision.** Verified: `tv_ticks_out_of_window_refused_total`, `tv_depth_rows_out_of_window_refused_total`, `tv_depth_rescue_inline_fallback_total` and `tv_depth_rescue_queued_total` each return ZERO hits under `deploy/`. Four EMF names ≈ $1.20/mo against a September forecast of $130.39 and an automatic `STOP_EC2_INSTANCES` line at $135.00 — $4.61 of margin. `dhan-rest-only-noise-lock-2026-07-14.md` §2.3n requires a LEVER, not a cost note. The approved-in-principle Elastic IP release (−$3.60/mo, Quote 10) is the lever; taking it is not an executor's call. |
+| 3 — arrival grace for arrival-clocked rows | **DONE.** `ARRIVAL_GRACE_TAIL_SECS = 240`, a separate `nanos_in_any_open_window_with_arrival_grace` predicate, depth gate repointed. 7 window tests + 1 depth regression, bite-proven both directions. |
+| 4 — `TV_QDB_CPUSET=3` | **NOT A FREE WIN — reclassified.** Verified: app `AllowedCPUs=1-2`, QuestDB `cpuset 2,3`, so core 2 is genuinely shared. But the host has 4 cores, core 0 services NIC softirq, and the compose file keeps QuestDB's `cpus` quota EQUAL to its cpuset width. Making them disjoint therefore takes a core from one side: QuestDB drops to 1 core (it applies WAL and merges ~1.5B depth rows/session) or the app drops to 1 (it runs the drain plus both writers). No measurement exists saying which can afford it, and guessing on a live trading box is not warranted by a 21.8%-throttling figure taken under the OLD configuration. Needs a measured comparison, not an edit. |
+| 5 — depth rescue queue 2 → 8 | **WITHDRAWN as wrong.** The constant carries its own reasoning: every payload in that queue is rows that exist NOWHERE ELSE in the process, so a deeper queue converts a database stall into a bigger CRASH-LOSS window. Deepening it trades durability for latency, which is backwards for the stated priority. An existing guard (`the_depth_rescue_queue_matches_the_tick_one`) also pins parity with the tick path so the two writers cannot drift into different failure semantics. The rescue path already never drops — it falls back to an inline write — so the cost of the shallow queue is a drain STALL, not loss, and the honest fix is visibility (Item 2), not depth. |
+| 6 — counter for the stacked-disconnect discard | **WITHDRAWN — already shipped** 2026-09-02 (#1842, `8f25ee625`), with the exact byte-accounting reasoning this item proposed. |
+| 7 — parked-socket respawn | IN PROGRESS, narrowed. The park policy is CORRECT for pool-overflow (805) and credential rejections — the code says so and it is right: re-dialing into an 805 kills a healthy pool member. Only the transport-fatal reason is eligible, once per session. |
+| 8 — correct the stale CLAUDE.md claims | **DONE.** Worse than recorded: 502,296 LoC not ~74K, 688 files not 158, 8 crates not 6, 11,750 test annotations not ~7,250. Two crates were missing from the map, including the one running the budget kill-switch. |
+
+### The pattern, recorded because it is the reusable part
+
+Half this plan described defects that were already fixed, or that the code had
+deliberately decided against. Every one of those four was sourced from a COMMENT or from
+an earlier session's note rather than from the call path. This repository already records
+the same failure twice — `day_ohlc_tracker` (2026-08-12) and `WAL-SUSPEND-01`
+(2026-08-25) — and the lesson did not transfer, because a plan file reads like settled
+context rather than a claim. It is a claim. Verify each item against the tree at the
+moment work starts on it, not at the moment it is written down.

@@ -1333,6 +1333,44 @@ pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
 /// constant when the close moved, and it must stay.
 pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 56_400;
 
+/// Seconds of grace added to the END of an open window, for ARRIVAL-CLOCKED
+/// rows only. 240 = 4 minutes.
+///
+/// # Why this exists
+///
+/// `market_depth` carries exactly ONE clock: its designated `ts` IS the instant
+/// the frame reached us, because the depth protocol has no exchange timestamp
+/// field. A tick whose LTT is the absent-value sentinel falls back to the same
+/// receipt clock. Those rows are therefore judged on OUR wall clock, and a row
+/// describing 15:39 book state that the vendor delivered at 15:40:05 was
+/// refused for being late — permanently, and with `Ok(())` returned, so no
+/// replay ever re-offered it.
+///
+/// That is the same defect `WindowVerdict::is_refusal` was corrected for on
+/// 2026-09-05, surviving on the one path where the receipt is not a second
+/// opinion but the only stamp there is.
+///
+/// # Why 240 and not a rounder number
+///
+/// DERIVED, not chosen. This repository's own measured Dhan delivery lag
+/// (`websocket-connection-scope-lock.md` §E, 2026-07-06) is p99 **46.37 s**
+/// and max **198.69 s**. 240 clears the measured maximum with ~20% margin and
+/// is far below the nearest junk class it must keep excluding: an evening
+/// restart at 18:00 is 2h20m outside it, and the Muhurat window opens at
+/// exactly 18:00 (`MUHURAT_PERSIST_START_SECS_OF_DAY_IST`), so the regular
+/// session's tail can never run into it.
+///
+/// # What it does NOT do
+///
+/// It does not widen the window for EXCHANGE-clocked rows. The operator's
+/// 2026-09-05 rule binds the EVENT clock, and a trade the exchange stamped
+/// outside the session is still refused. This grace only stops us asking a row
+/// to stamp an event it cannot see.
+///
+/// It also adds NO grace to the window START. A frame arriving at 08:58 is
+/// genuinely pre-open; nothing about delivery lag makes an early arrival late.
+pub const ARRIVAL_GRACE_TAIL_SECS: u32 = 240;
+
 /// CCL-06 (permutation-coverage audit §140): seconds-of-day (IST) at which the
 /// Muhurat (Diwali evening) trading-session persist window OPENS: 18:00:00 =
 /// 18 × 3600. This is a DELIBERATE SUPERSET of the historical announced NSE
@@ -3011,6 +3049,31 @@ const _: () = assert!(
 const _: () = assert!(
     TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY,
     "TICK_PERSIST_END must be within a single day"
+);
+
+// The arrival grace tail. Both bounds matter and neither is decorative.
+//
+// LOWER: it must clear the measured worst Dhan delivery lag (198.69 s,
+// `websocket-connection-scope-lock.md` §E), or the grace fails to admit the
+// very rows it exists for and is theatre.
+//
+// UPPER: the regular session's tail must never reach the Muhurat window's
+// start, or a Diwali evening frame would be admitted by the REGULAR window's
+// grace and counted against the wrong session.
+const _: () = assert!(
+    ARRIVAL_GRACE_TAIL_SECS > 199,
+    "the arrival grace must exceed the measured 198.69 s worst-case Dhan \
+     delivery lag, or it cannot admit the late deliveries it exists for"
+);
+const _: () = assert!(
+    TICK_PERSIST_END_SECS_OF_DAY_IST + ARRIVAL_GRACE_TAIL_SECS
+        < MUHURAT_PERSIST_START_SECS_OF_DAY_IST,
+    "the regular window's arrival tail must not reach the Muhurat window start"
+);
+const _: () = assert!(
+    MUHURAT_PERSIST_END_SECS_OF_DAY_IST + ARRIVAL_GRACE_TAIL_SECS < SECONDS_PER_DAY,
+    "the Muhurat window's arrival tail must not cross midnight, which would \
+     wrap the seconds-of-day arithmetic into the next morning"
 );
 
 // CCL-06: Muhurat persist window — start < end, both within a day, values match

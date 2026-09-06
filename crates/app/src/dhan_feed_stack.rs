@@ -138,6 +138,47 @@ pub const DHAN_LIVE_FEED_ENV_ON: &str = "1";
 /// through bring-up and for as long as the transport is unwired.
 pub const FEED_STACK_UP_GAUGE: &str = "tv_dhan_feed_stack_up";
 
+/// Gauge: `1` when the depth ILP flush is back ON the frame-drain task.
+///
+/// Boot calls [`LiveIngest::spawn_depth_offload_writer`] to move the depth ILP
+/// round trip onto `tv-depth-writer`. That spawn can FAIL — `EAGAIN`,
+/// `RLIMIT_NPROC`, a thread-starved box — and the handler deliberately logs
+/// and continues rather than refusing to boot, because a lane running degraded
+/// beats no lane at all.
+///
+/// What "degraded" actually means here is not small, which is why it gets a
+/// gauge rather than only a log line. The fallback reinstates the exact
+/// mechanism the offload was built to remove: a synchronous ILP-over-HTTP
+/// flush, bounded by the conf-pinned `request_timeout=5000`, on the only task
+/// emptying the socket — at a MEASURED ~24x the tick row volume
+/// (1,530,651,649 depth rows per session against 64,349,753 ticks). A stalled
+/// database then stops the fold, the receive buffer fills, and Dhan skips a
+/// slow consumer forward to "the latest available state" with no sequence
+/// number, so the loss happens at THEIR side and is invisible to every counter
+/// we own. That is a tick-loss path, not a cosmetic degradation.
+///
+/// # Both arms publish, and the healthy one is the load-bearing half
+///
+/// The success path sets `0`. That is not symmetry for its own sake: the
+/// CloudWatch agent computes a series from consecutive samples and DROPS the
+/// first sample of a series it has never seen, so a gauge written only on
+/// failure would publish nothing on the one boot that needed it — an absent
+/// series being indistinguishable from a healthy one. Seeding the healthy
+/// value at boot is what makes the failure value legible. The same
+/// first-sample rule hid `tv_depth_rows_spilled_total` on 2026-08-28 and left
+/// 104,540 depth rows permanently unclassifiable.
+///
+/// # NOT alarmed, and deliberately not shipped to CloudWatch here
+///
+/// This name is absent from every file under `deploy/` on purpose. A new
+/// Dhan-scoped page requires a dated operator authorization in
+/// `.claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md` §3, and no
+/// such authorization exists for this signal — adding an alarm without one is
+/// a REJECT by that lock's own terms. The gauge is published so the value
+/// exists locally and can be alarmed in one line the day it IS authorized;
+/// until then it is honestly unwatched rather than dishonestly absent.
+pub const DEPTH_OFFLOAD_DEGRADED_GAUGE: &str = "tv_dhan_depth_offload_degraded";
+
 /// Gauge: connections the plan reserved, by endpoint type.
 ///
 /// PLANNED, not alive. It is written once at bring-up and never moves again, so
@@ -3941,6 +3982,59 @@ fn flush_and_record(
     // sharing that worker stop pumping pongs, the drain stops draining, and
     // the ring fills. It is not merely slow — it is a tick-loss and
     // disconnect path, which is the whole reason the helper exists.
+    //
+    // ⚠ CORRECTED 2026-09-06 — the four paragraphs above are FALSE as of
+    // 2026-08-29, and the wrapper below is now belt-and-braces rather than
+    // the last thing standing between a stalled database and tick loss.
+    //
+    // What they claim: that `LiveIngest::flush` still reaches a blocking
+    // ILP-over-HTTP round trip through a separate, un-offloaded inline-depth
+    // sink, so this early return is a blocking-HTTP call on the drain "on the
+    // ONLY path production takes".
+    //
+    // What the code does now, symbol by symbol:
+    //
+    // * `LiveIngest::depth_sink` is the lane's ONE depth sink (2026-08-28).
+    //   depth-20, depth-200 and the inline depth-5 path all write through the
+    //   SAME `DepthIngest`; the "separate ILP buffers on separate flush
+    //   rhythms" this comment reasons from no longer exist, and a guard fails
+    //   the build if a second sink reappears.
+    // * Boot calls `LiveIngest::spawn_depth_offload_writer`, pinned by
+    //   `the_lane_actually_moves_the_depth_flush_off_the_drain`. It spawns
+    //   `tv-depth-writer` via `split_for_offload` and `tv-depth-rescue` via
+    //   `split_rescue_offload`, exactly as the tick side does.
+    // * So the production chain is `flush_and_record` -> `LiveIngest::flush`
+    //   -> `DepthIngest::flush` -> `DepthWriter::flush` -> the offload arm ->
+    //   `tx.try_send`. A bounded-queue hand-off. No HTTP and no file IO on
+    //   this task, and `try_send` never blocks — a full queue keeps the rows
+    //   and the rescue thread carries them, which is the whole design.
+    //
+    // PROVENANCE, because it is the reusable part: the text above was written
+    // on 2026-08-26 (#1824) and `spawn_depth_offload_writer` landed on
+    // 2026-08-29 (#1833). This comment therefore describes the tree as it
+    // stood THREE DAYS BEFORE the fix that followed it, and has read as a
+    // live defect ever since.
+    //
+    // Why that is worth a dated block rather than a silent edit: this
+    // repository has twice recorded that a stale claim does not merely fail
+    // to warn, it MANUFACTURES false findings — `day_ohlc_tracker`
+    // (2026-08-12) and `WAL-SUSPEND-01` (2026-08-25), each of which cost a
+    // session real work chasing a defect that was already fixed. This one did
+    // it a third time: on 2026-09-06 a session read these paragraphs, took
+    // them for the current tree, and reported "blocking HTTP on the frame
+    // drain" as its single highest-priority finding. The code was correct the
+    // whole time; only the comment was wrong, and a comment describing a hot
+    // path is a claim like any other — it goes stale like any other, and it
+    // is checkable in one `grep` for the symbol it names.
+    //
+    // The paragraph below STANDS and the `blocking_flush` wrapper STAYS. Its
+    // own reasoning is unaffected by any of this: gating the wrapper needs a
+    // second accessor kept in step with what `LiveIngest::flush` actually
+    // does, and that split knowledge is precisely what produced the original
+    // bug. The wrapper is now cheap insurance against the depth offload
+    // failing to spawn (see the boot handler, which publishes
+    // `DEPTH_OFFLOAD_DEGRADED_GAUGE` when it does) rather than the mitigation
+    // of a live coupling.
     //
     // Wrapped UNCONDITIONALLY rather than gated on "is there depth pending":
     // a gate needs a second accessor that must be kept in step with what
@@ -10028,6 +10122,12 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "depth writer: the ILP flush now runs on its own thread — the largest \
                  payload in the process can no longer stall the frame drain"
             );
+            // Publish the HEALTHY value, not nothing. The CloudWatch agent
+            // drops the first sample of a series it has never seen, so a gauge
+            // written only on the failure arm would publish nothing on the one
+            // boot that needed it — and an absent series reads exactly like a
+            // healthy one. Seeding 0 here is what makes the 1 below legible.
+            metrics::gauge!(DEPTH_OFFLOAD_DEGRADED_GAUGE).set(0.0);
         }
         Err(err) => {
             error!(
@@ -10037,6 +10137,12 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                  the frame drain, where a slow database stalls the fold and ticks are \
                  lost upstream at the vendor. The lane still runs."
             );
+            // The log line above scrolls; this does not. The fallback puts a
+            // synchronous 5,000 ms ILP round trip back on the frame drain at
+            // ~24x the tick row volume, which is a tick-loss path rather than
+            // a cosmetic degradation — see DEPTH_OFFLOAD_DEGRADED_GAUGE for
+            // the mechanism and for why this is deliberately not alarmed yet.
+            metrics::gauge!(DEPTH_OFFLOAD_DEGRADED_GAUGE).set(1.0);
         }
     }
 
@@ -12129,6 +12235,74 @@ mod tests {
              the join the process exits with the last batch in flight; without the SHARED \
              deadline the two joins sum past the lane's flush budget and the second one is \
              cut off by the exit — silently."
+        );
+    }
+
+    /// A failed depth-offload spawn must be VISIBLE, not only logged — and the
+    /// HEALTHY boot must publish too.
+    ///
+    /// The `Err` arm keeps the lane running on the SYNCHRONOUS depth path,
+    /// which reinstates the exact blocking ILP-over-HTTP round trip on the
+    /// frame drain that `spawn_depth_offload_writer` exists to remove, at a
+    /// MEASURED ~24x the tick row volume and a 5,000 ms timeout. A stalled
+    /// database then stops the fold and the vendor discards the intermediate
+    /// ticks at their side with no sequence number — a tick-loss path, not a
+    /// cosmetic degradation. Before 2026-09-06 its only trace was one coded
+    /// log line at boot, which scrolls.
+    ///
+    /// Both arms are pinned, and the healthy one is the load-bearing half: the
+    /// CloudWatch agent drops the first sample of a series it has never seen,
+    /// so a gauge published only on failure would publish nothing on the one
+    /// boot that needed it, and an absent series reads exactly like a healthy
+    /// one. That first-sample rule hid `tv_depth_rows_spilled_total` on
+    /// 2026-08-28 and left 104,540 depth rows permanently unclassifiable.
+    ///
+    /// A source scan rather than a behavioural test because the arm runs only
+    /// inside a boot that has already dialed sockets: the sibling guard
+    /// `the_lane_actually_moves_the_depth_flush_off_the_drain` is the same
+    /// shape, for the same reason.
+    #[test]
+    fn a_failed_depth_offload_spawn_publishes_the_degraded_gauge() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+
+        // The name is asserted here rather than only at the declaration so a
+        // rename cannot silently orphan a future CloudWatch filter keyed on
+        // the exact string.
+        assert_eq!(
+            DEPTH_OFFLOAD_DEGRADED_GAUGE, "tv_dhan_depth_offload_degraded",
+            "the degraded gauge keeps the tv_ house prefix and its exact name; \
+             anything reading it keys on that string"
+        );
+
+        let start = production_half
+            .find("match ingest.spawn_depth_offload_writer() {")
+            .expect(
+                "the boot path must MATCH on spawn_depth_offload_writer — an ignored \
+                 Result would drop the failure arm this gauge exists to report",
+            );
+        let rest = &production_half[start..];
+        let end = rest.find("// Seed BEFORE any socket opens").expect(
+            "the depth-offload boot arm must still be followed by the seeding block; \
+             without a terminator this scan would read the whole rest of the file and \
+             pass on gauge writes belonging to some other path",
+        );
+        let arm = &rest[..end];
+
+        assert!(
+            arm.contains("metrics::gauge!(DEPTH_OFFLOAD_DEGRADED_GAUGE).set(1.0)"),
+            "the Err arm of the depth-offload spawn must set the degraded gauge to 1. \
+             It keeps the lane on the SYNCHRONOUS depth path, which puts a 5,000 ms \
+             blocking ILP flush back on the frame drain at ~24x the tick row volume, \
+             and a log line is not a queryable state at 09:30"
+        );
+        assert!(
+            arm.contains("metrics::gauge!(DEPTH_OFFLOAD_DEGRADED_GAUGE).set(0.0)"),
+            "the Ok arm must publish 0 rather than nothing. The CloudWatch agent drops \
+             the first sample of a series it has never seen, so a failure-only gauge \
+             publishes nothing on the one boot that needed it"
         );
     }
 
