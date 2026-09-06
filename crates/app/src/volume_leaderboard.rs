@@ -34,24 +34,67 @@
 //! that measurement shows is negligible, and it bought the single worst failure
 //! mode in the design. So
 //! this module holds no threshold: [`VolumeLeaderboard::rank`] recomputes from
-//! current state, one bad value affects one contract instead of the whole set,
-//! and it self-corrects the moment a good value arrives.
+//! current state, and one bad value affects one contract instead of the whole
+//! set.
+//!
+//! **CORRECTED 2026-09-06, and the correction is the point.** This paragraph
+//! used to end "and it self-corrects the moment a good value arrives". That was
+//! FALSE, and false in the reassuring direction. The monotonicity gate below
+//! refuses every value beneath the stored one, so a contract latched near
+//! `u32::MAX` refused every later observation for the rest of the session and
+//! held its depth slot until the process restarted. The failure this header
+//! quotes a hostile reviewer killing the heap over — *a value nothing can ever
+//! beat* — had been reproduced one level down, per contract instead of per set,
+//! inside the very design that replaced it. A reader auditing this module for
+//! that shape would have read the sentence, believed it, and stopped.
+//!
+//! [`RELATCH_AFTER_CONSECUTIVE_LOWER`] is what makes the sentence true: after a
+//! sustained run of lower observations the stored high is abandoned rather than
+//! defended. Pinned by
+//! [`tests::a_contract_latched_at_the_ceiling_recovers_instead_of_owning_a_socket_forever`].
 //!
 //! # The monotonicity gate IS the overflow guard
 //!
 //! [`tickvault_common::tick_types::ParsedTick::volume`] is a `u32` and the WIRE
 //! value wraps at the vendor, which we cannot observe directly. But a wrap
 //! manifests as cumulative volume *falling* — from ~4.29e9 to near zero — and
-//! so do the other three breakers of monotonicity: write-ahead-log replay
-//! re-injecting older frames after newer ones, Dhan skipping a slow consumer
-//! forward to "the latest available state" with no sequence number, and the
-//! 09:00 session reset. **One gate catches all four — with one hole, stated rather
-//! than implied.** A wrap landing exactly on ZERO is invisible here: zero is
-//! short-circuited earlier as the pre-open state of every contract and cannot
-//! be told apart from it. Unreachable in practice, and recorded because
-//! "catches all four" read alone would overstate it. Refusing is the right
-//! direction: holding the last good high keeps the most liquid contract ranked,
-//! where accepting the wrapped value would silently drop it off the leaderboard.
+//! so do two of the other three breakers of monotonicity: write-ahead-log
+//! replay re-injecting older frames after newer ones, and the 09:00 session
+//! reset.
+//!
+//! **CORRECTED 2026-09-06 — this said "one gate catches all four", and the
+//! fourth was never caught.** Dhan skipping a slow consumer forward to "the
+//! latest available state" produces a HIGHER cumulative value, not a lower one:
+//! the intermediate trades are lost upstream and the next value we see is the
+//! new, larger total. That is `Accepted` here and is indistinguishable from
+//! ordinary trading — no gate on a monotonicity test can see it, because
+//! nothing about it is non-monotonic. The claim was wrong in the reassuring
+//! direction: a reader auditing tick-loss detection would have read "covered"
+//! and stopped, on the one breaker that is genuinely undetectable from this
+//! side of the socket. It stays undetectable; what changes is that this file no
+//! longer says otherwise.
+//!
+//! The remaining hole in what the gate DOES cover: a wrap landing exactly on
+//! ZERO is invisible, because zero is short-circuited earlier as the pre-open
+//! state of every contract and cannot be told apart from it.
+//!
+//! Refusing is the right first response — holding the last good high keeps the
+//! most liquid contract ranked, where accepting a wrapped value would drop it
+//! off the leaderboard — but refusing FOREVER is not, which is what
+//! [`RELATCH_AFTER_CONSECUTIVE_LOWER`] exists to bound.
+//!
+//! **And the premise under all of this is an inference, not a vendor fact.**
+//! Checked against the official DhanHQ v2 doc pack on 2026-09-06: the Quote and
+//! Full packets document bytes 23-26 as `int32 | Volume` and say nothing more —
+//! not "cumulative", not "since session open", not "resets". Greps for
+//! `cumulative`, `since`, `running total`, `reset` and `monotonic` across the
+//! whole pack return ZERO hits. The neighbouring fields ARE qualified ("Last
+//! Traded Quantity", "Total Sell Quantity"), which is what makes an unqualified
+//! "Volume" read as day-cumulative by convention — convention, not
+//! documentation. `ErrorCode::Volume01MonotonicityBreach`'s own doc cites Dhan
+//! Ticket #5525125 as proof of the semantic; that ticket is about PrevClose
+//! routing and carries no volume fact. The gate is built to be correct under
+//! EITHER reading, which is why it is worth having while the question is open.
 //!
 //! This restores the behaviour `ErrorCode::Volume01MonotonicityBreach` was minted for. Its
 //! module was deleted and the error code outlived it, so a wrapped or reset
@@ -79,14 +122,27 @@ use std::collections::HashMap;
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::ExchangeSegment;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Contracts tracked before the map refuses new ones.
 ///
 /// 25,000 deliberately, matching `AGGREGATOR_MAX_SLOTS`,
 /// `MAX_INDICATOR_INSTRUMENTS` and the two per-instrument tracker caps, so one
-/// figure covers every per-instrument structure on the same universe. The
-/// authorized set measured 22,996 on 2026-08-21, leaving 2,004 spare.
+/// figure covers every per-instrument structure on the same universe.
+///
+/// **CORRECTED 2026-09-06 — this is PER FAMILY, not per leaderboard.** There
+/// are two `Family` maps, so the structure's real ceiling is 50,000 entries and
+/// its memory bound is twice what a reader would take from the number. The
+/// previous doc said "the authorized set measured 22,996 on 2026-08-21, leaving
+/// 2,004 spare", which compares a per-family cap against the WHOLE subscribed
+/// universe — two different denominators.
+///
+/// The honest per-family figures from that same measurement: **20,220 stock
+/// options** and **1,250 index options**. So the stock family runs at ~81% of
+/// its cap and the index family at ~5%, and `RefusedAtCapacity` is not reachable
+/// on either at today's scope. It is kept as a fail-closed bound rather than
+/// deleted, because the ATM window is re-fitted per session and a wider one
+/// would move the stock figure.
 pub const MAX_TRACKED_CONTRACTS: usize = 25_000;
 
 /// Counter: observations refused, labelled by reason.
@@ -165,6 +221,21 @@ pub enum Observation {
         /// What arrived.
         offered: u32,
     },
+    /// The stored high was ABANDONED after
+    /// [`RELATCH_AFTER_CONSECUTIVE_LOWER`] consecutive lower observations, and
+    /// the offered volume adopted in its place.
+    ///
+    /// This is the escape from the one-way ratchet. Without it a contract
+    /// latched to a garbage high refuses every later value for the rest of the
+    /// session and holds a depth slot it does not deserve — the same "a value
+    /// nothing can ever beat" failure that killed the min-heap design, one
+    /// level down.
+    Relatched {
+        /// The high we stopped defending.
+        abandoned: u32,
+        /// The value taken in its place.
+        adopted: u32,
+    },
     /// The map is full and this contract is new. Already-tracked contracts are
     /// unaffected; this one will not be ranked.
     RefusedAtCapacity,
@@ -180,11 +251,50 @@ pub enum Observation {
     Unchanged,
 }
 
+/// Consecutive LOWER observations after which the stored high is abandoned.
+///
+/// Without this the gate is a one-way ratchet: a contract latched to a garbage
+/// high refuses every later value for the rest of the session and holds its
+/// depth slot forever. That is precisely the failure the module header cites as
+/// the reason the min-heap design was killed — "a value nothing can ever beat"
+/// — reproduced one level down, per contract instead of per set. An earlier
+/// version of that header claimed the design "self-corrects the moment a good
+/// value arrives"; it could not, and this constant is what makes the claim
+/// true.
+///
+/// The two causes of a falling volume that are REAL restarts — a 32-bit wrap
+/// and the session reset — produce an UNBOUNDED run of lower values: every
+/// subsequent tick is lower. The one cause that is transient — write-ahead-log
+/// replay re-injecting older frames — is bounded by the replay batch. Counting
+/// consecutive refusals separates them without a clock, which the per-tick path
+/// cannot afford.
+///
+/// 32 rather than a smaller number because a replay re-injects a contract's
+/// frames in order, so each replayed frame is higher than the last while still
+/// below the stored high — the counter climbs through the replay. Re-latching
+/// mid-replay costs a temporarily low ranking that the next live tick corrects.
+/// Re-latching too LATE costs a permanently frozen socket. The asymmetry is why
+/// this errs toward re-latching.
+pub const RELATCH_AFTER_CONSECUTIVE_LOWER: u16 = 32;
+
+/// One tracked contract plus the state the re-latch needs.
+///
+/// `Copy`, 8 bytes wider than the contract alone; at the 25,000 cap that is
+/// ~200 KB per family and it buys the difference between a transient
+/// mis-ranking and a socket frozen for the session.
+#[derive(Debug, Clone, Copy)]
+struct Tracked {
+    contract: RankedContract,
+    /// Reset to 0 on every accepted advance. Only a RUN of lower values counts.
+    consecutive_lower: u16,
+}
+
 #[derive(Debug)]
 struct Family {
-    volumes: HashMap<ContractKey, RankedContract>,
+    volumes: HashMap<ContractKey, Tracked>,
     non_monotonic: u64,
     at_capacity: u64,
+    relatched: u64,
     /// PRE-RESOLVED counter handles.
     ///
     /// `metrics::counter!` selects its zero-allocation arm on the label value
@@ -198,6 +308,14 @@ struct Family {
     /// per-tick path.
     refused_non_monotonic: metrics::Counter,
     refused_capacity: metrics::Counter,
+    /// Gauge handles, resolved for the SAME reason as the counters above.
+    ///
+    /// These sit on the 5-second cadence rather than the per-tick path, so the
+    /// allocating arm would have cost three `Vec`s per sweep — real but small.
+    /// Resolved anyway because a module whose doc explains this exact mechanism
+    /// and then does it is a file the next reader stops trusting.
+    tracked_gauge: metrics::Gauge,
+    ranked_gauge: metrics::Gauge,
 }
 
 impl Family {
@@ -214,6 +332,8 @@ impl Family {
         let refused_capacity =
             metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "capacity");
         refused_capacity.increment(0);
+        let tracked_gauge = metrics::gauge!(TRACKED_GAUGE, "family" => label);
+        let ranked_gauge = metrics::gauge!(RANKED_GAUGE, "family" => label);
         Self {
             // Pre-sized: an unsized map reallocates and rehashes ~15 times on
             // its way to the authorized universe, and every one of those lands
@@ -221,8 +341,11 @@ impl Family {
             volumes: HashMap::with_capacity(MAX_TRACKED_CONTRACTS),
             non_monotonic: 0,
             at_capacity: 0,
+            relatched: 0,
             refused_non_monotonic,
             refused_capacity,
+            tracked_gauge,
+            ranked_gauge,
         }
     }
 
@@ -233,6 +356,7 @@ impl Family {
         self.volumes.clear();
         self.non_monotonic = 0;
         self.at_capacity = 0;
+        self.relatched = 0;
     }
 }
 
@@ -303,8 +427,51 @@ impl VolumeLeaderboard {
             // overwhelmingly common tick a refusal -- which both swamped the
             // ONE counter that detects a real wrap and emitted a coded error
             // whose text says volume went backwards when it had not moved.
-            if contract.volume < existing.volume {
-                let stored = existing.volume;
+            if contract.volume < existing.contract.volume {
+                let stored = existing.contract.volume;
+                existing.consecutive_lower = existing.consecutive_lower.saturating_add(1);
+                let run = existing.consecutive_lower;
+
+                // RE-LATCH. A run this long is not a replayed frame; it is the
+                // contract's real volume, and the stored high is garbage we
+                // would otherwise defend for the rest of the session.
+                //
+                // Refusing forever is what made the ONE-WAY RATCHET: a contract
+                // latched near `u32::MAX` outranks everything real and holds a
+                // depth socket until the process restarts. That is the exact
+                // failure this module's header cites as the reason the min-heap
+                // design was killed — "a value nothing can ever beat" — and
+                // refusing without a way back reproduces it per contract.
+                //
+                // Adopting the new value costs a temporarily low ranking that
+                // the next genuine tick corrects. The asymmetry decides it.
+                if run >= RELATCH_AFTER_CONSECUTIVE_LOWER {
+                    *existing = Tracked {
+                        contract,
+                        consecutive_lower: 0,
+                    };
+                    slot.relatched = slot.relatched.saturating_add(1);
+                    let relatched_total = slot.relatched;
+                    warn!(
+                        metric = REFUSED_COUNTER,
+                        family = label,
+                        security_id = contract.security_id,
+                        ?contract.segment,
+                        abandoned_high = stored,
+                        adopted = contract.volume,
+                        consecutive_lower = run,
+                        relatched_total,
+                        "abandoning a stored volume high after a sustained run of lower \
+                         observations — treating it as a real restart (32-bit wrap or a \
+                         missed session reset) rather than a replayed frame. Refusing \
+                         forever would hold this contract's depth slot for the session."
+                    );
+                    return Observation::Relatched {
+                        abandoned: stored,
+                        adopted: contract.volume,
+                    };
+                }
+
                 slot.non_monotonic = slot.non_monotonic.saturating_add(1);
                 let seen = slot.non_monotonic;
                 slot.refused_non_monotonic.increment(1);
@@ -339,16 +506,22 @@ impl VolumeLeaderboard {
                     offered: contract.volume,
                 };
             }
-            if contract.volume == existing.volume {
+            if contract.volume == existing.contract.volume {
                 // Nothing to record and nothing wrong. Deliberately NOT counted
-                // and NOT logged.
+                // and NOT logged. The run is deliberately NOT reset either: an
+                // equal value is not evidence the stored high is good, and
+                // resetting here would let a wrapped contract that alternates
+                // equal/lower never reach the re-latch.
                 return Observation::Unchanged;
             }
             // Advance in place. The underlying is refreshed too: a derivative
             // id can be reused across days, and holding a stale underlying
             // would put the contract under the wrong name in the depth-200
             // distinct-underlying constraint.
-            *existing = contract;
+            *existing = Tracked {
+                contract,
+                consecutive_lower: 0,
+            };
             return Observation::Accepted;
         }
 
@@ -380,7 +553,13 @@ impl VolumeLeaderboard {
             return Observation::RefusedAtCapacity;
         }
 
-        slot.volumes.insert(key, contract);
+        slot.volumes.insert(
+            key,
+            Tracked {
+                contract,
+                consecutive_lower: 0,
+            },
+        );
         Observation::Accepted
     }
 
@@ -409,7 +588,9 @@ impl VolumeLeaderboard {
             self.family_ref(family)
                 .volumes
                 .values()
-                .copied()
+                // The re-latch bookkeeping stays inside the map; only the
+                // contract itself is ranked.
+                .map(|tracked| tracked.contract)
                 .filter(&eligible),
         );
 
@@ -426,9 +607,10 @@ impl VolumeLeaderboard {
         scratch.truncate(k);
         self.scratch = scratch;
 
-        metrics::gauge!(TRACKED_GAUGE, "family" => family.as_str())
-            .set(self.family_ref(family).volumes.len() as f64);
-        metrics::gauge!(RANKED_GAUGE, "family" => family.as_str()).set(self.scratch.len() as f64);
+        let ranked_len = self.scratch.len();
+        let slot = self.family_ref(family);
+        slot.tracked_gauge.set(slot.volumes.len() as f64);
+        slot.ranked_gauge.set(ranked_len as f64);
         &self.scratch
     }
 
@@ -476,7 +658,7 @@ impl VolumeLeaderboard {
         // size of the last materialised ranking" reporting 20,000 when five
         // sockets were filled is the wrong number for the only question an
         // operator asks of it.
-        metrics::gauge!(RANKED_GAUGE, "family" => family.as_str()).set(out.len() as f64);
+        self.family_ref(family).ranked_gauge.set(out.len() as f64);
         out
     }
 
@@ -490,6 +672,20 @@ impl VolumeLeaderboard {
     #[must_use]
     pub const fn non_monotonic_refusals(&self, family: OptionFamily) -> u64 {
         self.family_ref(family).non_monotonic
+    }
+
+    /// Stored highs ABANDONED after a sustained run of lower observations.
+    ///
+    /// Deliberately NOT a new metric name. A re-latch is the RESOLUTION of a
+    /// run of refusals that `tv_volume_leaderboard_refused_total` has already
+    /// counted, and the event itself carries a `warn!` naming the contract, the
+    /// abandoned high and the adopted value. Adding a second series would cost
+    /// ~$0.30/mo against a September forecast of $142.24 with the automatic
+    /// `STOP_EC2_INSTANCES` line at $135.00, to report something the log
+    /// already says.
+    #[must_use]
+    pub const fn relatches(&self, family: OptionFamily) -> u64 {
+        self.family_ref(family).relatched
     }
 
     /// Observations refused because the map was full, for a family.
@@ -594,6 +790,138 @@ mod tests {
             "the stored high must survive the refusal"
         );
         assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 1);
+    }
+
+    #[test]
+    fn a_contract_latched_at_the_ceiling_recovers_instead_of_owning_a_socket_forever() {
+        // THE ONE-WAY RATCHET, and the reason RELATCH_AFTER_CONSECUTIVE_LOWER
+        // exists. Before it, this contract refused every later value for the
+        // rest of the session and held a depth socket it did not deserve --
+        // the exact "a value nothing can ever beat" failure the module header
+        // cites as the reason the min-heap design was killed, reproduced per
+        // contract inside the design that replaced it.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock);
+        lb.observe(stock(2, 200, 5_000), OptionFamily::Stock);
+
+        // The real contract restarts near zero and climbs, as a wrapped or
+        // session-reset counter does.
+        for i in 1..RELATCH_AFTER_CONSECUTIVE_LOWER {
+            assert!(
+                matches!(
+                    lb.observe(stock(1, 100, u32::from(i)), OptionFamily::Stock),
+                    Observation::RefusedNonMonotonic { .. }
+                ),
+                "a SHORT run must still be refused -- that is the replay case"
+            );
+        }
+        assert_eq!(
+            lb.rank(OptionFamily::Stock, 10, all)[0].security_id,
+            1,
+            "while the run is short the garbage high is still defended"
+        );
+
+        // The run crosses the threshold: the high is abandoned.
+        assert_eq!(
+            lb.observe(
+                stock(1, 100, u32::from(RELATCH_AFTER_CONSECUTIVE_LOWER)),
+                OptionFamily::Stock
+            ),
+            Observation::Relatched {
+                abandoned: u32::MAX,
+                adopted: u32::from(RELATCH_AFTER_CONSECUTIVE_LOWER),
+            }
+        );
+        assert_eq!(lb.relatches(OptionFamily::Stock), 1);
+
+        let ranked = lb.rank(OptionFamily::Stock, 10, all);
+        assert_eq!(
+            ranked[0].security_id, 2,
+            "the real contract must now outrank the recovered one -- the socket is free"
+        );
+
+        // And the recovered contract ranks normally again from here.
+        assert_eq!(
+            lb.observe(stock(1, 100, 9_000), OptionFamily::Stock),
+            Observation::Accepted
+        );
+        assert_eq!(lb.rank(OptionFamily::Stock, 10, all)[0].security_id, 1);
+    }
+
+    #[test]
+    fn an_accepted_advance_resets_the_run_so_a_replay_burst_never_accumulates() {
+        // The run must count CONSECUTIVE lower values. A WAL replay interleaved
+        // with live ticks would otherwise creep to the threshold over a session
+        // and abandon a perfectly good high.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock);
+        for _ in 0..(RELATCH_AFTER_CONSECUTIVE_LOWER * 4) {
+            // one replayed frame, then one live advance
+            assert!(matches!(
+                lb.observe(stock(1, 100, 5), OptionFamily::Stock),
+                Observation::RefusedNonMonotonic { .. }
+            ));
+            let higher = lb.rank(OptionFamily::Stock, 1, all)[0].volume + 1;
+            assert_eq!(
+                lb.observe(stock(1, 100, higher), OptionFamily::Stock),
+                Observation::Accepted
+            );
+        }
+        assert_eq!(
+            lb.relatches(OptionFamily::Stock),
+            0,
+            "an interleaved burst must NEVER reach the threshold"
+        );
+    }
+
+    #[test]
+    fn an_equal_volume_does_not_reset_the_run_toward_relatch() {
+        // A wrapped contract whose volume alternates equal/lower must still
+        // reach the re-latch. An equal value is not evidence the stored high is
+        // good, so it must not clear the run.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock);
+        // 31 lower observations, each followed by one EQUAL to the stored high.
+        for _ in 1..RELATCH_AFTER_CONSECUTIVE_LOWER {
+            lb.observe(stock(1, 100, 7), OptionFamily::Stock);
+            assert_eq!(
+                lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock),
+                Observation::Unchanged,
+                "a value identical to the stored high is Unchanged, never Accepted"
+            );
+        }
+        assert_eq!(
+            lb.relatches(OptionFamily::Stock),
+            0,
+            "31 lower values is still short of the threshold"
+        );
+        // The 32nd crosses it, DESPITE 31 intervening equal values.
+        assert!(matches!(
+            lb.observe(stock(1, 100, 7), OptionFamily::Stock),
+            Observation::Relatched { .. }
+        ));
+        assert_eq!(
+            lb.relatches(OptionFamily::Stock),
+            1,
+            "equal values must not shield a garbage high from the re-latch"
+        );
+    }
+
+    #[test]
+    fn a_relatch_refreshes_the_underlying_so_depth_200_groups_it_correctly() {
+        // A derivative security_id can be reused across days. Holding the old
+        // underlying would file the contract under the wrong name in the
+        // distinct-underlying constraint, silently.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock);
+        for i in 1..=RELATCH_AFTER_CONSECUTIVE_LOWER {
+            lb.observe(stock(1, 999, u32::from(i)), OptionFamily::Stock);
+        }
+        assert_eq!(
+            lb.rank(OptionFamily::Stock, 1, all)[0].underlying_id,
+            999,
+            "the re-latch must adopt the whole contract, not just its volume"
+        );
     }
 
     #[test]
