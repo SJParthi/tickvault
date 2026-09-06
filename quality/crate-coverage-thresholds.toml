@@ -75,7 +75,26 @@ trading = 96.9
 storage = 90.1
 api     = 98.6
 # 2026-07-20: 63.3 -> 68.3 (up-only ratchet; CI-measured min 68.66 across the same two runs; PR #1694).
-app     = 68.3
+# 2026-09-06: 68.3 -> 72.6 (up-only ratchet). Two INDEPENDENT CI Coverage & Perf
+# measurements on different trees:
+#   main @ e1a1584cd, run 34016077307 job 101440089347 -> app 73.07%
+#   PR #1874 @ d20e43313, run 34027561018 job 101471327283 -> app 72.92%
+# Min 72.92. The standing formula (measured rounded down to one decimal, minus
+# 0.1) prescribes 72.8; 72.6 is taken instead, deliberately, for two reasons the
+# file already records elsewhere:
+#   (a) the 2026-07-20 app ratchet ALSO took extra margin — min 68.66 would have
+#       given 68.5 by formula and 68.3 was written, 0.36 under. app is the crate
+#       whose line count moves most (it holds the largest modules in the
+#       workspace), so its measured value drifts more between runs than any
+#       other crate's — the two runs above differ by 0.15 on an unchanged
+#       codebase.
+#   (b) the 2026-08-18 `common` correction in this same file argues at length
+#       that a 0.02-point margin produces a post-merge RED "for a reason no PR
+#       author can act on", and notes every other crate carries 0.2-2.0. 72.8
+#       would leave 0.12 under the min; 72.6 leaves 0.32, inside that practice.
+# This closes 4.3 of the 4.62 points of silent-regression room the 68.3 floor
+# permitted — app was the outlier by 3x (next widest was aws-lambdas at 1.41).
+app     = 72.6
 # aws-lambdas: NEW crate (2026-07-18, rust-only phase 2b-1 — the 4 AWS
 # Lambdas as Rust bins). MEASURED-then-ratcheted per the phase-2 design:
 # local `cargo llvm-cov -p tickvault-aws-lambdas` measured 64.92% lines

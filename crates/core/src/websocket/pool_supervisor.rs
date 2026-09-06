@@ -284,6 +284,23 @@ pub const FLAP_HISTORY_SLOTS: usize = 8;
 /// Counter: connection parked permanently. Labels: `endpoint`, `reason`.
 pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
 
+/// Counter: a park was CONVERTED into one bounded re-dial instead of being
+/// taken. Labels: `endpoint`, `reason`.
+///
+/// Strictly the complement of [`PARK_METRIC`]: a park either happens (that
+/// counter) or is spent as this slot's single respawn (this one). A slot can
+/// contribute at most ONE increment here per session — see
+/// [`ParkReason::allows_one_respawn`] for which reasons can reach it at all,
+/// and `ConnectionSupervisor::park` for the one-shot budget.
+///
+/// # No alarm, and no deploy-side entry, by decision
+///
+/// This name is deliberately absent from `deploy/` — no EMF selector entry and
+/// no CloudWatch alarm. Adding either needs a dated operator authorization
+/// under `dhan-rest-only-noise-lock-2026-07-14.md` §3, which this change does
+/// not have and does not assume. It is a local `/metrics` series only.
+pub const RESPAWN_METRIC: &str = "tv_dhan_ws_park_respawn_total";
+
 /// Counter: frame captured but the bounded ring refused it — the frame is
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
 pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
@@ -595,6 +612,82 @@ impl ParkReason {
             Self::Shutdown => "shutdown",
         }
     }
+
+    /// Whether ONE bounded re-dial is safe after a park for this reason.
+    ///
+    /// # Why this is a per-reason table and not a blanket policy
+    ///
+    /// A park is a PERMANENT capacity loss: the slot goes dark for the rest of
+    /// the session and only a process restart brings it back, which is exactly
+    /// the manual intervention the operator's standing mandate forbids. So the
+    /// blanket "never re-dial" is not free — it is a trade, and the trade is
+    /// only correct where a re-dial is actively HARMFUL rather than merely
+    /// useless. This function is where that judgement is recorded per reason,
+    /// so a future reader can see it was decided rather than defaulted.
+    ///
+    /// It is `const` and exhaustively matched on purpose: adding a
+    /// [`ParkReason`] stops this compiling until someone makes the call for it,
+    /// rather than letting a new reason inherit whichever answer happens to be
+    /// the fallthrough.
+    ///
+    /// # Every reason answers `false` today, and each for its OWN reason
+    ///
+    /// * [`Self::PoolOverflow`] (805) — re-dialing does not retry a failure, it
+    ///   EXECUTES a healthy sibling. Dhan kills the OLDEST socket per extra
+    ///   connection (`15-live-market-feed.md:209`), so a re-dial here costs a
+    ///   fully-subscribed pool member that was working. The cost of being wrong
+    ///   is another socket's shard, not one wasted dial.
+    /// * [`Self::FatalDisconnect`] — the CREDENTIAL/ENTITLEMENT class. Every
+    ///   code that reaches it (806 data-API not subscribed, 808 auth failed,
+    ///   810 client id invalid) needs a human to fix the account or the config,
+    ///   so a re-dial re-presents the identical rejected credential and earns
+    ///   the identical rejection. The one member that is NOT a credential —
+    ///   804, instruments-exceed-limit — is worse rather than better: the
+    ///   `SubscribeGuard` replays the SAME retained set on re-dial, so the
+    ///   outcome is deterministic, and `classify_disconnect`'s own note records
+    ///   that this connect/reject cycle is the traffic pattern 805 describes,
+    ///   whose documented consequence is the USER being blocked. So a 804
+    ///   re-dial can cost a sibling too.
+    /// * [`Self::Shutdown`] — we asked for it. Re-dialing during shutdown is
+    ///   not recovery, it is refusing to stop.
+    ///
+    /// # What a `true` reason would have to look like
+    ///
+    /// A TRANSPORT fatal that is neither overflow nor credential: one where the
+    /// worst case of being wrong is a single wasted dial on this slot alone,
+    /// and where the state that produced it can plausibly differ by the next
+    /// attempt. No such reason exists in this tree today — which is the finding,
+    /// not an omission. The mechanism below is wired and tested so that the day
+    /// one is introduced, it is a one-line answer here rather than a redesign.
+    #[must_use]
+    pub const fn allows_one_respawn(self) -> bool {
+        match self {
+            // Re-dialing kills a healthy sibling. Never.
+            Self::PoolOverflow => false,
+            // Credential/entitlement (806/808/810) repeats the rejection; 804
+            // replays an identical over-limit set and can earn an 805.
+            Self::FatalDisconnect => false,
+            // We asked to stop.
+            Self::Shutdown => false,
+        }
+    }
+}
+
+/// The ONE-SHOT half of the respawn rule, split out from the eligibility half
+/// so each can be tested on its own.
+///
+/// `eligible` is [`ParkReason::allows_one_respawn`]; `already_used` is the
+/// slot's spent flag. The conjunction is the whole rule: a respawn happens only
+/// for a reason that permits one AND only while this slot still has its single
+/// budget. Because the flag is never cleared, the `true` answer can be given at
+/// most once per slot per session — that is what makes "exactly once" a
+/// property of the code rather than of a caller's discipline.
+///
+/// Total, `const`, no clock and no state: the bound does not depend on how much
+/// time passed or on how healthy the socket looked in between, which is
+/// deliberate — see `ConnectionSupervisor::respawn_used`.
+const fn respawn_budget_allows(eligible: bool, already_used: bool) -> bool {
+    eligible && !already_used
 }
 
 /// Why a connection is being re-dialed. Metric label only.
@@ -721,6 +814,17 @@ pub struct ConnectionSupervisor {
     /// report WHY without re-deriving it, and so a caller handed an
     /// already-parked supervisor can exit instead of spinning.
     park_reason: Option<ParkReason>,
+    /// Whether this slot has already spent its ONE respawn this session.
+    ///
+    /// The budget is per SUPERVISOR, and a supervisor is per slot and lives for
+    /// the whole session, so "once per slot per session" needs no clock and no
+    /// window — the flag can only go `false -> true`, never back. Deliberately
+    /// NOT reset by [`ConnEvent::FrameReceived`] or any other health proof: a
+    /// socket that respawns, runs healthily for four hours and then takes a
+    /// second fatal has learned something (the fatal is durable), and giving it
+    /// a fresh budget on the strength of the good hours is how "one bounded
+    /// re-dial" turns into an unbounded loop with extra steps.
+    respawn_used: bool,
 }
 
 impl ConnectionSupervisor {
@@ -742,6 +846,7 @@ impl ConnectionSupervisor {
             frames: 0,
             reconnects: 0,
             park_reason: None,
+            respawn_used: false,
         }
     }
 
@@ -826,7 +931,7 @@ impl ConnectionSupervisor {
         }
 
         match event {
-            ConnEvent::ShutdownRequested => self.park(ParkReason::Shutdown),
+            ConnEvent::ShutdownRequested => self.park(ParkReason::Shutdown, now),
 
             ConnEvent::BeginDial => {
                 self.phase = ConnPhase::Dialing;
@@ -922,7 +1027,7 @@ impl ConnectionSupervisor {
                              a healthy sibling instead of recovering this one — parking. Check \
                              for a second process holding Dhan sockets on this account."
                         );
-                        self.park(ParkReason::PoolOverflow)
+                        self.park(ParkReason::PoolOverflow, now)
                     }
                     DisconnectClass::Fatal => {
                         error!(
@@ -933,7 +1038,7 @@ impl ConnectionSupervisor {
                             "Dhan closed this socket with a credential or entitlement error that \
                              cannot self-heal — parking. Operator action required."
                         );
-                        self.park(ParkReason::FatalDisconnect)
+                        self.park(ParkReason::FatalDisconnect, now)
                     }
                     DisconnectClass::TokenStale => {
                         // Floor the LADDER, then add this socket's stagger —
@@ -1180,7 +1285,52 @@ impl ConnectionSupervisor {
         }
     }
 
-    fn park(&mut self, reason: ParkReason) -> SupervisorAction {
+    /// Parks the connection — unless this reason is respawn-eligible and this
+    /// slot still has its one respawn, in which case ONE bounded re-dial is
+    /// taken instead.
+    ///
+    /// # The respawn is routed through the damper, never dialed directly
+    ///
+    /// It returns [`Self::schedule_redial`], the same tail every retryable
+    /// failure uses, so the respawn inherits the whole existing ladder: the
+    /// backoff rung, this socket's fixed per-slot stagger, the flap damper's
+    /// ceiling, the `redial_history` entry and the reconnect counter. A
+    /// respawn that dialed immediately would be the one re-dial in the file
+    /// that bypasses the flap protection, on the path with the least evidence
+    /// that dialing is safe — exactly backwards.
+    ///
+    /// # Bounded by DATA, not by a branch that cannot be taken
+    ///
+    /// Today [`ParkReason::allows_one_respawn`] answers `false` for every
+    /// reason, so the respawn arm is unreachable in production and the counter
+    /// below registers no series at all (see `PoolSupervisor::new`, which
+    /// pre-registers only reasons that can actually emit — the same discipline
+    /// that keeps `FlapVerdict::Ladder` off the damper counter). That is the
+    /// honest shape: the eligibility TABLE is empty, the mechanism is not
+    /// broken, and nothing publishes a metric that can never move.
+    fn park(&mut self, reason: ParkReason, now: Instant) -> SupervisorAction {
+        if respawn_budget_allows(reason.allows_one_respawn(), self.respawn_used) {
+            // One-shot: consumed BEFORE the redial, so a second fatal on this
+            // slot finds the budget spent and falls through to the park below.
+            self.respawn_used = true;
+            metrics::counter!(
+                RESPAWN_METRIC,
+                "endpoint" => self.slot.endpoint.as_str(),
+                "reason" => reason.as_str(),
+            )
+            .increment(1);
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                connection_index = self.slot.global_index,
+                reason = reason.as_str(),
+                "a Dhan live-feed socket hit a parking condition that is worth ONE re-dial — \
+                 spending this slot's single respawn on the normal backoff ladder rather than \
+                 going dark for the session. A second one parks it permanently."
+            );
+            return self.schedule_redial(ReconnectReason::Disconnected, now);
+        }
+
         self.phase = ConnPhase::Parked;
         self.park_reason = Some(reason);
         metrics::counter!(
@@ -1189,9 +1339,12 @@ impl ConnectionSupervisor {
             "reason" => reason.as_str(),
         )
         .increment(1);
-        // A park is PERMANENT — this socket will never dial again for the rest
-        // of the session, by design (re-dialing into a 805 kills a healthy pool
-        // member, and re-dialing into a credential rejection just repeats it).
+        // Reaching here means the park STANDS: either the reason is not
+        // respawn-eligible, or this slot already spent its one respawn. From
+        // this point it is PERMANENT — this socket will never dial again for
+        // the rest of the session, by design (re-dialing into a 805 kills a
+        // healthy pool member, and re-dialing into a credential rejection just
+        // repeats it).
         //
         // The park POLICY is correct and is not changed here. What was wrong,
         // until 2026-08-14, is that it happened in complete silence: the
@@ -2749,6 +2902,25 @@ impl PoolSupervisor {
                     "reason" => reason.as_str(),
                 )
                 .increment(0);
+            }
+            // Same baseline discipline for the respawn counter, and the same
+            // carve-out: only reasons that can ACTUALLY emit are registered.
+            // `allows_one_respawn` answers `false` for every reason today, so
+            // this registers nothing at all — which is the correct outcome, not
+            // a gap. A pre-registered `tv_dhan_ws_park_respawn_total` sitting
+            // at zero forever would be a series that can never move, the exact
+            // lie the `FlapVerdict::Ladder` carve-out below refuses to tell.
+            // The day a reason becomes eligible, its baseline appears here with
+            // no further edit.
+            for reason in ParkReason::ALL {
+                if reason.allows_one_respawn() {
+                    metrics::counter!(
+                        RESPAWN_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => reason.as_str(),
+                    )
+                    .increment(0);
+                }
             }
             // Same baseline discipline for the flap damper. Only the verdicts
             // that are actually EMITTED are registered — pre-registering
@@ -5489,6 +5661,247 @@ mod tests {
             }
         );
         assert_eq!(s.park_reason(), Some(ParkReason::Shutdown));
+    }
+
+    // -- one-shot respawn after a park -------------------------------------
+    //
+    // The eligibility TABLE is empty today (see `allows_one_respawn`), so the
+    // tests below split into two halves that must both hold:
+    //
+    //   * the NEVER half, driven end-to-end through the real event path for
+    //     every reason that exists. This is the half that matters — a wrong
+    //     `true` here re-dials into an 805 and executes a healthy sibling.
+    //   * the EXACTLY-ONCE half, driven through `respawn_budget_allows`, the
+    //     production predicate `park` gates on. It is tested directly because
+    //     no production reason can reach it today, and a test that could only
+    //     pass by being unreachable would prove nothing about the bound.
+
+    #[test]
+    fn test_no_park_reason_is_respawn_eligible_and_each_one_says_why() {
+        // THE FINDING, pinned. Every park reason in this tree is one whose
+        // re-dial is actively harmful, not merely useless:
+        //   PoolOverflow  — Dhan kills the OLDEST socket, so a re-dial costs a
+        //                   healthy fully-subscribed sibling.
+        //   FatalDisconnect — 806/808/810 are credential/entitlement and repeat
+        //                   verbatim; 804 replays an identical over-limit set
+        //                   and its connect/reject cycle can earn an 805.
+        //   Shutdown      — we asked to stop.
+        //
+        // Flipping any of these to `true` must fail here first, so the change
+        // is a confrontation with the reasoning rather than a one-word edit.
+        for reason in ParkReason::ALL {
+            assert!(
+                !reason.allows_one_respawn(),
+                "{} must NOT be respawn-eligible — re-dialing it is harmful, \
+                 not merely wasted; see ParkReason::allows_one_respawn",
+                reason.as_str()
+            );
+        }
+        // Exhaustive: a new variant stops this compiling until it is decided.
+        for reason in ParkReason::ALL {
+            match reason {
+                ParkReason::PoolOverflow | ParkReason::FatalDisconnect | ParkReason::Shutdown => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_805_pool_overflow_never_respawns_it_parks_on_the_first_fatal() {
+        // The most dangerous wrong answer in this file: a re-dial here does not
+        // retry OUR failure, it evicts somebody else's working socket.
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 2, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+
+        let action = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            },
+            now,
+        );
+        assert_eq!(
+            action,
+            SupervisorAction::Park {
+                reason: ParkReason::PoolOverflow
+            },
+            "805 must park on the FIRST fatal — never spend a respawn"
+        );
+        assert_eq!(s.phase(), ConnPhase::Parked);
+        assert!(
+            !matches!(action, SupervisorAction::SleepThenDial { .. }),
+            "an 805 that answers SleepThenDial would kill a healthy sibling"
+        );
+    }
+
+    #[test]
+    fn test_credential_class_fatal_never_respawns_it_parks_on_the_first_fatal() {
+        // 806 / 808 / 810 are credential + entitlement: a re-dial re-presents
+        // the identical rejected credential. 804 is the non-credential member
+        // and is worse, not better — the guard replays the SAME over-limit set
+        // and the connect/reject cycle is the pattern 805 punishes.
+        let now = t0();
+        for code in [
+            DisconnectCode::DataApiSubscriptionRequired,
+            DisconnectCode::AuthenticationFailed,
+            DisconnectCode::ClientIdInvalid,
+            DisconnectCode::InstrumentsExceedLimit,
+        ] {
+            let mut s = sup(DhanEndpointType::Depth20, 1, now);
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            let action = s.on_event(ConnEvent::Disconnected { code: Some(code) }, now);
+            assert_eq!(
+                action,
+                SupervisorAction::Park {
+                    reason: ParkReason::FatalDisconnect
+                },
+                "{code:?} must park on the FIRST fatal — never spend a respawn"
+            );
+            assert_eq!(s.phase(), ConnPhase::Parked, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn test_shutdown_never_respawns() {
+        // Re-dialing during shutdown is not recovery, it is refusing to stop.
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 3, now);
+        let action = s.on_event(ConnEvent::ShutdownRequested, now);
+        assert_eq!(
+            action,
+            SupervisorAction::Park {
+                reason: ParkReason::Shutdown
+            },
+            "a shutdown must park, never re-dial"
+        );
+        assert_eq!(s.phase(), ConnPhase::Parked);
+    }
+
+    #[test]
+    fn test_a_parked_socket_stays_parked_through_every_event() {
+        // The permanence half: once the park stands, nothing talks it back into
+        // dialing — including a SECOND fatal, which is the shape a spent
+        // respawn leaves behind.
+        let now = t0();
+        for reason_code in [
+            Some(DisconnectCode::ExceededActiveConnections),
+            Some(DisconnectCode::AuthenticationFailed),
+        ] {
+            let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+            let _ = s.on_event(ConnEvent::BeginDial, now);
+            let _ = s.on_event(ConnEvent::Disconnected { code: reason_code }, now);
+            assert_eq!(s.phase(), ConnPhase::Parked, "{reason_code:?}");
+
+            for ev in [
+                ConnEvent::BeginDial,
+                ConnEvent::DialSucceeded,
+                ConnEvent::FrameReceived,
+                ConnEvent::IdleElapsed,
+                ConnEvent::Disconnected { code: reason_code },
+            ] {
+                assert_eq!(
+                    s.on_event(ev, now),
+                    SupervisorAction::Continue,
+                    "a parked socket must never be re-dialed by {ev:?}"
+                );
+                assert_eq!(s.phase(), ConnPhase::Parked);
+            }
+        }
+    }
+
+    #[test]
+    fn test_respawn_budget_allows_exactly_one_and_a_second_fatal_parks() {
+        // The bound itself, over the full 2x2. This is what "exactly ONE
+        // respawn per slot per session" means mechanically: the ONLY true
+        // answer is eligible-and-unspent, so a second fatal on the same slot
+        // — which by construction arrives with the flag already set — falls
+        // through to the permanent park.
+        assert!(
+            respawn_budget_allows(true, false),
+            "an eligible reason on a slot with its budget intact must respawn"
+        );
+        assert!(
+            !respawn_budget_allows(true, true),
+            "the SECOND fatal on a slot must park permanently — this is the \
+             whole bound; without it one re-dial becomes an unbounded loop"
+        );
+        assert!(
+            !respawn_budget_allows(false, false),
+            "an ineligible reason must park even with the budget intact"
+        );
+        assert!(
+            !respawn_budget_allows(false, true),
+            "an ineligible reason must park with the budget spent"
+        );
+
+        // And the production gate is that predicate applied to the reason
+        // table: with every reason ineligible, no state of the flag yields a
+        // respawn today.
+        for reason in ParkReason::ALL {
+            for used in [false, true] {
+                assert!(
+                    !respawn_budget_allows(reason.allows_one_respawn(), used),
+                    "{} must not respawn (respawn_used={used})",
+                    reason.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_respawn_counter_baseline_and_emit_gate_on_the_same_predicate() {
+        // The counter half, scoped honestly. Asserting a real increment needs
+        // a `metrics` recorder this crate has no dev-dependency for (adding a
+        // workspace dep needs operator approval), so what is pinned instead is
+        // the property that actually goes wrong in this repo: a counter whose
+        // BASELINE and whose EMIT disagree. A reason registered but unable to
+        // emit is a series that can never move; a reason able to emit but not
+        // registered has its first increment eaten by the CloudWatch agent's
+        // dropped-first-sample rule — the exact shape that made 104,540 depth
+        // rows unclassifiable on 2026-08-28.
+        //
+        // Both sites must therefore gate on `allows_one_respawn`, and there
+        // must be exactly one emit site.
+        let src = include_str!("pool_supervisor.rs");
+        assert!(
+            src.contains("pub const RESPAWN_METRIC: &str = \"tv_dhan_ws_park_respawn_total\";"),
+            "the respawn counter must keep its tv_-prefixed name"
+        );
+        // Assembled at runtime so this scan does not match its OWN source and
+        // count itself as a third use — the self-referential-guard trap.
+        let needle = format!("{}{}", "RESPAWN_", "METRIC,");
+        let uses: Vec<&str> = src.split(needle.as_str()).collect();
+        assert_eq!(
+            uses.len(),
+            3,
+            "exactly two RESPAWN_METRIC uses: one emit, one baseline"
+        );
+        // File order: the emit lives in `park`, the baseline in
+        // `PoolSupervisor::new` far below it. Each must be immediately preceded
+        // by its gate — that adjacency IS the lockstep.
+        let gate_precedes = |chunk: &str, marker: &str| -> bool {
+            chunk.rsplit('\n').take(8).any(|l| l.contains(marker))
+        };
+        assert!(
+            gate_precedes(uses[0], "if respawn_budget_allows("),
+            "the EMIT must sit behind the one-shot budget gate"
+        );
+        assert!(
+            gate_precedes(uses[1], "if reason.allows_one_respawn() {"),
+            "the BASELINE must register ONLY reasons that can emit"
+        );
+        assert!(
+            !respawn_budget_allows(false, false),
+            "the emit gate is the budget predicate, and it is closed today"
+        );
+        // Nothing under deploy/ may reference it — no EMF entry, no alarm, per
+        // the noise lock. Pinned here as a comment-and-name check rather than a
+        // filesystem walk: this test owns one file.
+        assert!(
+            src.contains("This name is deliberately absent from `deploy/`"),
+            "the no-deploy-entry decision must stay recorded at the constant"
+        );
     }
 
     #[test]
