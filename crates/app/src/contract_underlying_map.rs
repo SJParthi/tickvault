@@ -8,43 +8,77 @@
 //! underlyings, and gainer eligibility is judged per underlying. A tick
 //! carries neither — it has the contract's own id and nothing else.
 //!
-//! ## Where the answer comes from, and why no new fetch is needed
+//! ## Where the answer comes from: the daily MASTER, at attach
 //!
-//! The per-minute option-chain REST leg already stores BOTH ids on every row
-//! it writes (`option_chain_1m.underlying_security_id` and
-//! `.contract_security_id`), and it is already running. That is the mapping,
-//! produced once a minute by a leg whose output `dhan_depth_universe` also
-//! reads. This module is the in-memory shape of it.
+//! ⚠ **CORRECTED 2026-09-06, before this module ever ran.** The first version
+//! of this header named the per-minute option-chain REST leg as the source —
+//! *"the chain leg already stores BOTH ids on every row it writes"* — and that
+//! is TRUE of the rows it writes and USELESS for the family that matters.
+//!
+//! `CHAIN_1M_UNDERLYINGS` (`constants.rs`) is a **const-asserted 3-element
+//! array**: NIFTY=13, BANKNIFTY=25, SENSEX=51. Every one is an INDEX. So
+//! `option_chain_1m` holds only index-option legs — roughly 1,250 contracts —
+//! and holds NOTHING for the ~20,220 STOCK options, which are the **only**
+//! family the 2026-09-06 depth lock subscribes (*"for depth 20 and depth 200
+//! only stocks options contracts strikes dude okay? No underlying spot or
+//! futures or indices or indices fmo"*).
+//!
+//! Wired that way this map would have answered for exactly the family that
+//! must never reach depth and returned `None` for the family that must. The
+//! stock leaderboard would have ranked nothing, depth would have subscribed
+//! nothing, and no counter would have moved — the false-OK class, inside the
+//! change meant to deliver the operator's ask. It is recorded rather than
+//! quietly rewritten because the reasoning error is the reusable part: the
+//! chain leg IS the right source for `dhan_depth_universe`, whose layout was
+//! index ATM pairs, and citing that precedent carried a premise the
+//! 2026-09-06 lock had already retired.
+//!
+//! **The source is the pair of daily artifacts**, which is what the plan's own
+//! settled Decision B says (`active-plan-volume-depth-steering.md` — *"the
+//! contract artifact, at attach"*) and what `dhan_depth_universe` already
+//! joins at attach. `ContractRow` says which contracts exist and what class
+//! each is (`OPTIDX`/`OPTSTK` — the family); the mapping artifact resolves an
+//! underlying SYMBOL to an id. [`legs_from_artifact`] performs that join.
+//!
+//! That covers BOTH families, and it is the source that DETERMINES the
+//! subscription — so the map cannot drift from what is actually subscribed,
+//! which a second, narrower source can and would.
 //!
 //! **No new REST call, no new table, no rule-file edit.** `/marketfeed/quote`
 //! stays FORBIDDEN (`no-rest-except-live-feed-2026-06-27.md` §11.3) and is not
-//! needed; the cheaper route is also the one that moves no rule.
+//! needed; the master is already downloaded and parsed every morning.
 //!
 //! ## Why `ArcSwap` and not a lock
 //!
-//! The writer is the chain leg's task; the reader is the frame drain, on the
-//! hot path. The chain leg rebuilds the WHOLE mapping once a minute rather
-//! than mutating it, so the natural shape is publish-a-new-snapshot: readers
-//! take a lock-free `load()` and never block, and a rebuild never contends
-//! with a tick. That is the `token_manager` pattern this repository already
-//! uses for the same reason.
+//! The writer is the attach path; the reader is the frame drain, on the hot
+//! path. The attach rebuilds the WHOLE mapping rather than mutating it, so the
+//! natural shape is publish-a-new-snapshot: readers take a lock-free `load()`
+//! and never block, and a rebuild never contends with a tick. That is the
+//! `token_manager` pattern this repository already uses for the same reason.
 //!
-//! A `Mutex` would put the drain behind a lock held by a once-a-minute
-//! rebuild of ~20,000 entries — small, but on the only task emptying the
-//! socket, which is the drain-stall shape that ends in upstream tick loss.
+//! A `Mutex` would put the drain behind a lock held by a rebuild of ~21,000
+//! entries — small, but on the only task emptying the socket, which is the
+//! drain-stall shape that ends in upstream tick loss.
 //!
 //! ## Complexity
 //!
 //! Lookup is **O(1) average**: one atomic load plus one hash probe on the
 //! I-P1-11 composite key. Zero allocation on the read path — `load()` returns
 //! a guard, not a clone of the map. A rebuild is O(n) in the legs and happens
-//! once a minute on the chain leg's own task, never on the drain.
+//! ONCE PER DAY on the attach path, never on the drain.
+//!
+//! [`legs_from_artifact`] is ONE O(n) pass over the contract rows with one
+//! hash probe each — never a per-contract scan for its underlying, which would
+//! be O(contracts x underlyings).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use tickvault_common::types::ExchangeSegment;
+
+use crate::dhan_contract_universe::ContractRow;
+use crate::volume_leaderboard::OptionFamily;
 
 /// The I-P1-11 composite identity of a contract. The bare `security_id` is
 /// reused across segments, so keying on it alone would let one segment's
@@ -67,6 +101,19 @@ pub enum LegRefusal {
     ZeroOrNegativeContractId,
     /// The underlying's id was missing or not usable.
     ZeroOrNegativeUnderlyingId,
+    /// The underlying SYMBOL is not in the mapping artifact, so the contract
+    /// cannot be grouped. Expected in small numbers on any day the two
+    /// artifacts were built from different masters.
+    UnresolvedUnderlyingSymbol,
+    /// The contract is on an exchange this lane does not subscribe (BSE and
+    /// everything beyond NSE derivatives).
+    UnsupportedSegment,
+    /// The underlying resolved, but to the WRONG CLASS — an index option
+    /// pointing at an equity, or a stock option at an index. The mapping
+    /// artifact is a union keyed on symbol, so a name present as both
+    /// resolves by file order; refusing is what stops that order deciding a
+    /// a contract's grouping.
+    UnderlyingClassMismatch,
     /// The snapshot is at its ceiling.
     AtCapacity,
 }
@@ -78,16 +125,20 @@ impl LegRefusal {
         match self {
             Self::ZeroOrNegativeContractId => "zero_contract_id",
             Self::ZeroOrNegativeUnderlyingId => "zero_underlying_id",
+            Self::UnresolvedUnderlyingSymbol => "unresolved_underlying_symbol",
+            Self::UnsupportedSegment => "unsupported_segment",
+            Self::UnderlyingClassMismatch => "underlying_class_mismatch",
             Self::AtCapacity => "at_capacity",
         }
     }
 }
 
-/// One chain leg's two ids, as the chain leg already holds them.
+/// One option contract's identity, reduced to what the ranking needs.
 ///
-/// Deliberately NOT the leg struct itself: this module needs exactly two
-/// fields, and taking the whole thing would couple the ranking to the chain
-/// leg's row shape.
+/// Deliberately NOT a master row or a chain row: this module needs exactly
+/// four fields, and taking a whole vendor row would couple the ranking to
+/// whichever producer happened to be wired first — which is the coupling that
+/// produced the corrected source claim in this module's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LegIds {
     /// The option contract's own security id.
@@ -96,12 +147,32 @@ pub struct LegIds {
     pub underlying_security_id: i64,
     /// The CONTRACT's segment — not the underlying's.
     ///
-    /// The chain table stores the UNDERLYING's segment (`IDX_I`), which is
-    /// not what a contract is subscribed under. The caller resolves the
-    /// contract segment and passes it; getting this wrong would file every
-    /// contract under a segment no tick ever arrives on, and every lookup
-    /// would miss silently.
+    /// The two genuinely differ: an index option's underlying sits in
+    /// `IDX_I` while the contract is subscribed under `NSE_FNO`, and a stock
+    /// option's underlying is `NSE_EQ`. Filing a contract under its
+    /// underlying's segment would put every entry under a segment no tick
+    /// ever arrives on, and every lookup would miss SILENTLY (I-P1-11).
     pub contract_segment: ExchangeSegment,
+    /// Which leaderboard this contract belongs in.
+    ///
+    /// Carried on the SAME row as the underlying id, and that is the point:
+    /// the two facts come from one master row, so they cannot disagree. A
+    /// second, separately-built family map could drift from this one, and the
+    /// drift would be invisible — a stock option ranked as an index option
+    /// simply never reaches depth.
+    pub family: OptionFamily,
+}
+
+/// What the map answers: who a contract belongs to, and which board it is on.
+///
+/// One value rather than two maps, so the per-tick path is ONE hash probe and
+/// the two facts are physically incapable of disagreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractOwner {
+    /// The underlying's security id — the depth-200 distinct-underlying key.
+    pub underlying_id: u64,
+    /// Which leaderboard the contract is ranked on.
+    pub family: OptionFamily,
 }
 
 /// What building a snapshot produced.
@@ -118,8 +189,8 @@ pub struct SnapshotBuild {
 /// A later leg for the same contract overwrites an earlier one — the chain is
 /// a snapshot of one minute, so a repeat is a re-observation, not a conflict.
 #[must_use]
-pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, u64>, SnapshotBuild) {
-    let mut map: HashMap<ContractKey, u64> =
+pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, SnapshotBuild) {
+    let mut map: HashMap<ContractKey, ContractOwner> =
         HashMap::with_capacity(legs.len().min(MAX_TRACKED_CONTRACTS));
     let mut refusals = Vec::new();
 
@@ -164,17 +235,129 @@ pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, u64>, SnapshotBu
             refusals.push((leg.contract_security_id, LegRefusal::AtCapacity));
             continue;
         }
-        map.insert(key, underlying_id);
+        map.insert(
+            key,
+            ContractOwner {
+                underlying_id,
+                family: leg.family,
+            },
+        );
     }
 
     let accepted = map.len();
     (map, SnapshotBuild { accepted, refusals })
 }
 
+/// Turns the two daily artifacts into ranking legs — the ONLY producer wired
+/// to production, and the correction recorded in this module's header.
+///
+/// # Why these two inputs
+///
+/// This is the join `dhan_depth_universe::load_depth_candidates` already
+/// performs at attach, on the same two artifacts, for the same reason: the
+/// contract artifact says WHICH contracts exist and what class each is, and
+/// the mapping artifact resolves an underlying SYMBOL to an id. Neither
+/// answers alone.
+///
+/// Reusing the production pair rather than re-parsing the master is what keeps
+/// the ranking map and the SUBSCRIPTION derived from one source. A separately
+/// parsed master would be a second derivation that can drift, and the drift
+/// would be invisible — a contract ranked under an underlying the subscription
+/// path does not use simply never groups correctly.
+///
+/// # The class check is a refusal, not a preference
+///
+/// `parse_symbol_map` is a UNION of the index mappings and the F&O underlying
+/// mappings, and it inserts by symbol — so a name present as both an index and
+/// an equity resolves to whichever the artifact listed last. Rather than
+/// inherit that file-order dependency, this checks the segment the map carries
+/// against the contract's own class: an `OPTIDX` must resolve to an `IDX_I`
+/// underlying and an `OPTSTK` to an `NSE_EQ` one. A mismatch is REFUSED and
+/// counted, never accepted — a contract grouped under the wrong underlying
+/// breaks the depth-200 distinct-underlying rule silently, which is worse than
+/// one contract missing from the board.
+///
+/// # Complexity
+///
+/// One O(n) pass over the contract rows with one hash probe each. Never a scan
+/// per contract, which would be O(contracts x underlyings).
+#[must_use]
+pub fn legs_from_artifact(
+    contracts: &[ContractRow],
+    symbols: &HashMap<String, (u64, u8)>,
+) -> (Vec<LegIds>, Vec<(i64, LegRefusal)>) {
+    let idx_code = ExchangeSegment::IdxI.binary_code();
+    let eq_code = ExchangeSegment::NseEquity.binary_code();
+
+    let mut legs = Vec::new();
+    let mut refusals = Vec::new();
+    for row in contracts {
+        let family = match row.c.as_str() {
+            "OPTIDX" => OptionFamily::Index,
+            "OPTSTK" => OptionFamily::Stock,
+            // Futures and anything else are not ranked. Skipped SILENTLY and
+            // never counted: they are the ordinary contents of the artifact,
+            // not a defect, and counting them would make the refusal counter
+            // measure the file's shape instead of a problem.
+            _ => continue,
+        };
+        let contract_id = match i64::try_from(row.i) {
+            Ok(id) if id > 0 => id,
+            // A zero id is the parser's "absent or unusable" answer. Mapping a
+            // real contract onto instrument 0 would look healthy and group
+            // every such contract together.
+            _ => {
+                refusals.push((0, LegRefusal::ZeroOrNegativeContractId));
+                continue;
+            }
+        };
+        // BSE derivatives return `None` and are REFUSED, not defaulted. The
+        // selector narrowed to NSE on 2026-08-20 and depth is NSE-only at the
+        // vendor, so a BSE contract filed under an NSE segment would be an
+        // entry no tick can ever match — silently.
+        let Some(contract_segment) = crate::dhan_contract_universe::derivative_segment(&row.x)
+        else {
+            refusals.push((contract_id, LegRefusal::UnsupportedSegment));
+            continue;
+        };
+        // Same normalization `parse_symbol_map` applied when it built the map.
+        // Looking up an un-normalized symbol would miss every entry whose
+        // source row carried different case or padding.
+        let Some(&(underlying_id, underlying_segment)) =
+            symbols.get(row.u.trim().to_uppercase().as_str())
+        else {
+            refusals.push((contract_id, LegRefusal::UnresolvedUnderlyingSymbol));
+            continue;
+        };
+        let expected = match family {
+            OptionFamily::Index => idx_code,
+            OptionFamily::Stock => eq_code,
+        };
+        if underlying_segment != expected {
+            refusals.push((contract_id, LegRefusal::UnderlyingClassMismatch));
+            continue;
+        }
+        let Ok(underlying_security_id) = i64::try_from(underlying_id) else {
+            refusals.push((contract_id, LegRefusal::ZeroOrNegativeUnderlyingId));
+            continue;
+        };
+        if underlying_security_id <= 0 {
+            refusals.push((contract_id, LegRefusal::ZeroOrNegativeUnderlyingId));
+            continue;
+        }
+        legs.push(LegIds {
+            contract_security_id: contract_id,
+            underlying_security_id,
+            contract_segment,
+            family,
+        });
+    }
+    (legs, refusals)
+}
 /// The published mapping. Cheap to clone — it is one `Arc`.
 #[derive(Debug, Clone)]
 pub struct ContractUnderlyingMap {
-    inner: Arc<ArcSwap<HashMap<ContractKey, u64>>>,
+    inner: Arc<ArcSwap<HashMap<ContractKey, ContractOwner>>>,
 }
 
 impl Default for ContractUnderlyingMap {
@@ -196,7 +379,7 @@ impl ContractUnderlyingMap {
     ///
     /// Readers in flight keep the old snapshot until they drop it, so a
     /// rebuild can never hand the drain a half-built map.
-    pub fn publish(&self, snapshot: HashMap<ContractKey, u64>) {
+    pub fn publish(&self, snapshot: HashMap<ContractKey, ContractOwner>) {
         self.inner.store(Arc::new(snapshot));
     }
 
@@ -207,9 +390,9 @@ impl ContractUnderlyingMap {
     pub fn publish_from_legs(&self, legs: &[LegIds]) -> SnapshotBuild {
         let (map, build) = build_snapshot(legs);
         // A refusal means a contract cannot be RANKED at all — the ranking is
-        // narrower than the chain, silently, and a counter alone would leave
-        // that reaching nobody. One SUMMARY line per publish rather than one
-        // per leg: this runs once a minute over a bounded leg count, so the
+        // narrower than the subscription, silently, and a counter alone would
+        // leave that reaching nobody. One SUMMARY line per publish, not per leg.
+        // per leg: this runs ONCE PER DAY at attach over a bounded leg count, so
         // whole picture fits in a single line and a per-leg line would be
         // thousands of them for one event.
         for (_, reason) in &build.refusals {
@@ -222,7 +405,7 @@ impl ContractUnderlyingMap {
                 legs = legs.len(),
                 first_reason = build.refusals[0].1.as_str(),
                 "contract-to-underlying mapping refused chain legs — those \
-                 contracts cannot be ranked or depth-steered this minute \
+                 contracts cannot be ranked or depth-steered today \
                  (one line per publish; per-reason counts are on the counter)"
             );
         }
@@ -230,16 +413,31 @@ impl ContractUnderlyingMap {
         build
     }
 
-    /// The underlying's id for this contract, or `None`.
+    /// Who this contract belongs to and which board it ranks on, or `None`.
     ///
-    /// O(1) average: one atomic load, one hash probe. `None` is the honest
-    /// answer and the caller must treat it as "cannot rank this contract",
-    /// never substitute a zero — a zero underlying would collapse every
+    /// **This is the per-tick call**, and `None` is the common, correct answer:
+    /// the main feed carries ~870 spots and ~660 futures alongside the options,
+    /// and none of them is in this map. The caller SKIPS an absent contract; it
+    /// must never be counted as a refusal, or the refusal counter measures the
+    /// ordinary shape of the feed instead of a defect.
+    ///
+    /// O(1) average: one atomic load, one hash probe. A caller must never
+    /// substitute a zero underlying for `None` — that would collapse every
     /// unmapped contract onto ONE pseudo-underlying, and the depth-200
     /// distinct-underlying rule would then admit five strikes of nothing.
     #[must_use]
-    pub fn underlying_of(&self, contract_id: u64, segment: ExchangeSegment) -> Option<u64> {
+    pub fn owner_of(&self, contract_id: u64, segment: ExchangeSegment) -> Option<ContractOwner> {
         self.inner.load().get(&(contract_id, segment)).copied()
+    }
+
+    /// The underlying's id alone, for callers that do not need the family.
+    ///
+    /// A thin projection of [`Self::owner_of`] rather than a second lookup
+    /// path, so the two can never answer differently.
+    #[must_use]
+    pub fn underlying_of(&self, contract_id: u64, segment: ExchangeSegment) -> Option<u64> {
+        self.owner_of(contract_id, segment)
+            .map(|owner| owner.underlying_id)
     }
 
     /// How many contracts the published snapshot holds.
@@ -267,7 +465,14 @@ mod tests {
             contract_security_id: contract,
             underlying_security_id: underlying,
             contract_segment: FNO,
+            family: OptionFamily::Stock,
         }
+    }
+
+    /// Projects the owner back to the bare underlying id, so the existing
+    /// assertions keep reading as "which underlying did this land under".
+    fn under(map: &HashMap<ContractKey, ContractOwner>, key: ContractKey) -> Option<u64> {
+        map.get(&key).map(|o| o.underlying_id)
     }
 
     #[test]
@@ -275,8 +480,8 @@ mod tests {
         let (map, build) = build_snapshot(&[leg(100, 13), leg(101, 13), leg(200, 25)]);
         assert_eq!(build.accepted, 3);
         assert!(build.refusals.is_empty());
-        assert_eq!(map.get(&(100, FNO)), Some(&13));
-        assert_eq!(map.get(&(200, FNO)), Some(&25));
+        assert_eq!(under(&map, (100, FNO)), Some(13));
+        assert_eq!(under(&map, (200, FNO)), Some(25));
     }
 
     #[test]
@@ -324,17 +529,19 @@ mod tests {
                 contract_security_id: 500,
                 underlying_security_id: 13,
                 contract_segment: FNO,
+                family: OptionFamily::Stock,
             },
             LegIds {
                 contract_security_id: 500,
                 underlying_security_id: 51,
                 contract_segment: BFO,
+                family: OptionFamily::Index,
             },
         ];
         let (map, build) = build_snapshot(&legs);
         assert_eq!(build.accepted, 2);
-        assert_eq!(map.get(&(500, FNO)), Some(&13));
-        assert_eq!(map.get(&(500, BFO)), Some(&51));
+        assert_eq!(under(&map, (500, FNO)), Some(13));
+        assert_eq!(under(&map, (500, BFO)), Some(51));
     }
 
     #[test]
@@ -342,7 +549,7 @@ mod tests {
         // One minute's chain is a snapshot; a repeat is a re-observation.
         let (map, build) = build_snapshot(&[leg(100, 13), leg(100, 25)]);
         assert_eq!(build.accepted, 1);
-        assert_eq!(map.get(&(100, FNO)), Some(&25));
+        assert_eq!(under(&map, (100, FNO)), Some(25));
     }
 
     #[test]
@@ -365,7 +572,7 @@ mod tests {
             .collect();
         legs.push(leg(7, 25));
         let (map, build) = build_snapshot(&legs);
-        assert_eq!(map.get(&(7, FNO)), Some(&25));
+        assert_eq!(under(&map, (7, FNO)), Some(25));
         assert!(build.refusals.is_empty());
     }
 
@@ -426,5 +633,196 @@ mod tests {
         sorted.iter().zip(sorted.iter().skip(1)).for_each(|(a, b)| {
             assert_ne!(a, b, "refusal labels must be distinct: {labels:?}");
         });
+    }
+
+    // ---------------------------------------------------------------------
+    // legs_from_artifact — the corrected producer
+    // ---------------------------------------------------------------------
+
+    fn contract(id: u64, class: &str, underlying: &str, exch: &str) -> ContractRow {
+        ContractRow {
+            i: id,
+            x: exch.to_owned(),
+            c: class.to_owned(),
+            e: 20_260_925,
+            s: 2_500_000,
+            l: "CE".to_owned(),
+            u: underlying.to_owned(),
+        }
+    }
+
+    /// The mapping artifact as production builds it: a UNION of the index
+    /// mappings (`IDX_I`) and the F&O underlying mappings (`NSE_EQ`).
+    fn symbol_map() -> HashMap<String, (u64, u8)> {
+        let idx = ExchangeSegment::IdxI.binary_code();
+        let eq = ExchangeSegment::NseEquity.binary_code();
+        HashMap::from([
+            ("NIFTY".to_owned(), (13_u64, idx)),
+            ("BANKNIFTY".to_owned(), (25_u64, idx)),
+            ("RELIANCE".to_owned(), (2885_u64, eq)),
+            ("TCS".to_owned(), (11536_u64, eq)),
+        ])
+    }
+
+    #[test]
+    fn legs_from_artifact_resolves_both_families() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(refusals.is_empty(), "unexpected refusals: {refusals:?}");
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].underlying_security_id, 13);
+        assert_eq!(legs[0].family, OptionFamily::Index);
+        assert_eq!(legs[1].underlying_security_id, 2885);
+        assert_eq!(legs[1].family, OptionFamily::Stock);
+        // Both are subscribed under the CONTRACT's segment, never the
+        // underlying's — an entry under `IDX_I` or `NSE_EQ` would match no
+        // tick this lane ever receives.
+        assert!(legs.iter().all(|l| l.contract_segment == FNO));
+    }
+
+    /// The NEGATIVE CONTROL for the defect this module's header records.
+    ///
+    /// `option_chain_1m` covers three INDEX underlyings and cannot represent a
+    /// stock symbol at all, so a symbol map derived from it resolves every
+    /// index option and NO stock option. This builds exactly that map and
+    /// asserts the stock side comes back empty — proving the corrected source
+    /// earns its place, rather than asserting that it does.
+    #[test]
+    fn an_index_only_symbol_map_resolves_zero_stock_options() {
+        let idx = ExchangeSegment::IdxI.binary_code();
+        let chain_only: HashMap<String, (u64, u8)> = HashMap::from([
+            ("NIFTY".to_owned(), (13_u64, idx)),
+            ("BANKNIFTY".to_owned(), (25_u64, idx)),
+            ("SENSEX".to_owned(), (51_u64, idx)),
+        ]);
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+            contract(601, "OPTSTK", "TCS", "NSE"),
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &chain_only);
+        assert_eq!(
+            legs.iter()
+                .filter(|l| l.family == OptionFamily::Stock)
+                .count(),
+            0,
+            "an index-only map must resolve no stock option — this is the \
+             defect the corrected source removes"
+        );
+        assert_eq!(legs.len(), 1, "only the index option resolves");
+        assert_eq!(refusals.len(), 2);
+        assert!(
+            refusals
+                .iter()
+                .all(|(_, r)| *r == LegRefusal::UnresolvedUnderlyingSymbol)
+        );
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_a_class_mismatch_rather_than_grouping_wrongly() {
+        // The mapping artifact is a union keyed on symbol, so a name present
+        // as BOTH an index and an equity resolves by file order. Refusing is
+        // what stops that order silently deciding a contract's grouping.
+        let rows = [contract(500, "OPTIDX", "RELIANCE", "NSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(500, LegRefusal::UnderlyingClassMismatch)]);
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_a_bse_contract_rather_than_defaulting_it() {
+        // Depth is NSE-only at the vendor and the selector narrowed to NSE on
+        // 2026-08-20. Filing a BSE contract under an NSE segment would be an
+        // entry no tick can ever match.
+        let rows = [contract(700, "OPTIDX", "NIFTY", "BSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(700, LegRefusal::UnsupportedSegment)]);
+    }
+
+    #[test]
+    fn legs_from_artifact_skips_non_options_silently_and_never_counts_them() {
+        // Futures are the ordinary contents of the artifact, not a defect.
+        // Counting them would make the refusal counter measure the file's
+        // shape instead of a problem.
+        let rows = [
+            contract(800, "FUTIDX", "NIFTY", "NSE"),
+            contract(801, "FUTSTK", "RELIANCE", "NSE"),
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert_eq!(legs.len(), 1);
+        assert!(
+            refusals.is_empty(),
+            "futures must not be counted as refusals"
+        );
+    }
+
+    #[test]
+    fn legs_from_artifact_normalizes_the_symbol_the_way_the_map_was_built() {
+        // `parse_symbol_map` stores `symbol.trim().to_uppercase()`. Looking up
+        // an un-normalized symbol would miss every entry whose source row
+        // carried different case or padding.
+        let rows = [contract(600, "OPTSTK", "  reliance  ", "NSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(refusals.is_empty(), "unexpected refusals: {refusals:?}");
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].underlying_security_id, 2885);
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_the_zero_contract_id_sentinel() {
+        let rows = [contract(0, "OPTSTK", "RELIANCE", "NSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(0, LegRefusal::ZeroOrNegativeContractId)]);
+    }
+
+    #[test]
+    fn owner_of_and_underlying_of_can_never_disagree() {
+        // `underlying_of` is a PROJECTION of `owner_of`, not a second lookup
+        // path. Pinned because two independent lookups over the same map is
+        // exactly the drift this module consolidated into one value to avoid.
+        let rows = [contract(600, "OPTSTK", "RELIANCE", "NSE")];
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        let map = ContractUnderlyingMap::new();
+        map.publish_from_legs(&legs);
+
+        assert_eq!(
+            map.owner_of(600, FNO).map(|o| o.underlying_id),
+            map.underlying_of(600, FNO)
+        );
+        assert_eq!(map.underlying_of(600, FNO), Some(2885));
+
+        // An absent contract: both answer `None`, and the caller SKIPS rather
+        // than counting a refusal — spots and futures land here legitimately.
+        assert!(map.owner_of(999, FNO).is_none());
+        assert!(map.underlying_of(999, FNO).is_none());
+    }
+
+    #[test]
+    fn legs_from_artifact_feeds_a_map_that_answers_both_families() {
+        // End to end: artifact -> legs -> published map -> per-tick lookup.
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        let map = ContractUnderlyingMap::new();
+        map.publish_from_legs(&legs);
+
+        let stock = map.owner_of(600, FNO).expect("stock option must resolve");
+        assert_eq!(stock.underlying_id, 2885);
+        assert_eq!(stock.family, OptionFamily::Stock);
+
+        let index = map.owner_of(500, FNO).expect("index option must resolve");
+        assert_eq!(index.family, OptionFamily::Index);
+
+        // A spot or future the map never held: absent, and the caller SKIPS it
+        // rather than counting a refusal.
+        assert!(map.owner_of(13, ExchangeSegment::IdxI).is_none());
     }
 }
