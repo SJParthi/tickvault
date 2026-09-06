@@ -314,6 +314,13 @@ impl VolumeLeaderboard {
                 if seen.is_power_of_two() {
                     error!(
                         code = ErrorCode::Volume01MonotonicityBreach.code_str(),
+                        // The counter NAME belongs in the line, not just the handle. The
+                        // handle above is what keeps the per-tick path allocation-free, but
+                        // it moved the literal into `Family::new`, so an operator reading
+                        // errors.jsonl had no way to know WHICH series records this, and
+                        // `loss_counter_visibility_guard` could no longer see that this
+                        // emit site is logged at all. Naming it here fixes both.
+                        metric = REFUSED_COUNTER,
                         family = label,
                         security_id = contract.security_id,
                         ?contract.segment,
@@ -352,6 +359,13 @@ impl VolumeLeaderboard {
             if seen.is_power_of_two() {
                 error!(
                     code = ErrorCode::Volume01MonotonicityBreach.code_str(),
+                    // The counter NAME belongs in the line, not just the handle. The
+                    // handle above is what keeps the per-tick path allocation-free, but
+                    // it moved the literal into `Family::new`, so an operator reading
+                    // errors.jsonl had no way to know WHICH series records this, and
+                    // `loss_counter_visibility_guard` could no longer see that this
+                    // emit site is logged at all. Naming it here fixes both.
+                    metric = REFUSED_COUNTER,
                     family = label,
                     security_id = contract.security_id,
                     ?contract.segment,
