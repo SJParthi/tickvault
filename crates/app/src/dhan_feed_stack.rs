@@ -9345,6 +9345,23 @@ pub fn refold_wal_frames(
     // v1/v2 records still carry `WAL_RECEIPT_UNKNOWN_NANOS`, because for those
     // the receipt genuinely never existed -- so the sentinel's fallback is
     // right for them and wrong for everything written since.
+    //
+    // AND YET `recv_millis` BELOW IS DELIBERATELY THE REPLAY CLOCK, not the
+    // persisted receipt. It is not a leak, and the distinction is the point:
+    // the parameter it feeds is `recv_monotonic_millis`, and its only consumer
+    // is `TickObservation::from_parsed_tick` -> the tick-gap detector, which
+    // answers "which instruments have gone SILENT" -- a LIVENESS question about
+    // now, not an event-time question about the frame.
+    //
+    // Feeding it the true historic receipt would tell the detector that every
+    // replayed instrument was last seen hours ago, so `scan_silence` would fire
+    // a RISK-GAP-03 episode for the whole universe on the first sweep after any
+    // crash-restart -- a page storm caused by recovery working. The receipt is
+    // threaded per frame into `dispatch_frame` instead, which is where event
+    // time belongs.
+    //
+    // Stated because a reader who has just finished the block above will
+    // reasonably suspect this line of being the leak it is not.
     let recv_millis =
         u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000)
             .unwrap_or(0);
