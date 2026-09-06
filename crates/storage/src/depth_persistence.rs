@@ -43,6 +43,15 @@
 //! a calendar day rather than a session is inflated by the 62,400 seconds the
 //! exchange is shut.
 //!
+//! **The figures below are a ~1% UNDERSTATEMENT for depth, deliberately stated
+//! rather than silently carried (2026-09-06).** Depth has no exchange
+//! timestamp, so it is gated on the ARRIVAL clock, which admits a bounded
+//! `ARRIVAL_GRACE_TAIL_SECS` (240 s) tail past the close — a depth row can
+//! therefore be written across **24,240 seconds**, not 24,000. That is roughly
+//! +210 MB/day on the ~21 GB/day estimate. Pinned by
+//! `the_storage_estimate_is_costed_over_a_session_not_a_calendar_day`, which
+//! now asserts BOTH windows so neither can move unnoticed.
+//!
 //! Row width, derived rather than guessed: 4 SYMBOL columns (`feed`, `segment`,
 //! `depth_kind`, `side`) at 4 B of interned key each = 16 B, plus 7 eight-byte
 //! columns (`security_id`, `level`, `price`, `quantity`, `orders`,
@@ -3384,6 +3393,40 @@ mod tests {
              every second the exchange is shut — the exact 3.4× error this \
              test exists to stop recurring"
         );
+
+        // ...but DEPTH is not judged on the session window alone.
+        //
+        // Added 2026-09-06. `market_depth` has no exchange timestamp -- its
+        // designated `ts` IS the arrival stamp -- so `DepthWriter::append_row`
+        // gates on `arrival_row_is_in_an_open_window`, which admits a bounded
+        // `ARRIVAL_GRACE_TAIL_SECS` tail past the close (the vendor's measured
+        // delivery lag is p99 46.4 s, max 198.7 s, so refusing that tail was
+        // destroying real books).
+        //
+        // The assertion above was written before the grace existed and was
+        // therefore BLIND to it: depth can be written for 24,240 seconds, not
+        // 24,000, so every GB/day figure in this module's docs is a ~1%
+        // understatement (~210 MB/day at the 21 GB/day estimate). Small, and
+        // recorded rather than left to be rediscovered -- an unstated
+        // understatement in a capacity figure is the same class of defect as an
+        // unstated overstatement, just quieter.
+        let depth_window_secs =
+            window_secs + u64::from(tickvault_common::constants::ARRIVAL_GRACE_TAIL_SECS);
+        assert_eq!(
+            depth_window_secs, 24_240,
+            "the window in which a DEPTH row can still be accepted is \
+             {depth_window_secs}s, not the 24,240s this module's storage \
+             estimate is derived from. Either the session window or the arrival \
+             grace moved -- recompute the GB/day figures before trusting any \
+             capacity or cost decision built on them."
+        );
+        // Deliberately NOT asserted here: that the grace is non-zero. A
+        // compile-time `const _: () = assert!(ARRIVAL_GRACE_TAIL_SECS > 199)`
+        // in `constants.rs` already makes a zero grace unbuildable, so a
+        // runtime check for it could never fire. Verified by mutation on
+        // 2026-09-06 -- setting the grace to 0 fails the BUILD, not this test.
+        // A test that cannot fail is decoration, and this file has spent the
+        // day removing that class rather than adding to it.
     }
 
     #[test]
