@@ -566,8 +566,23 @@ jobs:
         #      monitor, notify, auto-stop) no-ops via its `env.DEPLOY_SKIP_REASON
         #      == ''` guard and stays SILENT (no Telegram spam), then exit ZERO so
         #      this intentional skip is recorded GREEN — a deliberate no-op is not
-        #      a deploy FAILURE. The 08:45 IST pre-market cron (deploy-aws-after-
-        #      close) redeploys the same commit once the box is up. Honest
+        #      a deploy FAILURE. CORRECTED 2026-09-06: this used to name "the
+        #      08:45 IST pre-market cron" as the redeploy. That slot is INERT --
+        #      deploy-aws-after-close suppresses dispatch across [08:15, 09:15)
+        #      IST (the boot-critical prep window) and BOTH its morning crons
+        #      (08:30 + 08:45 IST) fall inside it, so fired on time they
+        #      dispatch nothing. That file already says so; this one did not.
+        #      The REAL cover splits by merge type:
+        #        - BOT merge (auto-merge, GITHUB_TOKEN): the push run is
+        #          suppressed, so NO run exists for the SHA and
+        #          postmerge-catchup (every 30 min, 7 days) dispatches
+        #          deploy-aws, which self-starts the box and stops it again.
+        #        - HUMAN merge: the push run DID fire and skipped green, and
+        #          catchup counts any run as covered -- so catchup will NOT
+        #          re-dispatch. Cover is the deploy-watchdog at 08:50 IST
+        #          Mon-Fri, which dispatches after-close by workflow_dispatch
+        #          (that BYPASSES the prep-window gate), plus the post-close
+        #          crons at 15:46 / 16:16 / 17:01 IST Mon-Fri. Honest
         #      envelope: an off-hours push shows a GREEN Actions run that did
         #      nothing-on-purpose (correct — "nothing to deploy, box is down by
         #      design") and pages nobody. A GENUINE deploy error (box up, smoke
@@ -617,7 +632,7 @@ jobs:
 
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
-            echo "::notice::Box is intentionally stopped (outside 08:30-17:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. The 08:45 IST pre-market cron will redeploy this commit once the box is up."
+            echo "::notice::Box is intentionally stopped (outside 08:30-17:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one within ~30 min, ANY day, self-starting the box and stopping it again. If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
             # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
             # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
             # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
@@ -1438,8 +1453,13 @@ jobs:
         # refused to self-heal it — see aws-autopilot.sh "unit disabled"
         # branch). Leaving the unit ENABLED means: systemd auto-starts it at
         # the next boot, the autopilot restarts an enabled-but-inactive unit,
-        # and a genuinely-bad binary is replaced by the morning redeploy
-        # (~08:45 IST) — all without the operator touching the box. The
+        # and a genuinely-bad binary is replaced by the next redeploy: the
+        # deploy-watchdog at 08:50 IST Mon-Fri (it compares the on-box
+        # binary-git-sha against main HEAD and dispatches after-close,
+        # bypassing the prep-window gate), or the post-close crons at
+        # 15:46 / 16:16 / 17:01 IST. CORRECTED 2026-09-06: this named the
+        # "~08:45 IST morning redeploy", a slot the prep-window gate always
+        # suppresses — all without the operator touching the box. The
         # intentional kill-switch (disable via AWS Control) stays the ONLY
         # source of a disabled unit, so the autopilot's disabled==intentional
         # semantics remain correct. Regression-locked by
@@ -1467,7 +1487,9 @@ jobs:
       - name: Notify Telegram on failure
         # ANTI-SPAM 2026-06-02: an intentional off-hours skip (box stopped on
         # purpose, auto push outside the up-window) is NOT a failure worth
-        # paging the operator at 2 AM. The 08:45 IST pre-market cron redeploys.
+        # paging the operator at 2 AM. The redeploy comes from postmerge-catchup
+        # (bot merges) or the 08:50 IST deploy-watchdog / post-close crons --
+        # NOT the 08:45 IST slot, which the prep-window gate always suppresses.
         # Genuine deploy failures (box up, smoke test failed, etc.) still page.
         if: failure() && env.DEPLOY_SKIP_REASON == ''
         run: |
