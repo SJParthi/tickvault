@@ -267,14 +267,58 @@ needs its own dated authorization under the noise lock.
   - Tests: T1, T2, T3 — plus 9 new `ws_frame_spill` tests, 3 bite-proven
   - **Verified 2026-08-28:** `ws_frame_spill` 62 passed / 0 failed
 
-- [ ] **W1b** *(REMAINING)* Thread the real receipt through the call chain
-      so `TVW3` actually carries a non-sentinel value
-  - **Honest status: the FORMAT exists and nothing populates it yet.** The
-    receipt is stamped correctly and early in `FrameSink::accept`, and is
-    still dropped at `main.rs:897` where the replayed record is turned back
-    into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
-    callers. Stated plainly because a record format that is present but
-    unpopulated reads, from the outside, exactly like a working one.
+- [x] **W1b** Thread the real receipt through the call chain so `TVW3`
+      actually carries a non-sentinel value
+  - **⚠ CORRECTED 2026-09-06: the CODE was already complete when this item
+    still read REMAINING.** The status block below is preserved verbatim
+    because the wrong version is the more useful record -- this is the THIRD
+    item in this plan found already-built (after W5, and after two claims in
+    the W2 research block), and the pattern is identical every time: a status
+    written from a partial read outlives the code that refuted it.
+  - The original text read:
+    > **Honest status: the FORMAT exists and nothing populates it yet.** The
+    > receipt is stamped correctly and early in `FrameSink::accept`, and is
+    > still dropped at `main.rs:897` where the replayed record is turned back
+    > into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
+    > callers.
+  - **Every load-bearing claim there is now false.** Verified in source
+    2026-09-06:
+
+    | The item claimed | Source says |
+    |---|---|
+    | "`append_with_seq_at` has zero production callers" | `pool_supervisor.rs::accept` calls it, passing `receipt_nanos_from(received_at)` |
+    | "dropped at `main.rs:897` ... turned back into `(frame_seq, Bytes)`" | the replay vector is `(u64, i64, WalEndpoint, Bytes)` -- the `i64` IS the receipt |
+    | "`refold_wal_frames` re-stamps `Utc::now()`" | it destructures `wal_received_at_nanos` per frame and hands THAT to `dispatch_frame` |
+
+  - **The shipped conversion is BETTER than this plan sketched, and the
+    difference matters.** The design below prescribed converting in the WAL
+    writer thread. What shipped is a REFRESHING (wall, instant) anchor
+    (`receipt_nanos_from`) -- which this plan lists under "rejected
+    alternatives" as *"anchoring once at boot ... drifts unboundedly"*. The
+    refresh is what answers that objection, and it carries its own
+    monotonicity guard refusing a backward re-anchor. The rejection was right
+    about the anchor-ONCE form and is superseded for the refreshing one.
+
+  - **What was genuinely missing, and is fixed here: the property had never
+    been EXECUTED.** Both existing guards
+    (`crates/app/tests/wal_receipt_threading_guard.rs`) are SOURCE SCANS, and
+    the round-trip test hand-encodes its record with `encode_v3_record`, so it
+    proves the reader only. Two behavioural tests added:
+    * `a_receipt_written_by_the_real_writer_replays_unchanged` -- real
+      `append_with_seq_at` -> writer thread -> file -> `replay_all`. Bite:
+      writer substitutes the UNKNOWN sentinel -> FAILS.
+    * `a_converted_receipt_lands_on_the_real_wall_clock_not_merely_in_order`
+      -- every prior test of this conversion checked ORDER, and **a constant
+      offset preserves order perfectly**. Bite-proven with the anchor moved
+      back one hour: this test FAILS and both pre-existing order tests still
+      PASS. An hour-wrong anchor was invisible to the entire suite, and for a
+      sentinel-LTT tick that value becomes the row's designated `ts` -- the
+      first column of the `ticks` DEDUP key.
+  - **One site deliberately left on the replay clock, now documented at the
+    site:** `refold_wal_frames``refold_wal_frames`'s `recv_millis``recv_millis`. Its only consumer is the
+    tick-gap detector, which asks a LIVENESS question; feeding it the true
+    historic receipt would report the whole universe as silent on the first
+    sweep after any crash-restart -- a page storm caused by recovery working.
   - Files: `crates/storage/src/ws_frame_spill.rs` (the writer thread),
     `crates/core/src/websocket/pool_supervisor.rs` (`WalRingSink::accept` —
     signature only), `crates/app/src/main.rs` (~:893-897),
@@ -318,7 +362,7 @@ needs its own dated authorization under the noise lock.
     `Instant` (meaningless across processes, which is the whole point of the
     replay path).
 
-- [ ] **W2** Candles bucket on `received_at`  *(REMAINING — blocked on W1b)*
+- [ ] **W2** Candles bucket on `received_at`  *(REMAINING — **UNBLOCKED 2026-09-06**; W1b is complete and behaviourally tested, so a large positive receipt-vs-exchange delta is no longer indistinguishable from a replay: replayed frames now carry their ORIGINAL receipt, and only genuinely-receipt-less v1/v2 records fall back to the sentinel)*
   - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
   - Tests: T4, T5, T16
   - **Research complete 2026-08-28. Three findings that shape the design:**

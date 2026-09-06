@@ -7629,6 +7629,107 @@ mod tests {
 
     /// The refresh must never rewind the projected clock.
     ///
+    /// The converted receipt is ACCURATE, not merely monotone.
+    ///
+    /// # Why monotonicity was not enough
+    ///
+    /// Every other test of this conversion checks ORDER: a refresh never moves
+    /// a receipt backwards, repeated refreshes stay ordered. All of them pass
+    /// with an anchor that is wrong by an arbitrary constant, because a
+    /// constant offset preserves order perfectly.
+    ///
+    /// A constant offset is not a harmless error here. `row_timestamp_ist_nanos`
+    /// promotes the receipt to the row's DESIGNATED `ts` whenever the exchange
+    /// stamp is the vendor's never-traded sentinel, and `ts` is the first column
+    /// of the `ticks` DEDUP key. An anchor off by hours therefore mints rows in
+    /// a partition that retention and archival -- both keyed on the trading day
+    /// -- can never reach, and it does so with total confidence.
+    ///
+    /// One second of tolerance, deliberately loose: this asserts the anchor is
+    /// ANCHORED, not that the machine is fast. A broken anchor is wrong by the
+    /// process uptime or by an epoch, never by 900 ms.
+    #[test]
+    fn a_converted_receipt_lands_on_the_real_wall_clock_not_merely_in_order() {
+        let before = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let converted = receipt_nanos_from(Instant::now());
+        let after = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        const TOLERANCE_NANOS: i64 = 1_000_000_000;
+        assert!(
+            converted >= before - TOLERANCE_NANOS && converted <= after + TOLERANCE_NANOS,
+            "receipt_nanos_from produced {converted}, which is outside \
+             [{before}, {after}] widened by one second. The monotonic anchor has \
+             drifted off the wall clock, so every replayed frame would carry a \
+             confidently WRONG arrival time -- and for a sentinel-LTT tick that \
+             value becomes the row's designated timestamp."
+        );
+
+        // And it must be inside the band the writer enforces, or the writer
+        // would silently degrade every real receipt to the UNKNOWN sentinel --
+        // which reads downstream exactly like a v1/v2 record that never had one.
+        assert_eq!(
+            plausible_receipt_nanos(converted),
+            converted,
+            "a freshly converted receipt must survive the plausibility band; \
+             if it does not, the capture path writes UNKNOWN for every frame \
+             and the whole TVW3 field is dead again."
+        );
+    }
+
+    /// END-TO-END through the REAL writer: a receipt handed to
+    /// `append_with_seq_at` survives the writer thread, the on-disk encoding
+    /// and `replay_all` unchanged.
+    ///
+    /// # Why this is not covered by the fixture tests
+    ///
+    /// `tvw3_fixture_replays_as_main_feed_with_its_receipt` hand-encodes the
+    /// record with `encode_v3_record` and proves the READER. Nothing exercised
+    /// the WRITER carrying a receipt all the way to a file.
+    ///
+    /// That gap is exactly the shape this field has failed in twice: first the
+    /// format existed and nothing populated it (`append_with_seq_at` had zero
+    /// production callers, so every record on disk carried 0 while the format
+    /// claimed otherwise); then it was populated and nothing read it back
+    /// (`ReplayedFrame::received_at_nanos` had zero consumers). Both times the
+    /// unit tests on either side stayed green, because each half was correct in
+    /// isolation. Only a test that spans the boundary can fail.
+    #[test]
+    fn a_receipt_written_by_the_real_writer_replays_unchanged() {
+        let dir = tmp_dir("receipt-e2e");
+        // A real converted receipt, not a literal: this ties the assertion to
+        // the conversion the capture path actually uses.
+        let receipt = receipt_nanos_from(Instant::now());
+        {
+            let spill = WsFrameSpill::new(&dir).unwrap();
+            spill.append_with_seq_at(
+                WsType::LiveFeed,
+                vec![9, 8, 7],
+                4242,
+                receipt,
+                WalEndpoint::Depth20,
+            );
+            wait_until_persisted(&spill, 1);
+        } // drop → writer thread drains and exits
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = replay_all(&dir).unwrap();
+        assert_eq!(frames.len(), 1, "the frame must survive the round trip");
+        assert_eq!(
+            frames[0].received_at_nanos, receipt,
+            "the RECEIPT must survive it too. A zero here means the writer \
+             dropped it; a different value means the encoding and the decoder \
+             disagree about the field offset."
+        );
+        // The three fields the replay consumer routes on must all survive
+        // together -- a receipt that arrives attached to the wrong frame or the
+        // wrong socket is worse than no receipt at all.
+        assert_eq!(frames[0].frame_seq, 4242);
+        assert_eq!(frames[0].endpoint, WalEndpoint::Depth20);
+        assert_eq!(frames[0].frame, vec![9, 8, 7]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Re-anchoring bounds NTP drift; done naively it also creates a way to
     /// move receipts BACKWARDS, and `received_at` is the candle bucketing
     /// clock — so a rewound receipt files a frame into a second that may
