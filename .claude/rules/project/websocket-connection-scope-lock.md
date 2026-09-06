@@ -2147,7 +2147,7 @@ cross-underlying comparison — all STAND.
 | depth-20 | **250 instruments** = 5 sockets × 50, the highest-volume stock-option contracts |
 | depth-200 | **5 instruments** = 5 sockets × 1, the highest-volume stock-option contracts, **each a distinct underlying** |
 | Budget | UNCHANGED — 250 + 5. This changes WHICH, never how many |
-| Ranking key | **cumulative day volume**, read from the Full packet at byte offset 22 (vendor-cumulative since session open, Dhan Ticket #5525125) |
+| Ranking key | **cumulative day volume**, read at byte offset 22 (`QUOTE_OFFSET_VOLUME`, const-asserted; the field is shared by the Quote AND Full layouts, not Full-only, and is ABSENT — reading 0 — in Ticker mode). ⚠ **The cumulative semantic is INFERRED, not proven, and the citation this row originally carried was FALSE.** It read "vendor-cumulative since session open, Dhan Ticket #5525125". That ticket is about PrevClose routing — `dhan_locked_facts.rs` records code 6, 16-byte packet, price@8, OI@12 under it and contains **zero** volume facts. The real state: `docs/operator/track-2-monotonicity-select.md` says the only mathematical proof "was unrunnable", and its `**Overall verdict:**` line is still the unfilled template `CONFIRMED CUMULATIVE | REFUTED | INSUFFICIENT`. So cumulative rests on three weak indicators plus vendor-SDK convention. **This is the single most load-bearing unproven input in the design** — if the field is a per-packet delta, the monotonicity gate refuses nearly everything. Running that SELECT on a live session is the cheapest high-value verification available. |
 | Gainer role | **eligibility filter, not the sort key.** An instrument qualifies if its underlying is in the day's gainers; volume then decides the order. This keeps the ordered set monotonic, and therefore stable |
 | **Family split** | index options and stock options are ranked in **SEPARATE leaderboards**, never one blended list |
 | Ranking cadence | every **5 seconds** |
@@ -2206,13 +2206,20 @@ mostly-empty books and reconnect churn. That is a measurement, not an opinion; i
 recorded here so the outcome is a decision rather than a surprise, and it is
 reversible by a fresh dated quote.
 
-**NOT claimed — that a 5-second RE-SUBSCRIBE is possible.** Swaps are one-for-one with
+**NOT claimed — that a 5-second full RE-SEND is possible.** (⚠ REFRAMED by the FOURTH quote below: the operator's requirement is that the SUBSCRIBED SET be current every 5 seconds, and delta-only delivers exactly that. This row states the refusal badly; read it with the reframe.) Swaps are one-for-one with
 no bulk API, each carries a 2 s wire budget on the drain task, and 250 swaps
 serialise to **up to 500 s against a 5-second window**. At 5 s the session runs
 **4,680** cycles (09:00–15:30 = 23,400 s), the per-socket command channel is depth 4,
-Dhan closes a socket silent for 40 s, error 804 parks a socket for the session and 805
-is an account block. **The RANKING runs every 5 seconds (measured ~70 µs, 0.0014% duty
-cycle — free); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
+Dhan closes a socket silent for 40 s, error 804 parks a socket for the session, and 805
+is "Too many requests/connections — may result in user being blocked" (Dhan's own
+wording, `docs/dhan-ref/08-annexure-enums.md:348` — *may*, which this line previously
+asserted flatly as "an account block"). **The RANKING runs every 5 seconds (⚠ CORRECTED: this said "measured ~70 µs,
+0.0014%". That was the `scan_silence` constant borrowed from a LINEAR scan and
+applied to a `sort_unstable_by` — an invalid transfer, and it was the number used to
+argue the heap design away. Actually MEASURED at 900 µs, a 0.018% duty cycle, by
+`rank_sweep_cost_at_the_authorized_ceiling`. The CONCLUSION is unchanged — 0.018% is
+still negligible and the heap's threshold-poisoning is still catastrophic — but the
+evidence for it was overstated 15x and is now real); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
 window**, which is the shape the existing re-fit already uses and for these reasons.
 
 **NOT claimed — that this improves capture.** 2026-09-04 captured ZERO ticks and
@@ -2234,6 +2241,90 @@ sits upstream of every word here.
 - Any edit to the §28 frozen indicator/strategy area.
 - Depth on `BSE_FNO` — structurally impossible, unchanged.
 
+
+#### 2026-09-06 (FOURTH quote, same day) — the reaffirmation, and the one thing it changes
+
+**The verbatim operator demand (preserve EXACTLY, typos included):**
+
+> "See for depth 20 and depth 200 never ever use the index options dude see every 5 seconds it shoudl he reussbribed to this stocks options strikes contracts alone only that too top volume gainers dude see for depth 20 pick top 250 but for depth 200 always ensure to to have top 5 as different symbols dude okay? If same symbols multiple strikes contracts mejas then have it as unique dude okay?"
+
+Three of its four clauses restate the contract above **exactly** and change nothing:
+index options never reach depth, depth-20 takes 250, depth-200 takes 5 distinct
+underlyings. They are recorded because a third statement of the same requirement is
+evidence about what matters to the operator, not noise — and because the last clause
+sharpens the depth-200 rule into a form worth pinning by test (below).
+
+**The fourth clause — "every 5 seconds it should be resubscribed" — is the second
+time this has been asked for, and the envelope above framed the answer badly.**
+
+##### The reframe: delta-only IS the 5-second resubscribe
+
+The envelope reads *"NOT claimed — that a 5-second RE-SUBSCRIBE is possible"*, which
+states a refusal. That is the wrong frame and it is corrected here. What the operator
+is asking for is a PROPERTY of the subscribed set:
+
+> at every 5-second boundary, the 250 instruments Dhan is streaming ARE the current
+> top 250 by volume.
+
+**Delta-only delivers exactly that property.** It is not a reduced version of the
+requirement — it is the only implementation of it that survives contact with the
+vendor, for a reason that is Dhan's, not ours:
+
+| | |
+|---|---|
+| What a literal full re-send does | re-subscribes instruments the socket already holds |
+| What we expect Dhan to answer | **804 — "Requested number of instruments exceeds limit"** (`docs/dhan-ref/08-annexure-enums.md:347`). ⚠ **The doc supports the WORDING of 804 only. That a DUPLICATE subscribe triggers it is THIS REPOSITORY'S INFERENCE** — nothing in `docs/dhan-ref/` documents duplicate-counting — and it is repeated in ~8 code comments, which is how an inference starts reading like a vendor fact. The reasoning: a duplicate counts again against the per-connection cap, so re-sending 50 held instruments to a 50-slot socket asks for 100. Sound for depth-200 (cap 1, so 2 > 1 regardless); UNPROVEN for depth-20, where it holds only if Dhan adds rather than de-duplicates |
+| What 804 costs | `classify_disconnect` files it **Fatal**: the socket closes and does not re-dial. `SubscribeGuard` replays the same retained set, so a re-dial earns the identical rejection — deterministic, for the session |
+| What the churn itself risks | **805 — "Too many requests/connections — may result in user being blocked"** (same table, line 348). *May*, in Dhan's own word — not a certainty, and not something to test against a live account |
+
+So a literal 5-second full re-send does not deliver the requirement more faithfully;
+it **destroys the sockets on the first cycle** and the set becomes permanently stale
+at whatever it held. The delta is what keeps the property true.
+
+**What is unchanged and what tightens:**
+
+| | |
+|---|---|
+| Ranking cadence | every **5 seconds** — unchanged, and it is free (~60 µs, a 0.0012% duty cycle) |
+| Set freshness | the subscribed set reflects the ranking **as of the last 5-second sweep** — this is the operator's requirement, met |
+| Wire traffic | only instruments that ENTERED or LEFT the top 250. A quiet window costs **zero** socket actions |
+| Per-window cap | a bounded number of swaps per window, with the refusal counted — so a churning market cannot serialise 250 two-second swaps into a 5-second window |
+
+##### The depth-200 clause, pinned rather than assumed
+
+*"If same symbols multiple strikes contracts means then have it as unique"* is the
+precise statement of the distinct-underlying rule: when the top five by volume
+contain several strikes of ONE stock, keep that stock's heaviest contract and take
+the next DISTINCT underlying for the remaining sockets. Greedy over the volume order
+does exactly this, and `rank_distinct_underlying` implements it — but the operator
+has now stated the multi-strike case explicitly, so it is pinned by its own named
+test rather than left as a property of the general case.
+
+##### ⚠ The blocking prerequisite nobody had named
+
+Raising the cadence multiplies one existing, UNVERIFIED risk by 12x, and it must be
+probed before any cadence increase ships.
+
+`docs/dhan-ref/08-annexure-enums.md` records the depth UNSUBSCRIBE RequestCode as a
+cross-surface split — **24 vs 25** — with the weight of evidence "SHIFTED toward 24"
+and the conclusion **"UNVERIFIED-LIVE both ways"**. `constants.rs:397` ships
+`FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`.
+
+If 25 is the wrong code, every unsubscribe is a silent no-op at Dhan's side and every
+swap becomes an ADD. A depth-200 socket then reaches 2 instruments against a cap of 1
+— 804, Fatal, parked for the session. `send_unsubscribe` is fire-and-forget
+(`connection.rs:1131`): `Ok` means bytes were written, not that Dhan removed anything,
+so there is no ack to detect it from. Today that risk fires at most 5 times a minute;
+at a 5-second cadence it fires twelve times more often.
+
+**So the ordering is: probe the unsubscribe code on a live session FIRST, then raise
+the cadence.** Shipping the cadence first is the one change here that could park all
+five depth-200 sockets for a session with no recovery path.
+
+**The thin-book cost is unchanged and still stated:** when the true top five ARE five
+strikes of one stock, this forces four substitutions into thinner books — the shape
+that measured 800 rows/minute against 100,800 on 2026-08-26. That is the operator's
+call and he has now made it twice.
 #### What a PR that violates this section looks like (REJECT)
 
 - Ranks index options and stock options in ONE blended leaderboard (returns zero

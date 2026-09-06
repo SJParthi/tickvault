@@ -29,10 +29,10 @@
 //! > can ever beat. The depth set freezes for the rest of the session. No error
 //! > fires, no counter moves, every dashboard stays green.
 //!
-//! A full sweep costs **~60 µs** at 20,220 contracts (2.8 ns/instrument, the
-//! measured `scan_silence` constant) — a **0.0012% duty cycle** at the 5-second
-//! cadence. The heap was premature optimisation against a cost that measurement
-//! shows is free, and it bought the single worst failure mode in the design. So
+//! A full sweep costs **900 µs** at 20,220 contracts — a **0.018% duty cycle**
+//! at the 5-second cadence. The heap was premature optimisation against a cost
+//! that measurement shows is negligible, and it bought the single worst failure
+//! mode in the design. So
 //! this module holds no threshold: [`VolumeLeaderboard::rank`] recomputes from
 //! current state, one bad value affects one contract instead of the whole set,
 //! and it self-corrects the moment a good value arrives.
@@ -45,7 +45,11 @@
 //! so do the other three breakers of monotonicity: write-ahead-log replay
 //! re-injecting older frames after newer ones, Dhan skipping a slow consumer
 //! forward to "the latest available state" with no sequence number, and the
-//! 09:00 session reset. **One gate catches all four.** Refusing is the right
+//! 09:00 session reset. **One gate catches all four — with one hole, stated rather
+//! than implied.** A wrap landing exactly on ZERO is invisible here: zero is
+//! short-circuited earlier as the pre-open state of every contract and cannot
+//! be told apart from it. Unreachable in practice, and recorded because
+//! "catches all four" read alone would overstate it. Refusing is the right
 //! direction: holding the last good high keeps the most liquid contract ranked,
 //! where accepting the wrapped value would silently drop it off the leaderboard.
 //!
@@ -57,8 +61,19 @@
 //!
 //! It takes observations and returns a ranking. It reads no database, opens no
 //! socket and performs no I/O, so every edge case below is a unit test rather
-//! than a live-session surprise. Allocation happens once at construction; the
-//! sweep fills a reusable buffer.
+//! than a live-session surprise.
+//!
+//! # Allocation
+//!
+//! The maps and the sweep buffer are pre-sized at construction and the metric
+//! handles are resolved there too, so [`VolumeLeaderboard::observe`] — the
+//! per-tick path — allocates nothing in steady state.
+//!
+//! **`rank_distinct_underlying` DOES allocate**, two `Vec`s of `k` per call. It
+//! is the depth-200 path, called once per cadence with `k = 5`, not per tick.
+//! Stated because an earlier version of this header said "allocation happens
+//! once at construction" without qualification, which was true of `rank` and
+//! false of that path.
 
 use std::collections::HashMap;
 
@@ -97,7 +112,13 @@ pub enum OptionFamily {
 }
 
 impl OptionFamily {
-    /// Metric label. A `&'static str` so the label never allocates.
+    /// Metric label.
+    ///
+    /// NOTE: being a `&'static str` is NOT what makes a label cheap.
+    /// `metrics::counter!` selects its zero-allocation arm on the label value
+    /// being a LITERAL; a variable of any type falls through to the arm that
+    /// builds a `Vec`. The counters are therefore resolved ONCE into handles on
+    /// [`Family`] rather than being re-macro'd per call.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -150,13 +171,69 @@ pub enum Observation {
     /// Volume is zero, which is the pre-open state of every contract. Not an
     /// error and not counted as a refusal — simply not rankable.
     Ignored,
+    /// The contract is tracked and the volume is IDENTICAL to what is stored.
+    ///
+    /// The most common outcome on a live feed, and not a fault: a packet is
+    /// emitted on an LTP, bid, ask or OI change, so most packets for a
+    /// contract carry a volume that has not moved since the last one. Never
+    /// counted, never logged.
+    Unchanged,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Family {
     volumes: HashMap<ContractKey, RankedContract>,
     non_monotonic: u64,
     at_capacity: u64,
+    /// PRE-RESOLVED counter handles.
+    ///
+    /// `metrics::counter!` selects its zero-allocation arm on the label value
+    /// being a LITERAL, not on its type -- a `&'static str` held in a variable
+    /// still falls through to the arm that builds a `Vec`. CLAUDE.md records
+    /// exactly this costing ~36M allocations/hour in `record_ws_lag`, and the
+    /// fix there was the same one: resolve the handles once and increment them.
+    ///
+    /// An earlier doc line here claimed "a `&'static str` so the label never
+    /// allocates". That was wrong about the mechanism, and it was wrong on the
+    /// per-tick path.
+    refused_non_monotonic: metrics::Counter,
+    refused_capacity: metrics::Counter,
+}
+
+impl Family {
+    fn new(family: OptionFamily) -> Self {
+        let label = family.as_str();
+        // Seeded at zero here: the CloudWatch agent computes a counter as the
+        // delta between consecutive samples and DROPS the first sample of a
+        // series it has never seen, so a counter whose first increment IS the
+        // event publishes nothing on the one day it matters (the 2026-08-28
+        // incident that made 104,540 depth rows permanently unclassifiable).
+        let refused_non_monotonic =
+            metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "non_monotonic");
+        refused_non_monotonic.increment(0);
+        let refused_capacity =
+            metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "capacity");
+        refused_capacity.increment(0);
+        Self {
+            // Pre-sized: an unsized map reallocates and rehashes ~15 times on
+            // its way to the authorized universe, and every one of those lands
+            // on the per-tick path.
+            volumes: HashMap::with_capacity(MAX_TRACKED_CONTRACTS),
+            non_monotonic: 0,
+            at_capacity: 0,
+            refused_non_monotonic,
+            refused_capacity,
+        }
+    }
+
+    /// Clears the tracked contracts and counters, KEEPING the map capacity and
+    /// the resolved handles. Replacing the struct would hand back the capacity
+    /// and pay the growth again every session.
+    fn clear(&mut self) {
+        self.volumes.clear();
+        self.non_monotonic = 0;
+        self.at_capacity = 0;
+    }
 }
 
 /// Per-family volume leaderboards.
@@ -179,21 +256,10 @@ impl VolumeLeaderboard {
     /// Builds a leaderboard, pre-sizing the sweep buffer.
     #[must_use]
     pub fn new() -> Self {
-        // Seed both refusal series at zero for both families. The CloudWatch
-        // agent computes a counter as the delta between consecutive samples and
-        // DROPS the first sample of a series it has never seen — so a counter
-        // whose first increment IS the event publishes nothing on the one day
-        // it matters. That is exactly how 104,540 depth rows became permanently
-        // unclassifiable on 2026-08-28.
-        for family in [OptionFamily::Index, OptionFamily::Stock] {
-            for reason in ["non_monotonic", "capacity"] {
-                metrics::counter!(REFUSED_COUNTER, "family" => family.as_str(), "reason" => reason)
-                    .increment(0);
-            }
-        }
+        // `Family::new` resolves and seeds each family's counter handles.
         Self {
-            index: Family::default(),
-            stock: Family::default(),
+            index: Family::new(OptionFamily::Index),
+            stock: Family::new(OptionFamily::Stock),
             scratch: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
         }
     }
@@ -230,12 +296,18 @@ impl VolumeLeaderboard {
         let slot = self.family_mut(family);
 
         if let Some(existing) = slot.volumes.get_mut(&key) {
-            if contract.volume <= existing.volume {
+            // STRICTLY less. An UNCHANGED cumulative volume is the NORMAL state,
+            // not a fault: a Full/Quote packet is emitted on an LTP, bid, ask
+            // or OI change, so between two trades of one contract many packets
+            // carry the same volume. Treating equal as a breach made the
+            // overwhelmingly common tick a refusal -- which both swamped the
+            // ONE counter that detects a real wrap and emitted a coded error
+            // whose text says volume went backwards when it had not moved.
+            if contract.volume < existing.volume {
                 let stored = existing.volume;
                 slot.non_monotonic = slot.non_monotonic.saturating_add(1);
                 let seen = slot.non_monotonic;
-                metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "non_monotonic")
-                    .increment(1);
+                slot.refused_non_monotonic.increment(1);
                 // Powers of two, so a storm cannot flood the sink. A wrapped
                 // contract refuses on every subsequent tick for the rest of the
                 // session, which is thousands of events for one condition.
@@ -260,6 +332,11 @@ impl VolumeLeaderboard {
                     offered: contract.volume,
                 };
             }
+            if contract.volume == existing.volume {
+                // Nothing to record and nothing wrong. Deliberately NOT counted
+                // and NOT logged.
+                return Observation::Unchanged;
+            }
             // Advance in place. The underlying is refreshed too: a derivative
             // id can be reused across days, and holding a stale underlying
             // would put the contract under the wrong name in the depth-200
@@ -271,8 +348,7 @@ impl VolumeLeaderboard {
         if slot.volumes.len() >= MAX_TRACKED_CONTRACTS {
             slot.at_capacity = slot.at_capacity.saturating_add(1);
             let seen = slot.at_capacity;
-            metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "capacity")
-                .increment(1);
+            slot.refused_capacity.increment(1);
             if seen.is_power_of_two() {
                 error!(
                     code = ErrorCode::Volume01MonotonicityBreach.code_str(),
@@ -361,6 +437,12 @@ impl VolumeLeaderboard {
     where
         F: Fn(&RankedContract) -> bool,
     {
+        // CLAMPED before the allocations below. `Vec::with_capacity(k)` PANICS
+        // on a capacity overflow, and the release profile is `panic = "abort"`,
+        // so an unclamped caller-supplied `k` is a process abort rather than a
+        // bad ranking. `rank` is already safe by construction because
+        // `truncate` clamps; this path allocates first, so it must clamp first.
+        let k = k.min(MAX_TRACKED_CONTRACTS);
         let ordered = self.rank(family, MAX_TRACKED_CONTRACTS, eligible);
         let mut seen: Vec<u64> = Vec::with_capacity(k);
         let mut out: Vec<RankedContract> = Vec::with_capacity(k);
@@ -374,6 +456,13 @@ impl VolumeLeaderboard {
             seen.push(row.underlying_id);
             out.push(*row);
         }
+        // `rank` above set this to the INTERMEDIATE sweep length (up to the
+        // whole map), because that is what it materialised. What this path
+        // actually hands the caller is `out`, and a gauge documented as "the
+        // size of the last materialised ranking" reporting 20,000 when five
+        // sockets were filled is the wrong number for the only question an
+        // operator asks of it.
+        metrics::gauge!(RANKED_GAUGE, "family" => family.as_str()).set(out.len() as f64);
         out
     }
 
@@ -403,8 +492,8 @@ impl VolumeLeaderboard {
     /// would mask, which is why the reset is asserted by a test rather than
     /// assumed.
     pub fn reset_daily(&mut self) {
-        self.index = Family::default();
-        self.stock = Family::default();
+        self.index.clear();
+        self.stock.clear();
         self.scratch.clear();
     }
 }
@@ -516,13 +605,49 @@ mod tests {
     }
 
     #[test]
-    fn an_equal_volume_is_refused_so_a_repeated_tick_cannot_churn_the_order() {
+    fn an_equal_volume_is_unchanged_not_a_breach_and_never_touches_the_counter() {
+        // CORRECTED 2026-09-06. This test previously asserted the opposite,
+        // under the name `an_equal_volume_is_refused_so_a_repeated_tick_cannot
+        // _churn_the_order` -- and BOTH halves of that name were wrong.
+        //
+        // It cannot churn the order: the sort is deterministic on
+        // (volume, security_id, segment), so re-storing an identical volume
+        // reorders nothing. Refusing it bought no stability at all.
+        //
+        // And it is not a breach. A Full/Quote packet is emitted on an LTP,
+        // bid, ask or OI change -- NOT only on a trade -- so between two trades
+        // of one contract, most packets carry a volume that has not moved.
+        // Counting those as non-monotonic made the ordinary tick a refusal,
+        // which swamped the one counter that detects a real 32-bit wrap and
+        // emitted a coded error whose text says volume went backwards when it
+        // had not moved at all.
         let mut lb = VolumeLeaderboard::new();
         lb.observe(stock(1, 100, 500), OptionFamily::Stock);
+
+        for _ in 0..1_000 {
+            assert_eq!(
+                lb.observe(stock(1, 100, 500), OptionFamily::Stock),
+                Observation::Unchanged,
+                "an unmoved cumulative volume is the normal tick, not a fault"
+            );
+        }
+        assert_eq!(
+            lb.non_monotonic_refusals(OptionFamily::Stock),
+            0,
+            "a thousand ordinary ticks must leave the wrap detector at zero"
+        );
+
+        // And a genuine decrease still refuses, so the gate is not simply gone.
         assert!(matches!(
-            lb.observe(stock(1, 100, 500), OptionFamily::Stock),
+            lb.observe(stock(1, 100, 499), OptionFamily::Stock),
             Observation::RefusedNonMonotonic { .. }
         ));
+        assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 1);
+        assert_eq!(
+            lb.rank(OptionFamily::Stock, 1, all)[0].volume,
+            500,
+            "and the stored high survives the refusal"
+        );
     }
 
     #[test]
@@ -708,6 +833,151 @@ mod tests {
         }
         let picked = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
         assert_eq!(picked.len(), 4, "only four distinct underlyings exist");
+    }
+
+    #[test]
+    fn multiple_strikes_of_one_symbol_collapse_to_one_and_the_next_names_fill_in() {
+        // Operator, 2026-09-06 (fourth quote): "If same symbols multiple
+        // strikes contracts means then have it as unique".
+        //
+        // The sibling test above proves the RESULT is five distinct names.
+        // This one proves the SUBSTITUTION RULE: the four displaced strikes are
+        // replaced by the next-heaviest DISTINCT names in volume order, not by
+        // an arbitrary four. That is the half a distinctness assertion cannot
+        // see -- a selector that returned the five lightest distinct names
+        // would satisfy "all distinct" and be wrong.
+        let mut lb = VolumeLeaderboard::new();
+
+        // Name 100 owns the raw top five outright: five strikes, 9_000..8_996.
+        for strike in 0..5u64 {
+            lb.observe(
+                stock(strike, 100, 9_000 - strike as u32),
+                OptionFamily::Stock,
+            );
+        }
+        // Six other names, DESCENDING, so "next in volume order" has a wrong
+        // answer available if the greedy walk ever loses the ordering.
+        for (rank, volume) in [8_000u32, 7_000, 6_000, 5_000, 4_000, 3_000]
+            .into_iter()
+            .enumerate()
+        {
+            let name = 200 + rank as u64;
+            lb.observe(stock(1_000 + name, name, volume), OptionFamily::Stock);
+        }
+
+        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+
+        assert_eq!(picked.len(), 5);
+        assert_eq!(
+            picked.iter().map(|c| c.underlying_id).collect::<Vec<_>>(),
+            vec![100, 200, 201, 202, 203],
+            "one entry for the dominant name, then the next four names by volume"
+        );
+        assert_eq!(
+            picked[0].security_id, 0,
+            "and the entry kept for the dominant name is its HEAVIEST strike"
+        );
+        assert!(
+            picked
+                .iter()
+                .all(|c| c.underlying_id != 204 && c.underlying_id != 205),
+            "the two lightest names must not displace a heavier one"
+        );
+    }
+
+    #[test]
+    fn an_index_option_can_never_reach_a_stock_ranking() {
+        // Operator, 2026-09-06 (fourth quote): "for depth 20 and depth 200
+        // never ever use the index options".
+        //
+        // Depth reads the STOCK family only, so the guarantee is that no
+        // observation filed as Index is reachable through the stock rankings --
+        // including when the index contract is orders of magnitude heavier,
+        // which is the realistic case (one NIFTY weekly ATM strike outtrades
+        // stock-option strikes by orders of magnitude).
+        let mut lb = VolumeLeaderboard::new();
+        for id in 0..5u64 {
+            lb.observe(
+                stock(id, 900 + id, u32::MAX - id as u32),
+                OptionFamily::Index,
+            );
+        }
+        lb.observe(stock(50, 100, 1), OptionFamily::Stock);
+
+        let top = lb.rank(OptionFamily::Stock, 250, all);
+        assert_eq!(top.len(), 1, "only the one stock contract is rankable");
+        assert_eq!(top[0].security_id, 50);
+
+        let five = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+        assert_eq!(five.len(), 1, "the depth-200 path sees the same one");
+        assert_eq!(five[0].security_id, 50);
+    }
+
+    /// MEASURES the real sweep cost at the authorized ceiling.
+    ///
+    /// `#[ignore]`d deliberately, the same shape as
+    /// `tick_gap_detector::scan_silence_sweep_cost_at_the_authorized_ceiling`
+    /// and `multi_tf_aggregator::catch_up_seal_all_sweep_cost_at_the_authorized_ceiling`:
+    /// a wall-clock number must never become a flaky CI gate.
+    ///
+    /// # Why this exists
+    ///
+    /// The design note that killed the incremental-heap alternative costed this
+    /// sweep at "~60 us, from the measured 2.8 ns/instrument constant". That
+    /// constant is `scan_silence`'s, and `scan_silence` is a LINEAR compare over
+    /// a slot array. This is a `sort_unstable_by` over the filtered set --
+    /// O(n log n) with a three-key comparator -- so the transfer was invalid and
+    /// the figure was an underestimate. Run this instead of quoting it.
+    #[test]
+    #[ignore = "wall-clock measurement, not a gate"]
+    fn rank_sweep_cost_at_the_authorized_ceiling() {
+        // The measured 2026-08-22 stock-option universe.
+        const CONTRACTS: u64 = 20_220;
+        const DEPTH_20: usize = 250;
+
+        let mut lb = VolumeLeaderboard::new();
+        for id in 0..CONTRACTS {
+            // Volumes deliberately NOT pre-sorted: a sort's cost depends on the
+            // input order, and a pre-sorted input measures the best case.
+            let volume = ((id.wrapping_mul(2_654_435_761)) % 5_000_000) as u32 + 1;
+            lb.observe(stock(id, id % 220, volume), OptionFamily::Stock);
+        }
+        assert_eq!(lb.tracked(OptionFamily::Stock), CONTRACTS as usize);
+
+        // Warm, so the first-call map/vec growth is not in the number.
+        let _ = lb.rank(OptionFamily::Stock, DEPTH_20, all);
+
+        const ROUNDS: u32 = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let top = lb.rank(OptionFamily::Stock, DEPTH_20, all);
+            std::hint::black_box(top.len());
+        }
+        let per_sweep = start.elapsed() / ROUNDS;
+
+        // The depth-200 path sorts the WHOLE map, not the top 250.
+        let start5 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let five = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+            std::hint::black_box(five.len());
+        }
+        let per_distinct = start5.elapsed() / ROUNDS;
+
+        // 5-second cadence.
+        let duty = per_sweep.as_secs_f64() / 5.0 * 100.0;
+        let duty5 = per_distinct.as_secs_f64() / 5.0 * 100.0;
+        println!(
+            "MEASURED at {CONTRACTS} contracts:\n  \
+             rank(top {DEPTH_20})        = {per_sweep:?}  -> {duty:.4}% duty at 5s\n  \
+             rank_distinct_underlying(5) = {per_distinct:?}  -> {duty5:.4}% duty at 5s"
+        );
+
+        // Not a gate on the number -- a gate on the SHAPE. A sweep that took a
+        // whole cadence would starve the drain arm it shares a task with.
+        assert!(
+            per_sweep < std::time::Duration::from_secs(1),
+            "a sweep must not approach the 5s cadence: {per_sweep:?}"
+        );
     }
 
     #[test]
