@@ -1692,6 +1692,26 @@ pub(crate) struct OutOfWindowCounters {
     reasons: [&'static str; 3],
     /// Pre-resolved handles, index-aligned with `reasons`.
     handles: [metrics::Counter; 3],
+    /// Log-throttle state, index-aligned with `reasons` -- one per reason, per
+    /// writer instance.
+    ///
+    /// PER-REASON, and that is the whole point (2026-09-06). This was a single
+    /// `static SEEN` inside `note`, i.e. ONE counter shared by every call site
+    /// in the process: two on the tick writer and three on the depth writer.
+    /// Depth carries a MEASURED 24x the tick row volume, and outside
+    /// 09:00-15:39:59 IST every row is a refusal -- so an ordinary pre-open
+    /// depth burst drives the shared counter past 2^18 within minutes, and the
+    /// next power of two is 2^19. A genuinely rare tick refusal arriving after
+    /// it -- `ts_out_of_plausible_band`, the CORRUPT-FRAME signal -- then has
+    /// to wait for a further ~260,000 events before it is allowed to log, and
+    /// the log is its only production surface (this counter reaches no EMF
+    /// selector and no alarm, see the `note` docs).
+    ///
+    /// A common benign event starving the rare real one is the throttle
+    /// failing in the exact direction a throttle exists to avoid. One state
+    /// per reason per writer means a depth storm cannot silence a tick
+    /// corruption, and the first occurrence of each reason always logs.
+    seen: [AtomicU64; 3],
 }
 
 impl OutOfWindowCounters {
@@ -1712,6 +1732,7 @@ impl OutOfWindowCounters {
         Self {
             reasons,
             handles: [make(reasons[0]), make(reasons[1]), make(reasons[2])],
+            seen: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -1746,6 +1767,24 @@ impl OutOfWindowCounters {
     /// Powers of two, so a pre-open storm costs one line per doubling rather
     /// than one per row; the running total rides in the line so a throttled
     /// message still states the true magnitude.
+    /// Advance this reason's log throttle; `Some(running_count)` when the
+    /// caller should emit, `None` when it is suppressed.
+    ///
+    /// Per-reason AND per-writer -- never a process-wide `static`. See the
+    /// [`Self::seen`] field docs for the storm that starved the rare signal.
+    ///
+    /// Split out of [`Self::note`] deliberately: it is the DECISION, and the
+    /// tests assert on it directly. Asserting on the `seen` field instead
+    /// would pass against a refactor that reintroduced a static and left the
+    /// field behind as an unread mirror -- a guard satisfied by the thing you
+    /// did not break.
+    fn throttle_tick(&self, idx: usize) -> Option<u64> {
+        let total = self.seen[idx]
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        total.is_power_of_two().then_some(total)
+    }
+
     pub(crate) fn note(&self, reason: &'static str) {
         let mut idx = self.reasons.len() - 1;
         let mut i = 0;
@@ -1758,9 +1797,7 @@ impl OutOfWindowCounters {
         }
         self.handles[idx].increment(1);
 
-        static SEEN: AtomicU64 = AtomicU64::new(0);
-        let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        if total.is_power_of_two() {
+        if let Some(total) = self.throttle_tick(idx) {
             warn!(
                 code = ErrorCode::StorageGapTickDedupSegment.code_str(),
                 reason,
@@ -1768,8 +1805,9 @@ impl OutOfWindowCounters {
                 "a row was REFUSED or flagged by the session-window gate. A \
                  refusal is deliberate, NOT data loss: the operator's rule is \
                  that every persisted row sits inside 09:00:00-15:39:59.999 \
-                 IST. Throttled to powers of two; refused_total is the true \
-                 running count across every gated writer in this process."
+                 IST. Throttled to powers of two PER REASON PER WRITER; \
+                 refused_total is this writer's running count for THIS reason, \
+                 not a process-wide total."
             );
         }
     }
@@ -5161,5 +5199,104 @@ mod tests {
         note_rescue_outcome_ticks(false, (base + 20, base + 30), false);
         assert_eq!(wm.unlanded_total(), unlanded + 1);
         assert!(wm.snapshot().range_has_unapplied(base + 25, base + 25));
+    }
+
+    /// A benign storm on one reason must not silence the rare one.
+    ///
+    /// This is the shape the shared `static SEEN` produced: depth carries a
+    /// measured 24x the tick row volume and refuses EVERY row outside
+    /// 09:00-15:39:59 IST, so the pre-open burst drove the process-wide
+    /// counter far past the next power of two, and the corrupt-frame reason --
+    /// whose only production surface is this log -- waited hundreds of
+    /// thousands of events for permission to speak.
+    #[test]
+    fn the_refusal_log_throttle_is_per_reason_not_process_wide() {
+        let c = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+
+        // The ordinary pre-open storm, on the time-of-day reason.
+        for _ in 0..1_000 {
+            let _ = c.throttle_tick(0);
+        }
+
+        // The rare corrupt-frame reason has seen nothing, so its FIRST
+        // occurrence must be allowed to log. Under the shared static its count
+        // read 1_001 and it stayed silent until the 2_048th event.
+        assert_eq!(
+            c.throttle_tick(2),
+            Some(1),
+            "the corrupt-frame reason inherited the storm's count -- the \
+             throttle is shared again, and the one signal with no metric and \
+             no alarm is silenced by ordinary pre-open volume"
+        );
+        // The untouched middle reason is likewise unaffected.
+        assert_eq!(c.throttle_tick(1), Some(1));
+    }
+
+    /// Two WRITERS must not share the throttle either.
+    ///
+    /// `market_depth` and `ticks` build separate instances with different
+    /// reason vocabularies; a process-wide static made the depth writer's
+    /// volume decide when the tick writer was allowed to speak.
+    #[test]
+    fn two_writers_do_not_share_the_refusal_log_throttle() {
+        let a = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        let b = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        for _ in 0..64 {
+            let _ = a.throttle_tick(0);
+        }
+        assert_eq!(
+            b.throttle_tick(0),
+            Some(1),
+            "the second writer inherited the first writer's count -- depth \
+             carries 24x the tick row volume, so a shared throttle lets the \
+             depth writer decide when the tick writer may speak"
+        );
+    }
+
+    /// An unrecognised reason is counted as the LAST arm, deliberately.
+    ///
+    /// Recorded as a test rather than left to the comment on
+    /// `TICK_OUT_OF_WINDOW_REASONS`, because it reads like a bug and was
+    /// nearly "fixed" on 2026-09-06: an unmatched string increments a handle
+    /// labelled with a reason that did not happen. That is a real cost, and it
+    /// is the deliberately chosen one -- index 2 is the most ALARMING reason in
+    /// both vocabularies (`ts_out_of_plausible_band` for ticks,
+    /// `arrival_out_of_plausible_band` for depth), so an unrecognised refusal
+    /// surfaces as a corrupt-frame signal rather than hiding inside an ordinary
+    /// pre-open count. Unreachable today (`is_noteworthy` gates out
+    /// `in_window`, and every other call site passes an element of the array
+    /// itself); this pins the direction for the day a fourth reason is added.
+    #[test]
+    fn an_unrecognised_reason_lands_on_the_most_alarming_arm() {
+        let c = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        c.note("a_reason_this_writer_has_never_heard_of");
+        // Slot 2 advanced, so its next tick is 2; slots 0 and 1 did not, so
+        // theirs is still 1. Read through the decision function rather than
+        // the field, for the reason `throttle_tick` records.
+        assert_eq!(
+            c.throttle_tick(2),
+            Some(2),
+            "an unrecognised reason must fall to the most alarming arm, not the \
+             first one -- silently attributing a corrupt frame to an ordinary \
+             pre-open refusal is the failure this ordering exists to prevent"
+        );
+        assert_eq!(c.throttle_tick(0), Some(1));
+        assert_eq!(c.throttle_tick(1), Some(1));
     }
 }

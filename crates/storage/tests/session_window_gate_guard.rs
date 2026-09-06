@@ -212,6 +212,84 @@ fn the_refusal_counter_is_seeded_for_every_reason_label() {
 // DEPTH
 // ---------------------------------------------------------------------------
 
+/// True when any line of `body` DECLARES a `static` item.
+///
+/// Not a substring search for `"static "`: Rust spells the `'static` lifetime
+/// with the same six letters, and both of the bodies this file inspects
+/// mention `&'static str` in their own signatures. The first version of this
+/// check failed on that prose while the code was correct -- a guard whose
+/// first act is a false positive is a guard someone deletes.
+fn declares_a_static(body: &str) -> bool {
+    body.lines()
+        .any(|l| l.trim_start().starts_with("static ") || l.trim_start().starts_with("static\n"))
+}
+
+/// The refusal log throttle must be per-reason and per-writer, never a
+/// process-wide `static`.
+///
+/// This is a SOURCE assertion because the shape is what matters, and the shape
+/// is what regressed. Until 2026-09-06 `note` held one `static SEEN` shared by
+/// every call site in the process -- two on the tick writer, three on the depth
+/// writer. Depth carries a MEASURED 24x the tick row volume and refuses EVERY
+/// row outside 09:00-15:39:59 IST, so an ordinary pre-open depth burst drove
+/// the shared counter past 2^18 within minutes and the next permitted log sat
+/// at 2^19. A rare tick refusal arriving after it -- `ts_out_of_plausible_band`,
+/// the corrupt-frame signal, whose ONLY production surface is this log because
+/// the counter reaches no EMF selector and no alarm -- then waited ~260,000
+/// events for permission to speak.
+///
+/// A common benign event starving the rare real one is the throttle failing in
+/// the direction a throttle exists to prevent.
+#[test]
+fn the_refusal_log_throttle_is_not_a_process_wide_static() {
+    let src = tick_persistence_src();
+
+    let at = src
+        .find("fn throttle_tick(&self, idx: usize) -> Option<u64>")
+        .expect(
+            "OutOfWindowCounters::throttle_tick is gone. It is the throttle \
+             DECISION, and the unit tests assert on it directly -- deleting it \
+             leaves them asserting on a field a refactor can turn into an \
+             unread mirror.",
+        );
+    // Bounded at the function's own closing brace, not a fixed character
+    // count. A 400-char window overran into the doc comment on `note`, whose
+    // phrase `&'static str` contains the literal this test searches for -- so
+    // the guard failed on prose while the code was correct.
+    let end = src[at..].find("\n    }\n").map_or(src.len(), |o| at + o);
+    let body = &src[at..end];
+    assert!(
+        body.contains("self.seen[idx]"),
+        "throttle_tick no longer reads the PER-WRITER, PER-REASON state. \
+         Anything else -- a static, a shared slot, a single index -- lets one \
+         writer's volume decide when another writer may log."
+    );
+    assert!(
+        !declares_a_static(body),
+        "throttle_tick declares a `static`. That is the exact regression: \
+         process-wide throttle state, silenced by whichever writer is loudest."
+    );
+
+    // And `note` must route through it rather than growing a second, private
+    // throttle beside the first.
+    let note_at = src
+        .find("pub(crate) fn note(&self, reason: &'static str) {")
+        .expect("OutOfWindowCounters::note is gone");
+    let note_end = src[note_at..]
+        .find("\n    }\n")
+        .map_or(src.len(), |o| note_at + o);
+    let note_body = &src[note_at..note_end];
+    assert!(
+        note_body.contains("self.throttle_tick(idx)"),
+        "note no longer routes through throttle_tick, so the unit tests pin a \
+         function production does not call."
+    );
+    assert!(
+        !declares_a_static(note_body),
+        "note declares a `static` again -- the shared throttle is back."
+    );
+}
+
 fn depth_persistence_src() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/depth_persistence.rs");
     let raw = std::fs::read_to_string(&path)

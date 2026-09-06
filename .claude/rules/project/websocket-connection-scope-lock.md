@@ -1391,6 +1391,48 @@ cheap half — and it survives the correction, because both pools scaled by the
 same wrong factor. The update rate is the unmeasured multiplier and still swings
 the answer 5×; it is **Assumed**, and the first live session measures it.
 
+> ### ✅ SETTLED 2026-09-06 — the Assumed multiplier is now MEASURED, and it is the HIGH column
+>
+> The paragraph above closes by saying the update rate "is **Assumed**, and the
+> first live session measures it." That session happened, and the measurement has
+> been sitting in `depth_persistence.rs`'s own module header since 2026-08-24
+> without ever being carried back to this table.
+>
+> | | rows/session |
+> |---|---:|
+> | This table's model at **1 update/s** | 288,000,000 |
+> | This table's model at **5 updates/s** | 1,440,000,000 |
+> | **MEASURED, 2026-08-24** | **1,530,651,649** |
+>
+> Implied rate: **5.31 updates/second** — slightly ABOVE this table's own high
+> column. At 72 B/row that is **110.2 GB/session** of logical depth rows: the
+> high column (104 GB) was right to within 6%, and **the low column (21 GB) is
+> understated 5.2×**.
+>
+> **That matters because the LOW column is the one the sizing decisions quote.**
+> `daily-universe-scope-expansion-2026-05-27.md` reasons that a 100 → 200 GB grow
+> "buys roughly +4.8 days at the low estimate and +1 day at the high one." Only
+> the second half was ever true. The same paragraph in this file says a 100 GB
+> root is "~4.8 days at the low estimate and ~23 hours at the high one" — it is
+> ~23 hours, full stop.
+>
+> **And 110 GB is not the disk burn.** The measured consumption is **~307 GB per
+> session** (booted 2026-09-01 at ~309.6 GB free, ended at 2.4 GB), i.e. **2.8×**
+> the logical depth rows once ticks, 24 candle frames, the raw-frame WAL, the
+> spill tiers and QuestDB's own write amplification are counted. A row-width
+> model is a floor on disk consumption, never an estimate of it — and this table
+> has been read as the latter.
+>
+> **What it cost.** On 2026-09-03 the volume reached 0 bytes free; on 2026-09-04
+> the box booted onto a full disk, captured **zero** ticks all day, and dropped
+> **2,000,238** frames before the write-ahead log — permanent loss, because a WAL
+> that cannot append cannot rescue. A 600 GB volume against a 307 GB session is
+> under two sessions of room, not the ~28 days the low column implies.
+>
+> Nothing about the SCOPE changes here — this is the measurement the table asked
+> for, recorded where the table is, so the next disk decision starts from the
+> right column.
+
 Against a **100 GB root** that is **~4.8 days at the low estimate and ~23 hours
 at the high one** — not the ~1.4 days and ~7 hours the wrong figure implied. gp3
 grows online in one command and `variables.tf` permits up to 200 GB.
@@ -2054,3 +2096,155 @@ assumption today and must be taught the difference.
   close (this codebase has already been bitten by a NaN poisoning indicator state
   for the life of the process).
 - Reports a pre-open minute with no ticks as a missing bar rather than as normal.
+
+### 2026-09-06 — DEPTH IS STOCK OPTIONS ONLY, RANKED BY VOLUME, WITH THE TWO OPTION FAMILIES RANKED SEPARATELY
+
+**The verbatim operator demands (2026-09-06, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the requirement):**
+> "Dude clealry note for depth 20 check every 5 seconds top volume of stocks options strikes contracts alone dude I mean pick top 250 top volume aligned wirh top gainers dude okay? For depth 200 also always pick top 5 volume gainers stocks options strikes contracts dude but ensure on depth 200 top 5 should never ever be same symbols strike ddue okay?"
+
+**Quote B (the narrowing, minutes later):**
+> "See clelwry note for depth 20 and depth 200 only stocks options contracts strikes dude oaky? No underlying spot or futures or indices or indices fmo dude okay? Meanwhile we need to split this top volume gainers purely based on indices options vs stocks options dude okay?"
+
+**Quote C (the authorization):**
+> "See whatever I mentioned go ahead with that dude okay?"
+
+Quote C was given in DIRECT response to a message that ENUMERATED exactly what was
+blocked and why — removing NIFTY/BANKNIFTY from depth-20, the depth-200 change, and
+the SEBI deletion — so it selects the enumerated work. That is the §28.2/§28.3
+authorization shape this repository already accepts. Recorded HERE before any code,
+per the rule-file-first law.
+
+#### What this SUPERSEDES
+
+This is a reversal of the 2026-08-26 (SECOND) depth-200 lock and of the index half
+of the depth-20 layout the same day authorized. Both are recorded rather than
+quietly overwritten:
+
+| Surface | 2026-08-26 locked value | 2026-09-06 |
+|---|---|---|
+| depth-20 socket 1 | NIFTY ATM ±12, CE + PE (50 slots) | **stock options** |
+| depth-20 socket 2 | BANKNIFTY ATM ±12, CE + PE (50 slots) | **stock options** |
+| depth-20 sockets 3–5 | 37 gainers + 37 losers + 1 = 75 stocks, ATM CE/PE, ranked by PERCENT CHANGE | same shape, **ranked by VOLUME**, widened to fill 250 |
+| depth-200 | NIFTY ATM CE/PE + BANKNIFTY ATM CE/PE + 1 lone mover | **top 5 stock-option contracts, distinct underlyings** |
+| Ranking key | `close_pct_from_prev_day` | **cumulative day volume**, gainers as an eligibility filter |
+| Cadence | once a minute at :08, edge-triggered on an ATM change | **rank every 5 s**; re-subscribe still edge-triggered (see the envelope) |
+
+The 2026-08-26 REJECT row *"Lets any underlying outside NIFTY/BANKNIFTY take a
+socket while a NIFTY or BANKNIFTY ATM pair is available"* is **RETIRED by Quote B**,
+which excludes those underlyings from depth entirely. Its sibling rows — the socket
+budget (5 remains 5), no hardcoded contract ids, and normalised rather than raw
+cross-underlying comparison — all STAND.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Instrument class | **stock options only** (`OPTSTK`). NO spot, NO futures (stock or index), NO indices, NO index options. Quote B is explicit on all four |
+| Segment | `NSE_FNO` only. **SENSEX and BANKEX can never have depth** — they are `BSE_FNO` and Dhan serves depth on NSE alone; the existing refusal stands unchanged |
+| depth-20 | **250 instruments** = 5 sockets × 50, the highest-volume stock-option contracts |
+| depth-200 | **5 instruments** = 5 sockets × 1, the highest-volume stock-option contracts, **each a distinct underlying** |
+| Budget | UNCHANGED — 250 + 5. This changes WHICH, never how many |
+| Ranking key | **cumulative day volume**, read from the Full packet at byte offset 22 (vendor-cumulative since session open, Dhan Ticket #5525125) |
+| Gainer role | **eligibility filter, not the sort key.** An instrument qualifies if its underlying is in the day's gainers; volume then decides the order. This keeps the ordered set monotonic, and therefore stable |
+| **Family split** | index options and stock options are ranked in **SEPARATE leaderboards**, never one blended list |
+| Ranking cadence | every **5 seconds** |
+| Re-subscribe cadence | **delta-only, edge-triggered, capped per window** — NOT a 5-second full re-subscribe (see the envelope) |
+| Contract source | the daily master artifact. Hardcoding contract ids remains a REJECT — they expire |
+
+#### Why the family split is mandatory, not stylistic
+
+Quote B asks for the split and it is the load-bearing requirement, not a
+refinement. Measured on the box 2026-08-22: **1,250 index-option contracts against
+20,220 stock-option contracts**, and a single NIFTY weekly at-the-money strike
+out-trades stock-option strikes by orders of magnitude.
+
+**A single blended top-250 by raw volume returns 250 index strikes and zero stock
+options.** Not approximately — the stock options this lock exists to capture would
+never appear, and the selector would silently return the exact opposite of the
+requirement while every counter read green. The split is what makes a stock-option
+ranking exist at all.
+
+This is the same reasoning the 2026-08-26 lock already applies one level up, where
+cross-underlying ranking is normalised rather than raw rupees because a 24,000 index
+and a 57,000 index are not comparable. Volume across the two option families is that
+problem an order of magnitude worse.
+
+#### ⚠ The honest envelope (mandatory per operator-charter §F)
+
+**Three defects must ship WITH this change or the ranking is unsafe.** All three were
+found by the 2026-09-06 five-agent sweep and all three are live today:
+
+1. **`ParsedTick.volume` is `u32` with NO overflow guard on the Dhan path.** This
+   file's own TrueData section records that a liquid index/future day *exceeds*
+   `u32::MAX`. On wrap, cumulative volume falls from ~4.29e9 to near zero and the
+   most liquid contract silently leaves the leaderboard. A saturating read with a
+   refusal counter is REQUIRED.
+2. **`VOLUME-MONO-01` has an error code but its `volume_monotonicity_guard` module
+   was DELETED.** Cumulative volume is NOT monotonic in practice — WAL replay
+   re-injects older frames after newer ones, Dhan skips a slow consumer forward with
+   no sequence number, and the counter resets at 09:00. **One garbage value near the
+   ceiling pins the leaderboard threshold at a value nothing can ever beat, the depth
+   set freezes for the session, and every counter reads green.** A falling volume must
+   be refused, counted and logged, and must never move the threshold.
+3. **Percent gain divides by the previous close, which is a PROVEN NaN source** —
+   the quote parser carries a test that asserts it — and `0.0` is a live sentinel. A
+   non-finite comparator is non-transitive, so a heap ordered by it corrupts wholesale
+   rather than in one entry. This is the §28.4 poisoning class one module over; a
+   finite gate on the ingest side is REQUIRED.
+
+**NOT claimed — the thin-book risk, which is the operator's to accept.** NIFTY and
+BANKNIFTY held the depth-200 sockets because they are the only books deep enough to
+fill 200 levels. The 2026-08-26 incident measured two FINNIFTY strikes delivering
+**800 rows/minute against NIFTY's 100,800** — a 125× difference — and the idle
+watchdog read the sparse sockets as dead and redialled them **112 and 210 times**
+against 19 for the healthy ones. **Stock-option books are thinner than FINNIFTY's.**
+Putting all five 200-level sockets on stock options is expected to produce
+mostly-empty books and reconnect churn. That is a measurement, not an opinion; it is
+recorded here so the outcome is a decision rather than a surprise, and it is
+reversible by a fresh dated quote.
+
+**NOT claimed — that a 5-second RE-SUBSCRIBE is possible.** Swaps are one-for-one with
+no bulk API, each carries a 2 s wire budget on the drain task, and 250 swaps
+serialise to **up to 500 s against a 5-second window**. At 5 s the session runs
+**4,680** cycles (09:00–15:30 = 23,400 s), the per-socket command channel is depth 4,
+Dhan closes a socket silent for 40 s, error 804 parks a socket for the session and 805
+is an account block. **The RANKING runs every 5 seconds (measured ~70 µs, 0.0014% duty
+cycle — free); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
+window**, which is the shape the existing re-fit already uses and for these reasons.
+
+**NOT claimed — that this improves capture.** 2026-09-04 captured ZERO ticks and
+dropped 2,000,238 frames before the write-ahead log because the volume was full. That
+sits upstream of every word here.
+
+#### ⚠ What this quote does NOT authorize
+
+- **Any deletion of SEBI or audit rows.** `instrument_lifecycle`,
+  `instrument_lifecycle_audit`, `index_constituency`, `order_audit`,
+  `order_update_events`, `position_update_events` and `ws_event_audit` are NEVER
+  deleted. A general "go ahead" is precisely the shape §5-class REJECT lists name as
+  insufficient — *"even if the operator approves verbally"* — and the retention is a
+  five-year regulatory obligation that cannot be rebuilt. Authorizing it needs its own
+  dated quote naming those tables.
+- Any change to the socket or instrument budget (250 + 5 remain).
+- Any fifth Dhan endpoint type, or more than 16 total connections.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Depth on `BSE_FNO` — structurally impossible, unchanged.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks index options and stock options in ONE blended leaderboard (returns zero
+  stock options — the defect this lock exists to prevent).
+- Subscribes any spot, future, index or index option to a depth socket.
+- Ships the volume ranking without the saturating read, the monotonicity gate, or the
+  finite gate on percent gain.
+- Re-subscribes unconditionally every 5 seconds rather than moving the delta.
+- Sorts by percent gain rather than using it as an eligibility filter (breaks
+  monotonicity and therefore stability).
+- Hardcodes contract security-ids.
+- Reports a depth pool as enabled while its instrument set is empty — including the
+  pre-open case, where volume is zero for everything and the ranking is meaningless.
+- Deletes a SEBI or audit row under cover of this quote.
