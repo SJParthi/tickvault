@@ -171,6 +171,10 @@ pub mod disk_pressure_boot;
 /// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
 pub mod market_ram_store_boot;
 pub mod movers;
+/// The previous close per instrument, fed from the response-code-6 packets
+/// the drain used to decode and discard. Without it the gainer-eligibility
+/// filter has nothing to divide by.
+pub mod prev_close_store;
 /// REST-era multi-TF candle derivation (operator directive 2026-07-16):
 /// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
 /// timeframes via the shared seal-writer channel + boot catch-up over the
