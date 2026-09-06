@@ -228,3 +228,53 @@ the same failure twice — `day_ohlc_tracker` (2026-08-12) and `WAL-SUSPEND-01`
 (2026-08-25) — and the lesson did not transfer, because a plan file reads like settled
 context rather than a claim. It is a claim. Verify each item against the tree at the
 moment work starts on it, not at the moment it is written down.
+
+### Closing items — 2026-09-06 (after the eight above)
+
+**Coverage floor — DONE.** `app` ratcheted **68.3 -> 72.6**, from two independent CI
+Coverage & Perf measurements on different trees (main @ `e1a1584cd` 73.07%, this PR @
+`d20e43313` 72.92%). The old floor left **4.62 points** of silent-regression room — 3x
+the next-widest crate. The sweep also found **nine stale floor numbers across three
+live documents**, some two ratchets behind; all corrected, and
+`every_documented_coverage_floor_matches_the_enforced_floor` now compares every
+documented claim against the TOML so a future ratchet cannot leave the prose behind.
+
+**Loss-counter visibility (Item 2 / Item 7) — BLOCKED, and the blocker is new.**
+Three of the four counters turn out to be correctly withheld, not overlooked:
+
+| counter | verdict |
+|---|---|
+| `tv_ticks_out_of_window_refused_total` | correctly withheld — a dated 2026-09-05 decision in `loss_counter_visibility_guard.rs` records that it measures the gate WORKING (outside 09:00-15:39:59 IST every tick increments it), so a series would chart normal behaviour |
+| `tv_depth_out_of_window_refused_total` | same class |
+| `tv_depth_rescue_queued_total` | counts normal operation, not loss |
+| **`tv_depth_rescue_inline_fallback_total`** | **genuinely worth shipping** — zero on a healthy lane, and `tv_seal_escalation_inline_fallback_total` is the precedent |
+
+So one EMF name (~$0.30/mo) is the real ask. **It cannot ship, and the reason is a live
+measurement that reverses my own earlier recommendation.** Read from the account
+2026-09-06 rather than inherited:
+
+| reading | value |
+|---|---|
+| `limit_amount` | $150.00 |
+| automatic `STOP_EC2_INSTANCES` at 90% | **$135.00** |
+| September actual (6 days in) | $28.43 |
+| **September forecast** | **$142.24** |
+| **margin to the automatic shutdown** | **-$7.24 — ALREADY OVER** |
+
+The repo's newest recorded figure, from ONE DAY earlier (`dhan-rest-only-noise-lock`
+2026-09-05), was $130.39. It moved $11.85 in a day. Daily costs Sep 1-5 were
+$8.78 / $4.79 / $5.15 / $6.10 / $3.59 — weekdays ~$4.79-8.78, weekends ~$2.79-2.87 —
+so the forecast is credible, not an artifact.
+
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3n already binds this case: *"the next
+addition of any size must come with a LEVER, not just a cost note."* At a NEGATIVE
+margin that is not a formality. The levers are unchanged and **neither is an
+executor's to take**: the already-approved Quote 10 Elastic IP release (-$3.60/mo,
+execution bundled with an instance recreate), or an operator decision on
+`limit_amount` — which Quote 19 caps at $150, already the live value, so a ceiling
+edit cannot buy room.
+
+**This is the third time a constraint in this repo has expired while still being
+quoted** — after the user-data byte budget and the $130 ceiling. The rule the
+2026-09-02 correction wrote down applies to itself: a budget limit is one
+`budgets describe-budgets` call; re-run it at the moment of writing.
