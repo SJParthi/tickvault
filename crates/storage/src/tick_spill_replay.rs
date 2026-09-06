@@ -459,6 +459,23 @@ fn nanos_are_a_plausible_epoch(nanos: i64) -> bool {
 
 pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
+    // FIRST-SAMPLE BASELINE. The CloudWatch agent computes a counter as the
+    // delta between consecutive samples and DROPS the first sample of a series
+    // it has never seen. A counter whose first increment IS the event therefore
+    // publishes NOTHING on the one round that matters. Registering the series at
+    // zero here -- once per round, before any file is opened -- makes the first
+    // real refusal a visible delta. Same discipline as the tick and depth drop
+    // counters (`register_drop_baseline`), and the same defect class that hid
+    // `tv_depth_rows_spilled_total` on 2026-08-28.
+    //
+    // O(1) and allocation-free: `dir_label` returns `&'static str`, so the
+    // metric name and the label value are both literals and `metrics::counter!`
+    // stays on its non-allocating arm.
+    metrics::counter!(
+        "tv_spill_replay_rows_out_of_window_refused_total",
+        "dir" => dir_label(dir)
+    )
+    .increment(0);
     // ONE buffer for the whole round, reused across files: a fixed cost per
     // round rather than per file, and the thing that makes the peak resident
     // size independent of how large any spill file has grown.

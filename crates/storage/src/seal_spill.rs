@@ -2072,7 +2072,6 @@ mod c3_tf_ordinal_pins {
 /// task through the seal-escalation inline fallback.
 #[cfg(test)]
 mod per_tick_metrics_pins {
-    use super::*;
 
     /// `append_seal` is reachable from the FRAME-DRAIN task.
     ///
