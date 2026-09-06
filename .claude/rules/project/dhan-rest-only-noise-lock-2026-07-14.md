@@ -3156,3 +3156,177 @@ which is the half we can control; the half before it remains undetectable.
 - Adds a per-CONNECTION or per-INSTRUMENT dimension (the §2.3 cardinality rule
   stands).
 - Presents it as detection of upstream tick loss. It is not, and cannot be.
+
+## ⚠ CORRECTED 2026-09-06 — the budget kill-switch is ARMED AND HEALTHY. Fifteen statements across three rule files say it may be broken, and the read they call impossible now works.
+
+**This section authorizes NOTHING.** It records a live measurement and retires a
+standing flag that has been carried, unchecked, since 2026-07-31.
+
+### What the rule files say
+
+`daily-universe-scope-expansion-2026-05-27.md` (10 occurrences), `aws-budget.md`
+(4) and this file (1) all carry a variant of: *both `STOP_EC2_INSTANCES` budget
+actions were last seen in `EXECUTION_FAILURE`, the read is `AccessDenied` for
+`user/claude-code-agent`, so whether the kill switch fires at all is Unknown.*
+Quotes 13, 17, 18 and 19 each repeat it. It was re-tested and still blocked on
+**2026-08-08**, **2026-08-22** and **2026-08-25**.
+
+### What is live TODAY (read 2026-09-06, `describe-budget-actions-for-budget`)
+
+| | Live value |
+|---|---|
+| The read itself | **SUCCEEDS** — no longer `AccessDenied`. The IAM gap closed at some point and nobody re-checked. |
+| Action 1 | threshold **90%**, `AUTOMATIC`, status **`STANDBY`** |
+| Action 2 | threshold **100%**, `AUTOMATIC`, status **`STANDBY`** |
+| Target | `i-0c3fe906dad5492fc` — the live prod box |
+| Region | `ap-south-1` |
+
+`STANDBY` is the healthy armed state. **The switch fires.**
+
+### ⚠ A discrepancy I nearly reported as a finding, and did not, because I looked one level deeper
+
+The API returns `ActionType: RUN_SSM_DOCUMENTS`, while **52** occurrences across
+the rules say `STOP_EC2_INSTANCES`. That looks like a documentation error and is
+NOT one: `terraform/budget.tf:364` sets `action_type = "RUN_SSM_DOCUMENTS"` and
+`:376` sets `action_sub_type = "STOP_EC2_INSTANCES"`. The sub-type is the
+behaviour. **The rules' shorthand is correct in substance** and must not be
+"fixed". Recorded because a one-level-shallow read of the same API call would
+have manufactured a 52-site false finding.
+
+### Why the stale flag is dangerous rather than merely untidy
+
+It is stale in the direction that produces complacency. A reader who believes the
+switch is broken sees a forecast above the action line and reasonably concludes
+nothing will happen. The opposite is true, and the margin is negative:
+
+| Reading, live 2026-09-06 | Value |
+|---|---|
+| `limit_amount` | $150.00 |
+| 90% automatic action line | **$135.00** |
+| September actual, 6 days in | $28.43 |
+| **September forecast** | **$142.24** |
+| **Margin** | **-$7.24 — the box gets stopped mid-month** |
+
+### Where the money actually goes (MEASURED by USAGE TYPE, Cost Explorer, Sep 1-6)
+
+⚠ An earlier draft of this section had EC2 compute and EBS SWAPPED. AWS bills EBS
+under the service name **"EC2 - Other"**, not under "Elastic Compute Cloud -
+Compute", and a first pass read the two lines the wrong way round. Corrected here
+before it landed, by re-querying grouped on USAGE_TYPE rather than SERVICE — which
+is the only grouping that names the components unambiguously:
+
+| Usage type (ap-south-1) | 6-day | note |
+|---|---:|---|
+| `EBS:VolumeUsage.gp3` | **$7.23** | 600 GB storage |
+| `EBS:VolumeP-IOPS.gp3` | **$2.78** | the 3,000 IOPS above baseline |
+| `EBS:VolumeP-Throughput.gp3` | **$2.78** | the 375 MiB/s above baseline |
+| `DataTransfer-Regional-Bytes` | $1.25 | ~$6.2/mo — not trivial, previously unnoticed |
+| `EBS:SnapshotUsage` | $0.24 | |
+| **EC2 - Other, total** | **$14.29** | |
+| Elastic Compute Cloud - **Compute** | $6.71 | the instance itself |
+| Tax | $4.33 | |
+| CloudWatch | $1.59 | |
+| VPC (the Elastic IP) | $0.60 | |
+| AWS Cost Explorer (the hourly spend guard's own polling) | $0.50 | ~$2.5/mo, matching the recorded ~$2.38 |
+| KMS · S3 · Secrets · SSM | $0.40 combined | |
+
+**The conclusion survives the correction and is now measured rather than assumed:
+EBS is the single largest cost, and the Elastic IP is not.** EBS components total
+**$12.79 of the $28.43 six-day spend — 45% of the entire bill.**
+
+The per-unit rates DERIVED from those actuals (ap-south-1, not the us-east-1
+figures an earlier draft used from memory):
+
+```
+storage      = $0.0912 per GB-month     (remembered rate was correct)
+prov. IOPS   = $0.0057 per IOPS-month   (remembered $0.005 — 14% low)
+prov. thrpt  = $0.0456 per MiBps-month  (remembered $0.040 — 12% low)
+```
+
+Scaling the observed six days to a full month at the CURRENT configuration
+(`vol-0c6ab6e593e39d8c8`, 600 GB gp3, 6000 IOPS, 500 MiB/s — `describe-volumes`,
+same day) gives **EBS = $88.92/month**, about **66% of the $135.00 action line before
+a single hour of compute**. It also explains the $130.39 -> $142.24 forecast jump
+in one day: the Quote 22 grow to 600 GB landed 2026-09-05.
+
+The already-approved Quote 10 Elastic IP release is **$3.60/mo** — measured at
+$0.60 per 6 days, so that recorded figure is correct — and it does **not** close a
+$7.24 gap on its own. Whoever takes a lever should know that before spending an
+instance recreate on it.
+
+### NOT recommended here, and the reason is on the record
+
+Reverting the Quote 17 IOPS/throughput provisioning would save **$30.00/mo** and
+close the gap outright. It is **not** recommended: Quotes 19 and 20 both refused
+it on measured evidence (peaks of 1,168 of 6,000 IOPS and 107 of 500 MiB/s), and
+the operator's standing mandate is no tick loss irrespective of cost. Those
+measurements predate the 2026-08-28 depth offload, so they may now understate the
+headroom — but re-deciding that is an operator call with a tick-loss consequence,
+not an executor's, and it is recorded as an option rather than taken.
+
+### The reusable rule, now demonstrated on itself for the fourth time
+
+A constraint quoted from a quote is not a measurement. This repository has now
+carried four: the user-data byte budget (freed, cited as blocking four times), the
+$130 ceiling (raised to $150, costed against for fifteen statements), the
+September forecast (stale within a day), and this one — a capability recorded as
+permanently denied that had quietly started working. Every one of the four is a
+single command. **Re-run it at the moment of writing.**
+
+```
+aws budgets describe-budgets --account-id 208384284948
+aws budgets describe-budget-actions-for-budget --account-id 208384284948 --budget-name tv-prod-monthly-budget-v2
+aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=<instance>
+```
+
+### ⚠ $135 is a BLIP. $150 is the CLIFF. They are different mechanisms and only one loses the month.
+
+Every cost note in this repository treats the 90% line as *the* consequence.
+That framing is wrong, and the difference decides how urgent this is. Verified in
+`budget.tf` and `budget-guards.tf`, cross-checked against the live EventBridge
+rules:
+
+| | **$135.00** (90%, AWS budget action) | **$150.00** (the repo's own `hard_stop_guard`) |
+|---|---|---|
+| Mechanism | AWS Budgets `RUN_SSM_DOCUMENTS` / `STOP_EC2_INSTANCES` | our hourly Lambda, `BUDGET_KILL_USD = "150"` (`budget-guards.tf:262`) |
+| What it does | stops the instance | stops the instance **AND calls `events:DisableRule` on `tv-prod-daily-start`** |
+| Next morning | **the box comes back** — `tv-prod-daily-start` `cron(0 3 ? * MON-FRI)` is ENABLED, and `start-watchdog-ping`/`-check` call `start_instances` as self-heal | **the box does NOT come back.** The start rule is disabled until an operator re-enables it |
+| Cost of a fire | the remainder of one session (CE refresh lags ~8-12 h, so a mid-session stop is possible but not certain) | **every remaining trading day of the month** |
+
+**So the deadline that matters is $150, not $135.** Crossing $135 costs part of a
+day and self-heals; crossing $150 ends the month unless a human intervenes.
+
+### The forecast is not naive, and it may be LOW
+
+AWS's $142.24 already discounts weekends — a naive linear extrapolation of the
+Sep 1-5 daily series (8.784, 4.791, 5.151, 6.098, 3.586) would give ~$170.
+
+Modelled independently from the real shape (Sep 1 was a Monday: 22 weekdays,
+8 weekend days; the volume reached 600 GB on Sep 5; weekend ~$4.25/day since EBS
+and the EIP bill while the box is stopped; weekday ~$6.00/day):
+
+```
+28.41 already spent + 17 x 6.00 + 8 x 4.25  =  ~$164 for September
+```
+
+August closed at **$85.33** on a 300-500 GB volume, so the jump is real and is
+mostly the disk growing 300 -> 500 -> 600 GB within one month.
+
+At ~$164: **$135 lands around Sep 25** (a blip) and **$150 around Sep 28** (the
+cliff, ~2 trading days lost). At AWS's more conservative $142.24 the cliff is not
+reached at all. Both are projections; the honest statement is that the cliff is
+*plausible this month and not certain*, and that it is the one worth acting on.
+
+### The levers, priced against the real gap
+
+To keep September under $150 from a ~$164 projection, ~$14 must come out — or
+~$1 against AWS's own $142.24 forecast.
+
+| Lever | Saves | Status |
+|---|---:|---|
+| Revert Quote 17 IOPS+throughput (6000->3000, 500->125 MiB/s) | **$34.20/mo** | Quotes 19/20 refused it on measured 19%/21% utilisation. Closes the gap alone. Operator call with a tick-loss consequence. |
+| Release the Elastic IP (Quote 10, approved in principle) | $3.60/mo | needs an instance recreate; does NOT close a $14 gap alone |
+| Shrink the volume | — | **IMPOSSIBLE**: gp3 never shrinks. Only a terminate-and-recreate. |
+| Raise `limit_amount` | — | Quote 19 caps it at $150, already the live value |
+
+Recorded, not taken. Every one is the operator's.

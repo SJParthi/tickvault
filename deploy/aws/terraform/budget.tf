@@ -7,6 +7,32 @@
 # (e.g., terminate a rogue stress test) before the bill arrives. The 100%
 # actual alarm is the hard "we crossed the budget" signal.
 #
+# ⚠ CORRECTED 2026-09-06 — the header paragraph immediately below is STALE in
+# every figure, and it is written in the PRESENT TENSE, so it reads as current
+# configuration rather than as history. The dated OPERATOR RULING entries
+# further down are accurate and are kept verbatim per house convention; only
+# this banner is added.
+#
+#   claim in the header below   |  live value (read 2026-09-06)
+#   ----------------------------|--------------------------------------------
+#   r8g.large                   |  r8g.xlarge (Quote 15, FINALISED)
+#   30 GB EBS                   |  600 GB gp3, 6000 IOPS, 500 MiB/s
+#   270-hr ceiling              |  08:30-17:30 IST weekdays (~198 hrs)
+#   "Limit set to $55"          |  limit_amount = "150"  (line ~187 of this file)
+#   "~$29.10 pre-GST"           |  September forecast $142.24
+#
+# The live EBS line alone is measured by usage type at
+# $88.92/mo — 66% of the $135.00 automatic-stop line, before any compute. Full
+# measured breakdown and the kill-switch state (both actions STANDBY and ARMED,
+# not EXECUTION_FAILURE as several rule files still claim) are recorded in
+# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, same date.
+#
+# The lockstep this header describes is REAL and INTACT: budget.tf limit_amount,
+# budget-guards.tf BUDGET_KILL_USD and budget_digest.rs BUDGET_USD are all 150,
+# pinned by crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs. Only the
+# prose went stale — which is the same failure this repository has now recorded
+# four times, and the reason the banner is here instead of a silent edit.
+#
 # USD vs INR: AWS Budgets uses USD internally (pre-GST). Config: r8g.large,
 # 270-hr ceiling, 30 GB EBS, +EIP = ~$29.10 pre-GST (~₹2,919/mo incl. 18%
 # GST). Limit set to $55 (raised 2026-06-30 from $25) for honest headroom over

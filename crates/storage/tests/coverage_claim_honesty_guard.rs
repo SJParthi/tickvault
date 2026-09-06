@@ -242,10 +242,18 @@ fn every_documented_coverage_floor_matches_the_enforced_floor() {
         }
     }
 
+    // 22 is the MEASURED count, not a round number, and it is deliberately not
+    // lower. An adversarial sweep on 2026-09-06 showed the previous floor of 18
+    // sat exactly at "still passes after losing the crate this guard was written
+    // for": `app` supplies 4 of the 22, every one of them preceded by `(`, so a
+    // single plausible-looking tightening of the boundary check silently dropped
+    // all four, left compared at exactly 18, and let `app 11.1` -- wrong by 61
+    // points -- pass green. A floor must be ABOVE the count that survives losing
+    // a crate, never equal to it.
     assert!(
-        compared >= 18,
+        compared >= 22,
         "coverage-floor doc scan compared only {compared} claims across {} \
-         documents — expected at least 18 (each carries a full floor list). A \
+         documents — expected at least 22 (each carries a full floor list). A \
          scan that matches nothing passes vacuously, which is the exact \
          false-OK this guard exists to prevent.",
         DOCS.len()
