@@ -28,6 +28,16 @@
 // note called this "a deliberate throughput trade". The trade is now taken at
 // an interval, with the cost and the new risk written at the constant.
 //
+// AMENDED 2026-09-06 — the interval bound did NOT hold for a rotated segment,
+// and the paragraph above claimed it did. `maybe_sync_segment` syncs `current`
+// and only `current`. At a 128 MiB rotation the writer flushed the full
+// segment, dropped it, and made the NEW file `current` — so the closed one was
+// never synced by anything, ever, and its tail fell back to the kernel's
+// writeback policy (the ~30 s the text above says was replaced). `persisted`
+// had already counted every record in it. Rotation now finalises through
+// `finalise_segment`, the same flush-then-sync the stop and close arms use, so
+// the ~1 s bound is true of every segment rather than only the last one.
+//
 // Three comments in this file previously said "fsync" while the code called
 // `sync_all` zero times. That overstatement was load-bearing, because the live
 // feed refuses to open a socket without this WAL and cites it as the durability
@@ -1447,19 +1457,34 @@ fn maybe_sync_segment(
     Instant::now()
 }
 
-/// Flushes the open segment and, unless syncing is disabled, forces it onto
-/// the device before the writer exits.
+/// Flushes a segment that is being FINALISED and, unless syncing is disabled,
+/// forces it onto the device.
 ///
-/// The sync here is UNCONDITIONAL rather than rate-limited: this runs once per
-/// process, at the moment the last records are written, and it is the only
-/// point at which "the app stopped cleanly" can be made to mean "nothing is
-/// waiting in the page cache". Its cost is one sync per shutdown.
-fn flush_on_exit(current: &mut Option<BufWriter<File>>, stage: &'static str) {
+/// Three events finalise a segment and nothing writes to it afterwards: the
+/// writer stopping, the channel closing, and a 128 MiB rotation. Until
+/// 2026-09-06 only the first two synced. The third — by far the most frequent —
+/// flushed and dropped the file, which puts the tail in the page cache and
+/// nowhere else: the periodic sync (`maybe_sync_segment`) only ever touches
+/// `current`, and at that instant `current` is the NEW segment, so the closed
+/// one is never synced by anything, ever. A power cut inside the kernel's
+/// writeback window therefore loses its last records permanently, while
+/// `persisted` has already counted every one of them — the silent-loss shape
+/// the WAL exists to make impossible.
+///
+/// The sync here is UNCONDITIONAL rather than rate-limited, because each of
+/// these is the LAST chance for that particular segment. Its cost is bounded
+/// by what the periodic sync has not already written — at most one sync
+/// interval of records — and it is paid once per finalisation, not per record.
+fn finalise_segment(
+    current: &mut Option<BufWriter<File>>,
+    flush_stage: &'static str,
+    fsync_stage: &'static str,
+) {
     let Some(mut w) = current.take() else {
         return;
     };
     if let Err(err) = w.flush() {
-        report_io_error(stage, &err);
+        report_io_error(flush_stage, &err);
         // A failed flush means the bytes are not in the kernel either, so
         // syncing would force an incomplete segment and report success.
         return;
@@ -1472,15 +1497,17 @@ fn flush_on_exit(current: &mut Option<BufWriter<File>>, stage: &'static str) {
         Err(err) => {
             metrics::counter!("tv_wal_fsync_errors_total").increment(1);
             // Same reasoning as the periodic arm, with a sharper consequence:
-            // this is the LAST sync of the process, so a failure here means a
-            // clean shutdown did not, after all, put the final records beyond
-            // a power cut.
+            // NOTHING will sync this segment again. At shutdown it is the
+            // process's last sync; at a rotation the periodic sync has already
+            // moved on to the new segment. Either way the tail stays in the
+            // page cache until the kernel gets round to it.
             warn!(
                 code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-                stage = "fsync_on_exit",
+                stage = fsync_stage,
                 error = %err,
-                "final WAL sync FAILED at shutdown — the last records are \
-                 flushed to the kernel but not forced to the device"
+                "WAL sync FAILED while finalising a segment — its last records \
+                 are flushed to the kernel but not forced to the device, and \
+                 nothing will sync this segment again"
             );
         }
     }
@@ -1551,7 +1578,7 @@ fn writer_loop(
                 // when nothing arrived. So a stop request that reaches here has
                 // a fully drained queue behind it and it is safe to close.
                 if stop.load(Ordering::Acquire) {
-                    flush_on_exit(&mut current, "flush_on_stop");
+                    finalise_segment(&mut current, "flush_on_stop", "fsync_on_stop");
                     info!("ws-frame-spill-writer stop requested and queue drained; exiting");
                     // The writer is gone: its last segment is closed and replayable again.
                     clear_open_segment_under(wal_dir);
@@ -1572,7 +1599,7 @@ fn writer_loop(
                 // exactly the number it lost. The sibling flush thirty lines
                 // below has always called `report_io_error` -- this arm and
                 // the rotation arm were the two that did not.
-                flush_on_exit(&mut current, "flush_on_close");
+                finalise_segment(&mut current, "flush_on_close", "fsync_on_close");
                 info!("ws-frame-spill-writer channel closed; exiting");
                 clear_open_segment_under(wal_dir);
                 return Ok(());
@@ -1646,14 +1673,15 @@ fn writer_loop(
         }
 
         if bytes_written >= WAL_SEGMENT_MAX_BYTES {
-            if let Some(mut w) = current.take() {
-                // Same repair as the close arm above: a failed rotation flush
-                // silently lost the tail of the segment it was closing, while
-                // `persisted` had already counted every record in it.
-                if let Err(err) = w.flush() {
-                    report_io_error("flush_on_rotate", &err);
-                }
-            }
+            // FLUSH **AND SYNC**. A rotation finalises this segment: nothing
+            // writes to it again, and `maybe_sync_segment` only ever syncs
+            // `current`, which one line below becomes the NEW file. Flushing
+            // alone therefore left every 128 MiB segment's tail in the page
+            // cache with no later sync to force it down, while `persisted`
+            // had already counted every record in it. This is the same
+            // finalisation the stop and close arms perform, and it is by far
+            // the most frequent of the three.
+            finalise_segment(&mut current, "flush_on_rotate", "fsync_on_rotate");
             current = open_segment_resilient(wal_dir);
             bytes_written = 0;
         }
@@ -4574,7 +4602,15 @@ mod tests {
         // Either direction of drift now fails: adding a sync without
         // correcting the note, or restoring the claim without the sync.
         let src = include_str!("ws_frame_spill.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
+        // A COLUMN-0 marker, not the bare attribute (corrected 2026-09-06).
+        // `src.split("#[cfg(test)]")` truncates at the FIRST occurrence, and
+        // the first one in this file is an INDENTED attribute at ~line 1000 —
+        // so "production" was the first thousand lines of a ~1,780-line
+        // production section, and everything from `finalise_segment` to the
+        // writer loop was outside the scan entirely. A guard whose whole job
+        // is keeping the durability words honest was reading less than
+        // two-thirds of the code it vouched for.
+        let test_marker = concat!("\n#[cfg(", "test)]\n");
         let production = src.split(test_marker).next().unwrap_or(src);
 
         let syncs = production.matches(concat!("sync_", "all")).count()
@@ -4639,6 +4675,108 @@ mod tests {
                 "the header must still name the case the sync exists for"
             );
         }
+    }
+
+    /// Every segment finalisation flushes AND syncs — including the rotation.
+    ///
+    /// Durability is invisible to a unit test (the guard above says so: a
+    /// flushed record and a synced record are byte-identical until the machine
+    /// loses power), so this pins the CALL. `wal_sync_is_rate_limited_and_disableable`
+    /// pins that the call does something.
+    ///
+    /// The rotation arm is the one that matters and the one that was wrong.
+    /// `maybe_sync_segment` syncs `current` and only `current`; a rotation
+    /// makes the NEW file `current` in the very next statement, so a segment
+    /// that leaves this arm unsynced is never synced by anything, ever. Its
+    /// tail sits in the page cache under the kernel's ~30 s writeback policy
+    /// while `persisted` has already counted every record in it — and at
+    /// 128 MiB a session rotates many times, so this was the most frequent of
+    /// the three finalisations and the only one that did not sync.
+    #[test]
+    fn every_segment_finalisation_syncs_including_the_rotation() {
+        let src = include_str!("ws_frame_spill.rs");
+        // A COLUMN-0 marker, not the bare attribute (corrected 2026-09-06).
+        // `src.split("#[cfg(test)]")` truncates at the FIRST occurrence, and
+        // the first one in this file is an INDENTED attribute at ~line 1000 —
+        // so "production" was the first thousand lines of a ~1,780-line
+        // production section, and everything from `finalise_segment` to the
+        // writer loop was outside the scan entirely. A guard whose whole job
+        // is keeping the durability words honest was reading less than
+        // two-thirds of the code it vouched for.
+        let test_marker = concat!("\n#[cfg(", "test)]\n");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        // All three finalisations go through the ONE helper. Naming them
+        // individually is what keeps a future fourth arm from quietly
+        // hand-rolling a flush: the count below has to move with it.
+        for stage in ["flush_on_stop", "flush_on_close", "flush_on_rotate"] {
+            let call = format!("finalise_segment(&mut current, \"{stage}\"");
+            assert!(
+                production.contains(&call),
+                "the `{stage}` arm must finalise through `finalise_segment` \
+                 (flush THEN sync). A bare `w.flush()` here leaves the segment's \
+                 tail in the page cache with nothing to sync it later, while \
+                 `persisted` has already counted every record in it."
+            );
+        }
+
+        // Non-vacuous in the other direction: the helper is the ONLY place a
+        // finalisation may flush, so a hand-rolled flush cannot creep back
+        // beside the call. `flush()` legitimately appears elsewhere in the
+        // module (the periodic path), so this counts the finalisation calls
+        // rather than banning the word.
+        assert_eq!(
+            production.matches("finalise_segment(&mut current").count(),
+            3,
+            "exactly three arms finalise a segment — stop, close, rotate. A \
+             fourth call site means a new finalisation nobody added to this \
+             test; a missing one means an arm went back to flushing alone."
+        );
+
+        // The helper must actually REACH the sync. The two are one edit apart,
+        // and the first version of this block asserted only that flush comes
+        // before sync in source order -- which a bare `return` slipped between
+        // them satisfies perfectly while leaving every finalisation flush-only.
+        // That mutation was planted and this test PASSED, so the check was
+        // rewritten to count the exits instead of the order.
+        let body = production
+            .split("fn finalise_segment(")
+            .nth(1)
+            .expect("finalise_segment must exist");
+        let flush_at = body.find("w.flush()").expect("it must flush");
+        let sync_at = body
+            .find(concat!("sync_", "all"))
+            .expect("it must sync, or the rotation fix is undone");
+        assert!(
+            flush_at < sync_at,
+            "flush must precede sync — syncing an unflushed buffer forces an \
+             incomplete segment and reports success"
+        );
+
+        // Exactly TWO early exits may stand between the flush and the sync,
+        // and both are named here so a third cannot arrive unnoticed:
+        //
+        //   1. the flush FAILED — the bytes never reached the kernel, so
+        //      syncing would force an incomplete segment and report success;
+        //   2. `resolve_wal_fsync_interval()` is None — the operator disabled
+        //      syncing, which is a documented knob.
+        //
+        // Anything else between them makes the sync unreachable for some or
+        // all callers, and the assertions above would still be green.
+        let window = &body[flush_at..sync_at];
+        assert!(
+            window.contains("resolve_wal_fsync_interval"),
+            "exit 2 must be the fsync-disabled knob; if it is gone, the count \
+             below is measuring something else"
+        );
+        assert_eq!(
+            window.matches("return;").count(),
+            2,
+            "exactly two early exits may sit between the flush and the sync — \
+             the failed flush and the disabled-fsync knob. A third makes the \
+             sync unreachable, which no source-order check can see: every other \
+             assertion in this test stays green while nothing is ever synced."
+        );
     }
 
     /// The sync is real, reachable, and rate-limited — proven by behaviour,
