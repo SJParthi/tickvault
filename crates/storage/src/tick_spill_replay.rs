@@ -384,11 +384,11 @@ fn dir_label(dir: &Path) -> &'static str {
 ///
 /// O(bytes in the chunk), one pass, no per-line allocation. This is the cold
 /// replay path — boot and a periodic drain — never the frame drain.
-fn retain_lines_in_open_window(chunk: &[u8]) -> (Vec<u8>, u64) {
+fn retain_lines_in_open_window(chunk: &[u8], is_arrival_clock: bool) -> (Vec<u8>, u64) {
     let mut kept = Vec::with_capacity(chunk.len());
     let mut dropped: u64 = 0;
     for line in chunk.split_inclusive(|b| *b == b'\n') {
-        if line_is_positively_out_of_window(line) {
+        if line_is_positively_out_of_window(line, is_arrival_clock) {
             dropped = dropped.saturating_add(1);
         } else {
             kept.extend_from_slice(line);
@@ -419,7 +419,7 @@ fn retain_lines_in_open_window(chunk: &[u8]) -> (Vec<u8>, u64) {
 /// (`MIN_PLAUSIBLE_EXCHANGE_TS_SECS` ..= `MAX_PLAUSIBLE_EXCHANGE_TS_SECS`), so
 /// there is ONE definition of "this integer is a real market timestamp" in the
 /// workspace rather than a second one invented here.
-fn line_is_positively_out_of_window(line: &[u8]) -> bool {
+fn line_is_positively_out_of_window(line: &[u8], is_arrival_clock: bool) -> bool {
     let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
     let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
     if trimmed.is_empty() {
@@ -441,7 +441,25 @@ fn line_is_positively_out_of_window(line: &[u8]) -> bool {
     if !nanos_are_a_plausible_epoch(nanos) {
         return false;
     }
-    !tickvault_common::session_window::row_is_in_an_open_window(nanos)
+    // CLOCK CHOICE -- load-bearing, added 2026-09-06.
+    //
+    // The depth spill carries ARRIVAL stamps: `market_depth` has no exchange
+    // timestamp, so `DepthWriter` appends the receipt instant and gates it with
+    // `arrival_row_is_in_an_open_window` (a bounded ARRIVAL_GRACE_TAIL_SECS tail
+    // past the close, for the vendor lag measured at p99 46.4s / max 198.7s).
+    // The tick spill carries EXCHANGE stamps and gets the strict form.
+    //
+    // Judging BOTH with the strict form -- which this function did until today --
+    // deletes exactly the rows the writer was just taught to accept: a depth book
+    // delivered 15:40:00-15:43:59 IST is written, fails its ILP flush, is rescued
+    // to the depth spill, and is then DELETED on replay. The file is truncated
+    // either way, so those bytes are gone permanently. That is the same defect
+    // the writer fix closed, surviving one tier down in the rescue path.
+    if is_arrival_clock {
+        !tickvault_common::session_window::arrival_row_is_in_an_open_window(nanos)
+    } else {
+        !tickvault_common::session_window::row_is_in_an_open_window(nanos)
+    }
 }
 
 /// True when `nanos` is large enough to be a real market timestamp rather than
@@ -643,7 +661,13 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 // still advance it or the round would re-read the same bytes
                 // forever and never converge.
                 let len = raw.len() as u64;
-                let (chunk, refused_lines) = retain_lines_in_open_window(raw);
+                // The depth spill is ARRIVAL-clocked (see the CLOCK CHOICE note in
+                // `line_is_positively_out_of_window`); every other spill dir is
+                // exchange-clocked. Deciding it HERE, from the dir being drained,
+                // is what keeps replay in agreement with the writer that spilled it.
+                let is_arrival_clock = dir_label(dir)
+                    == dir_label(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR));
+                let (chunk, refused_lines) = retain_lines_in_open_window(raw, is_arrival_clock);
                 refused_bytes =
                     refused_bytes.saturating_add(len.saturating_sub(chunk.len() as u64));
                 if refused_lines > 0 {
@@ -660,7 +684,9 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                          OUTSIDE every open window. These are rows a pre-gate binary spilled; \
                          the gate now lives in the writers, so anything spilled after \
                          2026-09-05 is already in window. The refusal is deliberate and is NOT \
-                         tick loss: the row would have been refused at the writer too. Note \
+                         tick loss: the row would have been refused at the writer too -- \
+                         judged on the SAME clock the writer used, arrival for the depth \
+                         spill and exchange for the rest. Note \
                          the file is still DRAINED -- a fully-refused closed file is truncated \
                          like any other, because leaving it would re-refuse the same bytes \
                          every round forever. A torn or unparseable stamp is never judged; it \
@@ -1168,7 +1194,7 @@ mod tests {
         chunk.push_str(&tick_line(12 * 3600)); // 12:00 — keep
         chunk.push_str(&tick_line(22 * 3600)); // 22:00 — refuse
         chunk.push_str(&tick_line(9 * 3600)); //  09:00 — keep, boundary
-        let (kept, dropped) = retain_lines_in_open_window(chunk.as_bytes());
+        let (kept, dropped) = retain_lines_in_open_window(chunk.as_bytes(), false);
 
         assert_eq!(dropped, 1, "exactly the 22:00 line is refused");
         let kept = String::from_utf8(kept).expect("utf8");
@@ -1185,7 +1211,7 @@ mod tests {
         // Dropping it would destroy a row on the strength of not understanding
         // it, which is the one error this filter must never make.
         let chunk = b"ticks,segment=NSE_EQ,feed=dhan ltp=100.5,volume=10i\n";
-        let (kept, dropped) = retain_lines_in_open_window(chunk);
+        let (kept, dropped) = retain_lines_in_open_window(chunk, false);
         assert_eq!(dropped, 0);
         assert_eq!(kept, chunk, "kept byte-for-byte");
     }
@@ -1203,7 +1229,7 @@ mod tests {
             &b"ticks,segment=NSE_EQ ltp=1.0 17160237"[..], // torn tail, no newline
             &[0xff, 0xfe, b' ', b'1', b'2', b'3', b'\n'][..], // invalid utf8
         ] {
-            let (kept, dropped) = retain_lines_in_open_window(raw);
+            let (kept, dropped) = retain_lines_in_open_window(raw, false);
             assert_eq!(dropped, 0, "must keep: {raw:?}");
             assert_eq!(kept, raw, "must keep byte-for-byte: {raw:?}");
         }
@@ -1217,7 +1243,7 @@ mod tests {
             "ticks,segment=NSE_EQ,feed=dhan ltp=1.0 {}",
             ist_at(23 * 3600)
         );
-        let (kept, dropped) = retain_lines_in_open_window(line.as_bytes());
+        let (kept, dropped) = retain_lines_in_open_window(line.as_bytes(), false);
         assert_eq!(dropped, 1);
         assert!(kept.is_empty());
     }
@@ -1232,7 +1258,7 @@ mod tests {
         // its timestamp short.
         let torn = b"ticks,segment=NSE_EQ ltp=1.0 17160237\n";
         assert!(
-            !line_is_positively_out_of_window(torn),
+            !line_is_positively_out_of_window(torn, false),
             "a torn timestamp must never be judged"
         );
 
@@ -1240,7 +1266,7 @@ mod tests {
         // guard above is not simply disabling the gate.
         let complete = format!("ticks,segment=NSE_EQ ltp=1.0 {}\n", ist_at(23 * 3600));
         assert!(
-            line_is_positively_out_of_window(complete.as_bytes()),
+            line_is_positively_out_of_window(complete.as_bytes(), false),
             "a complete out-of-window stamp must still be refused"
         );
     }
@@ -1276,7 +1302,7 @@ mod tests {
             "ticks,segment=NSE_FNO,feed=dhan  ltp=1.0,x=\"a b\" {}\r\n",
             ist_at(11 * 3600)
         );
-        let (kept, dropped) = retain_lines_in_open_window(odd.as_bytes());
+        let (kept, dropped) = retain_lines_in_open_window(odd.as_bytes(), false);
         assert_eq!(dropped, 0);
         assert_eq!(kept, odd.as_bytes(), "surviving lines are copied verbatim");
     }
@@ -2091,5 +2117,65 @@ mod tests {
              being refused and the round stopped there every time"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The depth spill is ARRIVAL-clocked, so replay must judge it on the same
+    /// clock the depth WRITER used — otherwise replay deletes precisely the rows
+    /// the writer was just taught to keep.
+    ///
+    /// 15:41 IST is past the 15:39:59 window end but inside
+    /// `ARRIVAL_GRACE_TAIL_SECS`. `DepthWriter` accepts such a book (the vendor's
+    /// measured lag is p99 46.4 s, max 198.7 s). Before this fix, replay judged it
+    /// on the exchange clock and DELETED it — and because a fully-refused file is
+    /// truncated like any other, those bytes were gone permanently.
+    ///
+    /// Bite-proof in both directions: the first assert fails if the depth arm is
+    /// reverted to the strict clock; the second fails if the grace is wrongly
+    /// applied to exchange-clocked spills, which would admit genuinely late ticks.
+    #[test]
+    fn a_late_depth_spill_line_survives_replay_but_the_same_tick_line_does_not() {
+        let late = 15 * 3600 + 41 * 60; // 15:41 IST — inside the arrival grace
+        let chunk = tick_line(late);
+
+        let (kept_depth, dropped_depth) =
+            retain_lines_in_open_window(chunk.as_bytes(), /* is_arrival_clock */ true);
+        assert_eq!(
+            dropped_depth, 0,
+            "a 15:41 ARRIVAL-clocked row is inside the grace the depth writer \
+             accepts; replay must not delete it (the file is truncated either \
+             way, so a refusal here is permanent loss)"
+        );
+        assert_eq!(
+            String::from_utf8(kept_depth).expect("utf8").lines().count(),
+            1
+        );
+
+        let (kept_tick, dropped_tick) =
+            retain_lines_in_open_window(chunk.as_bytes(), /* is_arrival_clock */ false);
+        assert_eq!(
+            dropped_tick, 1,
+            "the SAME stamp on an EXCHANGE-clocked spill is genuinely out of \
+             window — the grace must not leak onto the tick path"
+        );
+        assert!(kept_tick.is_empty());
+    }
+
+    /// The clock is chosen from the directory being drained, so the depth dir
+    /// must be the one that maps to the arrival clock. Pins the mapping itself,
+    /// not just the predicate: a rename of `DEPTH_SPILL_DIR` that missed the
+    /// replay call site would otherwise silently restore the loss.
+    #[test]
+    fn the_depth_spill_dir_is_the_one_that_selects_the_arrival_clock() {
+        use std::path::Path;
+        let depth = dir_label(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR));
+        let tick = dir_label(Path::new(crate::tick_persistence::TICK_SPILL_DIR));
+        assert_ne!(
+            depth, tick,
+            "the two spill dirs must be distinguishable, or replay cannot pick a clock"
+        );
+        assert_eq!(
+            depth, "depth",
+            "the replay call site compares against this label"
+        );
     }
 }

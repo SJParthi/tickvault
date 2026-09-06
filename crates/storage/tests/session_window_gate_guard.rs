@@ -212,6 +212,84 @@ fn the_refusal_counter_is_seeded_for_every_reason_label() {
 // DEPTH
 // ---------------------------------------------------------------------------
 
+/// True when any line of `body` DECLARES a `static` item.
+///
+/// Not a substring search for `"static "`: Rust spells the `'static` lifetime
+/// with the same six letters, and both of the bodies this file inspects
+/// mention `&'static str` in their own signatures. The first version of this
+/// check failed on that prose while the code was correct -- a guard whose
+/// first act is a false positive is a guard someone deletes.
+fn declares_a_static(body: &str) -> bool {
+    body.lines()
+        .any(|l| l.trim_start().starts_with("static ") || l.trim_start().starts_with("static\n"))
+}
+
+/// The refusal log throttle must be per-reason and per-writer, never a
+/// process-wide `static`.
+///
+/// This is a SOURCE assertion because the shape is what matters, and the shape
+/// is what regressed. Until 2026-09-06 `note` held one `static SEEN` shared by
+/// every call site in the process -- two on the tick writer, three on the depth
+/// writer. Depth carries a MEASURED 24x the tick row volume and refuses EVERY
+/// row outside 09:00-15:39:59 IST, so an ordinary pre-open depth burst drove
+/// the shared counter past 2^18 within minutes and the next permitted log sat
+/// at 2^19. A rare tick refusal arriving after it -- `ts_out_of_plausible_band`,
+/// the corrupt-frame signal, whose ONLY production surface is this log because
+/// the counter reaches no EMF selector and no alarm -- then waited ~260,000
+/// events for permission to speak.
+///
+/// A common benign event starving the rare real one is the throttle failing in
+/// the direction a throttle exists to prevent.
+#[test]
+fn the_refusal_log_throttle_is_not_a_process_wide_static() {
+    let src = tick_persistence_src();
+
+    let at = src
+        .find("fn throttle_tick(&self, idx: usize) -> Option<u64>")
+        .expect(
+            "OutOfWindowCounters::throttle_tick is gone. It is the throttle \
+             DECISION, and the unit tests assert on it directly -- deleting it \
+             leaves them asserting on a field a refactor can turn into an \
+             unread mirror.",
+        );
+    // Bounded at the function's own closing brace, not a fixed character
+    // count. A 400-char window overran into the doc comment on `note`, whose
+    // phrase `&'static str` contains the literal this test searches for -- so
+    // the guard failed on prose while the code was correct.
+    let end = src[at..].find("\n    }\n").map_or(src.len(), |o| at + o);
+    let body = &src[at..end];
+    assert!(
+        body.contains("self.seen[idx]"),
+        "throttle_tick no longer reads the PER-WRITER, PER-REASON state. \
+         Anything else -- a static, a shared slot, a single index -- lets one \
+         writer's volume decide when another writer may log."
+    );
+    assert!(
+        !declares_a_static(body),
+        "throttle_tick declares a `static`. That is the exact regression: \
+         process-wide throttle state, silenced by whichever writer is loudest."
+    );
+
+    // And `note` must route through it rather than growing a second, private
+    // throttle beside the first.
+    let note_at = src
+        .find("pub(crate) fn note(&self, reason: &'static str) {")
+        .expect("OutOfWindowCounters::note is gone");
+    let note_end = src[note_at..]
+        .find("\n    }\n")
+        .map_or(src.len(), |o| note_at + o);
+    let note_body = &src[note_at..note_end];
+    assert!(
+        note_body.contains("self.throttle_tick(idx)"),
+        "note no longer routes through throttle_tick, so the unit tests pin a \
+         function production does not call."
+    );
+    assert!(
+        !declares_a_static(note_body),
+        "note declares a `static` again -- the shared throttle is back."
+    );
+}
+
 fn depth_persistence_src() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/depth_persistence.rs");
     let raw = std::fs::read_to_string(&path)
@@ -236,12 +314,22 @@ fn the_session_window_gate_is_wired_into_the_depth_write_path() {
     let src = depth_persistence_src();
     let body = depth_append_body(&src);
 
+    // QUALIFIED with `session_window::` deliberately, 2026-09-06. The bare
+    // string "row_is_in_an_open_window" is a SUBSTRING of
+    // "arrival_row_is_in_an_open_window", so it matched BOTH forms and this
+    // assertion could not tell the two clocks apart in either direction -- an
+    // adversarial sweep bite-proved that the candle writer could be swapped to
+    // the graced form with all 13 guard tests still green. The qualified form
+    // cannot match the arrival name, because `session_window::arrival_row_...`
+    // does not contain `session_window::row_...`.
     assert!(
-        body.contains("row_is_in_an_open_window"),
-        "the session-window gate is GONE from `DepthWriter::append_row`. Depth \
-         is 24x the tick row volume -- the largest payload in the process -- so \
-         an ungated depth writer defeats the operator's window rule at the one \
-         table where it costs the most disk."
+        body.contains("session_window::arrival_row_is_in_an_open_window"),
+        "`DepthWriter::append_row` no longer gates on the ARRIVAL clock. Depth
+         has no exchange timestamp -- its ILP stamp IS the receipt instant -- so
+         the strict form refuses books the vendor merely delivered late (measured
+         p99 46.4s, max 198.7s) and the refusal is permanent. Depth is also 24x
+         the tick row volume, so an ungated writer defeats the window rule at the
+         one table where it costs the most disk."
     );
     assert!(
         body.contains("out_of_window.note("),
@@ -351,9 +439,20 @@ fn the_session_window_gate_is_wired_into_the_candle_write_path() {
         .expect("ShadowCandleWriter::append_row is gone");
     let body = &src[start..(start + 3000).min(src.len())];
 
+    // QUALIFIED, and the arrival form is BANNED here — see the note on the
+    // depth guard above. Candles carry an EXCHANGE bucket, not a receipt, so
+    // admitting the arrival grace would let post-close events into candles and
+    // breach the 2026-08-25/26 pre-open rule in websocket-connection-scope-lock.
     assert!(
-        body.contains("row_is_in_an_open_window"),
+        body.contains("session_window::row_is_in_an_open_window"),
         "the session-window gate is GONE from the candle write path."
+    );
+    assert!(
+        !body.contains("session_window::arrival_row_is_in_an_open_window"),
+        "the candle write path is using the ARRIVAL-graced predicate. Candles are
+         bucketed on the EXCHANGE clock, so the grace has no meaning here and
+         would admit post-close events into candles — the exact leak the
+         2026-08-25 and 2026-08-26 rulings forbid."
     );
     // EVERY refusal arm returns Ok, not just one -- the same hardening the
     // DEPTH guard above already carries, applied here 2026-09-06 after an
@@ -482,17 +581,30 @@ fn the_session_window_gate_is_wired_into_the_spill_replay_path() {
     let production = &src[loop_at..tests_at];
 
     assert!(
-        production.contains("retain_lines_in_open_window(raw)"),
+        production.contains("retain_lines_in_open_window(raw, is_arrival_clock)"),
         "replay_spill_dir no longer filters each chunk through \
          retain_lines_in_open_window. Every unit test in that module calls the \
          filter directly and would still pass -- this assertion is the only \
          thing standing between a deleted call and an ungated write path."
     );
 
+    // And the clock must be CHOSEN FROM THE DIRECTORY. A `bool` parameter that
+    // is always `false` would satisfy the call-shape assertion above while
+    // restoring the exact loss it was added to close: the depth spill judged on
+    // the exchange clock deletes books the depth WRITER accepted, and a
+    // fully-refused file is truncated, so those bytes are gone for good.
+    assert!(
+        production.contains("DEPTH_SPILL_DIR"),
+        "replay_spill_dir no longer derives the clock from the directory being
+         drained. The depth spill is ARRIVAL-clocked and every other spill dir is
+         exchange-clocked; without this the two disagree and replay silently
+         deletes late depth rows the writer deliberately kept."
+    );
+
     // And it must gate what is SENT, not merely compute a number. A call whose
     // result is dropped is the same defect wearing a function call.
     let call_at = production
-        .find("retain_lines_in_open_window(raw)")
+        .find("retain_lines_in_open_window(raw, is_arrival_clock)")
         .expect("checked above");
     let after = &production[call_at..];
     let post_at = after

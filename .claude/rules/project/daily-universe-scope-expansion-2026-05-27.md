@@ -2320,3 +2320,27 @@ Monday headroom, nothing more).
 | Box | stopped 22:35 UTC by the executor; `tickvault.service` left ENABLED so the Monday 08:30 IST start boots the app normally |
 
 **What Monday still needs, unchanged:** the replay-watermark code fix (a restart must not replay already-applied segments — the 25–75 GB per restart cost measured on 2026-09-03), a no-in-session-deploy rule, and the depth write-volume decision. None of those shipped tonight; the wipe buys Monday, not the week.
+
+---
+
+## ⚠ CORRECTED 2026-09-06 — the ten `EXECUTION_FAILURE` / `AccessDenied` flags in this file are STALE
+
+Quotes 13, 17, 18, 19 and the §7 ruling annotations each record that both
+automatic `STOP_EC2_INSTANCES` budget actions were last seen in
+`EXECUTION_FAILURE`, that `budgets:DescribeBudgetActionsForBudget` returns
+`AccessDeniedException` for `user/claude-code-agent`, and that whether the kill
+switch fires is therefore **Unknown**.
+
+**Read live 2026-09-06: the read SUCCEEDS, and both actions are `STANDBY` —
+armed and healthy — targeting the live box `i-0c3fe906dad5492fc`.** The switch
+fires at the 90% line ($135.00 against the $150 limit).
+
+That inverts the risk these sections describe. Every one of them reasons from
+"the switch may not throw", which is reassuring; the truth is that it throws, and
+the live September forecast is **$142.24** — over the line by $7.24.
+
+The full record, including the measured cost breakdown showing that **EBS at
+$88.92/mo (rate-derived; 45% of the entire six-day bill) is the driver
+and the Elastic IP at $3.60/mo is not**, is in
+below are retained verbatim per house convention; where they conflict with this
+banner, the banner wins.
