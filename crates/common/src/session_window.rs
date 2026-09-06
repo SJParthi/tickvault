@@ -35,8 +35,9 @@
 //! allocation, no lookup, no branch on instrument. Safe on the hot path.
 
 use crate::constants::{
-    MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    ARRIVAL_GRACE_TAIL_SECS, MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 
 /// Nanoseconds in one second. Local rather than imported: `constants.rs` has no
@@ -205,6 +206,73 @@ pub fn nanos_in_any_open_window(ist_nanos: i64, muhurat_active: bool) -> bool {
 #[must_use]
 pub fn row_is_in_an_open_window(ist_nanos: i64) -> bool {
     nanos_in_any_open_window(ist_nanos, crate::muhurat::current())
+}
+
+/// True when an ARRIVAL-clocked stamp falls inside an open window, allowing a
+/// bounded [`ARRIVAL_GRACE_TAIL_SECS`] tail past the window's end.
+///
+/// # Why a second predicate rather than widening the first
+///
+/// The two are asking different questions and must keep different answers.
+///
+/// [`nanos_in_any_open_window`] asks *"did this EVENT happen inside the
+/// session?"* — the operator's 2026-09-05 rule, and it is exactly right for a
+/// tick carrying a real exchange timestamp. Widening it would admit trades the
+/// exchange itself stamped after the close.
+///
+/// This one asks *"did this row REACH US near enough to the session that the
+/// thing it describes was inside it?"* — the only question available for a row
+/// whose single clock is the receipt. `market_depth` is that row: its
+/// designated `ts` IS the arrival instant, because the depth protocol carries
+/// no exchange timestamp field at all.
+///
+/// Without this, a depth snapshot of the 15:39 book that the vendor delivered
+/// at 15:40:05 was refused — silently and permanently, because the depth writer
+/// returns `Ok(())` on a window refusal (deliberately, so a refused pre-open
+/// frame is not re-offered forever) and therefore never marks the frame
+/// unapplied. At this repository's measured p99 delivery lag of 46.37 s that
+/// discards the tail of every session for the slowest 1% of depth frames; at
+/// the measured max of 198.69 s, the last ~3.3 minutes.
+///
+/// # What it still refuses, which is the half that matters
+///
+/// The START is NOT graced. A frame arriving at 08:58 is genuinely pre-open —
+/// delivery lag makes a row LATE, never EARLY, so a grace at the front would
+/// only admit pre-open noise.
+///
+/// An evening restart at 18:00 is 2h20m past the graced end and is refused
+/// exactly as before. The const-asserts in `constants.rs` pin that the tail can
+/// never reach the Muhurat window's 18:00 start.
+///
+/// # Complexity
+///
+/// O(1) time, O(1) space — one division, two comparisons per window, no
+/// allocation. Same envelope as [`nanos_in_any_open_window`]; safe on the hot
+/// path and covered by the depth append DHAT gate.
+#[must_use]
+pub fn nanos_in_any_open_window_with_arrival_grace(ist_nanos: i64, muhurat_active: bool) -> bool {
+    let Some(s) = secs_of_day(ist_nanos) else {
+        return false;
+    };
+    let grace = i64::from(ARRIVAL_GRACE_TAIL_SECS);
+    let in_regular = s >= i64::from(TICK_PERSIST_START_SECS_OF_DAY_IST)
+        && s < i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST) + grace;
+    let in_muhurat = muhurat_active
+        && s >= i64::from(MUHURAT_PERSIST_START_SECS_OF_DAY_IST)
+        && s < i64::from(MUHURAT_PERSIST_END_SECS_OF_DAY_IST) + grace;
+    in_regular || in_muhurat
+}
+
+/// The window predicate an ARRIVAL-CLOCKED writer should call — the graced form
+/// of [`row_is_in_an_open_window`], reading the boot-installed Muhurat flag.
+///
+/// `market_depth` is the caller today. A future writer whose only timestamp is
+/// a receipt should call THIS one; a writer with a real exchange stamp must
+/// keep calling [`row_is_in_an_open_window`], because grace on an event clock
+/// admits genuinely out-of-session events.
+#[must_use]
+pub fn arrival_row_is_in_an_open_window(ist_nanos: i64) -> bool {
+    nanos_in_any_open_window_with_arrival_grace(ist_nanos, crate::muhurat::current())
 }
 /// The window verdict for a row carrying a designated timestamp and an
 /// OPTIONAL receipt timestamp, both IST epoch nanoseconds.
@@ -551,6 +619,143 @@ mod tests {
                 !narrow || wide,
                 "seconds-of-day {s} was accepted on an ordinary day and REFUSED on a Muhurat day"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ARRIVAL GRACE TAIL
+    // -----------------------------------------------------------------------
+
+    /// Shorthand: the graced predicate on an ordinary (non-Muhurat) day.
+    fn arrival(secs_of_day: i64) -> bool {
+        nanos_in_any_open_window_with_arrival_grace(at(secs_of_day), false)
+    }
+
+    #[test]
+    fn arrival_grace_accepts_the_tail_and_stops_at_its_end() {
+        let end = i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let grace = i64::from(ARRIVAL_GRACE_TAIL_SECS);
+
+        // The instant the ungraced window closes -- the one this whole change
+        // exists for. A depth snapshot of the 15:39 book delivered at 15:40:00.
+        assert!(
+            arrival(end),
+            "15:40:00 exactly must be admitted for an arrival-clocked row: it \
+             is the first instant the old gate refused, and the vendor's \
+             measured p99 lag alone puts real 15:39 book state here"
+        );
+        // Past the measured worst-case Dhan lag of 198.69 s, still inside.
+        assert!(
+            arrival(end + 199),
+            "the measured 198.69 s worst-case delivery lag must be inside the \
+             grace, or the grace does not cover the case it was sized for"
+        );
+        // The last graced instant.
+        assert!(
+            arrival(end + grace - 1),
+            "the final graced second must be in"
+        );
+        // And the first instant past it, which must close.
+        assert!(
+            !arrival(end + grace),
+            "the grace END is EXCLUSIVE. An open-ended tail is not a grace, it \
+             is the absence of a window"
+        );
+    }
+
+    #[test]
+    fn arrival_grace_never_admits_an_evening_restart() {
+        // The junk class the window exists to exclude, and the reason the tail
+        // is 240s rather than a comfortable round hour.
+        for s in [
+            16 * 3600,           // 16:00, an after-close deploy
+            17 * 3600 + 30 * 60, // 17:30, the scheduled box stop
+            18 * 3600,           // 18:00, a restart -- and the Muhurat start
+            23 * 3600,           // 23:00, an overnight batch
+        ] {
+            assert!(
+                !arrival(s),
+                "seconds-of-day {s} is hours outside the session and must be \
+                 refused even with the arrival grace"
+            );
+        }
+    }
+
+    #[test]
+    fn arrival_grace_is_never_applied_to_the_window_start() {
+        // Delivery lag makes a row LATE, never EARLY. A grace at the front
+        // would admit pre-open noise while fixing nothing.
+        let start = i64::from(TICK_PERSIST_START_SECS_OF_DAY_IST);
+        assert!(
+            !arrival(start - 1),
+            "08:59:59 is pre-open and must stay out"
+        );
+        assert!(
+            !arrival(start - i64::from(ARRIVAL_GRACE_TAIL_SECS)),
+            "the grace must not be mirrored onto the window start"
+        );
+        assert!(
+            arrival(start),
+            "09:00:00 itself is in window, graced or not"
+        );
+    }
+
+    #[test]
+    fn arrival_grace_does_not_widen_the_event_clock_path() {
+        // The load-bearing separation. `nanos_in_any_open_window` answers the
+        // operator's 2026-09-05 rule about the EVENT clock and must be
+        // completely unaffected: a trade the exchange stamped at 15:41 is still
+        // out of session, however fast it reached us.
+        let end = i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        for offset in [0, 60, 199, i64::from(ARRIVAL_GRACE_TAIL_SECS) - 1] {
+            assert!(
+                !nanos_in_any_open_window(at(end + offset), false),
+                "the ungraced predicate accepted {offset}s past the close -- \
+                 the grace has leaked onto the event clock, which admits \
+                 genuinely out-of-session trades"
+            );
+        }
+    }
+
+    #[test]
+    fn arrival_grace_widens_the_muhurat_window_too_and_only_when_active() {
+        let m_end = i64::from(MUHURAT_PERSIST_END_SECS_OF_DAY_IST);
+        assert!(
+            nanos_in_any_open_window_with_arrival_grace(at(m_end), true),
+            "a Muhurat depth frame is arrival-clocked exactly like a regular \
+             one, so the ceremonial session's close needs the same grace"
+        );
+        assert!(
+            !nanos_in_any_open_window_with_arrival_grace(at(m_end), false),
+            "the Muhurat tail must not open on an ordinary day"
+        );
+    }
+
+    #[test]
+    fn arrival_grace_still_refuses_a_negative_stamp() {
+        // A pre-1970 clock or a corrupt widening. `secs_of_day` rejects it
+        // before any arithmetic, and the grace must not reopen that door.
+        assert!(!nanos_in_any_open_window_with_arrival_grace(-1, false));
+        assert!(!nanos_in_any_open_window_with_arrival_grace(i64::MIN, true));
+    }
+
+    #[test]
+    fn arrival_grace_is_a_strict_superset_of_the_ungraced_window() {
+        // Every instant the event-clock predicate accepts, the arrival one must
+        // accept too. A future rewrite that made the graced form a different
+        // range rather than a widened one would silently start refusing
+        // mid-session depth, which no counter would distinguish from a quiet
+        // market.
+        for s in (0..i64::from(SECONDS_PER_DAY)).step_by(37) {
+            for muhurat in [false, true] {
+                if nanos_in_any_open_window(at(s), muhurat) {
+                    assert!(
+                        nanos_in_any_open_window_with_arrival_grace(at(s), muhurat),
+                        "seconds-of-day {s} (muhurat={muhurat}) is accepted by \
+                         the event-clock window and refused by the arrival one"
+                    );
+                }
+            }
         }
     }
 }

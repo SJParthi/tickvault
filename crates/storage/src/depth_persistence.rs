@@ -1345,7 +1345,29 @@ impl DepthWriter {
                 self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[2]);
                 return Ok(());
             }
-            if !tickvault_common::session_window::row_is_in_an_open_window(row.ts_nanos) {
+            // ARRIVAL form, not the event form, and the difference is a real
+            // loss path rather than a naming preference.
+            //
+            // `row.ts_nanos` IS the instant this frame reached us -- the depth
+            // protocol carries no exchange timestamp at all, as the block above
+            // says. Judging it with `row_is_in_an_open_window` therefore asked
+            // "did the EVENT happen in session?" of a number that can only
+            // answer "when did the DELIVERY land?", and refused a snapshot of
+            // the 15:39 book that the vendor handed over at 15:40:05.
+            //
+            // That refusal was silent AND permanent: this arm returns `Ok(())`
+            // by design (so a pre-open frame is not re-offered forever), so it
+            // never marks the frame unapplied and no replay re-offers it. At
+            // the measured p99 Dhan lag of 46.37 s that discarded the tail of
+            // every session for the slowest 1% of depth frames; at the measured
+            // max of 198.69 s, the last ~3.3 minutes -- the closing-auction
+            // book, which is the part of the day this window exists to keep.
+            //
+            // `ARRIVAL_GRACE_TAIL_SECS` (240) clears that measured maximum. It
+            // graces the END only: a frame arriving at 08:58 is genuinely
+            // pre-open and is still refused, because delivery lag makes a row
+            // late, never early. An 18:00 restart is still refused by 2h20m.
+            if !tickvault_common::session_window::arrival_row_is_in_an_open_window(row.ts_nanos) {
                 self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[0]);
                 return Ok(());
             }
@@ -3774,6 +3796,63 @@ mod tests {
         assert_eq!(w.rescued, 0, "and it is not a rescue either");
     }
 
+    /// The closing-auction book, delivered late, is now KEPT.
+    ///
+    /// This is the regression this whole arrival-grace change exists for, and
+    /// it fails on the tree as it stood before: the gate asked
+    /// `row_is_in_an_open_window` of a number that is the ARRIVAL instant, so a
+    /// snapshot of the 15:39 book handed over at 15:40:05 was refused -- with
+    /// `Ok(())` returned and no `note_unapplied`, so no replay ever re-offered
+    /// it. At the measured p99 Dhan lag of 46.37 s that discarded the tail of
+    /// every session for the slowest 1% of depth frames.
+    #[test]
+    fn a_late_delivered_closing_book_is_written_not_silently_refused() {
+        let day = row().ts_nanos - (row().ts_nanos % 86_400_000_000_000);
+        let at = |secs: i64| day + secs * 1_000_000_000;
+        let end = i64::from(tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let grace = i64::from(tickvault_common::constants::ARRIVAL_GRACE_TAIL_SECS);
+
+        // 15:40:05 -- five seconds past the ungraced close, well inside the
+        // measured delivery lag, describing book state from before it.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.ts_nanos = at(end + 5);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(
+            w.pending, 1,
+            "a depth frame delivered 5s past the close must be WRITTEN: its \
+             one clock is the arrival instant, so refusing it discards real \
+             15:39 book state because the vendor was slow"
+        );
+
+        // The measured worst case, 198.69 s, rounded up.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        r.ts_nanos = at(end + 199);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(
+            w.pending, 1,
+            "the measured 198.69 s worst-case lag must be inside the grace"
+        );
+
+        // And the grace still CLOSES -- an open-ended tail is not a grace.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        r.ts_nanos = at(end + grace);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(
+            w.pending, 0,
+            "past the grace the row must still be refused, or the window has \
+             simply been removed for depth"
+        );
+
+        // The junk class the window exists for is untouched: an evening
+        // restart is hours out and must never be admitted.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        r.ts_nanos = at(18 * 3600);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(w.pending, 0, "an 18:00 restart must still be refused");
+        assert_eq!(w.dropped, 0, "and a refusal is still never a drop");
+    }
+
     /// The pre-TVW3 WAL sentinel: no receipt at all.
     ///
     /// `ws_frame_spill` maps an absent receipt to 0, and the depth row is then
@@ -3836,14 +3915,42 @@ mod tests {
     }
 
     /// The boundary the operator asked for, on the depth path specifically.
+    ///
+    /// ⚠ AMENDED 2026-09-06 — the 15:40:00 row moved from REFUSED to ACCEPTED,
+    /// and that is a deliberate behaviour change, not a relaxed assertion.
+    ///
+    /// The operator's 2026-09-05 rule binds the EVENT clock: a trade the
+    /// exchange stamped outside [09:00, 15:40) is out of session, and this test
+    /// pinned exactly that. But `market_depth` has no event clock — the depth
+    /// protocol carries no exchange timestamp, so `ts_nanos` IS the instant the
+    /// frame reached us. Judging it on 15:40:00 therefore refused a snapshot of
+    /// the 15:39 book because the VENDOR was slow, silently and permanently
+    /// (`Ok(())`, no `note_unapplied`, so no replay re-offers it). At this
+    /// repository's measured p99 Dhan lag of 46.37 s that discarded the tail of
+    /// every session for the slowest 1% of depth frames; at the measured max of
+    /// 198.69 s, the last ~3.3 minutes — the closing-auction book.
+    ///
+    /// So the boundary below is now the GRACED one, and the two rows that
+    /// matter are both still pinned: the grace CLOSES at
+    /// `ARRIVAL_GRACE_TAIL_SECS`, and the window START is not graced at all
+    /// (08:59:59 is still refused — delivery lag makes a row late, never
+    /// early). The ungraced event-clock boundary is unchanged and is pinned by
+    /// `session_window::tests::arrival_grace_does_not_widen_the_event_clock_path`.
     #[test]
     fn depth_accepts_the_last_in_window_instant_and_refuses_the_next() {
         let midnight = 1_699_920_000_i64;
+        let grace = i64::from(tickvault_common::constants::ARRIVAL_GRACE_TAIL_SECS);
         for (sod, want_pending, label) in [
             (32_400_i64, 1_usize, "09:00:00 accepted"),
             (56_399, 1, "15:39:59 accepted"),
-            (56_400, 0, "15:40:00 refused"),
-            (32_399, 0, "08:59:59 refused"),
+            (
+                56_400,
+                1,
+                "15:40:00 accepted — arrival-clocked, inside the grace",
+            ),
+            (56_400 + grace - 1, 1, "the last graced instant accepted"),
+            (56_400 + grace, 0, "one second past the grace refused"),
+            (32_399, 0, "08:59:59 refused — the START is never graced"),
         ] {
             let mut w = DepthWriter::for_test(Feed::Dhan);
             let mut r = row();
