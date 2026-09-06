@@ -23,7 +23,7 @@ and the replacement is both simpler and safer:
 |---|---|---|
 | per-tick work | 1 compare, or ~8 ops on a re-sift, plus a side index from instrument to slot | 1 map update |
 | poisoned by one bad value | **yes, permanently** — a garbage volume near `u32::MAX` pins the threshold and nothing can ever beat it again; the set freezes for the session, green | **no** — the sweep recomputes from current state, so one bad value affects one instrument and self-corrects on its next good tick |
-| cost of a sweep | avoided | **~60 µs measured-class** (2.8 ns/instrument × 20,220), a 0.0012% duty cycle at 5 s |
+| cost of a sweep | avoided | **900 µs MEASURED** (`rank_sweep_cost_at_the_authorized_ceiling`, release, 20,220 contracts), a **0.018% duty cycle** at 5 s |
 | code | heap + slot index + re-sift + tie policy | one scan into a reusable buffer |
 
 The heap was premature optimisation against a cost that measurement shows is free,
@@ -76,7 +76,11 @@ monotonic and therefore stable — which is what keeps the re-subscribe delta sm
 - `top_k_returns_empty_when_every_volume_is_zero` — the pre-open rule
 - `ties_break_deterministically_on_the_composite_key`
 - `reset_daily_clears_both_families`
-- `the_sweep_allocates_nothing_after_construction` — DHAT
+- `rank_sweep_cost_at_the_authorized_ceiling` — an `#[ignore]`d wall-clock harness,
+  the house shape. ⚠ **This line previously named `the_sweep_allocates_nothing_after_construction`
+  as delivered. No such test existed** — a named test listed against a ticked item and
+  absent from the tree. The DHAT proof it promised is a real follow-up, not a
+  delivered one, and is recorded as outstanding rather than quietly dropped.
 - Bite-proofs: remove the monotonicity gate → the wrap test fails; remove the split → the negative control fails; remove the finite gate → the NaN test fails.
 
 ## Rollback
@@ -168,7 +172,7 @@ The cadence sits on the drain task deliberately, for the reason CLAUDE.md's O(1)
 table already records for `catch_up_seal_all`: moving a sweep off that task needs a
 lock or a channel around a `&mut`, and both are strictly worse for the hot path than
 a bounded pause. That row measures its own 5-second sweep at **9.67 ms, a 0.2% duty
-cycle**; this one is ~60 µs, **0.0012%** — two orders of magnitude cheaper than the
+cycle**; this one MEASURES 900 µs, **0.018%** — an order of magnitude cheaper than the
 sweep already running beside it.
 
 ### Decision B — where index-vs-stock classification comes from: the contract artifact, at attach
@@ -224,7 +228,10 @@ bare id.
 ## Honest 100% claim
 
 100% inside the tested envelope, with ratcheted regression coverage: the ranking is
-pure, allocation-free after construction, fail-closed at its cap, and cannot be
+pure, fail-closed at its cap, allocation-free on the per-tick path after
+construction (⚠ `rank_distinct_underlying` DOES allocate two `Vec`s per call — the
+depth-200 path, once per cadence, not per tick; an earlier version of this line said
+"allocation-free after construction" without that qualifier), and cannot be
 poisoned by a single bad value because it holds no threshold. **NOT claimed:** that
 stock-option 200-level books are worth capturing — the 2026-08-26 evidence (800
 rows/minute against 100,800, and 112/210 redials against 19) says many will be
