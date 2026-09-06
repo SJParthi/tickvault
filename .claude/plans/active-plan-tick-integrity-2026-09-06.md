@@ -45,13 +45,47 @@ unrecoverable — the main feed carries no sequence number.
 
 ## Plan Items
 
-- [ ] **Item 1 — Offload the inline-depth sink off the frame drain**
-  - `LiveIngest::flush` flushes the inline-depth sink FIRST and unconditionally; `DepthIngest::flush`
-    is a blocking ILP-over-HTTP round trip bounded only by `request_timeout=5000`. `block_in_place`
-    saves the runtime, not the drain. Documented in-source as "a tick-loss and disconnect path".
-  - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/storage/src/depth_persistence.rs`
-  - Tests: bite-test that no blocking HTTP call is reachable from the drain; boot-site assertion
-    that a spawn failure is LOUD, never a silent fall-back to the blocking path
+- [x] **Item 1 — WITHDRAWN AS WRITTEN. The defect it named was already fixed; a stale comment
+  manufactured it.** Replaced by Item 1a below.
+  - The original text claimed `LiveIngest::flush` leaves a blocking ILP-over-HTTP round trip on
+    the frame drain via a separate, un-offloaded inline-depth sink. **Every part of that is false
+    in the current tree**, and it was sourced from a code comment rather than from the call path:
+    - The inline-depth sink is **not** separate. `LiveIngest::depth_sink()` records the 2026-08-28
+      merge — d20, d200 and inline-d5 all write through the SAME `DepthIngest`, and a guard fails
+      the build if a second one appears ("Two ILP buffers writing one table").
+    - It **is** offloaded. Boot calls `ingest.spawn_depth_offload_writer()`
+      (`dhan_feed_stack.rs:10025`), pinned by a guard at `:12120`; it spawns `tv-depth-writer` via
+      `split_for_offload` AND `tv-depth-rescue` via `split_rescue_offload`.
+    - The production flush path is `flush_and_record` → `LiveIngest::flush` → `DepthIngest::flush`
+      → `DepthWriter::flush` → offload arm → `tx.try_send` — non-blocking. No HTTP and no file IO
+      on the drain.
+  - **Provenance of the error:** the comment at `dhan_feed_stack.rs:3920-3950` was written
+    2026-08-26 (#1824); `spawn_depth_offload_writer` landed 2026-08-29 (#1833). The comment
+    describes the tree as it was three days BEFORE the fix that followed it. This is precisely the
+    class this repository already records twice — `day_ohlc_tracker` (2026-08-12) and
+    `WAL-SUSPEND-01` (2026-08-25): **a stale comment does not merely fail to warn, it manufactures
+    false findings.** It cost this session a wrong #1 priority and a wrong statement to the
+    operator, both corrected on 2026-09-06.
+
+- [ ] **Item 1a — Harden the depth-offload spawn failure, and correct the stale comment**
+  - Gap A (real, and the only survivor of Item 1): on `spawn_depth_offload_writer` failure the boot
+    path logs `HotPath02WriterQueueDrop` and **continues on the synchronous path**, reinstating the
+    exact blocking-HTTP-on-the-drain mechanism. With depth at ~24x tick volume that fallback is not
+    "degraded", it is the documented loss path.
+  - Preferred: retry with backoff, then REFUSE to open sockets rather than run a lane that captures
+    ticks it will lose upstream. **That trades availability for correctness and is an OPERATOR
+    decision — not taken without a dated quote.**
+  - Minimum, shippable now: an `AtomicBool` read at the flush site plus a degraded gauge, so the
+    fallback is visible. An ALARM on it needs a dated row in `dhan-rest-only-noise-lock-2026-07-14.md`
+    §3 first, per that file's own law.
+  - Gap B: annotate `dhan_feed_stack.rs:3920-3950` with a dated correction block (house convention —
+    annotate, never rewrite). **The `blocking_flush` wrapper STAYS**: its own comment gives the right
+    reason, that gating it needs a second accessor kept in step with `LiveIngest::flush`, and that
+    split knowledge is what produced the original bug.
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `the_drain_reaches_no_blocking_network_call_when_both_writers_are_offloaded` (bite-proof
+    by removing `split_for_offload`); extend the existing `:12120` boot-site guard to pin the
+    failure arm's disposition
 
 - [ ] **Item 2 — Make the window-gate refusals visible**
   - `grep -rn out_of_window_refused_total deploy/` returns ZERO. Both counters exist, are seeded,
