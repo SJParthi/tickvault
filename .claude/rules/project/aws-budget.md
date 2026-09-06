@@ -1145,3 +1145,24 @@ unchanged and neither is taken here: the already-approved Quote 10 EIP release
 (−$3.60/mo, bundled with an instance recreate), or an operator decision on
 `limit_amount` — which Quote 18 forbids raising above 125, and which cannot be
 set to 125 because 90% of that is $112.50, below the bill.
+
+---
+
+## ⚠ CORRECTED 2026-09-06 — the four `EXECUTION_FAILURE` flags in this file are STALE
+
+The automatic budget actions are NOT failing. Read live 2026-09-06 with
+`describe-budget-actions-for-budget` (a call this file records as permanently
+`AccessDenied`): the read **succeeds**, and both actions are **`STANDBY`** —
+armed and healthy — targeting `i-0c3fe906dad5492fc`, firing at 90% ($135.00) and
+100% ($150.00) of the $150 limit.
+
+The live September forecast is **$142.24**, i.e. **$7.24 past the line that
+automatically stops the production trading box**.
+
+Measured driver (Cost Explorer, Sep 1-6): **EBS $88.92/mo (rate-derived from live usage)** at the live
+600 GB / 6000 IOPS / 500 MiB/s volume — 66% of the action line before compute.
+The Elastic IP is **$3.60/mo** and does not close the gap alone.
+
+Full record: `dhan-rest-only-noise-lock-2026-07-14.md`, same date. The four flags
+below are retained verbatim per house convention; where they conflict with this
+banner, the banner wins.

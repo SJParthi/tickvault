@@ -236,12 +236,22 @@ fn the_session_window_gate_is_wired_into_the_depth_write_path() {
     let src = depth_persistence_src();
     let body = depth_append_body(&src);
 
+    // QUALIFIED with `session_window::` deliberately, 2026-09-06. The bare
+    // string "row_is_in_an_open_window" is a SUBSTRING of
+    // "arrival_row_is_in_an_open_window", so it matched BOTH forms and this
+    // assertion could not tell the two clocks apart in either direction -- an
+    // adversarial sweep bite-proved that the candle writer could be swapped to
+    // the graced form with all 13 guard tests still green. The qualified form
+    // cannot match the arrival name, because `session_window::arrival_row_...`
+    // does not contain `session_window::row_...`.
     assert!(
-        body.contains("row_is_in_an_open_window"),
-        "the session-window gate is GONE from `DepthWriter::append_row`. Depth \
-         is 24x the tick row volume -- the largest payload in the process -- so \
-         an ungated depth writer defeats the operator's window rule at the one \
-         table where it costs the most disk."
+        body.contains("session_window::arrival_row_is_in_an_open_window"),
+        "`DepthWriter::append_row` no longer gates on the ARRIVAL clock. Depth
+         has no exchange timestamp -- its ILP stamp IS the receipt instant -- so
+         the strict form refuses books the vendor merely delivered late (measured
+         p99 46.4s, max 198.7s) and the refusal is permanent. Depth is also 24x
+         the tick row volume, so an ungated writer defeats the window rule at the
+         one table where it costs the most disk."
     );
     assert!(
         body.contains("out_of_window.note("),
@@ -351,9 +361,20 @@ fn the_session_window_gate_is_wired_into_the_candle_write_path() {
         .expect("ShadowCandleWriter::append_row is gone");
     let body = &src[start..(start + 3000).min(src.len())];
 
+    // QUALIFIED, and the arrival form is BANNED here — see the note on the
+    // depth guard above. Candles carry an EXCHANGE bucket, not a receipt, so
+    // admitting the arrival grace would let post-close events into candles and
+    // breach the 2026-08-25/26 pre-open rule in websocket-connection-scope-lock.
     assert!(
-        body.contains("row_is_in_an_open_window"),
+        body.contains("session_window::row_is_in_an_open_window"),
         "the session-window gate is GONE from the candle write path."
+    );
+    assert!(
+        !body.contains("session_window::arrival_row_is_in_an_open_window"),
+        "the candle write path is using the ARRIVAL-graced predicate. Candles are
+         bucketed on the EXCHANGE clock, so the grace has no meaning here and
+         would admit post-close events into candles — the exact leak the
+         2026-08-25 and 2026-08-26 rulings forbid."
     );
     // EVERY refusal arm returns Ok, not just one -- the same hardening the
     // DEPTH guard above already carries, applied here 2026-09-06 after an
@@ -482,17 +503,30 @@ fn the_session_window_gate_is_wired_into_the_spill_replay_path() {
     let production = &src[loop_at..tests_at];
 
     assert!(
-        production.contains("retain_lines_in_open_window(raw)"),
+        production.contains("retain_lines_in_open_window(raw, is_arrival_clock)"),
         "replay_spill_dir no longer filters each chunk through \
          retain_lines_in_open_window. Every unit test in that module calls the \
          filter directly and would still pass -- this assertion is the only \
          thing standing between a deleted call and an ungated write path."
     );
 
+    // And the clock must be CHOSEN FROM THE DIRECTORY. A `bool` parameter that
+    // is always `false` would satisfy the call-shape assertion above while
+    // restoring the exact loss it was added to close: the depth spill judged on
+    // the exchange clock deletes books the depth WRITER accepted, and a
+    // fully-refused file is truncated, so those bytes are gone for good.
+    assert!(
+        production.contains("DEPTH_SPILL_DIR"),
+        "replay_spill_dir no longer derives the clock from the directory being
+         drained. The depth spill is ARRIVAL-clocked and every other spill dir is
+         exchange-clocked; without this the two disagree and replay silently
+         deletes late depth rows the writer deliberately kept."
+    );
+
     // And it must gate what is SENT, not merely compute a number. A call whose
     // result is dropped is the same defect wearing a function call.
     let call_at = production
-        .find("retain_lines_in_open_window(raw)")
+        .find("retain_lines_in_open_window(raw, is_arrival_clock)")
         .expect("checked above");
     let after = &production[call_at..];
     let post_at = after

@@ -116,7 +116,7 @@ AWS path (opt-in):
 | 9.2 | `a81206f`, extended each phase | `scripts/validate-automation.sh` + `make validate-automation` — 25 end-to-end checks. |
 | 10.1 | `275157a` | `zero_tick_loss_alert_guard` — pins tick-loss metric emissions + buffer capacity constant + doc coherence. _(Post #O3 the 4 Prometheus alert-rule assertions were removed when the Prometheus container retired; the early-warning signal moved to CloudWatch Alarms over the same metrics, which the guard still pins as EMITTED.)_ |
 | 11 | `897f7b6` | `resilience_sla_alert_guard` — 6 tests pin WS/QuestDB/Valkey SLA alerts. |
-| 12.1 | existing `quality/crate-coverage-thresholds.toml` | 100% line-coverage floor per crate, enforced by `scripts/coverage-gate.sh`. |
+| 12.1 | existing `quality/crate-coverage-thresholds.toml` | ratcheted per-crate line-coverage floors (app 72.6 … common 99.4; 100% is the TARGET, never the enforced gate), enforced by `scripts/coverage-gate.sh`. |
 | 12.2 | existing `.github/workflows/mutation.yml:103-113` | Mutation zero-survivor gate. |
 | 12.5 | existing `quality/benchmark-budgets.toml` | DHAT zero-alloc + Criterion latency budgets, 5% regression gate. |
 | 12.6 | `9e807ca` | `observability_chain_e2e` integration test — in-process end-to-end proof; caught a real `flatten_event(true)` bug on first run. |
