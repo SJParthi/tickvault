@@ -121,8 +121,16 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     // unreachable from CloudWatch; it stayed while the counter recorded a
     // 2.4%-of-every-tick hard refusal that nobody could see. It ships now.
     (
+        "tv_candle_rows_out_of_window_refused_total",
+        "logged, and the guard cannot see it — same const -> struct field -> method chain as the two rows below and as tv_dhan_feed_ingest_seq_refused_total. The emit is `counter.increment(1)` on a pre-resolved handle held in a CandleOutOfWindowCounters field; the throttled `warn!` (code=STORAGE-GAP-01, powers of two) sits on the next lines of the same `note()` body. VERIFIED 2026-09-05 by running this guard, not by reading the code. Carries NO `feed` label, unlike its tick and depth siblings: ShadowCandleWriter is feed-agnostic and `row.feed` varies per row, so a per-row labelled handle would drop `metrics::counter!` to its allocating arm on the seal path — the record_ws_lag class of defect, which cost 36M allocations/hour the last time it shipped. NOT EMF-shipped, deliberately: this counter measures the gate WORKING, so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note. This change carries no lever.",
+    ),
+    (
         "tv_chain1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
+    ),
+    (
+        "tv_depth_rows_out_of_window_refused_total",
+        "logged, and the guard cannot see it — identical chain to tv_ticks_out_of_window_refused_total below (they share OutOfWindowCounters::note, which carries the throttled `warn!`). Recorded as its own row rather than left to an accidental pass: until 2026-09-05 the counter const was spelled at three struct-literal sites, which put it nine lines above the `error!` in the ILP-connect failure arm, and this guard reported the counter reachable on the strength of a log about a completely different event. The const is now named once, in `depth_out_of_window_counters`, so the verdict is honest. Its reason vocabulary says `arrival_*`, not `ts_*`, because market_depth has exactly ONE clock — the designated `ts` IS the receipt instant, the depth protocol carries no exchange timestamp at all. NOT EMF-shipped for the same reason and at the same cost as the row below.",
     ),
     // REMOVED 2026-08-14: `tv_dhan_feed_ingest_refused_total` is now in the EMF
     // selector, so the "periodic report is good enough" exemption no longer
@@ -182,6 +190,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     (
         "tv_tf_verify_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
+    ),
+    (
+        "tv_ticks_out_of_window_refused_total",
+        "logged, and the guard cannot see it — VERIFIED 2026-09-05 by running this guard, not by reading the code. The emit is `counter.increment(1)` on a pre-resolved `metrics::Counter` held in an `OutOfWindowCounters` struct field, and the throttled `warn!` (code=STORAGE-GAP-01) sits on the next lines of the same `note()` body. That is the const -> struct field -> method chain already allowlisted above for tv_dhan_feed_ingest_seq_refused_total: the scanner follows a const NAME alias and a local `let h = metrics::counter!(..)` handle, but not this one, so it judges proximity at `tick_out_of_window_counters` — where no log sits — instead of at `note()`. That function exists so the const is named exactly ONCE outside its declaration: spelled at the three struct-literal sites it sat nine lines above the `error!` in the ILP-connect failure arm, and this guard passed the counter on the strength of a log about a completely different event. An accidental pass retires the question without answering it, which is worse than a recorded exemption. The handles are pre-resolved because the macro form allocated ONCE PER TICK on the drain task (DHAT measured 10,010 blocks over 10,000 ticks against a ceiling of 500, CI-caught 2026-09-05); the all-literal macro form is allocation-free and passes this guard, and was rejected because it cannot carry the `feed` label that every sibling loss counter carries and that the pluggable-feed contract needs. NOT EMF-shipped, deliberately: this counter measures the gate WORKING (outside 09:00-15:39:59 IST every tick increments it), so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note.",
     ),
 ];
 

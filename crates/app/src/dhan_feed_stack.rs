@@ -9345,6 +9345,23 @@ pub fn refold_wal_frames(
     // v1/v2 records still carry `WAL_RECEIPT_UNKNOWN_NANOS`, because for those
     // the receipt genuinely never existed -- so the sentinel's fallback is
     // right for them and wrong for everything written since.
+    //
+    // AND YET `recv_millis` BELOW IS DELIBERATELY THE REPLAY CLOCK, not the
+    // persisted receipt. It is not a leak, and the distinction is the point:
+    // the parameter it feeds is `recv_monotonic_millis`, and its only consumer
+    // is `TickObservation::from_parsed_tick` -> the tick-gap detector, which
+    // answers "which instruments have gone SILENT" -- a LIVENESS question about
+    // now, not an event-time question about the frame.
+    //
+    // Feeding it the true historic receipt would tell the detector that every
+    // replayed instrument was last seen hours ago, so `scan_silence` would fire
+    // a RISK-GAP-03 episode for the whole universe on the first sweep after any
+    // crash-restart -- a page storm caused by recovery working. The receipt is
+    // threaded per frame into `dispatch_frame` instead, which is where event
+    // time belongs.
+    //
+    // Stated because a reader who has just finished the block above will
+    // reasonably suspect this line of being the leak it is not.
     let recv_millis =
         u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000)
             .unwrap_or(0);
@@ -19314,6 +19331,18 @@ mod alive_connection_guard_tests {
 mod inline_depth_tests {
     use super::*;
 
+    /// A UTC receipt instant that lands 12:30:00 IST once
+    /// `IST_UTC_OFFSET_NANOS` is added by the row builder.
+    ///
+    /// Fixtures here used `1` and `1_700_000_000_000_000_000` — a 1970 epoch
+    /// and 03:43 IST — because the receipt was incidental to what each test
+    /// was actually asserting. That stopped being free on 2026-09-05, when the
+    /// depth writer gained the session-window gate: both are refused, the
+    /// refusal returns `Ok`, and three tests measuring capture-seq stamping
+    /// and offloaded flushing started measuring the gate instead. A fixture
+    /// clock is only incidental until something starts reading it.
+    const RECEIPT_UTC_NANOS: i64 = 1_699_945_200_000_000_000;
+
     #[test]
     fn with_inline_depth_is_off_by_default_and_the_builder_enables_it() {
         // The default must stay OFF. At the 25,000 target this path writes
@@ -19358,7 +19387,7 @@ mod inline_depth_tests {
             &mut sink,
             &tick,
             &levels,
-            1_700_000_000_000_000_000,
+            RECEIPT_UTC_NANOS,
             0,
             0,
             counters(),
@@ -19403,7 +19432,7 @@ mod inline_depth_tests {
             &mut sink,
             &tick,
             &levels,
-            1_700_000_000_000_000_000,
+            RECEIPT_UTC_NANOS,
             0,
             0,
             counters(),
@@ -19486,8 +19515,24 @@ mod inline_depth_tests {
 
         // Same frame (seq 4096, base-aligned), packets 0 and 1.
         let frame_seq = 4096_u64;
-        let a = append_inline_depth(&mut sink, &tick, &levels, 1, frame_seq, 0, counters());
-        let b = append_inline_depth(&mut sink, &tick, &levels, 1, frame_seq, 1, counters());
+        let a = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            RECEIPT_UTC_NANOS,
+            frame_seq,
+            0,
+            counters(),
+        );
+        let b = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            RECEIPT_UTC_NANOS,
+            frame_seq,
+            1,
+            counters(),
+        );
         assert_eq!(a + b, 20, "both packets appended their ten rows");
 
         let ilp = sink.writer.buffer_utf8();
@@ -19529,7 +19574,7 @@ mod inline_depth_tests {
             ask_price: 101.0,
             ..Default::default()
         }; 5];
-        let utc = 1_700_000_000_000_000_000_i64;
+        let utc = RECEIPT_UTC_NANOS;
         assert_eq!(
             append_inline_depth(&mut sink, &tick, &levels, utc, 0, 0, counters()),
             10
@@ -19722,7 +19767,7 @@ mod inline_depth_tests {
             &mut sink,
             &tick,
             &levels,
-            1_700_000_000_000_000_000,
+            RECEIPT_UTC_NANOS,
             0,
             0,
             counters(),

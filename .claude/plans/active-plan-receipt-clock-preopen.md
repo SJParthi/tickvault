@@ -1,6 +1,23 @@
 # Implementation Plan: Receipt-clock OHLCV, 09:00 candles, per-minute ATM re-fit, percentage columns
 
-**Status:** APPROVED
+**Status:** VERIFIED (2026-09-06 — every item checked; see the honesty note below)
+
+> **⚠ What VERIFIED rests on here, and what it does NOT.**
+>
+> `plan-verify.sh` reports `PASS: No active implementation plan` for this file,
+> and that PASS is **VACUOUS**: the hook hardcodes
+> `PLAN_FILE=".claude/plans/active-plan.md"` and never globs `active-plan-*.md`,
+> so it has not inspected a single item here. Recorded rather than cited,
+> because leaning on it would be exactly the accidental-pass class this plan's
+> own items were corrected for.
+>
+> The asymmetry is worth naming for a future session: `plan-gate.sh` (the
+> design-first wall) DOES scan every `active-plan*.md`, while `plan-verify.sh`
+> reads only the singular name. So a multi-file plan is GATED on entry and
+> UNVERIFIED on exit. Closing that is its own change, not this one.
+>
+> This VERIFIED therefore rests on the per-item evidence recorded in each block
+> — source citations, measured test counts, and bite-proofs — not on the hook.
 **Date:** 2026-08-28
 **Approved by:** Parthiban (operator) — verbatim, this session: *"Yes fox and resolve everything always ensure to start eelvery candles starting at 9 am dude okay"* / *"Meanwhile ensure to achieve this ohlcv based on one and only received at dude okay?"* / *"See clealry ensure whenever the pre marketbope ticks and candles get finished ensure to provide this fucking atm plus minus depths also dude and starting 9.16 am every one minute resubscribe also right dude of current atm and what about pre oopem marketbpercentage change and even percentage change also dude okay?"*
 **Authority:** `.claude/rules/project/websocket-connection-scope-lock.md` § "2026-08-28 — CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK…" (landed before this plan, per the rule-file-first law)
@@ -267,14 +284,58 @@ needs its own dated authorization under the noise lock.
   - Tests: T1, T2, T3 — plus 9 new `ws_frame_spill` tests, 3 bite-proven
   - **Verified 2026-08-28:** `ws_frame_spill` 62 passed / 0 failed
 
-- [ ] **W1b** *(REMAINING)* Thread the real receipt through the call chain
-      so `TVW3` actually carries a non-sentinel value
-  - **Honest status: the FORMAT exists and nothing populates it yet.** The
-    receipt is stamped correctly and early in `FrameSink::accept`, and is
-    still dropped at `main.rs:897` where the replayed record is turned back
-    into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
-    callers. Stated plainly because a record format that is present but
-    unpopulated reads, from the outside, exactly like a working one.
+- [x] **W1b** Thread the real receipt through the call chain so `TVW3`
+      actually carries a non-sentinel value
+  - **⚠ CORRECTED 2026-09-06: the CODE was already complete when this item
+    still read REMAINING.** The status block below is preserved verbatim
+    because the wrong version is the more useful record -- this is the THIRD
+    item in this plan found already-built (after W5, and after two claims in
+    the W2 research block), and the pattern is identical every time: a status
+    written from a partial read outlives the code that refuted it.
+  - The original text read:
+    > **Honest status: the FORMAT exists and nothing populates it yet.** The
+    > receipt is stamped correctly and early in `FrameSink::accept`, and is
+    > still dropped at `main.rs:897` where the replayed record is turned back
+    > into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
+    > callers.
+  - **Every load-bearing claim there is now false.** Verified in source
+    2026-09-06:
+
+    | The item claimed | Source says |
+    |---|---|
+    | "`append_with_seq_at` has zero production callers" | `pool_supervisor.rs::accept` calls it, passing `receipt_nanos_from(received_at)` |
+    | "dropped at `main.rs:897` ... turned back into `(frame_seq, Bytes)`" | the replay vector is `(u64, i64, WalEndpoint, Bytes)` -- the `i64` IS the receipt |
+    | "`refold_wal_frames` re-stamps `Utc::now()`" | it destructures `wal_received_at_nanos` per frame and hands THAT to `dispatch_frame` |
+
+  - **The shipped conversion is BETTER than this plan sketched, and the
+    difference matters.** The design below prescribed converting in the WAL
+    writer thread. What shipped is a REFRESHING (wall, instant) anchor
+    (`receipt_nanos_from`) -- which this plan lists under "rejected
+    alternatives" as *"anchoring once at boot ... drifts unboundedly"*. The
+    refresh is what answers that objection, and it carries its own
+    monotonicity guard refusing a backward re-anchor. The rejection was right
+    about the anchor-ONCE form and is superseded for the refreshing one.
+
+  - **What was genuinely missing, and is fixed here: the property had never
+    been EXECUTED.** Both existing guards
+    (`crates/app/tests/wal_receipt_threading_guard.rs`) are SOURCE SCANS, and
+    the round-trip test hand-encodes its record with `encode_v3_record`, so it
+    proves the reader only. Two behavioural tests added:
+    * `a_receipt_written_by_the_real_writer_replays_unchanged` -- real
+      `append_with_seq_at` -> writer thread -> file -> `replay_all`. Bite:
+      writer substitutes the UNKNOWN sentinel -> FAILS.
+    * `a_converted_receipt_lands_on_the_real_wall_clock_not_merely_in_order`
+      -- every prior test of this conversion checked ORDER, and **a constant
+      offset preserves order perfectly**. Bite-proven with the anchor moved
+      back one hour: this test FAILS and both pre-existing order tests still
+      PASS. An hour-wrong anchor was invisible to the entire suite, and for a
+      sentinel-LTT tick that value becomes the row's designated `ts` -- the
+      first column of the `ticks` DEDUP key.
+  - **One site deliberately left on the replay clock, now documented at the
+    site:** `refold_wal_frames``refold_wal_frames`'s `recv_millis``recv_millis`. Its only consumer is the
+    tick-gap detector, which asks a LIVENESS question; feeding it the true
+    historic receipt would report the whole universe as silent on the first
+    sweep after any crash-restart -- a page storm caused by recovery working.
   - Files: `crates/storage/src/ws_frame_spill.rs` (the writer thread),
     `crates/core/src/websocket/pool_supervisor.rs` (`WalRingSink::accept` —
     signature only), `crates/app/src/main.rs` (~:893-897),
@@ -318,7 +379,62 @@ needs its own dated authorization under the noise lock.
     `Instant` (meaningless across processes, which is the whole point of the
     replay path).
 
-- [ ] **W2** Candles bucket on `received_at`  *(REMAINING — blocked on W1b)*
+- [x] **W2** Candles bucket on `received_at`
+  - **⚠ CORRECTED 2026-09-06: the CODE was already complete, and the research
+    block below is what a correct design note looks like AFTER it shipped.**
+    This is the FOURTH item in this plan found already-built (after W5, W1b,
+    and two claims inside this very block). Same pattern every time: a status
+    line written from a partial read outlives the code that refuted it.
+  - **All five coupled sites verified on `fold_secs` in source 2026-09-06** --
+    the four the research block below names, plus the bucket itself:
+
+    | Site | Reads |
+    |---|---|
+    | bucket (`aggregator_cell`) | `fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos)` |
+    | watermark advance | `if fold_secs > self.watermark_secs` |
+    | seconds-of-day session gate | `let secs_of_day = fold_secs % 86_400` |
+    | `close_ts_ist_secs` | `close_ts_ist_secs: fold_secs` |
+    | `tick_is_newest` ordering | `fold_secs >= state.close_ts_ist_secs` |
+
+  - **One deliberate deviation from this plan, and the implementation is
+    right.** The block below lists the stale-trading-day gate as MUST-NOT-MOVE.
+    It DOES read `fold_secs` -- and must, because it compares against a
+    watermark that is itself advanced by `fold_secs`. The site says so: *"A
+    packet near midnight whose receipt crosses the day boundary advances the
+    watermark into day D+1 and is then rejected by its own advance as
+    `stale_trading_day`. Comparing like with like removes the shape entirely."*
+    The plan's rule was about not using the RAW receipt; comparing a fold-clock
+    day against a fold-clock watermark is self-consistent, which is the actual
+    requirement.
+  - **The two genuine MUST-NOT-MOVE sites are verified UNMOVED:** `ws_lag_ms`
+    still takes `tick.exchange_timestamp`, and `row_timestamp_ist_nanos` still
+    takes the exchange stamp with the receipt only as the sentinel fallback.
+
+  - **What was genuinely missing, and is fixed here: the COUPLING was
+    unpinned.** The research block calls the split the trap -- *"Moving the
+    bucket clock alone leaves ordering deciding on one clock and bucketing on
+    another"* -- and nothing enforced it. Each site is individually correct on
+    either clock; only their AGREEMENT is the property, and no test asserted
+    it. MEASURED by planting the reverts:
+
+    | Plant | Caught by |
+    |---|---|
+    | `tick_is_newest` back on the exchange stamp | the existing `the_close_is_owned_by_the_last_packet_we_received` -- already covered |
+    | **watermark advance back on the exchange stamp** | **NOTHING. All 1,703 trading lib tests PASSED.** Only the new guard bites |
+    | `ws_lag_ms` moved onto the fold clock | **NOTHING.** New guard bites |
+
+  - **`ws_lag_ms` is the dangerous one and now has its own guard.** The fold
+    clock IS the receipt whenever the receipt is plausible, so feeding it in as
+    the exchange stamp makes `lag = received - received`: every lag collapses
+    to ~0. That is not an error value -- `WsLag::Measured(0.0)` is legal -- so
+    every histogram flattens, the per-connection p99 reads perfect, and
+    `tv-<env>-dhan-worst-socket-deaf` can never fire again. It would erase the
+    MEASURED p50 1.38 s / p99 46.37 s / max 198.69 s this feed actually
+    delivers, and a tidy "move every clock read onto fold_secs" refactor would
+    do it while passing CI.
+  - New guards: `crates/trading/tests/fold_clock_coupling_guard.rs` (5 tests)
+    and `crates/app/tests/ws_lag_clock_guard.rs` (2 tests, one of which
+    DEMONSTRATES the collapse arithmetically rather than arguing it).
   - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
   - Tests: T4, T5, T16
   - **Research complete 2026-08-28. Three findings that shape the design:**
@@ -373,7 +489,45 @@ needs its own dated authorization under the noise lock.
     is 0 until a regular-session trade prints. Semantically correct — there
     is no baseline yet — but indistinguishable from "flat" on a chart.
 
-- [ ] **W5** Per-minute additive ATM re-fit from 09:16  *(REMAINING)*
+- [x] **W5** Per-minute additive ATM re-fit from 09:16
+      *(ALREADY BUILT AND LIVE — checkbox corrected 2026-09-06)*
+  - **This item was UNCHECKED while the Design section above it said, in bold,
+    "✅ ALREADY BUILT AND LIVE — this plan item was WRONG". The plan
+    contradicted itself, and the two halves had been disagreeing since
+    2026-08-28.** Settled from the CODE rather than from either prose, by
+    symbol rather than by line number (the house rule — a line number in an
+    uncompiled document is a claim with no way to stay true):
+
+    | Symbol the draft said was missing | Occurrences |
+    |---|---|
+    | `send_unsubscribe` (`core/src/websocket/connection.rs`) | 2 |
+    | `SubscribeGuard::try_swap` (`pool_supervisor.rs`) | 1 |
+    | `LiveSubscriptionCommand::Swap` (`pool_supervisor.rs`) | 15 |
+    | `run_depth_rebalance` (`app/src/depth_rebalance.rs`) | 1 |
+    | `is_quiet` (the edge-trigger) | 8 |
+
+    The per-minute cadence is real too: `secs_until_next_rebalance` sleeps to
+    `REBALANCE_OFFSET_SECS = 8` past each minute, and `REBALANCE_HEARTBEAT_SECS`
+    stamps liveness from a separate ticker. Spawned in production from
+    `dhan_feed_stack::spawn_depth_rebalance`, which the attach loop reaches on
+    its only success return.
+
+  - **Why a stale UNCHECKED box is worth a correction and not a silent tick.**
+    An unchecked item is an instruction to a future session to go and build the
+    thing. The Design section already spells out what that costs here: a second
+    re-fit loop racing the first over the same five depth-200 sockets, both
+    issuing `Swap` against one `SubscribeGuard`. That is strictly worse than
+    the surplus work — it is a correctness bug manufactured by a checkbox.
+    Same class as the `day_ohlc_tracker` row this repo records: a stale record
+    does not merely fail to inform, it actively produces false findings.
+
+  - **Scope note, checked rather than assumed.** W5 is the DEPTH-200 ATM
+    re-fit (the operator's 2026-08-26 directive: NIFTY/BANKNIFTY ATM CE/PE,
+    every minute, edge-triggered). It is NOT the main-feed contract top-up,
+    whose separate `CONTRACT_TOPUP_CUTOFF_IST_SECS = 09:30` bound this item's
+    original draft cited. Those are two different mechanisms on two different
+    socket pools, and conflating them is how this box would have been ticked
+    for the wrong reason.
   - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/core/src/websocket/pool_supervisor.rs`, `crates/common/src/config.rs`, `config/base.toml`
   - Tests: T13, T14, T15
   - **Research complete 2026-08-28. What already exists, and what does not:**
@@ -405,6 +559,188 @@ needs its own dated authorization under the noise lock.
        churn this work is meant to reduce.
 
 ---
+
+- [x] **W6** Enforce the session window on the WRITE path — ticks, depth, candles
+  - Files: `crates/common/src/session_window.rs`,
+    `crates/storage/src/tick_persistence.rs`,
+    `crates/storage/src/depth_persistence.rs`,
+    `crates/storage/src/shadow_candle_writer.rs`,
+    `crates/storage/tests/session_window_gate_guard.rs`,
+    `crates/storage/tests/dhat_depth_append_zero_alloc.rs`,
+    `crates/common/tests/loss_counter_visibility_guard.rs`,
+    `crates/common/src/muhurat.rs`,
+    `crates/common/tests/dead_const_ratchet.rs`,
+    `crates/storage/src/tick_spill_replay.rs`
+  - Tests: `session_window_gate_guard` (10, all bite-proven),
+    `session_window` unit (10), `tick_persistence` (66),
+    `depth_persistence` (59), `shadow_candle_writer` (36),
+    `dhat_depth_append_zero_alloc` (1),
+    `dhat_live_ingest_seam::out_of_window_refusal_does_not_allocate_per_tick`,
+    `tick_spill_replay` (37, incl. 3 bite-proven window/band tests),
+    `session_window` Muhurat unit (4), `dead_const_ratchet` (3)
+  - **Why this belongs to W1/W2 and not to a new plan:** W1b/W2 move candles
+    onto the receipt clock; this establishes what the window MEANS on every
+    write path first, so the two clocks are gated by one shared predicate
+    (`session_window::verdict` / `nanos_in_session_window`) instead of three
+    private opinions. `TICK_PERSIST_{START,END}_SECS_OF_DAY_IST` had named
+    this window for months with **no reader on any write path** —
+    `dhan_feed_stack.rs` says so in its own words: *"A row outside the window
+    is written because NOTHING STOPS THE WRITER."*
+
+  - **The three gates, and why each reads what it reads:**
+
+    | Table | Gate reads | Because |
+    |---|---|---|
+    | `ticks` | `row.ts_ist_nanos` AND `row.received_at_ist_nanos` | two genuine clocks; both must be in window |
+    | `market_depth` | `row.ts_nanos` only | depth has exactly ONE clock — its designated `ts` IS the receipt; the depth protocol carries no exchange timestamp field at all |
+    | `candles_<tf>` | `row.timestamp_ist_nanos` only | that is the BUCKET-OPEN instant, never the seal instant |
+
+  - **The last-bar trap, which is the whole design constraint on the candle
+    gate.** A candle row is BUILT at the seal, long after its bucket opens:
+    the M1 bucket opening 15:39:00 seals at watermark 15:40:02
+    (`CATCHUP_LATENESS_MARGIN_SECS = 2`), and `force_seal_all` at close plus
+    the boot recovery drain are later still. A gate testing when the row was
+    built — a wall clock, or a receipt stamp — would discard the final bar of
+    every session, every day, and D1 with it. Pinned by
+    `the_candle_gate_reads_the_bucket_and_never_the_seal_instant` and by
+    `the_final_bucket_of_the_session_is_written_even_though_it_seals_after_1540`.
+
+  - **A refusal is not a loss, and the distinction is load-bearing.** Every
+    refusal arm returns `Ok(())`. An `Err` from these writers is routed by the
+    caller into `note_unapplied` + `tv_{ticks,depth_rows}_dropped_total`, which
+    are ALARMED: returning `Err` would page the operator on every ordinary
+    pre-open row and train the one alarm that reports real loss into noise.
+    It would also hold the applied watermark back forever, since a re-offered
+    frame is refused again.
+
+  - **Two defects found in this work by adversarial review, both fixed:**
+    1. **C1 (severe, in already-pushed code).** `verdict` refused when EITHER
+       clock was out of window, so a 15:39:30 exchange print arriving 15:40:05
+       — inside the measured Dhan p99 delivery lag of 46 s — was silently
+       discarded. `is_refusal` is now narrowed to `TsOutOfWindow` alone, with
+       `is_noteworthy` counting the rest.
+    2. **M1.** A stray duplicate `#[test]` attribute left
+       `is_refusal_and_reason_agree_on_every_variant` with no attribute at all,
+       so it never ran — and it encoded the wrong invariant.
+
+  - **A guard that had stopped guarding, found by bite-proofing.** The first
+    version of the depth refusal assertion asked whether `return Ok(())`
+    appeared anywhere in the refusal region; a planted `Err` in one of three
+    arms PASSED. It now counts one `Ok` per counted arm and bans `return Err`
+    outright. Bite-proven in both directions, as were the depth gate removal,
+    the candle clock swap, the candle `feed` label, and double seeding.
+
+  - **Fixture archaeology, disclosed rather than quietly patched.** Fifteen
+    test fixtures across five modules used timestamps that are not plausible
+    epochs at all — `1` nanosecond, `34_200` (read as 09:30 seconds-of-day but
+    actually **1970-01-01**), `1_700_000_000` (03:43 IST once stamped). They
+    were free until something read them. Two of the repaired tests
+    (`runner_boot_drain_reports_pending_honestly_when_db_is_down`,
+    `real_rescue_path_end_to_end_is_recovered`) had begun reporting three
+    commits against a dead database — they were measuring the new band check,
+    not the database. Bases are now named constants with the arithmetic shown.
+
+  - **Observability.** Three counters —
+    `tv_{ticks,depth_rows,candle_rows}_out_of_window_refused_total` — each
+    labelled by reason, seeded at 0 beside their handles (one seed site, so it
+    cannot fall behind the reason vocabulary; the previous two-site version
+    already listed only two of three reasons), and logged by a throttled
+    power-of-two `warn!` carrying the true running total. Deliberately NOT
+    EMF-shipped: they measure the gate WORKING, so a series would chart normal
+    behaviour rather than a defect, and each name costs ~$0.30/mo against a
+    September forecast of $130.39 with the automatic `STOP_EC2_INSTANCES` line
+    at $135.00 — $4.61 of margin, and the noise lock's standing rule is that
+    the next addition arrives with a LEVER, not a cost note. All three are
+    allowlisted in `loss_counter_visibility_guard` with that reasoning stated.
+
+  - **Allocation.** All handles are pre-resolved; `note()` scans three
+    `&'static str` and increments. The macro form allocated ONCE PER TICK on
+    the drain task — DHAT measured 10,010 blocks over 10,000 ticks against a
+    ceiling of 500, caught by CI on 2026-09-05. The candle counter carries no
+    `feed` label for the same reason: `row.feed` varies per row there, and a
+    non-literal label value drops `metrics::counter!` to its allocating arm.
+
+  - **Two residuals this item DISCLOSED, both now CLOSED (2026-09-05).** The
+    paragraph that stood here flagged them "unfixed, rather than discovered
+    later". They are fixed in the same plan item rather than deferred, because
+    each one made the gate a claim rather than an enforcement.
+
+    1. **`tick_spill_replay::replay_spill_dir` bypassed every gate.** It POSTs
+       raw ILP bytes straight at QuestDB, so any spill file written by a
+       pre-gate binary re-introduced exactly the rows the writers now refuse —
+       the gate held on the live path and leaked on the recovery path.
+       `retain_lines_in_open_window` now filters each chunk line-by-line
+       against the SAME `session_window::row_is_in_an_open_window` predicate.
+
+       **It fails OPEN, and that half is the one that costs data if it is
+       wrong.** A crash-torn tail ends mid-timestamp (`... ltp=1.0 17160237`);
+       that prefix parses cleanly as an integer and, read as nanoseconds,
+       lands in 1970 — out of window by any measure. Judging on the window
+       alone would DELETE a captured tick because a crash cut its stamp short.
+       So a value is judged only when its magnitude says it really is an epoch
+       (`MIN_PLAUSIBLE_EXCHANGE_TS_SECS ..= MAX_PLAUSIBLE_EXCHANGE_TS_SECS` —
+       the aggregator's own band, so there is one definition of "real market
+       timestamp" in the workspace, not a second one invented here). Anything
+       below the band is POSTed and QuestDB decides, which is the module's
+       pre-existing torn-tail contract, unchanged.
+
+       **A pre-existing test caught something the new tests did not.**
+       `replay_spill_dir_keeps_the_file_when_questdb_is_unreachable` uses the
+       fixture `ticks value=1i 1`. Under the first (window-only) version every
+       line was filtered out, the chunk went empty, the POST was skipped — and
+       an all-refused CLOSED file is then truncated like any other. The test
+       reported `files_failed = 0` where it expects 1, i.e. a file the database
+       never received was being treated as drained and emptied. The band fixes
+       that case too, because `1` is not a plausible epoch.
+
+       Also corrected: `refused_bytes` were inflating
+       `tv_tick_spill_replayed_bytes_total`, which now reports
+       `accepted − refused_bytes`; and the refusal `warn!` claimed "the bytes
+       stay on disk until the file ages out", which is FALSE — a fully-refused
+       closed file IS truncated, deliberately, because leaving it would
+       re-refuse the same bytes every round forever. The message says so now.
+
+       Bite-proven: disabling the band fails exactly three tests
+       (`a_torn_timestamp_is_kept_because_its_magnitude_is_not_an_epoch`,
+       `an_unparseable_or_torn_line_is_kept_never_dropped`,
+       `replay_spill_dir_keeps_the_file_when_questdb_is_unreachable`);
+       restoring it returns 37/37.
+
+    2. **Muhurat would have been refused across all 26 tables.**
+       `MUHURAT_PERSIST_{START,END}_SECS_OF_DAY_IST` (18:00–19:30 IST) sat in
+       `dead_const_ratchet`'s allowlist, and `muhurat::current()` had **zero
+       production readers** — the flag was WRITE-ONLY for months. Its module
+       header named two consumers to justify itself: `should_connect_ws`
+       (zero occurrences anywhere in the repo) and `run_tick_processor`
+       (deleted 2026-07-17). Shipping the gate on top of that would have
+       silently discarded an entire Diwali session.
+
+       `nanos_in_any_open_window(ist_nanos, muhurat_active)` is the pure
+       predicate; `row_is_in_an_open_window` is the global-reading wrapper the
+       three writers call. `verdict` is split the same way — a pure
+       `verdict_in(ts, rx, muhurat_active)` plus a wrapper — so no test
+       depends on the boot `OnceLock`. Both constants leave the dead-const
+       allowlist in the same change. Four tests pin it, including that the two
+       windows never overlap (so a row is never ambiguous) and that the flag
+       only ever WIDENS the accepted set.
+
+  - **One claim in this item was too broad and is corrected.** "A late closing
+    print is kept" is true of `ticks` and FALSE of candles. The candle gate
+    reads the bucket-open instant, but the FOLD chooses that bucket via
+    `tf_index::fold_clock_ist_secs`, which prefers the RECEIPT stamp within
+    ±300 s. So a 15:39:30 exchange print delivered at 15:40:05 lands in
+    `ticks` and is absent from the 15:39 bar — the two paths disagree, by
+    design of two different clocks. Reconciling them is W1b/W2, which is
+    blocked. Recorded here rather than repaired, and the table in
+    `session_window.rs` now shows both clocks side by side.
+
+  - **The candle gate cannot fire today, and says so.** `bucket_start` clamps
+    to `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (09:00) and the fold's own window
+    is byte-identical to the persist window, so no reachable input produces an
+    out-of-window candle row. It is defence in depth across a crate boundary —
+    the writer is a public API that cannot see the fold's invariants — not
+    enforcement, and the source records that distinction rather than letting a
+    future reader believe a counter at zero is proof of anything.
 
 ## Scenarios
 

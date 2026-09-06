@@ -472,7 +472,7 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(4, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
+        let s = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
         assert_eq!(p.submit(s, now), SubmitOutcome::Buffered);
         assert_eq!(p.ring_len(), 1);
         cleanup(&spill, &dlq);
@@ -486,9 +486,9 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(2, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
-        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0);
         assert_eq!(p.submit(s1, now), SubmitOutcome::Buffered);
         assert_eq!(p.submit(s2, now), SubmitOutcome::Buffered);
         assert_eq!(p.submit(s3, now), SubmitOutcome::Spilled);
@@ -525,8 +525,8 @@ mod tests {
             dlq.clone(),
         );
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
         assert_eq!(p.submit(s1, now), SubmitOutcome::Buffered);
         assert_eq!(p.submit(s2, now), SubmitOutcome::DlqWritten);
         // Verify the evicted s1 landed in the DLQ.
@@ -568,8 +568,8 @@ mod tests {
             dlq_as_file.clone(),
         );
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
         assert_eq!(p.submit(s1, now), SubmitOutcome::Buffered);
         match p.submit(s2, now) {
             SubmitOutcome::Dropped(lost) => {
@@ -588,7 +588,7 @@ mod tests {
         // Every variant of SubmitOutcome must compare unequal to the
         // others — operator's "tv_seal_absorption_total{tier=...}"
         // counter relies on this.
-        let s = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
+        let s = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
         let buffered = SubmitOutcome::Buffered;
         let spilled = SubmitOutcome::Spilled;
         let dlq = SubmitOutcome::DlqWritten;
@@ -612,7 +612,7 @@ mod tests {
                 13 + i,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i as u32,
+                1_716_023_700 + i as u32,
                 100.0 + i as f64,
             );
             assert_eq!(p.submit(s, now), SubmitOutcome::Buffered);
@@ -635,7 +635,7 @@ mod tests {
                 13 + i,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i as u32,
+                1_716_023_700 + i as u32,
                 100.0 + i as f64,
             );
             assert_eq!(p.submit(s, now), SubmitOutcome::Buffered);
@@ -667,9 +667,9 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(2, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
-        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0);
         p.submit(s1, now);
         p.submit(s2, now);
         p.submit(s3, now);
@@ -695,9 +695,9 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(2, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let seg0 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let seg1 = mk_buffered_seal(13, 1, TfIndex::M1, 1_716_001_500, 200.0);
-        let filler = mk_buffered_seal(99, 0, TfIndex::M1, 1_716_002_100, 300.0);
+        let seg0 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let seg1 = mk_buffered_seal(13, 1, TfIndex::M1, 1_716_024_300, 200.0);
+        let filler = mk_buffered_seal(99, 0, TfIndex::M1, 1_716_024_900, 300.0);
         p.submit(seg0, now);
         p.submit(seg1, now);
         // 3rd submit evicts seg0 (oldest). Spill receives composite-key-distinct seg0.
@@ -734,7 +734,7 @@ mod tests {
                 13 + i,
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i as u32,
+                1_716_023_700 + i as u32,
                 100.0 + i as f64,
             );
             p.submit(s, now);
@@ -771,9 +771,9 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
-        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0);
         assert_eq!(p.submit(s1, now), SubmitOutcome::Buffered);
         assert_eq!(p.submit(s2, now), SubmitOutcome::Spilled);
         assert_eq!(p.submit(s3, now), SubmitOutcome::Spilled);
@@ -795,8 +795,8 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M15, 1_716_000_900, 102.5);
-        let filler = mk_buffered_seal(99, 0, TfIndex::M1, 1_716_001_500, 200.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M15, 1_716_023_700, 102.5);
+        let filler = mk_buffered_seal(99, 0, TfIndex::M1, 1_716_024_300, 200.0);
         p.submit(s1, now);
         p.submit(filler, now);
         let writer = SealSpillWriter::with_spill_dir_for_test(spill.clone());
@@ -816,9 +816,9 @@ mod tests {
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(2, spill.clone(), dlq.clone());
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
-        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0);
         p.submit(s1, now);
         p.submit(s2, now);
         p.submit(s3, now);
@@ -857,8 +857,8 @@ mod tests {
             dlq_as_file.clone(),
         );
         let now = jan1_noon_utc();
-        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0);
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
         p.submit(s1, now);
         let outcome = p.submit(s2, now);
         match outcome {

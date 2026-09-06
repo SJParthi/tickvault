@@ -1616,6 +1616,9 @@ pub struct TickWriter {
     pending_max_seq: u64,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
+    /// Pre-resolved session-window refusal counters -- see
+    /// [`OutOfWindowCounters`] for why they are resolved once.
+    out_of_window: OutOfWindowCounters,
     /// Highest `capture_seq` this connection has stamped — the per-connection
     /// monotonicity witness (`0` before the first row).
     last_capture_seq: i64,
@@ -1649,6 +1652,173 @@ pub struct TickWriter {
     /// This is the batch-WIDTH bound, and it is the one the live measurement
     /// made load-bearing — see [`MAX_RETAINED_FLUSH_SPANS`].
     retained_spans: u32,
+}
+
+/// Pre-resolved refusal counters -- one handle per reason, per writer.
+///
+/// PRE-RESOLVED, and that is the whole point (2026-09-05). The first version
+/// called `metrics::counter!(NAME, "feed" => .., "reason" => ..)` at the
+/// refusal site, and DHAT caught it in CI: 10,010 blocks over 10,000 ticks
+/// against a ceiling of 500 -- one allocation PER TICK on the live path.
+///
+/// The mechanism is the one CLAUDE.md already records from `record_ws_lag`: a
+/// non-literal label value drops the `metrics!` macro to its allocating arm.
+/// Both of ours are non-literal (the metric name is a `const`, the reason is a
+/// variable), so every call built a fresh label vector.
+///
+/// It looked harmless because a refusal "should be rare". It is not: OUTSIDE
+/// 09:00-15:39 IST EVERY tick is a refusal, so the pre-open burst -- the
+/// busiest stretch of the morning -- would have allocated once per tick, on
+/// the drain task, in exactly the window the operator asked us to be strict
+/// about.
+///
+/// Resolving the three handles once at construction makes the refusal path a
+/// counter increment and nothing else. Gated by
+/// `dhat_live_ingest_seam::out_of_window_refusal_does_not_allocate_per_tick`,
+/// which feeds a 05:30 IST receipt so every frame is refused -- the gates that
+/// measure the FOLD cannot cover this path, because their receipt is
+/// deliberately in-window.
+#[derive(Debug)]
+pub(crate) struct OutOfWindowCounters {
+    /// The reason vocabulary this writer uses, parallel to `handles`.
+    ///
+    /// Carried rather than hard-coded because DEPTH speaks a different one.
+    /// `ticks` has two clocks and says `ts_out_of_window`; `market_depth` has
+    /// exactly ONE clock -- its designated `ts` IS the arrival stamp, there is
+    /// no exchange timestamp anywhere in the depth protocol -- so it says
+    /// `arrival_out_of_window`. Reusing the tick words there would tell an
+    /// operator the EXCHANGE stamped the row out of window, which is not a
+    /// thing depth can even express.
+    reasons: [&'static str; 3],
+    /// Pre-resolved handles, index-aligned with `reasons`.
+    handles: [metrics::Counter; 3],
+}
+
+impl OutOfWindowCounters {
+    pub(crate) fn new(feed: Feed, counter: &'static str, reasons: [&'static str; 3]) -> Self {
+        let make = |reason: &'static str| {
+            let c = metrics::counter!(
+                counter,
+                "feed" => feed.as_str(),
+                "reason" => reason,
+            );
+            // Seed at 0 here rather than in `register_drop_baseline`: the
+            // CloudWatch agent drops the first sample of a series it has never
+            // seen, so an unseeded counter publishes nothing on the one sample
+            // that matters. Same discipline, one place.
+            c.increment(0);
+            c
+        };
+        Self {
+            reasons,
+            handles: [make(reasons[0]), make(reasons[1]), make(reasons[2])],
+        }
+    }
+
+    /// Allocation-free on the common path: pick a pre-resolved handle,
+    /// increment, and log only on a power of two.
+    ///
+    /// The scan is over exactly THREE `&'static str` of at most 26 bytes, so
+    /// it is O(1) with a fixed bound and no allocation -- the DHAT gates on
+    /// both the tick seam and `dhat_depth_append_zero_alloc` hold it to that.
+    ///
+    /// The `warn!` lives HERE, beside the increment, and not in a helper --
+    /// because a log three functions away is a log nobody finds from the
+    /// counter. That is a readability argument, and it is the only one:
+    /// an earlier version of this comment claimed the placement also satisfied
+    /// `loss_counter_visibility_guard`, and it does NOT. Verified 2026-09-05 by
+    /// running it: the scanner resolves a `const` name alias and a local
+    /// `let h = metrics::counter!(..)` handle, but not `const -> struct field ->
+    /// method`, so it locates the emit inside `OutOfWindowCounters::new` --
+    /// where no log sits -- rather than here. That is the same chain already
+    /// allowlisted for `tv_dhan_feed_ingest_seq_refused_total`, and both of
+    /// these counters are allowlisted beside it for the same reason.
+    ///
+    /// Deliberately a log and not an EMF metric. The guard offers three routes;
+    /// this takes the log because (a) these counters measure the gate WORKING
+    /// -- outside 09:00-15:39:59 IST every row increments one of them, so an
+    /// EMF series would chart normal behaviour, not a defect -- and (b) an EMF
+    /// name costs ~0.30 USD/mo against a September forecast of 130.39 with the
+    /// automatic STOP_EC2_INSTANCES line at 135.00, i.e. 4.61 of margin, and
+    /// the noise lock's standing rule is that the next addition comes with a
+    /// LEVER, not a cost note. This change carries no lever.
+    ///
+    /// Powers of two, so a pre-open storm costs one line per doubling rather
+    /// than one per row; the running total rides in the line so a throttled
+    /// message still states the true magnitude.
+    pub(crate) fn note(&self, reason: &'static str) {
+        let mut idx = self.reasons.len() - 1;
+        let mut i = 0;
+        while i < self.reasons.len() {
+            if self.reasons[i] == reason {
+                idx = i;
+                break;
+            }
+            i += 1;
+        }
+        self.handles[idx].increment(1);
+
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if total.is_power_of_two() {
+            warn!(
+                code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+                reason,
+                refused_total = total,
+                "a row was REFUSED or flagged by the session-window gate. A \
+                 refusal is deliberate, NOT data loss: the operator's rule is \
+                 that every persisted row sits inside 09:00:00-15:39:59.999 \
+                 IST. Throttled to powers of two; refused_total is the true \
+                 running count across every gated writer in this process."
+            );
+        }
+    }
+}
+
+/// Counter for rows refused by the session-window gate.
+///
+/// A REFUSAL, not a loss — named so it can never be mistaken for one on a
+/// dashboard. `tv_ticks_dropped_total` means "rows left the fold without
+/// reaching QuestDB and are gone"; this means "rows we deliberately declined to
+/// write because they fall outside 09:00-15:39:59 IST".
+pub const TICK_OUT_OF_WINDOW_COUNTER: &str = "tv_ticks_out_of_window_refused_total";
+
+/// Refusal reason for a `ts` outside the plausible epoch band.
+///
+/// Distinct from the two `WindowVerdict` reasons because it answers a
+/// different question: those say "wrong time of day", this says "not a real
+/// date at all". Folding it into either would hide a corrupt-frame signal
+/// inside an ordinary pre-open count.
+pub const TICK_TS_OUT_OF_BAND_REASON: &str = "ts_out_of_plausible_band";
+
+/// The three reason labels `ticks` reports, in the order the counter handles
+/// are resolved.
+///
+/// Index 2 is the fallback arm of [`OutOfWindowCounters::note`], so the band
+/// reason must sit there: an unrecognised reason is counted as the most
+/// alarming of the three rather than silently attributed to a time-of-day
+/// refusal.
+pub const TICK_OUT_OF_WINDOW_REASONS: [&str; 3] = [
+    tickvault_common::session_window::WindowVerdict::TsOutOfWindow.reason(),
+    tickvault_common::session_window::WindowVerdict::ReceivedAtOutOfWindow.reason(),
+    TICK_TS_OUT_OF_BAND_REASON,
+];
+
+/// Build the session-window counters for a TICK writer.
+///
+/// Exists so [`TICK_OUT_OF_WINDOW_COUNTER`] is named exactly ONCE outside its
+/// own declaration. That is not tidiness: `loss_counter_visibility_guard`
+/// treats every line mentioning a counter const as an emit site and asks
+/// whether a log sits within twelve lines AFTER it. Spelling the const at the
+/// three struct-literal sites put it nine lines above the `error!` in the
+/// ILP-connect failure arm, so the guard reported this counter as reachable on
+/// the strength of a log about a completely different event. An accidental
+/// pass is worse than a recorded exemption -- it retires the question without
+/// answering it. With the const named only here, the guard's verdict is honest
+/// (no log is near, because the real one is in `note()` two indirections away)
+/// and the allowlist row states the reason in the open.
+fn tick_out_of_window_counters(feed: Feed) -> OutOfWindowCounters {
+    OutOfWindowCounters::new(feed, TICK_OUT_OF_WINDOW_COUNTER, TICK_OUT_OF_WINDOW_REASONS)
 }
 
 /// Publish a zero on this feed's drop series before any row can be written.
@@ -1693,6 +1863,15 @@ fn register_drop_baseline(feed: Feed) {
     // delta baseline, so the one event that invalidates the rescue proof
     // publishes nothing.
     metrics::counter!(TICK_RESCUE_ABANDONED_COUNTER, "writer" => "tick").increment(0);
+    // 2026-09-05: the session-window refusal series is seeded in
+    // `OutOfWindowCounters::new`, not here. It was seeded in BOTH places for
+    // half a day, and the copy here listed only TWO of the three reasons --
+    // `ts_out_of_plausible_band` was missing, so on the one shape that matters
+    // (a garbage epoch) the first increment would still have been swallowed as
+    // the CloudWatch delta baseline. Two seed sites for one series is how that
+    // happens: the second one is written from memory of the first. Seeding
+    // lives with the handles, which is the only place that cannot fall behind
+    // the reason vocabulary, because it IS the reason vocabulary.
     // 2026-09-05: the optional-price drop series. It fires when a tick
     // carries a non-finite optional price and that field is dropped from
     // the row — rare by construction, which is exactly what makes the
@@ -1719,6 +1898,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
+                    out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
@@ -1739,6 +1919,7 @@ impl TickWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
+                    out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
@@ -1777,6 +1958,7 @@ impl TickWriter {
             pending_min_seq: 0,
             pending_max_seq: 0,
             feed,
+            out_of_window: tick_out_of_window_counters(feed),
             last_capture_seq: 0,
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
             offload: None,
@@ -1827,7 +2009,85 @@ impl TickWriter {
     /// [`TickRow::from_parsed_tick`] refusals and ILP buffer errors.
     pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
         let outcome = match TickRow::from_parsed_tick(tick, capture_seq) {
-            Ok(row) => self.append_row(&row),
+            Ok(row) => {
+                // THE SESSION-WINDOW GATE (operator requirement, 2026-09-05).
+                //
+                // Deliberately here and NOT inside `from_parsed_tick`: every
+                // `Err` from that constructor is treated by the block below as
+                // a LOSS -- it calls `note_unapplied` and increments
+                // `tv_ticks_dropped_total`, which `dhan_ticks_dropped` PAGES
+                // on. An out-of-window tick is a deliberate refusal, not a
+                // loss, so routing it through that path would page the
+                // operator on every ordinary pre-open tick and train him to
+                // ignore the one alarm that reports real tick loss.
+                //
+                // It is also AFTER row construction rather than before, so the
+                // check reads the SAME `ts_ist_nanos` and `received_at_ist_nanos`
+                // the row would have carried -- including the sentinel-LTT
+                // fallback, where `ts` becomes the receipt. Checking the raw
+                // `ParsedTick` would test a different pair of numbers than the
+                // ones that reach the table.
+                //
+                // `note_unapplied` is deliberately NOT called: the frame is
+                // handled, not deferred. Re-offering it on the next replay
+                // would refuse it again forever.
+                //
+                // THE ABSOLUTE BAND, checked BEFORE the window (2026-09-05).
+                //
+                // `session_window` asks only "what time of DAY is this?" —
+                // `(nanos / 1e9) % 86_400`. That is the operator's requirement
+                // and it is deliberately date-blind, which leaves a hole this
+                // gate must close rather than inherit: `exchange_timestamp` is
+                // a raw `u32` off the wire, so a garbage `2_600_000_000`
+                // (year 2052) has seconds-of-day 51_200 = 14:13:20 and reads
+                // as perfectly in-window.
+                //
+                // `row_timestamp_ist_nanos` already carries a band ceiling for
+                // exactly this reason, but its out-of-band arm FALLS BACK to
+                // the receipt — and when the receipt is absent (a pre-TVW3 WAL
+                // record, or a receipt `plausible_receipt_nanos` mapped to 0)
+                // the fallback is the out-of-band LTT itself. `ts` is the
+                // DESIGNATED timestamp, so such a row opens a far-future
+                // QuestDB partition that retention and archival — both keyed
+                // on the trading day — can never reach, while every `max(ts)`
+                // over `ticks` silently includes it.
+                //
+                // The band is READ from `tickvault_trading`, never re-declared
+                // here: `constants.rs` records that two constants naming the
+                // same bound with different values is the real hazard, because
+                // a future reader tightening one would change nothing and
+                // believe otherwise.
+                {
+                    use tickvault_trading::candles::multi_tf_aggregator::{
+                        MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+                    };
+                    let secs = row.ts_ist_nanos.div_euclid(1_000_000_000);
+                    let in_band = u32::try_from(secs).is_ok_and(|s| {
+                        (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+                            // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+                            .contains(&s)
+                    });
+                    if !in_band {
+                        self.out_of_window.note(TICK_TS_OUT_OF_BAND_REASON);
+                        return Ok(());
+                    }
+                }
+                let verdict = tickvault_common::session_window::verdict(
+                    row.ts_ist_nanos,
+                    row.received_at_ist_nanos,
+                );
+                // COUNT first, REFUSE second, and they are not the same set.
+                // A late RECEIPT is noteworthy but never a refusal -- see
+                // `WindowVerdict::is_refusal`, which records why refusing it
+                // was destroying the closing auction at the measured p99 lag.
+                if verdict.is_noteworthy() {
+                    self.out_of_window.note(verdict.reason());
+                }
+                if verdict.is_refusal() {
+                    return Ok(());
+                }
+                self.append_row(&row)
+            }
             Err(err) => Err(err.into()),
         };
         if let Err(err) = &outcome {
@@ -1872,6 +2132,15 @@ impl TickWriter {
 
     /// Appends one prepared [`TickRow`] to the ILP buffer (no flush).
     ///
+    /// **`pub(crate)`, and that visibility is the point.** This is the raw
+    /// append: it does NOT consult the session window. The gate lives one
+    /// level up in [`TickWriter::append_tick_with_seq`], so a caller reaching
+    /// this directly writes an ungated row. It was `pub` until 2026-09-05 with
+    /// no caller outside this crate — an open door nobody had walked through
+    /// yet, which is exactly when a door is cheap to close. Narrowing it means
+    /// a future bypass has to be written inside `tickvault-storage`, where the
+    /// gate's own tests live and where a reviewer is looking for it.
+    ///
     /// ILP requires every SYMBOL before any field column, so `segment` and
     /// `feed` are written first. Both are routed through `sanitize_ilp_symbol`
     /// (defence in depth against line-protocol injection) even though both come
@@ -1880,7 +2149,7 @@ impl TickWriter {
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_row(&mut self, row: &TickRow) -> Result<()> {
+    pub(crate) fn append_row(&mut self, row: &TickRow) -> Result<()> {
         let feed = self.feed.as_str();
         self.buffer
             .table(TICKS_TABLE)
@@ -2862,14 +3131,72 @@ mod tests {
             .to_path_buf()
     }
 
+    /// BITE TEST (2026-09-05) — a year-2052 LTT that reads as 14:13:20 IST.
+    ///
+    /// The session-window check is `(nanos / 1e9) % 86_400` — deliberately
+    /// date-blind, because the operator's rule is about the time of DAY. That
+    /// leaves a hole an adversarial sweep found: `exchange_timestamp` is a raw
+    /// `u32`, and `2_600_000_000` (year 2052) has seconds-of-day 51_200, i.e.
+    /// 14:13:20 — squarely inside 09:00-15:39.
+    ///
+    /// `row_timestamp_ist_nanos` has a band ceiling for exactly this, but its
+    /// out-of-band arm falls back to the RECEIPT, and with no receipt (a
+    /// pre-TVW3 WAL record, or one `plausible_receipt_nanos` mapped to 0) the
+    /// fallback is the out-of-band stamp itself. `ts` is the DESIGNATED
+    /// timestamp, so the row would open a year-2052 QuestDB partition that
+    /// retention and archival — both keyed on the trading day — can never
+    /// reach.
+    ///
+    /// Bite-proven: deleting the band block in `append_tick_with_seq` makes
+    /// this fail with `pending() == 1`.
+    #[test]
+    fn a_far_future_ltt_that_looks_in_window_is_refused_not_written() {
+        let mut tick = sample_tick();
+        tick.exchange_timestamp = 2_600_000_000; // year 2052
+        tick.received_at_nanos = 0; // no receipt => no fallback to rescue it
+        let row = TickRow::from_parsed_tick(&tick, 1).expect("row must build"); // APPROVED: test
+        let secs_of_day = row.ts_ist_nanos.div_euclid(1_000_000_000) % 86_400;
+        assert_eq!(
+            secs_of_day, 51_200,
+            "the fixture must actually LOOK in-window (14:13:20 IST), or this \
+             test proves nothing about the hole it exists for"
+        );
+
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&tick, 1)
+            .expect("a refusal is Ok(()) -- never an Err, which would be counted as a loss");
+        assert_eq!(
+            w.pending(),
+            0,
+            "a year-2052 stamp must be REFUSED even though its seconds-of-day \
+             sit inside the session window"
+        );
+    }
+
+    /// The fixture instant is INSIDE the 09:00-15:39 IST session window, and
+    /// that is load-bearing rather than cosmetic (2026-09-05).
+    ///
+    /// `append_tick_with_seq` now refuses any row whose `ts` or `received_at`
+    /// falls outside that window (the operator's data-side capture rule). The
+    /// fixture used to sit at 20:26:40 IST, so once the gate landed EVERY test
+    /// that appends a sample tick buffered zero rows and asserted against an
+    /// empty buffer.
+    ///
+    /// Both clocks are pinned deliberately, because they are derived
+    /// differently and only one of them is the exchange stamp:
+    ///   * `exchange_timestamp` is IST epoch SECONDS verbatim -> 12:30:00 IST.
+    ///   * `received_at_nanos` is UTC and has `IST_UTC_OFFSET_NANOS` ADDED by
+    ///     `from_parsed_tick`, so it is stamped 5h30m EARLIER to land on the
+    ///     same 12:30:00.111 IST instant.
+    /// Moving either one out of the window silently empties the buffer again.
     fn sample_tick() -> ParsedTick {
         ParsedTick {
             security_id: 13,
             exchange_segment_code: 0, // IDX_I
             last_traded_price: 23_146.45,
             last_trade_quantity: 50,
-            exchange_timestamp: 1_780_000_000,
-            received_at_nanos: 1_780_000_000_111_000_000,
+            exchange_timestamp: 1_779_971_400,
+            received_at_nanos: 1_779_951_600_111_000_000,
             average_traded_price: 23_145.1,
             volume: 1_234_567,
             total_sell_quantity: 9_000,
@@ -3325,7 +3652,7 @@ mod tests {
         for i in 0..N {
             let mut tick = sample_tick();
             // Same instrument, same wall-clock SECOND for every tick.
-            tick.exchange_timestamp = 1_780_000_000;
+            tick.exchange_timestamp = 1_779_971_400;
             tick.last_traded_price = ltps[i % ltps.len()];
             tick.volume = 0; // index shape: value-identical rows
             let seq = next_capture_seq();
@@ -3372,7 +3699,7 @@ mod tests {
         let mut keys = Vec::new();
         for i in 0..8 {
             let mut tick = sample_tick();
-            tick.exchange_timestamp = 1_780_000_000;
+            tick.exchange_timestamp = 1_779_971_400;
             tick.last_traded_price = 23_100.0 + i as f32;
             let row = TickRow::from_parsed_tick(&tick, 7).expect("row");
             keys.push((
@@ -3590,7 +3917,7 @@ mod tests {
         assert!(line.contains("volume=1234567i"), "volume: {line}");
         assert!(line.contains("oi=987654i"), "oi: {line}");
         assert!(
-            line.contains("exchange_timestamp=1780000000i"),
+            line.contains("exchange_timestamp=1779971400i"),
             "ltt: {line}"
         );
         // Symbols must precede all field columns (ILP requirement).
@@ -3611,7 +3938,7 @@ mod tests {
         tick.security_id = 25;
         tick.exchange_segment_code = 0;
         tick.last_traded_price = 51_234.55;
-        tick.exchange_timestamp = 1_780_000_000;
+        tick.exchange_timestamp = 1_779_971_400;
         let row = TickRow::from_parsed_tick(&tick, 9).expect("row");
         assert_eq!(row.open, None);
         assert_eq!(row.high, None);

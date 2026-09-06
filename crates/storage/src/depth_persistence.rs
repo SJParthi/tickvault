@@ -518,6 +518,58 @@ fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
 /// budget would let depth starve the tick rescue.
 pub const DEPTH_SPILL_DIR: &str = "data/spill/depth";
 
+/// Counter for depth rows refused by the session-window gate.
+///
+/// A REFUSAL, not a loss — named so it can never be mistaken for one on a
+/// dashboard. `tv_depth_rows_dropped_total` means "rows left the buffer
+/// without reaching QuestDB and are gone", and it is ALARMED
+/// (`loss-and-retention-alarms.tf`); this means "rows we deliberately declined
+/// to write because they fall outside 09:00–15:39:59 IST".
+pub const DEPTH_OUT_OF_WINDOW_COUNTER: &str = "tv_depth_rows_out_of_window_refused_total";
+
+/// The three reason labels `market_depth` reports.
+///
+/// # Why these words and not the tick ones
+///
+/// Depth carries exactly ONE clock. `DepthRow::ts_nanos` is the ARRIVAL stamp
+/// (`dhan_feed_stack.rs` sets it from `received_at_nanos + IST_UTC_OFFSET`),
+/// and the depth protocol has no exchange timestamp at all — the packet header
+/// is message length, response code, segment, security id and a
+/// sequence/row-count field, and `crates/core/src/parser/depth.rs` contains
+/// zero timestamp tokens. `websocket-enforcement.md` rule 4 says so and is
+/// correct: *"Depth has NO timestamp. Only `received_at_nanos`."*
+///
+/// So saying `ts_out_of_window` here would tell an operator the EXCHANGE
+/// stamped the row outside the session — a claim depth cannot even express.
+/// It says `arrival_out_of_window`, which is the truth.
+///
+/// `arrival_unknown` is the pre-`TVW3` WAL sentinel. Those records carry no
+/// receipt, `ws_frame_spill` maps it to 0, and the row is then stamped
+/// `0 + IST_UTC_OFFSET_NANOS` = 1970-01-01 05:30 IST. Refusing it is right —
+/// it would open a 1970 partition that retention and archival, both keyed on
+/// the trading day, can never reach — but it is a DIFFERENT operational fact
+/// from "we are outside market hours", so it gets its own label rather than
+/// masquerading as one.
+pub const DEPTH_OUT_OF_WINDOW_REASONS: [&str; 3] = [
+    "arrival_out_of_window",
+    "arrival_unknown",
+    "arrival_out_of_plausible_band",
+];
+
+/// Build the session-window counters for a DEPTH writer.
+///
+/// Same reason as `tick_out_of_window_counters`: naming
+/// [`DEPTH_OUT_OF_WINDOW_COUNTER`] once, in a body with no log near it, keeps
+/// `loss_counter_visibility_guard`'s verdict honest instead of letting it pass
+/// on an unrelated `error!` twelve lines down a struct literal.
+fn depth_out_of_window_counters(feed: Feed) -> crate::tick_persistence::OutOfWindowCounters {
+    crate::tick_persistence::OutOfWindowCounters::new(
+        feed,
+        DEPTH_OUT_OF_WINDOW_COUNTER,
+        DEPTH_OUT_OF_WINDOW_REASONS,
+    )
+}
+
 /// Hard ceiling on the depth spill directory, in bytes (512 MiB).
 ///
 /// **The bound is explicit because the disk is the thing that fails first.**
@@ -939,6 +991,10 @@ pub struct DepthWriter {
     pending_min_seq: u64,
     pending_max_seq: u64,
     feed: Feed,
+    /// Pre-resolved session-window refusal counters. See
+    /// [`DEPTH_OUT_OF_WINDOW_REASONS`] for why depth speaks a different
+    /// reason vocabulary than `ticks`.
+    out_of_window: crate::tick_persistence::OutOfWindowCounters,
     /// Rows that left the buffer without reaching QuestDB, across this
     /// writer's lifetime.
     ///
@@ -1066,6 +1122,7 @@ impl DepthWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
+                    out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
@@ -1089,6 +1146,7 @@ impl DepthWriter {
                     pending_min_seq: 0,
                     pending_max_seq: 0,
                     feed,
+                    out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
                     rescued: 0,
                     spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
@@ -1119,6 +1177,7 @@ impl DepthWriter {
             pending_min_seq: 0,
             pending_max_seq: 0,
             feed,
+            out_of_window: depth_out_of_window_counters(feed),
             dropped: 0,
             rescued: 0,
             spill_dir: temp_depth_spill_dir(),
@@ -1217,6 +1276,80 @@ impl DepthWriter {
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
+        // ---- SESSION-WINDOW GATE ----------------------------------------
+        //
+        // Placed INSIDE `append_row` but BEFORE `append_row_inner`, and it
+        // returns `Ok(())` on a refusal. Both halves are load-bearing.
+        //
+        // `append_row` calls `note_unapplied` on EVERY `Err`, and all three
+        // callers in `dhan_feed_stack.rs` treat a non-`Ok` as `depth_refused`
+        // feeding `tv_depth_rows_dropped_total`, which IS alarmed
+        // (`loss-and-retention-alarms.tf`). So returning `Err` here would do
+        // three wrong things at once: page the operator on every ordinary
+        // pre-open snapshot, count a deliberate refusal as data loss, and
+        // mark the frame unapplied so the next replay re-offers it, is
+        // refused again, and marks it unapplied again -- forever.
+        //
+        // Returning `Ok(())` states the truth: the frame is HANDLED, not
+        // deferred. The tick writer records the identical reasoning.
+        //
+        // Depth carries ONE clock. `ts_nanos` IS the arrival stamp and no
+        // exchange timestamp exists in the depth protocol, so `None` is the
+        // honest second argument -- passing `Some(row.ts_nanos)` would check
+        // one number twice and could never produce a distinct verdict.
+        {
+            // The WAL sentinel first: a pre-TVW3 record carries no receipt,
+            // which becomes exactly `IST_UTC_OFFSET_NANOS` after stamping.
+            // It IS out of window, but "an old WAL format is being replayed"
+            // and "we are outside market hours" are different operational
+            // facts and must not share a label.
+            //
+            // ## Why depth REFUSES this and ticks ACCEPT the same situation
+            //
+            // `session_window::verdict` treats a `None` receipt on a TICK as
+            // "unknown, not a refusal" and writes the row. This arm refuses.
+            // That looks inconsistent and is not, because the missing value
+            // does not play the same role in the two tables:
+            //
+            //   * a tick carries TWO clocks. A pre-TVW3 tick still has its
+            //     EXCHANGE stamp, which is a real observation of when the
+            //     trade happened, so only the delivery time is unknown and
+            //     the row is worth keeping.
+            //   * depth carries ONE. `ts_nanos` IS the receipt, so a record
+            //     with no receipt has no usable timestamp at all -- the value
+            //     here is the bare IST offset, i.e. 1970-01-01 05:30.
+            //
+            // Writing it would not preserve an observation, it would FABRICATE
+            // one, and it would open a 1970 partition that retention and
+            // archival -- both keyed on the trading day -- can never reach.
+            // The refusal is counted under its own reason so an operator can
+            // tell "an old WAL format is being replayed" from "we are outside
+            // market hours"; the bytes stay on disk in the WAL segment.
+            if row.ts_nanos == tickvault_common::constants::IST_UTC_OFFSET_NANOS {
+                self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[1]);
+                return Ok(());
+            }
+            // Absolute epoch band BEFORE the time-of-day check: the window
+            // question is deliberately date-blind, so a corrupt far-future
+            // stamp whose seconds-of-day happen to land inside 09:00-15:40
+            // would read as perfectly in-window and open a partition that
+            // retention and archival can never reach.
+            let secs = row.ts_nanos.div_euclid(1_000_000_000);
+            let in_band = u32::try_from(secs).is_ok_and(|s| {
+                (tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+                    ..=tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+                    // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+                    .contains(&s)
+            });
+            if !in_band {
+                self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[2]);
+                return Ok(());
+            }
+            if !tickvault_common::session_window::row_is_in_an_open_window(row.ts_nanos) {
+                self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[0]);
+                return Ok(());
+            }
+        }
         let outcome = self.append_row_inner(row);
         if outcome.is_err() {
             // Captured to the WAL, never reaching the database from this
@@ -2527,7 +2660,18 @@ mod tests {
             quantity: 750,
             orders: 12,
             capture_seq: 1,
-            ts_nanos: 1_700_000_000_000_000_000,
+            // 12:30:00 IST, mid-session, and that is now load-bearing.
+            //
+            // This was 1_700_000_000 (22:13:20 IST) until 2026-09-05, which
+            // was fine while nothing read the clock and became a silent
+            // 20-test failure the moment the session-window gate landed: the
+            // gate refused every row, so each test asserted against an empty
+            // buffer. The tick fixture hit the identical wall the same day.
+            //
+            // Derived, not guessed: 1_700_000_000 - (1_700_000_000 % 86_400)
+            // is that day's IST midnight, + 45_000 s puts it at 12:30:00.
+            // Moving it outside 09:00:00-15:39:59.999 empties the buffer again.
+            ts_nanos: 1_699_965_000_000_000_000,
         }
     }
 
@@ -3605,6 +3749,107 @@ mod tests {
             r.depth_kind = kind;
             r.side = side;
             w.append_row(&r).expect("proven labels must append"); // APPROVED: test-only
+        }
+    }
+
+    /// Depth's own out-of-window refusal, and it must NOT read as a loss.
+    ///
+    /// The three counters the callers watch (`tv_depth_rows_dropped_total`
+    /// and its rescued twin) must be untouched, and `append_row` must return
+    /// `Ok(())` -- an `Err` here would mark the frame unapplied and the next
+    /// replay would refuse it again, forever, paging on every cycle.
+    #[test]
+    fn an_out_of_window_depth_row_is_refused_as_ok_never_as_a_loss() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        // 22:13:20 IST -- the old fixture value, now a refusal.
+        r.ts_nanos = 1_700_000_000_000_000_000;
+        assert!(
+            w.append_row(&r).is_ok(),
+            "a refusal is Ok(()): an Err marks the frame unapplied and the \
+             callers count it as tv_depth_rows_dropped_total, which is alarmed"
+        );
+        assert_eq!(w.pending, 0, "the refused row must not reach the buffer");
+        assert_eq!(w.dropped, 0, "a refusal is NOT a drop");
+        assert_eq!(w.rescued, 0, "and it is not a rescue either");
+    }
+
+    /// The pre-TVW3 WAL sentinel: no receipt at all.
+    ///
+    /// `ws_frame_spill` maps an absent receipt to 0, and the depth row is then
+    /// stamped `0 + IST_UTC_OFFSET_NANOS` = 1970-01-01 05:30 IST. It must be
+    /// refused -- a 1970 partition is unreachable by retention and archival,
+    /// both of which key on the trading day -- but under its OWN reason, not
+    /// as an ordinary out-of-hours row.
+    #[test]
+    fn the_pre_tvw3_wal_sentinel_is_refused_under_its_own_reason() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.ts_nanos = tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(w.pending, 0);
+        assert_eq!(w.dropped, 0);
+        assert_ne!(
+            DEPTH_OUT_OF_WINDOW_REASONS[1], DEPTH_OUT_OF_WINDOW_REASONS[0],
+            "the sentinel must be distinguishable from an out-of-hours row"
+        );
+    }
+
+    /// A corrupt far-future stamp whose TIME OF DAY looks perfectly normal.
+    ///
+    /// 2_600_000_000 s is in the year 2052; its seconds-of-day is 51_200 =
+    /// 14:13:20, squarely inside the session. Only the absolute band check
+    /// catches it, which is why that check runs BEFORE the window check.
+    #[test]
+    fn a_far_future_depth_stamp_that_looks_in_window_is_refused() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.ts_nanos = 2_600_000_000_i64 * 1_000_000_000;
+        assert_eq!(
+            (2_600_000_000_i64 % 86_400) as u32,
+            51_200,
+            "fixture precondition: this stamp's time-of-day IS in window"
+        );
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(w.pending, 0, "the band check must refuse it anyway");
+    }
+
+    /// Depth speaks `arrival_*`, never `ts_*`.
+    ///
+    /// Depth has ONE clock and it is the arrival stamp; there is no exchange
+    /// timestamp in the depth protocol at all. A reason label saying `ts_`
+    /// would tell an operator the EXCHANGE stamped the row out of window --
+    /// a claim depth cannot express.
+    #[test]
+    fn every_depth_reason_says_arrival_because_depth_has_no_exchange_clock() {
+        for reason in DEPTH_OUT_OF_WINDOW_REASONS {
+            assert!(
+                reason.starts_with("arrival_"),
+                "{reason} must say arrival: DepthRow::ts_nanos IS the receipt"
+            );
+        }
+        let mut seen = DEPTH_OUT_OF_WINDOW_REASONS;
+        seen.sort_unstable();
+        seen.windows(2).for_each(|w| {
+            assert_ne!(w[0], w[1], "two reasons must never share a metric label");
+        });
+    }
+
+    /// The boundary the operator asked for, on the depth path specifically.
+    #[test]
+    fn depth_accepts_the_last_in_window_instant_and_refuses_the_next() {
+        let midnight = 1_699_920_000_i64;
+        for (sod, want_pending, label) in [
+            (32_400_i64, 1_usize, "09:00:00 accepted"),
+            (56_399, 1, "15:39:59 accepted"),
+            (56_400, 0, "15:40:00 refused"),
+            (32_399, 0, "08:59:59 refused"),
+        ] {
+            let mut w = DepthWriter::for_test(Feed::Dhan);
+            let mut r = row();
+            r.ts_nanos = (midnight + sod) * 1_000_000_000;
+            assert!(w.append_row(&r).is_ok(), "{label}: always Ok");
+            assert_eq!(w.pending, want_pending, "{label}");
         }
     }
 }

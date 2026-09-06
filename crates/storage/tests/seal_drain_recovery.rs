@@ -141,7 +141,24 @@ fn cleanup(spill: &Path, dlq: &Path) {
     }
     let _ = std::fs::remove_dir_all(dlq);
 }
+/// IST-epoch seconds for 09:15:00 on a real trading date, the base every
+/// candle fixture in this file counts minutes from. See `mk_seal`.
+const CANDLE_FIXTURE_BUCKET_BASE: u32 = 1_716_023_700;
 
+/// Build a seal whose bucket is a REAL IST epoch, not a seconds-of-day value.
+///
+/// `bucket_start_ist_secs` is a full IST epoch — `ShadowSealRow` converts it
+/// with `* 1_000_000_000` and nothing adds a date. The fixtures here used
+/// `34_200` (and `40_000`), which read as 09:30 and 11:06 seconds-of-day and
+/// are in fact **1970-01-01**. That was invisible until the session-window
+/// gate landed on 2026-09-05: its plausible-epoch band refused them, the
+/// refusal returns `Ok`, and two tests that meant to prove "a dead DB commits
+/// nothing" started reporting three commits. The fixture was measuring the
+/// band check, not the database.
+///
+/// So the epoch base below is deliberate and load-bearing: `1_716_023_700`
+/// is 09:15:00 by the seconds-of-day arithmetic the gate actually uses
+/// (1_716_023_700 % 86_400 = 33_300), and it sits inside the plausible band.
 fn mk_seal(sid: u64, bucket: u32) -> BufferedSeal {
     let mut state = LiveCandleState::empty();
     state.bucket_start_ist_secs = bucket;
@@ -161,7 +178,7 @@ fn spill_n(dir: &Path, n: u64) -> Vec<(u64, u8, u32)> {
     let writer = SealSpillWriter::with_spill_dir_for_test(dir.to_path_buf());
     let mut keys = Vec::new();
     for i in 0..n {
-        let seal = mk_seal(1000 + i, 34_200 + (i as u32) * 60);
+        let seal = mk_seal(1000 + i, CANDLE_FIXTURE_BUCKET_BASE + (i as u32) * 60);
         writer
             .append_seal(&SerializedSeal::from(&seal), NOW)
             .expect("spill append");
@@ -180,7 +197,7 @@ fn dlq_n(dir: &Path, n: u64) -> Vec<(u64, u8, u32)> {
     let writer = SealDlqWriter::with_dlq_dir_for_test(dir.to_path_buf());
     let mut keys = Vec::new();
     for i in 0..n {
-        let seal = mk_seal(7000 + i, 40_000 + (i as u32) * 60);
+        let seal = mk_seal(7000 + i, CANDLE_FIXTURE_BUCKET_BASE + 600 + (i as u32) * 60);
         let record = SealDlqRecord::from(&SerializedSeal::from(&seal));
         writer.append_record(&record, NOW).expect("dlq append");
         keys.push((
@@ -528,7 +545,7 @@ fn real_rescue_path_end_to_end_is_recovered() {
     let mut writer = ShadowCandleWriter::for_test();
     let mut expected = Vec::new();
     for i in 0..8u64 {
-        let seal = mk_seal(2000 + i, 34_200 + (i as u32) * 60);
+        let seal = mk_seal(2000 + i, CANDLE_FIXTURE_BUCKET_BASE + (i as u32) * 60);
         expected.push((
             seal.security_id,
             seal.exchange_segment_code,
