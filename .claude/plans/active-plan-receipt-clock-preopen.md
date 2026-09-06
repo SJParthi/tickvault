@@ -1,6 +1,23 @@
 # Implementation Plan: Receipt-clock OHLCV, 09:00 candles, per-minute ATM re-fit, percentage columns
 
-**Status:** APPROVED
+**Status:** VERIFIED (2026-09-06 — every item checked; see the honesty note below)
+
+> **⚠ What VERIFIED rests on here, and what it does NOT.**
+>
+> `plan-verify.sh` reports `PASS: No active implementation plan` for this file,
+> and that PASS is **VACUOUS**: the hook hardcodes
+> `PLAN_FILE=".claude/plans/active-plan.md"` and never globs `active-plan-*.md`,
+> so it has not inspected a single item here. Recorded rather than cited,
+> because leaning on it would be exactly the accidental-pass class this plan's
+> own items were corrected for.
+>
+> The asymmetry is worth naming for a future session: `plan-gate.sh` (the
+> design-first wall) DOES scan every `active-plan*.md`, while `plan-verify.sh`
+> reads only the singular name. So a multi-file plan is GATED on entry and
+> UNVERIFIED on exit. Closing that is its own change, not this one.
+>
+> This VERIFIED therefore rests on the per-item evidence recorded in each block
+> — source citations, measured test counts, and bite-proofs — not on the hook.
 **Date:** 2026-08-28
 **Approved by:** Parthiban (operator) — verbatim, this session: *"Yes fox and resolve everything always ensure to start eelvery candles starting at 9 am dude okay"* / *"Meanwhile ensure to achieve this ohlcv based on one and only received at dude okay?"* / *"See clealry ensure whenever the pre marketbope ticks and candles get finished ensure to provide this fucking atm plus minus depths also dude and starting 9.16 am every one minute resubscribe also right dude of current atm and what about pre oopem marketbpercentage change and even percentage change also dude okay?"*
 **Authority:** `.claude/rules/project/websocket-connection-scope-lock.md` § "2026-08-28 — CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK…" (landed before this plan, per the rule-file-first law)
@@ -362,7 +379,62 @@ needs its own dated authorization under the noise lock.
     `Instant` (meaningless across processes, which is the whole point of the
     replay path).
 
-- [ ] **W2** Candles bucket on `received_at`  *(REMAINING — **UNBLOCKED 2026-09-06**; W1b is complete and behaviourally tested, so a large positive receipt-vs-exchange delta is no longer indistinguishable from a replay: replayed frames now carry their ORIGINAL receipt, and only genuinely-receipt-less v1/v2 records fall back to the sentinel)*
+- [x] **W2** Candles bucket on `received_at`
+  - **⚠ CORRECTED 2026-09-06: the CODE was already complete, and the research
+    block below is what a correct design note looks like AFTER it shipped.**
+    This is the FOURTH item in this plan found already-built (after W5, W1b,
+    and two claims inside this very block). Same pattern every time: a status
+    line written from a partial read outlives the code that refuted it.
+  - **All five coupled sites verified on `fold_secs` in source 2026-09-06** --
+    the four the research block below names, plus the bucket itself:
+
+    | Site | Reads |
+    |---|---|
+    | bucket (`aggregator_cell`) | `fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos)` |
+    | watermark advance | `if fold_secs > self.watermark_secs` |
+    | seconds-of-day session gate | `let secs_of_day = fold_secs % 86_400` |
+    | `close_ts_ist_secs` | `close_ts_ist_secs: fold_secs` |
+    | `tick_is_newest` ordering | `fold_secs >= state.close_ts_ist_secs` |
+
+  - **One deliberate deviation from this plan, and the implementation is
+    right.** The block below lists the stale-trading-day gate as MUST-NOT-MOVE.
+    It DOES read `fold_secs` -- and must, because it compares against a
+    watermark that is itself advanced by `fold_secs`. The site says so: *"A
+    packet near midnight whose receipt crosses the day boundary advances the
+    watermark into day D+1 and is then rejected by its own advance as
+    `stale_trading_day`. Comparing like with like removes the shape entirely."*
+    The plan's rule was about not using the RAW receipt; comparing a fold-clock
+    day against a fold-clock watermark is self-consistent, which is the actual
+    requirement.
+  - **The two genuine MUST-NOT-MOVE sites are verified UNMOVED:** `ws_lag_ms`
+    still takes `tick.exchange_timestamp`, and `row_timestamp_ist_nanos` still
+    takes the exchange stamp with the receipt only as the sentinel fallback.
+
+  - **What was genuinely missing, and is fixed here: the COUPLING was
+    unpinned.** The research block calls the split the trap -- *"Moving the
+    bucket clock alone leaves ordering deciding on one clock and bucketing on
+    another"* -- and nothing enforced it. Each site is individually correct on
+    either clock; only their AGREEMENT is the property, and no test asserted
+    it. MEASURED by planting the reverts:
+
+    | Plant | Caught by |
+    |---|---|
+    | `tick_is_newest` back on the exchange stamp | the existing `the_close_is_owned_by_the_last_packet_we_received` -- already covered |
+    | **watermark advance back on the exchange stamp** | **NOTHING. All 1,703 trading lib tests PASSED.** Only the new guard bites |
+    | `ws_lag_ms` moved onto the fold clock | **NOTHING.** New guard bites |
+
+  - **`ws_lag_ms` is the dangerous one and now has its own guard.** The fold
+    clock IS the receipt whenever the receipt is plausible, so feeding it in as
+    the exchange stamp makes `lag = received - received`: every lag collapses
+    to ~0. That is not an error value -- `WsLag::Measured(0.0)` is legal -- so
+    every histogram flattens, the per-connection p99 reads perfect, and
+    `tv-<env>-dhan-worst-socket-deaf` can never fire again. It would erase the
+    MEASURED p50 1.38 s / p99 46.37 s / max 198.69 s this feed actually
+    delivers, and a tidy "move every clock read onto fold_secs" refactor would
+    do it while passing CI.
+  - New guards: `crates/trading/tests/fold_clock_coupling_guard.rs` (5 tests)
+    and `crates/app/tests/ws_lag_clock_guard.rs` (2 tests, one of which
+    DEMONSTRATES the collapse arithmetically rather than arguing it).
   - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
   - Tests: T4, T5, T16
   - **Research complete 2026-08-28. Three findings that shape the design:**
