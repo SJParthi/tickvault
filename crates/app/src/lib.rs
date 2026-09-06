@@ -183,6 +183,10 @@ pub mod rest_candle_fold;
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
 pub mod volume_leaderboard;
+/// Settles what the Dhan WebSocket `volume` field actually MEANS (running day
+/// total vs per-packet quantity) from data already on disk — the premise the
+/// whole volume-ranked depth steering rests on, which no Dhan document states.
+pub mod volume_semantics_probe;
 // PR #4 (2026-05-19): depth-20 / depth-200 modules DELETED (operator-locked
 // per websocket-connection-scope-lock.md — 4-IDX_I uses 1 main-feed conn
 // + 1 order-update conn only).
