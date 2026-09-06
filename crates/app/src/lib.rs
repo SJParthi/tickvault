@@ -95,6 +95,12 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// The previous close per instrument, fed from the response-code-6 packets
+/// the drain used to decode and discard. Without it the gainer-eligibility
+/// filter has nothing to divide by.
+/// Which underlying a contract belongs to — built from the chain leg the
+/// lane already runs, published lock-free for the drain to read.
+pub mod contract_underlying_map;
 /// Once-per-trading-day delivery markers for daily scheduled tasks
 /// (Telegram cleanliness overhaul, coordinator-relayed directive
 /// 2026-07-15). Fail-open advisory files under `data/state/daily/` —
@@ -171,9 +177,6 @@ pub mod disk_pressure_boot;
 /// RAMSTORE-01 runbook: `.claude/rules/project/ram-store-error-codes.md`.
 pub mod market_ram_store_boot;
 pub mod movers;
-/// The previous close per instrument, fed from the response-code-6 packets
-/// the drain used to decode and discard. Without it the gainer-eligibility
-/// filter has nothing to divide by.
 pub mod prev_close_store;
 /// REST-era multi-TF candle derivation (operator directive 2026-07-16):
 /// folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
