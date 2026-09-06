@@ -73,8 +73,10 @@
 //! two combine as a `max`: the more protective of the two, never the less.
 //! See [`SESSION_BURN_BYTES_DEFAULT`], which also records why it ships INERT.
 //!
-//! **What this does NOT do.** It does not stop the disk burning 138 GB a
-//! session — depth is 80% of that and untouched here. It does not make the ILP
+//! **What this does NOT do.** It does not stop the disk burning a session's
+//! worth of space — **138 GB when this was written, MEASURED at ~307 GB on
+//! 2026-09-01** (see the correction on [`SESSION_BURN_BYTES_DEFAULT`]) — depth
+//! is 80% of that and untouched here. It does not make the ILP
 //! flush faster, and it does not remove backpressure; it arms the existing
 //! relief valve early enough to matter instead of after the volume is full.
 
@@ -336,6 +338,42 @@ pub fn decide_shed_level(
 ///
 /// Set it to the MEASURED burn of a real session, not to an estimate. The
 /// 2026-08-28 figure is 138 GB.
+///
+/// # ⚠ CORRECTED 2026-09-06 — the burn has MORE THAN DOUBLED since that figure
+///
+/// The 138 GB above is the 2026-08-28 measurement and is the number an operator
+/// would arm this with. It is now **2.2× low**. Measured 2026-09-01 from
+/// `tv_spill_dir_free_bytes`: the box booted at ~309.6 GB free and ended the
+/// session at 2.4 GB — a burn of **~307 GB in one session**. The volume has
+/// since grown 300 → 600 GB, so free at open is ~626.7 GB.
+///
+/// What that changes for whoever arms this:
+///
+/// | | at 138 GB (quoted) | at 307 GB (measured) |
+/// |---|---:|---:|
+/// | runway at open, 600 GB volume | 4.54 sessions | **2.04 sessions** |
+/// | sheds INLINE depth below | 207 GB free | **460 GB free** |
+/// | sheds ALL depth below | 138 GB free | **307 GB free** |
+///
+/// So at the real burn this arms **mid-session on an ordinary day** — inline
+/// depth stops after ~166 GB is written, roughly early afternoon — where the
+/// quoted figure implies it would barely arm at all. That is not an argument
+/// against arming it; it is the argument for arming it with the RIGHT number,
+/// because the decision the paragraph above calls an operator's is a different
+/// decision at 307 than at 138.
+///
+/// It is also why the fractional bars did not save 2026-09-04: at 15%/8% of a
+/// 600 GB volume they sit at 90/48 GB, i.e. after ~537 GB of a ~307 GB session
+/// has been written — arithmetically unreachable before the disk is full. This
+/// module's own header predicted exactly that: *"grow the volume and every
+/// fractional bar moves FURTHER AWAY in bytes while the daily burn is
+/// unchanged, so the most obvious remedy — a bigger disk — disarms the safety
+/// net."* The volume then doubled.
+///
+/// **STILL INERT, deliberately.** Arming it remains the operator decision the
+/// paragraph above describes, and this correction does not make it. What it
+/// removes is the possibility of making that decision against a number that is
+/// less than half the real one.
 pub const SESSION_BURN_BYTES_DEFAULT: u64 = 0;
 
 /// Sessions of runway below which inline depth stops being captured.
