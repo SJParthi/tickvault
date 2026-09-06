@@ -110,23 +110,114 @@ rather than hidden.
 
 ## Plan Items
 
-- [ ] Item 1 — `crates/app/src/volume_leaderboard.rs`: capped map, monotonicity gate, family split, O(n) top-K into a reusable buffer
+- [x] Item 1 — `crates/app/src/volume_leaderboard.rs`: capped map, monotonicity gate, family split, O(n) top-K into a reusable buffer
   - Files: `crates/app/src/volume_leaderboard.rs`, `crates/app/src/lib.rs`
   - Tests: the eleven named above
+  - **Landed alone**, in a PR after the authorization merged. See "Item 1 shipped without Item 2" below.
 - [ ] Item 2 — wire it as the ranking source for the depth-20 stock sockets
-  - Files: `crates/app/src/depth20_layout.rs`, `crates/app/src/depth_rebalance.rs`
-  - Tests: layout tests updated to assert volume ordering
+  - Files: `crates/app/src/dhan_contract_universe.rs` (emit the family map),
+    `crates/app/src/dhan_feed_stack.rs` (own the leaderboard, observe per tick,
+    publish on the 5s arm), `crates/app/src/depth_rebalance.rs` (read the
+    snapshot), `crates/app/src/depth20_layout.rs` (rank by volume)
+  - Tests: the classification map survives a round trip through attach; the drain
+    observes and skips a non-contract tick; the published snapshot is what the
+    layout consumes; layout tests assert volume ordering
+  - **Blocked until Item 1 merges** (serial-PR protocol, `pr-completion-protocol.md`)
 - [ ] Item 3 — depth-200 top-5 with the distinct-underlying constraint
   - Files: `crates/app/src/depth200_atm.rs`
   - Tests: distinct-underlying selection, and the down-rank case the thin-book evidence warns about
 
+## Item 2's two architectural decisions (Rule 15 — decided BEFORE the wiring PR)
+
+`audit-findings-2026-04-17.md` Rule 15 requires that a decision a later sub-PR
+depends on is settled in the plan first, and Rule 17 says a plan item carrying a
+"TBD" is DRAFT, not APPROVED. Item 2 named two files and settled neither of the
+seams it actually crosses. Both are settled here, from evidence.
+
+### Decision A — how volume crosses the task boundary: RAM, not QuestDB
+
+The frame drain owns `&mut LiveIngest` on its own task. The depth-rebalance loop is
+a separate task on a **one-minute** cadence, and it reads everything it has today
+(`fetch_movers`, `load_depth_candidates`) from **QuestDB**. So the existing
+architecture crosses this boundary through the database, and the cheapest-looking
+option is to follow it: a `LATEST ON ts PARTITION BY security_id` over the day's
+NSE_FNO rows.
+
+**Rejected, on three pieces of this repository's own measured evidence:**
+
+| | why the DB path is wrong here |
+|---|---|
+| The requirement | The operator asked for the ranking to follow volume *"every second I mean every tick"*. A per-minute query is not that, and a 5-second one over ~22,000 partitions is a different thing again. |
+| The measured bottleneck | The disk is what is actually failing. `dhan-rest-only-noise-lock` §2.3o measures 138 GB consumed in one session, and 2026-09-04 captured **zero** ticks and dropped **2,000,238** frames because the volume was full. Adding a 22,000-partition scan every few seconds to that is the coupling class this repository has spent three weeks removing. |
+| The standing rule | `aws-budget.md` rule 12 and CLAUDE.md's RAM-first principle: no decision path reads market data from the database. Depth steering is a decision path. |
+
+**The chosen shape is the one `LiveIngest` already uses for every other per-tick
+accumulator** (`refused_price`, `seals_dropped`, `scan_silence`): a **plain field on
+the single-owner `&mut` struct** — no lock, no channel, no allocation on the tick
+path — drained by a periodic timer arm on the drain's own `tokio::select!`.
+
+Publication across the boundary is `arc_swap::ArcSwap<Arc<Vec<RankedContract>>>`,
+already a pinned workspace dependency (`=1.9.2`), already a DIRECT dependency of
+`crates/app` — so Item 2 adds no dependency and needs no approval under CLAUDE.md's
+new-dep rule — and already the house pattern here: `token_manager.rs` (`TokenHandle =
+Arc<ArcSwap<Option<TokenState>>>`), `dhan_data_api_limiter.rs`, `leg_identity.rs` and
+`calendar_staleness.rs` all use it. The drain stores a fresh snapshot every 5
+seconds; the rebalance loop `load()`s it lock-free.
+
+The cadence sits on the drain task deliberately, for the reason CLAUDE.md's O(1)
+table already records for `catch_up_seal_all`: moving a sweep off that task needs a
+lock or a channel around a `&mut`, and both are strictly worse for the hot path than
+a bounded pause. That row measures its own 5-second sweep at **9.67 ms, a 0.2% duty
+cycle**; this one is ~60 µs, **0.0012%** — two orders of magnitude cheaper than the
+sweep already running beside it.
+
+### Decision B — where index-vs-stock classification comes from: the contract artifact, at attach
+
+`observe` needs `OptionFamily` and the underlying id, and a tick carries neither —
+only `security_id` and `segment`, and index and stock options share `NSE_FNO`. So a
+map is required, and the question is who builds it.
+
+`DepthCandidate` already carries `is_index_option` and is built on the
+**rebalance-loop** side from the daily contract artifact. `ContractSelection`, built
+on the **attach** side from the same artifact, knows the same fact — it counts
+`index_options` and `stock_options` separately — but **discards it per contract**,
+keeping only `Vec<SubscribeInstrument>` and two aggregate counts.
+
+**Decision:** `select_contract_universe` additionally emits the per-contract
+classification it already computes, and the attach installs it on `LiveIngest`. That
+is the correct owner for three reasons: it is where the fact is already known, so
+nothing is re-derived (the exact bug `DepthCandidate::is_index_option`'s own doc
+comment records — *"asking a six-entry index map 'do you know this name?' answers 'is
+it an index?' only by accident"*); it is built once daily on a cold path; and it
+makes the drain's per-tick step a single hash probe with no fallback and no guessing.
+
+A tick whose id is not in the map is **skipped, not refused** — spots, futures and
+index options all land there legitimately, and the authorization is stock options
+only. Counting them as refusals would make the refusal counter meaningless.
+
+### Item 1 shipped without Item 2 — the correction
+
+The guarantee matrix below said *"Items 1–2 land together, so no skeleton"*. **That
+is no longer true and is corrected rather than left standing.** The authorization
+(the rule-file section) merged in one PR; Item 1's code follows in another, and Item
+2 is blocked behind it by the serial-PR protocol.
+
+So Item 1 is in the tree with **no production caller**. Checked against Rule 14's own
+five detection signals, none is present — no stub comments, no heartbeat counter on
+an inert loop, no `enabled = false` flag, no exact-count tests, and `VOLUME-MONO-01`
+plus its runbook already existed. `pub-fn-wiring-guard` passes. **The honest residual,
+stated rather than implied by a green check:** that guard accepts *test* call sites
+while its own header describes the bug class as a missing *production* one, so the
+mechanical gate is satisfied and Rule 14's intent is not. Item 2 is what closes it.
+
 ## Z+ 15-row and 7-row guarantee matrices
 
 Both carried by reference from `.claude/rules/project/per-wave-guarantee-matrix.md`.
-Per-item specifics: coverage — every new pub fn has a test and a call site (Items 1–2
-land together, so no skeleton); performance — DHAT zero-alloc on the sweep, and the
-per-tick path is a single map update with no allocation; monitoring — the three
-counters above; recovery — refusals are counted and the previous layout is held;
+Per-item specifics: coverage — every new pub fn has a test; **Item 1's call sites are
+tests only, because Items 1 and 2 did NOT land together as this line originally
+claimed — see "Item 1 shipped without Item 2" above**; performance — DHAT zero-alloc
+on the sweep, and the per-tick path is a single map update with no allocation;
+monitoring — the three counters above; recovery — refusals are counted and the previous layout is held;
 uniqueness — the composite `(security_id, exchange_segment)` key throughout, never a
 bare id.
 
