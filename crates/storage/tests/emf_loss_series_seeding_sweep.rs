@@ -200,6 +200,127 @@ fn is_seeded_in(body: &str, tokens: &[String]) -> bool {
             }
         }
     }
+
+    // Shape 5 — the name reaches the macro through a PARAMETER.
+    //
+    // `OutOfWindowCounters::new(feed, TICK_OUT_OF_WINDOW_COUNTER, reasons)`
+    // hands the metric name to a constructor that seeds EVERY handle it
+    // builds. The macro inside that constructor reads `counter!(counter, ..)`
+    // — its first argument is the parameter, not the name — so the metric
+    // name never appears at a `counter!` site anywhere and shapes 1-4 are
+    // structurally blind to it. That blindness is what this shape fixes; it
+    // is not a new place to seed, it is a new way for the resolver to SEE an
+    // existing seed.
+    //
+    // Two-part proof, because the second half is what stops this becoming a
+    // rubber stamp for every counter that merely appears in the same file:
+    //   1. the token is passed as an ARGUMENT to some call, and
+    //   2. the callee is defined in these sources AND its body builds a
+    //      counter from a bare identifier and seeds that handle.
+    // A file with no generic seeding constructor cannot satisfy part 2.
+    false
+}
+
+/// Shape 5, resolved ACROSS files.
+///
+/// Separate from `is_seeded_in` because the const and the generic constructor
+/// legitimately live in different modules: `DEPTH_OUT_OF_WINDOW_COUNTER` is
+/// declared in `depth_persistence.rs` and handed to `OutOfWindowCounters::new`,
+/// which is defined in `tick_persistence.rs`. Shapes 1-4 stay per-file on
+/// purpose — a binding name in one module must not satisfy a counter in
+/// another — but a constructor crossing a module boundary is ordinary Rust,
+/// so this shape gets the concatenated sources and nothing else does.
+fn is_seeded_via_generic_ctor(all: &str, tokens: &[String]) -> bool {
+    for token in tokens {
+        for callee in callees_receiving(all, token) {
+            if sources_define_a_seeding_ctor(all, &callee) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Callee names of every call that receives `token` as an argument.
+///
+/// Deliberately crude: walk back from the token to the nearest `(`, then take
+/// the identifier path immediately before it. A path (`Type::new`) is reduced
+/// to its last segment, which is what `fn NAME(` will spell.
+fn callees_receiving(body: &str, token: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, _) in body.match_indices(token) {
+        let head = &body[..idx];
+        // The token must sit inside an argument list, not at a `counter!`
+        // site (shapes 1-4 own those) and not in its own const declaration.
+        let Some(open) = head.rfind('(') else {
+            continue;
+        };
+        if head[open..].contains(';') {
+            continue;
+        }
+        let before = head[..open].trim_end();
+        if before.ends_with('!') {
+            continue;
+        }
+        let seg: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Some(last) = seg.rsplit("::").next() {
+            if !last.is_empty() {
+                out.push(last.to_owned());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// True when `body` defines `fn callee(..)` whose body builds a counter from a
+/// bare identifier and seeds the resulting handle.
+///
+/// "Bare identifier" is the load-bearing part: `counter!("tv_x", ..)` is a
+/// literal and belongs to shapes 1-4, whereas `counter!(counter, ..)` proves
+/// the function seeds whatever NAME it is handed — which is exactly the
+/// guarantee shape 5 needs.
+fn sources_define_a_seeding_ctor(body: &str, callee: &str) -> bool {
+    let needle = format!("fn {callee}(");
+    // EVERY definition, not the first. `fn new(` is the most overloaded name in
+    // this workspace, so stopping at the first match asks the wrong function
+    // whether it seeds -- which is how this resolver reported a seeded counter
+    // as unseeded on its first run.
+    for (start, _) in body.match_indices(&needle) {
+        let tail = &body[start..];
+        // Bound the search to this function: the next close-brace that ends a
+        // block at either column zero or one impl level of indent.
+        let end = tail
+            .find("\n    }")
+            .or_else(|| tail.find("\n}"))
+            .map_or(tail.len(), |i| i + 2);
+        let f = &tail[..end];
+        let Some(site) = f.find("counter!(") else {
+            continue;
+        };
+        let after = &f[site + "counter!(".len()..];
+        let first_arg = after
+            .split(|c| c == ',' || c == ')')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let is_bare_ident = !first_arg.is_empty()
+            && !first_arg.starts_with('"')
+            && first_arg
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if is_bare_ident && f.contains("increment(0)") {
+            return true;
+        }
+    }
     false
 }
 
@@ -317,7 +438,19 @@ fn every_emf_selected_loss_series_is_seeded() {
         if is_gauge {
             continue;
         }
-        if !sources.iter().any(|(_, b)| is_seeded_in(b, &tokens)) {
+        // Shapes 1-4 are per-file by design. Shape 5 is not: a generic seeding
+        // constructor is ordinary Rust and may sit in another module, so it
+        // alone gets the concatenated sources.
+        let per_file = sources.iter().any(|(_, b)| is_seeded_in(b, &tokens));
+        let cross_file = || {
+            let all = sources
+                .iter()
+                .map(|(_, b)| b.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            is_seeded_via_generic_ctor(&all, &tokens)
+        };
+        if !per_file && !cross_file() {
             unseeded.push(metric.clone());
         }
     }
@@ -393,5 +526,60 @@ fn the_resolver_follows_all_four_house_shapes() {
     assert!(
         !is_seeded_in(neighbour, &[String::from("\"tv_z_dropped_total\"")]),
         "a neighbouring counter's seed must not satisfy an unseeded one"
+    );
+}
+
+/// Shape 5 — the metric name reaches the macro through a PARAMETER.
+///
+/// Taken from real production code: `OutOfWindowCounters::new` is handed a
+/// name const and seeds every handle it builds, so the metric name appears at
+/// no `counter!` site anywhere and shapes 1-4 are structurally blind to it.
+/// The resolver reported a genuinely-seeded counter as UNSEEDED on its first
+/// run against this shape, which is the false-finding class this repository
+/// keeps paying for.
+#[test]
+fn the_resolver_follows_the_generic_constructor_shape() {
+    // The const, the call that hands it over, and the constructor that seeds.
+    let seeding = r#"
+pub const TV_X_OUT_OF_WINDOW: &str = "tv_x_out_of_window_refused_total";
+fn build(feed: Feed) -> OutOfWindowCounters {
+    OutOfWindowCounters::new(feed, TV_X_OUT_OF_WINDOW, REASONS)
+}
+    pub(crate) fn new(feed: Feed, counter: &'static str) -> Self {
+        let make = |reason: &'static str| {
+            let c = metrics::counter!(counter, "reason" => reason);
+            c.increment(0);
+            c
+        };
+        Self { handles: [make("a")] }
+    }
+"#;
+    let tokens = [
+        String::from("\"tv_x_out_of_window_refused_total\""),
+        String::from("TV_X_OUT_OF_WINDOW"),
+    ];
+    assert!(
+        is_seeded_via_generic_ctor(seeding, &tokens),
+        "shape 5 must be followed: the name is passed to a constructor that \
+         seeds every handle it builds"
+    );
+
+    // The negative half, and it is the half that matters. Same call shape,
+    // but the constructor never seeds — so the counter really is unseeded and
+    // the resolver must NOT be satisfied merely because a constructor exists.
+    let not_seeding = seeding.replace("            c.increment(0);\n", "");
+    assert!(
+        !is_seeded_via_generic_ctor(&not_seeding, &tokens),
+        "a constructor that does not seed must not satisfy shape 5 — \
+         otherwise this shape is a rubber stamp for every counter in the file"
+    );
+
+    // A counter that is merely PRESENT in a file containing a seeding
+    // constructor must not pass: it was never handed to it.
+    let bystander = [String::from("\"tv_unrelated_dropped_total\"")];
+    assert!(
+        !is_seeded_via_generic_ctor(seeding, &bystander),
+        "shape 5 requires the token to be an ARGUMENT to the constructor, \
+         not just a string living in the same file"
     );
 }
