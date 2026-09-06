@@ -154,7 +154,41 @@ crates/
 └── app/        # Binary entry point, boot sequence, observability
 ```
 
+> **⚠ CORRECTED 2026-09-06 — the workspace has EIGHT crates, not six, and the
+> tree above omits two entirely.** `ls crates/` returns: api, app,
+> **aws-lambdas**, common, core, storage, **tickvault-logs-mcp**, trading. The
+> two missing entries, with today's measured sizes:
+>
+> ```
+> ├── aws-lambdas/        # 37 files, 22,043 lines — the 13 production Lambdas:
+> │                       #   Dhan/Groww token minters, budget kill-switch,
+> │                       #   start-watchdog, boot-heartbeat gate, market-hours
+> │                       #   gate, deploy-watchdog, operator control console
+> └── tickvault-logs-mcp/ # 11 files, 5,878 lines — the MCP server behind the
+>                         #   mcp__tickvault-logs__* tools
+> ```
+>
+> **This omission is not cosmetic, and the AUTOMATION-FIRST RULE above is what
+> makes it bite.** That section orders every session to reach for
+> `mcp__tickvault-logs__*` tools BEFORE grepping logs by hand — and the crate
+> implementing those tools is absent from the map the same session reads to
+> learn what exists. `aws-lambdas` is likewise where the budget kill-switch and
+> the morning start-watchdog live; a session told the workspace is
+> `common → core → trading → storage → api → app` has no reason to look for
+> either, and would reasonably conclude the AWS control plane is not in this
+> repository at all. It is 28,000 lines of it.
+>
+> The six-entry tree is left standing per house convention (annotate, never
+> silently rewrite) — it is ACCURATE about the six crates it lists and about
+> their dependency order; it is INCOMPLETE, which reads identically to a
+> reader who has no reason to doubt it. That is the same
+> partial-disclosure-reads-as-complete failure this file's own O(1) table
+> header warns about, here in the map rather than in the table.
+
 **Dependency flow:** `common` ← `core` ← `trading` ← `storage` ← `api` ← `app`
+*(the two crates added by the 2026-09-06 correction above are outside this
+chain: `aws-lambdas` and `tickvault-logs-mcp` are separate binaries/servers,
+not links in the library dependency order.)*
 
 ### crates/common — Shared Foundation (10 modules)
 
@@ -450,6 +484,53 @@ make questdb                         # localhost:9000 (QuestDB web console)
 
 **Why scoped is the default:** the 22 test categories below apply to the changed crate. Re-running them on the entire workspace for every diff wastes 10-15 minutes per session and produces no additional signal. The CI pipeline runs the full battery on every PR, so nothing slips through.
 
+> **⚠ COVERAGE — the enforced floors, recorded 2026-09-06 because this file
+> never stated them and its own pointers lead somewhere that says "100%".**
+>
+> **CLAUDE.md itself makes NO 100%-coverage claim** — checked before writing
+> this, and worth stating plainly rather than "correcting" something the file
+> never said: `grep -n "100% code coverage" CLAUDE.md` returns nothing, the
+> CI/CD section already cites "ratcheted per-crate floors", and KEY FILES
+> already points at `quality/crate-coverage-thresholds.toml`. Those claims are
+> **ACCURATE and are left unchanged.**
+>
+> What was missing is the number. This section is where a session reads the
+> testing contract, and it named no floor at all — while the FOREVER CHARTER
+> that line 5 of this file tells every session to "read FIRST" opens its
+> guarantee matrix with the row **"100% code coverage"**. So a session
+> following this file's own pointers arrives at 100 and finds nothing here to
+> correct it.
+>
+> **The executable source of truth is `quality/crate-coverage-thresholds.toml`,
+> and 100% is the stated TARGET, never the enforced gate.** Read today:
+>
+> | Crate | Enforced floor |
+> |---|---|
+> | common | 99.4 |
+> | api | 98.6 |
+> | trading | 96.9 |
+> | core | 91.6 |
+> | storage | 90.1 |
+> | tickvault-logs-mcp | 87.3 |
+> | aws-lambdas | 81.1 |
+> | **app** | **68.3** |
+> | *(any crate not listed)* | *default 63.0* |
+>
+> **`app` at 68.3 is the number to carry, and it is the largest crate in the
+> workspace** (133,924 lines — see the 2026-09-06 correction under CURRENT
+> CONTEXT). Roughly three lines in ten of the biggest crate may be uncovered
+> and CI still passes green. A session that reads "100% code coverage" in the
+> charter and writes a PR body claiming it has made a claim the gate does not
+> check and the code does not meet.
+>
+> That toml file is explicit about why, and its own header is the best summary
+> of the lesson: the previous 100.0 values "were never actually enforced: the
+> gate matched zero files and passed vacuously … Honest enforced floors replace
+> a fictional unenforced 100." The floors are an **up-only ratchet** — they may
+> rise, never fall, and a raise ships in the same PR as the coverage that
+> earned it. Re-read the toml rather than this table: it moves, and a floor
+> quoted from a quote is not a floor.
+
 | Type | Tool | Where | Purpose |
 |------|------|-------|---------|
 | Unit | `#[test]` | Inline in src | Pure functions, error cases |
@@ -716,6 +797,71 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 **Boot sequence:** CryptoProvider → Config → Observability → Logging → Notification → Auth → QuestDB → Universe → HistoricalCandles → WebSocket → TickProcessor → OrderUpdateWS → API → TokenRenewal → Shutdown
 **Codebase size:** ~74K LoC Rust (~61K production, ~14K tests), 158 files, 6 crates
 **Test count:** ~7,250 passing tests (unit + integration + proptest + adversarial), 43 integration test files, 8 benchmarks, 2 fuzz targets
+
+> **⚠ CORRECTED 2026-09-06 — EVERY figure in the two lines above is stale, and
+> every one is stale in the SAME direction: it understates the codebase by
+> between 1.4× and 6.8×.** Measured today by counting the tree rather than
+> quoting the previous count:
+>
+> | Claim above | Measured 2026-09-06 | Ratio |
+> |---|---|---|
+> | ~74K LoC Rust | **502,296** | 6.8× |
+> | 158 files | **688** `.rs` files | 4.4× |
+> | 6 crates | **8** | 1.3× |
+> | ~7,250 tests | **11,750** `#[test]` / `#[tokio::test]` annotations | 1.6× |
+> | 43 integration test files | **358** files under `crates/*/tests/` | 8.3× |
+> | 8 benchmarks | **11** bench files | 1.4× |
+> | 2 fuzz targets | **5** | 2.5× |
+>
+> Commands, so the next reader re-measures instead of re-quoting:
+> `find crates -name '*.rs' | xargs wc -l | tail -1`,
+> `grep -rn "#\[test\]\|#\[tokio::test\]" crates/ --include=*.rs | wc -l`,
+> `ls crates/`.
+>
+> **The LoC split, which the line above also gets wrong in shape and not just
+> in size.** It says "~61K production, ~14K tests", i.e. tests are ~19% of the
+> tree. Measured: `crates/*/src/` is 318 files / **393,445** lines,
+> `crates/*/tests/` is 358 files / **107,630** lines, `crates/*/benches/` is 11
+> files / **1,094** lines, plus one `build.rs` at 127 (688 files, 502,296 lines
+> — the four figures reconcile exactly). So there are MORE test files than
+> source files. And "393,445 production" would itself be wrong: `src/` contains
+> **493** `#[cfg(test)]` inline modules, so a large share of that number is also
+> test code. A clean production-only line count is not obtainable by counting
+> files, and none is asserted here — which is the honest form of a claim this
+> line has been making confidently for months.
+>
+> **Per-crate LoC** (sums to 502,296): app 133,924 · core 108,138 · storage
+> 79,828 · trading 73,219 · common 64,200 · aws-lambdas 22,043 · api 15,066 ·
+> tickvault-logs-mcp 5,878.
+>
+> **The two MISSING crates are the part that can mislead a session, not the
+> line count.** "6 crates" omits **`aws-lambdas`** (22,043 lines — the thirteen
+> production Lambdas: the token minters, the budget kill-switch, the
+> start-watchdog, the operator console) and **`tickvault-logs-mcp`** (5,878
+> lines — the MCP server this file's own AUTOMATION-FIRST RULE instructs every
+> session to prefer over hand-rolled Bash). A session reading "6 crates" and
+> the six-entry tree in CODEBASE STRUCTURE concludes those surfaces do not
+> exist in this repository. They are 28,000 lines and they are where the AWS
+> control plane lives.
+>
+> **⚠ The test count is an ANNOTATION count and is NOT the same thing as
+> "passing tests"** — the phrase the line above uses. It over-counts
+> `#[ignore]`d tests (which never run in a normal suite) and under-counts
+> proptest cases (one annotation runs 256 inputs by default). The honest
+> statement is "11,750 test annotations"; the true passing-test number needs
+> `cargo test`, which was deliberately not run for this correction. Split:
+> 9,152 inline in `src/`, 2,598 in `tests/`.
+>
+> **Why this staleness is worth a dated block rather than a quiet edit.** These
+> two lines sit under CURRENT CONTEXT, which the SESSION PROTOCOL has every
+> session read at startup, and they are the only place in this file that sizes
+> the repository. A session planning an audit against "158 files" scopes for a
+> tree 4.4× smaller than the real one and reports completion having read a
+> fraction of it — the failure this file's own O(1) table records for
+> `day_ohlc_tracker` on 2026-08-12, where a stale row did not merely fail to
+> warn but manufactured a false finding. The reusable half is the one this
+> repository keeps re-learning: **a count is a measurement, and a measurement
+> carries a date.** Each of these was true once; none was ever re-run.
 
 **2026-04-24 PR #337 — recent-session pointer:** reconnect hardening
 (Fix #3), 09:13 triple-dispatch ratchets (#4), pre-open buffer widened
