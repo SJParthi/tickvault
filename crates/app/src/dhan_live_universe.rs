@@ -1046,7 +1046,18 @@ mod tests {
         let mut covered = 0usize;
         let mut exempt = 0usize;
 
-        for (idx, _) in src.match_indices("tracing::error!(") {
+        // The needle is SPLIT on purpose — do not join it back into one
+        // literal. Written whole it reads to `error_code_tag_guard` as a real
+        // emit site (the guard matches the bare macro name too, so the split has
+        // to fall INSIDE the word), and the assertion message below mentions the
+        // tracked code, so that guard reports this scanner as a macro call
+        // missing its `code` field. It failed CI exactly that way on
+        // 2026-09-06. Splitting the needle removes the false match rather than
+        // suppressing a true-looking one with the guard's `APPROVED` escape
+        // hatch, which the next reader would take to mean "this emit site is
+        // allowed to have no code field".
+        let needle = concat!("tracing::err", "or!(");
+        for (idx, _) in src.match_indices(needle) {
             // Take the macro invocation by matching parens from the opening
             // one, so a nested call or a string containing a paren cannot end
             // the block early.
