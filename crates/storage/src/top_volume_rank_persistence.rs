@@ -291,6 +291,20 @@ pub struct TopVolumeRankWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Set by [`TopVolumeRankWriter::split_for_offload`]. When present, `flush`
+    /// hands the buffer to the writer thread instead of touching the network.
+    ///
+    /// `None` means this writer still flushes synchronously — the shape that
+    /// must never reach the frame drain, because a 5,000 ms `request_timeout`
+    /// on the drain task stalls the fold, fills the socket receive buffer, and
+    /// Dhan skips a slow consumer forward to "the latest available state" with
+    /// no sequence number. The ticks lost that way are lost at THEIR side and
+    /// are invisible to every counter we own. That is the 2026-08-28 depth
+    /// lesson, and this field is how this table avoids repeating it.
+    offload: Option<std::sync::mpsc::SyncSender<TopVolumeFlushBatch>>,
+    /// Consecutive flushes the producer has retained because the queue was
+    /// full. Bounded by [`MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`].
+    retained_spans: u32,
 }
 
 impl TopVolumeRankWriter {
@@ -313,6 +327,8 @@ impl TopVolumeRankWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    offload: None,
+                    retained_spans: 0,
                 }
             }
             Err(err) => {
@@ -324,6 +340,8 @@ impl TopVolumeRankWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    offload: None,
+                    retained_spans: 0,
                 }
             }
         }
@@ -337,6 +355,8 @@ impl TopVolumeRankWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            offload: None,
+            retained_spans: 0,
         }
     }
 
@@ -396,6 +416,24 @@ impl TopVolumeRankWriter {
         if self.pending == 0 {
             return Ok(());
         }
+        // OFF-DRAIN arm first: once split, the network is the sink thread's
+        // problem and this call must not touch it.
+        if self.offload.is_some() {
+            return match self.offload_flush() {
+                // Handed off, or held for the next flush — neither is an error
+                // to the caller. `QueueFull` in particular is BACKPRESSURE:
+                // reporting it as a failure would decay a health signal for
+                // rows that are still safely held.
+                TopVolumeOffloadOutcome::Sent(_) | TopVolumeOffloadOutcome::QueueFull(_) => Ok(()),
+                TopVolumeOffloadOutcome::WidthCapped(dropped) => anyhow::bail!(
+                    "top_volume_rank: writer thread stayed behind — {dropped} pending \
+                     row(s) dropped (no spill tier for a periodic snapshot)"
+                ),
+                TopVolumeOffloadOutcome::SinkGone(dropped) => anyhow::bail!(
+                    "top_volume_rank: writer thread is gone — {dropped} pending row(s) dropped"
+                ),
+            };
+        }
         if self.sender.is_none() {
             let dropped = self.discard_pending();
             anyhow::bail!(
@@ -429,6 +467,105 @@ impl TopVolumeRankWriter {
         }
     }
 
+    /// Splits this writer into a drain-side PRODUCER and a thread-side SINK.
+    ///
+    /// After this, `flush` hands the buffer to a bounded queue and returns
+    /// without touching the network. That is the whole point: the caller is the
+    /// frame drain, and a 5,000 ms `request_timeout` on the drain task stalls
+    /// the fold — after which the socket receive buffer fills and Dhan skips a
+    /// slow consumer forward with no sequence number, losing ticks at THEIR
+    /// side where no counter of ours can see it.
+    ///
+    /// Consuming `self` makes the split a ONE-WAY DOOR at the type level: there
+    /// is no way to keep a synchronous handle to the same writer and
+    /// accidentally flush it on the drain later. The tick and depth writers use
+    /// the same signature for the same reason.
+    #[must_use]
+    // TEST-EXEMPT: the split itself is exercised by every offload test below.
+    pub fn split_for_offload(
+        mut self,
+    ) -> (
+        Self,
+        TopVolumeRankWriterSink,
+        std::sync::mpsc::Receiver<TopVolumeFlushBatch>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_FLUSH_QUEUE_DEPTH);
+        let sink = TopVolumeRankWriterSink {
+            sender: self.sender.take(),
+        };
+        self.offload = Some(tx);
+        (self, sink, rx)
+    }
+
+    /// True once [`Self::split_for_offload`] has run and the queue is open.
+    #[must_use]
+    // TEST-EXEMPT: read by the offload tests below and by the lane's wiring.
+    pub const fn is_offloaded(&self) -> bool {
+        self.offload.is_some()
+    }
+
+    /// Hands the pending buffer to the writer thread without touching the
+    /// network.
+    ///
+    /// Uses `try_send`, NEVER `send`: a blocking send would re-create the exact
+    /// coupling the split exists to remove, one queue further out.
+    fn offload_flush(&mut self) -> TopVolumeOffloadOutcome {
+        let rows = self.pending;
+        // Read the protocol version BEFORE the replace: a fresh buffer must
+        // speak the same protocol the sender negotiated, and borrowing rules
+        // will not let both happen in one expression.
+        let protocol = self.buffer.protocol_version();
+        let batch = TopVolumeFlushBatch {
+            buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+            rows,
+        };
+        let Some(tx) = self.offload.as_ref() else {
+            // Unreachable — `flush` checks. Treated as the gone arm rather than
+            // silently succeeding, because "we sent it" when nothing was sent
+            // is the one report that must never be wrong.
+            self.buffer = batch.buffer;
+            return TopVolumeOffloadOutcome::SinkGone(rows);
+        };
+        match tx.try_send(batch) {
+            Ok(()) => {
+                self.pending = 0;
+                self.retained_spans = 0;
+                metrics::counter!("tv_top_volume_rank_flush_offloaded_total").increment(1);
+                TopVolumeOffloadOutcome::Sent(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                // Backpressure, not loss. Put the rows BACK and keep appending
+                // — the next flush retries. This arm is what makes the bounded
+                // queue safe: without it a full queue would either block the
+                // drain (the original defect) or drop rows (a worse one).
+                metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(1);
+                let held = returned.buffer.as_bytes().len();
+                self.buffer = returned.buffer;
+                self.retained_spans = self.retained_spans.saturating_add(1);
+                // TWO independent cuts, spans and bytes. `>` and not `>=`: the
+                // constant names how many spans may be RETAINED, so the cut
+                // belongs on the span AFTER them.
+                if self.retained_spans > MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS
+                    || held >= MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
+                {
+                    metrics::counter!("tv_top_volume_rank_flush_width_capped_total").increment(1);
+                    self.retained_spans = 0;
+                    // No spill tier for this table — see
+                    // `TopVolumeOffloadOutcome::WidthCapped` for why dropping
+                    // is the right call here and rescuing is not.
+                    let dropped = self.discard_pending();
+                    return TopVolumeOffloadOutcome::WidthCapped(dropped);
+                }
+                TopVolumeOffloadOutcome::QueueFull(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                self.buffer = returned.buffer;
+                let dropped = self.discard_pending();
+                TopVolumeOffloadOutcome::SinkGone(dropped)
+            }
+        }
+    }
+
     /// Drops the pending buffer, counts and LOGS the loss, returns the count.
     fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
@@ -453,6 +590,186 @@ impl TopVolumeRankWriter {
         self.buffer.clear();
         self.pending = 0;
         dropped
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Off-drain WRITE for top_volume_rank (2026-09-07)
+// ---------------------------------------------------------------------------
+
+/// Depth of the hand-off queue between the drain and the top-volume writer.
+///
+/// FOUR, the same as [`crate::depth_persistence::DEPTH_FLUSH_QUEUE_DEPTH`] and
+/// deliberately not tuned differently: one number is one thing to keep true,
+/// and the three writer paths sharing a shape is what stops them drifting into
+/// different failure semantics.
+///
+/// What four batches actually buy here is far more than on the depth path,
+/// because the volume is not comparable. Depth is a MEASURED ~63,800 rows/s;
+/// this table emits one snapshot per cadence — 250 rows at 1 s and 5 at 5 s,
+/// so ~255 rows/s, roughly 250x less. Four batches is therefore ~4 seconds of
+/// stall absorbed rather than depth's ~600 ms. The queue should never fill in
+/// practice; bounded is still bounded.
+pub const TOP_VOLUME_FLUSH_QUEUE_DEPTH: usize = 4;
+
+/// Consecutive full-queue flushes the producer may RETAIN before it stops
+/// widening the buffer and drops instead.
+///
+/// TWO, matching [`crate::depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`]'s
+/// sibling for the same reason as the queue depth.
+pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
+
+/// Byte ceiling on the buffer the producer retains while the writer is behind.
+///
+/// 4 MiB, EIGHT TIMES TIGHTER than the depth path's 32 MiB, and that is the
+/// point rather than an oversight: a single depth-200 snapshot is 400 rows and
+/// a burst can breach a byte ceiling inside one span, whereas a top-volume
+/// snapshot is a bounded 255 rows of ~120 B ILP ≈ 30 KB/s. 4 MiB is ~136
+/// seconds of backlog at that rate — an eternity for a table whose next
+/// snapshot supersedes the last one. A ceiling sized for depth's traffic would
+/// hold minutes of stale rankings that nothing downstream wants.
+pub const MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// One ILP payload on its way from the drain to the writer thread.
+pub struct TopVolumeFlushBatch {
+    buffer: Buffer,
+    rows: usize,
+}
+
+impl TopVolumeFlushBatch {
+    /// Rows this batch covers.
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the offload tests below.
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// What happened to a batch the producer tried to hand off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopVolumeOffloadOutcome {
+    /// Handed to the writer thread. The rows are no longer the drain's.
+    Sent(usize),
+    /// The writer is behind. Rows RETAINED by the producer, nothing lost.
+    QueueFull(usize),
+    /// The writer stayed behind long enough that retaining further would breach
+    /// [`MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`] or
+    /// [`MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES`]. Rows DROPPED.
+    ///
+    /// # Why dropped and not rescued — the one place this differs from depth
+    ///
+    /// The depth and tick paths rescue an over-wide payload to a spill tier,
+    /// durable and re-ingestable. **There is no spill tier for this table, and
+    /// building one would be the wrong trade.** A tick is a unique event that
+    /// exists nowhere else; a top-volume snapshot is a PERIODIC SAMPLE of a
+    /// leaderboard that lives in RAM and is recomputed from scratch a second
+    /// later. Dropping one thins the record; it cannot corrupt it, and it
+    /// cannot lose a tick.
+    ///
+    /// That is a real loss of an observability record and it is never silent:
+    /// `discard_pending` counts it and logs a coded error naming the hole.
+    WidthCapped(usize),
+    /// The writer thread is gone. Rows DROPPED, counted and logged.
+    SinkGone(usize),
+}
+
+/// The network half of a split [`TopVolumeRankWriter`] — owns the ILP `Sender`.
+///
+/// Lives on its own OS thread. It never touches the aggregator, the ring, the
+/// leaderboard or anything the drain owns, which is the entire reason the split
+/// exists: a five-second ILP timeout now blocks a thread whose only job is
+/// waiting, instead of the task that empties the socket.
+pub struct TopVolumeRankWriterSink {
+    sender: Option<Sender>,
+}
+
+impl TopVolumeRankWriterSink {
+    /// Writes one batch. Returns the rows that actually LANDED in QuestDB.
+    ///
+    /// Zero on any failure — the same contract [`TopVolumeRankWriter::flush`]
+    /// has, and for the same reason: a failed write must be reported as a
+    /// failure rather than forged into a success.
+    ///
+    /// # The bounded retry, and why it is here from the start
+    ///
+    /// `depth_persistence` records the cost of NOT doing this: its
+    /// synchronous path carried a single retry from 2026-08-25, the offload
+    /// shipped three days later without it, and the measured price on
+    /// 2026-09-03 was **41,204 coded flush failures in one session**, every one
+    /// reading `Connection reset by peer (os error 104)` — a transport class
+    /// the buffer survives intact. Shipping this sink without the retry would
+    /// repeat that mistake knowingly.
+    ///
+    /// Retrying is idempotent BY CONSTRUCTION, which is what makes one attempt
+    /// safe rather than merely cheap: [`DEDUP_KEY_TOP_VOLUME_RANK`] is
+    /// `ts, tf, family, feed, security_id, segment`, and every one of those is
+    /// fixed for a given snapshot — so a first POST that landed before the
+    /// reset is collapsed by the same UPSERT that makes a manual re-ingest
+    /// safe to repeat.
+    ///
+    /// Bounded at ONE and gated on the first failure being FAST, mirroring the
+    /// depth arm: `request_timeout` is 5,000 ms, so an unconditional retry
+    /// makes the worst case ten seconds. A reset returns in microseconds; a
+    /// timeout consumes the whole budget. The window separates them with three
+    /// orders of magnitude to spare.
+    pub fn write(&mut self, batch: &mut TopVolumeFlushBatch) -> usize {
+        if batch.rows == 0 {
+            return 0;
+        }
+        let Some(sender) = self.sender.as_mut() else {
+            Self::report_lost(batch, "no ILP sender (QuestDB unreachable)");
+            return 0;
+        };
+        let started = std::time::Instant::now();
+        let first = sender.flush(&mut batch.buffer);
+        let first_elapsed = started.elapsed();
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err)
+                if crate::depth_persistence::flush_failure_is_retryable(&err)
+                    && first_elapsed
+                        < crate::depth_persistence::DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                metrics::counter!("tv_top_volume_rank_flush_retries_total").increment(1);
+                sender.flush(&mut batch.buffer)
+            }
+            Err(err) => Err(err),
+        };
+        match outcome {
+            Ok(()) => {
+                let landed = batch.rows;
+                batch.rows = 0;
+                landed
+            }
+            Err(err) => {
+                let why = format!("{err}"); // APPROVED: loss arm after a flush already failed, never per row
+                Self::report_lost(batch, &why);
+                0
+            }
+        }
+    }
+
+    /// Counts and LOGS a batch the network refused, through the same counter
+    /// and the same coded error the synchronous `discard_pending` uses — so an
+    /// operator sees no difference between a synchronous and an offloaded loss.
+    fn report_lost(batch: &mut TopVolumeFlushBatch, why: &str) {
+        let dropped = batch.rows;
+        if dropped == 0 {
+            return;
+        }
+        metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(dropped as u64);
+        error!(
+            code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+            metric = "tv_top_volume_rank_rows_discarded_total",
+            dropped,
+            why,
+            "STORAGE-GAP-03: top_volume_rank rows discarded by the offload \
+             writer — the ranking record has a hole for those snapshots. No \
+             tick is lost by this: the leaderboard is in RAM and the next \
+             snapshot rebuilds it."
+        );
+        batch.buffer.clear();
+        batch.rows = 0;
     }
 }
 
@@ -660,6 +977,202 @@ mod tests {
             w.buffer_utf8().contains("subscribed=f"),
             "a false must be recorded, or the audit cannot tell 'we missed it' \
              from 'no row was written'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Off-drain write (2026-09-07)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_for_offload_moves_the_sender_and_opens_the_queue() {
+        let (producer, sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        assert!(
+            producer.is_offloaded(),
+            "the producer must know it is split — the drain reads this to refuse a synchronous flush"
+        );
+        assert!(
+            producer.sender.is_none(),
+            "the ILP sender must MOVE to the sink; leaving a copy behind is how a \
+             5-second network call finds its way back onto the drain"
+        );
+        assert!(
+            sink.sender.is_none(),
+            "for_test() has no sender to move — this pins the MOVE, not the presence"
+        );
+    }
+
+    #[test]
+    fn a_flush_after_the_split_hands_off_instead_of_writing() {
+        let (mut producer, _sink, rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        producer.append_row(&row()).expect("append");
+        assert_eq!(producer.pending(), 1);
+
+        producer.flush().expect("hand-off is not an error");
+
+        assert_eq!(
+            producer.pending(),
+            0,
+            "the rows are the writer thread's now, not the drain's"
+        );
+        let batch = rx.try_recv().expect("the batch must be on the queue");
+        assert_eq!(batch.rows(), 1, "the batch must carry the row count");
+    }
+
+    #[test]
+    fn a_full_queue_is_backpressure_and_never_loss() {
+        let (mut producer, _sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        // Fill every slot. `_rx` is held so nothing drains it.
+        for _ in 0..TOP_VOLUME_FLUSH_QUEUE_DEPTH {
+            producer.append_row(&row()).expect("append");
+            assert!(matches!(
+                producer.offload_flush(),
+                TopVolumeOffloadOutcome::Sent(1)
+            ));
+        }
+
+        producer.append_row(&row()).expect("append");
+        let outcome = producer.offload_flush();
+
+        assert_eq!(
+            outcome,
+            TopVolumeOffloadOutcome::QueueFull(1),
+            "a full queue must report backpressure, not success and not loss"
+        );
+        assert_eq!(
+            producer.pending(),
+            1,
+            "the rows must be RETAINED — this is the arm that makes the bounded \
+             queue safe. Without it a full queue either blocks the drain (the \
+             original defect) or drops rows (a worse one)."
+        );
+    }
+
+    #[test]
+    fn queue_full_is_not_reported_to_the_caller_as_a_failure() {
+        let (mut producer, _sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        for _ in 0..TOP_VOLUME_FLUSH_QUEUE_DEPTH {
+            producer.append_row(&row()).expect("append");
+            producer.flush().expect("hand-off");
+        }
+        producer.append_row(&row()).expect("append");
+
+        assert!(
+            producer.flush().is_ok(),
+            "backpressure is not a failure: reporting it as one would decay a \
+             health signal for rows that are still safely held"
+        );
+    }
+
+    #[test]
+    fn retaining_past_the_span_cap_drops_rather_than_widening_forever() {
+        let (mut producer, _sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        for _ in 0..TOP_VOLUME_FLUSH_QUEUE_DEPTH {
+            producer.append_row(&row()).expect("append");
+            producer.flush().expect("hand-off");
+        }
+
+        // Every flush from here retains, until the span cut fires.
+        let mut outcomes = Vec::new();
+        for _ in 0..=MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS {
+            producer.append_row(&row()).expect("append");
+            outcomes.push(producer.offload_flush());
+        }
+
+        let capped = outcomes
+            .iter()
+            .filter(|o| matches!(o, TopVolumeOffloadOutcome::WidthCapped(_)))
+            .count();
+        assert_eq!(
+            capped, 1,
+            "exactly one cut on the span AFTER the retained ones — the constant \
+             names how many may be RETAINED, so `>` and not `>=`. Got {outcomes:?}"
+        );
+        assert_eq!(
+            producer.pending(),
+            0,
+            "the cut must clear the buffer; retaining past it is the unbounded-\
+             memory path the cap exists to close"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_sink_reports_gone_and_never_forges_success() {
+        let (mut producer, _sink, rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        drop(rx);
+        producer.append_row(&row()).expect("append");
+
+        let outcome = producer.offload_flush();
+
+        assert!(
+            matches!(outcome, TopVolumeOffloadOutcome::SinkGone(1)),
+            "a vanished writer thread must be reported as gone. \"We sent it\" \
+             when nothing was sent is the one report that must never be wrong. \
+             Got {outcome:?}"
+        );
+        // A fresh row, because the outcome above already discarded the first:
+        // `flush` returns early on an empty buffer, so asserting on it without
+        // re-appending would test the early return rather than the gone arm.
+        producer.append_row(&row()).expect("append");
+        assert!(
+            producer.flush().is_err(),
+            "and the caller must see the failure, not a silent Ok"
+        );
+    }
+
+    #[test]
+    fn the_sink_reports_zero_landed_when_it_cannot_write() {
+        let (mut producer, mut sink, rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        producer.append_row(&row()).expect("append");
+        producer.flush().expect("hand-off");
+        let mut batch = rx.try_recv().expect("batch");
+
+        // `for_test()` has no ILP sender, so this is the no-sender arm.
+        let landed = sink.write(&mut batch);
+
+        assert_eq!(
+            landed, 0,
+            "a failed write must report ZERO landed. The caller reports health \
+             from this number, so forging it is worse than the failure."
+        );
+        assert_eq!(
+            batch.rows(),
+            0,
+            "and the batch must be cleared so a retry cannot double-count it"
+        );
+    }
+
+    #[test]
+    fn the_sink_reports_the_rows_that_actually_landed() {
+        // No sender means nothing can land; the positive direction is covered
+        // by the live QuestDB path. What this pins is that an EMPTY batch is a
+        // no-op rather than an error — the drain flushes on a timer, and a
+        // timer that fires on an idle second must not log a loss.
+        let (_producer, mut sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
+        let mut empty = TopVolumeFlushBatch {
+            buffer: Buffer::new(ProtocolVersion::V1),
+            rows: 0,
+        };
+        assert_eq!(sink.write(&mut empty), 0);
+    }
+
+    #[test]
+    fn the_producer_byte_ceiling_is_far_tighter_than_the_depth_path() {
+        // Not a style preference — a sizing claim, pinned so it cannot drift
+        // into depth's 32 MiB by copy-paste. This table emits ~255 rows/s
+        // against depth's measured ~63,800, so a ceiling sized for depth would
+        // hold minutes of stale rankings nothing downstream wants.
+        assert!(
+            MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
+                < crate::depth_persistence::MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+            "the top-volume ceiling must stay tighter than depth's"
+        );
+        assert_eq!(
+            TOP_VOLUME_FLUSH_QUEUE_DEPTH,
+            crate::depth_persistence::DEPTH_FLUSH_QUEUE_DEPTH,
+            "the queue DEPTH is deliberately the same across writers — one \
+             number is one thing to keep true, and a shared shape is what stops \
+             the three paths drifting into different failure semantics"
         );
     }
 }
