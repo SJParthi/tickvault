@@ -926,10 +926,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_register_contract_underlying_counters_is_callable_without_a_recorder() {
+    fn pre_register_contract_underlying_counters_never_panics_without_a_recorder() {
+        // Not-panicking IS the whole property here, and the name says so: with
+        // no recorder installed there is nothing observable to assert against.
         // The seed runs at attach, before any recorder is guaranteed installed
-        // in a test process. It must not panic there -- a seeding call that
-        // aborts the attach would cost the whole contract universe.
+        // in a test process, and a seeding call that aborts the attach would
+        // cost the whole contract universe. Every refusal reason being seeded
+        // is a separate claim, checked by the label test above.
         pre_register_contract_underlying_counters();
     }
 
