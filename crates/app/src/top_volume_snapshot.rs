@@ -225,6 +225,7 @@ mod tests {
             segment: ExchangeSegment::NseFno,
             underlying_id,
             volume,
+            window_lots_milli: 0,
         }
     }
 

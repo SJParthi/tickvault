@@ -106,6 +106,17 @@ pub enum SnapshotCadence {
 }
 
 impl SnapshotCadence {
+    /// Every cadence, so callers that need one slot per cadence can size
+    /// themselves from the enum instead of a literal.
+    ///
+    /// A const array rather than a derive, for the reason `LegRefusal::ALL`
+    /// carries: adding a variant without adding it here is a silent
+    /// under-count, and the ranking's per-cadence baselines are sized from
+    /// `ALL.len()` — an under-count there would alias two cadences onto one
+    /// baseline and make both boards report a window neither one measured.
+    /// `every_cadence_is_in_the_all_list` pins that this stays whole.
+    pub const ALL: [Self; 2] = [Self::OneSecond, Self::FiveSecond];
+
     /// Stable wire label. Never reworded — it is a persisted SYMBOL value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -791,6 +802,35 @@ impl TopVolumeRankWriterSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_cadence_is_in_the_all_list() {
+        // `ALL.len()` sizes the ranking's per-contract baselines, one slot per
+        // cadence. A variant missing from this list under-counts that array,
+        // and two cadences would then share a baseline — each board reporting
+        // a window neither one measured, with nothing erroring.
+        //
+        // Asserted by round-tripping the wire label, so a variant added
+        // without being listed here fails the exhaustive match below rather
+        // than passing a length check that was hand-updated to agree.
+        for cadence in SnapshotCadence::ALL {
+            let label = cadence.as_str();
+            let round_tripped = match label {
+                "1s" => SnapshotCadence::OneSecond,
+                "5s" => SnapshotCadence::FiveSecond,
+                other => panic!("cadence {other} is in ALL but not in this match"),
+            };
+            assert_eq!(round_tripped, cadence);
+        }
+        // And the length is what the baselines are sized from, so it is pinned
+        // rather than left to the array literal.
+        assert_eq!(SnapshotCadence::ALL.len(), 2);
+        assert_ne!(
+            SnapshotCadence::ALL[0],
+            SnapshotCadence::ALL[1],
+            "a duplicated entry would silently halve the real cadence count"
+        );
+    }
 
     fn row() -> TopVolumeRankRow {
         TopVolumeRankRow {

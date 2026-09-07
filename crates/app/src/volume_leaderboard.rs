@@ -122,6 +122,7 @@ use std::collections::HashMap;
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
 use tracing::{error, warn};
 
 /// Contracts tracked before the map refuses new ones.
@@ -203,7 +204,24 @@ pub struct RankedContract {
     /// distinct-underlying constraint and for gainer eligibility.
     pub underlying_id: u64,
     /// Cumulative traded volume for the day, as last accepted.
+    ///
+    /// This is the OBSERVATION — what the vendor's counter reads. It is what
+    /// the monotonicity gate guards and what the baselines below are measured
+    /// against. Since 2026-09-07 it is no longer the sort key.
     pub volume: u32,
+    /// The RANK KEY: lots traded in the window that just closed, × 1000.
+    ///
+    /// **Written by [`VolumeLeaderboard::rank`], ignored by
+    /// [`VolumeLeaderboard::observe`].** A caller constructing an observation
+    /// leaves it 0 and the ranking overwrites it; a value set here on the way
+    /// IN has no effect and is not read.
+    ///
+    /// Milli-lots rather than whole lots because a 250-deep board is decided at
+    /// its bottom edge: with integer lots every contract trading under one lot
+    /// in a one-second window collapses to 0 and the cut becomes an arbitrary
+    /// tie-break rather than a measurement. See the 2026-09-07 scope-lock
+    /// section.
+    pub window_lots_milli: u64,
 }
 
 /// What happened to one observation.
@@ -287,6 +305,63 @@ struct Tracked {
     contract: RankedContract,
     /// Reset to 0 on every accepted advance. Only a RUN of lower values counts.
     consecutive_lower: u16,
+    /// Cumulative volume as of this contract's last snapshot, PER CADENCE.
+    ///
+    /// One entry per window because the 1s and 5s boards measure different
+    /// intervals: sharing a baseline would make whichever cadence fired last
+    /// steal the other's window, and both boards would report a figure neither
+    /// interval actually traded.
+    ///
+    /// Seeded to the contract's CURRENT volume when it is first tracked, never
+    /// to 0. A 0 seed makes the first window report the whole day so far, which
+    /// is the largest number that contract will ever show and would hand it a
+    /// depth socket on its first appearance — the "stale high" shape this
+    /// module already refuses one level up.
+    baseline: [u32; WINDOW_COUNT],
+}
+
+/// Distinct snapshot cadences, and therefore baselines per contract.
+///
+/// Derived from the cadence enum rather than written as a literal: adding a
+/// third cadence must fail to compile here rather than silently index out of
+/// range or, worse, alias two cadences onto one baseline.
+pub const WINDOW_COUNT: usize = SnapshotCadence::ALL.len();
+
+/// Fixed-point scale on the rank key. 1000 = three decimal places of a lot.
+pub const LOTS_SCALE: u64 = 1_000;
+
+const _: () = assert!(
+    (u32::MAX as u64).checked_mul(LOTS_SCALE).is_some(),
+    "the rank key multiplies a u32 delta by LOTS_SCALE in u64; if that can \
+     overflow, a busy contract's key wraps to a small number and it silently \
+     leaves the board"
+);
+
+/// Which baseline slot a cadence owns.
+const fn window_index(cadence: SnapshotCadence) -> usize {
+    match cadence {
+        SnapshotCadence::OneSecond => 0,
+        SnapshotCadence::FiveSecond => 1,
+    }
+}
+
+/// Lots traded in a window, × [`LOTS_SCALE`], from raw units and a lot size.
+///
+/// The operator's own arithmetic (2026-09-07): 20,000 units on a 200-unit lot
+/// is 100 lots. Integer throughout — a float key would make the comparator
+/// non-transitive the moment a NaN reached it, which corrupts a sort wholesale
+/// rather than misplacing one row.
+///
+/// Returns `None` for a zero lot size rather than defaulting it. That cannot
+/// happen through the production path (`LegRefusal::MissingLotSize` refuses it
+/// at the join) and is refused again here because this is the function that
+/// would otherwise divide by it.
+#[must_use]
+pub const fn window_lots_milli(delta_units: u32, lot_size: u32) -> Option<u64> {
+    if lot_size == 0 {
+        return None;
+    }
+    Some((delta_units as u64 * LOTS_SCALE) / lot_size as u64)
 }
 
 #[derive(Debug)]
@@ -449,6 +524,14 @@ impl VolumeLeaderboard {
                     *existing = Tracked {
                         contract,
                         consecutive_lower: 0,
+                        // RESEEDED, not preserved. A re-latch is the decision
+                        // that the stored series was garbage, and the baseline
+                        // was measured against that same garbage — keeping it
+                        // would hold this contract's window at 0 until it
+                        // climbed back past a number we have just declared
+                        // wrong. Its first window after a re-latch reports
+                        // nothing, which is the honest answer.
+                        baseline: [contract.volume; WINDOW_COUNT],
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
@@ -521,6 +604,11 @@ impl VolumeLeaderboard {
             *existing = Tracked {
                 contract,
                 consecutive_lower: 0,
+                // PRESERVED, deliberately. This is a normal advance inside a
+                // window that has not closed yet; reseeding here would zero
+                // the delta on every accepted tick and every window would
+                // report 0, which is the whole feature silently doing nothing.
+                baseline: existing.baseline,
             };
             return Observation::Accepted;
         }
@@ -558,6 +646,11 @@ impl VolumeLeaderboard {
             Tracked {
                 contract,
                 consecutive_lower: 0,
+                // Seeded to what this contract has ALREADY traded today, never
+                // to 0. Seeding 0 would make its first window report the whole
+                // session so far — the largest figure it will ever show, on a
+                // board whose top entries take depth sockets.
+                baseline: [contract.volume; WINDOW_COUNT],
             },
         );
         Observation::Accepted
@@ -574,33 +667,65 @@ impl VolumeLeaderboard {
     /// previous layout rather than subscribing an empty set: a depth pool
     /// reported as enabled while carrying nothing is the false-OK the scope
     /// lock bans.
-    pub fn rank<F>(&mut self, family: OptionFamily, k: usize, eligible: F) -> &[RankedContract]
+    pub fn rank<F, L>(
+        &mut self,
+        family: OptionFamily,
+        cadence: SnapshotCadence,
+        k: usize,
+        lot_of: L,
+        eligible: F,
+    ) -> &[RankedContract]
     where
         F: Fn(&RankedContract) -> bool,
+        L: Fn(&RankedContract) -> Option<u32>,
     {
+        let idx = window_index(cadence);
         // `take` rather than a direct fill: the buffer and the family map both
         // live on `self`, so filling one from the other needs two borrows. Take
         // moves the Vec out WITH its capacity, so the allocation is still made
         // once at construction and reused for the life of the process.
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        scratch.extend(
-            self.family_ref(family)
-                .volumes
-                .values()
-                // The re-latch bookkeeping stays inside the map; only the
-                // contract itself is ranked.
-                .map(|tracked| tracked.contract)
-                .filter(&eligible),
-        );
 
-        // Highest volume first, then a DETERMINISTIC tiebreak on the composite
-        // identity. Without the tiebreak, equal volumes order by whatever the
-        // hash map yielded, so the same input reorders between sweeps and the
-        // caller swaps subscriptions for nothing.
+        // ONE pass, and it does three things that must not be split apart:
+        // computes each contract's delta against ITS baseline, pushes the
+        // eligible ones, and rolls EVERY baseline forward.
+        //
+        // "Every" is the load-bearing word. Rolling forward only the ranked
+        // contracts would let an ineligible one accumulate across windows and
+        // arrive with a delta measuring minutes the moment it became eligible —
+        // it would take a depth socket on a number no other contract on the
+        // board was measured over.
+        for tracked in self.family_mut(family).volumes.values_mut() {
+            let delta = tracked
+                .contract
+                .volume
+                .saturating_sub(tracked.baseline[idx]);
+            tracked.baseline[idx] = tracked.contract.volume;
+
+            let mut row = tracked.contract;
+            // A missing lot size cannot reach here through production — the
+            // join refuses it — so this is the defensive arm, and it SKIPS
+            // rather than ranking the contract at 0, which would put it in an
+            // arbitrary tie at the bottom of the board instead of out of it.
+            let Some(lots) = lot_of(&row).and_then(|lot| window_lots_milli(delta, lot)) else {
+                continue;
+            };
+            row.window_lots_milli = lots;
+            if eligible(&row) {
+                scratch.push(row);
+            }
+        }
+
+        // Most lots traded in the window first, then a DETERMINISTIC tiebreak
+        // on the composite identity. Without the tiebreak, equal keys order by
+        // whatever the hash map yielded, so the same input reorders between
+        // sweeps and the caller swaps subscriptions for nothing — and equal
+        // keys are COMMON now in a way they were not under a cumulative key:
+        // every contract that traded nothing in the window is exactly 0.
         scratch.sort_unstable_by(|a, b| {
-            b.volume
-                .cmp(&a.volume)
+            b.window_lots_milli
+                .cmp(&a.window_lots_milli)
                 .then_with(|| a.security_id.cmp(&b.security_id))
                 .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
         });
@@ -624,14 +749,17 @@ impl VolumeLeaderboard {
     /// when the true top five are five strikes of one stock, this forces four
     /// substitutions into thinner books — the shape that produced 800
     /// rows/minute against 100,800 on 2026-08-26.
-    pub fn rank_distinct_underlying<F>(
+    pub fn rank_distinct_underlying<F, L>(
         &mut self,
         family: OptionFamily,
+        cadence: SnapshotCadence,
         k: usize,
+        lot_of: L,
         eligible: F,
     ) -> Vec<RankedContract>
     where
         F: Fn(&RankedContract) -> bool,
+        L: Fn(&RankedContract) -> Option<u32>,
     {
         // CLAMPED before the allocations below. `Vec::with_capacity(k)` PANICS
         // on a capacity overflow, and the release profile is `panic = "abort"`,
@@ -639,7 +767,7 @@ impl VolumeLeaderboard {
         // bad ranking. `rank` is already safe by construction because
         // `truncate` clamps; this path allocates first, so it must clamp first.
         let k = k.min(MAX_TRACKED_CONTRACTS);
-        let ordered = self.rank(family, MAX_TRACKED_CONTRACTS, eligible);
+        let ordered = self.rank(family, cadence, MAX_TRACKED_CONTRACTS, lot_of, eligible);
         let mut seen: Vec<u64> = Vec::with_capacity(k);
         let mut out: Vec<RankedContract> = Vec::with_capacity(k);
         for row in ordered {
@@ -739,11 +867,24 @@ mod tests {
             segment: ExchangeSegment::NseFno,
             underlying_id: underlying,
             volume,
+            window_lots_milli: 0,
         }
     }
 
     fn all(_: &RankedContract) -> bool {
         true
+    }
+
+    const S1: SnapshotCadence = SnapshotCadence::OneSecond;
+    const S5: SnapshotCadence = SnapshotCadence::FiveSecond;
+
+    /// Lot size 1 for the tests that predate lot normalisation.
+    ///
+    /// With a lot of 1 the key is `delta * 1000`, so it is ORDER-IDENTICAL to
+    /// ranking on the delta itself — which keeps every ordering assertion below
+    /// meaningful while the normalisation gets its own dedicated tests.
+    fn lot1(_: &RankedContract) -> Option<u32> {
+        Some(1)
     }
 
     #[test]
@@ -761,7 +902,7 @@ mod tests {
             lb.observe(stock(2, 200, 700), OptionFamily::Stock),
             Observation::Accepted
         );
-        let ranked = lb.rank(OptionFamily::Stock, 10, all);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].security_id, 1, "900 must outrank 700");
         assert_eq!(
@@ -784,7 +925,7 @@ mod tests {
                 offered: 12
             }
         );
-        let ranked = lb.rank(OptionFamily::Stock, 10, all);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(
             ranked[0].volume, 4_000_000_000,
             "the stored high must survive the refusal"
@@ -815,10 +956,32 @@ mod tests {
                 "a SHORT run must still be refused -- that is the replay case"
             );
         }
+        // UPDATED 2026-09-07 with the ranking key. Under the old cumulative
+        // key this asserted `security_id == 1` — the latched contract sat at
+        // the TOP of the board holding a socket, which is what made the
+        // one-way ratchet expensive.
+        //
+        // Under a per-window key it sits at the BOTTOM instead: its stored
+        // volume is not advancing, so its delta is 0 while contract 2 is
+        // genuinely trading. The stored high is still defended — the refusals
+        // above prove that, and they are unchanged — but defending it no
+        // longer BUYS the contract a socket. That is a real improvement the
+        // key change brings, and it is asserted rather than assumed.
+        //
+        // Contract 2 has to actually TRADE for that comparison to mean
+        // anything: an opening rank closes both contracts' first window, then
+        // 2 advances and 1 cannot.
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        lb.observe(stock(2, 200, 6_000), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(
-            lb.rank(OptionFamily::Stock, 10, all)[0].security_id,
-            1,
-            "while the run is short the garbage high is still defended"
+            ranked[0].security_id, 2,
+            "a contract whose volume is frozen must not out-rank one that is trading"
+        );
+        assert_eq!(
+            lb.non_monotonic_refusals(OptionFamily::Stock),
+            u64::from(RELATCH_AFTER_CONSECUTIVE_LOWER - 1),
+            "the high IS still defended -- that is what the refusals record"
         );
 
         // The run crosses the threshold: the high is abandoned.
@@ -834,18 +997,33 @@ mod tests {
         );
         assert_eq!(lb.relatches(OptionFamily::Stock), 1);
 
-        let ranked = lb.rank(OptionFamily::Stock, 10, all);
-        assert_eq!(
-            ranked[0].security_id, 2,
-            "the real contract must now outrank the recovered one -- the socket is free"
-        );
+        // The re-latch reseeded contract 1's baseline to the value it adopted,
+        // so the window that closes here measures nothing for it — correct,
+        // because we have just declared the series it was measured against
+        // garbage. This rank is what closes that window for both contracts.
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
 
-        // And the recovered contract ranks normally again from here.
+        // And the recovered contract ranks normally again from here: it now
+        // trades MORE in the window than contract 2, and takes the top slot
+        // on that basis rather than on a latched high.
         assert_eq!(
             lb.observe(stock(1, 100, 9_000), OptionFamily::Stock),
             Observation::Accepted
         );
-        assert_eq!(lb.rank(OptionFamily::Stock, 10, all)[0].security_id, 1);
+        assert_eq!(
+            lb.observe(stock(2, 200, 6_100), OptionFamily::Stock),
+            Observation::Accepted
+        );
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(
+            ranked[0].security_id, 1,
+            "8,968 traded this window must outrank 100"
+        );
+        assert_eq!(
+            ranked[0].window_lots_milli,
+            (9_000 - u64::from(RELATCH_AFTER_CONSECUTIVE_LOWER)) * LOTS_SCALE,
+            "the key is what traded IN THE WINDOW, not the cumulative 9,000"
+        );
     }
 
     #[test]
@@ -861,7 +1039,7 @@ mod tests {
                 lb.observe(stock(1, 100, 5), OptionFamily::Stock),
                 Observation::RefusedNonMonotonic { .. }
             ));
-            let higher = lb.rank(OptionFamily::Stock, 1, all)[0].volume + 1;
+            let higher = lb.rank(OptionFamily::Stock, S1, 1, lot1, all)[0].volume + 1;
             assert_eq!(
                 lb.observe(stock(1, 100, higher), OptionFamily::Stock),
                 Observation::Accepted
@@ -918,7 +1096,7 @@ mod tests {
             lb.observe(stock(1, 999, u32::from(i)), OptionFamily::Stock);
         }
         assert_eq!(
-            lb.rank(OptionFamily::Stock, 1, all)[0].underlying_id,
+            lb.rank(OptionFamily::Stock, S1, 1, lot1, all)[0].underlying_id,
             999,
             "the re-latch must adopt the whole contract, not just its volume"
         );
@@ -940,7 +1118,7 @@ mod tests {
             Observation::RefusedNonMonotonic { .. }
         ));
         assert_eq!(
-            lb.rank(OptionFamily::Stock, 1, all)[0].volume,
+            lb.rank(OptionFamily::Stock, S1, 1, lot1, all)[0].volume,
             u32::MAX - 5,
             "a wrapped contract stays ranked at its last good high, not at 4"
         );
@@ -986,7 +1164,7 @@ mod tests {
         ));
         assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 1);
         assert_eq!(
-            lb.rank(OptionFamily::Stock, 1, all)[0].volume,
+            lb.rank(OptionFamily::Stock, S1, 1, lot1, all)[0].volume,
             500,
             "and the stored high survives the refusal"
         );
@@ -1015,7 +1193,7 @@ mod tests {
             lb.observe(stock(id, id, 0), OptionFamily::Stock);
         }
         assert!(
-            lb.rank(OptionFamily::Stock, 250, all).is_empty(),
+            lb.rank(OptionFamily::Stock, S1, 250, lot1, all).is_empty(),
             "an all-zero field must rank nothing, never an arbitrary 250"
         );
     }
@@ -1027,9 +1205,15 @@ mod tests {
         lb.observe(stock(2, 200, 5_000_000), OptionFamily::Index);
         assert_eq!(lb.tracked(OptionFamily::Stock), 1);
         assert_eq!(lb.tracked(OptionFamily::Index), 1);
-        assert_eq!(lb.rank(OptionFamily::Stock, 10, all).len(), 1);
-        assert_eq!(lb.rank(OptionFamily::Stock, 10, all)[0].security_id, 1);
-        assert_eq!(lb.rank(OptionFamily::Index, 10, all)[0].security_id, 2);
+        assert_eq!(lb.rank(OptionFamily::Stock, S1, 10, lot1, all).len(), 1);
+        assert_eq!(
+            lb.rank(OptionFamily::Stock, S1, 10, lot1, all)[0].security_id,
+            1
+        );
+        assert_eq!(
+            lb.rank(OptionFamily::Index, S1, 10, lot1, all)[0].security_id,
+            2
+        );
     }
 
     #[test]
@@ -1069,7 +1253,7 @@ mod tests {
         );
 
         assert_eq!(
-            lb.rank(OptionFamily::Stock, 250, all).len(),
+            lb.rank(OptionFamily::Stock, S1, 250, lot1, all).len(),
             250,
             "ranked apart, the stock family fills all 250 slots"
         );
@@ -1108,12 +1292,12 @@ mod tests {
             lb.observe(stock(id, id, 777), OptionFamily::Stock);
         }
         let first: Vec<u64> = lb
-            .rank(OptionFamily::Stock, 40, all)
+            .rank(OptionFamily::Stock, S1, 40, lot1, all)
             .iter()
             .map(|c| c.security_id)
             .collect();
         let second: Vec<u64> = lb
-            .rank(OptionFamily::Stock, 40, all)
+            .rank(OptionFamily::Stock, S1, 40, lot1, all)
             .iter()
             .map(|c| c.security_id)
             .collect();
@@ -1128,7 +1312,9 @@ mod tests {
         lb.observe(stock(1, 100, 900), OptionFamily::Stock);
         lb.observe(stock(2, 200, 800), OptionFamily::Stock);
         lb.observe(stock(3, 300, 700), OptionFamily::Stock);
-        let ranked = lb.rank(OptionFamily::Stock, 10, |c| c.underlying_id != 100);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, |c: &RankedContract| {
+            c.underlying_id != 100
+        });
         assert_eq!(ranked.len(), 2, "underlying 100 is filtered out");
         assert_eq!(ranked[0].security_id, 2, "volume still decides the order");
         assert_eq!(ranked[1].security_id, 3);
@@ -1148,7 +1334,7 @@ mod tests {
         for name in 1..5u64 {
             lb.observe(stock(100 + name, 100 + name, 1_000), OptionFamily::Stock);
         }
-        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
         assert_eq!(picked.len(), 5);
         assert_eq!(
             picked[0].security_id, 0,
@@ -1173,7 +1359,7 @@ mod tests {
                 OptionFamily::Stock,
             );
         }
-        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
         assert_eq!(picked.len(), 4, "only four distinct underlyings exist");
     }
 
@@ -1207,7 +1393,7 @@ mod tests {
             lb.observe(stock(1_000 + name, name, volume), OptionFamily::Stock);
         }
 
-        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
 
         assert_eq!(picked.len(), 5);
         assert_eq!(
@@ -1246,11 +1432,11 @@ mod tests {
         }
         lb.observe(stock(50, 100, 1), OptionFamily::Stock);
 
-        let top = lb.rank(OptionFamily::Stock, 250, all);
+        let top = lb.rank(OptionFamily::Stock, S1, 250, lot1, all);
         assert_eq!(top.len(), 1, "only the one stock contract is rankable");
         assert_eq!(top[0].security_id, 50);
 
-        let five = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+        let five = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
         assert_eq!(five.len(), 1, "the depth-200 path sees the same one");
         assert_eq!(five[0].security_id, 50);
     }
@@ -1287,12 +1473,12 @@ mod tests {
         assert_eq!(lb.tracked(OptionFamily::Stock), CONTRACTS as usize);
 
         // Warm, so the first-call map/vec growth is not in the number.
-        let _ = lb.rank(OptionFamily::Stock, DEPTH_20, all);
+        let _ = lb.rank(OptionFamily::Stock, S1, DEPTH_20, lot1, all);
 
         const ROUNDS: u32 = 50;
         let start = std::time::Instant::now();
         for _ in 0..ROUNDS {
-            let top = lb.rank(OptionFamily::Stock, DEPTH_20, all);
+            let top = lb.rank(OptionFamily::Stock, S1, DEPTH_20, lot1, all);
             std::hint::black_box(top.len());
         }
         let per_sweep = start.elapsed() / ROUNDS;
@@ -1300,7 +1486,7 @@ mod tests {
         // The depth-200 path sorts the WHOLE map, not the top 250.
         let start5 = std::time::Instant::now();
         for _ in 0..ROUNDS {
-            let five = lb.rank_distinct_underlying(OptionFamily::Stock, 5, all);
+            let five = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
             std::hint::black_box(five.len());
         }
         let per_distinct = start5.elapsed() / ROUNDS;
@@ -1372,6 +1558,7 @@ mod tests {
         let mut lb = VolumeLeaderboard::new();
         lb.observe(
             RankedContract {
+                window_lots_milli: 0,
                 security_id: 13,
                 segment: ExchangeSegment::NseFno,
                 underlying_id: 1,
@@ -1381,6 +1568,7 @@ mod tests {
         );
         lb.observe(
             RankedContract {
+                window_lots_milli: 0,
                 security_id: 13,
                 segment: ExchangeSegment::BseFno,
                 underlying_id: 2,
@@ -1401,9 +1589,176 @@ mod tests {
         for id in 0..500u64 {
             lb.observe(stock(id, id, 1_000 + id as u32), OptionFamily::Stock);
         }
-        let ranked = lb.rank(OptionFamily::Stock, 250, all);
+        // UPDATED 2026-09-07: the first rank CLOSES the opening window. Every
+        // contract's baseline was seeded to what it had already traded, so
+        // every delta here is 0 — which is the honest answer, because a single
+        // observation says nothing about how much traded inside a window.
+        let opening = lb.rank(OptionFamily::Stock, S1, 250, lot1, all);
+        assert!(
+            opening.iter().all(|c| c.window_lots_milli == 0),
+            "a contract seen once has traded nothing measurable IN a window"
+        );
+
+        // Now give each contract a window's worth of trading, deliberately in
+        // the OPPOSITE order to the cumulative one: id 0 trades the most.
+        for id in 0..500u64 {
+            let traded = 500 - id as u32;
+            lb.observe(
+                stock(id, id, 1_000 + id as u32 + traded),
+                OptionFamily::Stock,
+            );
+        }
+        let ranked = lb.rank(OptionFamily::Stock, S1, 250, lot1, all);
         assert_eq!(ranked.len(), 250);
-        assert_eq!(ranked[0].volume, 1_499, "the heaviest is first");
-        assert_eq!(ranked[249].volume, 1_250, "the 250th, not the lightest");
+        // The contract with the LOWEST cumulative volume is now first, which
+        // is the whole point of the change: the board measures the window, not
+        // the morning. Under the old key this row read 1,499.
+        assert_eq!(ranked[0].security_id, 0);
+        assert_eq!(ranked[0].volume, 1_500, "its cumulative is mid-pack");
+        assert_eq!(
+            ranked[0].window_lots_milli,
+            500 * LOTS_SCALE,
+            "500 units on a lot of 1 is 500 lots"
+        );
+        assert_eq!(
+            ranked[249].window_lots_milli,
+            251 * LOTS_SCALE,
+            "the 250th, not the lightest"
+        );
+    }
+
+    #[test]
+    fn the_key_is_lots_not_units_so_a_big_lot_does_not_win_on_size_alone() {
+        // The defect the operator named (2026-09-07): "based on lot quantity
+        // size it should be checked". Contract 1 trades 20,000 units on a
+        // 200-unit lot = 100 lots. Contract 2 trades 24,000 units — MORE units
+        // — on a 1,200-unit lot = 20 lots. Ranking on units puts 2 first;
+        // ranking on lots puts 1 first, which is the busier book.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+
+        lb.observe(stock(1, 100, 1 + 20_000), OptionFamily::Stock);
+        lb.observe(stock(2, 200, 1 + 24_000), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+
+        assert_eq!(ranked[0].security_id, 1, "100 lots beats 20 lots");
+        assert_eq!(ranked[0].window_lots_milli, 100 * LOTS_SCALE);
+        assert_eq!(ranked[1].window_lots_milli, 20 * LOTS_SCALE);
+        // And the raw units say the opposite, which is the whole point.
+        assert!(ranked[1].volume > ranked[0].volume);
+    }
+
+    #[test]
+    fn the_five_second_window_is_measured_independently_of_the_one_second_one() {
+        // The operator gave BOTH cadences ("every second ... and even per 5
+        // second also"), and they must not share a baseline: whichever fired
+        // last would steal the other's interval and both boards would report a
+        // window neither one measured.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        let _ = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+
+        // Five 1-second windows of 1,000 units each.
+        for step in 1..=5u32 {
+            lb.observe(stock(1, 100, 1 + step * 1_000), OptionFamily::Stock);
+            let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+            assert_eq!(
+                ranked[0].window_lots_milli,
+                1_000 * LOTS_SCALE,
+                "each 1s window sees only its own 1,000"
+            );
+        }
+
+        // The 5s window has not been read since before any of that, so it sees
+        // the WHOLE 5,000 — not the last second's 1,000, and not zero.
+        let ranked = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+        assert_eq!(ranked[0].window_lots_milli, 5_000 * LOTS_SCALE);
+    }
+
+    #[test]
+    fn a_newly_tracked_contract_reports_nothing_until_it_trades_in_a_window() {
+        // The "stale high" guard. Seeding the baseline to 0 would make a
+        // contract's FIRST window report its whole day so far — the largest
+        // number it will ever show — and hand it a depth socket on arrival.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 4_000_000), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(
+            ranked[0].window_lots_milli, 0,
+            "four million units traded BEFORE we were watching is not a window"
+        );
+        assert_eq!(
+            ranked[0].volume, 4_000_000,
+            "the observation itself is kept"
+        );
+    }
+
+    #[test]
+    fn a_contract_with_no_usable_lot_size_is_left_off_the_board_entirely() {
+        // Skipped, never ranked at 0: a 0 key would put it in an arbitrary
+        // tie at the bottom of a 250-deep board rather than out of it, and the
+        // bottom edge is exactly where the cut is decided.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+        let none_for_one = |c: &RankedContract| (c.security_id != 1).then_some(50);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, none_for_one, all);
+        lb.observe(stock(1, 100, 5_000), OptionFamily::Stock);
+        lb.observe(stock(2, 200, 5_000), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, none_for_one, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].security_id, 2);
+    }
+
+    #[test]
+    fn window_lots_milli_refuses_a_zero_lot_and_never_divides_by_it() {
+        assert_eq!(window_lots_milli(20_000, 200), Some(100 * LOTS_SCALE));
+        assert_eq!(window_lots_milli(25_000, 200), Some(125 * LOTS_SCALE));
+        assert_eq!(window_lots_milli(0, 200), Some(0));
+        assert_eq!(window_lots_milli(1_000, 0), None, "never a divide by zero");
+        // Sub-lot resolution is why the scale exists: 100 units on a 250 lot
+        // is 0.4 lots, which must be distinguishable from nothing at all.
+        assert_eq!(window_lots_milli(100, 250), Some(400));
+        assert_ne!(window_lots_milli(100, 250), window_lots_milli(0, 250));
+        // The widest possible delta must not overflow the key.
+        assert_eq!(
+            window_lots_milli(u32::MAX, 1),
+            Some(u64::from(u32::MAX) * LOTS_SCALE)
+        );
+    }
+
+    #[test]
+    fn an_ineligible_contract_still_has_its_baseline_rolled_forward() {
+        // Otherwise it accumulates across every window it sits out and arrives
+        // with a delta measuring minutes, taking a socket on a number no other
+        // contract on the board was measured over.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+        let only_two = |c: &RankedContract| c.security_id == 2;
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, only_two);
+
+        // Contract 1 trades hard for three windows while ineligible.
+        for step in 1..=3u32 {
+            lb.observe(stock(1, 100, step * 10_000), OptionFamily::Stock);
+            lb.observe(stock(2, 200, step * 10), OptionFamily::Stock);
+            let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, only_two);
+        }
+
+        // Now it becomes eligible and trades a modest amount. Its key must
+        // measure THAT window, not the 30,000 it traded while sitting out.
+        lb.observe(stock(1, 100, 30_100), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        let one = ranked.iter().find(|c| c.security_id == 1).expect("present");
+        assert_eq!(one.window_lots_milli, 100 * LOTS_SCALE);
+    }
+
+    /// Lot 200 for contract 1, lot 1,200 for contract 2 — real-ish sizes that
+    /// differ by 6x, which is what makes the units-vs-lots distinction bite.
+    fn lot_of_fixture(c: &RankedContract) -> Option<u32> {
+        Some(if c.security_id == 1 { 200 } else { 1_200 })
     }
 }

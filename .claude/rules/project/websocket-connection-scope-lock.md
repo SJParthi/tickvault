@@ -2339,3 +2339,119 @@ call and he has now made it twice.
 - Reports a depth pool as enabled while its instrument set is empty — including the
   pre-open case, where volume is zero for everything and the ranking is meaningless.
 - Deletes a SEBI or audit row under cover of this quote.
+
+### 2026-09-07 — THE RANKING KEY BECOMES LOTS TRADED IN THE WINDOW, NOT UNITS TRADED SINCE OPEN
+
+**The verbatim operator demand (2026-09-07, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see i decided to put our sort by volume liek this dude see based on lot quantity size it hsodul be chekced rigth suppose lets say per lot quantity is 200 and every second if it is having somwhwre or somehtign like 20k volume means and even per 5 seocnd also if the veolume is 25k means then you need to chekc the quantiyt to volume difference rigth then you will get the precise voluem percentage rigth dude so that eaisly we can sort it out right do youu dnerstand what im even aksing dude?"
+
+**The authorization (2026-09-07, same session, in DIRECT response to a message
+that enumerated this work, named the rule-file row it changes, and said it needed
+his word first):**
+
+> "Bro fix and resolve everything dude okay?"
+
+That is the §28.2/§28.3 authorization shape this repository already accepts — a
+general go-ahead answering an ENUMERATED ask selects the enumerated work.
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What this SUPERSEDES
+
+The 2026-09-06 contract table row:
+
+| Aspect | 2026-09-06 locked value | 2026-09-07 |
+|---|---|---|
+| Ranking key | **cumulative day volume** | **lots traded IN THE WINDOW** = `(units traded since the last snapshot of this cadence × 1000) ÷ lot size` |
+| Unit | raw exchange units | milli-lots (integer, 3 decimal places of a lot) |
+| Horizon | since 09:15 | the 1s or 5s window that just closed |
+
+Everything else in that section STANDS unchanged and is not re-litigated here:
+stock options only, `NSE_FNO` only, 250 depth-20 + 5 depth-200, the two option
+families ranked in SEPARATE leaderboards, gainers as an eligibility FILTER and
+never the sort key, distinct underlyings on depth-200, delta-only edge-triggered
+re-subscribe, no hardcoded contract ids.
+
+#### The operator's own arithmetic, which is the specification
+
+His numbers define it exactly:
+
+| His words | Meaning |
+|---|---|
+| "per lot quantity is 200" | lot size = 200 units |
+| "every second ... 20k volume" | 20,000 units traded in that 1-second window |
+| "per 5 second also ... 25k" | 25,000 units traded in that 5-second window |
+| "check the quantiyt to volume difference" | divide volume by lot quantity |
+| "you will get the precise voluem percentage" | 20,000 ÷ 200 = **100 lots**; 25,000 ÷ 200 = **125 lots** |
+| "so that eaisly we can sort it out" | those figures are the sort key |
+
+Both halves matter and both are changes:
+
+1. **NORMALISE by lot size.** Without it the board compares a 15-unit lot
+   against a 1,800-unit lot and the big-lot contract wins on units while
+   trading fewer actual contracts. Ranking is supposed to find the BUSIEST
+   book, and units are not comparable across contracts; lots are.
+2. **Measure the WINDOW, not the day.** His figures are explicitly per-second
+   and per-5-seconds. Cumulative-since-open answers "who has been busy today",
+   which by mid-afternoon is a fact about the morning. The depth sockets should
+   sit on what is busy NOW.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Sort key | `lots_milli = (delta_units as u64 * 1000) / lot_size as u64` — integer, no float anywhere on the path |
+| `delta_units` | `stored_cumulative - baseline[cadence]`, saturating; a contract whose cumulative FELL is refused by the existing monotonicity gate before this is ever computed |
+| Baseline | per contract, PER CADENCE — the 1s and 5s windows are independent and each keeps its own; updated in the same pass that reads it |
+| First window after a contract is first tracked | baseline is seeded to the contract's CURRENT cumulative, so its first delta is **0** and it ranks nothing until it trades inside a real window |
+| Lot size | from `ContractOwner.lot_size`, guaranteed non-zero by `LegRefusal::MissingLotSize` |
+| Tie-break | unchanged — `security_id` then `segment`, so the order is total and stable |
+| Scale | `× 1000` (milli-lots). Integer division alone would collapse every contract trading under one lot in a 1-second window to 0 and make the bottom of a 250-deep board an arbitrary tie |
+| Overflow | `u32::MAX × 1000 = 4.295e12`, inside `u64`. Const-asserted, never `as` |
+| Cumulative pipeline | **UNCHANGED** — the monotonicity gate, `RELATCH_AFTER_CONSECUTIVE_LOWER`, the capacity cap and the refusal counters all stay exactly as they are. They guard the INPUT; this changes only the key derived from it |
+
+#### ⚠ The honest cost, which is a real behaviour change and not a detail
+
+**The board stops being monotonic, and that is the point of the change rather
+than a defect in it.** Today's key only ever rises, so the top-250 set is
+stable by construction and the delta-only re-subscribe sends almost nothing. A
+per-window rate rises AND falls, so the set will genuinely churn more, and every
+entry and exit is a depth swap on a socket.
+
+Three things bound that, and none of them is new machinery:
+
+* The re-subscribe is already **edge-triggered and delta-only** — a contract
+  that stays in the set costs nothing, however its rank moves inside the set.
+* It is already **capped per window**, with the refusal counted, so a violently
+  churning market cannot serialise 250 two-second swaps into a 5-second window.
+* The 5-second board is inherently steadier than the 1-second one, and it is
+  the 5s board that has the larger sample.
+
+**NOT claimed:** that the churn is small. Nobody has measured it, because no
+session has yet ranked on this key. `tv_depth_swaps_total` against the existing
+budget-refusal counter is the measurement, and the first live session is when it
+exists. If the swap budget is hit routinely, the answer is a longer window or a
+hysteresis band on entry/exit — NOT reverting to cumulative, which answers a
+different question.
+
+**NOT claimed:** that a 1-second window is statistically meaningful for a thin
+stock option. Many will trade zero units in any given second and rank 0, which
+is correct and not a bug; the 5s board is where a thin book gets a fair reading.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks on raw units without dividing by lot size (the defect this fixes).
+- Uses a float anywhere in the sort key — a non-finite comparator is
+  non-transitive and corrupts a sort wholesale, which this file already records
+  once.
+- Defaults a missing lot size to 1 rather than refusing the contract.
+- Seeds a newly-tracked contract's baseline to 0, which makes its first window
+  report the WHOLE DAY and hands it a depth socket it did not earn.
+- Shares one baseline between the 1s and 5s cadences — each window must measure
+  its own interval.
+- Weakens or removes the monotonicity gate, the re-latch, or the capacity cap
+  because "the key is a delta now". They guard the cumulative INPUT and are
+  still exactly as load-bearing.
+- Re-subscribes unconditionally rather than on the delta, or removes the
+  per-window swap cap, on the grounds that the set churns more.
