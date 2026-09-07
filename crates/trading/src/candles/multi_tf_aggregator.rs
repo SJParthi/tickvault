@@ -139,6 +139,19 @@ struct InstrumentSlot {
     /// invented. Under-reporting one bucket is far less wrong than
     /// over-reporting by a whole day, and it must not be silent.
     volume_baseline_seeded: bool,
+    /// Last accepted last-traded price, in rupees.
+    ///
+    /// Stored on the slot that ALREADY EXISTS per instrument rather than in a
+    /// second per-instrument map. A parallel map would be one more structure
+    /// bounded only by caller convention -- the unbounded-growth shape this
+    /// codebase's own O(1) table has recorded and removed repeatedly -- and it
+    /// could disagree with the fold about which price was last accepted.
+    ///
+    /// `f64::NAN` until the first accepted tick, deliberately: a reader must be
+    /// able to tell "no price yet" from a real zero, and `0.0` is a live
+    /// sentinel on this feed (Ticker-mode packets and pre-open instruments both
+    /// carry it). Every consumer of this value already refuses a non-finite.
+    last_ltp: f64,
 }
 
 /// Per-tick outcome, coalesced across all [`TF_COUNT`](crate::candles::TF_COUNT)
@@ -583,6 +596,7 @@ impl MultiTfAggregator {
             key,
             cell: AggregatorCell::empty(),
             last_cumulative: 0,
+            last_ltp: f64::NAN,
             // Deliberately NOT a baseline — see the field doc. The first tick
             // this slot folds replaces it with a real observation.
             volume_baseline_seeded: false,
@@ -1000,6 +1014,10 @@ impl MultiTfAggregator {
         // unattributable to any bucket we own. Anchoring the baseline on this
         // first observation makes the first bar report 0; anchoring it on `0`
         // made the first bar report the whole day.
+        // Recorded HERE, on the accepted-tick path, so it can never hold a price
+        // the fold itself refused. Every earlier return in this function is a
+        // refusal.
+        slot.last_ltp = prices.last_traded_price;
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
             slot.last_cumulative = cumulative_volume;
@@ -1255,6 +1273,41 @@ impl MultiTfAggregator {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+impl MultiTfAggregator {
+    /// The last accepted last-traded price for one instrument, in rupees.
+    ///
+    /// `None` when the instrument has no slot, or has a slot that has not yet
+    /// folded an accepted tick. Both are the same answer to the caller -- there
+    /// is no price to reason about -- and neither is an error: a slot is created
+    /// on first sight and the authorized universe is far larger than the set
+    /// that trades in any given second.
+    ///
+    /// # Why this lives here rather than in a map of its own
+    ///
+    /// The fold already keeps one slot per instrument, bounded by
+    /// `AGGREGATOR_MAX_SLOTS` and fail-closed at it. A second per-instrument map
+    /// would be another structure bounded only by caller convention -- the
+    /// unbounded-growth shape this repository's O(1) table has recorded and
+    /// removed repeatedly -- and it could disagree with the fold about which
+    /// price was last ACCEPTED, which is the only price worth reporting.
+    ///
+    /// # Complexity
+    ///
+    /// O(1) average: one hash probe and one indexed read. Takes `&self`, so it
+    /// cannot allocate a slot as a side effect of being asked -- a reader must
+    /// never grow the table it is reading.
+    #[must_use]
+    pub fn last_ltp(&self, feed: Feed, security_id: u64, segment_code: u8) -> Option<f64> {
+        let idx = *self.index.get(&(feed, security_id, segment_code))?;
+        let slot = self.slots.get(usize::try_from(idx).ok()?)?;
+        // NAN is the "no accepted tick yet" sentinel, and it must not escape as
+        // a price: every downstream gain calculation refuses a non-finite, so
+        // returning it would turn "unknown" into "refused" one layer away from
+        // where the reason is known.
+        slot.last_ltp.is_finite().then_some(slot.last_ltp)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3256,5 +3309,44 @@ mod out_of_band_timestamp_tests {
         assert!(!stats.out_of_band_timestamp);
         assert!(!stats.refused_timestamp);
         assert!(stats.folded(), "an ordinary tick must still fold");
+    }
+
+    #[test]
+    fn last_ltp_is_none_before_any_accepted_tick_and_some_after() {
+        // The two states a caller must be able to tell apart. `0.0` is a LIVE
+        // sentinel on this feed -- Ticker-mode packets and pre-open instruments
+        // both carry it -- so "no price yet" cannot be signalled as a zero.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        assert_eq!(
+            agg.last_ltp(Feed::Dhan, 77, 2),
+            None,
+            "an instrument with no slot has no price"
+        );
+
+        let t = tick(77, 2, CANDLE_OPEN + 60, 101.25, 500);
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        let got = agg
+            .last_ltp(Feed::Dhan, 77, 2)
+            .expect("an accepted tick leaves a price");
+        assert!(
+            (got - 101.25).abs() < 1e-6,
+            "expected the accepted price, got {got}"
+        );
+    }
+
+    #[test]
+    fn last_ltp_keys_on_the_composite_so_a_segment_collision_cannot_answer() {
+        // I-P1-11: Dhan reuses the same numeric id across segments. Keyed on the
+        // bare id, an index would answer with a same-numbered option's price.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let t = tick(27, 2, CANDLE_OPEN + 60, 55.5, 100);
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        assert!(agg.last_ltp(Feed::Dhan, 27, 2).is_some());
+        assert_eq!(
+            agg.last_ltp(Feed::Dhan, 27, 0),
+            None,
+            "id 27 on IDX_I is a DIFFERENT instrument"
+        );
     }
 }
