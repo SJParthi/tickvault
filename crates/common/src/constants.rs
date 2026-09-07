@@ -1351,6 +1351,21 @@ pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 56_400;
 /// that spans midnight without one starts the pre-open holding YESTERDAY's
 /// non-zero volumes, and a value-only guard would happily publish 250 stale
 /// rows every second from 09:00. A value gate is not a session gate.
+/// Contracts ranked and recorded per option family, per snapshot.
+///
+/// 250 is the depth-20 instrument budget, and that is the point: the table
+/// exists to audit the steering decision, so recording FEWER than the pool can
+/// hold would leave contracts that were subscribed with no row saying whether
+/// they had earned it. Recording more would record a ranking no socket could
+/// ever act on.
+///
+/// Per FAMILY, not in total. Index options and stock options are ranked on
+/// separate boards -- a single blended top-250 by raw volume returns 250 index
+/// strikes and zero stock options, because one NIFTY weekly at-the-money strike
+/// out-trades stock strikes by orders of magnitude. That split is the operator's
+/// 2026-09-06 requirement and the reason the family column exists.
+pub const TOP_VOLUME_RANK_PER_FAMILY: usize = 250;
+
 pub const TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST: u32 = 33_300;
 
 /// Seconds-of-day (IST) at which top-volume snapshot capture ends:
