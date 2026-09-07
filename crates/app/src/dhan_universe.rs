@@ -1731,6 +1731,7 @@ mod tests {
             strike_paise: 0,
             option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
             underlying_symbol: underlying.to_owned(),
+            lot_size: 0,
         }
     }
 
@@ -2394,6 +2395,7 @@ mod tests {
             strike_paise: 0,
             option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
             underlying_symbol: String::new(),
+            lot_size: 0,
         }
     }
 

@@ -111,6 +111,18 @@ pub struct ContractRow {
     pub l: String,
     /// Underlying symbol.
     pub u: String,
+    /// `LOT_SIZE` — the contract multiplier. `0` when the master did not
+    /// carry one.
+    ///
+    /// `serde(default)` is load-bearing, not tidiness: this artifact is
+    /// written to disk once a day and re-read by every later boot, so a
+    /// restart on the SAME day this field ships would meet a file written by
+    /// the previous binary with no `z` key. Without the default that parse
+    /// fails, the artifact reads as unusable, and the lane falls back to the
+    /// 4-index universe — the exact 99.98% collapse this repo already has an
+    /// alarm for.
+    #[serde(default)]
+    pub z: u32,
 }
 
 impl ContractRow {
@@ -134,6 +146,7 @@ impl ContractRow {
             strike_paise: self.s,
             option_leg: OptionLeg::from_master_field(&self.l),
             underlying_symbol: self.u.clone(),
+            lot_size: self.z,
         }
     }
 }
@@ -168,6 +181,7 @@ pub fn contract_rows_from_master(master: &[MasterRow]) -> Vec<ContractRow> {
             }
             .into(),
             u: r.underlying_symbol.clone(),
+            z: r.lot_size,
         })
         .collect()
 }
@@ -1605,6 +1619,7 @@ mod tests {
             s: 250_000,
             l: "CE".into(),
             u: "RELIANCE".into(),
+            z: 0,
         }
     }
 
@@ -1772,6 +1787,9 @@ mod tests {
             strike_paise: strike_rupees * 100,
             option_leg: leg,
             underlying_symbol: underlying.into(),
+            // A REAL multiplier, so every fixture below exercises the value
+            // actually carried rather than the absent sentinel.
+            lot_size: 75,
         }
     }
 
@@ -2900,6 +2918,65 @@ mod tests {
         assert_eq!(m.option_leg, OptionLeg::Put);
         assert_eq!(m.strike_paise, 123_400);
         assert_eq!(m.underlying_symbol, "RELIANCE");
+        // The lot size must survive the disk round trip: the ranking divides
+        // by it, and the artifact is the only place it reaches the lane.
+        assert_eq!(back[0].z, 75);
+        assert_eq!(m.lot_size, 75);
+    }
+
+    #[test]
+    fn an_artifact_written_before_the_lot_size_field_still_parses() {
+        // The load-bearing case for `#[serde(default)]`, and the reason it is
+        // not tidiness: this artifact is written once a day and re-read by
+        // every later boot, so a restart on the DAY this field ships meets a
+        // file the previous binary wrote with no `z` key. Without the default
+        // that parse fails, `load_contract_universe` reports the artifact
+        // unusable, and the lane collapses to the 4-index fallback.
+        let legacy =
+            r#"[{"i":5,"x":"NSE","c":"OPTSTK","e":20260828,"s":123400,"l":"PE","u":"RELIANCE"}]"#;
+        let back: Vec<ContractRow> = serde_json::from_str(legacy).expect("legacy artifact parses");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].z, 0, "absent reads as the sentinel, not a guess");
+        assert_eq!(back[0].u, "RELIANCE", "every other field still lands");
+        // And the sentinel is what the ranking refuses, so a legacy artifact
+        // costs the board its contracts for one session — never a silently
+        // wrong ordering.
+        assert_eq!(back[0].to_master_row().lot_size, 0);
+    }
+
+    #[test]
+    fn contract_rows_from_master_carries_each_contracts_own_lot_size() {
+        let master = [
+            MasterRow {
+                lot_size: 75,
+                ..contract(
+                    5,
+                    InstrumentClass::IndexOption,
+                    "NSE",
+                    "NIFTY",
+                    2026_08_28,
+                    24_500,
+                    OptionLeg::Call,
+                )
+            },
+            MasterRow {
+                lot_size: 250,
+                ..contract(
+                    6,
+                    InstrumentClass::StockOption,
+                    "NSE",
+                    "RELIANCE",
+                    2026_08_28,
+                    3_000,
+                    OptionLeg::Call,
+                )
+            },
+        ];
+        let rows = contract_rows_from_master(&master);
+        // Per contract, never one figure for the file — two real contracts on
+        // the same day have genuinely different multipliers.
+        assert_eq!(rows[0].z, 75);
+        assert_eq!(rows[1].z, 250);
     }
 
     #[test]

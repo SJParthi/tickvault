@@ -73,6 +73,7 @@ fn row(
         strike_paise,
         option_leg: leg,
         underlying_symbol: underlying.to_owned(),
+        lot_size: 0,
     }
 }
 
