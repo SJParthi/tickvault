@@ -91,6 +91,53 @@ pub const fn floor_to_second(ts_nanos: i64) -> i64 {
     ts_nanos - rem
 }
 
+/// Whether a snapshot stamped at this instant may be CAPTURED at all.
+///
+/// Pure, O(1), and the gate the caller must consult BEFORE ranking — not
+/// after, because ranking 25,000 contracts to then throw the result away is
+/// work the drain does not need to do.
+///
+/// # Why this exists, when zero volume already yields an empty ranking
+///
+/// It looks redundant and it is not. Before 09:15 every cumulative volume is
+/// zero, so an empty ranking falls out on its own — **while the leaderboard
+/// is fresh**. The leaderboard lives in RAM and `reset_daily` is the only
+/// thing that clears it, so a process spanning midnight begins the pre-open
+/// holding YESTERDAY's non-zero volumes. A value-only guard would publish 250
+/// stale rows every second from 09:00, each one a confident ranking of a
+/// market that has not opened.
+///
+/// A value gate is not a session gate. This is the session gate; wiring
+/// `reset_daily` is the other half and neither substitutes for the other.
+///
+/// The window is `[09:15:00, 15:40:00)` — the operator's *"starting 9.15 am
+/// till 3.39 pm"*, with the end exclusive so the last captured snapshot is
+/// 15:39:59.
+#[must_use]
+pub const fn within_capture_window(secs_of_day_ist: u32) -> bool {
+    secs_of_day_ist >= tickvault_common::constants::TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST
+        && secs_of_day_ist < tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST
+}
+
+/// Seconds-of-day IST for an IST-nanosecond instant.
+///
+/// The stored timestamps on this path are ALREADY IST (the WebSocket
+/// timestamp rule: `ts` is IST epoch, never UTC plus an offset), so this is a
+/// modulo and deliberately NOT a timezone conversion. Adding one here would
+/// be the +5:30-twice bug the data-integrity rule calls the single most
+/// critical one in the repository.
+#[must_use]
+pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
+    const SECS_PER_DAY: i64 = 86_400;
+    let secs = ts_ist_nanos.div_euclid(NANOS_PER_SECOND);
+    // `rem_euclid` so a pre-epoch instant lands in [0, 86_400) rather than
+    // going negative and failing the cast — unreachable in production, and
+    // the kind of asymmetry nobody re-derives later.
+    let of_day = secs.rem_euclid(SECS_PER_DAY);
+    // Bounded by the modulo above, so the cast cannot truncate.
+    of_day as u32
+}
+
 /// Projects one family's ranked slice into storable rows.
 ///
 /// `gain_pct_of` and `is_subscribed` are supplied by the caller because the
@@ -449,5 +496,111 @@ mod tests {
         sorted.iter().zip(sorted.iter().skip(1)).for_each(|(a, b)| {
             assert_ne!(a, b, "refusal labels must be distinct: {labels:?}");
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // The session-clock capture gate (2026-09-07)
+    // -----------------------------------------------------------------------
+
+    /// Seconds-of-day helper for readable fixtures.
+    const fn ist(h: u32, m: u32, s: u32) -> u32 {
+        h * 3600 + m * 60 + s
+    }
+
+    #[test]
+    fn the_capture_window_opens_at_0915_and_not_before() {
+        assert!(
+            !within_capture_window(ist(9, 14, 59)),
+            "09:14:59 is pre-open — one second before the window"
+        );
+        assert!(
+            within_capture_window(ist(9, 15, 0)),
+            "09:15:00 is INCLUSIVE: it is the operator's stated start"
+        );
+    }
+
+    #[test]
+    fn the_capture_window_closes_after_the_1539_minute() {
+        assert!(
+            within_capture_window(ist(15, 39, 59)),
+            "15:39:59 must still capture — the operator's \"till 3.39 pm\" reads \
+             as THROUGH the 15:39 minute, so the end is exclusive at 15:40:00"
+        );
+        assert!(
+            !within_capture_window(ist(15, 40, 0)),
+            "15:40:00 is EXCLUSIVE"
+        );
+    }
+
+    #[test]
+    fn the_pre_open_auction_window_never_captures() {
+        // 09:00-09:15 ticks ARE legitimately persisted (tick persistence opens
+        // at 09:00), and ranking them would rank an auction. This is the whole
+        // reason the capture window starts LATER than the persist window.
+        for secs in [ist(9, 0, 0), ist(9, 7, 0), ist(9, 12, 30)] {
+            assert!(
+                !within_capture_window(secs),
+                "pre-open second {secs} must never produce a snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overnight_hours_never_capture() {
+        // The case a VALUE-only guard cannot cover: a process spanning midnight
+        // holds yesterday's non-zero volumes, so "volume is zero" is false and
+        // an unguarded snapshot would publish a confident ranking of a market
+        // that has not opened.
+        for secs in [0, ist(3, 0, 0), ist(8, 59, 59), ist(20, 0, 0), 86_399] {
+            assert!(
+                !within_capture_window(secs),
+                "out-of-session second {secs} must never produce a snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_never_outlives_the_ticks_that_feed_it() {
+        // A ranking of volume can only be as current as the ticks behind it.
+        // Capturing past the tick-persist window would publish a FROZEN
+        // ranking that looks live, which is worse than publishing nothing.
+        assert_eq!(
+            tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST,
+            tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST,
+            "the capture window must END with the tick window, not after it"
+        );
+    }
+
+    #[test]
+    fn secs_of_day_reads_ist_directly_and_never_adds_an_offset() {
+        // THE most critical data-integrity rule in this repository: stored
+        // timestamps on this path are ALREADY IST. Adding +5:30 here would be
+        // the offset-applied-twice bug, and it would move every snapshot into
+        // a window it does not belong to.
+        let nine_fifteen = i64::from(ist(9, 15, 0)) * NANOS_PER_SECOND;
+        assert_eq!(
+            secs_of_day_ist(nine_fifteen),
+            ist(9, 15, 0),
+            "an IST instant must read back as the SAME seconds-of-day"
+        );
+    }
+
+    #[test]
+    fn secs_of_day_wraps_at_the_day_boundary_rather_than_growing() {
+        let day = 86_400_i64 * NANOS_PER_SECOND;
+        let second_day_noon = day + i64::from(ist(12, 0, 0)) * NANOS_PER_SECOND;
+        assert_eq!(secs_of_day_ist(second_day_noon), ist(12, 0, 0));
+        assert_eq!(secs_of_day_ist(day), 0, "midnight of any day is second 0");
+    }
+
+    #[test]
+    fn secs_of_day_stays_in_range_for_a_pre_epoch_instant() {
+        // Unreachable in production, and the kind of asymmetry nobody
+        // re-derives later: a `%` that rounds toward zero would go NEGATIVE
+        // and the cast would wrap into a bogus in-window second.
+        let before_epoch = -NANOS_PER_SECOND;
+        let of_day = secs_of_day_ist(before_epoch);
+        assert!(of_day < 86_400, "must stay inside a day, got {of_day}");
+        assert_eq!(of_day, 86_399, "one second before the epoch is 23:59:59");
     }
 }

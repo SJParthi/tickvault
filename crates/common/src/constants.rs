@@ -1333,6 +1333,48 @@ pub const TICK_PERSIST_START_SECS_OF_DAY_IST: u32 = 32_400;
 /// constant when the close moved, and it must stay.
 pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 56_400;
 
+// ---------------------------------------------------------------------------
+// Top-volume snapshot capture window (operator directive 2026-09-06)
+// ---------------------------------------------------------------------------
+//
+// Operator verbatim: *"ensure to capture the top volume gainers of the entire
+// options contracts starting 9.15 am till 3.39 pm"*.
+
+/// Seconds-of-day (IST) at which top-volume snapshot capture starts:
+/// 09:15:00 = 9 × 3600 + 15 × 60. INCLUSIVE.
+///
+/// # Why a CLOCK gate and not just a zero-volume check
+///
+/// Before 09:15 every contract's cumulative volume is zero, so an empty
+/// ranking falls out naturally and a clock gate looks redundant. It is not.
+/// The leaderboard is in RAM and `reset_daily` is what clears it; a process
+/// that spans midnight without one starts the pre-open holding YESTERDAY's
+/// non-zero volumes, and a value-only guard would happily publish 250 stale
+/// rows every second from 09:00. A value gate is not a session gate.
+pub const TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST: u32 = 33_300;
+
+/// Seconds-of-day (IST) at which top-volume snapshot capture ends:
+/// 15:40:00. **EXCLUSIVE**, so the last captured snapshot is 15:39:59 —
+/// the operator's "till 3.39 pm" read as "through the 15:39 minute".
+///
+/// Deliberately the same instant as `TICK_PERSIST_END_SECS_OF_DAY_IST`: a
+/// ranking of volume can only be as current as the ticks that fed it, so
+/// capturing past the tick window would publish a frozen ranking that looks
+/// live. Pinned to that constant by a const-assert below rather than
+/// re-derived, so the NSE CAS-session class of change (which moved the close
+/// once already, on 2026-08-03) cannot move one and leave the other behind.
+pub const TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST: u32 = TICK_PERSIST_END_SECS_OF_DAY_IST;
+
+const _: () = assert!(
+    TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST < TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST,
+    "the top-volume capture window must be non-empty"
+);
+const _: () = assert!(
+    TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST > TICK_PERSIST_START_SECS_OF_DAY_IST,
+    "capture must start AFTER tick persistence does: the pre-open 09:00-09:15 \
+     ticks are legitimately persisted, but ranking them would rank an auction"
+);
+
 /// Seconds of grace added to the END of an open window, for ARRIVAL-CLOCKED
 /// rows only. 240 = 4 minutes.
 ///
