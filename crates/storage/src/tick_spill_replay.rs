@@ -1815,7 +1815,19 @@ mod tests {
     ///
     /// The two `n > 1` call sites are the exposed ones (`n = 2` and `n = 3`);
     /// a single unconditional connection cannot under-run its own count.
-    fn tiny_server(status: &'static str, n: usize) -> (String, std::thread::JoinHandle<()>) {
+    ///
+    /// # Why the handle yields the SERVED COUNT (2026-09-07)
+    ///
+    /// An adversarial re-read of this fix found that bounding the loop is not
+    /// enough on its own: a caller that only asserts on `replay_spill_dir`'s
+    /// outcome cannot tell "the server answered 500" from "the server never
+    /// ran at all", because a dead listener is dropped, the client gets
+    /// `ECONNREFUSED`, and the replay reports the SAME failure tuple. That
+    /// test would have passed green straight through the very hang this
+    /// change exists to fix. The thread therefore returns how many requests
+    /// it actually served, so a caller can assert the response was DELIVERED
+    /// rather than merely that the round failed.
+    fn tiny_server(status: &'static str, n: usize) -> (String, std::thread::JoinHandle<usize>) {
         tiny_server_with_deadline(status, n, TINY_SERVER_DEADLINE)
     }
 
@@ -1825,7 +1837,7 @@ mod tests {
         status: &'static str,
         n: usize,
         deadline: Duration,
-    ) -> (String, std::thread::JoinHandle<()>) {
+    ) -> (String, std::thread::JoinHandle<usize>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -1837,7 +1849,7 @@ mod tests {
             let mut served = 0usize;
             while served < n {
                 if Instant::now() >= give_up_at {
-                    return;
+                    return served;
                 }
                 match listener.accept() {
                     Ok((mut sock, _)) => {
@@ -1856,15 +1868,35 @@ mod tests {
                         let _ = sock.flush();
                         served = served.saturating_add(1);
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        // WouldBlock is the normal no-pending-connection poll.
+                        // Interrupted (EINTR) and ConnectionAborted
+                        // (ECONNABORTED — a client that vanished between the
+                        // SYN and our accept) are TRANSIENT: std does not
+                        // retry `accept` for us, so returning here would end
+                        // the server on a hiccup and hand the caller the same
+                        // never-ran ambiguity the served count exists to
+                        // remove. The deadline still bounds the retry.
+                        //
                         // 5 ms: short enough that a real connection is served
                         // essentially immediately, long enough that the poll
                         // costs nothing across a whole suite.
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    Err(_) => return,
+                    // Anything else (EMFILE, EBADF, a closed listener) is not
+                    // retryable — end, and report what was served so the
+                    // caller's assertion names the shortfall.
+                    Err(_) => return served,
                 }
             }
+            served
         });
         (format!("http://127.0.0.1:{port}/write"), handle)
     }
@@ -1889,7 +1921,7 @@ mod tests {
         // Two expected, none made — the shape that hung CI, with the deadline
         // shrunk so the bound is provable without a 30-second test.
         let (_url, server) = tiny_server_with_deadline(
-            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             2,
             Duration::from_millis(200),
         );
@@ -1917,27 +1949,61 @@ mod tests {
     ///
     /// Without this, the test above could be satisfied by a server that never
     /// serves anyone — a bound that works by breaking the thing it bounds.
+    ///
+    /// # Why ONE pooled client, and why that is the point (2026-09-07)
+    ///
+    /// The first version of this test used two SEPARATE clients so neither
+    /// could reuse the other's socket. That proved the deadline was harmless
+    /// and proved nothing about the actual failure: every real call site — and
+    /// `replay_spill_dir` itself — reuses ONE `build_probe_client` across all
+    /// its requests, and `build_probe_client` sets no `pool_max_idle_per_host`,
+    /// so reqwest keeps the connection alive by default. Under-connecting was
+    /// never a hypothetical; it was the production shape.
+    ///
+    /// So this now drives two requests through ONE client and asserts the
+    /// server SERVED both — the shape that can actually under-run.
+    ///
+    /// # ⚠ What this does NOT prove, measured 2026-09-07
+    ///
+    /// The `connection: close` header on every response was added in the same
+    /// change on the theory that it is what stops reqwest pooling the socket.
+    /// **Bite-tested, and the bite did NOT fire:** removing the header from
+    /// this test leaves it passing with `served == 2`. The reason is in the
+    /// accept loop above — `sock` is bound inside the `Ok((mut sock, _))` arm
+    /// and DROPPED at the end of it, which sends FIN, so the helper closes
+    /// every connection server-side whether or not the header says so. The
+    /// header is therefore honest hygiene and redundant belt-and-braces, NOT
+    /// the load-bearing mechanism, and it is recorded that way rather than
+    /// claimed as a fix.
+    ///
+    /// Which leaves the original under-connection cause UNEXPLAINED. The
+    /// deadline is what makes that survivable: whatever the mechanism, the
+    /// thread ends and the caller's assertion names the shortfall in seconds
+    /// instead of the job dying at its timeout with no verdict.
     #[test]
     fn tiny_server_still_serves_every_connection_it_promised() {
         let (url, server) = tiny_server_with_deadline(
-            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             2,
             Duration::from_secs(30),
         );
 
-        // Two SEPARATE clients, so neither can reuse the other's pooled socket
-        // and under-run the count the way a single pooled client can.
+        // ONE client, reused — the shape `replay_spill_dir` actually uses.
+        let client = crate::http_client::build_probe_client(5).expect("client");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
         for _ in 0..2 {
-            let client = crate::http_client::build_probe_client(5).expect("client");
-            let sent = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("rt")
-                .block_on(async { client.post(&url).body("x").send().await.is_ok() });
+            let sent = rt.block_on(async { client.post(&url).body("x").send().await.is_ok() });
             assert!(sent, "the server must answer a real request");
         }
 
-        server.join().expect("server thread");
+        let served = server.join().expect("server thread");
+        assert_eq!(
+            served, 2,
+            "a pooled client must still get two connections served — the helper drops each socket after answering, so the count is what proves it"
+        );
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1972,7 +2038,10 @@ mod tests {
         std::fs::write(&closed, payload).expect("write closed");
         std::fs::write(&live, payload).expect("write live");
 
-        let (url, server) = tiny_server("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", 2);
+        let (url, server) = tiny_server(
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            2,
+        );
         let client = crate::http_client::build_probe_client(5).expect("client");
         let outcome = replay_spill_dir(&dir, &url, &client).await;
         let _ = server.join();
@@ -2019,7 +2088,10 @@ mod tests {
         let path = dir.join("ticks-dhan-1.ilp");
         std::fs::write(&path, b"ticks value=1i 1\n").expect("write");
 
-        let (url, server) = tiny_server("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n", 1);
+        let (url, server) = tiny_server(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            1,
+        );
         let client = crate::http_client::build_probe_client(5).expect("client");
         let outcome = replay_spill_dir(&dir, &url, &client).await;
         let _ = server.join();
@@ -2053,12 +2125,23 @@ mod tests {
         std::fs::write(&first, b"ticks value=1i 1\n").expect("write");
         std::fs::write(&second, b"ticks value=2i 2\n").expect("write");
 
-        let (url, server) =
-            tiny_server("HTTP/1.1 500 Server Error\r\ncontent-length: 0\r\n\r\n", 1);
+        let (url, server) = tiny_server(
+            "HTTP/1.1 500 Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            1,
+        );
         let client = crate::http_client::build_probe_client(5).expect("client");
         let outcome = replay_spill_dir(&dir, &url, &client).await;
-        let _ = server.join();
+        let served = server.join().expect("server thread");
 
+        // The response must have been DELIVERED, not merely absent.
+        //
+        // Without this line the test is VACUOUS: a server that never ran drops
+        // its listener, the client gets ECONNREFUSED, and `replay_spill_dir`
+        // reports the identical tuple below — one file failed, none replayed,
+        // second file untouched. That is exactly the state the 2026-09-06 CI
+        // hang produced, so this assertion is what makes the rest of the test
+        // mean "the round stops on a 500" instead of "the round stops".
+        assert_eq!(served, 1, "the 500 must actually have been served");
         assert_eq!(outcome.files_failed, 1, "exactly ONE file may be attempted");
         assert_eq!(outcome.files_replayed, 0);
         assert!(
@@ -2076,7 +2159,10 @@ mod tests {
             std::fs::write(dir.join(format!("ticks-dhan-{n}.ilp")), b"ticks v=1i 1\n")
                 .expect("write");
         }
-        let (url, server) = tiny_server("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n", 3);
+        let (url, server) = tiny_server(
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            3,
+        );
         let client = crate::http_client::build_probe_client(5).expect("client");
         let outcome = replay_spill_dir(&dir, &url, &client).await;
         let _ = server.join();
