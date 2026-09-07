@@ -1195,6 +1195,41 @@ pub const fn secs_until_next_rebalance(second_of_minute: u64) -> u64 {
     }
 }
 
+/// Publishes what BOTH depth pools currently believe they hold.
+///
+/// Called once before the loop (so the first minute is not blank) and once per
+/// iteration immediately AFTER the reconcile, which is the only moment the
+/// `held` vectors mean "acked on the wire".
+///
+/// Deliberately NOT called after `apply_*`: a swap sent this minute is
+/// `pending`, not acknowledged, and publishing it would claim a subscription
+/// the connection may still refuse. Publishing only reconciled state keeps the
+/// error in the UNDERSTATING direction -- a contract reads unsubscribed for at
+/// most one steering interval after it is taken -- so an operator auditing
+/// "did the heaviest contract get a socket?" is never told yes when the answer
+/// was no.
+///
+/// O(n) in held instruments (<=250 + <=5), once per minute, on this loop's own
+/// task. The READ side, which is the one on the hot path, stays O(1).
+fn publish_depth_subscriptions(
+    view: &crate::depth_subscription_view::DepthSubscriptionView,
+    sockets: &[RebalanceSocket],
+    depth20: &[crate::depth20_track::Depth20LiveSocket],
+) {
+    view.publish_depth200(
+        sockets
+            .iter()
+            .filter_map(|s| s.held)
+            .map(|i| (i.security_id, i.segment)),
+    );
+    view.publish_depth20(
+        depth20
+            .iter()
+            .flat_map(|s| s.held.iter())
+            .map(|i| (i.security_id, i.segment)),
+    );
+}
+
 /// The per-minute rebalance: the thing that makes every engine above live.
 ///
 /// # Why the sockets are owned, not borrowed
@@ -1217,6 +1252,15 @@ pub async fn run_depth_rebalance(
     today_ist_micros: i64,
     mut sockets: Vec<RebalanceSocket>,
     mut depth20: Vec<crate::depth20_track::Depth20LiveSocket>,
+    // What the pools hold, published for the tick drain to read.
+    //
+    // This loop is the ONLY place in the process that knows the answer: both
+    // pools' `held` vectors are owned `&mut` here, and the frame drain -- where
+    // the top-volume snapshot is taken -- cannot reach them. Without this the
+    // `subscribed` column would have to be written `false` for every row, which
+    // the column's own docs make worse than useless: it is the difference
+    // between "we ranked it first" and "we were watching it".
+    subscription_view: std::sync::Arc<crate::depth_subscription_view::DepthSubscriptionView>,
 ) {
     if sockets.is_empty() && depth20.is_empty() {
         tracing::error!(
@@ -1258,6 +1302,26 @@ pub async fn run_depth_rebalance(
         "depth rebalance started: the at-the-money strikes now follow spot through the session"
     );
 
+    // The dial-time truth, published BEFORE the first sleep. Without it the
+    // view stays empty for a whole steering interval and every snapshot in
+    // that window records `subscribed = false` for contracts that were dialed
+    // with a socket at boot.
+    publish_depth_subscriptions(&subscription_view, &sockets, &depth20);
+    {
+        // Once per session, at info: an operator reading the boot log can see
+        // that the view is POPULATED rather than having to infer it from
+        // `subscribed` columns downstream. Reported as a PAIR, never a sum --
+        // a pool that published nothing must not be hidden behind the other
+        // pool's count, and that is exactly the state worth seeing.
+        let (d20, d200) = subscription_view.published_counts();
+        tracing::info!(
+            depth20_instruments = d20,
+            depth200_instruments = d200,
+            "depth subscription view seeded from the dial — this is what the top-volume \
+             snapshot will record as `subscribed`"
+        );
+    }
+
     loop {
         let second = u64::from(ist_second_of_day_now() % 60);
         tokio::time::sleep(std::time::Duration::from_secs(secs_until_next_rebalance(
@@ -1277,6 +1341,9 @@ pub async fn run_depth_rebalance(
                  affected swaps are planned again this minute"
             );
         }
+        // Republish the reconciled truth. Placed here rather than at the end of
+        // the iteration on purpose -- see `publish_depth_subscriptions`.
+        publish_depth_subscriptions(&subscription_view, &sockets, &depth20);
 
         let candidates =
             crate::dhan_depth_universe::load_depth_candidates(&questdb, &date_ist, today_ymd).await;
