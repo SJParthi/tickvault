@@ -114,6 +114,21 @@ impl SnapshotCadence {
             Self::FiveSecond => "5s",
         }
     }
+
+    /// How often this cadence fires, in whole seconds.
+    ///
+    /// The scheduler's timer period comes from HERE rather than from a literal
+    /// at the call site, so the interval a snapshot is actually taken at and
+    /// the `cadence` SYMBOL it is stored under cannot drift apart. A row
+    /// labelled `5s` written every four seconds would be a quiet lie in a
+    /// table whose whole purpose is to be queried after the fact.
+    #[must_use]
+    pub const fn interval_secs(self) -> u64 {
+        match self {
+            Self::OneSecond => 1,
+            Self::FiveSecond => 5,
+        }
+    }
 }
 
 /// One ranked contract at one snapshot boundary, ready for ILP write.
@@ -940,6 +955,31 @@ mod tests {
     fn the_cadence_labels_are_the_stable_wire_strings() {
         assert_eq!(SnapshotCadence::OneSecond.as_str(), "1s");
         assert_eq!(SnapshotCadence::FiveSecond.as_str(), "5s");
+    }
+
+    /// The label and the interval are two halves of the same claim: a row
+    /// stamped `5s` asserts that the snapshot behind it was taken every five
+    /// seconds. They are separate `match` arms, so nothing but a test stops
+    /// one from being edited without the other — and the drift would be
+    /// invisible, because a wrongly-paced snapshot still writes a
+    /// well-formed row under a label that reads correct.
+    #[test]
+    fn interval_secs_agrees_with_the_label_it_is_stored_under() {
+        for cadence in [SnapshotCadence::OneSecond, SnapshotCadence::FiveSecond] {
+            let from_label: u64 = cadence
+                .as_str()
+                .trim_end_matches('s')
+                .parse()
+                .expect("every cadence label is <n>s");
+            assert_eq!(
+                cadence.interval_secs(),
+                from_label,
+                "{} claims {}s in its label but fires every {}s",
+                cadence.as_str(),
+                from_label,
+                cadence.interval_secs()
+            );
+        }
     }
 
     /// A disconnected writer must not silently retain rows: a buffer kept

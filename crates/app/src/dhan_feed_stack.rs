@@ -1126,6 +1126,13 @@ pub struct LiveIngest {
     /// a tick is seen, and a structure reached through `&mut self` on a
     /// single-owner path needs no concurrent map.
     leaderboard: crate::volume_leaderboard::VolumeLeaderboard,
+    /// The top-volume snapshot writer, already split for offload.
+    ///
+    /// `None` unless a caller opts in, so every existing construction site and
+    /// every test keeps its behaviour by construction. When present it is the
+    /// PRODUCER half: its flush hands a batch to a dedicated thread and never
+    /// blocks this task on the database.
+    top_volume: Option<tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter>,
 }
 
 impl LiveIngest {
@@ -1140,6 +1147,124 @@ impl LiveIngest {
     pub fn with_inline_depth(mut self, sink: DepthIngest) -> Self {
         self.inline_depth = Some(sink);
         self
+    }
+
+    /// Opts this ingest in to writing top-volume snapshots.
+    ///
+    /// Takes the PRODUCER half of an already-split writer. The type makes the
+    /// mistake unavailable rather than merely discouraged: `split_for_offload`
+    /// consumes the writer, so there is no way to hand this a synchronous
+    /// handle whose flush would block the frame drain on an ILP round trip --
+    /// the coupling that lost ticks in August, at Dhan's side, invisibly.
+    #[must_use]
+    pub fn with_top_volume_writer(
+        mut self,
+        writer: tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter,
+    ) -> Self {
+        self.top_volume = Some(writer);
+        self
+    }
+
+    /// Ranks both families and appends one snapshot's rows, then flushes.
+    ///
+    /// Returns `(rows_appended, refusals)`. `(0, 0)` is the normal answer
+    /// outside the capture window and before any contract has traded.
+    ///
+    /// # Complexity
+    ///
+    /// O(n log n) in TRACKED CONTRACTS per call, from the ranking sort -- the
+    /// same sort the depth steering already pays. Deliberately NOT on the
+    /// per-tick path: it runs on a timer, and the write it triggers is handed
+    /// to another thread rather than performed here.
+    pub fn snapshot_top_volume(
+        &mut self,
+        now_ist_nanos: i64,
+        cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) -> (usize, usize) {
+        // The clock gate FIRST, before any ranking work. Outside the window
+        // there is nothing to publish, and ranking to discover that would pay
+        // the sort ~23,000 times a session for nothing.
+        if !crate::top_volume_snapshot::within_capture_window(
+            crate::top_volume_snapshot::secs_of_day_ist(now_ist_nanos),
+        ) {
+            return (0, 0);
+        }
+        if self.top_volume.is_none() {
+            return (0, 0);
+        }
+
+        let mut appended = 0usize;
+        let mut refused = 0usize;
+        for family in [
+            crate::volume_leaderboard::OptionFamily::Index,
+            crate::volume_leaderboard::OptionFamily::Stock,
+        ] {
+            // Ranked into a scratch the leaderboard owns, then COPIED out
+            // before the closures below borrow `self` again. Holding the
+            // borrow across the projection would need `rank`'s slice and
+            // `self.aggregator` at once, and the copy is bounded by the
+            // per-family budget rather than by the tracked population.
+            let ranked: Vec<crate::volume_leaderboard::RankedContract> = self
+                .leaderboard
+                .rank(
+                    family,
+                    tickvault_common::constants::TOP_VOLUME_RANK_PER_FAMILY,
+                    |_| true,
+                )
+                .to_vec();
+            if ranked.is_empty() {
+                continue;
+            }
+
+            let aggregator = &self.aggregator;
+            let prev_close = &self.prev_close;
+            let view = crate::depth_subscription_view::global_depth_subscription_view();
+            let projection = crate::top_volume_snapshot::project_snapshot(
+                now_ist_nanos,
+                cadence,
+                family,
+                &ranked,
+                |security_id, segment| {
+                    // Both halves must be real. A missing LTP or a missing
+                    // previous close yields a non-finite, which the projection
+                    // REFUSES and counts -- never a fabricated zero percent,
+                    // which would read as "this contract did not move".
+                    let ltp = aggregator
+                        .last_ltp(Feed::Dhan, security_id, segment.binary_code())
+                        .unwrap_or(f64::NAN);
+                    let close = prev_close.get(security_id, segment).unwrap_or(f64::NAN);
+                    crate::volume_leaderboard::eligible_gain_pct(ltp, close).unwrap_or(f64::NAN)
+                },
+                |security_id, segment| view.is_subscribed(security_id, segment),
+            );
+
+            refused = refused.saturating_add(projection.refusal_count());
+            let Some(writer) = self.top_volume.as_mut() else {
+                return (appended, refused);
+            };
+            for row in &projection.rows {
+                if writer.append_row(row).is_ok() {
+                    appended = appended.saturating_add(1);
+                }
+            }
+        }
+
+        // The flush is the OFFLOAD hand-off, not a database round trip: a full
+        // queue is backpressure and the rows are retained for the next attempt.
+        //
+        // The result is deliberately DROPPED rather than propagated, and the
+        // drop is explicit so a reader sees the choice. `flush` already emits a
+        // coded error and increments its own counter on every failure arm, so
+        // re-reporting here would double-count one event -- and there is no
+        // action this caller could take that the writer has not already taken:
+        // it is one snapshot of a leaderboard that will be re-ranked a second
+        // from now.
+        if appended > 0
+            && let Some(writer) = self.top_volume.as_mut()
+        {
+            drop(writer.flush());
+        }
+        (appended, refused)
     }
 
     /// The lane's ONE depth sink.
@@ -1251,6 +1376,7 @@ impl LiveIngest {
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
+            top_volume: None,
         }
     }
 
@@ -4315,6 +4441,15 @@ async fn run_frame_drain(
     // scan is O(n) in tracked instruments and the flush arm runs at 500 ms.
     let mut silence_timer = tokio::time::interval(SILENCE_SCAN_INTERVAL);
     silence_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The two top-volume snapshot cadences. `Delay` like every other timer on
+    // this loop: `Burst` would try to catch up after a stall by firing back to
+    // back, and a snapshot is a SAMPLE of a leaderboard that lives in RAM --
+    // replaying a missed second would write the CURRENT ranking under a PAST
+    // timestamp, which is worse than the missing row it is trying to repair.
+    let mut snapshot_1s_timer = tokio::time::interval(TOP_VOLUME_SNAPSHOT_1S_INTERVAL);
+    snapshot_1s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut snapshot_5s_timer = tokio::time::interval(TOP_VOLUME_SNAPSHOT_5S_INTERVAL);
+    snapshot_5s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
@@ -4339,6 +4474,12 @@ async fn run_frame_drain(
     // on the first 30-second tick of every session would report a midnight
     // crossing that did not happen.
     let mut ranking_day: i64 = 0;
+    // Snapshot accounting, reported as a DELTA by the 30s arm for the same
+    // reason the refusal counts are: a cumulative that only grows reads as
+    // alarming forever after one bad minute.
+    let mut snapshot_rows_1s: u64 = 0;
+    let mut snapshot_rows_5s: u64 = 0;
+    let mut snapshot_refused: u64 = 0;
 
     loop {
         tokio::select! {
@@ -4650,6 +4791,26 @@ async fn run_frame_drain(
                 // drops its sender. `recv` then returns None forever, so this
                 // arm must not treat that as a reason to end the drain.
             }
+            // Both snapshot arms sit AFTER the frame arm's `biased` priority, so
+            // a snapshot can never preempt draining queued frames. They touch
+            // the leaderboard and the aggregator read-only-ish and cannot
+            // starve each other: both are timers, not queues.
+            _ = snapshot_1s_timer.tick() => {
+                let (rows, refused) = ingest.snapshot_top_volume(
+                    now_ist_nanos(),
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+                );
+                snapshot_rows_1s = snapshot_rows_1s.saturating_add(rows as u64);
+                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+            }
+            _ = snapshot_5s_timer.tick() => {
+                let (rows, refused) = ingest.snapshot_top_volume(
+                    now_ist_nanos(),
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+                );
+                snapshot_rows_5s = snapshot_rows_5s.saturating_add(rows as u64);
+                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+            }
             _ = silence_timer.tick() => {
                 // Daily rollover for the ranking state, checked on the 30s arm
                 // rather than given a timer of its own: it is a cheap integer
@@ -4663,6 +4824,17 @@ async fn run_frame_drain(
                 // "bounded by the deploy schedule, not by the code" as
                 // insufficient (the Groww per-contract map and the intent
                 // ledger both carry that note, and neither was ever fixed).
+                if snapshot_rows_1s > 0 || snapshot_rows_5s > 0 || snapshot_refused > 0 {
+                    info!(
+                        rows_1s = snapshot_rows_1s,
+                        rows_5s = snapshot_rows_5s,
+                        refused = snapshot_refused,
+                        "top-volume snapshots written in the last 30s"
+                    );
+                    snapshot_rows_1s = 0;
+                    snapshot_rows_5s = 0;
+                    snapshot_refused = 0;
+                }
                 let today = ist_day_number_now();
                 if ranking_day != today {
                     if ranking_day != 0 {
@@ -7296,6 +7468,40 @@ pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 =
 /// against the previous value, and a number cannot be compared wrongly by
 /// locale, padding or separator. Floor division, so a pre-1970 clock (a box
 /// with no NTP yet) still moves monotonically instead of wrapping.
+/// The two top-volume snapshot cadences, per the operator's 2026-09-06 ask for
+/// 1-second and 5-second granularity.
+///
+/// The five-second boundary is the one the depth set is re-steered on, so those
+/// rows are the ones that actually drove a subscription decision; the
+/// one-second rows are the finer record underneath them. Both are written --
+/// deriving the 5s rows from the 1s rows at query time would work only while
+/// every second is present, and the whole point of the `subscribed` column is
+/// to audit sessions where something was missing.
+///
+/// Both periods are DERIVED from the cadence enum's own `interval_secs`, not
+/// written as literals here. The enum also supplies the `cadence` SYMBOL each
+/// row is stored under, so the pace a snapshot is taken at and the label it is
+/// filed beneath come from one place and cannot drift apart.
+const TOP_VOLUME_SNAPSHOT_1S_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
+    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond.interval_secs(),
+);
+const TOP_VOLUME_SNAPSHOT_5S_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
+    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond.interval_secs(),
+);
+
+/// Wall clock in IST nanoseconds — the snapshot boundary stamp.
+///
+/// IST because every timestamp on this path already is: `data-integrity.md`
+/// calls adding the offset twice the single most critical rule in this
+/// repository, and the projection's own `secs_of_day_ist` is a MODULO of this
+/// value, not a conversion of it.
+fn now_ist_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
 pub(crate) fn ist_day_number_now() -> i64 {
     let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
@@ -10305,6 +10511,47 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // `with_detector_capacity` for the 1.2M refusals this fixes.
     .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb));
+
+    // The top-volume snapshot writer, split for offload BEFORE it is handed to
+    // the ingest -- so the ingest can only ever hold the producer half. The
+    // thread is spawned here rather than inside the ingest because the sink is
+    // moved into it and never comes back, and a split with nothing on the other
+    // end would rescue nothing: this table has no spill tier by design (a
+    // snapshot is a periodic SAMPLE, not a unique event), so its batches would
+    // simply be dropped and counted.
+    //
+    // A spawn failure leaves `top_volume` unset. That is the honest degrade:
+    // no snapshot rows rather than a synchronous ILP flush on the frame drain,
+    // which is the coupling that loses ticks upstream at the vendor with no
+    // sequence number and no counter that can see it.
+    {
+        let writer = tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::new(
+            &params.questdb,
+        );
+        let (producer, mut sink, rx) = writer.split_for_offload();
+        match std::thread::Builder::new()
+            .name("tv-top-volume-writer".to_owned())
+            .spawn(move || {
+                while let Ok(mut batch) = rx.recv() {
+                    sink.write(&mut batch);
+                }
+                info!("top-volume writer thread exiting — the drain closed its queue");
+            }) {
+            Ok(_handle) => {
+                ingest = ingest.with_top_volume_writer(producer);
+                info!(
+                    "top-volume snapshots enabled — 1s and 5s rankings will be written off                      the drain"
+                );
+            }
+            Err(err) => {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    error = %err,
+                    "top-volume writer thread could not be spawned — NO ranking snapshots                      will be written this session. The lane and every other writer are                      unaffected; only the top_volume_rank table stays empty."
+                );
+            }
+        }
+    }
 
     // Move the blocking ILP round trip off the drain task, BEFORE any socket
     // opens. See `LiveIngest::spawn_offload_writer` for why a flush on the
@@ -20840,6 +21087,148 @@ mod depth_rebalance_wiring_tests {
         // never masquerades as a filtered one.
         std::mem::forget(rx);
         (endpoint, tx, instruments)
+    }
+
+    /// One end-to-end pass: a folded tick reaches the board, and a snapshot in
+    /// the window produces rows while the same state outside it produces none.
+    ///
+    /// Heavier than a unit test on purpose. The cheap version -- assert `(0, 0)`
+    /// before 09:15 on an ingest with no writer -- passes whether the clock gate
+    /// exists or not, because the no-writer guard returns the same tuple. That
+    /// is the vacuous-pass shape closed in #1884, and this test was written that
+    /// way first: deleting the gate left it green.
+    fn ranking_fixture() -> LiveIngest {
+        ranking_ingest(true)
+    }
+
+    /// The same board, built with or without the snapshot writer attached.
+    fn ranking_ingest(attach_writer: bool) -> LiveIngest {
+        use tickvault_common::types::ExchangeSegment;
+        // The global map is shared process state. Only this test publishes into
+        // it, and it publishes a superset each time, so a parallel run cannot
+        // observe a narrower map than it needs.
+        crate::contract_underlying_map::global_contract_underlying_map().publish_from_legs(&[
+            crate::contract_underlying_map::LegIds {
+                contract_security_id: 777,
+                underlying_security_id: 13,
+                contract_segment: ExchangeSegment::NseFno,
+                family: crate::volume_leaderboard::OptionFamily::Stock,
+            },
+        ]);
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        if attach_writer {
+            ingest = ingest.with_top_volume_writer(
+                tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
+            );
+        }
+        // A previous close AND a folded tick: `gain_pct` needs both, and the
+        // projection REFUSES a non-finite rather than writing a zero percent
+        // that would read as "this contract did not move".
+        ingest.record_previous_close(777, ExchangeSegment::NseFno, 100.0);
+        let mut tick = tickvault_common::tick_types::ParsedTick::default();
+        tick.security_id = 777;
+        tick.exchange_segment_code = ExchangeSegment::NseFno.binary_code();
+        tick.last_traded_price = 110.0;
+        tick.volume = 5_000;
+        tick.exchange_timestamp = 1_779_321_600 + 34_000;
+        tick.received_at_nanos = i64::from(tick.exchange_timestamp) * 1_000_000_000;
+        let _ = ingest.ingest_tick_at(&tick, 1, 0, 1);
+        ingest
+    }
+
+    /// The builder is the ONLY thing that opts a lane in to writing snapshots,
+    /// and its failure mode is silence: an ingest with no writer ranks nothing,
+    /// returns `(0, 0)`, and looks exactly like a quiet market. The boot path
+    /// tolerates a failed writer-thread spawn by leaving the writer unattached,
+    /// so this pair is what separates "opted out" from "opted in and empty".
+    #[test]
+    fn with_top_volume_writer_is_what_turns_silence_into_rows() {
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
+
+        let mut without = ranking_ingest(false);
+        assert_eq!(
+            without.snapshot_top_volume(in_window, cadence),
+            (0, 0),
+            "no writer attached must write nothing, and must not report a refusal \
+             either -- a lane that opted out did not fail"
+        );
+
+        let mut with = ranking_ingest(true);
+        let (rows, _) = with.snapshot_top_volume(in_window, cadence);
+        assert!(
+            rows >= 1,
+            "the same board with the writer attached must write rows, got {rows}"
+        );
+    }
+
+    #[test]
+    fn a_folded_tick_reaches_the_board_and_a_snapshot_in_the_window_writes_rows() {
+        let mut ingest = ranking_fixture();
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        let (rows, _refused) = ingest.snapshot_top_volume(
+            in_window,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert!(
+            rows >= 1,
+            "a folded tick with a previous close must produce at least one row, got {rows}"
+        );
+    }
+
+    #[test]
+    fn the_same_board_writes_nothing_outside_the_capture_window() {
+        // Same fixture, same board, only the clock differs. Deleting the gate
+        // in `snapshot_top_volume` makes THIS fail -- which the cheap version
+        // of the test could not do.
+        let mut ingest = ranking_fixture();
+        let day: i64 = 1_779_321_600;
+        let pre_open = (day + 33_299) * 1_000_000_000;
+        let (rows, refused) = ingest.snapshot_top_volume(
+            pre_open,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert_eq!(
+            (rows, refused),
+            (0, 0),
+            "09:14:59 is one second before capture opens"
+        );
+    }
+
+    #[test]
+    fn snapshot_top_volume_writes_nothing_outside_the_capture_window() {
+        // The clock gate runs FIRST, before any ranking work. Outside the
+        // window there is nothing to publish, and ranking to discover that
+        // would pay the sort ~23,000 times a session for nothing.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        // 09:14:59 IST on an exact-day boundary — one second before capture opens.
+        let day: i64 = 1_779_321_600;
+        let pre_open = (day + 33_299) * 1_000_000_000;
+        let (rows, refused) = ingest.snapshot_top_volume(
+            pre_open,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert_eq!((rows, refused), (0, 0), "the pre-open must publish nothing");
+    }
+
+    #[test]
+    fn snapshot_top_volume_writes_nothing_without_a_writer() {
+        // The honest degrade when the writer thread could not be spawned: no
+        // rows, and specifically NOT a synchronous flush on the frame drain.
+        // In-window, so the clock gate cannot be what makes this pass.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 40_000) * 1_000_000_000;
+        assert!(crate::top_volume_snapshot::within_capture_window(
+            crate::top_volume_snapshot::secs_of_day_ist(in_window)
+        ));
+        let (rows, refused) = ingest.snapshot_top_volume(
+            in_window,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+        );
+        assert_eq!((rows, refused), (0, 0));
     }
 
     #[test]
