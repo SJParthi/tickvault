@@ -41,6 +41,51 @@ pub const AUTO_FIX_LOG: &str = "auto-fix.log";
 /// Subprocess poll granularity while waiting on a spawned child
 /// (parity: the retired reference implementation subprocess timeout loop).
 const PROC_POLL_INTERVAL_MS: u64 = 25;
+
+/// How long the parent waits for one pipe reader to reach end-of-stream after
+/// the child has exited or been killed.
+///
+/// # The hang this bounds
+///
+/// `run_with_timeout` enforced its timeout against the CHILD and not against
+/// the READERS. On the success path it called `join()` on both reader threads
+/// with no bound, and `read_to_end` returns only at EOF — which arrives when
+/// EVERY holder of the pipe's write end has closed it, not when the child
+/// exits. A child that backgrounds anything (`&`, `nohup`, `docker compose up
+/// -d` — which this repository's own session hook runs) leaves a GRANDCHILD
+/// holding the inherited pipe, so EOF never comes, `join()` never returns, and
+/// the MCP server hangs inside the function whose entire purpose is a timeout.
+///
+/// This is the same class as the `tiny_server` accept loop bounded in #1883: a
+/// blocking call with nothing to notice a deadline with.
+///
+/// Five seconds because the child is already gone by this point — the pipes
+/// either drain immediately or a grandchild is holding them, and no amount of
+/// further waiting distinguishes the two.
+const PROC_READER_DRAIN_TIMEOUT_MS: u64 = 5_000;
+
+/// Bytes ONE captured stream may hold. 8 MiB.
+///
+/// The previous `read_to_end` had no ceiling, so a chatty or looping child
+/// could grow the parent's heap without limit — the unbounded-growth shape this
+/// repository bans everywhere else.
+///
+/// Honest consequence of capping: at the cap the reader stops and its end of
+/// the pipe drops, so a child that keeps writing takes an EPIPE and usually
+/// dies. That is a REPORTED death — the exit code reaches the caller — and it
+/// is the better half of the trade against an unbounded parent heap.
+const PROC_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Appended to `stderr` when a reader did not reach end-of-stream in time.
+///
+/// It goes into the OUTPUT rather than only a `bool`, because the failure it
+/// describes is silent by construction: the caller otherwise sees a successful
+/// exit code beside a short or empty stream and has no way to tell that from a
+/// command that genuinely printed nothing.
+const PROC_CAPTURE_TRUNCATED_NOTICE: &str = "\n[tickvault-logs-mcp] capture INCOMPLETE: a pipe \
+     reader did not reach end-of-stream within the drain budget, so the output above may be \
+     partial. The usual cause is a background grandchild that inherited the pipe and is still \
+     holding it open.\n";
 /// Subprocess timeout for `scripts/doctor.sh` (parity: the retired reference implementation timeout=120).
 const DOCTOR_TIMEOUT_SECS: u64 = 120;
 /// Subprocess timeout for `git log` (parity: the retired reference implementation timeout=10).
@@ -788,13 +833,89 @@ pub enum ProcError {
     Timeout,
 }
 
+/// Read one child pipe on its own thread, into a SHARED, CAPPED buffer.
+///
+/// Two properties the previous `read_to_end`-into-a-returned-`Vec` did not
+/// have, and both are the point:
+///
+/// * the bytes are visible to the parent WHILE the thread is still running, so
+///   a reader that never reaches EOF still yields what it received. With
+///   `read_to_end` the result is all-or-nothing, so the hang and a genuinely
+///   empty stream produced the identical observation.
+/// * the buffer is bounded by [`PROC_CAPTURE_MAX_BYTES`].
+///
+/// The returned receiver fires once, when the thread is done. The parent waits
+/// on THAT with a timeout rather than on `join()`, which cannot take one.
+fn spawn_bounded_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&shared);
+    // Bounded by construction: exactly one message is ever sent, so a capacity
+    // of 1 means `send` never blocks and the channel can never grow. An
+    // unbounded `channel()` would carry the same single message and is banned
+    // repo-wide, so the bounded form is both compliant and strictly narrower.
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0_u8; 8192];
+            // A read error ends the capture exactly as EOF does: there is
+            // nothing further to collect either way, and looping on a failing
+            // pipe is the busy-wait version of the hang this function bounds.
+            while let Ok(read) = pipe.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                // A poisoned lock means the parent panicked; stop rather than
+                // spin, and let the parent's own unwind be the report.
+                let Ok(mut held) = sink.lock() else { break };
+                let Some(room) = PROC_CAPTURE_MAX_BYTES.checked_sub(held.len()) else {
+                    break;
+                };
+                if room == 0 {
+                    break;
+                }
+                held.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+        let _ignored = done_tx.send(());
+    });
+    (shared, done_rx)
+}
+
+/// Take what a reader has captured, waiting a BOUNDED time for it to finish.
+///
+/// Returns the bytes and whether the reader actually reached end-of-stream.
+/// `false` is the hang case, and the caller must say so in the output rather
+/// than hand back a short stream that reads as complete.
+fn collect_bounded_stream(
+    buffer: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: &std::sync::mpsc::Receiver<()>,
+    deadline: std::time::Instant,
+) -> (Vec<u8>, bool) {
+    // ONE deadline SHARED by both streams, not one budget each. A grandchild
+    // inherits stdout AND stderr, so a per-stream budget doubles the worst
+    // case — the parent waits the full drain twice for a single cause. The
+    // first draft of this fix did exactly that and its own regression test
+    // caught it, failing at the harness bound.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let finished = done.recv_timeout(remaining).is_ok();
+    let bytes = buffer
+        .lock()
+        .map(|held| held.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+    (bytes, finished)
+}
+
 fn run_with_timeout(
     program: &str,
     args: &[String],
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ProcResult, ProcError> {
-    use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(program)
         .args(args)
@@ -804,28 +925,21 @@ fn run_with_timeout(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ProcError::Spawn(e.to_string()))?;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ignored = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ignored = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let (out_buffer, out_done) = spawn_bounded_pipe_reader(child.stdout.take());
+    let (err_buffer, err_done) = spawn_bounded_pipe_reader(child.stderr.take());
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = out_handle.join().unwrap_or_default();
-                let stderr = err_handle.join().unwrap_or_default();
+                // BOUNDED, never `join()`. The child has exited; if a
+                // grandchild it spawned still holds the pipe, EOF never comes
+                // and an unbounded join would park the server here forever.
+                let drain_by =
+                    std::time::Instant::now() + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS);
+                let (stdout, stdout_drained) =
+                    collect_bounded_stream(&out_buffer, &out_done, drain_by);
+                let (stderr, stderr_drained) =
+                    collect_bounded_stream(&err_buffer, &err_done, drain_by);
                 let code = match status.code() {
                     Some(c) => i64::from(c),
                     None => {
@@ -840,16 +954,28 @@ fn run_with_timeout(
                         }
                     }
                 };
+                let mut stderr_text = legacy_textmode(&decode_utf8_replace(&stderr));
+                if !stdout_drained || !stderr_drained {
+                    stderr_text.push_str(PROC_CAPTURE_TRUNCATED_NOTICE);
+                }
                 return Ok(ProcResult {
                     code,
                     stdout: legacy_textmode(&decode_utf8_replace(&stdout)),
-                    stderr: legacy_textmode(&decode_utf8_replace(&stderr)),
+                    stderr: stderr_text,
                 });
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ignored = child.kill();
                     let _ignored = child.wait();
+                    // Bounded here too. Killing the child usually closes the
+                    // pipes and both readers return at once; when a grandchild
+                    // holds them this reaps nothing and simply returns, rather
+                    // than leaving the threads unwaited on every timeout.
+                    let reap_by = std::time::Instant::now()
+                        + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS);
+                    let _ignored = collect_bounded_stream(&out_buffer, &out_done, reap_by);
+                    let _ignored = collect_bounded_stream(&err_buffer, &err_done, reap_by);
                     return Err(ProcError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(PROC_POLL_INTERVAL_MS));
@@ -1963,6 +2089,141 @@ pub fn call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `run_with_timeout` on a helper thread so a REGRESSION fails this
+    /// test instead of hanging it.
+    ///
+    /// This shape is not decoration. The defect under test is an unbounded
+    /// block, so calling it directly would make the un-fixed code park the
+    /// test runner — the exact outcome being fixed, and worthless as a signal.
+    /// The channel converts "parked forever" into a named assertion failure.
+    fn run_off_thread(
+        script: &str,
+        harness_budget: Duration,
+    ) -> Option<Result<ProcResult, ProcError>> {
+        // Bounded: exactly one result is ever sent, so capacity 1 never blocks.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let owned = script.to_owned();
+        std::thread::spawn(move || {
+            let out = run_with_timeout(
+                "sh",
+                &["-c".to_owned(), owned],
+                Path::new("."),
+                Duration::from_secs(30),
+            );
+            let _ignored = tx.send(out);
+        });
+        rx.recv_timeout(harness_budget).ok()
+    }
+
+    /// THE REGRESSION. A child that backgrounds anything leaves a GRANDCHILD
+    /// holding the inherited stdout pipe, so end-of-stream never arrives even
+    /// though the child itself exited immediately.
+    ///
+    /// `read_to_end` + `join()` waits for that EOF with no bound. Here the
+    /// grandchild holds the pipe for 15 seconds and the harness gives up at
+    /// 10 — so an unbounded join fails this test in ten seconds rather than
+    /// parking the suite.
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_park_the_reader_join() {
+        let Some(result) = run_off_thread("sleep 15 & echo held-open", Duration::from_secs(10))
+        else {
+            panic!(
+                "run_with_timeout did not return within 10s while a backgrounded grandchild held \
+                 the stdout pipe. That is the unbounded-join hang: the child exited at once, but \
+                 EOF waits for EVERY holder of the write end to close it."
+            )
+        };
+        let Ok(proc) = result else {
+            panic!("the child exited cleanly, so this must not be a spawn error or a timeout")
+        };
+        assert_eq!(
+            proc.code, 0,
+            "the shell exited 0 and that code must survive"
+        );
+        assert!(
+            proc.stdout.contains("held-open"),
+            "bytes written before the reader gave up must still be returned — an \
+             all-or-nothing capture makes the hang indistinguishable from an empty stream. \
+             Got: {:?}",
+            proc.stdout
+        );
+        assert!(
+            proc.stderr.contains("capture INCOMPLETE"),
+            "a stream that never reached end-of-stream must SAY so; otherwise a partial \
+             capture reads as a complete one. Got: {:?}",
+            proc.stderr
+        );
+    }
+
+    /// The bound must not cost the ordinary case anything.
+    #[test]
+    fn an_ordinary_command_still_captures_both_streams_and_says_nothing_extra() {
+        let Some(result) =
+            run_off_thread("echo out-line; echo err-line 1>&2", Duration::from_secs(10))
+        else {
+            panic!("a trivial command must return well inside the harness budget")
+        };
+        let Ok(proc) = result else {
+            panic!("expected a clean run")
+        };
+        assert_eq!(proc.code, 0);
+        assert!(proc.stdout.contains("out-line"), "got {:?}", proc.stdout);
+        assert!(proc.stderr.contains("err-line"), "got {:?}", proc.stderr);
+        assert!(
+            !proc.stderr.contains("capture INCOMPLETE"),
+            "a fully drained run must NOT be marked truncated — a notice that fires on healthy \
+             runs is one operators learn to ignore. Got: {:?}",
+            proc.stderr
+        );
+    }
+
+    /// A non-zero exit still reports its code, with the pipes drained.
+    #[test]
+    fn a_failing_command_reports_its_exit_code() {
+        let Some(Ok(proc)) = run_off_thread("echo boom 1>&2; exit 3", Duration::from_secs(10))
+        else {
+            panic!("expected a clean run with a non-zero exit code")
+        };
+        assert_eq!(proc.code, 3);
+        assert!(proc.stderr.contains("boom"), "got {:?}", proc.stderr);
+    }
+
+    /// The capture is CAPPED. Driven through the reader directly rather than a
+    /// real 8 MiB child, so the test costs milliseconds instead of seconds.
+    #[test]
+    fn spawn_bounded_pipe_reader_stops_at_the_capture_ceiling() {
+        let oversized = vec![b'x'; PROC_CAPTURE_MAX_BYTES + 4096];
+        let (buffer, done) = spawn_bounded_pipe_reader(Some(std::io::Cursor::new(oversized)));
+        let (bytes, finished) = collect_bounded_stream(
+            &buffer,
+            &done,
+            std::time::Instant::now() + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS),
+        );
+        assert!(
+            finished,
+            "the reader must FINISH at the ceiling rather than spin — a capped reader that \
+             never sends is the hang with a different cause"
+        );
+        assert_eq!(
+            bytes.len(),
+            PROC_CAPTURE_MAX_BYTES,
+            "the buffer must stop exactly at the ceiling, never grow past it"
+        );
+    }
+
+    /// An absent pipe is not an error, and must not leave the parent waiting.
+    #[test]
+    fn spawn_bounded_pipe_reader_completes_on_a_missing_pipe() {
+        let (buffer, done) = spawn_bounded_pipe_reader(Option::<std::io::Cursor<Vec<u8>>>::None);
+        let (bytes, finished) = collect_bounded_stream(
+            &buffer,
+            &done,
+            std::time::Instant::now() + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS),
+        );
+        assert!(finished, "a `None` pipe must signal completion immediately");
+        assert!(bytes.is_empty());
+    }
 
     #[test]
     fn tool_names_match_registry_order() {
