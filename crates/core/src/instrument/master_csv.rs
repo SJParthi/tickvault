@@ -188,6 +188,13 @@ pub struct MasterRow {
     /// is unambiguous within the NSE derivative segment and is what the
     /// selection actually groups on.
     pub underlying_symbol: String,
+    /// `LOT_SIZE` — the contract multiplier, or `0` when absent.
+    ///
+    /// Zero is the ABSENT sentinel and is never a usable divisor. Callers that
+    /// normalise by lot size must refuse a zero and say so; defaulting it to 1
+    /// would rank that contract by raw units and put it at the top of a board
+    /// whose whole purpose is to compare contracts fairly.
+    pub lot_size: u32,
 }
 
 impl MasterRow {
@@ -284,6 +291,14 @@ const COL_EXPIRY: &str = "SM_EXPIRY_DATE";
 const COL_STRIKE: &str = "STRIKE_PRICE";
 const COL_OPTION_TYPE: &str = "OPTION_TYPE";
 const COL_UNDERLYING_SYMBOL: &str = "UNDERLYING_SYMBOL";
+/// `LOT_SIZE` — the contract multiplier (market lot).
+///
+/// OPTIONAL like the rest of this group, so a header carrying only the six
+/// join columns stays a valid master. Dhan serves it
+/// (`docs/dhan-ref/09-instrument-master.md`: "LOT_SIZE / SEM_LOT_UNITS — Lot
+/// size (trading multiple)"), and until 2026-09-07 this parser resolved every
+/// other derivative column and dropped this one.
+const COL_LOT_SIZE: &str = "LOT_SIZE";
 
 /// Days in `month` of `year`, Gregorian.
 ///
@@ -515,6 +530,7 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
     let i_strike = opt_col(COL_STRIKE);
     let i_leg = opt_col(COL_OPTION_TYPE);
     let i_underlying = opt_col(COL_UNDERLYING_SYMBOL);
+    let i_lot = opt_col(COL_LOT_SIZE);
 
     // `widest` bounds the mandatory columns ONLY. An optional column that
     // lands beyond a short row is read as absent for that row, never as a bad
@@ -570,6 +586,13 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             underlying_symbol: i_underlying
                 .and_then(|i| fields.get(i))
                 .map_or_else(String::new, |v| v.trim().to_uppercase()),
+            // Absent, blank, non-numeric and negative all collapse to the same
+            // 0 sentinel: none of them is a lot size, and distinguishing them
+            // here would only move the refusal to a caller that has less
+            // context about why the row is unusable.
+            lot_size: i_lot
+                .and_then(|i| fields.get(i))
+                .map_or(0, |v| v.trim().parse::<u32>().unwrap_or(0)),
         });
     }
 
@@ -1016,6 +1039,7 @@ mod tests {
             strike_paise: 0,
             option_leg: OptionLeg::None,
             underlying_symbol: String::new(),
+            lot_size: 0,
         };
         assert!(base.is_nse_cash_equity());
         // BSE also lists series EQ — a constituent resolved there is a
@@ -1085,6 +1109,75 @@ mod tests {
         assert_eq!(r.strike_paise, 2_450_000, "24500 rupees is 2,450,000 paise");
         assert_eq!(r.option_leg, OptionLeg::Call);
         assert_eq!(r.underlying_symbol, "NIFTY");
+        // The header above carries no `LOT_SIZE`, so this row reports the
+        // absent sentinel rather than a guess.
+        assert_eq!(r.lot_size, 0);
+    }
+
+    #[test]
+    fn test_lot_size_is_read_from_the_detailed_master_column() {
+        // `LOT_SIZE` is the DETAILED master's own column name
+        // (`docs/dhan-ref/09-instrument-master.md`), and the detailed CSV is
+        // what this lane downloads — so this is the real header, not a
+        // convenient one.
+        let header = format!(
+            "{HEADER},INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,UNDERLYING_SYMBOL,LOT_SIZE"
+        );
+        let body = master_with(
+            &header,
+            &[
+                "44311,,NIFTY28AUG2524500CE,NSE,D,,OPTIDX,2026-08-28,24500.000000,CE,NIFTY,75",
+                "55001,,RELIANCE28AUG253000CE,NSE,D,,OPTSTK,2026-08-28,3000.000000,CE,RELIANCE,250",
+            ],
+        );
+        // Per contract, not one figure for the file: two real contracts on the
+        // same day carry genuinely different multipliers, and a single shared
+        // default would rank one of them in the wrong unit.
+        assert_eq!(rows_by_id(&body, 44311).lot_size, 75);
+        assert_eq!(rows_by_id(&body, 55001).lot_size, 250);
+    }
+
+    #[test]
+    fn test_every_unusable_lot_size_collapses_to_the_absent_sentinel() {
+        let header = format!("{HEADER},INSTRUMENT,LOT_SIZE");
+        let body = master_with(
+            &header,
+            &[
+                "1,,BLANK,NSE,D,,OPTSTK,",
+                "2,,TEXT,NSE,D,,OPTSTK,NA",
+                "3,,NEGATIVE,NSE,D,,OPTSTK,-75",
+                "4,,DECIMAL,NSE,D,,OPTSTK,75.0",
+                "5,,ZERO,NSE,D,,OPTSTK,0",
+                "6,,PADDED,NSE,D,,OPTSTK,  75  ",
+            ],
+        );
+        // Blank, non-numeric, negative, decimal and an explicit zero are all
+        // the SAME answer — we do not know this contract's multiplier — and
+        // every one must land on 0 so the single downstream refusal covers
+        // them all. A `75.0` that silently parsed as 75 would be worse: the
+        // vendor writing a decimal there is a format change we must notice.
+        for id in [1_u64, 2, 3, 4, 5] {
+            assert_eq!(rows_by_id(&body, id).lot_size, 0, "id {id}");
+        }
+        // Padding is NOT unusable — the parser trims, as it does elsewhere.
+        assert_eq!(rows_by_id(&body, 6).lot_size, 75);
+    }
+
+    #[test]
+    fn test_a_short_row_reads_lot_size_as_absent_rather_than_failing() {
+        // The optional-column rule this parser already applies everywhere: a
+        // row that ends before an optional column is missing that field, never
+        // a parse error that would drop the whole master and collapse the
+        // universe to the four index fallbacks.
+        let header = format!("{HEADER},INSTRUMENT,SM_EXPIRY_DATE,LOT_SIZE");
+        let body = master_with(&header, &["44311,,NIFTY,NSE,D,,OPTIDX"]);
+        let r = rows_by_id(&body, 44311);
+        assert_eq!(r.lot_size, 0);
+        assert_eq!(
+            r.class,
+            InstrumentClass::IndexOption,
+            "the row still parses"
+        );
     }
 
     #[test]
@@ -1250,6 +1343,7 @@ mod tests {
             strike_paise: 0,
             option_leg: OptionLeg::None,
             underlying_symbol: String::new(),
+            lot_size: 0,
         }
     }
 

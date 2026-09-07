@@ -21113,6 +21113,7 @@ mod depth_rebalance_wiring_tests {
                 underlying_security_id: 13,
                 contract_segment: ExchangeSegment::NseFno,
                 family: crate::volume_leaderboard::OptionFamily::Stock,
+                lot_size: 75,
             },
         ]);
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);

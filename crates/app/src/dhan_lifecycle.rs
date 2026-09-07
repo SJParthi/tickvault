@@ -283,7 +283,15 @@ pub fn build_lifecycle_rows<'a>(
             display_name: row.symbol_name.as_str(),
             underlying_security_id: 0,
             underlying_symbol: row.underlying_symbol.as_str(),
-            lot_size: 0,
+            // From the master, not a placeholder. This column was hardcoded 0
+            // until 2026-09-07, which had a consequence nobody had noticed:
+            // `lifecycle_reconciler::is_stock_split` requires
+            // `old_lot_size > 0 && new_lot_size > 0`, so the lot half of
+            // corporate-action detection could never fire on a Dhan row.
+            lot_size: i32::try_from(row.lot_size).unwrap_or(i32::MAX),
+            // Still 0: the master carries TICK_SIZE but this parser does not
+            // resolve that column yet, and inventing a value here would make
+            // the OTHER half of split detection lie rather than abstain.
             tick_size: 0.0,
             expiry_date_nanos: expiry_ymd_to_ist_nanos(row.expiry_ymd),
             strike_price: strike_paise_to_rupees(row.strike_paise),
@@ -321,6 +329,9 @@ pub fn build_lifecycle_rows<'a>(
             display_name: "",
             underlying_security_id: 0,
             underlying_symbol: "",
+            // Correctly 0 here: this is the ABSENCE pass, which marks a row
+            // the master no longer lists. There is no master row to read a lot
+            // size from, and 0 is this field's documented absent sentinel.
             lot_size: 0,
             tick_size: 0.0,
             expiry_date_nanos: 0,
@@ -698,6 +709,7 @@ mod tests {
             strike_paise: 0,
             option_leg: leg,
             underlying_symbol: "NIFTY".into(),
+            lot_size: 75,
         }
     }
 
@@ -847,6 +859,46 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn build_lifecycle_rows_writes_the_masters_real_lot_size() {
+        // Hardcoded `0` until 2026-09-07, and the cost was not cosmetic:
+        // `lifecycle_reconciler::is_stock_split` requires
+        // `old_lot_size > 0 && new_lot_size > 0`, so the lot half of
+        // corporate-action detection could never fire on a Dhan row — it was
+        // comparing 0 against 0 on every instrument, every day.
+        let master = vec![MasterRow {
+            lot_size: 250,
+            ..row(
+                1,
+                InstrumentClass::StockOption,
+                "NSE",
+                2026_08_28,
+                OptionLeg::Call,
+            )
+        }];
+        let (rows, _) = build_lifecycle_rows(&master, &[], TODAY, TODAY_NANOS, "sha");
+        assert_eq!(rows[0].lot_size, 250);
+    }
+
+    #[test]
+    fn build_lifecycle_rows_records_an_absent_lot_size_as_zero_not_a_guess() {
+        let master = vec![MasterRow {
+            lot_size: 0,
+            ..row(
+                1,
+                InstrumentClass::StockOption,
+                "NSE",
+                2026_08_28,
+                OptionLeg::Call,
+            )
+        }];
+        let (rows, _) = build_lifecycle_rows(&master, &[], TODAY, TODAY_NANOS, "sha");
+        // 0 is this column's documented absent sentinel, and it is exactly
+        // what `is_stock_split` treats as "cannot judge" — so an unknown lot
+        // size makes the classifier ABSTAIN rather than report a false split.
+        assert_eq!(rows[0].lot_size, 0);
     }
 
     #[test]
