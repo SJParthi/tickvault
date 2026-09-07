@@ -4557,3 +4557,127 @@ Counters (pre-registered at 0 on the first fenced pass): `tv_wal_replay_skipped_
 no new alarm in this change: every refusal rides the already-filtered WS-SPILL-01 code with a
 `source` field. The boot `info!` "WAL replay complete" now carries skipped segments/frames/bytes
 and `watermark_present`.
+
+---
+
+## Item 40 — the timeout that did not bound the readers (2026-09-07)
+
+**Numbered 40 because 25, 23, 24 and 12 have each been used twice already in this file
+(see the "TWO different sections were both numbered Item 12" merge note above). 39 was the
+highest unused number; this takes 40 so nothing collides a fifth time.**
+
+**Status: IMPLEMENTED, awaiting the PR.**
+Authorization: the operator's standing "Bro fix and resolve everything dude okay?"
+(2026-09-06), given in direct response to a message that ENUMERATED this finding among the
+second-sweep open items, and the standing "fix resolve merge deploy … until it gets merged
+and deployed don't stop". Same authorization shape as Item 23 above.
+
+**⚠ Sequencing honesty (Rule 11, no false-OK).** The code for this item was written and
+committed BEFORE this plan section existed — the design-first wall caught it at the push
+and this section is the response. The wall did its job; recording the design after the code
+is a real deviation from its intent and is stated here rather than papered over. What is
+NOT a deviation: the fix ships with its design, its edge cases, its failure modes and its
+bite-proofs in the same PR, which is what the wall exists to guarantee arrives.
+
+### Why (the defect, verified in source)
+
+`crates/tickvault-logs-mcp/src/tools.rs::run_with_timeout` enforced its timeout against the
+CHILD and not against the READERS. On the success path it called `join()` on both reader
+threads with no bound; on the timeout path it leaked them entirely.
+
+`read_to_end` returns at EOF, and EOF arrives when EVERY holder of the pipe's write end
+closes it — **not** when the child exits. A child that backgrounds anything (`&`, `nohup`,
+`docker compose up -d`, which this repository's own SessionStart hook runs) leaves a
+GRANDCHILD holding the inherited pipe. EOF never comes, `join()` never returns, and the MCP
+server hangs inside the one function whose entire purpose is a timeout.
+
+This is the same class as the accept loop bounded in #1883 (Item 15 of the second-sweep
+list): a blocking call with nothing to notice a deadline with. That one was in `storage`
+and therefore inside an existing plan's crate set; this one is in `tickvault-logs-mcp`,
+which **no active plan has ever referenced** — which is why the wall fired.
+
+It matters because CLAUDE.md's AUTOMATION-FIRST RULE orders every session to reach for the
+`mcp__tickvault-logs__*` tools BEFORE grepping by hand. A hang here does not degrade
+observability, it removes it, at exactly the moment a session is trying to answer "is
+anything broken?".
+
+## Plan Items
+
+- [x] **40a — `spawn_bounded_pipe_reader`** replaces the `read_to_end` closure: fills a
+  shared `Arc<Mutex<Vec<u8>>>` in 8 KiB chunks and signals completion on a
+  `sync_channel(1)`, so the parent can wait with a deadline instead of a `join()`.
+- [x] **40b — `collect_bounded_stream`** takes what has arrived by a deadline and reports
+  whether the stream actually ended.
+- [x] **40c — `PROC_CAPTURE_MAX_BYTES` (8 MiB)** caps ONE stream. `read_to_end` had no
+  ceiling, so a looping child could grow the parent heap without limit — the unbounded
+  growth this repository bans everywhere else.
+- [x] **40d — `PROC_CAPTURE_TRUNCATED_NOTICE`** appended to stderr when a reader did not
+  finish, because the failure is silent by construction otherwise.
+- [x] **40e — the timeout path reaps too**, under its own shared deadline, instead of
+  leaking both reader threads.
+
+### Design (Item 40)
+
+The drain deadline is **SHARED across both streams**, not one budget each. A grandchild
+inherits stdout AND stderr, so a per-stream budget doubles the worst case. The first draft
+did exactly that and its own regression test caught it, failing at the harness bound; the
+reasoning is recorded at `collect_bounded_stream`.
+
+The completion signal is a `sync_channel(1)`, never an unbounded `channel()`: exactly one
+message is ever sent, so capacity 1 can never block and can never grow. The pre-commit
+banned-pattern scanner caught the first draft using the unbounded form — recorded because
+the gate found a real thing, not a formality.
+
+Five seconds for the drain because the child is already gone by that point: the pipes
+either drain immediately or a grandchild is holding them, and no amount of further waiting
+distinguishes the two.
+
+### Edge Cases (Item 40)
+
+A missing pipe (`None`) completes immediately rather than blocking. A read ERROR ends the
+capture exactly as EOF does — looping on a failing pipe is the busy-wait version of the
+hang being bounded. A poisoned buffer lock means the parent panicked, so the reader stops
+and lets the parent's own unwind be the report. At the byte ceiling the reader stops and
+`checked_sub` cannot underflow.
+
+### Failure Modes (Item 40)
+
+At the cap the reader drops its end of the pipe, so a child that keeps writing takes an
+EPIPE and usually dies. That death is **REPORTED** — the exit code reaches the caller — and
+is the better half of the trade against an unbounded parent heap; stated at the constant.
+A reader that misses the drain budget yields a partial stream PLUS the truncation notice,
+never a silent short read.
+
+### Test Plan (Item 40)
+
+Five tests, each running the call on a helper thread behind a bounded channel so a
+regression FAILS at the harness bound rather than hanging the suite:
+`a_grandchild_holding_the_pipe_cannot_park_the_reader_join` (`sh -c "sleep 15 & echo
+held-open"`, 10 s bound), `an_ordinary_command_still_captures_both_streams_and_says_nothing_extra`,
+`a_failing_command_reports_its_exit_code`, `spawn_bounded_pipe_reader_stops_at_the_capture_ceiling`,
+`spawn_bounded_pipe_reader_completes_on_a_missing_pipe`.
+
+Bite-proven in both directions, each mutation restored afterward: `recv_timeout` → unbounded
+`recv()` fails the grandchild test at 10 s; dropping the truncation notice fails the stderr
+assertion; `PROC_CAPTURE_MAX_BYTES` → `usize::MAX` fails the ceiling test; restored, 84 passed.
+
+### Rollback (Item 40)
+
+Single-file, single-function revert. No schema, no DEDUP key, no wire format, no config, no
+constant consumed outside this module. The MCP tool surface is unchanged.
+
+### Observability (Item 40)
+
+No new metric and no new alarm, deliberately: the signal is the truncation notice in the
+caller's own stderr, which reaches the operator through the same tool result that carries
+the output. A counter here would be a series nobody reads, which this repository has already
+recorded as its own failure class.
+
+### Honest envelope (Item 40)
+
+100% inside the tested envelope, with bite-proven regression coverage: a grandchild holding
+the pipe can no longer park the parent, and a partial capture says so in its own output.
+**NOT claimed:** that a parked grandchild is impossible — it is not; the grandchild still
+holds the pipe and still runs. What changed is that the parent no longer waits on it
+forever. **NOT claimed:** that this bounds every blocking call in the MCP server; it bounds
+`run_with_timeout`'s readers, which is the one this defect is in.
