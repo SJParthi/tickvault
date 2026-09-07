@@ -1120,6 +1120,12 @@ pub struct LiveIngest {
     /// the only place the packet is seen, and because a store reached through
     /// `&mut self` on a single-owner path needs no concurrent map.
     prev_close: crate::prev_close_store::PrevCloseStore,
+    /// Cumulative volume per contract, ranked per option family.
+    ///
+    /// Beside `prev_close` and for the same reason: the drain is the only place
+    /// a tick is seen, and a structure reached through `&mut self` on a
+    /// single-owner path needs no concurrent map.
+    leaderboard: crate::volume_leaderboard::VolumeLeaderboard,
 }
 
 impl LiveIngest {
@@ -1244,6 +1250,7 @@ impl LiveIngest {
             rescue_thread: None,
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
+            leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
         }
     }
 
@@ -2215,10 +2222,85 @@ impl LiveIngest {
             }
             return IngestOutcome::WrittenOutOfSession;
         }
+        // The leaderboard sees ONLY a fully-accepted tick, and the placement is
+        // the load-bearing part of this call.
+        //
+        // Every arm above that returns early is one whose tick must not rank:
+        // a hard refusal carries a NaN or out-of-band price; and the
+        // candle-only arm -- which returns `WrittenOutOfSession` -- covers
+        // `stale_trading_day` and `out_of_band_timestamp`, both of which carry a
+        // CUMULATIVE VOLUME FROM A PREVIOUS DAY.
+        //
+        // That last one is not theoretical and it is not survivable by the
+        // monotonicity gate. Dhan sends the LAST TRADE TIME, so a dormant
+        // contract snapshotted now carries whenever it last traded (measured
+        // mean ~5 hours, max 34 days) together with THAT day's cumulative
+        // volume. Ranked, it would set the contract's baseline to a stale high;
+        // then today's real, lower volume reads as a FALL, the monotonicity gate
+        // refuses it, and the board defends yesterday's number until the
+        // 32-tick re-latch fires -- per contract, across the whole board.
+        //
+        // Reusing the fold's own verdict rather than re-deriving a session test
+        // here means the two can never disagree about what "this tick counts"
+        // means.
+        self.observe_for_ranking(tick);
         IngestOutcome::Folded {
             sealed: stats.sealed_count,
             amended: stats.amended_count,
         }
+    }
+
+    /// Feeds one accepted tick into the volume leaderboard. **Per-tick path.**
+    ///
+    /// O(1): one segment decode, one hash probe into the published
+    /// contract-to-underlying map, one hash probe inside the leaderboard. No
+    /// allocation.
+    ///
+    /// An unmapped contract is SKIPPED and never counted as a refusal. `None`
+    /// is the common, correct answer here: the main feed carries ~870 spots and
+    /// ~660 futures alongside the options, and none of them belongs on an
+    /// option leaderboard. Counting those would make the refusal counter
+    /// measure the ordinary shape of the feed instead of a defect.
+    /// Clears the ranking state for a new trading day.
+    ///
+    /// Both stores together, and that is not tidiness: they are read as a PAIR
+    /// (`gain_pct` divides an LTP by a previous close), so resetting one and
+    /// keeping the other would compute today's price against yesterday's close
+    /// for every contract -- the whole board shifted by the overnight gap, with
+    /// nothing saying so.
+    ///
+    /// The failure mode if this never runs is QUIET in both halves. Cumulative
+    /// volume restarts at the open, so a carried-over board reads every real
+    /// first tick as a FALL, the monotonicity gate refuses it, and the ranking
+    /// defends yesterday's numbers until the 32-tick re-latch fires per
+    /// contract. Nothing errors; the board is simply wrong all day.
+    pub fn reset_ranking_daily(&mut self) {
+        self.leaderboard.reset_daily();
+        self.prev_close.reset_daily();
+    }
+
+    fn observe_for_ranking(&mut self, tick: &ParsedTick) {
+        let Some(segment) =
+            tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
+        else {
+            // An unknown segment byte is already counted and logged by the
+            // decoder; re-reporting it here would double-count one packet.
+            return;
+        };
+        let Some(owner) = crate::contract_underlying_map::global_contract_underlying_map()
+            .owner_of(tick.security_id, segment)
+        else {
+            return;
+        };
+        let _ = self.leaderboard.observe(
+            crate::volume_leaderboard::RankedContract {
+                security_id: tick.security_id,
+                segment,
+                underlying_id: owner.underlying_id,
+                volume: tick.volume,
+            },
+            owner.family,
+        );
     }
 
     /// Seals every OPEN bucket across every instrument and timeframe, routing
@@ -4252,6 +4334,11 @@ async fn run_frame_drain(
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
     let mut last_refusals: (u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0);
+    // IST day the ranking state belongs to. Zero means "not yet established",
+    // which is why the first pass adopts the day SILENTLY: logging a rollover
+    // on the first 30-second tick of every session would report a midnight
+    // crossing that did not happen.
+    let mut ranking_day: i64 = 0;
 
     loop {
         tokio::select! {
@@ -4564,6 +4651,31 @@ async fn run_frame_drain(
                 // arm must not treat that as a reason to end the drain.
             }
             _ = silence_timer.tick() => {
+                // Daily rollover for the ranking state, checked on the 30s arm
+                // rather than given a timer of its own: it is a cheap integer
+                // compare, and a whole tokio timer to fire once a day would be
+                // a task that sleeps 86,370 seconds out of every 86,400.
+                //
+                // The box stops at 17:30 IST and starts at 08:30, so today this
+                // never fires -- the process does not span midnight. That is
+                // exactly why it is here: the reset is bounded by the DEPLOY
+                // SCHEDULE, and this repository's own O(1) table twice records
+                // "bounded by the deploy schedule, not by the code" as
+                // insufficient (the Groww per-contract map and the intent
+                // ledger both carry that note, and neither was ever fixed).
+                let today = ist_day_number_now();
+                if ranking_day != today {
+                    if ranking_day != 0 {
+                        info!(
+                            previous_day = ranking_day,
+                            today,
+                            "ranking state reset for a new trading day — the process spanned \
+                             an IST midnight"
+                        );
+                    }
+                    ranking_day = today;
+                    ingest.reset_ranking_daily();
+                }
                 // Re-take the WAL receipt anchor (2026-08-28).
                 //
                 // `received_at` is the candle BUCKETING clock, and it is
@@ -7178,6 +7290,19 @@ pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 =
 /// (`crate::depth_rebalance`) needs the SAME clock this lane uses. A second
 /// implementation would be one more place for the IST offset to drift, and a
 /// drift there puts every rebalance in the wrong minute.
+/// Days since the epoch in IST — the trading-day identity for the daily reset.
+///
+/// A DAY NUMBER rather than a formatted date: the only operation is equality
+/// against the previous value, and a number cannot be compared wrongly by
+/// locale, padding or separator. Floor division, so a pre-1970 clock (a box
+/// with no NTP yet) still moves monotonically instead of wrapping.
+pub(crate) fn ist_day_number_now() -> i64 {
+    let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    now_ist.div_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY))
+}
+
 pub(crate) fn ist_second_of_day_now() -> u32 {
     let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
@@ -20715,6 +20840,40 @@ mod depth_rebalance_wiring_tests {
         // never masquerades as a filtered one.
         std::mem::forget(rx);
         (endpoint, tx, instruments)
+    }
+
+    #[test]
+    fn ist_day_number_now_moves_once_per_day_and_is_stable_within_one() {
+        // Equality against the previous value is the ONLY operation, so what
+        // matters is that it does not flap inside a day and does advance across
+        // one. Two reads microseconds apart must agree.
+        let a = ist_day_number_now();
+        let b = ist_day_number_now();
+        assert_eq!(a, b, "the day number must not flap within a single day");
+        // A day number derived from the same clock must be positive in any
+        // realistic present -- a negative value would mean a pre-1970 clock,
+        // which floor division handles without wrapping but which would also
+        // make the reset fire once and then settle.
+        assert!(
+            a > 19_000,
+            "epoch-day for any date after 2022 exceeds 19,000"
+        );
+    }
+
+    #[test]
+    fn reset_ranking_daily_clears_both_stores_together() {
+        // They are read as a PAIR -- gain divides an LTP by a previous close --
+        // so clearing one and keeping the other computes today's price against
+        // yesterday's close for every contract, with nothing saying so.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.record_previous_close(77, tickvault_common::types::ExchangeSegment::NseFno, 101.5);
+        assert_eq!(ingest.prev_close().tracked(), 1);
+        ingest.reset_ranking_daily();
+        assert_eq!(
+            ingest.prev_close().tracked(),
+            0,
+            "the previous-close half must clear with the leaderboard"
+        );
     }
 
     #[test]
