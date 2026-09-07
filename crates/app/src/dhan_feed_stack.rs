@@ -1208,7 +1208,17 @@ impl LiveIngest {
                 .leaderboard
                 .rank(
                     family,
+                    cadence,
                     tickvault_common::constants::TOP_VOLUME_RANK_PER_FAMILY,
+                    // The SAME map the drain already probes per tick, so the
+                    // lot size that normalises a contract's volume is the one
+                    // its own master row carried. A second source here could
+                    // disagree with the subscription about what a lot is.
+                    |c| {
+                        crate::contract_underlying_map::global_contract_underlying_map()
+                            .owner_of(c.security_id, c.segment)
+                            .map(|owner| owner.lot_size)
+                    },
                     |_| true,
                 )
                 .to_vec();
@@ -2424,6 +2434,9 @@ impl LiveIngest {
                 segment,
                 underlying_id: owner.underlying_id,
                 volume: tick.volume,
+                // Rank-output only: `observe` ignores it and `rank` overwrites
+                // it. Set here it would be a value nothing reads.
+                window_lots_milli: 0,
             },
             owner.family,
         );
