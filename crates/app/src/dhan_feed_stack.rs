@@ -8865,6 +8865,9 @@ fn spawn_depth_rebalance(
         today_micros,
         sockets,
         depth20,
+        // The spawn boundary is where the global is read. The loop itself takes
+        // the view as a parameter so it stays testable against a private one.
+        Arc::clone(crate::depth_subscription_view::global_depth_subscription_view()),
     ));
 }
 /// How long to wait before the next late-attach attempt, given the IST second.
