@@ -1492,6 +1492,30 @@ pub async fn load_contract_universe(
     let prices = fetch_spot_prices(questdb, today_ist_nanos).await;
     let spot = spot_paise_by_symbol(&symbols, &prices);
 
+    // Publish the contract -> underlying/family mapping the ranking layer reads
+    // per tick. Built HERE because this is the one place that holds BOTH inputs
+    // -- the day's contract rows and the symbol map -- so building it anywhere
+    // else would mean re-reading two artifacts to learn what is already in hand.
+    //
+    // Before the selection, deliberately: the map describes what the artifact
+    // CONTAINS, not what capacity let us subscribe. A contract dropped for
+    // capacity is still one the drain may see a tick for (it can be on the
+    // depth pools), and an unmapped tick is silently unrankable.
+    {
+        crate::contract_underlying_map::pre_register_contract_underlying_counters();
+        let (legs, artifact_refusals) =
+            crate::contract_underlying_map::legs_from_artifact(&contracts, &symbols);
+        let build = crate::contract_underlying_map::global_contract_underlying_map()
+            .publish_from_legs(&legs);
+        tracing::info!(
+            mapped_contracts = build.accepted,
+            refused_in_build = build.refusals.len(),
+            refused_in_artifact_scan = artifact_refusals.len(),
+            "contract-to-underlying map published — this is what the top-volume ranking \
+             can see"
+        );
+    }
+
     let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
     let selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
 

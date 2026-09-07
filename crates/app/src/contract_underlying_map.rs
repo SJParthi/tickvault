@@ -119,6 +119,21 @@ pub enum LegRefusal {
 }
 
 impl LegRefusal {
+    /// Every variant, so the counter can be seeded exhaustively.
+    ///
+    /// A const array rather than a derive: adding a variant without adding it
+    /// here leaves that reason's series unseeded, and an unseeded series is one
+    /// the CloudWatch agent drops on its first sample -- silent on the one day
+    /// it fires. `all_variants_are_in_the_seed_list` pins that this stays whole.
+    pub const ALL: [Self; 6] = [
+        Self::ZeroOrNegativeContractId,
+        Self::ZeroOrNegativeUnderlyingId,
+        Self::UnresolvedUnderlyingSymbol,
+        Self::UnsupportedSegment,
+        Self::UnderlyingClassMismatch,
+        Self::AtCapacity,
+    ];
+
     /// Stable label for the refusal counter.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -409,6 +424,30 @@ impl ContractUnderlyingMap {
                  (one line per publish; per-reason counts are on the counter)"
             );
         }
+        // An EMPTY published map is the silent catastrophe this arm exists for.
+        //
+        // The refusal warn above cannot cover it: a build with ZERO legs has no
+        // refusals, so `refusals.is_empty()` is true and nothing is said --
+        // while `owner_of` then returns `None` for every tick and the entire
+        // ranking subsystem produces nothing, all session, reporting healthy.
+        //
+        // That is the exact false-OK class this repository keeps removing, and
+        // it is reachable by ordinary means: an artifact with no OPTIDX/OPTSTK
+        // rows, or a symbol map that failed to load (its own arm leaves an
+        // empty `HashMap` and continues by design).
+        //
+        // Coded, so it reaches the error triage path rather than only a log
+        // anyone happens to read.
+        if build.accepted == 0 {
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                legs = legs.len(),
+                refused = build.refusals.len(),
+                "contract-to-underlying mapping published an EMPTY map — NOTHING can be \
+                 ranked or depth-steered today. Every tick will look unmapped, the \
+                 top-volume boards stay empty, and no other signal says so."
+            );
+        }
         self.publish(map);
         build
     }
@@ -450,6 +489,41 @@ impl ContractUnderlyingMap {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// The process-wide map.
+///
+/// Global for the same reason `depth_subscription_view` is: the PUBLISHER is
+/// the contract-universe attach and the READER is the frame drain, and the two
+/// sit on opposite sides of several `tokio::spawn` boundaries whose signatures
+/// already carry a dozen arguments each.
+///
+/// Defaults to an EMPTY map, which is the truthful answer before the attach has
+/// run -- and `publish_from_legs` now says so LOUDLY if the first publish is
+/// also empty, so "empty because nothing has attached yet" cannot be confused
+/// with "empty because the attach produced nothing".
+#[must_use]
+pub fn global_contract_underlying_map() -> &'static std::sync::Arc<ContractUnderlyingMap> {
+    static MAP: std::sync::OnceLock<std::sync::Arc<ContractUnderlyingMap>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Arc::new(ContractUnderlyingMap::new()))
+}
+
+/// Puts the refusal counter on the wire at zero before the first publish.
+///
+/// The CloudWatch agent computes a counter as the delta between consecutive
+/// samples and DROPS the first sample of a series it has never seen. A counter
+/// whose first increment IS the event therefore publishes nothing on the one
+/// day it matters -- the same first-sample rule that hid
+/// `tv_depth_rows_spilled_total` on 2026-08-28 and made 104,540 depth rows
+/// permanently unclassifiable.
+///
+/// Every reason is seeded, not just one: an unseeded label is a series that
+/// does not exist until it fires, which is exactly the case being protected.
+pub fn pre_register_contract_underlying_counters() {
+    for reason in LegRefusal::ALL {
+        metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(0);
     }
 }
 
@@ -824,5 +898,62 @@ mod tests {
         // A spot or future the map never held: absent, and the caller SKIPS it
         // rather than counting a refusal.
         assert!(map.owner_of(13, ExchangeSegment::IdxI).is_none());
+    }
+
+    #[test]
+    fn all_variants_are_in_the_seed_list() {
+        // An unseeded reason is a series the CloudWatch agent drops on its
+        // first sample -- silent on exactly the day it fires. Adding a variant
+        // without adding it here would reintroduce that, so the count is
+        // asserted against the match arms rather than trusted.
+        let labels: std::collections::HashSet<&str> =
+            LegRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            LegRefusal::ALL.len(),
+            "labels must be distinct"
+        );
+        for r in [
+            LegRefusal::ZeroOrNegativeContractId,
+            LegRefusal::ZeroOrNegativeUnderlyingId,
+            LegRefusal::UnresolvedUnderlyingSymbol,
+            LegRefusal::UnsupportedSegment,
+            LegRefusal::UnderlyingClassMismatch,
+            LegRefusal::AtCapacity,
+        ] {
+            assert!(labels.contains(r.as_str()), "{} is not seeded", r.as_str());
+        }
+    }
+
+    #[test]
+    fn pre_register_contract_underlying_counters_is_callable_without_a_recorder() {
+        // The seed runs at attach, before any recorder is guaranteed installed
+        // in a test process. It must not panic there -- a seeding call that
+        // aborts the attach would cost the whole contract universe.
+        pre_register_contract_underlying_counters();
+    }
+
+    #[test]
+    fn publish_from_legs_reports_an_empty_publish_rather_than_swallowing_it() {
+        // The silent-catastrophe arm. Zero legs means zero refusals, so the
+        // refusal warn cannot fire, and `owner_of` then returns None for every
+        // tick while every counter reads healthy.
+        let map = ContractUnderlyingMap::new();
+        let build = map.publish_from_legs(&[]);
+        assert_eq!(build.accepted, 0);
+        assert!(build.refusals.is_empty());
+        assert!(
+            map.is_empty(),
+            "an empty publish must REPLACE the map, not leave a stale one live"
+        );
+    }
+
+    #[test]
+    fn global_contract_underlying_map_is_one_map_and_starts_empty() {
+        // Two maps would mean the attach publishes into one and the drain reads
+        // the other, failing silently as "no contract is ever mapped".
+        let a = global_contract_underlying_map();
+        let b = global_contract_underlying_map();
+        assert!(std::sync::Arc::ptr_eq(a, b));
     }
 }
