@@ -796,6 +796,89 @@ pub const MAPPING_WAIT_NEVER_PAST_IST_SECS: u32 = 9 * 3_600 + 10 * 60;
 /// this is at most 240 `stat` calls total.
 const MAPPING_POLL_INTERVAL_MS: u64 = 500;
 
+/// The longest this function may stall boot, in seconds. One hour.
+///
+/// [`mapping_wait_end_ist_secs`] extends the wait to cover the rider's build
+/// hour, and without a ceiling that extension would stall an overnight boot
+/// until morning. This is the ceiling, and the number is chosen from the
+/// MEASURED spread rather than picked round: on 2026-09-07 the boot that
+/// deserved the extension needed **35.7 minutes** of it and the three that
+/// deserved nothing were **4h37, 5h02 and 7h04** away. One hour sits in the
+/// middle of a gap four hours wide, so this is not a knife-edge.
+pub const MAPPING_WAIT_MAX_STALL_SECS: u32 = 3_600;
+
+/// Decide the IST second-of-day at which the boot wait must stop, or `None`
+/// when waiting cannot pay.
+///
+/// # The defect this closes (MEASURED, 2026-09-07)
+///
+/// The wait used to be bounded by a duration measured from BOOT, and that is
+/// the wrong clock: the artifact has one producer, the daily rider, and the
+/// rider does not write before its own target hour. A boot that starts more
+/// than [`MAPPING_WAIT_DEADLINE_SECS`] before that target therefore burned the
+/// entire deadline against a producer that had not run, gave up, and collapsed
+/// the session to 4 index SIDs.
+///
+/// Every boot on 2026-09-07, from the app log, against a rider target of 08:00:
+///
+/// | Boot (IST) | Old bound | Outcome then | This function |
+/// |---|---|---|---|
+/// | 01:06:22 | 01:16 | timed out, collapsed | **no wait** — 7h04 away |
+/// | 03:08:30 | 03:19 | timed out, collapsed | **no wait** — 5h02 away |
+/// | 03:32:33 | 03:43 | timed out, collapsed | **no wait** — 4h37 away |
+/// | **07:34:15** | **07:44** | **timed out, collapsed** | **wait to 08:10** |
+/// | 08:09:28 | — | artifact present, widened | unchanged |
+///
+/// The 07:34 boot is the one that mattered: it gave up sixteen minutes before
+/// the artifact existed, and only a manual restart at 08:09 rescued the
+/// session. The three overnight boots gain something smaller but real — they
+/// stop stalling boot for ten minutes apiece to reach a fallback that was
+/// certain from the first poll.
+///
+/// # Why the three clauses, and what each one is for
+///
+/// * Past [`MAPPING_WAIT_NEVER_PAST_IST_SECS`] nothing waits at all — dialing a
+///   partial set beats dialing nothing at 09:15. That bound is unchanged and
+///   still wins over everything below.
+/// * The end is pushed out to `rider_target + MAPPING_WAIT_DEADLINE_SECS` so
+///   the rider gets its full build budget from the moment it may start, rather
+///   than from the moment we happened to boot.
+/// * [`MAPPING_WAIT_MAX_STALL_SECS`] caps the result, because an overnight boot
+///   is hours from any producer and must not hold boot open until morning.
+///
+/// Returns the end instant as an IST second-of-day, so the caller compares
+/// wall clock to wall clock and no elapsed-time accounting can drift from it.
+#[must_use]
+pub fn mapping_wait_end_ist_secs(now_ist_secs: u32, rider_target_ist_secs: u32) -> Option<u32> {
+    // The clock bound is absolute and is checked first: a boot already past it
+    // must not wait even a single poll interval.
+    if now_ist_secs >= MAPPING_WAIT_NEVER_PAST_IST_SECS {
+        return None;
+    }
+
+    // Saturating throughout: `now + deadline` is at most 86_400 + 600 and the
+    // target is operator config, so neither can overflow a u32 in practice —
+    // but a wrapped bound here would silently produce a wait of the wrong
+    // length, which is exactly the class of defect this function exists to fix.
+    let from_boot =
+        now_ist_secs.saturating_add(u32::try_from(MAPPING_WAIT_DEADLINE_SECS).unwrap_or(u32::MAX));
+    let from_rider = rider_target_ist_secs
+        .saturating_add(u32::try_from(MAPPING_WAIT_DEADLINE_SECS).unwrap_or(u32::MAX));
+
+    let end = from_boot
+        .max(from_rider)
+        .min(MAPPING_WAIT_NEVER_PAST_IST_SECS);
+
+    // `end` is strictly greater than `now` here: it is at least `from_boot`
+    // capped at the cutoff, and the arm above proved `now < cutoff`.
+    let stall = end.saturating_sub(now_ist_secs);
+    if stall > MAPPING_WAIT_MAX_STALL_SECS {
+        return None;
+    }
+
+    Some(end)
+}
+
 /// Counter: how each boot's wait for the mapping artifact ended.
 ///
 /// `outcome` is one of `not_requested`, `rider_disabled`, `already_present`,
@@ -944,40 +1027,43 @@ pub async fn await_mapping_artifact(
         return;
     }
 
+    let now_ist = tickvault_common::market_hours::now_ist_secs_of_day();
+    let Some(end_ist) = mapping_wait_end_ist_secs(now_ist, cfg.target_secs_of_day_ist) else {
+        metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "producer_too_far").increment(1);
+        // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at the
+        // top of this function. `resolve_live_universe` emits the labelled
+        // collapse line immediately after this returns.
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            now_ist_secs = now_ist,
+            rider_target_ist_secs = cfg.target_secs_of_day_ist,
+            path = %path.display(),
+            "live universe: not waiting for today's mapping — the daily rider's build hour is \
+             further away than this boot may stall for, so no amount of waiting can produce the \
+             artifact. Subscribing the 4 index SIDs. This is the expected shape for an overnight \
+             or off-hours boot; the scheduled morning start is what widens the session."
+        );
+        return;
+    };
+
     tracing::info!(
         path = %path.display(),
-        deadline_secs = MAPPING_WAIT_DEADLINE_SECS,
+        now_ist_secs = now_ist,
+        end_ist_secs = end_ist,
+        rider_target_ist_secs = cfg.target_secs_of_day_ist,
         "live universe: today's mapping artifact is not written yet — waiting for the daily \
          rider before subscribing, so the lane does not lose the boot race and collapse to 4 \
          instruments"
     );
 
     let started = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(MAPPING_WAIT_DEADLINE_SECS);
     let interval = std::time::Duration::from_millis(MAPPING_POLL_INTERVAL_MS);
 
-    while started.elapsed() < deadline {
-        // Bounded by the CLOCK as well as the duration — see
-        // `MAPPING_WAIT_NEVER_PAST_IST_SECS`. Checked first so a boot that is
-        // already past the cutoff exits without burning a poll interval.
-        if tickvault_common::market_hours::now_ist_secs_of_day() >= MAPPING_WAIT_NEVER_PAST_IST_SECS
-        {
-            metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "pre_open_cutoff").increment(1);
-            // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at
-            // the top of this function. `resolve_live_universe` emits the
-            // labelled collapse line immediately after this returns.
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                waited_secs = started.elapsed().as_secs_f64(),
-                path = %path.display(),
-                "live universe: stopped waiting for today's mapping at the 09:10 IST pre-open \
-                 cutoff — the market opens at 09:15 and dialing a partial set beats dialing \
-                 nothing. This session subscribes the 4 index SIDs. It means the box booted \
-                 late or the daily rider is failing; the rider keeps retrying, but the lane \
-                 reads the artifact once at boot, so only a restart widens this session."
-            );
-            return;
-        }
+    // ONE clock, not two. The end instant already carries the rider's build
+    // hour AND the 09:10 cutoff, so the loop compares wall clock to wall clock
+    // and there is no elapsed-time bound left to disagree with it — that
+    // disagreement is exactly what cost 2026-09-07 its first four boots.
+    while tickvault_common::market_hours::now_ist_secs_of_day() < end_ist {
         tokio::time::sleep(interval).await;
         if path.exists() {
             metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "became_ready").increment(1);
@@ -990,6 +1076,30 @@ pub async fn await_mapping_artifact(
         }
     }
 
+    // The two give-up shapes are NOT the same operator problem, so they keep
+    // separate labels: the cutoff means the box booted late or the rider is
+    // failing, while the rider budget means the rider ran and did not finish.
+    // Classified at the single exit rather than by a second in-loop arm — the
+    // end instant is capped at the cutoff, so an in-loop cutoff check could
+    // never fire and would read as live cover it does not provide.
+    if end_ist >= MAPPING_WAIT_NEVER_PAST_IST_SECS {
+        metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "pre_open_cutoff").increment(1);
+        // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at the
+        // top of this function. `resolve_live_universe` emits the labelled
+        // collapse line immediately after this returns.
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            waited_secs = started.elapsed().as_secs_f64(),
+            path = %path.display(),
+            "live universe: stopped waiting for today's mapping at the 09:10 IST pre-open \
+             cutoff — the market opens at 09:15 and dialing a partial set beats dialing \
+             nothing. This session subscribes the 4 index SIDs. It means the box booted \
+             late or the daily rider is failing; the rider keeps retrying, but the lane \
+             reads the artifact once at boot, so only a restart widens this session."
+        );
+        return;
+    }
+
     metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "timed_out").increment(1);
     // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at the top
     // of this function. `resolve_live_universe` emits the labelled collapse
@@ -997,16 +1107,127 @@ pub async fn await_mapping_artifact(
     tracing::error!(
         code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
         waited_secs = started.elapsed().as_secs_f64(),
+        end_ist_secs = end_ist,
         path = %path.display(),
         "live universe: the daily rider did not produce today's mapping within \
-         {MAPPING_WAIT_DEADLINE_SECS}s. Subscribing the 4 index SIDs for this session. The \
-         rider keeps retrying, but the lane reads the artifact once at boot — so this session \
-         stays at 4 instruments until a restart."
+         {MAPPING_WAIT_DEADLINE_SECS}s of its own build hour. Subscribing the 4 index SIDs for \
+         this session. The rider keeps retrying, but the lane reads the artifact once at boot — \
+         so this session stays at 4 instruments until a restart."
     );
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The live rider target, 08:00 IST (`config/base.toml`
+    /// `[dhan_universe] target_secs_of_day_ist = 28800`).
+    const RIDER_TARGET: u32 = 8 * 3_600;
+
+    /// Every boot of 2026-09-07, replayed against the rule that now decides.
+    ///
+    /// These are not invented fixtures: each row is a real `await_mapping_artifact`
+    /// log line from `/tickvault/prod/app` that day. Four of the five collapsed
+    /// the session to 4 index SIDs, and the fifth only widened because a human
+    /// restarted the box.
+    #[test]
+    fn the_five_boots_of_2026_09_07_resolve_the_way_the_evidence_says_they_should() {
+        // 01:06:22, 03:08:30, 03:32:33 — overnight. The rider cannot write for
+        // hours, so the old 600 s wait was ten minutes spent reaching a
+        // certainty. Not waiting is the honest answer AND the faster one.
+        for (h, m, s) in [(1, 6, 22), (3, 8, 30), (3, 32, 33)] {
+            let now = h * 3_600 + m * 60 + s;
+            assert_eq!(
+                super::mapping_wait_end_ist_secs(now, RIDER_TARGET),
+                None,
+                "a {h:02}:{m:02} boot is hours from the rider's build hour — waiting cannot \
+                 produce the artifact, so boot must not stall for it"
+            );
+        }
+
+        // 07:34:15 — THE ONE THAT MATTERED. It gave up at 07:44 and the
+        // artifact appeared by 08:09. The rule must now carry it past 08:00.
+        let boot = 7 * 3_600 + 34 * 60 + 15;
+        let end = super::mapping_wait_end_ist_secs(boot, RIDER_TARGET)
+            .expect("the 07:34 boot is inside the stall ceiling and must wait");
+        assert_eq!(
+            end,
+            RIDER_TARGET + 600,
+            "the wait must end at the rider's build hour plus its build budget (08:10), not \
+             at boot plus the same budget (07:44) — the artifact did not exist at 07:44"
+        );
+        assert!(
+            end > 8 * 3_600,
+            "an end at or before 08:00 cannot see an artifact the rider writes at 08:00"
+        );
+
+        // 08:09:28 — the rescue boot. It found the artifact in 3.3 s, so it
+        // never reaches this function's wait path; the rule must still permit
+        // a wait, or a restart at that minute would refuse to look at all.
+        let rescue = 8 * 3_600 + 9 * 60 + 28;
+        assert!(
+            super::mapping_wait_end_ist_secs(rescue, RIDER_TARGET).is_some(),
+            "a boot minutes after the build hour must still be willing to wait"
+        );
+    }
+
+    /// The stall ceiling is what stops the rider extension from holding boot
+    /// open until morning, and it must bite on duration alone.
+    #[test]
+    fn mapping_wait_end_ist_secs_caps_the_rider_extension_at_the_stall_ceiling() {
+        // Exactly at the ceiling: an 07:10 boot is 3,600 s from 08:10.
+        let at_ceiling = RIDER_TARGET + 600 - super::MAPPING_WAIT_MAX_STALL_SECS;
+        assert!(
+            super::mapping_wait_end_ist_secs(at_ceiling, RIDER_TARGET).is_some(),
+            "a stall of exactly MAPPING_WAIT_MAX_STALL_SECS is permitted — the ceiling is a \
+             maximum, not an exclusive bound"
+        );
+        assert_eq!(
+            super::mapping_wait_end_ist_secs(at_ceiling - 1, RIDER_TARGET),
+            None,
+            "one second over the ceiling must refuse to wait"
+        );
+    }
+
+    /// The 09:10 cutoff outranks everything, in both directions.
+    #[test]
+    fn the_pre_open_cutoff_still_wins() {
+        assert_eq!(
+            super::mapping_wait_end_ist_secs(super::MAPPING_WAIT_NEVER_PAST_IST_SECS, RIDER_TARGET),
+            None,
+            "a boot at the cutoff must not wait even one poll interval"
+        );
+        assert_eq!(
+            super::mapping_wait_end_ist_secs(9 * 3_600 + 30 * 60, RIDER_TARGET),
+            None,
+            "a boot after the open must dial immediately — a partial set beats nothing"
+        );
+
+        // A misconfigured target LATER than the cutoff must not push the wait
+        // past it. The cutoff is the safety property; the target is a hint.
+        let late_target = 10 * 3_600;
+        let end = super::mapping_wait_end_ist_secs(9 * 3_600, late_target)
+            .expect("an 09:00 boot is 10 minutes from the cutoff, inside the ceiling");
+        assert_eq!(
+            end,
+            super::MAPPING_WAIT_NEVER_PAST_IST_SECS,
+            "a rider target past 09:10 must be clamped to the cutoff, never followed"
+        );
+    }
+
+    /// A boot after the build hour keeps the behaviour it already had.
+    #[test]
+    fn a_boot_after_the_build_hour_is_unchanged() {
+        // The scheduled 08:30 morning start: end is boot + the deadline, as
+        // before. The rider extension must not lengthen a wait that already
+        // starts after the producer could have run.
+        let scheduled = 8 * 3_600 + 30 * 60;
+        assert_eq!(
+            super::mapping_wait_end_ist_secs(scheduled, RIDER_TARGET),
+            Some(scheduled + 600),
+            "the normal morning boot must keep its boot-relative budget — the rider hour is \
+             already behind it, so extending to it would SHORTEN the wait"
+        );
+    }
 
     /// Every `WS-GAP-03` error in this module must carry the `source` field the
     /// CloudWatch filter selects on.
