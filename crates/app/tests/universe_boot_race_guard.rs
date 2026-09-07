@@ -93,9 +93,27 @@ fn the_wait_is_bounded_and_fail_soft() {
     );
 
     let code = code_only(src);
+    // 2026-09-07: this asserted `started.elapsed() < deadline`. That bound is
+    // the defect, not the protection — it measured from BOOT while the only
+    // producer writes at its own build hour, so a 07:34 boot gave up at 07:44
+    // against an artifact that appeared at 08:0x. Four boots collapsed that
+    // morning. The loop is still bounded, and more tightly: `end_ist` is capped
+    // at the 09:10 cutoff AND at MAPPING_WAIT_MAX_STALL_SECS, so the same
+    // hang-behind-a-vendor-outage argument holds with the clock the producer
+    // actually runs on.
     assert!(
-        code.contains("started.elapsed() < deadline"),
-        "the poll loop must be deadline-bounded"
+        code.contains("< end_ist"),
+        "the poll loop must be bounded by the wall-clock end instant"
+    );
+    assert!(
+        code.contains("fn mapping_wait_end_ist_secs"),
+        "the end instant must come from a pure, testable rule — the old bound was an inline \
+         duration nobody could exercise without a real boot"
+    );
+    assert!(
+        code.contains("MAPPING_WAIT_MAX_STALL_SECS"),
+        "the rider extension must carry a stall ceiling — without one an overnight boot waits \
+         until morning, which is a worse failure than the one being fixed"
     );
 
     // Fail-soft: the function returns rather than panicking or looping forever.
@@ -121,6 +139,10 @@ fn every_wait_outcome_is_counted() {
         "became_ready",
         "timed_out",
         "pre_open_cutoff",
+        // 2026-09-07: a boot whose nearest producer is hours away. Without its
+        // own label it was indistinguishable from a rider that ran and failed,
+        // and the three overnight boots that day looked like three failures.
+        "producer_too_far",
     ] {
         assert!(
             src.contains(outcome),
@@ -136,8 +158,12 @@ fn a_disabled_rider_does_not_burn_the_whole_deadline() {
         .find("if !cfg.enabled")
         .expect("the wait must short-circuit when the rider that writes the artifact is off");
     let loop_at = code
-        .find("while started.elapsed()")
-        .expect("the poll loop must exist");
+        .find("while tickvault_common::market_hours::now_ist_secs_of_day() < end_ist")
+        .expect(
+            "the poll loop must exist and must be bounded by the WALL CLOCK. It was bounded by \
+             elapsed time until 2026-09-07, when a 07:34 boot gave up at 07:44 against a rider \
+             that writes at 08:00 — two clocks that could disagree, and did.",
+        );
     assert!(
         disabled_at < loop_at,
         "the `[dhan_universe] enabled = false` check must come BEFORE the poll loop. With no \
