@@ -1766,6 +1766,23 @@ mod tests {
         );
     }
 
+    use std::time::{Duration, Instant};
+
+    /// How long [`tiny_server`] keeps waiting for the `n`-th connection before
+    /// it gives up and lets the thread end.
+    ///
+    /// Generous on purpose: the tests build their client with
+    /// `build_probe_client(5)`, so a legitimate request has a 5-second budget
+    /// and a healthy run finishes in milliseconds. This is not a latency knob,
+    /// it is the bound that turns "parked forever" into "returned".
+    const TINY_SERVER_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// How long one accepted socket may take to deliver its request line.
+    ///
+    /// Without it a client that connects and then sends nothing parks the read
+    /// instead of the accept — the same hang one layer in.
+    const TINY_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// A one-shot local HTTP server that answers `n` requests with `status`.
     ///
     /// # Why a real socket rather than a mock
@@ -1775,24 +1792,152 @@ mod tests {
     /// prove only that the mock was called. Twenty lines of `TcpListener`
     /// exercise the real `reqwest` round trip, the real status check, and the
     /// real truncate — with no QuestDB and no new dependency.
+    ///
+    /// # Why the accept loop is DEADLINE-BOUNDED (2026-09-06)
+    ///
+    /// Until 2026-09-06 this performed exactly `n` BLOCKING `accept()` calls
+    /// and every caller then joined the thread unconditionally. If the client
+    /// opened fewer than `n` TCP connections — pooled-connection reuse, a retry
+    /// landing on the same socket, any timing shift — the thread parked forever
+    /// in `accept()`, `join()` never returned, and the whole test binary hung.
+    ///
+    /// That is measured, not theoretical. On CI run 34057591677 the test
+    /// `replay_spill_dir_truncates_a_closed_file_and_leaves_the_live_one_intact`
+    /// hung for 50 minutes and consumed the entire 60-minute `Coverage & Perf`
+    /// job budget, while `Test (storage)` passed on the SAME commit in the same
+    /// run in 1m35s. A plain `cargo test` and an llvm-cov-instrumented run
+    /// differ only in timing, which is exactly what this shape is sensitive to.
+    ///
+    /// The deadline does not make a missing connection acceptable — it makes it
+    /// LOUD. The thread returns, `join()` returns, and the caller's own
+    /// assertions fail on the replay that did not happen, naming the cause in
+    /// seconds instead of the job dying at its timeout with no verdict at all.
+    ///
+    /// The two `n > 1` call sites are the exposed ones (`n = 2` and `n = 3`);
+    /// a single unconditional connection cannot under-run its own count.
     fn tiny_server(status: &'static str, n: usize) -> (String, std::thread::JoinHandle<()>) {
+        tiny_server_with_deadline(status, n, TINY_SERVER_DEADLINE)
+    }
+
+    /// [`tiny_server`] with an explicit deadline, so the bound itself is
+    /// testable without a test that waits 30 seconds to prove it.
+    fn tiny_server_with_deadline(
+        status: &'static str,
+        n: usize,
+        deadline: Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        // Non-blocking so the loop can NOTICE the deadline. A blocking accept
+        // has nothing to notice it with, which is the entire defect.
+        listener.set_nonblocking(true).expect("set_nonblocking");
         let handle = std::thread::spawn(move || {
-            for _ in 0..n {
-                let Ok((mut sock, _)) = listener.accept() else {
+            let give_up_at = Instant::now() + deadline;
+            let mut served = 0usize;
+            while served < n {
+                if Instant::now() >= give_up_at {
                     return;
-                };
-                let mut buf = [0u8; 4096];
-                // One read is enough: we never inspect the body, and draining it
-                // fully would block on a request larger than the buffer.
-                let _ = sock.read(&mut buf);
-                let _ = sock.write_all(status.as_bytes());
-                let _ = sock.flush();
+                }
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        // The accepted socket must be BLOCKING: it inherits
+                        // nothing useful here, and a non-blocking read would
+                        // return WouldBlock before the request arrived and we
+                        // would answer an empty request.
+                        let _ = sock.set_nonblocking(false);
+                        let _ = sock.set_read_timeout(Some(TINY_SERVER_READ_TIMEOUT));
+                        let mut buf = [0u8; 4096];
+                        // One read is enough: we never inspect the body, and
+                        // draining it fully would block on a request larger
+                        // than the buffer.
+                        let _ = sock.read(&mut buf);
+                        let _ = sock.write_all(status.as_bytes());
+                        let _ = sock.flush();
+                        served = served.saturating_add(1);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        // 5 ms: short enough that a real connection is served
+                        // essentially immediately, long enough that the poll
+                        // costs nothing across a whole suite.
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
             }
         });
         (format!("http://127.0.0.1:{port}/write"), handle)
+    }
+
+    /// The accept loop must END when the `n`-th connection never arrives.
+    ///
+    /// This is the regression test for the 2026-09-06 CI hang: it asks for two
+    /// connections, makes ZERO, and proves the thread terminated anyway.
+    ///
+    /// # Why the join runs on a helper thread
+    ///
+    /// A bite test for a HANG cannot simply call `join()`. If the bound is
+    /// removed, that call parks and the TEST hangs rather than failing — which
+    /// is the very outcome being fixed, and is worthless as a signal: a hung
+    /// test looks identical to a slow one until the job dies at its timeout
+    /// with no verdict. Joining on a helper thread and waiting on a channel
+    /// converts "parked forever" into a NAMED assertion failure in five
+    /// seconds. On failure the helper is deliberately left running: it is
+    /// parked in `accept()`, which is exactly what the assertion reports.
+    #[test]
+    fn tiny_server_gives_up_instead_of_parking_when_a_connection_never_arrives() {
+        // Two expected, none made — the shape that hung CI, with the deadline
+        // shrunk so the bound is provable without a 30-second test.
+        let (_url, server) = tiny_server_with_deadline(
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n",
+            2,
+            Duration::from_millis(200),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ended_cleanly = server.join().is_ok();
+            let _ = tx.send(ended_cleanly);
+        });
+
+        let ended_cleanly = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "the accept loop must be deadline-bounded, and it never returned. \
+             That is the hang which consumed the entire 60-minute Coverage & Perf \
+             budget on CI run 34057591677 while Test (storage) passed on the same \
+             commit in 1m35s",
+        );
+        assert!(
+            ended_cleanly,
+            "the server thread must end by deadline, not by panicking"
+        );
+    }
+
+    /// The deadline must not cost a HEALTHY run anything: the same helper still
+    /// serves every connection it promised.
+    ///
+    /// Without this, the test above could be satisfied by a server that never
+    /// serves anyone — a bound that works by breaking the thing it bounds.
+    #[test]
+    fn tiny_server_still_serves_every_connection_it_promised() {
+        let (url, server) = tiny_server_with_deadline(
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n",
+            2,
+            Duration::from_secs(30),
+        );
+
+        // Two SEPARATE clients, so neither can reuse the other's pooled socket
+        // and under-run the count the way a single pooled client can.
+        for _ in 0..2 {
+            let client = crate::http_client::build_probe_client(5).expect("client");
+            let sent = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt")
+                .block_on(async { client.post(&url).body("x").send().await.is_ok() });
+            assert!(sent, "the server must answer a real request");
+        }
+
+        server.join().expect("server thread");
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
