@@ -2259,6 +2259,7 @@ mod master_sourced_tests {
             s: strike_paise,
             l: leg.into(),
             u: u.into(),
+            z: 0,
         }
     }
 

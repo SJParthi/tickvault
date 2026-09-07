@@ -114,6 +114,16 @@ pub enum LegRefusal {
     /// resolves by file order; refusing is what stops that order deciding a
     /// a contract's grouping.
     UnderlyingClassMismatch,
+    /// The master carried no usable `LOT_SIZE` for this contract.
+    ///
+    /// REFUSED rather than defaulted to 1. A lot size is the divisor that
+    /// turns traded units into lots, so defaulting it leaves that contract
+    /// ranked in RAW UNITS while every sibling is ranked in lots — which puts
+    /// it at the top of the board by a factor of its own lot size and hands a
+    /// depth socket to whichever contract the master happened to be missing a
+    /// column for. A contract absent from the board is visible in this
+    /// counter; a contract wrongly at the top of it is not.
+    MissingLotSize,
     /// The snapshot is at its ceiling.
     AtCapacity,
 }
@@ -125,12 +135,13 @@ impl LegRefusal {
     /// here leaves that reason's series unseeded, and an unseeded series is one
     /// the CloudWatch agent drops on its first sample -- silent on the one day
     /// it fires. `all_variants_are_in_the_seed_list` pins that this stays whole.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ZeroOrNegativeContractId,
         Self::ZeroOrNegativeUnderlyingId,
         Self::UnresolvedUnderlyingSymbol,
         Self::UnsupportedSegment,
         Self::UnderlyingClassMismatch,
+        Self::MissingLotSize,
         Self::AtCapacity,
     ];
 
@@ -143,6 +154,7 @@ impl LegRefusal {
             Self::UnresolvedUnderlyingSymbol => "unresolved_underlying_symbol",
             Self::UnsupportedSegment => "unsupported_segment",
             Self::UnderlyingClassMismatch => "underlying_class_mismatch",
+            Self::MissingLotSize => "missing_lot_size",
             Self::AtCapacity => "at_capacity",
         }
     }
@@ -151,7 +163,7 @@ impl LegRefusal {
 /// One option contract's identity, reduced to what the ranking needs.
 ///
 /// Deliberately NOT a master row or a chain row: this module needs exactly
-/// four fields, and taking a whole vendor row would couple the ranking to
+/// five fields, and taking a whole vendor row would couple the ranking to
 /// whichever producer happened to be wired first — which is the coupling that
 /// produced the corrected source claim in this module's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +188,14 @@ pub struct LegIds {
     /// drift would be invisible — a stock option ranked as an index option
     /// simply never reaches depth.
     pub family: OptionFamily,
+    /// Contract multiplier from the master's `LOT_SIZE` column — how many
+    /// units one lot is.
+    ///
+    /// Guaranteed non-zero: [`legs_from_artifact`] refuses a leg whose master
+    /// row carried no usable lot size rather than defaulting it, so a divide
+    /// by this value cannot fault and cannot silently rank one contract in a
+    /// different unit from its siblings.
+    pub lot_size: u32,
 }
 
 /// What the map answers: who a contract belongs to, and which board it is on.
@@ -188,6 +208,13 @@ pub struct ContractOwner {
     pub underlying_id: u64,
     /// Which leaderboard the contract is ranked on.
     pub family: OptionFamily,
+    /// Units per lot, from the daily master. Always non-zero — see [`LegIds`].
+    ///
+    /// Carried HERE, on the same value the drain already looks up, so the
+    /// ranking path pays ONE hash probe for owner, family and multiplier
+    /// together. A separate lot-size map would be a second probe on the hot
+    /// path and a second thing that can go missing independently.
+    pub lot_size: u32,
 }
 
 /// What building a snapshot produced.
@@ -242,6 +269,15 @@ pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, 
             ));
             continue;
         }
+        // Enforced HERE and not only in `legs_from_artifact`, because this is
+        // the function that CONSTRUCTS `ContractOwner`, and that type's
+        // contract says its lot size is never zero. A caller assembling legs
+        // by hand — a test, or a future second producer — must not be able to
+        // publish a value that makes a divide fault on the drain.
+        if leg.lot_size == 0 {
+            refusals.push((leg.contract_security_id, LegRefusal::MissingLotSize));
+            continue;
+        }
         let key = (contract_id, leg.contract_segment);
         // An UPDATE to a contract already in the snapshot is always allowed;
         // only a NEW contract can hit the ceiling. Refusing the update would
@@ -255,6 +291,7 @@ pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, 
             ContractOwner {
                 underlying_id,
                 family: leg.family,
+                lot_size: leg.lot_size,
             },
         );
     }
@@ -291,6 +328,15 @@ pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, 
 /// counted, never accepted — a contract grouped under the wrong underlying
 /// breaks the depth-200 distinct-underlying rule silently, which is worse than
 /// one contract missing from the board.
+///
+/// # The lot size is a refusal for the same reason
+///
+/// A missing `LOT_SIZE` is refused, never defaulted to 1. The lot size is the
+/// divisor that puts every contract's traded volume in the SAME unit, so a
+/// contract that keeps its raw units outranks its siblings by a factor of its
+/// own lot size — and it does so at the top of the board, where it takes a
+/// depth socket. Refusing costs one contract; defaulting corrupts the
+/// ordering, and only the refusal leaves a counter behind.
 ///
 /// # Complexity
 ///
@@ -360,11 +406,21 @@ pub fn legs_from_artifact(
             refusals.push((contract_id, LegRefusal::ZeroOrNegativeUnderlyingId));
             continue;
         }
+        // `ContractRow::z` is `0` when the master carried no `LOT_SIZE`, and
+        // `#[serde(default)]` also yields `0` for an artifact written by a
+        // binary that predates the column. Both are the same answer — we do
+        // not know this contract's multiplier — and both are REFUSED rather
+        // than defaulted, per `LegRefusal::MissingLotSize`.
+        if row.z == 0 {
+            refusals.push((contract_id, LegRefusal::MissingLotSize));
+            continue;
+        }
         legs.push(LegIds {
             contract_security_id: contract_id,
             underlying_security_id,
             contract_segment,
             family,
+            lot_size: row.z,
         });
     }
     (legs, refusals)
@@ -539,6 +595,7 @@ mod tests {
             contract_security_id: contract,
             underlying_security_id: underlying,
             contract_segment: FNO,
+            lot_size: 75,
             family: OptionFamily::Stock,
         }
     }
@@ -604,12 +661,14 @@ mod tests {
                 underlying_security_id: 13,
                 contract_segment: FNO,
                 family: OptionFamily::Stock,
+                lot_size: 75,
             },
             LegIds {
                 contract_security_id: 500,
                 underlying_security_id: 51,
                 contract_segment: BFO,
                 family: OptionFamily::Index,
+                lot_size: 15,
             },
         ];
         let (map, build) = build_snapshot(&legs);
@@ -722,6 +781,11 @@ mod tests {
             s: 2_500_000,
             l: "CE".to_owned(),
             u: underlying.to_owned(),
+            // A REAL lot size, because the production default is a real lot
+            // size: every row the master carries a `LOT_SIZE` for has one.
+            // Leaving this at the absent-field 0 would make every test below
+            // exercise the refusal path instead of the path it is named for.
+            z: 75,
         }
     }
 
@@ -853,6 +917,77 @@ mod tests {
         let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
         assert!(legs.is_empty());
         assert_eq!(refusals, vec![(0, LegRefusal::ZeroOrNegativeContractId)]);
+    }
+
+    #[test]
+    fn legs_from_artifact_carries_the_masters_lot_size_onto_every_leg() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            ContractRow {
+                z: 250,
+                ..contract(600, "OPTSTK", "RELIANCE", "NSE")
+            },
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(refusals.is_empty(), "unexpected refusals: {refusals:?}");
+        // Per-contract, not one figure for the file: NIFTY and RELIANCE have
+        // genuinely different multipliers, and a shared default would rank
+        // one of them in the wrong unit.
+        assert_eq!(legs[0].lot_size, 75);
+        assert_eq!(legs[1].lot_size, 250);
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_a_missing_lot_size_rather_than_defaulting_it() {
+        // `z == 0` is BOTH answers that mean "unknown": a master row with no
+        // `LOT_SIZE` column, and an artifact written by a binary that predates
+        // the field (`#[serde(default)]`). Defaulting either to 1 would rank
+        // this contract in raw units — 75x its siblings on a NIFTY-sized lot —
+        // and put it at the top of the board, taking a depth socket.
+        let rows = [ContractRow {
+            z: 0,
+            ..contract(600, "OPTSTK", "RELIANCE", "NSE")
+        }];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(600, LegRefusal::MissingLotSize)]);
+    }
+
+    #[test]
+    fn build_snapshot_refuses_a_zero_lot_size_so_contract_owner_is_never_zero() {
+        // Defence in depth: `legs_from_artifact` already refuses, but
+        // `build_snapshot` is what CONSTRUCTS `ContractOwner`, whose contract
+        // says the lot size is never zero. A hand-built leg — a test, or a
+        // future second producer — must not be able to publish a value that
+        // makes the ranking divide by zero.
+        let legs = [LegIds {
+            lot_size: 0,
+            ..leg(600, 2885)
+        }];
+        let (map, build) = build_snapshot(&legs);
+        assert!(map.is_empty());
+        assert_eq!(build.accepted, 0);
+        assert_eq!(build.refusals, vec![(600, LegRefusal::MissingLotSize)]);
+    }
+
+    #[test]
+    fn a_published_owner_always_carries_a_divisible_lot_size() {
+        // The property the whole gate exists for, asserted end to end on the
+        // published map rather than on the builder's return value.
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            ContractRow {
+                z: 0,
+                ..contract(600, "OPTSTK", "RELIANCE", "NSE")
+            },
+        ];
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        let map = ContractUnderlyingMap::new();
+        map.publish_from_legs(&legs);
+        assert!(map.owner_of(500, FNO).is_some_and(|o| o.lot_size > 0));
+        // And the one we could not compute a lot size for is simply absent —
+        // never present with a made-up multiplier.
+        assert!(map.owner_of(600, FNO).is_none());
     }
 
     #[test]
