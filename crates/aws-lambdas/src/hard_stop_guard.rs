@@ -29,7 +29,7 @@
 //! touched" ratchets). The real SDK impls are thin, uncovered-by-design
 //! shells (UNPROVEN until deploy — a live Lambda invoke is the only probe).
 
-use chrono::{DateTime, Datelike, FixedOffset, Offset, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Offset, Timelike, Utc};
 use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
@@ -78,6 +78,36 @@ pub struct GuardEnv {
     pub start_rule_name: String,
     pub budget_kill_usd: f64,
     pub ping_state_param: String,
+    /// The operator keep-alive marker the start-watchdog's curfew honours —
+    /// honoured here too since 2026-09-08, so the two hourly guards over
+    /// the same box agree on what "deliberately running late" means.
+    pub keep_alive_param: String,
+}
+
+/// Grace: never out-of-window-stop a box within this many minutes of its
+/// launch. Pinned equal to the curfew's `CURFEW_START_GRACE_MINUTES` so an
+/// operator's manual start is judged by ONE grace, not two.
+pub const OUT_OF_WINDOW_START_GRACE_MINUTES: i64 =
+    crate::start_watchdog::CURFEW_START_GRACE_MINUTES;
+
+/// Legacy `_read_keep_alive_until`, shared shape with the start-watchdog:
+/// `None` = no (usable) override. Never raises; any failure is "no override",
+/// so the guard stays armed — fail-open here would silently disable budget
+/// protection.
+pub async fn read_keep_alive_until<S: SsmApi>(ssm: &S, param: &str) -> Option<DateTime<Utc>> {
+    match ssm.get_parameter(param).await {
+        Ok(raw) => {
+            let parsed = crate::start_watchdog::parse_keep_alive_timestamp(&raw);
+            if parsed.is_none() && !raw.trim().is_empty() {
+                info!("keep-alive param unparseable — no override");
+            }
+            parsed
+        }
+        Err(exc) => {
+            info!(error = %exc, "keep-alive param unavailable — no override");
+            None
+        }
+    }
 }
 
 impl GuardEnv {
@@ -99,6 +129,9 @@ impl GuardEnv {
             },
             ping_state_param: std::env::var("PING_STATE_PARAM")
                 .unwrap_or_else(|_| DEFAULT_PING_STATE_PARAM.to_string()),
+            keep_alive_param: std::env::var("KEEP_ALIVE_PARAM").unwrap_or_else(|_| {
+                crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string()
+            }),
         }
     }
 }
@@ -593,8 +626,44 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         }));
     }
 
-    // Running OUTSIDE the up-window — force stop + alert (the legacy
-    // never-cross guard, unchanged by GAP 1).
+    // Running OUTSIDE the up-window. Before force-stopping, honour the two
+    // exemptions the start-watchdog's curfew already honours — and until
+    // 2026-09-08 this guard did NOT, so an operator who set the keep-alive
+    // marker and started the box for evening work had it stopped by THIS
+    // Lambda within the hour while the curfew correctly left it alone. Two
+    // guards over the same box that disagree on the exemption is one guard
+    // that ignores it.
+    //
+    // 1. The keep-alive marker: an explicit, timed operator override.
+    if let Some(until) = read_keep_alive_until(ssm, &env.keep_alive_param).await
+        && now_utc < until
+    {
+        info!(
+            keep_alive_until = %until,
+            "out-of-window guard — keep-alive override active; leaving the box alone"
+        );
+        return Ok(json!({
+            "ok": true, "noop": true, "state": state, "skipped": "keep_alive"
+        }));
+    }
+    // 2. Launch grace: a box started minutes ago is a deliberate manual
+    //    start still being used, not a 17:30 stop that failed. The same
+    //    grace the curfew uses, so the two guards cannot disagree on it.
+    if let Some(launch_time) = inst.launch_time
+        && now_utc.signed_duration_since(launch_time)
+            < Duration::minutes(OUT_OF_WINDOW_START_GRACE_MINUTES)
+    {
+        info!(
+            launch_time = %launch_time,
+            grace_minutes = OUT_OF_WINDOW_START_GRACE_MINUTES,
+            "out-of-window guard — fresh manual start inside the grace window; not stopping"
+        );
+        return Ok(json!({
+            "ok": true, "noop": true, "state": state, "skipped": "grace"
+        }));
+    }
+
+    // Force stop + alert (the legacy never-cross guard, unchanged by GAP 1).
     ec2.stop_instances(&env.instance_id).await?;
     sns.publish(
         &env.alerts_topic_arn,
@@ -818,13 +887,22 @@ mod tests {
 
     struct FakeEc2 {
         state: String,
+        /// The LaunchTime the fake reports. The legacy default is
+        /// 2026-07-07 03:00 UTC; grace tests override it so `now` can sit
+        /// inside or outside the start-grace window deliberately.
+        launch_time: DateTime<Utc>,
         stopped: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeEc2 {
         fn new(state: &str) -> Self {
+            Self::launched_at(state, utc(2026, 7, 7, 3, 0))
+        }
+
+        fn launched_at(state: &str, launch_time: DateTime<Utc>) -> Self {
             Self {
                 state: state.to_string(),
+                launch_time,
                 stopped: RefCell::new(Vec::new()),
             }
         }
@@ -834,8 +912,7 @@ mod tests {
         async fn describe(&self, _instance_id: &str) -> Result<Option<GuardInstance>, String> {
             Ok(Some(GuardInstance {
                 state: self.state.clone(),
-                // Legacy fake: LaunchTime = 2026-07-07 03:00 UTC.
-                launch_time: Some(utc(2026, 7, 7, 3, 0)),
+                launch_time: Some(self.launch_time),
             }))
         }
 
@@ -989,6 +1066,7 @@ mod tests {
             start_rule_name: "tv-prod-daily-start".to_string(),
             budget_kill_usd: 55.0,
             ping_state_param: DEFAULT_PING_STATE_PARAM.to_string(),
+            keep_alive_param: crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string(),
         }
     }
 
@@ -1336,6 +1414,166 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         );
     }
 
+    /// 2026-09-08: an operator keep-alive marker that has not yet expired
+    /// stops the out-of-window force-stop, exactly as it stops the curfew.
+    /// The FakeSsm serves ONE value for every parameter name, so the marker
+    /// is what `read_keep_alive_until` receives here.
+    #[tokio::test]
+    async fn test_out_of_window_keep_alive_override_leaves_the_box_running() {
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        // out_of_window() is 2026-07-07 14:00 UTC; the marker runs to 18:00.
+        let ssm = FakeSsm::new(Some("2026-07-07T18:00:00Z"));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            out_of_window(),
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["skipped"], json!("keep_alive"));
+        assert!(
+            ec2.stopped.borrow().is_empty(),
+            "keep-alive must prevent the stop"
+        );
+        assert!(
+            sns.published.borrow().is_empty(),
+            "no page for a deliberate late run"
+        );
+    }
+
+    /// An EXPIRED marker is no marker: the stop still lands.
+    #[tokio::test]
+    async fn test_out_of_window_expired_keep_alive_still_stops() {
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::new(Some("2026-07-07T13:00:00Z"));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            out_of_window(),
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// A box launched inside the grace window is a manual start still in
+    /// use, not a failed 17:30 stop — left alone, exactly as the curfew does.
+    /// Saturday 2026-07-04 03:20 UTC (08:50 IST) is out of window; the fake
+    /// reports a launch 20 minutes earlier, inside the 45-minute grace.
+    #[tokio::test]
+    async fn test_out_of_window_fresh_launch_inside_grace_is_not_stopped() {
+        let now = utc(2026, 7, 4, 3, 20);
+        let launched = now - Duration::minutes(20);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::new(None);
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(
+            out["noop"],
+            json!(true),
+            "a 20-minute-old launch is inside grace"
+        );
+        assert_eq!(out["skipped"], json!("grace"));
+        assert!(
+            ec2.stopped.borrow().is_empty(),
+            "grace must never stop the box"
+        );
+        assert!(
+            sns.published.borrow().is_empty(),
+            "grace is silent — no page"
+        );
+    }
+
+    /// The grace is a WINDOW, not a flag: one minute past it the same box
+    /// on the same Saturday is stopped. Pins the boundary from the other side
+    /// so the constant cannot silently become "never stop a manual start".
+    #[tokio::test]
+    async fn test_out_of_window_launch_past_grace_is_stopped() {
+        let now = utc(2026, 7, 4, 3, 20);
+        let launched = now - Duration::minutes(OUT_OF_WINDOW_START_GRACE_MINUTES + 1);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::new(None);
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(
+            out["noop"],
+            json!(false),
+            "one minute past grace has no grace"
+        );
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// The two hourly guards over the same box must judge a manual start
+    /// by ONE grace. If the constants ever diverge, an operator's evening
+    /// start is left alone by one Lambda and stopped by the other.
+    #[test]
+    fn out_of_window_start_grace_matches_the_curfew_grace() {
+        assert_eq!(
+            OUT_OF_WINDOW_START_GRACE_MINUTES,
+            crate::start_watchdog::CURFEW_START_GRACE_MINUTES
+        );
+        const { assert!(OUT_OF_WINDOW_START_GRACE_MINUTES > 0) };
+    }
+
+    /// `read_keep_alive_until` is fail-CLOSED for the guard: an unreadable
+    /// or unparseable parameter is "no override", never a skip.
+    #[tokio::test]
+    async fn read_keep_alive_until_treats_missing_and_garbage_as_no_override() {
+        let missing = FakeSsm::new(None);
+        assert!(
+            read_keep_alive_until(&missing, DEFAULT_PING_STATE_PARAM)
+                .await
+                .is_none()
+        );
+        let garbage = FakeSsm::new(Some("tomorrow-ish"));
+        assert!(
+            read_keep_alive_until(&garbage, DEFAULT_PING_STATE_PARAM)
+                .await
+                .is_none()
+        );
+        let good = FakeSsm::new(Some("2026-07-07T18:00:00Z"));
+        assert_eq!(
+            read_keep_alive_until(&good, DEFAULT_PING_STATE_PARAM).await,
+            Some(utc(2026, 7, 7, 18, 0))
+        );
+    }
+
     #[tokio::test]
     async fn test_already_stopped_is_noop() {
         let (ec2, sns, events) = (
@@ -1578,9 +1816,26 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         );
     }
 
+    /// The out-of-window arm reads ONE parameter — the keep-alive marker —
+    /// and never writes. A read-only SSM that fails the read must fall
+    /// through to the stop (fail-CLOSED: an unreadable override is no
+    /// override), and the write path must stay untouched on this arm.
     #[tokio::test]
-    async fn test_out_of_window_force_stop_never_touches_ssm() {
-        // The legacy out-of-window arm is untouched — no state read/write.
+    async fn test_out_of_window_force_stop_reads_keep_alive_only_and_never_writes_ssm() {
+        struct ReadFailsWriteExplodes;
+        impl SsmApi for ReadFailsWriteExplodes {
+            async fn get_parameter(&self, name: &str) -> Result<String, String> {
+                assert_eq!(
+                    name,
+                    crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM,
+                    "the only out-of-window read is the keep-alive marker"
+                );
+                Err("simulated SSM outage".to_string())
+            }
+            async fn put_parameter(&self, name: &str, _value: &str) -> Result<(), String> {
+                panic!("SSM must never be WRITTEN on the out-of-window arm: {name}");
+            }
+        }
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),
@@ -1592,12 +1847,16 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             &sns,
             &events,
             &FakeCe { amount: Some(10.0) },
-            &ExplodingSsm,
+            &ReadFailsWriteExplodes,
             out_of_window(),
         )
         .await
         .expect("run_guard ok");
-        assert_eq!(out["noop"], json!(false));
+        assert_eq!(
+            out["noop"],
+            json!(false),
+            "an unreadable keep-alive is no override"
+        );
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
     }
 }

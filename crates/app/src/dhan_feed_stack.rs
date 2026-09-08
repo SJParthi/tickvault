@@ -1120,6 +1120,10 @@ pub struct LiveIngest {
     /// the only place the packet is seen, and because a store reached through
     /// `&mut self` on a single-owner path needs no concurrent map.
     prev_close: crate::prev_close_store::PrevCloseStore,
+    /// Edge latch for the "every gainer verdict was Unknown" line: once per
+    /// session, because the condition persists for a whole session when it
+    /// happens at all and a line per 5-second sweep would be 4,680 of them.
+    gainer_all_unknown_reported: bool,
     /// Today's spot level per underlying, shared with the attach tasks.
     ///
     /// `Arc` and a concurrent map, UNLIKE its two neighbours here, and the
@@ -1229,31 +1233,40 @@ impl LiveIngest {
             if !wants_rows && family != crate::volume_leaderboard::OptionFamily::Stock {
                 continue;
             }
-            // Ranked into a scratch the leaderboard owns, then COPIED out
-            // before the closures below borrow `self` again. Holding the
-            // borrow across the projection would need `rank`'s slice and
-            // `self.aggregator` at once, and the copy is bounded by the
-            // per-family budget rather than by the tracked population.
-            let ranked: Vec<crate::volume_leaderboard::RankedContract> = self
-                .leaderboard
-                .rank(
-                    family,
-                    cadence,
-                    tickvault_common::constants::TOP_VOLUME_RANK_PER_FAMILY,
-                    // The SAME map the drain already probes per tick, so the
-                    // lot size that normalises a contract's volume is the one
-                    // its own master row carried. A second source here could
-                    // disagree with the subscription about what a lot is.
-                    |c| {
-                        crate::contract_underlying_map::global_contract_underlying_map()
-                            .owner_of(c.security_id, c.segment)
-                            .map(|owner| owner.lot_size)
-                    },
-                    |_| true,
-                )
-                .to_vec();
+            // Disjoint-field borrows, taken BEFORE the ranking borrow: the
+            // gainer pass below reads these two stores while `rank`'s slice is
+            // still alive, and the borrow checker allows that only because
+            // they are named as fields rather than reached through `self`.
+            let spot_prices = &self.spot_prices;
+            let prev_close = &self.prev_close;
+            // Ranked WITHOUT a cut. The sort is over every contract that traded
+            // in the window either way — truncation happens after it — so the
+            // only cost of `usize::MAX` is the copy below, which is bounded to
+            // the per-family budget, not the population.
+            //
+            // The cut moved OUT of `rank` on 2026-09-08 because the gainer
+            // filter was being applied AFTER a top-250 cut: what reached the
+            // depth pool was `top250 ∩ gainers`, routinely far fewer than 250,
+            // while eligible gainers ranked 251st and below never appeared at
+            // all. The operator's rule is "gainers are the eligibility filter,
+            // volume decides the order" — the top 250 AMONG the eligible.
+            let ranked_all: &[crate::volume_leaderboard::RankedContract] = self.leaderboard.rank(
+                family,
+                cadence,
+                usize::MAX,
+                // The SAME map the drain already probes per tick, so the
+                // lot size that normalises a contract's volume is the one
+                // its own master row carried. A second source here could
+                // disagree with the subscription about what a lot is.
+                |c| {
+                    crate::contract_underlying_map::global_contract_underlying_map()
+                        .owner_of(c.security_id, c.segment)
+                        .map(|owner| owner.lot_size)
+                },
+                |_| true,
+            );
 
-            // ---- the depth-200 steering publish (2026-09-08) ----
+            // ---- the depth steering publish (2026-09-08) ----
             //
             // Off THIS pass, deliberately, and NOT via
             // `rank_distinct_underlying`: that method ranks, and a second rank
@@ -1261,7 +1274,7 @@ impl LiveIngest {
             // one has already consumed -- every delta 0, the order collapsed to
             // the security_id tie-break, silently. See its own doc comment.
             //
-            // Placed BEFORE the `is_empty` skip so an empty ranking publishes
+            // Computed BEFORE the `is_empty` skip so an empty ranking publishes
             // an EMPTY list rather than nothing at all. Those are different
             // answers: "nothing traded" is a reading, "we have not ranked" is
             // the absence of one, and the reader refuses to claim a divergence
@@ -1271,45 +1284,86 @@ impl LiveIngest {
             // from depth entirely, so publishing them would hand the steering
             // loop the very set the lock forbids.
             //
-            // HONEST BOUND, stated because it is not exact: this is the greedy
-            // distinct-underlying pass over the top
-            // `TOP_VOLUME_RANK_PER_FAMILY` (250) rather than over the whole
-            // sorted population, because 250 is what this pass materialised.
-            // The two agree whenever those 250 rows contain at least 5 distinct
-            // underlyings. When they do not, this publishes FEWER than 5 -- a
-            // short list, which the length gauge shows -- never a wrong one.
-            if family == crate::volume_leaderboard::OptionFamily::Stock && wants_candidates {
-                // ---- the gainer ELIGIBILITY filter (2026-09-06 lock) ----
-                //
-                // "An instrument qualifies if its underlying is in the day's
-                // gainers; volume then decides the order." Applied HERE, on
-                // the volume-ordered rows and before the distinct pass, so
-                // membership is the underlying's day gain and order is still
-                // lots-in-window. Not applied inside `rank`, because the
-                // persisted `top_volume_rank` rows must keep recording which
-                // contracts were busiest whether or not their stock rose.
-                //
-                // Both probes are RAM: the spot store the drain writes and
-                // the previous-close store the same packet walk fills. An
-                // underlying with no spot today or no previous close is
-                // `Unknown` — counted, never treated as falling.
-                //
-                // HONEST CONSEQUENCE, recorded rather than smoothed over: on a
-                // day where every stock falls, this publishes an EMPTY list,
-                // and `plan_ranked_minute` moves nothing on an empty ranking,
-                // so the five sockets hold whatever they held. That is what
-                // the operator's rule produces on a down day; the tally below
-                // is how an operator reads "no gainers" apart from "nothing
-                // could be judged".
-                let (gainers, tally) =
-                    crate::volume_leaderboard::gainer_eligible(&ranked, |underlying_id| {
+            // ---- the gainer ELIGIBILITY filter (2026-09-06 lock) ----
+            //
+            // "An instrument qualifies if its underlying is in the day's
+            // gainers; volume then decides the order." Applied on the FULL
+            // volume-ordered population, stopping once the depth-20 exit set
+            // is filled, so membership is the underlying's day gain and order
+            // is still lots-in-window. Not applied inside `rank`, because the
+            // persisted `top_volume_rank` rows must keep recording which
+            // contracts were busiest whether or not their stock rose.
+            //
+            // Both probes are RAM: the spot store the drain writes and the
+            // previous-close store the same packet walk fills. An underlying
+            // with no spot today or no previous close is `Unknown` — counted,
+            // never treated as falling.
+            //
+            // HONEST CONSEQUENCE, recorded rather than smoothed over: on a day
+            // where every stock falls, this publishes an EMPTY list, and both
+            // planners move nothing on an empty ranking, so the sockets hold
+            // whatever they held. That is what the operator's rule produces on
+            // a down day; the tally is how an operator reads "no gainers"
+            // apart from "nothing could be judged".
+            let steering = if family == crate::volume_leaderboard::OptionFamily::Stock
+                && wants_candidates
+            {
+                Some(crate::volume_leaderboard::gainer_eligible(
+                    ranked_all,
+                    crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS,
+                    |underlying_id| {
                         let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
                         crate::volume_leaderboard::underlying_gainer_verdict(
-                            self.spot_prices.latest_paise(underlying_id, segment),
-                            self.prev_close.get(underlying_id, segment),
+                            spot_prices.latest_paise(underlying_id, segment),
+                            prev_close.get(underlying_id, segment),
                         )
-                    });
+                    },
+                ))
+            } else {
+                None
+            };
+            // The persisted rows: the busiest `TOP_VOLUME_RANK_PER_FAMILY`
+            // whether or not their stock rose. COPIED out before the closures
+            // below need `self` again; the copy is bounded by the budget.
+            let ranked: Vec<crate::volume_leaderboard::RankedContract> = ranked_all[..ranked_all
+                .len()
+                .min(tickvault_common::constants::TOP_VOLUME_RANK_PER_FAMILY)]
+                .to_vec();
+
+            if let Some((gainers, tally)) = steering {
                 crate::volume_leaderboard::record_gainer_tally(tally);
+                // Every verdict Unknown while the board is non-empty means the
+                // gainer filter has NO inputs — no spot or no previous close
+                // for any stock — and the depth pools will hold whatever they
+                // hold all session while every counter reads green. Once per
+                // session, coded, log-sink-only (no CloudWatch filter reads
+                // this `source`; the cost decision is the operator's).
+                if !self.gainer_all_unknown_reported
+                    && tally.unknown > 0
+                    && tally.gainer == 0
+                    && tally.not_gainer == 0
+                {
+                    self.gainer_all_unknown_reported = true;
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        source = "gainer_verdicts_all_unknown",
+                        unknown = tally.unknown,
+                        ranked = ranked.len(),
+                        "volume ranking: EVERY gainer verdict was Unknown — no stock has both a \
+                         spot price and a previous close in RAM, so no stock-option contract can \
+                         qualify for depth and the depth sockets will hold their current set all \
+                         session. Check the previous-close store and the spot store, not the ranking."
+                    );
+                }
+                // The depth-20 pool takes the gainer-eligible top set in volume
+                // order (2026-09-06 lock: "for depth 20 pick top 250"). The
+                // published list runs to `DEPTH20_EXIT_RANKS`: entries are
+                // taken from the first 250, a held contract is kept while it
+                // stays inside the list — the hysteresis band the 2026-09-07
+                // lock names as the remedy for a churning board.
+                crate::depth20_ranked_steer::global_depth20_candidates()
+                    .publish(crate::depth200_candidates::candidates_from_ranked(&gainers));
+                // The distinct-underlying pass is depth-200's rule only.
                 let picked = crate::volume_leaderboard::distinct_underlying_over(
                     &gainers,
                     crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
@@ -1488,6 +1542,7 @@ impl LiveIngest {
             rescue_thread: None,
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
+            gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             top_volume: None,
         }
@@ -2512,11 +2567,47 @@ impl LiveIngest {
         // Reusing the fold's own verdict rather than re-deriving a session test
         // here means the two can never disagree about what "this tick counts"
         // means.
+        self.record_prev_close_from_tick(tick);
         self.observe_for_ranking(tick);
         IngestOutcome::Folded {
             sealed: stats.sealed_count,
             amended: stats.amended_count,
         }
+    }
+
+    /// Fills the previous-close store from a STOCK SPOT tick's own `day_close`
+    /// field. **Per-tick path.**
+    ///
+    /// The store's other write door is the standalone code-6 PrevClose packet,
+    /// which Dhan support confirmed for IDX_I and which is UNVERIFIED for
+    /// NSE_EQ. The Quote and Full packets carry the previous session's close
+    /// in their "Day Close" field, streamed live in every packet (Dhan support,
+    /// `docs/dhan-ref/03-live-market-feed-websocket.md`), so this is the
+    /// second door — and without it, on a day with no code-6 for equities,
+    /// every gainer verdict is Unknown and no stock option can reach depth.
+    /// Found by the 2026-09-08 adversarial sweep.
+    ///
+    /// O(1): one segment compare, one finite check, one hash probe; the store
+    /// insert happens ONCE per instrument per day (first write wins — the
+    /// field is constant through the session). Ticker-mode packets carry
+    /// `0.0`, which the store refuses without a line; a NaN is refused the same
+    /// way. Only the stock-option UNDERLYING segment is written: that is the
+    /// segment the gainer verdict probes, and writing every segment would cost
+    /// a probe per tick for a value nothing reads.
+    fn record_prev_close_from_tick(&mut self, tick: &ParsedTick) {
+        let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+        if tick.exchange_segment_code != segment.binary_code() {
+            return;
+        }
+        let close = tick.day_close;
+        if !close.is_finite() || close <= 0.0 {
+            return;
+        }
+        if self.prev_close.get(tick.security_id, segment).is_some() {
+            return;
+        }
+        let widened = tickvault_common::price_precision::f32_to_f64_clean(close);
+        let _ = self.prev_close.record(tick.security_id, segment, widened);
     }
 
     /// Feeds one accepted tick into the volume leaderboard. **Per-tick path.**
@@ -7386,6 +7477,18 @@ fn current_feed_token() -> Option<FeedTokenBuffer<String>> {
 pub struct DhanFeedStackParams {
     /// `[feeds] dhan_enabled` from the boot config.
     pub dhan_enabled: bool,
+    /// The dual-instance lock verdict, owned by the boot and written by the
+    /// REST stack (`true` on acquire, `false` on loss).
+    ///
+    /// The lane dials ONLY while this reads `true`. The token manager it
+    /// waits for is registered by the REST stack after the lock is acquired,
+    /// so on a healthy boot the two agree — but "agree by ordering" is not a
+    /// check, and a lock lost between acquisition and dial (a heartbeat that
+    /// could not renew, a peer that seized the parameter) would otherwise put
+    /// two boxes on one Dhan account's five-connection budget, where the
+    /// second connection past the cap is answered with 805 and the account
+    /// "may be blocked". Refused with a coded error rather than dialed.
+    pub instance_lock_held: Arc<AtomicBool>,
     /// Live-feed frames recovered from the write-ahead log at boot, as
     /// `(frame_seq, raw_bytes)` — the exact bytes a previous session captured
     /// but died before folding.
@@ -9754,7 +9857,9 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         // caller LOGS rather than as a queue that hides it.
         let topup_rx = match (endpoint, topup_rx, out_depth_commands.as_deref_mut()) {
             (DhanEndpointType::Depth20 | DhanEndpointType::Depth200, None, Some(depth_vec)) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                let (tx, rx) = tokio::sync::mpsc::channel(
+                    crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
+                );
                 let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
                 depth_vec.push((endpoint, tx, held));
                 Some(rx)
@@ -10585,6 +10690,13 @@ pub fn refold_wal_frames(
         );
     }
 
+    // A replay hands the leaderboard a backlog with no sweep between the
+    // frames, so without this the first LIVE sweep would read the whole
+    // backlog as one window's trading and hand depth sockets to whatever was
+    // busiest during the outage. Both production replay sites (the boot
+    // STAGE-C replay and the catch-up drain) come through here, which is why
+    // the rebaseline lives in this function and not at either caller.
+    ingest.leaderboard.rebaseline_all();
     out
 }
 
@@ -10823,6 +10935,30 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         report_unfolded_wal_frames(&params.wal_replay_live_feed, "token_manager_missing");
         return;
     };
+
+    // ---- dual-instance lock ------------------------------------------------
+    // The token manager above is registered by the REST stack only AFTER it
+    // acquired the SSM instance lock, so on a healthy boot this is already
+    // true. It is checked anyway, because the lock can be LOST after
+    // acquisition (heartbeat renewal failure, a peer seizing the parameter)
+    // and nothing else between the token and the dial would notice: two
+    // boxes on one account is exactly the shape the lock exists to prevent,
+    // and Dhan answers the connection past its cap with 805 — "may result in
+    // user being blocked". Refused, counted through the same refusal path as
+    // the other floors, never dialed.
+    if !params.instance_lock_held.load(Ordering::Acquire) {
+        error!(
+            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+            source = "live_lane_dial_refused",
+            planned_connections = plan.len(),
+            "Dhan live feed is enabled and a token exists, but this process does NOT hold \
+             the dual-instance lock — REFUSING to open any socket. Another tickvault on \
+             this account holds it, or the heartbeat lost it; dialing anyway would put two \
+             boxes on one five-connection budget."
+        );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "instance_lock_not_held");
+        return;
+    }
 
     // ---- the fold ----------------------------------------------------------
     // DISTINCT slots across all three pools — not the sum of their lengths.
@@ -14791,6 +14927,7 @@ mod tests {
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             dhan_enabled: false,
+            instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
             // main.rs still drops the batch loudly when the gate is closed.
             wal_replay_live_feed: Vec::new(),
@@ -21766,6 +21903,13 @@ mod depth_rebalance_wiring_tests {
         tick.volume = 5_000;
         tick.exchange_timestamp = 1_779_321_600 + 34_000;
         tick.received_at_nanos = i64::from(tick.exchange_timestamp) * 1_000_000_000;
+        // Two ticks, not one: the 2026-09-07 lots-in-window key seeds a newly
+        // tracked contract at its CURRENT cumulative, so a single print ranks
+        // nothing. The second print trades exactly one lot (75 units) inside
+        // the window, which is what puts 777 on the board.
+        tick.volume = 4_925;
+        let _ = ingest.ingest_tick_at(&tick, 1, 0, 1);
+        tick.volume = 5_000;
         let _ = ingest.ingest_tick_at(&tick, 1, 0, 1);
         ingest
     }

@@ -298,3 +298,69 @@ fn test_rest_stack_module_is_not_a_stub() {
          (dual-instance-lock-2026-07-04.md §2)"
     );
 }
+
+/// 2026-09-08: the live tick lane dials ONLY while the dual-instance lock is
+/// held, and the flag it reads is the ONE the REST stack writes.
+///
+/// Before this the flag was created inside the REST stack's task, and the
+/// lane's only protection was ordering: it waited for the token manager,
+/// which the stack registers after acquiring the lock. A lock lost after
+/// acquisition — a heartbeat that could not renew, a peer seizing the
+/// parameter — left the lane dialing on a second box's token with nothing
+/// checking. Three pins: the boot creates the flag once and hands it to both
+/// stacks; the REST stack CLONES the shared flag rather than minting its own;
+/// the lane refuses to dial on `false` with the RESILIENCE-01 code.
+#[test]
+fn test_live_lane_refuses_to_dial_without_the_shared_instance_lock() {
+    let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
+    assert!(
+        main_src.contains("let dhan_instance_lock_held ="),
+        "main.rs must create the shared dual-instance lock flag once"
+    );
+    assert_eq!(
+        main_src
+            .matches("instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held)")
+            .count(),
+        2,
+        "the ONE flag must be handed to BOTH Dhan stacks (REST + live lane)"
+    );
+    let rest_src = strip_line_comments(&read("crates/app/src/dhan_rest_stack.rs"));
+    assert!(
+        rest_src.contains("let instance_lock_held = Arc::clone(&params.instance_lock_held);"),
+        "the REST stack must share the boot's flag, never mint a private one"
+    );
+    assert!(
+        !rest_src.contains("let instance_lock_held = Arc::new(AtomicBool::new(false));"),
+        "a privately-minted flag would leave the live lane reading a flag nobody writes"
+    );
+    let feed_src = strip_line_comments(&read("crates/app/src/dhan_feed_stack.rs"));
+    let prod = feed_src.split("#[cfg(test)]").next().unwrap_or(&feed_src);
+    assert!(
+        prod.contains("if !params.instance_lock_held.load(Ordering::Acquire)"),
+        "run_dhan_feed_stack must check the lock flag before dialing"
+    );
+    assert!(
+        prod.contains(
+            "report_unfolded_wal_frames(&params.wal_replay_live_feed, \"instance_lock_not_held\")"
+        ),
+        "the lock refusal must account for the replayed WAL frames like every other refusal"
+    );
+    assert!(
+        prod.contains("code = ErrorCode::Resilience01DualInstanceDetected.code_str(),\n            source = \"live_lane_dial_refused\","),
+        "the refusal must carry RESILIENCE-01 with its own source label"
+    );
+    // The gate must sit AFTER the token wait and BEFORE the fold/dial.
+    let gate = prod
+        .find("if !params.instance_lock_held.load(Ordering::Acquire)")
+        .expect("gate present (asserted above)"); // APPROVED: test
+    let token_wait = prod
+        .find("\"token_manager_missing\"")
+        .expect("token wait present"); // APPROVED: test
+    let fold = prod
+        .find("let capacity = distinct_fold_slots(")
+        .expect("fold present"); // APPROVED: test
+    assert!(
+        token_wait < gate && gate < fold,
+        "lock gate must follow the token wait ({token_wait}) and precede the fold ({fold}); gate at {gate}"
+    );
+}

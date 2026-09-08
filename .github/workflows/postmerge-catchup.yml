@@ -109,6 +109,40 @@ jobs:
           # an error string or a truncated sha.
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
 
+          # 2026-09-08 — the sha the deploy-watchdog COMPARES against must be
+          # "the sha the box SHOULD be running", not bare main HEAD.
+          # deploy-aws.yml is PATH-FILTERED, so a docs-only merge advances
+          # main HEAD without any deploy; mirroring HEAD would then make
+          # `tv-<env>-binary-sha-stale` report a mismatch that reflects no
+          # operational difference at all (the false-positive class recorded
+          # in dhan-rest-only-noise-lock §2.3q's 2026-09-02 addendum). So the
+          # mirror carries the NEWEST commit on main that touched one of
+          # deploy-aws.yml's `on.push.paths` — the same list, kept in lockstep
+          # by hand (crates/**, Cargo.toml, Cargo.lock, deploy/systemd/**,
+          # deploy/docker/**, config/**, deploy/aws/cloudwatch-agent.json,
+          # deploy/aws/prometheus.yaml, .github/workflows/deploy-aws.yml).
+          # A FAILED code deploy still leaves the box behind this sha and still
+          # pages; only the docs-only case stops manufacturing a mismatch.
+          # Fail-safe: any API failure falls back to HEAD with a warning — a
+          # possibly-false mismatch is the pre-2026-09-08 behaviour, never a
+          # missed real one.
+          deploy_sha=""
+          deploy_date=""
+          for p in 'crates' 'Cargo.toml' 'Cargo.lock' 'deploy/systemd' 'deploy/docker' 'config' 'deploy/aws/cloudwatch-agent.json' 'deploy/aws/prometheus.yaml' '.github/workflows/deploy-aws.yml'; do
+            line=$(gh api "repos/${GH_REPO}/commits?sha=main&path=${p}&per_page=1" \
+              --jq '.[0] | "\(.sha) \(.commit.committer.date)"' 2>/dev/null || echo "")
+            sha="${line%% *}"; date="${line#* }"
+            if [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] && [[ "${date}" > "${deploy_date}" ]]; then
+              deploy_sha="${sha}"; deploy_date="${date}"
+            fi
+          done
+          if ! [[ "${deploy_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::could not resolve the newest deploy-relevant sha — mirroring main HEAD instead (may produce a docs-only false mismatch)"
+            deploy_sha="${head_sha}"
+          fi
+          echo "newest deploy-relevant sha = ${deploy_sha} (committed ${deploy_date:-unknown})"
+          echo "deploy_sha=${deploy_sha}" >> "$GITHUB_OUTPUT"
+
           dispatched=0
           # deploy-aws.yml is included so a bot-merged (push-suppressed) commit
           # still gets its ARM build + a real deploy run before the box's 08:30 IST
@@ -227,12 +261,12 @@ jobs:
           aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           role-session-name: tv-github-catchup-mirror-${{ github.run_id }}
 
-      - name: Mirror main HEAD to SSM (deploy-provenance fallback)
+      - name: Mirror the newest deploy-relevant main sha to SSM (deploy-provenance fallback)
         if: steps.probe.outputs.head_sha != ''
         continue-on-error: true
         shell: bash
         env:
-          HEAD_SHA: ${{ steps.probe.outputs.head_sha }}
+          HEAD_SHA: ${{ steps.probe.outputs.deploy_sha || steps.probe.outputs.head_sha }}
         run: |
           set -euo pipefail
           # LOCKSTEP NOTE: the path below hardcodes the single real env (prod)
@@ -254,7 +288,7 @@ jobs:
               --type String \
               --overwrite \
               --value "${HEAD_SHA}"; then
-            echo "mirrored main HEAD ${HEAD_SHA} to /tickvault/prod/deploy/desired-git-sha"
+            echo "mirrored the newest deploy-relevant main sha ${HEAD_SHA} to /tickvault/prod/deploy/desired-git-sha"
           else
             echo "::warning::mirror write failed — the deploy-watchdog falls back to the previous mirrored value (or to GitHub, if a token is present); the next 30-min firing retries"
           fi

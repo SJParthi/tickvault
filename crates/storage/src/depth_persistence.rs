@@ -411,8 +411,13 @@ pub fn market_depth_ensure_statements() -> Vec<String> {
 /// missing key is the depth-kind discriminator, so the two pools would begin
 /// overwriting each other's levels — the failure mode this module exists to
 /// prevent. The consequence is named in the log rather than left implicit.
-// TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line — the guard reads only the line immediately above).
-pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
+///
+/// Returns `true` only when EVERY statement was accepted, so the boot can
+/// retry a refusal instead of running the whole session on an auto-created
+/// table with no `depth_kind` in its key (`candle_ddl_boot::run_live_table_ddl_at_boot`).
+#[must_use = "a false verdict means the depth_kind DEDUP key may be missing; retry it"]
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line, directly above the fn — the guard reads only that line, so it must sit BELOW the attribute).
+pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
     // APPROVED: QuestDB base URL, once per ensure_market_depth_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
@@ -434,9 +439,10 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
                  ILP write may auto-create the table WITHOUT the depth_kind DEDUP key, \
                  which makes depth-20 and depth-200 overwrite each other's levels"
             );
-            return;
+            return false;
         }
     };
+    let mut every_statement_accepted = true;
     for ddl in &market_depth_ensure_statements() {
         match client
             .get(&base_url)
@@ -459,6 +465,7 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
                     "market_depth DDL returned non-2xx — the depth_kind DEDUP key may be \
                      missing, which makes the two depth pools overwrite each other"
                 );
+                every_statement_accepted = false;
             }
             Err(err) => {
                 metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl")
@@ -470,9 +477,11 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
                     ddl = ddl.as_str(),
                     "market_depth DDL request failed"
                 );
+                every_statement_accepted = false;
             }
         }
     }
+    every_statement_accepted
 }
 
 // ---------------------------------------------------------------------------

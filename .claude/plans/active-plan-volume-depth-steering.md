@@ -118,18 +118,36 @@ rather than hidden.
   - Files: `crates/app/src/volume_leaderboard.rs`, `crates/app/src/lib.rs`
   - Tests: the eleven named above
   - **Landed alone**, in a PR after the authorization merged. See "Item 1 shipped without Item 2" below.
-- [ ] Item 2 — wire it as the ranking source for the depth-20 stock sockets
-  - Files: `crates/app/src/dhan_contract_universe.rs` (emit the family map),
-    `crates/app/src/dhan_feed_stack.rs` (own the leaderboard, observe per tick,
-    publish on the 5s arm), `crates/app/src/depth_rebalance.rs` (read the
-    snapshot), `crates/app/src/depth20_layout.rs` (rank by volume)
-  - Tests: the classification map survives a round trip through attach; the drain
-    observes and skips a non-contract tick; the published snapshot is what the
-    layout consumes; layout tests assert volume ordering
-  - **Blocked until Item 1 merges** (serial-PR protocol, `pr-completion-protocol.md`)
-- [ ] Item 3 — depth-200 top-5 with the distinct-underlying constraint
-  - Files: `crates/app/src/depth200_atm.rs`
-  - Tests: distinct-underlying selection, and the down-rank case the thin-book evidence warns about
+- [x] Item 2 — wire it as the ranking source for the depth-20 stock sockets
+  - Files (as shipped, not as first planned): `crates/app/src/dhan_contract_universe.rs`
+    (emits the family map), `crates/app/src/dhan_feed_stack.rs` (owns the
+    leaderboard, observes per tick, ranks on the 1 s AND 5 s arms, publishes the
+    gainer-eligible top set on the 5 s arm), `crates/app/src/depth20_ranked_steer.rs`
+    (the ranked planner — entry 250, exit 300, ≤4 swaps per socket per minute),
+    `crates/app/src/depth_rebalance.rs` (applies it once a minute; the 2026-08-26
+    `depth20_layout` is the pre-first-ranking fallback only)
+  - Tests: `plan_depth20_ranked_minute_*` (incl. the exit-band and inclusive-edge
+    tests), `a_gainer_ranked_below_the_top_250_by_volume_still_qualifies_for_depth`,
+    `gainer_eligible_stops_at_the_limit_and_tallies_only_what_it_visited`,
+    `rebaseline_all_makes_the_next_window_measure_only_live_trading`,
+    `a_newly_tracked_contract_reports_nothing_until_it_trades_in_a_window`, the
+    `depth_rebalance_wiring_tests` publish tests, and the DHAT ingest-seam gate now
+    covering `observe`
+  - **Landed 2026-09-08.** Decision A (RAM, not QuestDB) held: the ranking crosses
+    the task boundary through an `ArcSwapOption` snapshot
+- [x] Item 3 — depth-200 top-5 with the distinct-underlying constraint
+  - Files (as shipped, not as first planned): `crates/app/src/volume_leaderboard.rs`
+    (`rank_distinct_underlying`, `distinct_underlying_over`, `gainer_eligible`),
+    `crates/app/src/depth200_candidates.rs`, `crates/app/src/depth200_ranked_steer.rs`,
+    `crates/app/src/depth_rebalance.rs` — `depth200_atm.rs` survives only as the
+    pre-first-ranking fallback
+  - Tests: `rank_distinct_underlying_takes_the_heaviest_contract_per_name`,
+    `multiple_strikes_of_one_symbol_collapse_to_one_and_the_next_names_fill_in`,
+    `rank_distinct_underlying_returns_fewer_than_k_rather_than_repeating_a_name`,
+    `the_five_second_pass_publishes_the_depth200_steering_candidates`, the
+    `plan_ranked_minute` suite in `depth200_ranked_steer.rs`
+  - **Landed 2026-09-08** (PR #1890 wired the swap engine; the gainer filter, the
+    lots-in-window key and the zero-lot exclusion followed in the depth-20 PR)
 
 ## Item 2's two architectural decisions (Rule 15 — decided BEFORE the wiring PR)
 

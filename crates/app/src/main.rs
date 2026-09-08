@@ -2699,6 +2699,12 @@ async fn async_main() -> Result<()> {
         tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByConfig
         | tickvault_app::dhan_feed_stack::FeedStackGate::Enabled => {}
     }
+    // The dual-instance lock verdict, created HERE so both Dhan stacks read
+    // one flag: the REST stack acquires the SSM lock and stores true; the
+    // live tick lane refuses to open a socket while it reads false. Before
+    // 2026-09-08 the flag lived inside the REST stack's task and the lane's
+    // only protection was the ORDER in which the two happened to run.
+    let dhan_instance_lock_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
         tickvault_app::dhan_rest_stack::DhanRestStackParams {
             config: std::sync::Arc::new(config.clone()),
@@ -2725,6 +2731,9 @@ async fn async_main() -> Result<()> {
             // Order-leg P&L (2026-07-19): sink for the runtime's paper-leg
             // realized/unrealized events. None = feature OFF.
             leg_pnl_tx: order_leg_pnl_tx,
+            // Shared with the live tick lane below: the stack sets it on
+            // acquire, the lane refuses to dial while it reads false.
+            instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
         },
     );
 
@@ -2875,6 +2884,7 @@ async fn async_main() -> Result<()> {
             // includes them (2026-08-14).
             calendar: std::sync::Arc::clone(&trading_calendar),
             dhan_enabled: config.feeds.dhan_enabled,
+            instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
             // lane re-folds them after its ingest exists and before any socket
             // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
@@ -3742,7 +3752,13 @@ async fn build_shared_infra(
     // Awaited INLINE here, beside the candle DDL, for the same ordering
     // reason: it must complete before the first ILP row can auto-create the
     // table with the wrong shape.
-    tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
+    //
+    // 2026-09-08: BOTH live-table ensures now run through ONE bounded retry
+    // loop (`run_live_table_ddl_at_boot`), because a single fire-and-forget
+    // attempt against a QuestDB that answered the readiness probe and then
+    // refused the DDL left the DEDUP key missing for the whole session. The
+    // `market_depth` half is described directly below; the two are ensured
+    // together so neither can be retried without the other.
 
     // --- `market_depth` DDL — the same class, and it matters MORE here ---
     //
@@ -3758,8 +3774,11 @@ async fn build_shared_infra(
     // above, because the loss is not duplicate rows but MISSING ones.
     //
     // Awaited INLINE, before the first depth ILP row can exist, for exactly
-    // the reason the two DDLs above are.
-    tickvault_storage::depth_persistence::ensure_market_depth_table(&config.questdb).await;
+    // the reason the two DDLs above are. The verdict is logged inside the
+    // loop (coded error on exhaustion); boot continues either way — a missing
+    // key is a degraded session, a halted boot is a dark one.
+    let _live_tables_ensured =
+        tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await;
 
     // --- Dhan live-vs-REST cross-verification audit tables ---
     //

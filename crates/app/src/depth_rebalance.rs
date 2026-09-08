@@ -53,6 +53,15 @@ use crate::dhan_depth_universe::{DepthCandidate, contract_segment_for_underlying
 use crate::dhan_feed_stack::ist_second_of_day_now;
 use crate::movers::StockMove;
 
+/// 09:20 IST — five minutes after the capture window opens at 09:15.
+///
+/// By then the drain has run ~60 five-second sweeps; a session whose steering
+/// view is STILL `None` at this point has no ranking at all (the drain never
+/// ranked, or nothing it saw was a stock option). Read by the steering loop
+/// once a minute; log-sink detection, not a page.
+pub const RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST + 5 * 60;
+
 /// The segment a STOCK option trades in.
 ///
 /// Not derived per row, and that is deliberate. [`crate::dhan_depth_universe::contract_segment_for_underlying`]
@@ -1279,6 +1288,7 @@ pub async fn run_depth_rebalance(
     pre_register_rebalance_counters();
     crate::depth20_track::pre_register_depth20_counters();
     crate::depth200_ranked_steer::pre_register_ranked_counters();
+    crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
@@ -1328,6 +1338,8 @@ pub async fn run_depth_rebalance(
         );
     }
 
+    let mut post_close_logged = false;
+    let mut no_ranking_reported = false;
     loop {
         let second = u64::from(ist_second_of_day_now() % 60);
         tokio::time::sleep(std::time::Duration::from_secs(secs_until_next_rebalance(
@@ -1351,6 +1363,64 @@ pub async fn run_depth_rebalance(
         // the iteration on purpose -- see `publish_depth_subscriptions`.
         publish_depth_subscriptions(&subscription_view, &sockets, &depth20);
 
+        // ---- post-close gate (2026-09-08) ----
+        //
+        // The ranking stops at the capture-window end (15:40 IST — the last
+        // snapshot is 15:39:59) and its last publish stays in the ArcSwap. Before
+        // this gate the loop kept planning against that FROZEN ranking every
+        // minute until the box stopped, re-sending capped and unfunded swaps to
+        // a market that had closed: wire traffic on the depth sockets for a
+        // ranking that could never change again. Reconcile and the published
+        // subscription view above still run (they are reads); only the two
+        // planners are skipped. The pre-open side is deliberately NOT gated:
+        // the legacy at-the-money engine has to centre the boot dial before
+        // 09:15, and the ranked engine cannot exist before then anyway.
+        let secs_of_day = crate::dhan_feed_stack::ist_second_of_day_now();
+        // ---- "no ranking by 09:20" (2026-09-08) ----
+        //
+        // Once per session, coded, log-sink only (no CloudWatch filter reads
+        // this `source`; the cost decision is the operator's). `None` here
+        // means the drain has never published a ranking: every counter reads
+        // green while both depth pools sit on the boot dial for the whole
+        // session — the 2026-09-08 morning, where the sockets steered on
+        // nothing for thirty minutes and nothing said so. On an NSE holiday the
+        // box runs and this line is EXPECTED once; that is the price of not
+        // needing the trading calendar on this task.
+        if !no_ranking_reported
+            && (RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST
+                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST)
+                .contains(&secs_of_day)
+            && crate::depth200_candidates::global_depth200_candidates()
+                .latest()
+                .is_none()
+        {
+            no_ranking_reported = true;
+            tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "no_ranking_by_0920",
+                secs_of_day,
+                deadline = RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST,
+                "depth steering: NO volume ranking has been published five minutes into the \
+                 session — both depth pools are still on the boot dial and will stay there. \
+                 Check the contract attach (no contract map means nothing to rank), the frame \
+                 drain's 5-second arm, and whether any stock-option tick reached the fold."
+            );
+        }
+        if secs_of_day >= tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST {
+            if !post_close_logged {
+                post_close_logged = true;
+                tracing::info!(
+                    secs_of_day,
+                    capture_end =
+                        tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST,
+                    "depth rebalance: past the capture window — steering holds every socket \
+                     where it is until the box stops"
+                );
+            }
+            continue;
+        }
+
         let candidates = crate::dhan_depth_universe::load_depth_candidates(
             &questdb,
             &spot_store,
@@ -1368,21 +1438,13 @@ pub async fn run_depth_rebalance(
 
         // ---- the volume-ranking divergence report (2026-09-08) ----
         //
-        // READ-ONLY. This changes no subscription and sends no command.
-        //
-        // The 2026-09-06 lock puts the top five STOCK-option contracts by
-        // traded volume on these five sockets, each a distinct underlying. This
-        // loop selects on `close_pct_from_prev_day` of the underlying SPOT
-        // instead, so four of the five carry NIFTY/BANKNIFTY INDEX options --
-        // the class the lock bans. Nothing measured that gap; it was found by
-        // reading the code.
-        //
-        // Acting on it here would move five deep sockets onto books whose depth
-        // has never been measured, on the strength of a ranking that has never
-        // steered anything. The lock's own text records 800 rows/minute against
-        // 100,800 when thin contracts took these sockets on 2026-08-26. So this
-        // makes the violation MEASURABLE first and leaves the sockets alone --
-        // measure, then move, in that order.
+        // READ-ONLY. This block changes no subscription and sends no command;
+        // the ranked steering BELOW is what moves the sockets, at most one
+        // swap per socket per minute. The line exists so a reader can tell
+        // "the ranking and the sockets disagree" from "the planner chose not
+        // to act this minute" (capped, unfunded, or an empty ranking). Kept
+        // after the steering was wired, because the 2026-08-26 violation was
+        // found by reading the code rather than by a line that said so.
         //
         // Read AFTER the reconcile, which is the only moment `held` means
         // "acked on the wire" rather than "sent and hoped for", matching the
@@ -1426,15 +1488,47 @@ pub async fn run_depth_rebalance(
         // `continue`s the loop. Placing depth-20 after it would silently tie
         // depth-20 tracking to depth-200 having something to do — and the
         // overwhelmingly common minute is one where depth-200 is quiet.
+        //
+        // 2026-09-08: the VOLUME ranking once it exists, the 2026-08-26 layout
+        // until then — the same shape as the depth-200 block below.
+        // `Some(empty)` holds (the ranking ran and selected nothing); `None`
+        // is pre-first-ranking and keeps the legacy layout so the sockets are
+        // not left on a boot dial nobody re-centres.
         if !depth20.is_empty() {
-            let layout = crate::depth20_layout::build_depth20_layout(&candidates, &movers);
             let held_20: Vec<Vec<SubscribeInstrument>> =
                 depth20.iter().map(|s| s.held.clone()).collect();
-            let plan_20 = crate::depth20_track::plan_depth20_minute(&held_20, &layout);
+            let ranking_20 = crate::depth20_ranked_steer::global_depth20_candidates().latest();
+            let (plan_20, engine_20) = match ranking_20.as_deref() {
+                Some(ranked) => {
+                    let ranked_20 =
+                        crate::depth20_ranked_steer::plan_depth20_ranked_minute(&held_20, ranked);
+                    crate::depth20_ranked_steer::record_depth20_ranked_decision(&ranked_20);
+                    if ranked_20.capped > 0 || ranked_20.unplaced > 0 {
+                        tracing::info!(
+                            capped = ranked_20.capped,
+                            unplaced = ranked_20.unplaced,
+                            unfunded_departures = ranked_20.unfunded_departures,
+                            kept = ranked_20.kept,
+                            ranked = ranked.len(),
+                            "depth-20 ranked steering could not place every ranked contract \
+                             this minute — the rest is retried next minute"
+                        );
+                    }
+                    (ranked_20.plan, "volume_ranking")
+                }
+                None => {
+                    let layout = crate::depth20_layout::build_depth20_layout(&candidates, &movers);
+                    (
+                        crate::depth20_track::plan_depth20_minute(&held_20, &layout),
+                        "layout_until_first_ranking",
+                    )
+                }
+            };
             if !plan_20.is_quiet() {
                 let sent_20 = crate::depth20_track::apply_depth20_plan(&mut depth20, &plan_20);
                 tracing::info!(
                     sent = sent_20,
+                    engine = engine_20,
                     planned = plan_20.swap_count(),
                     sockets_moved = plan_20.sockets.len(),
                     sockets_left_alone = plan_20.sockets_left_alone,

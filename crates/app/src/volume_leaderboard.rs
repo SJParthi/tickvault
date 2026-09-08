@@ -711,6 +711,19 @@ impl VolumeLeaderboard {
             let Some(lots) = lot_of(&row).and_then(|lot| window_lots_milli(delta, lot)) else {
                 continue;
             };
+            // A contract that traded NOTHING in the window is not "top volume"
+            // and is left OFF the board — the same treatment as a missing lot
+            // size, for the same reason. Under the window key a zero is the
+            // COMMON value (every quiet contract, every first sweep after a
+            // boot or restart, every thin 1-second window), so ranking zeros
+            // would pad the tail of a 250-deep board with contracts ordered by
+            // nothing but their security_id, and the depth pools would swap
+            // sockets onto strikes that traded nothing. Found by the
+            // 2026-09-08 adversarial sweep; before it, the first sweep after
+            // every boot published up to 250 zero-lot "top" contracts.
+            if lots == 0 {
+                continue;
+            }
             row.window_lots_milli = lots;
             if eligible(&row) {
                 scratch.push(row);
@@ -835,6 +848,30 @@ impl VolumeLeaderboard {
         self.index.clear();
         self.stock.clear();
         self.scratch.clear();
+    }
+
+    /// Moves EVERY tracked contract's per-cadence baselines up to its current
+    /// cumulative volume, so the next window on every cadence measures only
+    /// what trades from now on.
+    ///
+    /// Called once a WAL replay has finished re-folding a backlog. A replay
+    /// feeds the leaderboard frames that are minutes or hours old, in order,
+    /// with no sweep between them: the first replayed frame seeds a contract's
+    /// baseline and every later one advances its volume, so the first LIVE
+    /// sweep after the replay would report the entire backlog as "lots traded
+    /// in the window" — the whole-day-in-one-window shape the seed rule exists
+    /// to prevent, arriving through the recovery path instead of the tracking
+    /// path. Found by the 2026-09-08 adversarial sweep.
+    ///
+    /// O(tracked) once per replay, on the boot/catch-up path, never per tick.
+    /// Refusal counters and the re-latch state are untouched: this moves the
+    /// measuring stick, not the record of what was refused.
+    pub fn rebaseline_all(&mut self) {
+        for family in [&mut self.index, &mut self.stock] {
+            for tracked in family.volumes.values_mut() {
+                tracked.baseline = [tracked.contract.volume; WINDOW_COUNT];
+            }
+        }
     }
 }
 
@@ -975,11 +1012,14 @@ pub struct GainerTally {
     pub unknown: usize,
 }
 
-/// Keeps only the ranked contracts whose underlying `verdict_of` calls a
+/// Keeps the first `limit` ranked contracts whose underlying `verdict_of` calls a
 /// gainer, PRESERVING the volume order. Pure.
 ///
 /// `verdict_of` is called once per ranked row with the underlying id, so the
-/// caller pays one spot-store probe and one prev-close probe per row of the
+/// caller pays one spot-store probe and one prev-close probe per row VISITED,
+/// and the walk STOPS once `limit` gainers are collected — so on an ordinary
+/// day it visits a few hundred rows of a population that may be thousands.
+/// The tally counts only the rows visited. Formerly one probe per row of the
 /// top 250 — cold, once per 5 seconds, and both probes O(1).
 ///
 /// Applied AFTER the volume sort rather than inside `rank` deliberately: the
@@ -989,14 +1029,18 @@ pub struct GainerTally {
 #[must_use]
 pub fn gainer_eligible<F>(
     ranked: &[RankedContract],
+    limit: usize,
     verdict_of: F,
 ) -> (Vec<RankedContract>, GainerTally)
 where
     F: Fn(u64) -> GainerVerdict,
 {
-    let mut out: Vec<RankedContract> = Vec::with_capacity(ranked.len());
+    let mut out: Vec<RankedContract> = Vec::with_capacity(ranked.len().min(limit));
     let mut tally = GainerTally::default();
     for row in ranked {
+        if out.len() >= limit {
+            break;
+        }
         match verdict_of(row.underlying_id) {
             GainerVerdict::Gainer => {
                 tally.gainer = tally.gainer.saturating_add(1);
@@ -1063,6 +1107,39 @@ mod tests {
         }
     }
 
+    fn idx(id: u64, underlying: u64, volume: u32) -> RankedContract {
+        RankedContract {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+            underlying_id: underlying,
+            volume,
+            window_lots_milli: 0,
+        }
+    }
+    /// Observe a contract as TRADING inside the window.
+    ///
+    /// The 2026-09-07 lock seeds a newly tracked contract's baseline to its
+    /// current cumulative, so its first delta is 0 and it ranks nothing until
+    /// it trades — tests that want a contract ON the board therefore seed it
+    /// at 1 first (an untracked key only) and then observe the real volume, so
+    /// `volume - 1` units are lots-in-window and the ordering the test asserts
+    /// is the ordering of the volumes it names.
+    fn trade(
+        lb: &mut VolumeLeaderboard,
+        contract: RankedContract,
+        family: OptionFamily,
+    ) -> Observation {
+        let key = (contract.security_id, contract.segment);
+        if contract.volume > 1 && !lb.family_mut(family).volumes.contains_key(&key) {
+            let seed = RankedContract {
+                volume: 1,
+                ..contract
+            };
+            let _ = lb.observe(seed, family);
+        }
+        lb.observe(contract, family)
+    }
+
     fn all(_: &RankedContract) -> bool {
         true
     }
@@ -1083,15 +1160,15 @@ mod tests {
     fn monotonic_volume_updates_are_accepted_and_ranked() {
         let mut lb = VolumeLeaderboard::new();
         assert_eq!(
-            lb.observe(stock(1, 100, 500), OptionFamily::Stock),
+            trade(&mut lb, stock(1, 100, 500), OptionFamily::Stock),
             Observation::Accepted
         );
         assert_eq!(
-            lb.observe(stock(1, 100, 900), OptionFamily::Stock),
+            trade(&mut lb, stock(1, 100, 900), OptionFamily::Stock),
             Observation::Accepted
         );
         assert_eq!(
-            lb.observe(stock(2, 200, 700), OptionFamily::Stock),
+            trade(&mut lb, stock(2, 200, 700), OptionFamily::Stock),
             Observation::Accepted
         );
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
@@ -1109,9 +1186,9 @@ mod tests {
         // The whole point of the gate. Accepting the lower value would drop the
         // most liquid contract to near-zero and off the leaderboard entirely.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 4_000_000_000), OptionFamily::Stock);
+        trade(&mut lb, stock(1, 100, 4_000_000_000), OptionFamily::Stock);
         assert_eq!(
-            lb.observe(stock(1, 100, 12), OptionFamily::Stock),
+            trade(&mut lb, stock(1, 100, 12), OptionFamily::Stock),
             Observation::RefusedNonMonotonic {
                 stored: 4_000_000_000,
                 offered: 12
@@ -1224,16 +1301,16 @@ mod tests {
         // with live ticks would otherwise creep to the threshold over a session
         // and abandon a perfectly good high.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock);
+        trade(&mut lb, stock(1, 100, 1_000_000), OptionFamily::Stock);
         for _ in 0..(RELATCH_AFTER_CONSECUTIVE_LOWER * 4) {
             // one replayed frame, then one live advance
             assert!(matches!(
-                lb.observe(stock(1, 100, 5), OptionFamily::Stock),
+                trade(&mut lb, stock(1, 100, 5), OptionFamily::Stock),
                 Observation::RefusedNonMonotonic { .. }
             ));
             let higher = lb.rank(OptionFamily::Stock, S1, 1, lot1, all)[0].volume + 1;
             assert_eq!(
-                lb.observe(stock(1, 100, higher), OptionFamily::Stock),
+                trade(&mut lb, stock(1, 100, higher), OptionFamily::Stock),
                 Observation::Accepted
             );
         }
@@ -1283,10 +1360,19 @@ mod tests {
         // underlying would file the contract under the wrong name in the
         // distinct-underlying constraint, silently.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock);
+        trade(&mut lb, stock(1, 100, u32::MAX), OptionFamily::Stock);
         for i in 1..=RELATCH_AFTER_CONSECUTIVE_LOWER {
-            lb.observe(stock(1, 999, u32::from(i)), OptionFamily::Stock);
+            trade(&mut lb, stock(1, 999, u32::from(i)), OptionFamily::Stock);
         }
+        // The re-latch re-seeds the window baseline (the contract is treated as
+        // newly tracked), so it ranks only once it trades again — and the
+        // stored high of u32::MAX would still refuse this value had the
+        // re-latch not happened.
+        trade(
+            &mut lb,
+            stock(1, 999, u32::from(RELATCH_AFTER_CONSECUTIVE_LOWER) + 1),
+            OptionFamily::Stock,
+        );
         assert_eq!(
             lb.rank(OptionFamily::Stock, S1, 1, lot1, all)[0].underlying_id,
             999,
@@ -1301,12 +1387,12 @@ mod tests {
         // WAL replay of an older frame, a vendor consumer-skip, and the 09:00
         // reset. This test is the wrap; the one above is the general case.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, u32::MAX - 5), OptionFamily::Stock);
+        trade(&mut lb, stock(1, 100, u32::MAX - 5), OptionFamily::Stock);
         // u32::MAX - 5 plus 10 wraps to 4 on the wire.
         let wrapped = (u32::MAX - 5).wrapping_add(10);
         assert_eq!(wrapped, 4, "sanity: this is what a wrap looks like");
         assert!(matches!(
-            lb.observe(stock(1, 100, wrapped), OptionFamily::Stock),
+            trade(&mut lb, stock(1, 100, wrapped), OptionFamily::Stock),
             Observation::RefusedNonMonotonic { .. }
         ));
         assert_eq!(
@@ -1334,11 +1420,11 @@ mod tests {
         // emitted a coded error whose text says volume went backwards when it
         // had not moved at all.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 500), OptionFamily::Stock);
+        trade(&mut lb, stock(1, 100, 500), OptionFamily::Stock);
 
         for _ in 0..1_000 {
             assert_eq!(
-                lb.observe(stock(1, 100, 500), OptionFamily::Stock),
+                trade(&mut lb, stock(1, 100, 500), OptionFamily::Stock),
                 Observation::Unchanged,
                 "an unmoved cumulative volume is the normal tick, not a fault"
             );
@@ -1351,7 +1437,7 @@ mod tests {
 
         // And a genuine decrease still refuses, so the gate is not simply gone.
         assert!(matches!(
-            lb.observe(stock(1, 100, 499), OptionFamily::Stock),
+            trade(&mut lb, stock(1, 100, 499), OptionFamily::Stock),
             Observation::RefusedNonMonotonic { .. }
         ));
         assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 1);
@@ -1393,15 +1479,13 @@ mod tests {
     #[test]
     fn index_and_stock_options_are_ranked_in_separate_leaderboards() {
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 900), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 5_000_000), OptionFamily::Index);
+        trade(&mut lb, stock(1, 100, 900), OptionFamily::Stock);
+        trade(&mut lb, stock(2, 200, 5_000_000), OptionFamily::Index);
         assert_eq!(lb.tracked(OptionFamily::Stock), 1);
         assert_eq!(lb.tracked(OptionFamily::Index), 1);
-        assert_eq!(lb.rank(OptionFamily::Stock, S1, 10, lot1, all).len(), 1);
-        assert_eq!(
-            lb.rank(OptionFamily::Stock, S1, 10, lot1, all)[0].security_id,
-            1
-        );
+        let stock_ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all).to_vec();
+        assert_eq!(stock_ranked.len(), 1);
+        assert_eq!(stock_ranked[0].security_id, 1);
         assert_eq!(
             lb.rank(OptionFamily::Index, S1, 10, lot1, all)[0].security_id,
             2
@@ -1422,12 +1506,12 @@ mod tests {
 
         for id in 0..300u64 {
             let c = stock(id, id % 40, 10_000_000 + id as u32);
-            lb.observe(c, OptionFamily::Index);
+            trade(&mut lb, c, OptionFamily::Index);
             blended.push(c);
         }
         for id in 1_000..1_300u64 {
             let c = stock(id, id % 40, 5_000 + id as u32);
-            lb.observe(c, OptionFamily::Stock);
+            trade(&mut lb, c, OptionFamily::Stock);
             blended.push(c);
         }
 
@@ -1478,22 +1562,32 @@ mod tests {
     fn ties_break_deterministically_on_the_composite_key() {
         // Without this the order comes from whatever the hash map yielded, so
         // the same input reorders between sweeps and the caller swaps
-        // subscriptions for nothing.
+        // subscriptions for nothing. Under the window key every contract must
+        // TRADE the same amount in each window to tie — a zero window is off
+        // the board, not a tie at the bottom of it.
         let mut lb = VolumeLeaderboard::new();
         for id in (0..40u64).rev() {
             lb.observe(stock(id, id, 777), OptionFamily::Stock);
+        }
+        let _seed = lb.rank(OptionFamily::Stock, S1, 40, lot1, all);
+        for id in (0..40u64).rev() {
+            lb.observe(stock(id, id, 1_777), OptionFamily::Stock);
         }
         let first: Vec<u64> = lb
             .rank(OptionFamily::Stock, S1, 40, lot1, all)
             .iter()
             .map(|c| c.security_id)
             .collect();
+        for id in (0..40u64).rev() {
+            lb.observe(stock(id, id, 2_777), OptionFamily::Stock);
+        }
         let second: Vec<u64> = lb
             .rank(OptionFamily::Stock, S1, 40, lot1, all)
             .iter()
             .map(|c| c.security_id)
             .collect();
-        assert_eq!(first, second, "two sweeps of identical state must agree");
+        assert_eq!(first, second, "two sweeps of identical deltas must agree");
+        assert_eq!(first.len(), 40);
         assert_eq!(first[0], 0, "the tiebreak is ascending on security_id");
         assert_eq!(first[39], 39);
     }
@@ -1501,9 +1595,9 @@ mod tests {
     #[test]
     fn eligibility_filters_membership_while_volume_decides_order() {
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 900), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 800), OptionFamily::Stock);
-        lb.observe(stock(3, 300, 700), OptionFamily::Stock);
+        trade(&mut lb, stock(1, 100, 900), OptionFamily::Stock);
+        trade(&mut lb, stock(2, 200, 800), OptionFamily::Stock);
+        trade(&mut lb, stock(3, 300, 700), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, |c: &RankedContract| {
             c.underlying_id != 100
         });
@@ -1569,13 +1663,18 @@ mod tests {
         // the remaining four slots go to the next four names.
         let mut lb = VolumeLeaderboard::new();
         for strike in 0..5u64 {
-            lb.observe(
+            trade(
+                &mut lb,
                 stock(strike, 100, 9_000 - strike as u32),
                 OptionFamily::Stock,
             );
         }
         for name in 1..5u64 {
-            lb.observe(stock(100 + name, 100 + name, 1_000), OptionFamily::Stock);
+            trade(
+                &mut lb,
+                stock(100 + name, 100 + name, 1_000),
+                OptionFamily::Stock,
+            );
         }
         let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
         assert_eq!(picked.len(), 5);
@@ -1597,7 +1696,8 @@ mod tests {
         // operator's rule silently.
         let mut lb = VolumeLeaderboard::new();
         for strike in 0..20u64 {
-            lb.observe(
+            trade(
+                &mut lb,
                 stock(strike, strike % 4, 5_000 + strike as u32),
                 OptionFamily::Stock,
             );
@@ -1621,7 +1721,8 @@ mod tests {
 
         // Name 100 owns the raw top five outright: five strikes, 9_000..8_996.
         for strike in 0..5u64 {
-            lb.observe(
+            trade(
+                &mut lb,
                 stock(strike, 100, 9_000 - strike as u32),
                 OptionFamily::Stock,
             );
@@ -1633,7 +1734,11 @@ mod tests {
             .enumerate()
         {
             let name = 200 + rank as u64;
-            lb.observe(stock(1_000 + name, name, volume), OptionFamily::Stock);
+            trade(
+                &mut lb,
+                stock(1_000 + name, name, volume),
+                OptionFamily::Stock,
+            );
         }
 
         let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
@@ -1668,16 +1773,19 @@ mod tests {
         // stock-option strikes by orders of magnitude).
         let mut lb = VolumeLeaderboard::new();
         for id in 0..5u64 {
-            lb.observe(
+            trade(
+                &mut lb,
                 stock(id, 900 + id, u32::MAX - id as u32),
                 OptionFamily::Index,
             );
         }
-        lb.observe(stock(50, 100, 1), OptionFamily::Stock);
+        trade(&mut lb, stock(50, 100, 2), OptionFamily::Stock);
 
         let top = lb.rank(OptionFamily::Stock, S1, 250, lot1, all);
         assert_eq!(top.len(), 1, "only the one stock contract is rankable");
         assert_eq!(top[0].security_id, 50);
+        // A sweep rolls the baseline; trade again so the second sweep has a window.
+        trade(&mut lb, stock(50, 100, 3), OptionFamily::Stock);
 
         let five = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
         assert_eq!(five.len(), 1, "the depth-200 path sees the same one");
@@ -1923,20 +2031,27 @@ mod tests {
 
     #[test]
     fn a_newly_tracked_contract_reports_nothing_until_it_trades_in_a_window() {
-        // The "stale high" guard. Seeding the baseline to 0 would make a
-        // contract's FIRST window report its whole day so far — the largest
-        // number it will ever show — and hand it a depth socket on arrival.
+        // The "stale high" guard, and its 2026-09-08 sharpening. Seeding the
+        // baseline to 0 would make a contract's FIRST window report its whole
+        // day so far — the largest number it will ever show — and hand it a
+        // depth socket on arrival. And a contract whose window is ZERO is not
+        // "top volume" at all: it is left OFF the board rather than ranked at
+        // 0, because a zero-lot tail is the arbitrary "whoever ticked first"
+        // set the operator's requirement excludes.
         let mut lb = VolumeLeaderboard::new();
         lb.observe(stock(1, 100, 4_000_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(
-            ranked[0].window_lots_milli, 0,
-            "four million units traded BEFORE we were watching is not a window"
+        assert!(
+            ranked.is_empty(),
+            "four million units traded BEFORE we were watching is not a window, \
+             and a zero window is not a place on the board"
         );
-        assert_eq!(
-            ranked[0].volume, 4_000_000,
-            "the observation itself is kept"
-        );
+        // The observation itself is kept: the next window measures from it.
+        lb.observe(stock(1, 100, 4_000_050), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].window_lots_milli, 50 * LOTS_SCALE);
+        assert_eq!(ranked[0].volume, 4_000_050);
     }
 
     #[test]
@@ -2071,11 +2186,12 @@ mod tests {
             stock(4, 100, 600), // gainer, same underlying as #1
             stock(5, 400, 500), // gainer
         ];
-        let (eligible, tally) = gainer_eligible(&ranked, |underlying| match underlying {
-            100 | 400 => GainerVerdict::Gainer,
-            200 => GainerVerdict::NotGainer,
-            _ => GainerVerdict::Unknown,
-        });
+        let (eligible, tally) =
+            gainer_eligible(&ranked, usize::MAX, |underlying| match underlying {
+                100 | 400 => GainerVerdict::Gainer,
+                200 => GainerVerdict::NotGainer,
+                _ => GainerVerdict::Unknown,
+            });
         let ids: Vec<u64> = eligible.iter().map(|c| c.security_id).collect();
         assert_eq!(
             ids,
@@ -2102,7 +2218,7 @@ mod tests {
     #[test]
     fn gainer_eligible_on_a_down_day_is_empty_and_the_tally_says_why() {
         let ranked = [stock(1, 100, 900), stock(2, 200, 800)];
-        let (eligible, tally) = gainer_eligible(&ranked, |_| GainerVerdict::NotGainer);
+        let (eligible, tally) = gainer_eligible(&ranked, usize::MAX, |_| GainerVerdict::NotGainer);
         assert!(
             eligible.is_empty(),
             "no gainers means no candidates — sockets hold"
@@ -2133,5 +2249,81 @@ mod tests {
     fn pre_register_gainer_filter_counter_seeds_every_label_without_panicking() {
         pre_register_gainer_filter_counter();
         pre_register_gainer_filter_counter();
+    }
+
+    /// A replayed backlog must not become one window's trading: after
+    /// `rebaseline_all` the next window on EVERY cadence reads 0 until the
+    /// contract trades again.
+    #[test]
+    fn rebaseline_all_makes_the_next_window_measure_only_live_trading() {
+        let mut lb = VolumeLeaderboard::new();
+        // A "replay": frames in order with no sweep between them.
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+        lb.observe(stock(1, 100, 900_000), OptionFamily::Stock);
+        lb.observe(idx(2, 13, 500), OptionFamily::Index);
+        lb.observe(idx(2, 13, 700_000), OptionFamily::Index);
+        lb.rebaseline_all();
+        assert!(lb.rank(OptionFamily::Stock, S1, 10, lot1, all).is_empty());
+        assert!(lb.rank(OptionFamily::Stock, S5, 10, lot1, all).is_empty());
+        assert!(lb.rank(OptionFamily::Index, S1, 10, lot1, all).is_empty());
+        // Live trading after the replay is measured from the rebaselined value.
+        lb.observe(stock(1, 100, 900_050), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].window_lots_milli, 50 * LOTS_SCALE);
+    }
+
+    /// The gainer walk stops once `limit` gainers are collected, and the tally
+    /// counts only what was visited — so a 20,000-row population costs a few
+    /// hundred probes on an ordinary day, not 40,000.
+    #[test]
+    fn gainer_eligible_stops_at_the_limit_and_tallies_only_what_it_visited() {
+        let ranked: Vec<RankedContract> =
+            (1..=10u64).map(|i| stock(i, i, 1_000 - i as u32)).collect();
+        let (eligible, tally) = gainer_eligible(&ranked, 3, |u| {
+            if u % 2 == 0 {
+                GainerVerdict::Gainer
+            } else {
+                GainerVerdict::NotGainer
+            }
+        });
+        let ids: Vec<u64> = eligible.iter().map(|c| c.security_id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 4, 6],
+            "the first three gainers in volume order"
+        );
+        assert_eq!(tally.gainer, 3);
+        assert_eq!(
+            tally.not_gainer, 3,
+            "rows 1, 3, 5 were visited; 7+ were not"
+        );
+        assert_eq!(tally.unknown, 0);
+    }
+
+    /// Gainers ranked below the persisted cut still reach the depth pool: the
+    /// filter runs on the full population, not on a pre-cut top-250.
+    #[test]
+    fn a_gainer_ranked_below_the_top_250_by_volume_still_qualifies_for_depth() {
+        let mut lb = VolumeLeaderboard::new();
+        for i in 1..=300u64 {
+            lb.observe(stock(i, i, 1), OptionFamily::Stock);
+        }
+        for i in 1..=300u64 {
+            // Contract i trades (301 - i) more units: rank i.
+            lb.observe(stock(i, i, 1 + (301 - i as u32)), OptionFamily::Stock);
+        }
+        let ranked_all = lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
+        assert_eq!(ranked_all.len(), 300, "no cut inside rank");
+        // Only the 50 contracts ranked 251..=300 are gainers.
+        let (gainers, _) = gainer_eligible(ranked_all, 250, |u| {
+            if u > 250 {
+                GainerVerdict::Gainer
+            } else {
+                GainerVerdict::NotGainer
+            }
+        });
+        assert_eq!(gainers.len(), 50);
+        assert_eq!(gainers[0].security_id, 251);
     }
 }
