@@ -118,6 +118,44 @@ pub const VIEW_TOP_VOLUME_5S: &str = "top_volume_rank_5s";
 /// Top-volume base table. Mirrors `top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE`;
 /// equality is pinned by `test_top_volume_base_matches_persistence_const`.
 const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume_rank";
+
+/// The two stored ranking cadences, each with its own named view.
+///
+/// The DDL builder takes this ENUM rather than free strings so the view
+/// name and the `tf` literal it filters on can only ever be one of these two
+/// compile-time pairs — a caller cannot reach the `format!` with a quote in
+/// either position. Pinned by
+/// `test_top_volume_cadence_view_and_tf_are_the_pinned_literals`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopVolumeCadence {
+    /// The 1-second sweep.
+    OneSecond,
+    /// The 5-second sweep.
+    FiveSeconds,
+}
+
+impl TopVolumeCadence {
+    /// Both cadences, in the order the views are created at boot.
+    pub const ALL: [Self; 2] = [Self::OneSecond, Self::FiveSeconds];
+
+    /// The named view this cadence is read through.
+    #[must_use]
+    pub const fn view(self) -> &'static str {
+        match self {
+            Self::OneSecond => VIEW_TOP_VOLUME_1S,
+            Self::FiveSeconds => VIEW_TOP_VOLUME_5S,
+        }
+    }
+
+    /// The `tf` SYMBOL value the writer stamps for this cadence.
+    #[must_use]
+    pub const fn tf(self) -> &'static str {
+        match self {
+            Self::OneSecond => "1s",
+            Self::FiveSeconds => "5s",
+        }
+    }
+}
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -206,7 +244,9 @@ pub fn depth_named_view_ddl() -> String {
 /// `cadence` is the `tf` SYMBOL literal (`1s` / `5s`) — the same wire strings
 /// `SnapshotCadence::as_str` writes, pinned by
 /// `test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences`.
-pub fn top_volume_cadence_view_ddl(view: &str, cadence: &str) -> String {
+pub fn top_volume_cadence_view_ddl(cadence: TopVolumeCadence) -> String {
+    let view = cadence.view();
+    let tf = cadence.tf();
     let dim = lifecycle_dim_subquery();
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
@@ -218,7 +258,7 @@ pub fn top_volume_cadence_view_ddl(view: &str, cadence: &str) -> String {
          ON t.security_id = il.security_id \
          AND t.segment = il.exchange_segment \
          AND t.feed = il.feed \
-         WHERE t.tf = '{cadence}';"
+         WHERE t.tf = '{tf}';"
     )
 }
 /// Issue one view-DDL statement to QuestDB's `/exec` endpoint.
@@ -230,17 +270,43 @@ pub fn top_volume_cadence_view_ddl(view: &str, cadence: &str) -> String {
 async fn run_view_ddl(client: &Client, base_url: &str, view: &str, ddl: &str) {
     match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
+            metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "ok").increment(1);
             info!(view, "named console view ready");
         }
         Ok(resp) => {
+            metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "non_2xx").increment(1);
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             let body_prefix: String = body.chars().take(200).collect();
             warn!(view, %status, body = %body_prefix, "named view DDL non-2xx — retries next boot");
         }
         Err(err) => {
+            metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "transport").increment(1);
             error!(view, ?err, "named view DDL request failed");
         }
+    }
+}
+
+/// Counter: named-view DDL statements at boot, by `outcome` (`ok`,
+/// `non_2xx`, `transport`).
+///
+/// Added 2026-09-08 after the hostile sweep found a refused view DDL was a
+/// `warn!` and nothing else — a `top_volume_rank_1s` view absent for a whole
+/// session had no number behind it. A view is a READ projection, so its
+/// absence loses no data (the base table keeps every row) and this is
+/// deliberately NOT loss-shaped and NOT EMF-selected: the operator's
+/// question is "did my view come up?", answered locally on `/metrics` and by
+/// the coded line beside it.
+pub const VIEW_DDL_COUNTER: &str = "tv_console_view_ddl_total";
+
+/// Every outcome [`VIEW_DDL_COUNTER`] carries, for pre-registration.
+pub const VIEW_DDL_OUTCOMES: [&str; 3] = ["ok", "non_2xx", "transport"];
+
+/// Seeds every outcome series at zero so the first refusal is a delta the
+/// scrape can see rather than a dropped first sample.
+pub fn pre_register_view_ddl_counter() {
+    for outcome in VIEW_DDL_OUTCOMES {
+        metrics::counter!(VIEW_DDL_COUNTER, "outcome" => outcome).increment(0);
     }
 }
 
@@ -256,6 +322,7 @@ async fn run_view_ddl(client: &Client, base_url: &str, view: &str, ddl: &str) {
 /// is convergent, so double execution on dual-feed boots is harmless.
 // TEST-EXEMPT: requires a running QuestDB; the DDL strings are ratcheted by the pure-builder unit tests below; exercised by boot integration + `make doctor`.
 pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
+    pre_register_view_ddl_counter();
     // FEATURE-GATE FIX: the lifecycle dimension table must exist before
     // CREATE VIEW validates the join. Prod app builds enable
     // `daily_universe_fetcher` by default (crates/app/Cargo.toml); without
@@ -330,14 +397,14 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &client,
         &base_url,
         VIEW_TOP_VOLUME_1S,
-        &top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_1S, "1s"),
+        &top_volume_cadence_view_ddl(TopVolumeCadence::OneSecond),
     )
     .await;
     run_view_ddl(
         &client,
         &base_url,
         VIEW_TOP_VOLUME_5S,
-        &top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_5S, "5s"),
+        &top_volume_cadence_view_ddl(TopVolumeCadence::FiveSeconds),
     )
     .await;
 }
@@ -362,11 +429,11 @@ mod tests {
             ("market_depth_named", depth_named_view_ddl()),
             (
                 "top_volume_rank_1s",
-                top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_1S, "1s"),
+                top_volume_cadence_view_ddl(TopVolumeCadence::OneSecond),
             ),
             (
                 "top_volume_rank_5s",
-                top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_5S, "5s"),
+                top_volume_cadence_view_ddl(TopVolumeCadence::FiveSeconds),
             ),
         ]
     }
@@ -378,8 +445,11 @@ mod tests {
         // `SnapshotCadence` writes. A view that forgot the WHERE would show
         // both cadences interleaved, which is the shape the operator asked to
         // be rid of.
-        for (view, cadence) in [(VIEW_TOP_VOLUME_1S, "1s"), (VIEW_TOP_VOLUME_5S, "5s")] {
-            let ddl = top_volume_cadence_view_ddl(view, cadence);
+        for (view, cadence, c) in [
+            (VIEW_TOP_VOLUME_1S, "1s", TopVolumeCadence::OneSecond),
+            (VIEW_TOP_VOLUME_5S, "5s", TopVolumeCadence::FiveSeconds),
+        ] {
+            let ddl = top_volume_cadence_view_ddl(c);
             assert_eq!(ddl.matches(';').count(), 1, "{view}: one statement");
             assert!(
                 ddl.contains(&format!("FROM {NAMED_VIEW_TOP_VOLUME_BASE} t")),
@@ -405,8 +475,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pre_register_view_ddl_counter_covers_every_outcome_and_does_not_panic() {
+        pre_register_view_ddl_counter();
+        pre_register_view_ddl_counter();
+        assert_eq!(VIEW_DDL_OUTCOMES.len(), 3);
+        assert!(VIEW_DDL_COUNTER.ends_with("_total"));
+        assert!(
+            !VIEW_DDL_COUNTER.contains("dropped")
+                && !VIEW_DDL_COUNTER.contains("refused")
+                && !VIEW_DDL_COUNTER.contains("lost"),
+            "a view is a read projection; its DDL outcome is not loss-shaped"
+        );
+    }
+
     fn tickvault_storage_cadence_1s() -> &'static str {
         crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.as_str()
+    }
+
+    /// The enum is what keeps a quote character out of the `format!`: its
+    /// `view()` and `tf()` are compile-time literals, and `tf()` must be the
+    /// SAME wire string the writer stamps — otherwise the view filters on a
+    /// value no row carries and reads empty all day.
+    #[test]
+    fn test_top_volume_cadence_view_and_tf_are_the_pinned_literals() {
+        use crate::top_volume_rank_persistence::SnapshotCadence;
+        assert_eq!(TopVolumeCadence::ALL.len(), 2);
+        assert_eq!(TopVolumeCadence::ALL[0], TopVolumeCadence::OneSecond);
+        assert_eq!(TopVolumeCadence::ALL[1], TopVolumeCadence::FiveSeconds);
+        assert_eq!(TopVolumeCadence::OneSecond.view(), VIEW_TOP_VOLUME_1S);
+        assert_eq!(TopVolumeCadence::FiveSeconds.view(), VIEW_TOP_VOLUME_5S);
+        assert_eq!(
+            TopVolumeCadence::OneSecond.tf(),
+            SnapshotCadence::OneSecond.as_str()
+        );
+        assert_eq!(
+            TopVolumeCadence::FiveSeconds.tf(),
+            SnapshotCadence::FiveSecond.as_str()
+        );
+        for c in TopVolumeCadence::ALL {
+            for s in [c.view(), c.tf()] {
+                assert!(
+                    !s.contains('\'') && !s.contains('"') && !s.contains(';'),
+                    "{s}: a quote or terminator in a DDL literal is an injection surface"
+                );
+            }
+        }
     }
 
     #[test]

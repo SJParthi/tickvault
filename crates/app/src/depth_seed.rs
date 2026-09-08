@@ -111,6 +111,39 @@ pub const SEED_OUTCOMES: [&str; 5] = [
     "refused_segment",
 ];
 
+/// Counter: whole-FILE outcomes that never reach the per-row tally, by
+/// `outcome`. Added 2026-09-08 after the hostile sweep found all three were
+/// `debug!`/`warn!`-only with no number behind them:
+///
+/// - `unreadable` — the seed file exists and does not parse;
+/// - `artifact_missing` — a seed exists but TODAY's contract artifact could
+///   not be read, so there is nothing to validate it against;
+/// - `stale_date` — the seed's `date_ist` is more than
+///   [`MAX_SEED_AGE_DAYS`] before today, or after it (a clock fault).
+///
+/// NOT EMF-selected, for the same budget reason as [`SEED_COUNTER`].
+pub const SEED_FILE_COUNTER: &str = "tv_depth_seed_file_total";
+
+/// Every outcome [`SEED_FILE_COUNTER`] can carry.
+pub const SEED_FILE_OUTCOMES: [&str; 3] = ["unreadable", "artifact_missing", "stale_date"];
+
+/// Oldest seed the boot will apply, in calendar days before today.
+///
+/// A seed is a record of what was BUSY at the previous close, and busy-ness
+/// decays: a week-old file (a long holiday stretch is the longest legitimate
+/// gap between two sessions) may still name contracts that pass today's
+/// expiry check and yet reflect a market that no longer exists. Seven covers
+/// a Friday close read on the Monday after a two-day holiday with margin;
+/// anything older is refused whole, counted, and the boot dial runs as it
+/// did before this module existed. The date check was absent until
+/// 2026-09-08 — `date_ist` was carried into the log line and never compared.
+pub const MAX_SEED_AGE_DAYS: i64 = 7;
+
+/// Records one whole-file outcome on [`SEED_FILE_COUNTER`].
+pub fn record_seed_file_outcome(outcome: &'static str) {
+    metrics::counter!(SEED_FILE_COUNTER, "outcome" => outcome).increment(1);
+}
+
 /// The two pools a seed can feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedPool {
@@ -199,8 +232,23 @@ pub fn write_depth_seed(path: &std::path::Path, seed: &DepthSeed) -> std::io::Re
     }
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(seed).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&body)?;
+        // Durable before the rename: a crash between write and rename must
+        // never leave tomorrow's boot a truncated seed under the final name.
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Best-effort directory sync so the rename itself survives a power loss;
+    // a failure here is logged, not fatal — the read path is fail-soft.
+    if let Some(dir) = path.parent()
+        && let Err(err) = std::fs::File::open(dir).and_then(|d| d.sync_all())
+    {
+        tracing::debug!(path = %path.display(), %err, "depth seed directory sync failed");
+    }
+    Ok(())
 }
 
 /// Reads the seed, or `None` when there is none or it cannot be parsed.
@@ -214,14 +262,39 @@ pub fn read_depth_seed(path: &std::path::Path) -> Option<DepthSeed> {
     match serde_json::from_slice::<DepthSeed>(&body) {
         Ok(seed) => Some(seed),
         Err(err) => {
+            record_seed_file_outcome("unreadable");
             tracing::warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
+                    .code_str(),
+                source = "depth_seed_unreadable",
                 path = %path.display(),
                 %err,
-                "depth seed file exists but could not be parsed — dialing without it"
+                "depth seed file exists but could not be parsed — dialing without it \
+                 (log-sink only; counted under `unreadable` on the seed-file counter)"
             );
             None
         }
     }
+}
+
+/// Whether a seed dated `seed_date_ist` (`YYYY-MM-DD`) may be applied on
+/// `today_ymd` (`YYYYMMDD`): not in the future, and not older than
+/// [`MAX_SEED_AGE_DAYS`]. A date that does not parse is refused — an
+/// unreadable stamp is not evidence of freshness.
+#[must_use]
+pub fn seed_date_is_fresh(seed_date_ist: &str, today_ymd: u32) -> bool {
+    let Ok(seed) = chrono::NaiveDate::parse_from_str(seed_date_ist, "%Y-%m-%d") else {
+        return false;
+    };
+    let Some(today) = chrono::NaiveDate::from_ymd_opt(
+        i32::try_from(today_ymd / 10_000).unwrap_or(0),
+        (today_ymd / 100) % 100,
+        today_ymd % 100,
+    ) else {
+        return false;
+    };
+    let age = (today - seed).num_days();
+    (0..=MAX_SEED_AGE_DAYS).contains(&age)
 }
 
 /// The per-pool tally of one application.
@@ -286,7 +359,15 @@ impl TodayIndex {
     fn build(rows: &[ContractRow]) -> Self {
         let mut index = HashMap::with_capacity(rows.len());
         for r in rows {
-            let is_stock_option_leg = r.c == "OPTSTK" && (r.l == "CE" || r.l == "PE");
+            // NSE only. Dhan serves depth on NSE alone and the seed row's
+            // segment is checked against `NSE_FNO` in `judge`, but the
+            // artifact is keyed here on the bare id — so a seed id whose
+            // TODAY row is a BSE stock option (a reused id across exchanges,
+            // the I-P1-11 class) would otherwise read as a live NSE leg and be
+            // dialed on a segment it does not trade on. Found by the
+            // 2026-09-08 hostile sweep.
+            let is_stock_option_leg =
+                r.x == "NSE" && r.c == "OPTSTK" && (r.l == "CE" || r.l == "PE");
             // First write wins: the artifact should carry one row per id, and
             // if it did not, the FIRST row is the one every other reader sees.
             index.entry(r.i).or_insert((is_stock_option_leg, r.e));
@@ -379,11 +460,28 @@ pub fn apply_depth_seed(
     today_rows: &[ContractRow],
     today_ymd: u32,
 ) -> SeedApplied {
-    let index = TodayIndex::build(today_rows);
     let mut applied = SeedApplied {
         seed_date_ist: seed.date_ist.clone(),
         ..SeedApplied::default()
     };
+    // Whole-file freshness gate BEFORE any row is judged: a stale seed's rows
+    // can each pass today's expiry check and still describe a market that is
+    // gone. Refused whole, counted, and the boot dial runs as before.
+    if !seed_date_is_fresh(&seed.date_ist, today_ymd) {
+        record_seed_file_outcome("stale_date");
+        tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "depth_seed_stale",
+            seed_date = %seed.date_ist,
+            today_ymd,
+            max_age_days = MAX_SEED_AGE_DAYS,
+            "depth seed is not from a recent session (or its date is unreadable or in the \
+             future) — refused whole; the boot dial chooses as it did before the seed existed \
+             (log-sink only; counted under `stale_date` on the seed-file counter)"
+        );
+        return applied;
+    }
+    let index = TodayIndex::build(today_rows);
 
     let live_200 = survivors(&index, &seed.depth_200, today_ymd, &mut applied.depth_200);
     applied.depth_200.applied = live_200.len().min(DEPTH_200_TOTAL_SOCKETS);
@@ -421,16 +519,31 @@ fn record_seed_tally(pool: SeedPool, tally: SeedTally) {
                 .increment(n as u64);
         }
     }
-    if tally.applied > 0 || tally.refused() > 0 {
-        tracing::info!(
+    if tally.refused() > 0 {
+        // Coded, so the refusal is reachable by the same three-condition
+        // filter convention every other WS-GAP-02 source uses, and pinned by
+        // the error-code tag guard. Log-sink only: an expiry rollover refuses
+        // a whole seed legitimately, and paging on it would page on every
+        // expiry Thursday's Friday.
+        tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "depth_seed_refused",
             pool = pool.as_str(),
             applied = tally.applied,
             refused_unknown = tally.refused_unknown,
             refused_not_stock_option = tally.refused_not_stock_option,
             refused_expired = tally.refused_expired,
             refused_segment = tally.refused_segment,
-            "depth seed: yesterday's holdings validated against today's contracts — the \
-             applied rows dial first, the refused ones fall back to the dial's own choice"
+            "depth seed: some of yesterday's holdings were refused against today's \
+             contracts — the applied rows dial first, the refused ones fall back to the \
+             dial's own choice (log-sink only; each reason is counted on the seed counter)"
+        );
+    } else if tally.applied > 0 {
+        tracing::info!(
+            pool = pool.as_str(),
+            applied = tally.applied,
+            "depth seed: every one of yesterday's holdings validated against today's \
+             contracts and dials first"
         );
     }
 }
@@ -443,6 +556,9 @@ pub fn pre_register_seed_counters() {
             metrics::counter!(SEED_COUNTER, "pool" => pool.as_str(), "outcome" => outcome)
                 .increment(0);
         }
+    }
+    for outcome in SEED_FILE_OUTCOMES {
+        metrics::counter!(SEED_FILE_COUNTER, "outcome" => outcome).increment(0);
     }
 }
 
@@ -653,6 +769,93 @@ mod tests {
     fn pre_register_seed_counters_covers_every_label() {
         pre_register_seed_counters();
         assert_eq!(SEED_OUTCOMES.len(), 5);
+        assert_eq!(SEED_FILE_OUTCOMES.len(), 3);
+        for outcome in SEED_FILE_OUTCOMES {
+            record_seed_file_outcome(outcome);
+        }
+    }
+
+    /// The freshness gate: yesterday and a week-old holiday stretch pass; a
+    /// seed from a fortnight ago, a future-dated one (clock fault) and an
+    /// unparseable date are all refused.
+    #[test]
+    fn seed_date_is_fresh_accepts_a_recent_session_and_refuses_stale_future_or_garbage() {
+        assert!(seed_date_is_fresh("2026-09-07", 20_260_908));
+        assert!(
+            seed_date_is_fresh("2026-09-08", 20_260_908),
+            "same day (a restart)"
+        );
+        assert!(
+            seed_date_is_fresh("2026-09-01", 20_260_908),
+            "exactly the age bound"
+        );
+        assert!(
+            !seed_date_is_fresh("2026-08-31", 20_260_908),
+            "one day past the bound"
+        );
+        assert!(
+            !seed_date_is_fresh("2026-09-09", 20_260_908),
+            "the future is a clock fault"
+        );
+        assert!(!seed_date_is_fresh("yesterday", 20_260_908));
+        assert!(
+            !seed_date_is_fresh("2026-09-07", 0),
+            "an unbuildable today refuses"
+        );
+    }
+
+    /// A stale seed is refused WHOLE before any row is judged: the dial is
+    /// untouched, nothing is marked seeded, and the tally is empty.
+    #[test]
+    fn a_stale_seed_is_refused_whole_and_leaves_the_dial_untouched() {
+        let _serialised = BOOT_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_boot_seeded_for_tests();
+        let seed = DepthSeed {
+            date_ist: "2026-08-01".into(),
+            depth_200: vec![SeedContract { i: 101, g: FNO }],
+            depth_20: vec![SeedContract { i: 103, g: FNO }],
+        };
+        let mut sel = DepthSelection {
+            depth_200: vec![inst(9001)],
+            depth_20: vec![inst(8001)],
+            depth_200_lone_leg: true,
+            ..DepthSelection::default()
+        };
+        let applied = apply_depth_seed(&mut sel, &seed, &today(), 20_260_908);
+        assert!(!applied.any_applied());
+        assert_eq!(applied.depth_200, SeedTally::default());
+        assert_eq!(applied.depth_20, SeedTally::default());
+        assert_eq!(sel.depth_200.len(), 1);
+        assert_eq!(sel.depth_20.len(), 1);
+        assert!(sel.depth_200_lone_leg);
+        assert!(!boot_seeded(SeedPool::Depth200));
+        assert!(!boot_seeded(SeedPool::Depth20));
+    }
+
+    /// The artifact index is NSE-only: a seed id whose today-row is a BSE
+    /// stock option (a reused id across exchanges) is refused as not a leg,
+    /// never dialed on `NSE_FNO`.
+    #[test]
+    fn a_seed_id_that_is_a_bse_stock_option_today_is_refused() {
+        let _serialised = BOOT_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_boot_seeded_for_tests();
+        let mut bse = row(101, "OPTSTK", "CE", 20_260_925);
+        bse.x = "BSE".to_owned();
+        let rows = vec![bse, row(102, "OPTSTK", "PE", 20_260_925)];
+        let seed = DepthSeed {
+            date_ist: "2026-09-07".into(),
+            depth_200: vec![
+                SeedContract { i: 101, g: FNO },
+                SeedContract { i: 102, g: FNO },
+            ],
+            depth_20: vec![],
+        };
+        let mut sel = DepthSelection::default();
+        let applied = apply_depth_seed(&mut sel, &seed, &rows, 20_260_908);
+        assert_eq!(applied.depth_200.applied, 1);
+        assert_eq!(applied.depth_200.refused_not_stock_option, 1);
+        let ids: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
+        assert_eq!(ids, vec![102]);
     }
 
     #[test]

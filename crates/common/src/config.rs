@@ -2274,7 +2274,7 @@ impl QuestDbConfig {
 /// The destructive archive→verify→drop leg is gated on `archive_enabled`
 /// (serde default **false**), so a config rollback (`archive_enabled = false`,
 /// or simply deleting the key) restores the legacy detach-only behaviour
-/// instantly. `market_data_hot_days` defaulting to 14 is safe-by-default
+/// instantly. `market_data_hot_days` defaulting to 15 is safe-by-default
 /// precisely BECAUSE the flow is fail-closed: nothing is ever dropped unless
 /// its S3 copy has been row-count- and size-verified, and nothing at all
 /// happens while `archive_enabled` is false.

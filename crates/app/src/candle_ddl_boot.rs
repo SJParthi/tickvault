@@ -131,7 +131,8 @@ pub const LIVE_TABLE_DDL_ATTEMPTS: u32 = 6;
 /// Seconds between `ticks` / `market_depth` DDL attempts.
 pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 
-/// Ensure the two LIVE-writer tables — `ticks` and `market_depth` — with
+/// Ensure the three LIVE-writer tables — `ticks`, `market_depth` and
+/// `top_volume_rank` — with
 /// their DEDUP keys, retrying a refusal instead of running the session on
 /// whatever ILP auto-creates.
 ///
@@ -149,11 +150,11 @@ pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 /// session, because nothing re-ran the DDL.
 ///
 /// The ensure fns now return whether every statement was accepted, and this
-/// loop re-runs BOTH until they are or the bound is spent. Re-running an
+/// loop re-runs ALL of them until they are or the bound is spent. Re-running an
 /// already-accepted table is free: every statement is `IF NOT EXISTS` or an
 /// idempotent `DEDUP ENABLE`.
 ///
-/// Returns `true` when both tables were ensured on some attempt. On
+/// Returns `true` when all three tables were ensured on some attempt. On
 /// exhaustion it returns `false` after a coded `error!` naming the
 /// consequence — never a panic, and never a silent continue.
 // TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
@@ -162,11 +163,20 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
             tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
-        if ticks_ok && depth_ok {
+        // top_volume_rank — the 1 s / 5 s volume-ranking snapshot table
+        // (2026-09-06). Its offload writer appends every second from the
+        // first ranking sweep; until 2026-09-08 NOTHING ensured the table,
+        // so on a fresh volume the first ILP row would have auto-created it
+        // with no DEDUP key (`ts, tf, family, feed, security_id, segment`)
+        // and every replayed or re-flushed snapshot would have duplicated.
+        let rank_ok =
+            tickvault_storage::top_volume_rank_persistence::ensure_top_volume_rank_table(questdb)
+                .await;
+        if ticks_ok && depth_ok && rank_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) ensured"
+                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured"
             );
             return true;
         }
@@ -176,6 +186,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
                 attempts = LIVE_TABLE_DDL_ATTEMPTS,
                 ticks_ok,
                 depth_ok,
+                rank_ok,
                 backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
                 "live-table DDL refused — retrying so the session does not run on an \
                  ILP-auto-created table with the DEDUP key missing"
@@ -187,7 +198,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
         attempts = LIVE_TABLE_DDL_ATTEMPTS,
         backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
-        "live-table DDL boot EXHAUSTED — ticks and/or market_depth could not be \
+        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or top_volume_rank could not be \
          ensured. Consequence: the first ILP write may auto-create the table \
          WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
          pools overwrite each other's levels — until a later boot's ensure succeeds. \
