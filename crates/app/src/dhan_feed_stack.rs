@@ -1363,10 +1363,15 @@ impl LiveIngest {
                 // lock names as the remedy for a churning board.
                 crate::depth20_ranked_steer::global_depth20_candidates()
                     .publish(crate::depth200_candidates::candidates_from_ranked(&gainers));
-                // The distinct-underlying pass is depth-200's rule only.
+                // The distinct-underlying pass is depth-200's rule only. The
+                // list runs to `DEPTH200_EXIT_UNDERLYINGS`, not the socket
+                // budget: the first five are the entry set, the rest is the
+                // hysteresis band that keeps a held contract from being
+                // swapped out on a single window in which it slipped to
+                // sixth.
                 let picked = crate::volume_leaderboard::distinct_underlying_over(
                     &gainers,
-                    crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
+                    crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
                 );
                 crate::depth200_candidates::global_depth200_candidates()
                     .publish(crate::depth200_candidates::candidates_from_ranked(&picked));
@@ -3233,6 +3238,14 @@ pub struct DrainCounters {
     depth_dropped: metrics::Counter,
     depth_disconnects: metrics::Counter,
     depth_length_mismatch: metrics::Counter,
+    /// Depth packets for an instrument this process told the socket to DROP,
+    /// still arriving after the grace: the unsubscribe was ignored or lost.
+    depth_ghost: metrics::Counter,
+    /// Depth packets for an instrument dropped less than the grace ago -- the
+    /// vendor is still allowed to act on the unsubscribe. Counted, not acted on.
+    depth_unsubscribed_grace: metrics::Counter,
+    /// Redials actually ARMED by the ghost detector (after the per-socket cooldown).
+    depth_ghost_redials: metrics::Counter,
     truncated: metrics::Counter,
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
@@ -3303,6 +3316,9 @@ pub fn counters() -> &'static DrainCounters {
         depth_dropped: metrics::counter!(DEPTH_COUNTER, "outcome" => "dropped"),
         depth_disconnects: metrics::counter!(DEPTH_COUNTER, "outcome" => "disconnects"),
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
+        depth_ghost: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost"),
+        depth_unsubscribed_grace: metrics::counter!(DEPTH_COUNTER, "outcome" => "unsubscribed_grace"),
+        depth_ghost_redials: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_redial"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
@@ -3448,7 +3464,19 @@ pub const SEALS_RESCUED_COUNTER: &str = "tv_dhan_feed_seals_rescued_total";
 ///   no data is lost, but a sustained non-zero reading means the vendor
 ///   changed a convention, and learning that from a counter beats learning it
 ///   from mis-framed books. Expected 0; UNVERIFIED-LIVE.
+/// * `ghost` — packets for an instrument this process unsubscribed at least
+///   `GHOST_GRACE_SECS` ago and the vendor is STILL streaming. The signal that
+///   the unsubscribe RequestCode was ignored; each one asks that socket to
+///   redial (`request_ghost_redial`, cooled down per socket). Expected 0.
+/// * `unsubscribed_grace` — packets for an instrument unsubscribed less than
+///   the grace ago. Normal for a few seconds after every swap; counted so the
+///   vendor's unsubscribe latency is measurable, never acted on.
 pub const DEPTH_COUNTER: &str = "tv_dhan_feed_depth_total";
+
+/// Nanoseconds per second, as the `i64` the receipt clock is carried in.
+/// Used to turn `received_at_nanos` into the epoch-seconds the ghost detector
+/// and its redial register agree on.
+const NANOS_PER_SEC_I64: i64 = 1_000_000_000;
 
 /// Counter: ILP flushes to QuestDB, by outcome.
 pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
@@ -4890,6 +4918,33 @@ async fn run_frame_drain(
                                     );
                                 }
                                 depth_refused = depth_refused.saturating_add(outcome.refused);
+                                // A ghost asks its socket to redial. The
+                                // register is cooled down per socket (180 s)
+                                // and taken by the connection task on its
+                                // next idle tick, so this is at most one
+                                // relaxed load and two stores per frame, and
+                                // the `error!` fires at most once per cooldown
+                                // per socket -- inherently throttled, no
+                                // power-of-two ladder needed.
+                                if outcome.ghost > 0
+                                    && tickvault_core::websocket::pool_supervisor::request_ghost_redial(
+                                        frame.connection_index,
+                                        received_at_nanos / NANOS_PER_SEC_I64,
+                                    )
+                                {
+                                    c.depth_ghost_redials.increment(1);
+                                    error!(
+                                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                        source = "unsubscribe_ignored",
+                                        connection_index = frame.connection_index,
+                                        endpoint = frame.endpoint.as_str(),
+                                        ghost_packets = outcome.ghost,
+                                        "a depth socket is still delivering an instrument it was told to \
+                                         unsubscribe more than the grace ago -- the unsubscribe was ignored \
+                                         or lost, so the socket is asked to redial and replay its current \
+                                         set (log-sink only; counted under `ghost` on the depth counter)"
+                                    );
+                                }
                             }
                             None => {
                                 depth_unconsumed = depth_unconsumed.saturating_add(1);
@@ -6007,6 +6062,11 @@ pub struct DepthFrameOutcome {
     pub refused: u64,
     /// Server-initiated disconnect packets seen on a depth socket.
     pub disconnects: u64,
+    /// Packets for an instrument this process dropped whose grace elapsed
+    /// (`DepthFrameClass::Ghost`). Non-zero asks the socket to redial.
+    pub ghost: u64,
+    /// Packets for an instrument dropped inside the grace window.
+    pub unsubscribed_grace: u64,
 }
 
 /// Depth capture state — the writer plus the reusable level buffer.
@@ -6672,6 +6732,32 @@ fn drain_depth_frame(
             c.depth_refused.increment(1);
             continue;
         };
+        // Ghost-instrument check (2026-09-08). One O(1) classification per
+        // PACKET, not per level: two lock-free loads and at most three hash
+        // probes, before the level loop so a ghost costs nothing extra per
+        // row. Replayed frames (`connection_index == u8::MAX`) are skipped:
+        // they were captured before the drop they would be judged against.
+        // The rows are STILL written -- the levels arrived, and "capture
+        // everything" is not suspended for an instrument we did not want;
+        // the verdict only counts, and asks the socket to redial.
+        if frame.connection_index != u8::MAX {
+            match crate::depth_subscription_view::global_depth_subscription_view().classify_raw(
+                header.security_id,
+                header.exchange_segment_code,
+                received_at_nanos / NANOS_PER_SEC_I64,
+            ) {
+                crate::depth_subscription_view::DepthFrameClass::Ghost => {
+                    out.ghost = out.ghost.saturating_add(1);
+                    c.depth_ghost.increment(1);
+                }
+                crate::depth_subscription_view::DepthFrameClass::RecentlyDropped => {
+                    out.unsubscribed_grace = out.unsubscribed_grace.saturating_add(1);
+                    c.depth_unsubscribed_grace.increment(1);
+                }
+                crate::depth_subscription_view::DepthFrameClass::Held
+                | crate::depth_subscription_view::DepthFrameClass::Unknown => {}
+            }
+        }
         for (idx, level) in levels.iter().enumerate() {
             // Price sanity, per level — the depth twin of `tick_price_is_sane`.
             //
@@ -8913,6 +8999,48 @@ async fn attach_depth_when_available(
                              undialed this attempt"
                         );
                     }
+                }
+            }
+
+            // ---- the previous session's close, validated against today ----
+            //
+            // 2026-09-08 (THIRD). Everything above chose index at-the-money
+            // contracts and the 2026-08-26 layout — the shapes the volume lock
+            // bans, kept only because pre-open has no volume to rank. The seed
+            // replaces the LEADING slots with what the sockets held at
+            // yesterday's close, after every row is checked against today's
+            // contract artifact (`depth_seed` names each refusal). Applied
+            // LAST so it overrides the fifth-socket pick too, and BEFORE the
+            // dial so `plan_pool` sees the seeded set. Re-applied on every
+            // attempt until depth dials, because `selection` is rebuilt each
+            // time; the file is the same, so the answer is the same.
+            if let Some(seed) = crate::depth_seed::read_depth_seed(&crate::depth_seed::seed_path())
+            {
+                match crate::dhan_contract_universe::read_contract_artifact(&today_date) {
+                    Ok(rows) => {
+                        let applied = crate::depth_seed::apply_depth_seed(
+                            &mut selection,
+                            &seed,
+                            &rows,
+                            ymd_from_ist_date(&today_date),
+                        );
+                        if applied.any_applied() {
+                            info!(
+                                seed_date = %applied.seed_date_ist,
+                                depth_200_seeded = applied.depth_200.applied,
+                                depth_20_seeded = applied.depth_20.applied,
+                                depth_200 = selection.depth_200.len(),
+                                depth_20 = selection.depth_20.len(),
+                                "depth: dialing from the previous session's close — the \
+                                 volume ranking takes over at its first sweep after 09:15"
+                            );
+                        }
+                    }
+                    Err(err) => tracing::debug!(
+                        %err,
+                        "depth seed present but today's contract artifact is unreadable — \
+                         nothing to validate against, dialing without the seed"
+                    ),
                 }
             }
         }
@@ -22003,9 +22131,10 @@ mod depth_rebalance_wiring_tests {
     ///
     /// Five sockets exist, so publishing 250 rows would hand the steering loop
     /// a wish-list it can never satisfy and make every divergence report read
-    /// as 245 unheld contracts every minute.
+    /// as 245 unheld contracts every minute. Since the hysteresis band the
+    /// bound is the entry set PLUS the band, never the whole board.
     #[test]
-    fn the_published_list_never_exceeds_the_depth200_socket_budget() {
+    fn the_published_list_never_exceeds_the_depth200_entry_set_plus_band() {
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
@@ -22017,10 +22146,10 @@ mod depth_rebalance_wiring_tests {
             .latest()
             .expect("published");
         assert!(
-            published.len() <= crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
-            "published {} for {} sockets",
+            published.len() <= crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
+            "published {} for {} entry slots plus band",
             published.len(),
-            crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET
+            crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS
         );
     }
 
