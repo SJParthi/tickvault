@@ -127,6 +127,20 @@ pub fn rupees_to_paise(rupees: f64) -> Option<i64> {
         return None;
     }
     let paise = (rupees * 100.0).round();
+    // The guard above is on RUPEES; this one is on PAISE, and they are not the
+    // same test. Any price in (0, 0.005) rounds to ZERO paise — a sub-subnormal
+    // f32, or a mis-framed packet whose bytes happen to decode small — and a
+    // zero is not a small price, it is the ABSENCE of one.
+    //
+    // Before the RAM store this could only ADD a key. Now the overlay does
+    // `prices.extend(ram)`, so a zero here OVERWRITES a good database price and
+    // the underlying's entire ladder disappears into `underlyings_without_spot`.
+    // Both consumers guard `spot <= 0`, so the failure is a silent absence
+    // rather than a wrong strike — which is the harmless direction and still
+    // not one to hand them.
+    if paise <= 0.0 {
+        return None;
+    }
     // 2^53 - 1: past this an f64 no longer represents consecutive integers,
     // so the rounded value is not the price any more.
     if paise > 9_007_199_254_740_991.0 {
@@ -379,6 +393,44 @@ mod tests {
         );
     }
 
+    /// A price too small to be ONE PAISE is an absence, not a small price —
+    /// and after the RAM overlay it can overwrite a good one.
+    ///
+    /// The guard at the top of `rupees_to_paise` is on RUPEES (`<= 0.0`); the
+    /// caller cares about PAISE. Every value in `(0, 0.005)` rounds to zero, so
+    /// before this test the function returned `Some(0)` for `0.004`, for a
+    /// subnormal `f32` widened to `f64`, and for `1e-300`.
+    ///
+    /// That was harmless while QuestDB was the only source: a zero could only
+    /// ADD a key. It stopped being harmless the moment the contract and depth
+    /// selectors started doing `prices.extend(ram)` — RAM wins on overlap, so
+    /// a zero paise from a mis-framed packet now REPLACES a good database price
+    /// and that underlying's whole ladder vanishes into `underlyings_without_spot`.
+    ///
+    /// Both consumers guard `spot <= 0`, so the outcome is a silent absence
+    /// rather than a wrong strike. That is the harmless direction and still not
+    /// one to hand them.
+    #[test]
+    fn record_refuses_a_price_too_small_to_be_one_paise() {
+        let store = SpotPriceStore::new();
+        for rupees in [0.004_f64, 0.0049, 1e-300, f64::from(1e-40_f32)] {
+            assert_eq!(
+                store.record(1, NSE_EQ, rupees),
+                RecordOutcome::RejectedValue,
+                "{rupees} rounds to ZERO paise — a zero is the absence of a \
+                 price, and with the RAM overlay it would overwrite a good one"
+            );
+            assert_eq!(
+                store.latest_paise(1, NSE_EQ),
+                None,
+                "a refused price must leave NOTHING behind, not a zero"
+            );
+        }
+        // The smallest value that IS a paise still lands, so the guard has not
+        // quietly become a floor on real prices. 0.005 rounds to 1.
+        assert_eq!(store.record(1, NSE_EQ, 0.005), RecordOutcome::Stored);
+        assert_eq!(store.latest_paise(1, NSE_EQ), Some(1));
+    }
     #[test]
     fn rupees_to_paise_is_the_same_conversion_the_database_path_uses() {
         // The anti-drift test. If these ever disagree the fallback centres

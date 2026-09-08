@@ -328,6 +328,198 @@ fn both_counters_are_in_the_emf_allowlist_or_the_alarms_watch_nothing() {
     }
 }
 
+/// No PROSE in the market-hours gate file may state how many alarms the gate
+/// arms — the `ALARM_NAMES` list is the only authority.
+///
+/// ## The defect this exists to prevent (2026-09-08)
+///
+/// The gate file carried a running commentary of counts, each correct on the
+/// day it was written and none updated when the next alarm joined:
+///
+/// ```text
+/// "The gate now arms 3 alarms"   "...4 alarms"   "...6 alarms"
+/// "...8 alarms"   "...11 alarms"   "the 2 gated alarms"
+/// ```
+///
+/// The real number was **12**. Worst of all, the `alarm_description` — the
+/// text an operator reads at 3am while the gate is broken — said "the 3
+/// gated alarms" and then named three by hand. Wrong by 4x, on the one
+/// surface where being wrong costs the most.
+///
+/// The fix is not a re-count. A re-count goes stale the same way, on the same
+/// schedule, and this file proves it did so six times. Every count is REMOVED
+/// and replaced with a pointer to `ALARM_NAMES`, and this test stops the next
+/// one being written.
+///
+/// Deliberately narrow: it bans a count of GATED ALARMS, not every digit in
+/// the file. Thresholds, cron fields, evaluation periods and dated history
+/// ("trimmed to 2 on 2026-07-17") are all legitimate numbers, and a guard that
+/// flagged them would be turned off within a week.
+#[test]
+fn no_prose_in_the_gate_file_states_how_many_alarms_it_arms() {
+    let root = repo_root();
+    let path = root.join("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    let text = fs::read_to_string(&path).expect("read market-hours-liveness-alarm.tf");
+
+    // The two present-tense shapes that ACTUALLY drifted, and only those.
+    //
+    // NARROWED after the first version produced THREE false positives on
+    // legitimate dated history: "the 3 new silent-feed alarms" (a join event),
+    // "the 4 Dhan-lane alarms left" (a departure), "Alarm count 23 -> 24" (a
+    // cost delta). None of those claims how big the gated set is NOW. A guard
+    // whose first act is a false positive teaches the reader that the cheapest
+    // fix is to delete it, so it must not fire on any of them.
+    fn states_a_current_count(lower: &str) -> bool {
+        // "arms 8 alarms" / "arms the 12 gated alarms"
+        let arms_n = lower.split(" arms ").skip(1).any(|rest| {
+            rest.split_whitespace()
+                .take(3)
+                .any(|w| w.chars().all(|c| c.is_ascii_digit()) && !w.is_empty())
+                && rest.contains("alarm")
+        });
+        // "the 2 gated alarms"
+        let n_gated = lower.split(" gated alarm").next().is_some_and(|before| {
+            before
+                .split_whitespace()
+                .next_back()
+                .is_some_and(|w| w.chars().all(|c| c.is_ascii_digit()) && !w.is_empty())
+        }) && lower.contains("gated alarm");
+        arms_n || n_gated
+    }
+
+    let mut offenders: Vec<String> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let lower = line.to_lowercase();
+        if !states_a_current_count(&lower) {
+            continue;
+        }
+        // Dated history is legitimate — it describes a past state, not the
+        // current one, and rewriting it would destroy the audit trail this
+        // repository keeps on purpose.
+        if lower.contains("retired")
+            || lower.contains("trimmed to")
+            || lower.contains("corrected")
+            || lower.contains("history")
+        {
+            continue;
+        }
+        offenders.push(format!("  line {}: {}", index + 1, line.trim()));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "market-hours-liveness-alarm.tf states a COUNT of gated alarms in prose:\n{}\n\n\
+         Six such counts drifted before 2026-09-08 and the operator-facing \
+         alarm_description was wrong by 4x. Point at ALARM_NAMES instead — it \
+         is the list the Lambda actually reads, so it cannot be wrong.",
+        offenders.join("\n")
+    );
+}
+
+/// The wal-dropped alarm's OPERATOR TEXT must name BOTH outcomes the counter
+/// covers, and the phrases it tells the operator to grep for must actually
+/// exist in the source that emits them.
+///
+/// ## The defect this exists to prevent (2026-09-08)
+///
+/// `tv_dhan_ws_wal_dropped_total` increments on `wal_refused`, and since
+/// 2026-09-05 that single condition resolves to TWO outcomes with materially
+/// different severity:
+///
+/// | outcome | ring | ticks reach the DB this session? |
+/// |---|---|---|
+/// | `CapturedLiveOnly` | took it | **YES** — only a crash before the next flush loses them |
+/// | `WalDropped` | refused it too | **NO** — the bytes were never written anywhere |
+///
+/// The counter's comment says it "keeps its exact previous meaning — the
+/// write-ahead queue refused this frame", which is right. The ALARM did not
+/// follow: its description asserted the WORSE outcome unconditionally —
+/// "the bytes were never written at all, so no replay, no backfill and no
+/// cross-verification can recover them" — for a counter whose common case
+/// under a stalled writer is the recoverable one. Its own source comment
+/// calls `CapturedLiveOnly` "the common one".
+///
+/// That is the same class the operator complained about on 2026-09-08 with
+/// three screenshots: a degrade arriving as an emergency. Here it arrives
+/// inside the alarm TEXT rather than the emoji, which is worse, because the
+/// text is what an operator reads at 3am to decide whether data is gone.
+///
+/// The counter is NOT re-scoped to total-loss-only, deliberately. Its meaning
+/// is documented at the emit site and a WAL refusal is worth paging on either
+/// way; re-scoping it would also break comparability with every prior
+/// session's numbers, which this file's siblings explicitly protect. The fix
+/// is that the page tells the truth about what it covers.
+#[test]
+fn the_wal_dropped_alarm_names_both_outcomes_it_actually_covers() {
+    let root = repo_root();
+    let tf = fs::read_to_string(root.join("deploy/aws/terraform/live-lane-alarms.tf"))
+        .expect("read live-lane-alarms.tf");
+
+    // Slice to THIS alarm. Without the slice the assertions below pass on any
+    // sibling alarm in the file that happens to carry the words — the vacuity
+    // this file's own header records learning the hard way.
+    let start = tf
+        .find("resource \"aws_cloudwatch_metric_alarm\" \"dhan_wal_dropped\"")
+        .expect("the dhan_wal_dropped alarm resource must exist");
+    let body = &tf[start..];
+    let end = body.find("\nresource ").map_or(body.len(), |offset| offset);
+    let alarm = &body[..end];
+
+    assert!(
+        alarm.contains("tv_dhan_ws_wal_dropped_total"),
+        "the sliced alarm is not the one that watches the WAL-drop counter"
+    );
+
+    // The distinguishing FIELD NAMES are what an operator greps for, so they
+    // are what the alarm must name — not a paraphrase of the two outcomes.
+    for phrase in ["degraded_on_this_socket", "lost_on_this_socket"] {
+        assert!(
+            alarm.contains(phrase),
+            "tv-<env>-dhan-wal-dropped's description does not name `{phrase}`.\n\
+             The counter covers a RECOVERABLE outcome and an UNRECOVERABLE one, \
+             and these two log fields are the only way to tell them apart. A \
+             description that names neither tells the operator data is gone \
+             when most of it reached the database."
+        );
+    }
+
+    assert!(
+        !alarm.contains("There is no second signal for this condition"),
+        "the description still claims there is no second signal.\n\
+         There is: the ring took the frame in the CapturedLiveOnly case and its \
+         ticks are folded and persisted. That sentence is what made the page \
+         over-state a degrade as total loss."
+    );
+
+    // The phrases are only useful if the emitter really writes them. A
+    // description pointing at a log line nobody logs is worse than no
+    // description, because the operator concludes the event did not happen.
+    let supervisor = production_text(&root.join("crates/core/src/websocket/pool_supervisor.rs"));
+    for (field, message) in [
+        (
+            "degraded_on_this_socket",
+            "write-ahead log refused a Dhan frame but the ring accepted",
+        ),
+        (
+            "lost_on_this_socket",
+            "write-ahead log refused a Dhan frame AND the ring refused",
+        ),
+    ] {
+        assert!(
+            supervisor.contains(field),
+            "pool_supervisor.rs no longer emits the `{field}` field that the \
+             alarm description tells the operator to grep for"
+        );
+        assert!(
+            compact(&supervisor).contains(&compact(message)),
+            "pool_supervisor.rs no longer logs the message the alarm quotes \
+             for `{field}`:\n  {message}\n\
+             Reword the alarm description in the SAME change, or the page \
+             sends the operator hunting for a line that does not exist."
+        );
+    }
+}
+
 /// The guard's own helpers, tested — because a guard whose text extraction is
 /// broken reports on a file it never really read. That is precisely how the
 /// first version of this file went vacuous.
