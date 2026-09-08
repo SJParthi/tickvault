@@ -197,6 +197,10 @@ const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
 /// enough that a genuinely dead SSM still fails the boot inside the
 /// start-watchdog's window.
 const API_BEARER_FETCH_MAX_ATTEMPTS: u32 = 3;
+/// Seconds before the second bearer-token fetch; doubles per attempt.
+/// Local to the shared-infra path on purpose: `build_shared_infra` may
+/// not name the Dhan REST stack (`per_feed_boot_isolation_guard`).
+const API_BEARER_FETCH_BACKOFF_SECS: u64 = 2;
 
 /// How many consecutive 30s stall scans must run with ZERO ticks observed
 /// before the starved-detector line fires.
@@ -3962,32 +3966,40 @@ async fn build_shared_infra(
     // Infra sweep row 12 (2026-09-08): this was ONE SSM call on the boot path
     // with no retry — a transient SSM throttle or a cold-start DNS blip at
     // 08:30 failed the whole boot, and the start-watchdog then paged for a
-    // box that had nothing wrong with it. Bounded: the REST stack's own
-    // backoff ladder, capped at `API_BEARER_FETCH_MAX_ATTEMPTS`, never
+    // box that had nothing wrong with it. Bounded: a local doubling
+    // backoff (`API_BEARER_FETCH_BACKOFF_SECS`), capped at `API_BEARER_FETCH_MAX_ATTEMPTS`, never
     // infinite (an SSM that is truly down must still fail the boot loudly).
-    let api_bearer_token = {
-        let mut attempt: u32 = 0;
-        loop {
-            attempt = attempt.saturating_add(1);
-            match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
-                Ok(token) => break token,
-                Err(err) if attempt < API_BEARER_FETCH_MAX_ATTEMPTS => {
-                    let wait =
-                        tickvault_app::dhan_rest_stack::dhan_rest_stack_backoff_secs(attempt);
-                    warn!(
-                        attempt,
-                        max = API_BEARER_FETCH_MAX_ATTEMPTS,
-                        retry_in_secs = wait,
-                        error = %err,
-                        "GAP-SEC-01: SSM fetch for the API bearer token failed — retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                }
-                Err(err) => {
-                    return Err(err).context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token after every retry — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`");
-                }
+    let mut bearer_from_retry = None;
+    let mut attempt: u32 = 1;
+    while attempt < API_BEARER_FETCH_MAX_ATTEMPTS {
+        match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
+            Ok(token) => {
+                bearer_from_retry = Some(token);
+                break;
+            }
+            Err(err) => {
+                let wait = API_BEARER_FETCH_BACKOFF_SECS << (attempt - 1).min(5);
+                warn!(
+                    attempt,
+                    max = API_BEARER_FETCH_MAX_ATTEMPTS,
+                    retry_in_secs = wait,
+                    error = %err,
+                    "GAP-SEC-01: SSM fetch for the API bearer token failed — retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                attempt = attempt.saturating_add(1);
             }
         }
+    }
+    // The FINAL attempt is written as the plain call so the api crate's
+    // ssm-only source pin (`test_main_rs_uses_ssm_only_no_env_fallback`)
+    // keeps finding the literal shape it scans for; retries above are
+    // additive and never introduce an env-var fallback.
+    let api_bearer_token = match bearer_from_retry {
+        Some(token) => token,
+        None => tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+            .await
+            .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token after every retry — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?,
     };
     info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
     // Operator sweep row 11 (2026-09-08): an EMPTY value disables bearer auth
