@@ -188,6 +188,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
     (
+        "tv_spot_price_store_refused_total",
+        "logged, and the guard cannot see it — the emit is `counter!(REFUSED_COUNTER).absolute(..)` inside `SpotPriceStore::publish_metrics`, the periodic fold that re-states every tally as an ABSOLUTE value from the 30-second drain arm, so the counter is published far from the site that increments the tally. The refusal itself is logged at that site: `record()` fires a coded `error!` (code=WS-GAP-03, source=spot_price_store_full, throttled to powers of two — noise-lock §2.3v) the moment a NEW instrument is refused past MAX_TRACKED_INSTRUMENTS, and the count is also carried on the drain's periodic summary line via `refusals()`. Recorded 2026-09-08 as its own row rather than by moving the log next to the absolute publish, which would log a running total every 30 s instead of the event. NOT EMF-shipped: the live spot universe is ~869 against a 25,000 cap, so the refusal needs the universe to grow ~29x first — which `dhan-contract-universe-failed` and the universe-collapse alarm already page on — and an EMF name is ~0.30 USD/mo against a September forecast of 142.24 with the automatic STOP_EC2_INSTANCES line at 135.00.",
+    ),
+    (
         "tv_tf_verify_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),

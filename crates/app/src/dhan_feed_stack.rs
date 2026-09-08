@@ -22324,6 +22324,12 @@ mod connection_delivery_tests {
         let now = 1_757_300_000_000_i64;
         publish_connection_deliveries(now);
         publish_connection_deliveries(now + 30_000);
+        // Publishing re-reads the same per-slot state the console reads:
+        // every one of the sixteen sockets is still reported afterwards.
+        assert_eq!(
+            connection_deliveries(now + 30_000).len(),
+            MAX_TOTAL_DHAN_CONNECTIONS as usize
+        );
     }
 
     /// A clock stepped backwards reads as age 0, never as a wrapped giant.

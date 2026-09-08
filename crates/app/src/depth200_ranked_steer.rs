@@ -361,10 +361,12 @@ mod tests {
     #[test]
     fn record_ranked_decision_accepts_every_shape() {
         record_ranked_decision(&RankedDecision::default());
-        record_ranked_decision(&plan_ranked_minute(
-            &[held(9001, IDX)],
-            &[candidate(1, 10, 500)],
-        ));
+        // An index option holding against one ranked stock option is exactly
+        // one swap and nothing kept; recording that shape must not change it.
+        let decision = plan_ranked_minute(&[held(9001, IDX)], &[candidate(1, 10, 500)]);
+        record_ranked_decision(&decision);
+        assert_eq!(decision.swaps.len(), 1);
+        assert_eq!(decision.kept, 0);
     }
 
     #[test]
