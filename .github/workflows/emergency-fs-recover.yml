@@ -63,6 +63,14 @@ on:
       confirm_instance_id:
         description: 'Type the EXACT prod instance id (i-...) to confirm.'
         required: true
+      force_market_hours:
+        description: 'Type "yes" to run INSIDE 09:00-15:45 IST Mon-Fri. Default refuses: this stops the app and drops the market-data tables mid-session.'
+        required: false
+        default: 'no'
+      force_disk_check:
+        description: 'Type "yes" to run even when the root filesystem is under 95% used. Default refuses: a not-full disk means this is the wrong tool.'
+        required: false
+        default: 'no'
 
 concurrency:
   group: emergency-fs-recover
@@ -86,6 +94,26 @@ jobs:
           if [ "$HAS_KEY" != "true" ] || [ "$HAS_SECRET" != "true" ]; then
             echo "::error::AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not set."
             exit 1
+          fi
+
+      # Operator sweep row 28 (2026-09-08): this workflow stops the app, deletes
+      # the WAL/spill backlog and DROPS ticks/market_depth/candles_*. Dispatched
+      # inside the session by mistake it ends the trading day. deploy-aws.yml has
+      # refused the same window since 2026-07-04; this mirrors that guard exactly
+      # (09:00-15:45 IST = 03:30-10:15 UTC, Mon-Fri) behind an explicit override.
+      - name: Refuse to run inside the trading session unless forced
+        env:
+          FORCE: ${{ inputs.force_market_hours }}
+        run: |
+          set -euo pipefail
+          HHMM=$(date -u +%H%M); DOW=$(date -u +%u)
+          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0330 ] && [ "$HHMM" -lt 1015 ]; then
+            if [ "$FORCE" = "yes" ]; then
+              echo "::warning::running INSIDE 09:00-15:45 IST on operator override — the app will stop and today's market-data tables will be dropped"
+            else
+              echo "::error::BLOCK: it is $(TZ='Asia/Kolkata' date +'%H:%M IST') on a weekday — this recovery stops the app and drops today's tables. Re-run with force_market_hours=yes only if the box is already dead."
+              exit 1
+            fi
           fi
 
       - name: Configure AWS credentials
@@ -127,11 +155,23 @@ jobs:
           echo "public ip $IP in $AZ"
 
       - name: Write the on-box recovery script
+        env:
+          FORCE_DISK: ${{ inputs.force_disk_check }}
         run: |
           set -euo pipefail
           cat > recover.sh <<'EOS'
           set -u
           echo "=== 0. before ==="; df -B1G / | tail -1
+          # Precondition (2026-09-08): this script is for a FULL root. On a box
+          # whose disk is fine it would still delete the backlog and drop every
+          # market-data table, so it refuses unless the disk is actually full
+          # or the operator forced it. Exit 3 is the "refused" code the caller
+          # treats as terminal (never retried as an sshd-not-ready failure).
+          USED_PCT=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+          if [ "${USED_PCT:-0}" -lt 95 ] && [ "__FORCE_DISK__" != "yes" ]; then
+            echo "REFUSED: root is ${USED_PCT:-?}% used, not full — this recovery deletes the WAL/spill backlog and DROPS the market-data tables. Re-run with force_disk_check=yes if you really mean it."
+            exit 3
+          fi
           echo "=== 1. stop + disable the app ==="
           sudo systemctl stop tickvault || true
           sudo systemctl disable tickvault || true
@@ -189,6 +229,7 @@ jobs:
           sleep 5; systemctl is-active amazon-ssm-agent || true
           echo "FINAL"; df -h / | tail -1
           EOS
+          sed -i "s/__FORCE_DISK__/${FORCE_DISK}/" recover.sh
           echo "script written ($(wc -l < recover.sh) lines)"
 
       - name: Push a 60-second key via EC2 Instance Connect and run the recovery
@@ -208,8 +249,13 @@ jobs:
               case "$OUT" in *UnauthorizedOperation*|*AccessDenied*) exit 1;; esac
               sleep 10; continue
             fi
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
-                   -i eic_key ec2-user@"$IP" 'bash -s' < recover.sh; then ok=1; break; fi
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
+                   -i eic_key ec2-user@"$IP" 'bash -s' < recover.sh; rc=$?
+            if [ "$rc" -eq 0 ]; then ok=1; break; fi
+            if [ "$rc" -eq 3 ]; then
+              echo "::error::the on-box precondition REFUSED (root filesystem is not full) — nothing was deleted or dropped. Re-run with force_disk_check=yes only if you mean it."
+              exit 1
+            fi
             echo "ssh attempt $attempt did not complete — sshd may still be starting; retrying in 15s"
             sleep 15
           done

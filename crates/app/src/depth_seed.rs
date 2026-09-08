@@ -103,12 +103,13 @@ const STOCK_OPTION_SEGMENT: ExchangeSegment = ExchangeSegment::NseFno;
 pub const SEED_COUNTER: &str = "tv_depth_seed_rows_total";
 
 /// Every label pair the counter can carry, for pre-registration at zero.
-pub const SEED_OUTCOMES: [&str; 5] = [
+pub const SEED_OUTCOMES: [&str; 6] = [
     "applied",
     "refused_unknown",
     "refused_not_stock_option",
     "refused_expired",
     "refused_segment",
+    "refused_identity_changed",
 ];
 
 /// Counter: whole-FILE outcomes that never reach the per-row tally, by
@@ -180,12 +181,55 @@ pub fn seed_path() -> std::path::PathBuf {
 /// One contract as persisted. Short field names for the same reason
 /// [`ContractRow`] uses them; there are at most 255 of these, so it is
 /// convention rather than size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SeedContract {
     /// The CONTRACT's own `security_id`.
     pub i: u64,
     /// The segment's wire byte — half of the I-P1-11 identity.
     pub g: u8,
+    /// The contract's expiry `YYYYMMDD` at capture time, or `0` when the
+    /// writer had no artifact to read it from (an older seed file, or an
+    /// unreadable artifact at the close). Dhan documents derivative ids as
+    /// UNSTABLE across days, so a bare id can name a different strike
+    /// tomorrow; `judge` compares this triple against today's row and
+    /// refuses a changed identity. At `0` the check is skipped — the
+    /// pre-2026-09-08 behaviour, never a fabricated refusal.
+    #[serde(default)]
+    pub e: u32,
+    /// Strike in paise at capture time, or `0` when unknown.
+    #[serde(default)]
+    pub s: i64,
+    /// Leg at capture time: [`LEG_CE`], [`LEG_PE`], or `0` when unknown.
+    #[serde(default)]
+    pub l: u8,
+}
+
+/// Leg code for a CE row, as persisted in [`SeedContract::l`].
+pub const LEG_CE: u8 = 1;
+/// Leg code for a PE row, as persisted in [`SeedContract::l`].
+pub const LEG_PE: u8 = 2;
+
+/// Maps the artifact's leg string to the persisted code; anything else is `0`.
+#[must_use]
+pub fn leg_code(leg: &str) -> u8 {
+    match leg {
+        "CE" => LEG_CE,
+        "PE" => LEG_PE,
+        _ => 0,
+    }
+}
+
+/// Contract identity `(expiry, strike_paise, leg)` by `security_id`, built once
+/// from today's artifact so the seed WRITER can stamp each held contract.
+/// O(rows) once per write, at the 15:40 close, cold.
+#[must_use]
+pub fn identity_index(rows: &[ContractRow]) -> HashMap<u64, (u32, i64, u8)> {
+    let mut index = HashMap::with_capacity(rows.len());
+    for r in rows {
+        // First write wins, matching `TodayIndex::build`.
+        index.entry(r.i).or_insert((r.e, r.s, leg_code(&r.l)));
+    }
+    index
 }
 
 /// What the depth pools held at the previous session's close.
@@ -201,14 +245,25 @@ pub struct DepthSeed {
 
 impl DepthSeed {
     /// Builds a seed from what the sockets hold right now.
-    pub fn from_holdings<A, B>(date_ist: &str, depth_200: A, depth_20: B) -> Self
+    ///
+    /// `identity` answers `(expiry, strike_paise, leg)` for a held id from
+    /// TODAY's artifact; `None` stamps zeros, which the reader treats as
+    /// "identity unknown, check skipped" rather than as a mismatch.
+    pub fn from_holdings<A, B, F>(date_ist: &str, depth_200: A, depth_20: B, identity: F) -> Self
     where
         A: IntoIterator<Item = SubscribeInstrument>,
         B: IntoIterator<Item = SubscribeInstrument>,
+        F: Fn(u64) -> Option<(u32, i64, u8)>,
     {
-        let to_seed = |i: SubscribeInstrument| SeedContract {
-            i: i.security_id,
-            g: i.segment.binary_code(),
+        let to_seed = |i: SubscribeInstrument| {
+            let (e, s, l) = identity(i.security_id).unwrap_or((0, 0, 0));
+            SeedContract {
+                i: i.security_id,
+                g: i.segment.binary_code(),
+                e,
+                s,
+                l,
+            }
         };
         Self {
             date_ist: date_ist.to_owned(),
@@ -310,6 +365,9 @@ pub struct SeedTally {
     pub refused_expired: usize,
     /// Rows not on the stock-option segment.
     pub refused_segment: usize,
+    /// Rows whose id names a DIFFERENT contract today (expiry, strike or leg
+    /// changed under a reused id).
+    pub refused_identity_changed: usize,
 }
 
 impl SeedTally {
@@ -318,6 +376,7 @@ impl SeedTally {
             .saturating_add(self.refused_not_stock_option)
             .saturating_add(self.refused_expired)
             .saturating_add(self.refused_segment)
+            .saturating_add(self.refused_identity_changed)
     }
 }
 
@@ -347,12 +406,14 @@ enum Verdict {
     NotStockOption,
     Expired,
     Segment,
+    IdentityChanged,
 }
 
 /// Today's artifact, indexed for O(1) seed validation.
 struct TodayIndex {
-    /// `security_id` → (is a stock-option CE/PE leg, expiry `YYYYMMDD`).
-    rows: HashMap<u64, (bool, u32)>,
+    /// `security_id` → (is a stock-option CE/PE leg, expiry `YYYYMMDD`,
+    /// strike paise, leg code).
+    rows: HashMap<u64, (bool, u32, i64, u8)>,
 }
 
 impl TodayIndex {
@@ -370,7 +431,9 @@ impl TodayIndex {
                 r.x == "NSE" && r.c == "OPTSTK" && (r.l == "CE" || r.l == "PE");
             // First write wins: the artifact should carry one row per id, and
             // if it did not, the FIRST row is the one every other reader sees.
-            index.entry(r.i).or_insert((is_stock_option_leg, r.e));
+            index
+                .entry(r.i)
+                .or_insert((is_stock_option_leg, r.e, r.s, leg_code(&r.l)));
         }
         Self { rows: index }
     }
@@ -379,11 +442,19 @@ impl TodayIndex {
         if seed.g != STOCK_OPTION_SEGMENT.binary_code() {
             return Verdict::Segment;
         }
-        let Some(&(is_leg, expiry)) = self.rows.get(&seed.i) else {
+        let Some(&(is_leg, expiry, strike, leg)) = self.rows.get(&seed.i) else {
             return Verdict::Unknown;
         };
         if !is_leg {
             return Verdict::NotStockOption;
+        }
+        // A stamped identity must match TODAY's row exactly: Dhan documents
+        // derivative ids as unstable across days, so the same id can name a
+        // different strike or leg tomorrow, and dialing it would put a socket
+        // on a contract nothing ranked. A zero stamp (older seed, or the
+        // writer had no artifact) skips the check rather than refusing.
+        if seed.e != 0 && (seed.e != expiry || seed.s != strike || seed.l != leg) {
+            return Verdict::IdentityChanged;
         }
         if expiry < today_ymd {
             return Verdict::Expired;
@@ -418,6 +489,9 @@ fn survivors(
             }
             Verdict::Expired => tally.refused_expired = tally.refused_expired.saturating_add(1),
             Verdict::Segment => tally.refused_segment = tally.refused_segment.saturating_add(1),
+            Verdict::IdentityChanged => {
+                tally.refused_identity_changed = tally.refused_identity_changed.saturating_add(1);
+            }
         }
     }
     out
@@ -512,6 +586,7 @@ fn record_seed_tally(pool: SeedPool, tally: SeedTally) {
         ("refused_not_stock_option", tally.refused_not_stock_option),
         ("refused_expired", tally.refused_expired),
         ("refused_segment", tally.refused_segment),
+        ("refused_identity_changed", tally.refused_identity_changed),
     ];
     for (outcome, n) in pairs {
         if n > 0 {
@@ -534,6 +609,7 @@ fn record_seed_tally(pool: SeedPool, tally: SeedTally) {
             refused_not_stock_option = tally.refused_not_stock_option,
             refused_expired = tally.refused_expired,
             refused_segment = tally.refused_segment,
+            refused_identity_changed = tally.refused_identity_changed,
             "depth seed: some of yesterday's holdings were refused against today's \
              contracts — the applied rows dial first, the refused ones fall back to the \
              dial's own choice (log-sink only; each reason is counted on the seed counter)"
@@ -612,6 +688,15 @@ mod tests {
         }
     }
 
+    /// A seed row carrying the identity `today()` gives that id, so a plain
+    /// `sc(id)` passes the identity check; ids `today()` does not know are
+    /// stamped zero (identity unknown).
+    fn sc(i: u64) -> SeedContract {
+        let ids = identity_index(&today());
+        let (e, s, l) = ids.get(&i).copied().unwrap_or((0, 0, 0));
+        SeedContract { i, g: FNO, e, s, l }
+    }
+
     fn today() -> Vec<ContractRow> {
         vec![
             row(101, "OPTSTK", "CE", 20_260_925),
@@ -630,11 +715,8 @@ mod tests {
         reset_boot_seeded_for_tests();
         let seed = DepthSeed {
             date_ist: "2026-09-07".into(),
-            depth_200: vec![
-                SeedContract { i: 101, g: FNO },
-                SeedContract { i: 102, g: FNO },
-            ],
-            depth_20: vec![SeedContract { i: 103, g: FNO }],
+            depth_200: vec![sc(101), sc(102)],
+            depth_20: vec![sc(103)],
         };
         let mut sel = DepthSelection {
             depth_200: vec![inst(9001), inst(9002), inst(9003), inst(9004), inst(9005)],
@@ -666,11 +748,11 @@ mod tests {
         let seed = DepthSeed {
             date_ist: "2026-09-07".into(),
             depth_200: vec![
-                SeedContract { i: 201, g: FNO }, // index option
-                SeedContract { i: 301, g: FNO }, // future
-                SeedContract { i: 401, g: FNO }, // expired
-                SeedContract { i: 999, g: FNO }, // unknown
-                SeedContract { i: 101, g: 0 },   // wrong segment
+                sc(201),                          // index option
+                sc(301),                          // future
+                sc(401),                          // expired
+                sc(999),                          // unknown
+                SeedContract { g: 0, ..sc(101) }, // wrong segment
             ],
             depth_20: vec![],
         };
@@ -696,10 +778,7 @@ mod tests {
         reset_boot_seeded_for_tests();
         let seed = DepthSeed {
             date_ist: "2026-09-07".into(),
-            depth_200: vec![
-                SeedContract { i: 101, g: FNO },
-                SeedContract { i: 101, g: FNO },
-            ],
+            depth_200: vec![sc(101), sc(101)],
             depth_20: vec![],
         };
         let mut sel = DepthSelection {
@@ -720,8 +799,20 @@ mod tests {
             .collect();
         let seed = DepthSeed {
             date_ist: "2026-09-07".into(),
-            depth_200: (1..=7).map(|i| SeedContract { i, g: FNO }).collect(),
-            depth_20: (1..=300).map(|i| SeedContract { i, g: FNO }).collect(),
+            depth_200: (1..=7)
+                .map(|i| SeedContract {
+                    i,
+                    g: FNO,
+                    ..SeedContract::default()
+                })
+                .collect(),
+            depth_20: (1..=300)
+                .map(|i| SeedContract {
+                    i,
+                    g: FNO,
+                    ..SeedContract::default()
+                })
+                .collect(),
         };
         let mut sel = DepthSelection::default();
         let applied = apply_depth_seed(&mut sel, &seed, &rows, 20_260_908);
@@ -737,7 +828,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tv-depth-seed-{}", std::process::id()));
         let path = dir.join("seed.json");
         assert!(read_depth_seed(&path).is_none(), "no file yet");
-        let seed = DepthSeed::from_holdings("2026-09-08", [inst(101), inst(102)], [inst(103)]);
+        let seed =
+            DepthSeed::from_holdings("2026-09-08", [inst(101), inst(102)], [inst(103)], |_| None);
         write_depth_seed(&path, &seed).expect("write");
         assert_eq!(read_depth_seed(&path), Some(seed));
         std::fs::write(&path, b"{ not json").expect("corrupt");
@@ -750,10 +842,118 @@ mod tests {
 
     #[test]
     fn from_holdings_carries_the_composite_key_and_is_empty_only_when_both_pools_are() {
-        let seed = DepthSeed::from_holdings("2026-09-08", [inst(101)], []);
-        assert_eq!(seed.depth_200, vec![SeedContract { i: 101, g: FNO }]);
+        let ids = identity_index(&today());
+        let seed =
+            DepthSeed::from_holdings("2026-09-08", [inst(101)], [], |i| ids.get(&i).copied());
+        assert_eq!(seed.depth_200, vec![sc(101)]);
+        assert_eq!(
+            seed.depth_200[0].l, LEG_CE,
+            "the leg is stamped from today's artifact"
+        );
         assert!(!seed.is_empty());
-        assert!(DepthSeed::from_holdings("2026-09-08", [], []).is_empty());
+        assert!(DepthSeed::from_holdings("2026-09-08", [], [], |_| None).is_empty());
+        let unstamped = DepthSeed::from_holdings("2026-09-08", [inst(101)], [], |_| None);
+        assert_eq!(
+            unstamped.depth_200[0],
+            SeedContract {
+                i: 101,
+                g: FNO,
+                e: 0,
+                s: 0,
+                l: 0
+            },
+            "no artifact at the close stamps zeros — identity unknown, never invented"
+        );
+    }
+
+    #[test]
+    fn a_reused_id_that_names_a_different_contract_today_is_refused_as_identity_changed() {
+        let _serialised = BOOT_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_boot_seeded_for_tests();
+        // Yesterday id 101 was the 1000-strike CE; today the same id names
+        // the 1050-strike PE. Dhan documents derivative ids as unstable, so
+        // this is a real shape, and dialing it would put a socket on a
+        // contract nothing ranked.
+        let seed = DepthSeed {
+            date_ist: "2026-09-07".into(),
+            depth_200: vec![
+                SeedContract {
+                    i: 101,
+                    g: FNO,
+                    e: 20_260_925,
+                    s: 105_000,
+                    l: LEG_CE,
+                },
+                SeedContract {
+                    i: 102,
+                    g: FNO,
+                    e: 20_260_925,
+                    s: 100_000,
+                    l: LEG_CE,
+                }, // leg flipped
+                SeedContract {
+                    i: 103,
+                    g: FNO,
+                    e: 20_261_030,
+                    s: 100_000,
+                    l: LEG_CE,
+                }, // expiry moved
+                sc(101), // matches
+            ],
+            depth_20: vec![SeedContract {
+                i: 103,
+                g: FNO,
+                e: 0,
+                s: 0,
+                l: 0,
+            }], // old-format seed
+        };
+        let mut sel = DepthSelection {
+            depth_200: vec![inst(9001)],
+            depth_20: vec![inst(8001)],
+            ..DepthSelection::default()
+        };
+        let applied = apply_depth_seed(&mut sel, &seed, &today(), 20_260_908);
+        assert_eq!(applied.depth_200.refused_identity_changed, 3);
+        assert_eq!(
+            applied.depth_200.applied, 1,
+            "the matching stamp is the only survivor"
+        );
+        assert_eq!(
+            applied.depth_20.applied, 1,
+            "a zero stamp is identity-unknown and is judged as before, never refused for it"
+        );
+        let ids: Vec<u64> = sel.depth_200.iter().map(|i| i.security_id).collect();
+        assert_eq!(ids, vec![101, 9001]);
+    }
+
+    #[test]
+    fn leg_code_maps_only_ce_and_pe() {
+        assert_eq!(leg_code("CE"), LEG_CE);
+        assert_eq!(leg_code("PE"), LEG_PE);
+        assert_eq!(leg_code(""), 0);
+        assert_eq!(leg_code("XX"), 0);
+        assert_eq!(
+            leg_code("ce"),
+            0,
+            "the artifact is upper-case; no case folding is invented"
+        );
+        assert_ne!(LEG_CE, LEG_PE);
+    }
+
+    #[test]
+    fn identity_index_is_first_write_wins_on_a_duplicate_id() {
+        let mut rows = today();
+        rows.push(row(101, "OPTSTK", "PE", 20_260_925)); // duplicate id, later row
+        let ids = identity_index(&rows);
+        assert_eq!(
+            ids.get(&101),
+            Some(&(20_260_925, 100_000, LEG_CE)),
+            "first write wins"
+        );
+        assert_eq!(ids.get(&102), Some(&(20_260_925, 100_000, LEG_PE)));
+        assert_eq!(ids.get(&301), Some(&(20_260_925, 100_000, 0)));
+        assert_eq!(ids.get(&999), None);
     }
 
     #[test]
@@ -768,7 +968,7 @@ mod tests {
     #[test]
     fn pre_register_seed_counters_covers_every_label() {
         pre_register_seed_counters();
-        assert_eq!(SEED_OUTCOMES.len(), 5);
+        assert_eq!(SEED_OUTCOMES.len(), 6);
         assert_eq!(SEED_FILE_OUTCOMES.len(), 3);
         for outcome in SEED_FILE_OUTCOMES {
             record_seed_file_outcome(outcome);
@@ -812,8 +1012,8 @@ mod tests {
         reset_boot_seeded_for_tests();
         let seed = DepthSeed {
             date_ist: "2026-08-01".into(),
-            depth_200: vec![SeedContract { i: 101, g: FNO }],
-            depth_20: vec![SeedContract { i: 103, g: FNO }],
+            depth_200: vec![sc(101)],
+            depth_20: vec![sc(103)],
         };
         let mut sel = DepthSelection {
             depth_200: vec![inst(9001)],
@@ -844,10 +1044,7 @@ mod tests {
         let rows = vec![bse, row(102, "OPTSTK", "PE", 20_260_925)];
         let seed = DepthSeed {
             date_ist: "2026-09-07".into(),
-            depth_200: vec![
-                SeedContract { i: 101, g: FNO },
-                SeedContract { i: 102, g: FNO },
-            ],
+            depth_200: vec![sc(101), sc(102)],
             depth_20: vec![],
         };
         let mut sel = DepthSelection::default();
@@ -888,9 +1085,11 @@ mod tests {
     /// The file-level outcome recorder takes only the three named labels and
     /// never panics without a recorder installed (the boot path calls it
     /// before metrics may be wired, and a seed problem must not take the boot
-    /// down with it).
+    /// down with it). The property proven here IS the absence of a panic --
+    /// there is no recorder to read back -- so the name says so, per the
+    /// assertion-free ratchet convention.
     #[test]
-    fn record_seed_file_outcome_accepts_every_named_label_without_a_recorder() {
+    fn record_seed_file_outcome_never_panics_without_a_recorder() {
         for outcome in SEED_FILE_OUTCOMES {
             record_seed_file_outcome(outcome);
         }

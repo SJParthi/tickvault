@@ -1266,6 +1266,27 @@ where
     json!({"sent": sent, "failures": failures, "records": records_len})
 }
 
+/// True when the batch had messages to send and NOT ONE reached Telegram.
+///
+/// Operator sweep row 24 (2026-09-08): `handle` returned `Ok` on this shape,
+/// so a dead bot token, a revoked chat, or a Telegram outage produced ZERO
+/// Lambda errors — the `*-errors` alarm on this function stayed green while
+/// every page in the account was being dropped on the floor. A partial
+/// failure stays `Ok` (SNS would otherwise redeliver the whole batch and
+/// re-page the ones that landed); a TOTAL failure is the one shape where a
+/// redelivery costs nothing and an error is the only signal that survives,
+/// because the alarm's own Telegram leg is the thing that is broken and its
+/// email fan-out is not.
+#[must_use]
+pub fn nothing_was_delivered(result: &Value) -> bool {
+    let sent = result.get("sent").and_then(Value::as_u64).unwrap_or(0);
+    let failures = result
+        .get("failures")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    sent == 0 && failures > 0
+}
+
 /// Fold + send composed — the testable end-to-end delivery seam the
 /// LambdaHandlerDelivery tests drive (the legacy runtime patched `lambda_handler`'s
 /// collaborators; the Rust seam injects the cache + transport instead).
@@ -1377,6 +1398,19 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         }
     })
     .await;
+
+    if nothing_was_delivered(&result) {
+        error!(
+            code = "LAMBDA-NOTIFY-01",
+            records = records.len(),
+            "not one message of this batch reached Telegram — failing the invocation so the \
+             function's Errors alarm can say so through its email leg"
+        );
+        return Err(Error::from(format!(
+            "telegram delivery failed for every message in the batch: {}",
+            result["failures"]
+        )));
+    }
 
     Ok(result)
 }
@@ -2143,6 +2177,27 @@ mod tests {
         .await;
         let texts = posted.lock().unwrap_or_else(|e| e.into_inner()).clone();
         (result, texts)
+    }
+
+    #[test]
+    fn nothing_was_delivered_is_true_only_for_a_total_failure() {
+        use super::nothing_was_delivered;
+        use serde_json::json;
+        assert!(nothing_was_delivered(
+            &json!({"sent": 0, "failures": ["http 401: x"], "records": 1})
+        ));
+        assert!(
+            !nothing_was_delivered(&json!({"sent": 1, "failures": ["http 429: y"], "records": 2})),
+            "a partial failure stays Ok — SNS would redeliver and re-page the ones that landed"
+        );
+        assert!(!nothing_was_delivered(
+            &json!({"sent": 2, "failures": [], "records": 2})
+        ));
+        assert!(
+            !nothing_was_delivered(&json!({"sent": 0, "failures": [], "records": 0})),
+            "an empty batch delivered nothing and failed nothing — not an error"
+        );
+        assert!(!nothing_was_delivered(&json!({"sent": 0, "skipped": 1})));
     }
 
     #[tokio::test]

@@ -1497,6 +1497,34 @@ pub fn build_spot_price_query(today_ist_nanos: i64) -> String {
 /// fields is skipped rather than failing the parse — one bad row must not cost
 /// the other seven hundred.
 pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String> {
+    let (map, collisions) = parse_symbol_map_counting_collisions(body)?;
+    if collisions > 0 {
+        // Identity sweep row 24 (2026-09-08): a symbol that resolves to TWO
+        // different (id, segment) pairs is the I-P1-11 class arriving through
+        // the mapping artifact — last-write-wins silently picked one, and
+        // every contract of that underlying was then priced off whichever
+        // row happened to come last. Still last-write-wins (the artifact's
+        // order is deterministic, so the choice is reproducible), but COUNTED
+        // and said once per parse, so a non-zero reading is the signal to
+        // look at the ISIN join rather than at the option ladder.
+        metrics::counter!("tv_dhan_contract_symbol_collisions_total").increment(collisions as u64);
+        tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "symbol_map_collision",
+            collisions,
+            "contract universe: {collisions} symbol(s) in the mapping artifact resolve to more \
+             than one (security_id, segment) — last row wins; check the ISIN join"
+        );
+    }
+    Ok(map)
+}
+
+/// [`parse_symbol_map`] with the number of symbols that mapped to a DIFFERENT
+/// `(security_id, segment)` than an earlier row. Pure, so the collision count
+/// is a unit test rather than a log line.
+pub fn parse_symbol_map_counting_collisions(
+    body: &str,
+) -> Result<(HashMap<String, (u64, u8)>, usize), String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Err("mapping artifact is not valid JSON".to_owned());
     };
@@ -1504,6 +1532,7 @@ pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String
         return Err("mapping artifact has no `mappings` array".to_owned());
     };
     let mut out = HashMap::with_capacity(rows.len());
+    let mut collisions: usize = 0;
     for row in rows {
         let (Some(symbol), Some(id), Some(seg)) = (
             row.get("symbol").and_then(serde_json::Value::as_str),
@@ -1515,10 +1544,15 @@ pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String
         };
         let Ok(seg) = u8::try_from(seg) else { continue };
         // A stock appears once per index it belongs to, so the same symbol
-        // arrives many times with the same id. Insert is idempotent.
-        out.insert(symbol.trim().to_uppercase(), (id, seg));
+        // arrives many times with the same id. Insert is idempotent for that
+        // shape; a DIFFERENT pair under the same symbol is a collision.
+        if let Some(previous) = out.insert(symbol.trim().to_uppercase(), (id, seg))
+            && previous != (id, seg)
+        {
+            collisions = collisions.saturating_add(1);
+        }
     }
-    Ok(out)
+    Ok((out, collisions))
 }
 
 /// Converts a QuestDB `/exec` dataset of `[security_id, segment, ltp]` into a
@@ -3506,6 +3540,40 @@ mod tests {
     fn a_malformed_price_response_is_an_error_not_an_empty_market() {
         assert!(parse_spot_prices("not json").is_err());
         assert!(parse_spot_prices(r#"{"columns":[]}"#).is_err());
+    }
+
+    #[test]
+    fn parse_symbol_map_counting_collisions_counts_only_a_symbol_that_changes_its_pair() {
+        // Identity sweep row 24 (2026-09-08): a stock appears once per index
+        // list with the SAME id — that is not a collision. The same symbol
+        // resolving to a DIFFERENT (id, segment) is, and last row wins.
+        let body = r#"{"mappings":[
+            {"symbol":"RELIANCE","security_id":2885,"exchange_segment":1},
+            {"symbol":"reliance ","security_id":2885,"exchange_segment":1},
+            {"symbol":"TCS","security_id":11536,"exchange_segment":1},
+            {"symbol":"TCS","security_id":99999,"exchange_segment":1},
+            {"symbol":"INFY","security_id":1594,"exchange_segment":1},
+            {"symbol":"INFY","security_id":1594,"exchange_segment":4}
+        ]}"#;
+        let (m, collisions) = parse_symbol_map_counting_collisions(body).expect("parses");
+        assert_eq!(
+            collisions, 2,
+            "TCS changed id, INFY changed segment; RELIANCE repeated"
+        );
+        assert_eq!(m.get("RELIANCE"), Some(&(2885, 1)));
+        assert_eq!(
+            m.get("TCS"),
+            Some(&(99999, 1)),
+            "last row wins, deterministically"
+        );
+        assert_eq!(m.get("INFY"), Some(&(1594, 4)));
+        assert_eq!(m.len(), 3);
+        let (_, none) = parse_symbol_map_counting_collisions(
+            r#"{"mappings":[{"symbol":"A","security_id":1,"exchange_segment":1}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(none, 0);
+        assert!(parse_symbol_map_counting_collisions("not json").is_err());
     }
 
     #[test]

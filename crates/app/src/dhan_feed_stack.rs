@@ -88,7 +88,8 @@ use secrecy::ExposeSecret;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-    MAX_PLAUSIBLE_LTP, SPOT_1M_REST_INDICES, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    HEADER_OFFSET_MESSAGE_LENGTH, MAX_PLAUSIBLE_LTP, SPOT_1M_REST_INDICES,
+    TICK_PERSIST_END_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
@@ -875,6 +876,16 @@ pub const INGEST_TICKS_COUNTER: &str = "tv_dhan_feed_ingest_ticks_total";
 /// Counter: ticks the aggregator refused, labelled by reason.
 pub const INGEST_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_refused_total";
 
+/// Counter: ticks on the stock-option UNDERLYING segment whose `day_close`
+/// field disagreed with the previous close already held for that instrument.
+///
+/// Zero on a healthy day by the vendor's own definition — the previous close
+/// is constant through a session. Non-zero means the first packet of the day
+/// carried a corrupt value (which first-write-wins then held all session) or a
+/// later one did; either is a number the gainer filter's `not_gainer` tally
+/// cannot distinguish from an ordinary down day. Local `/metrics` only.
+pub const PREV_CLOSE_DISAGREEMENT_COUNTER: &str = "tv_prev_close_store_tick_disagreement_total";
+
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
 /// # Why this function exists at all — the two-atomic hazard
@@ -1120,6 +1131,15 @@ pub struct LiveIngest {
     /// the only place the packet is seen, and because a store reached through
     /// `&mut self` on a single-owner path needs no concurrent map.
     prev_close: crate::prev_close_store::PrevCloseStore,
+    /// Ticks on the underlying segment whose `day_close` DISAGREED with the
+    /// previous close already held for that instrument. Zero on a healthy
+    /// day by the vendor's own definition of the field. Read by the periodic
+    /// drain log line; the pre-resolved counter beside it is the same number
+    /// for `/metrics`.
+    prev_close_disagreements: u64,
+    /// Pre-resolved handle for [`PREV_CLOSE_DISAGREEMENT_COUNTER`], so the
+    /// per-tick path pays one atomic add and never a registry lookup.
+    prev_close_disagreement_counter: metrics::Counter,
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1564,11 +1584,27 @@ impl LiveIngest {
             rescue_thread: None,
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
+            prev_close_disagreements: 0,
+            // Resolved once here and seeded at zero, so the series exists
+            // before its first real sample (the agent drops the first sample
+            // of a series it has never seen).
+            prev_close_disagreement_counter: {
+                let c = metrics::counter!(PREV_CLOSE_DISAGREEMENT_COUNTER);
+                c.increment(0);
+                c
+            },
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             replaying_wal: false,
             top_volume: None,
         }
+    }
+
+    /// Ticks whose `day_close` disagreed with the previous close already held
+    /// for that instrument this session. Zero on a healthy day.
+    #[must_use]
+    pub const fn prev_close_disagreements(&self) -> u64 {
+        self.prev_close_disagreements
     }
 
     /// The previous-close store, for the gainer-eligibility filter.
@@ -2626,10 +2662,24 @@ impl LiveIngest {
         if !close.is_finite() || close <= 0.0 {
             return;
         }
-        if self.prev_close.get(tick.security_id, segment).is_some() {
+        let widened = tickvault_common::price_precision::f32_to_f64_clean(close);
+        if let Some(held) = self.prev_close.get(tick.security_id, segment) {
+            // First write wins, so a later packet that DISAGREES is not
+            // applied — but it is counted (identity sweep rows 20/21,
+            // 2026-09-08). A wrong first value mis-classifies every strike of
+            // that stock as not-a-gainer for the whole session, and the only
+            // visible symptom was a `not_gainer` tally that reads like an
+            // ordinary down day. The field is constant through a session by
+            // the vendor's own definition, so a non-zero reading here is a
+            // corrupt first packet or a corrupt later one — either way a
+            // number worth having. One f64 compare per tick on the underlying
+            // segment; no allocation.
+            if held != widened {
+                self.prev_close_disagreements = self.prev_close_disagreements.saturating_add(1);
+                self.prev_close_disagreement_counter.increment(1);
+            }
             return;
         }
-        let widened = tickvault_common::price_precision::f32_to_f64_clean(close);
         let _ = self.prev_close.record(tick.security_id, segment, widened);
     }
 
@@ -3274,6 +3324,18 @@ pub struct DrainCounters {
     /// to stop redialling (once per socket per session).
     depth_ghost_exhausted: metrics::Counter,
     truncated: metrics::Counter,
+    /// Main-feed packets whose vendor-stamped `message_length` (header bytes
+    /// 1..3, LE u16) disagreed with the fixed size the walk used. Counter
+    /// only — the fixed table is what the parser trusts, and acting on the
+    /// stamp would be the resync-on-a-guess this walk refuses. Market sweep
+    /// row 27 (2026-09-08): the depth path has counted this disagreement since
+    /// 2026-08-15; the main feed never read the field at all, so a vendor
+    /// layout change or a mis-aligned walk was indistinguishable from a clean
+    /// session. Whether Dhan's stamp equals the packet size for EVERY code is
+    /// UNVERIFIED-LIVE; the first session's reading is the answer, and a
+    /// constant non-zero rate means the stamp semantics differ, not that
+    /// packets are wrong.
+    main_feed_length_mismatch: metrics::Counter,
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
     abandoned_bytes: metrics::Counter,
@@ -3348,6 +3410,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_ghost_redials: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_redial"),
         depth_ghost_exhausted: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_exhausted"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
+        main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
         xverify_vacuous: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "vacuous"),
@@ -5829,6 +5892,26 @@ pub fn drain_main_feed_frame(
             out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
             return out;
         }
+        // The vendor's own length stamp, compared and COUNTED, never acted on
+        // (see `DrainCounters::main_feed_length_mismatch`). Two byte reads and
+        // one compare per packet; `end <= len` above guarantees both bytes
+        // exist, and `get` keeps the walk panic-free regardless.
+        let stamped = u16::from_le_bytes([
+            frame
+                .bytes
+                .get(offset + HEADER_OFFSET_MESSAGE_LENGTH)
+                .copied()
+                .unwrap_or(0),
+            frame
+                .bytes
+                .get(offset + HEADER_OFFSET_MESSAGE_LENGTH + 1)
+                .copied()
+                .unwrap_or(0),
+        ]);
+        if usize::from(stamped) != len {
+            c.main_feed_length_mismatch.increment(1);
+            out.length_mismatch = out.length_mismatch.saturating_add(1);
+        }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
             Ok(parsed @ (ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
                 // Full mode carries 5 levels of bid/ask in EVERY tick packet.
@@ -6103,6 +6186,10 @@ pub struct FrameOutcome {
     pub disconnects: u64,
     /// Packets refused by the parser or by an unknown response code.
     pub unparseable: u64,
+    /// Packets whose vendor-stamped `message_length` disagreed with the fixed
+    /// size the walk used. The packet is STILL decoded on the fixed size;
+    /// this is a measurement of the stamp, not a refusal.
+    pub length_mismatch: u64,
     /// Depth rows appended from the 5 levels carried INLINE in Full-mode tick
     /// packets. Zero unless the ingest was built with
     /// [`LiveIngest::with_inline_depth`] — which the production boot site does
@@ -16286,6 +16373,72 @@ mod tests {
     }
 
     #[test]
+    fn prev_close_disagreements_count_a_later_packet_that_contradicts_the_first_and_never_apply_it()
+    {
+        // Identity sweep rows 20/21 (2026-09-08): the previous close is
+        // constant through a session by the vendor's own definition, so the
+        // store is first-write-wins. Before this counter a contradicting later
+        // packet was silently ignored, and a corrupt FIRST packet
+        // mis-classified every strike of that stock for the whole day with no
+        // number anywhere saying so.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+        let tick = |close: f32| ParsedTick {
+            security_id: 2885,
+            exchange_segment_code: segment.binary_code(),
+            day_close: close,
+            ..Default::default()
+        };
+
+        assert_eq!(ingest.prev_close_disagreements(), 0);
+
+        // First write wins and is not a disagreement with anything.
+        ingest.record_prev_close_from_tick(&tick(1_402.35));
+        assert_eq!(ingest.prev_close_disagreements(), 0);
+
+        // The same value again is agreement, not a disagreement.
+        ingest.record_prev_close_from_tick(&tick(1_402.35));
+        assert_eq!(ingest.prev_close_disagreements(), 0);
+
+        // A contradicting later value is COUNTED and NOT applied.
+        ingest.record_prev_close_from_tick(&tick(1_399.00));
+        assert_eq!(ingest.prev_close_disagreements(), 1);
+        ingest.record_prev_close_from_tick(&tick(0.0));
+        assert_eq!(
+            ingest.prev_close_disagreements(),
+            1,
+            "a Ticker-mode 0.0 is the documented absent sentinel, not a disagreement"
+        );
+        ingest.record_prev_close_from_tick(&tick(f32::NAN));
+        assert_eq!(
+            ingest.prev_close_disagreements(),
+            1,
+            "a NaN is refused before the compare"
+        );
+        ingest.record_prev_close_from_tick(&tick(1_500.00));
+        assert_eq!(ingest.prev_close_disagreements(), 2);
+
+        // The held value is still the FIRST one.
+        let held = ingest
+            .prev_close
+            .get(2885, segment)
+            .expect("the first write must still be held");
+        assert!(
+            (held - 1_402.35).abs() < 1e-6,
+            "first write wins: a contradicting later packet must never replace it, held {held}"
+        );
+
+        // An instrument on another segment never reaches the store or the counter.
+        ingest.record_prev_close_from_tick(&ParsedTick {
+            security_id: 2885,
+            exchange_segment_code: 0,
+            day_close: 9_999.0,
+            ..Default::default()
+        });
+        assert_eq!(ingest.prev_close_disagreements(), 2);
+    }
+
+    #[test]
     fn test_unusable_ticks_are_still_refused_outright() {
         // The other half of the same change, and the one that keeps it honest:
         // widening the out-of-session path must NOT widen the others. A tick
@@ -21519,6 +21672,45 @@ mod frame_walk_accounting_tests {
              behind it were thrown away — reporting 1 here is what made a \
              large loss look like a small one. outcome={out:?}"
         );
+    }
+
+    /// Market sweep row 27 (2026-09-08): the vendor's own length stamp is
+    /// COUNTED when it disagrees with the fixed size, and the packet is still
+    /// decoded on the fixed size — the stamp is a measurement, never a resync.
+    #[test]
+    fn a_vendor_length_stamp_that_disagrees_is_counted_and_the_packet_still_folds() {
+        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let mut lying = ticker_packet(13, 100.5, ANY_LTT);
+        lying[1] = 15; // vendor says 15 bytes; the ticker layout is 16
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&lying);
+        bytes.extend_from_slice(&good);
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+        assert_eq!(
+            out.length_mismatch, 1,
+            "exactly the lying packet is counted"
+        );
+        assert_eq!(out.folded, 3, "all three still fold on the fixed size");
+        assert_eq!(
+            out.abandoned_bytes, 0,
+            "a stamp disagreement abandons nothing"
+        );
+        assert_eq!(out.unparseable, 0);
     }
 
     /// Non-vacuity: a frame that decodes cleanly must abandon NOTHING, or the

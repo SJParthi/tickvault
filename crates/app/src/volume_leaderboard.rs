@@ -1072,8 +1072,28 @@ pub fn eligible_gain_pct(ltp: f64, prev_close: f64) -> Option<f64> {
         return None;
     }
     let pct = (ltp - prev_close) / prev_close * 100.0;
-    pct.is_finite().then_some(pct)
+    // Finite is not the same as plausible. A previous close of 0.01 against
+    // a 240-rupee LTP yields +2,400,000% — finite, sortable, and nonsense —
+    // and it was persisted as a DOUBLE until 2026-09-08 (identity sweep row
+    // 22). No NSE stock or option moves ten-fold in a session against its
+    // own previous close; a value past the bound is a corrupt input, not a
+    // move, and is refused the same way a NaN is.
+    if pct.is_finite() && pct.abs() <= MAX_PLAUSIBLE_GAIN_PCT {
+        Some(pct)
+    } else {
+        None
+    }
 }
+
+/// The widest percent move against the previous close that is treated as a
+/// real reading rather than a corrupt previous close.
+///
+/// 1,000% is a ten-fold move in one session. Stocks with F&O have no daily
+/// circuit band, but a ten-fold move has never happened on the NSE cash
+/// segment in a session, and deep-out-of-the-money OPTIONS — which can move
+/// that far — are not what this function is fed: the gainer verdict reads
+/// the UNDERLYING's spot against the underlying's previous close.
+pub const MAX_PLAUSIBLE_GAIN_PCT: f64 = 1_000.0;
 
 #[cfg(test)]
 mod tests {
@@ -1879,6 +1899,30 @@ mod tests {
         assert_eq!(eligible_gain_pct(100.0, -1.0), None, "negative prev close");
         assert_eq!(eligible_gain_pct(f64::INFINITY, 100.0), None);
         assert_eq!(eligible_gain_pct(100.0, f64::INFINITY), None);
+        // Identity sweep row 22 (2026-09-08): finite but impossible. A
+        // previous close of one paisa against a 240-rupee print is a corrupt
+        // input, and it used to persist as +2,400,000%.
+        assert_eq!(
+            eligible_gain_pct(240.0, 0.01),
+            None,
+            "a corrupt previous close"
+        );
+        let crash = eligible_gain_pct(0.01, 240.0)
+            .expect("a real crash to one paisa is inside the bound and is kept");
+        assert!(
+            (crash - (-99.995_833_333_333_33)).abs() < 1e-9,
+            "a crash is a large NEGATIVE move, never refused for size alone: {crash}"
+        );
+        assert_eq!(
+            eligible_gain_pct(100.0 + MAX_PLAUSIBLE_GAIN_PCT, 100.0),
+            Some(MAX_PLAUSIBLE_GAIN_PCT),
+            "the bound itself is admitted"
+        );
+        assert_eq!(
+            eligible_gain_pct(100.0 + MAX_PLAUSIBLE_GAIN_PCT + 1.0, 100.0),
+            None,
+            "one percent past the bound is refused"
+        );
     }
 
     #[test]

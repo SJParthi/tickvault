@@ -1722,10 +1722,27 @@ fn write_tomorrows_seed(
     sockets: &[RebalanceSocket],
     depth20: &[crate::depth20_track::Depth20LiveSocket],
 ) {
+    // Stamp each held contract with today's (expiry, strike, leg) so tomorrow's
+    // boot refuses an id that has come to mean a different contract overnight
+    // (Dhan documents derivative ids as unstable). An unreadable artifact
+    // stamps zeros — identity unknown — and the seed is still written, so the
+    // pre-2026-09-08 behaviour is the floor, never a lost seed.
+    let identities = match crate::dhan_contract_universe::read_contract_artifact(date_ist) {
+        Ok(rows) => crate::depth_seed::identity_index(&rows),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "depth rebalance: today's contract artifact is unreadable at the close — \
+                 the dial seed is written without contract identities"
+            );
+            std::collections::HashMap::new()
+        }
+    };
     let seed = crate::depth_seed::DepthSeed::from_holdings(
         date_ist,
         sockets.iter().filter_map(|s| s.held),
         depth20.iter().flat_map(|s| s.held.iter().copied()),
+        |id| identities.get(&id).copied(),
     );
     if seed.is_empty() {
         return;

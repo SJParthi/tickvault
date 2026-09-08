@@ -191,6 +191,13 @@ const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 300;
 /// Poll cadence for the boot-completed feed-liveness wait.
 const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
 
+/// Attempts at the boot-time SSM read of the API bearer token before the boot
+/// fails loudly (infra sweep row 12, 2026-09-08). Three is the REST stack's
+/// own shape: enough to ride out a throttle or a cold-start DNS blip, few
+/// enough that a genuinely dead SSM still fails the boot inside the
+/// start-watchdog's window.
+const API_BEARER_FETCH_MAX_ATTEMPTS: u32 = 3;
+
 /// How many consecutive 30s stall scans must run with ZERO ticks observed
 /// before the starved-detector line fires.
 ///
@@ -3952,10 +3959,63 @@ async fn build_shared_infra(
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
     );
-    let api_bearer_token = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
-        .await
-        .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+    // Infra sweep row 12 (2026-09-08): this was ONE SSM call on the boot path
+    // with no retry — a transient SSM throttle or a cold-start DNS blip at
+    // 08:30 failed the whole boot, and the start-watchdog then paged for a
+    // box that had nothing wrong with it. Bounded: the REST stack's own
+    // backoff ladder, capped at `API_BEARER_FETCH_MAX_ATTEMPTS`, never
+    // infinite (an SSM that is truly down must still fail the boot loudly).
+    let api_bearer_token = {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
+                Ok(token) => break token,
+                Err(err) if attempt < API_BEARER_FETCH_MAX_ATTEMPTS => {
+                    let wait =
+                        tickvault_app::dhan_rest_stack::dhan_rest_stack_backoff_secs(attempt);
+                    warn!(
+                        attempt,
+                        max = API_BEARER_FETCH_MAX_ATTEMPTS,
+                        retry_in_secs = wait,
+                        error = %err,
+                        "GAP-SEC-01: SSM fetch for the API bearer token failed — retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                }
+                Err(err) => {
+                    return Err(err).context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token after every retry — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`");
+                }
+            }
+        }
+    };
     info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
+    // Operator sweep row 11 (2026-09-08): an EMPTY value disables bearer auth
+    // entirely — `ApiAuthConfig::from_token` documents that main.rs "halts in
+    // live mode rather than silently disabling", and until today nothing
+    // here did. The feed toggle is bearer-gated unconditionally precisely
+    // because port 3001 is publicly funnelled; an empty token on a live box
+    // is an open switch on the internet, so live mode refuses to boot on it.
+    // Paper mode keeps the documented dev passthrough, said out loud.
+    let bearer_token_is_empty = {
+        use secrecy::ExposeSecret as _;
+        api_bearer_token.expose_secret().is_empty()
+    };
+    if bearer_token_is_empty {
+        if config.strategy.dry_run {
+            error!(
+                code = "GAP-SEC-01",
+                "the API bearer token in SSM is EMPTY — bearer auth is DISABLED for this paper-mode \
+                 session and every /api route including the feed toggle is open; store a token via \
+                 `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`"
+            );
+        } else {
+            anyhow::bail!(
+                "GAP-SEC-01: the API bearer token in SSM is EMPTY and this is LIVE mode — refusing to \
+                 boot with bearer auth disabled on a publicly funnelled port"
+            );
+        }
+    }
     let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
     // W2#7 (2026-07-10): supervised SSM re-read loop (slow-boot mirror of
     // the fast-arm spawn above) — token rotation without restart; fail-open
