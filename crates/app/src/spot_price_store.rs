@@ -596,7 +596,7 @@ mod tests {
     /// keeps delivering, so an OLD frame can arrive AFTER a newer one — and
     /// RAM wins over the database on every overlap.
     #[test]
-    fn an_older_trade_time_never_overwrites_a_fresher_price() {
+    fn latest_exchange_secs_keeps_the_fresher_trade_when_an_older_frame_replays() {
         let s = store();
         assert_eq!(
             s.record(2885, NSE_EQ, 1240.00, T0 + 60),
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn the_day_gate_admits_the_first_second_of_today_and_refuses_the_last_of_yesterday() {
+    fn for_trading_day_admits_the_first_second_of_today_and_refuses_the_last_of_yesterday() {
         // IST midnight of DAY, as UTC epoch seconds.
         let midnight_ist_utc =
             u32::try_from(DAY * i64::from(SECONDS_PER_DAY) - IST_UTC_OFFSET_SECONDS_I64)
@@ -790,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_prices_and_moves_the_day_gate_forward() {
+    fn reset_for_trading_day_clears_prices_and_moves_the_day_gate_forward() {
         let s = store();
         s.record(2885, NSE_EQ, 1234.55, T0);
         s.reset_for_trading_day(DAY + 1);
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_metrics_restates_absolute_tallies_without_double_counting() {
+    fn refusals_are_absolute_tallies_that_publish_metrics_never_double_counts() {
         let s = store();
         s.record(1, NSE_EQ, -1.0, T0);
         s.record(1, NSE_EQ, -1.0, T0);

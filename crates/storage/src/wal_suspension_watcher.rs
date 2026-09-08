@@ -1987,7 +1987,7 @@ mod tests {
     /// An empty 2xx while tables are latched is a server mid-restart, and the
     /// caller must skip it rather than evict everything.
     #[test]
-    fn an_empty_poll_while_latched_is_suspicious_not_a_mass_recovery() {
+    fn is_suspicious_empty_flags_an_empty_poll_while_latched_not_a_mass_recovery() {
         let mut t = WalLagTracker::new();
         assert!(
             !t.is_suspicious_empty(&[]),

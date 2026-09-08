@@ -426,13 +426,13 @@ pub const CONN_INSTRUMENTS_HELD_GAUGE: &str = "tv_dhan_ws_conn_instruments";
 ///
 /// Zero on dial and on park: until the subscribe is acked the wire carries
 /// nothing, however many instruments the guard retains for replay — and the
-/// gauge reports the wire, not the intent. Cold path only (confirm, top-up,
-/// dial, park), so the labelled-key allocation is acceptable here and would
-/// not be on the frame drain.
+/// gauge reports the wire, not the intent. Cold path (confirm, top-up, dial,
+/// park); the labels are compile-time constants, so even here nothing
+/// allocates for them.
 pub(crate) fn publish_connection_instruments(slot: &ConnectionSlot, held: usize) {
     metrics::gauge!(
         CONN_INSTRUMENTS_HELD_GAUGE,
-        "connection" => slot.global_index.to_string(),
+        "connection" => super::pool_budget::connection_slot_label(slot.global_index),
         "endpoint" => slot.endpoint.as_str()
     )
     .set(held as f64);
@@ -4375,6 +4375,55 @@ mod tests {
         RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
         SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
+
+    /// `tv_dhan_ws_conn_instruments` is what the operator console reads to
+    /// show how many instruments each of the sixteen sockets holds on the
+    /// wire. A gauge that is published from only some of the transitions
+    /// reads as a stale count during the ones it skips — a parked socket
+    /// still "holding 50" is the false-OK class. This pins every place the
+    /// held set can change: the confirmed subscribe, the top-up success arm,
+    /// the dial (nothing held yet) and the park (nothing held any more).
+    #[test]
+    fn publish_connection_instruments_is_called_at_every_held_set_transition() {
+        let src = include_str!("pool_supervisor.rs");
+        let calls = src
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("publish_connection_instruments(&supervisor.slot(),")
+            })
+            .count();
+        assert!(
+            calls >= 4,
+            "expected the gauge to be published at ≥4 held-set transitions, found {calls}"
+        );
+        let zeroed = src
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("publish_connection_instruments(&supervisor.slot(), 0)")
+            })
+            .count();
+        assert_eq!(
+            zeroed, 2,
+            "dial and park must each publish 0 so a dead socket never reads as holding instruments"
+        );
+        let sized = src
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("publish_connection_instruments(&supervisor.slot(), guard.len())")
+            })
+            .count();
+        assert_eq!(
+            sized, 2,
+            "the confirmed subscribe and the top-up arm must publish the live held count"
+        );
+        assert!(
+            src.contains("CONN_INSTRUMENTS_HELD_GAUGE: &str = \"tv_dhan_ws_conn_instruments\""),
+            "the gauge name the console greps for must not drift"
+        );
+    }
 
     fn si(id: u64) -> SubscribeInstrument {
         SubscribeInstrument {

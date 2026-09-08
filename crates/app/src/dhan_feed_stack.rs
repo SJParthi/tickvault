@@ -109,7 +109,7 @@ use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
 };
 use tickvault_core::websocket::pool_budget::{
-    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
+    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, connection_slot_label,
 };
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, ExtendOutcome, FrameSilenceGate, LiveSubscriptionCommand,
@@ -7025,8 +7025,8 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
 /// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot.
 ///
 /// Called from the drain's 30-second timer arm beside the worst-socket gauge.
-/// The labelled handles are resolved ONCE (sixteen `to_string()` calls, at
-/// first publish) and reused — the same discipline `WsLagHandles` applies to
+/// The labelled handles are resolved ONCE (at first publish, from the
+/// compile-time slot labels) and reused — the same discipline `WsLagHandles` applies to
 /// the per-tick histogram, kept here even though this path is cold, so a
 /// future move onto a hotter timer cannot quietly start allocating.
 pub fn publish_connection_deliveries(now_millis: i64) {
@@ -7039,12 +7039,12 @@ pub fn publish_connection_deliveries(now_millis: i64) {
                 (
                     metrics::gauge!(
                         CONN_TICK_AGE_GAUGE,
-                        "connection" => slot.to_string(),
+                        "connection" => connection_slot_label(slot),
                         "endpoint" => endpoint
                     ),
                     metrics::gauge!(
                         CONN_FRAMES_GAUGE,
-                        "connection" => slot.to_string(),
+                        "connection" => connection_slot_label(slot),
                         "endpoint" => endpoint
                     ),
                 )
@@ -22218,7 +22218,7 @@ mod connection_delivery_tests {
     /// The tiling is `DhanEndpointType::ALL` order: 5 main-feed, 5 depth-20,
     /// 5 depth-200, 1 order-update. A slot past the ceiling is nobody's.
     #[test]
-    fn every_slot_maps_to_the_pool_that_dials_it() {
+    fn endpoint_for_slot_maps_every_slot_to_the_pool_that_dials_it() {
         for slot in 0..MAX_TOTAL_DHAN_CONNECTIONS {
             let endpoint = endpoint_for_slot(slot).expect("every slot under the ceiling is tiled");
             let start = endpoint.jitter_base();
@@ -22242,7 +22242,7 @@ mod connection_delivery_tests {
     /// A stamped socket reports its age and its frame count; an unstamped one
     /// reports NO age (never a zero, which would read as "just delivered").
     #[test]
-    fn a_delivering_socket_reports_age_and_frames_and_a_silent_one_reports_none() {
+    fn connection_deliveries_report_age_and_frames_and_never_for_a_silent_socket() {
         // A slot no other test in this binary stamps: the last depth-20 one.
         let slot = DhanEndpointType::Depth200.jitter_base() - 1;
         let now = 1_757_300_000_000_i64;
@@ -22273,6 +22273,16 @@ mod connection_delivery_tests {
             connection_deliveries(now).len(),
             usize::from(MAX_TOTAL_DHAN_CONNECTIONS)
         );
+    }
+
+    /// The publish runs on the drain's 30-second arm for the whole session;
+    /// with no recorder installed (as in this test binary) it must be a
+    /// no-op, never a panic, and it must resolve its handles only once.
+    #[test]
+    fn publish_connection_deliveries_is_safe_to_call_repeatedly() {
+        let now = 1_757_300_000_000_i64;
+        publish_connection_deliveries(now);
+        publish_connection_deliveries(now + 30_000);
     }
 
     /// A clock stepped backwards reads as age 0, never as a wrapped giant.

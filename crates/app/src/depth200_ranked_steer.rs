@@ -219,7 +219,7 @@ mod tests {
     /// The overwhelmingly common minute: holdings and ranking agree, zero
     /// wire calls. This is the edge-trigger property in one assertion.
     #[test]
-    fn an_aligned_pool_plans_nothing() {
+    fn plan_ranked_minute_on_an_aligned_pool_plans_nothing() {
         let ranked = [
             candidate(1, 10, 500),
             candidate(2, 20, 400),
@@ -340,8 +340,34 @@ mod tests {
         assert_eq!(d.kept, 0);
     }
 
+    /// `is_quiet` is exactly "no swaps": kept, capped and unplaced counts do
+    /// not make a minute loud — only a swap costs a wire call.
     #[test]
-    fn every_counter_label_is_pre_registered() {
+    fn is_quiet_is_true_only_when_there_are_no_swaps() {
+        let quiet = RankedDecision {
+            swaps: Vec::new(),
+            kept: 3,
+            capped: 2,
+            unplaced: 1,
+        };
+        assert!(quiet.is_quiet());
+        let loud = plan_ranked_minute(&[held(9001, IDX)], &[candidate(1, 10, 500)]);
+        assert!(!loud.is_quiet());
+    }
+
+    /// Recording a decision must accept every shape, including the all-zero
+    /// one, without a panic — it runs once a minute for the whole session.
+    #[test]
+    fn record_ranked_decision_accepts_every_shape() {
+        record_ranked_decision(&RankedDecision::default());
+        record_ranked_decision(&plan_ranked_minute(
+            &[held(9001, IDX)],
+            &[candidate(1, 10, 500)],
+        ));
+    }
+
+    #[test]
+    fn pre_register_ranked_counters_covers_every_label() {
         pre_register_ranked_counters();
         record_ranked_decision(&RankedDecision {
             swaps: Vec::new(),

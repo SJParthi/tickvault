@@ -3521,7 +3521,7 @@ mod spot_backstop_tests {
     /// With nothing in RAM the database is the only source, so it gets the
     /// full `/exec` budget — the same one every sibling reader uses.
     #[test]
-    fn an_empty_store_gives_the_database_the_full_budget() {
+    fn spot_backstop_budget_secs_gives_an_empty_store_the_full_budget() {
         assert_eq!(spot_backstop_budget_secs(0), QUESTDB_EXEC_TIMEOUT_SECS);
     }
 
@@ -3557,7 +3557,7 @@ mod spot_backstop_tests {
     /// rather than an error or a hang: the same shape every other failure of
     /// the read produces, so the callers' `extend(ram)` is unchanged.
     #[tokio::test(start_paused = true)]
-    async fn a_stalled_backstop_is_abandoned_at_its_budget_with_an_empty_map() {
+    async fn fetch_spot_prices_backstop_abandons_a_stalled_database_with_an_empty_map() {
         // A black-hole host: RFC 5737 TEST-NET, guaranteed unroutable, so the
         // connect attempt outlives the two-second budget and the timeout —
         // not the network — is what returns. Paused tokio time makes the
