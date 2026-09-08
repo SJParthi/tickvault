@@ -154,6 +154,11 @@ pub enum SwitchReason {
     /// documented as unstable across days, so the SUBSCRIPTION KEY changed
     /// even though the price did not. Missing this would leave the socket on a
     /// dead id while every strike-level check reported agreement.
+    /// The socket's contract fell off the VOLUME ranking and a ranked one is
+    /// unheld — the 2026-09-06 lock's steering, via
+    /// [`crate::depth200_ranked_steer`]. Not an at-the-money reason at all;
+    /// carried on the same type so one swap pipeline serves both engines.
+    VolumeRankChanged,
     ContractIdChanged,
 }
 

@@ -162,8 +162,11 @@
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
         <div class="lbl" style="margin-top:4px">live websocket — exchange stamp → arrived here, per socket</div>
         <div id="latws" style="overflow:auto"></div>
-        <div class="muted" style="margin-top:6px">One row per open socket, read live from the app's own counters — NOT from the
-          database, because no table holds live-feed lag. <b>±1 second floor:</b> the exchange sends its timestamp in whole
+        <div class="muted" style="margin-top:6px">One row per socket slot the app tracks (16: 5 main-feed, 5 depth-20, 5 depth-200, 1 order-update), read live
+          from the app's own counters — NOT from the database. <b>instruments on wire</b> is what that socket is subscribed to right now;
+          <b>frames delivered</b> is how many data-carrying messages it has produced this session; <b>last data</b> is how long ago the
+          latest one arrived ("never" means it has not delivered once). A socket holding instruments with zero frames is highlighted —
+          that is the "connected but deaf" case. <b>ticks timed</b> is how many ticks had a usable exchange stamp for the lag columns. <b>±1 second floor:</b> the exchange sends its timestamp in whole
           seconds, so this shows outages and drift honestly but can never show milliseconds — treat a sub-second reading as
           "under a second", not as a precise number. Figures are bucket upper bounds, so they over-state slightly within a
           bucket. "+Inf" means slower than the largest bucket, i.e. unbounded. An empty table means the live feed produced no
@@ -480,8 +483,8 @@ async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTM
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
 function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
-function fmtLagMs(v){ if(v==null) return '-'; v=Number(v);
-  if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; }
+function fmtLagMs(v){ if(v==null||v==='') return '-'; if(typeof v==='string'&&/inf/i.test(v)) return 'over 60 s (slower than the last bucket)'; v=Number(v); if(!isFinite(v)) return '-';
+  if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; } function fmtAge(s){ s=Number(s); return s<60?s.toFixed(0)+' s ago':s<3600?(s/60).toFixed(1)+' min ago':(s/3600).toFixed(1)+' h ago'; }
 // REST-era latency card (2026-07-16). The per-(broker, pull type) table
 // iterates the SERVER's j.rest_latency rows — sourced from today's
 // rest_fetch_audit on the box (feed + leg discovered from the data, never
@@ -491,17 +494,17 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
   $('latrest').innerHTML='<span class="muted">measuring…</span>';
   $('latws').innerHTML='<span class="muted">measuring…</span>';
   const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; $('latws').innerHTML=''; return; }
-  // Live socket lag. Deliberately rendered BEFORE the REST table: this is the
-  // path that carries ticks, and until 2026-08-14 nothing measured it at all.
-  const ws=Array.isArray(j.ws_latency)?j.ws_latency:[];
+  // Live sockets: every socket the app tracks, what each holds on the wire, what it delivered, and how late.
+  // Rendered BEFORE the REST table: this is the path that carries ticks. Rows come from the app's own counters.
+  const ws=Array.isArray(j.ws_latency)?j.ws_latency:[]; const live=ws.filter(r=>Number(r.frames||0)>0).length;
   if(ws.length){
-    let w='<table><tr><th>socket</th><th>ticks measured</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
-    ws.forEach(r=>{ w+='<tr><td><b>#'+esc(String(r.connection))+'</b></td>'
-      +'<td>'+Number(r.samples||0).toLocaleString()+'</td>'
+    let w='<div class="muted">'+live+' of '+ws.length+' sockets delivered data this session</div><table><tr><th>socket</th><th>pool</th><th>instruments on wire</th><th>frames delivered</th><th>last data</th><th>ticks timed</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
+    ws.forEach(r=>{ const f=Number(r.frames||0), dead=(Number(r.instruments||0)>0&&f===0); w+='<tr'+(dead?' class="warn"':'')+'><td><b>#'+esc(String(r.connection))+'</b></td><td>'+esc(String(r.endpoint||'?'))+'</td>'
+      +'<td>'+(r.instruments==null?'—':Number(r.instruments).toLocaleString())+'</td><td>'+f.toLocaleString()+'</td><td>'+(r.tick_age_secs==null?'never':fmtAge(r.tick_age_secs))+'</td><td>'+Number(r.samples||0).toLocaleString()+'</td>'
       +'<td>'+esc(fmtLagMs(r.p50_ms))+'</td><td>'+esc(fmtLagMs(r.p99_ms))+'</td></tr>'; });
     $('latws').innerHTML=w+'</table>';
   } else {
-    $('latws').innerHTML='<span class="warn">no live ticks measured — the live feed is off, produced nothing, or the app is unreachable. This is NOT a zero-latency reading.</span>';
+    $('latws').innerHTML='<span class="warn">no live sockets reported — the live feed is off, produced nothing, or the app is unreachable. This is NOT a zero-latency reading.</span>';
   }
   const rows=Array.isArray(j.rest_latency)?j.rest_latency:[];
   if(rows.length){

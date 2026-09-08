@@ -410,6 +410,34 @@ pub const SUBSCRIBE_BATCH_METRIC: &str = "tv_dhan_ws_subscribe_batches_total";
 /// tick-gap detector's seeded set.
 pub const SUBSCRIBE_INSTRUMENTS_METRIC: &str = "tv_dhan_ws_subscribe_instruments_total";
 
+/// Gauge: instruments ONE connection currently holds on the wire.
+/// Labels: `connection` (the global socket slot, 0..16), `endpoint`.
+///
+/// The per-socket answer to "what is this connection actually carrying?",
+/// which nothing published before 2026-09-08: the subscribe counters above
+/// are per ENDPOINT and cumulative, so an operator could see that 22,996
+/// instruments were subscribed and not that socket 3 held 4,600 of them or
+/// that socket 12 held one. Read on the box by the operator console's
+/// per-connection table, never EMF-shipped (sixteen dimensions to answer a
+/// question a human asks while already looking).
+pub const CONN_INSTRUMENTS_HELD_GAUGE: &str = "tv_dhan_ws_conn_instruments";
+
+/// Publishes what one socket holds ON THE WIRE, by global slot.
+///
+/// Zero on dial and on park: until the subscribe is acked the wire carries
+/// nothing, however many instruments the guard retains for replay — and the
+/// gauge reports the wire, not the intent. Cold path (confirm, top-up, dial,
+/// park); the labels are compile-time constants, so even here nothing
+/// allocates for them.
+pub(crate) fn publish_connection_instruments(slot: &ConnectionSlot, held: usize) {
+    metrics::gauge!(
+        CONN_INSTRUMENTS_HELD_GAUGE,
+        "connection" => super::pool_budget::connection_slot_label(slot.global_index),
+        "endpoint" => slot.endpoint.as_str()
+    )
+    .set(held as f64);
+}
+
 /// Counter: a subscribe dispatch stopped part-way — a message failed to write
 /// and every batch after it was abandoned. Labels: `endpoint`.
 ///
@@ -3289,6 +3317,8 @@ where
         match action {
             SupervisorAction::Park { reason } => {
                 socket.close().await;
+                // Parked for the session: the wire carries nothing from here.
+                publish_connection_instruments(&supervisor.slot(), 0);
                 // A park is PERMANENT — nothing re-dials this socket, and its
                 // shard of the universe stops delivering for the rest of the
                 // session. Until 2026-08-20 that fact reached a log line and a
@@ -3352,6 +3382,8 @@ where
             }
 
             SupervisorAction::Dial => {
+                // Nothing is on the wire until this dial's subscribe is acked.
+                publish_connection_instruments(&supervisor.slot(), 0);
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
                     Err(_) => {
@@ -3387,6 +3419,7 @@ where
                     continue;
                 }
                 guard.mark_confirmed();
+                publish_connection_instruments(&supervisor.slot(), guard.len());
                 // CONNECTED means subscribed-and-acked, not merely dialed.
                 // The 2026-08-12 blackout is why: twelve sockets dialed and
                 // every one died on the handshake, so a row written at dial
@@ -3784,6 +3817,7 @@ where
                                 metrics::counter!("tv_dhan_ws_topup_instruments_total")
                                     .increment(added as u64);
                                 outcome = ExtendOutcome::Held;
+                                publish_connection_instruments(&supervisor.slot(), guard.len());
                             }
                         }
                         Err(_) => {
@@ -4341,6 +4375,55 @@ mod tests {
         RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
         SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
+
+    /// `tv_dhan_ws_conn_instruments` is what the operator console reads to
+    /// show how many instruments each of the sixteen sockets holds on the
+    /// wire. A gauge that is published from only some of the transitions
+    /// reads as a stale count during the ones it skips — a parked socket
+    /// still "holding 50" is the false-OK class. This pins every place the
+    /// held set can change: the confirmed subscribe, the top-up success arm,
+    /// the dial (nothing held yet) and the park (nothing held any more).
+    #[test]
+    fn publish_connection_instruments_is_called_at_every_held_set_transition() {
+        let src = include_str!("pool_supervisor.rs");
+        let calls = src
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("publish_connection_instruments(&supervisor.slot(),")
+            })
+            .count();
+        assert!(
+            calls >= 4,
+            "expected the gauge to be published at ≥4 held-set transitions, found {calls}"
+        );
+        let zeroed = src
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("publish_connection_instruments(&supervisor.slot(), 0)")
+            })
+            .count();
+        assert_eq!(
+            zeroed, 2,
+            "dial and park must each publish 0 so a dead socket never reads as holding instruments"
+        );
+        let sized = src
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("publish_connection_instruments(&supervisor.slot(), guard.len())")
+            })
+            .count();
+        assert_eq!(
+            sized, 2,
+            "the confirmed subscribe and the top-up arm must publish the live held count"
+        );
+        assert!(
+            src.contains("CONN_INSTRUMENTS_HELD_GAUGE: &str = \"tv_dhan_ws_conn_instruments\""),
+            "the gauge name the console greps for must not drift"
+        );
+    }
 
     fn si(id: u64) -> SubscribeInstrument {
         SubscribeInstrument {

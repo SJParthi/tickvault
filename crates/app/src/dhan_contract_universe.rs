@@ -1343,6 +1343,74 @@ fn fit_atm_window(ladders: &[Ladder<'_>], remaining: usize) -> Option<usize> {
 /// one attempt rather than the session.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
+/// Seconds the database backstop may take when the drain ALREADY holds
+/// today's prices in RAM.
+///
+/// The database is the BACKSTOP, not the source: it covers the one case RAM
+/// cannot — a stock that traded before this process booted and not since.
+/// On 2026-09-08 the database's apply lag ran to 27,089 transactions, and a
+/// selector that waited the full [`QUESTDB_EXEC_TIMEOUT_SECS`] on every
+/// attach and every steering minute was blocked behind a stalled backstop
+/// while RAM held every price it needed. Two seconds is the cold-path cost
+/// this repository already accepts for a `/exec` round trip on a healthy
+/// database (the sibling readers measure ~0.2 s); a database that cannot
+/// answer in two seconds is the exact database that RAM exists to outrun.
+pub const SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS: u64 = 2;
+
+/// Counter of backstop reads by `outcome` — `answered` or `timed_out`.
+///
+/// A timed-out backstop is NOT a failure of the selection (RAM still centres
+/// every ladder it has a price for); it is the number that says how often the
+/// database was too slow to be consulted, which is the trend the WAL apply-lag
+/// alarm reports from the other side.
+pub const SPOT_BACKSTOP_COUNTER: &str = "tv_spot_backstop_total";
+
+/// The budget the backstop gets, from how much RAM already knows.
+///
+/// RAM empty ⇒ the full `/exec` budget: nothing else can price a ladder, so
+/// the read is worth waiting for. RAM populated ⇒ the short budget: the read
+/// can only ADD stragglers, and a stalled database must not delay the sockets.
+#[must_use]
+pub const fn spot_backstop_budget_secs(ram_prices: usize) -> u64 {
+    if ram_prices == 0 {
+        QUESTDB_EXEC_TIMEOUT_SECS
+    } else {
+        SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS
+    }
+}
+
+/// [`fetch_spot_prices`] bounded by [`spot_backstop_budget_secs`].
+///
+/// Callers take the RAM snapshot FIRST and pass its size, so the budget is
+/// derived from what is already in hand rather than guessed. A timeout
+/// returns an EMPTY map — the same shape every other failure of the read
+/// already returns — and is counted, so a database that is never consulted
+/// shows up as a number rather than as a quietly narrower ladder set.
+pub async fn fetch_spot_prices_backstop(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    today_ist_nanos: i64,
+    ram_prices: usize,
+) -> HashMap<(u64, u8), i64> {
+    let budget = std::time::Duration::from_secs(spot_backstop_budget_secs(ram_prices));
+    match tokio::time::timeout(budget, fetch_spot_prices(questdb, today_ist_nanos)).await {
+        Ok(prices) => {
+            metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "answered").increment(1);
+            prices
+        }
+        Err(_elapsed) => {
+            metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "timed_out").increment(1);
+            tracing::warn!(
+                budget_secs = budget.as_secs(),
+                ram_prices,
+                "spot prices: the database backstop did not answer inside its budget — \
+                 selection continues on the prices the drain holds in RAM; only a stock \
+                 that traded before this process booted and never since could be missing"
+            );
+            HashMap::new()
+        }
+    }
+}
+
 /// The `/exec` query returning today's latest traded price per instrument.
 ///
 /// `LATEST ON ts PARTITION BY security_id, segment` collapses the day's ticks
@@ -1562,10 +1630,14 @@ pub async fn load_contract_universe(
     // Overlaid in this order so RAM WINS every conflict: it is the fresher of
     // the two by construction -- the database's copy of a price is the same
     // tick, later.
-    let mut prices = fetch_spot_prices(questdb, today_ist_nanos).await;
-    let from_questdb = prices.len();
+    // RAM is read FIRST so its size sets the database budget: a populated
+    // store means the read below can only add stragglers and gets the short
+    // budget; an empty one means nothing else can price a ladder and the read
+    // gets the full one. See `fetch_spot_prices_backstop`.
     let ram = spot_store.snapshot_prices();
     let from_ram = ram.len();
+    let mut prices = fetch_spot_prices_backstop(questdb, today_ist_nanos, from_ram).await;
+    let from_questdb = prices.len();
     prices.extend(ram);
     let spot = spot_paise_by_symbol(&symbols, &prices);
 
@@ -3438,5 +3510,68 @@ mod tests {
             sel.instruments.len()
         );
         assert!(sel.instruments.len() <= 25_000, "never over the envelope");
+    }
+}
+
+/// The database backstop's budget, derived from what RAM already holds.
+#[cfg(test)]
+mod spot_backstop_tests {
+    use super::*;
+
+    /// With nothing in RAM the database is the only source, so it gets the
+    /// full `/exec` budget — the same one every sibling reader uses.
+    #[test]
+    fn spot_backstop_budget_secs_gives_an_empty_store_the_full_budget() {
+        assert_eq!(spot_backstop_budget_secs(0), QUESTDB_EXEC_TIMEOUT_SECS);
+    }
+
+    /// One price in RAM is enough to demote the database to a backstop: the
+    /// read can only add stragglers, and a stalled database must not delay
+    /// the sockets for a read that adds nothing the ladders need.
+    #[test]
+    fn a_populated_store_bounds_the_database_to_the_short_budget() {
+        assert_eq!(
+            spot_backstop_budget_secs(1),
+            SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS
+        );
+        assert_eq!(
+            spot_backstop_budget_secs(25_000),
+            SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS
+        );
+    }
+
+    /// The short budget is genuinely SHORTER. A future edit that raises it to
+    /// or past the full budget would silently restore the 2026-09-08 shape —
+    /// a selector blocked behind a stalled database — with the same names
+    /// still in place.
+    #[test]
+    fn the_short_budget_is_strictly_shorter_than_the_full_one() {
+        assert!(SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS < QUESTDB_EXEC_TIMEOUT_SECS);
+        assert!(
+            SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS >= 1,
+            "a zero budget never asks at all"
+        );
+    }
+
+    /// A backstop that cannot answer inside its budget yields an EMPTY map
+    /// rather than an error or a hang: the same shape every other failure of
+    /// the read produces, so the callers' `extend(ram)` is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_spot_prices_backstop_abandons_a_stalled_database_with_an_empty_map() {
+        // A black-hole host: RFC 5737 TEST-NET, guaranteed unroutable, so the
+        // connect attempt outlives the two-second budget and the timeout —
+        // not the network — is what returns. Paused tokio time makes the
+        // wait instantaneous.
+        let questdb = tickvault_common::config::QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let prices = fetch_spot_prices_backstop(&questdb, 0, 1).await;
+        assert!(
+            prices.is_empty(),
+            "a timed-out backstop must add nothing, not hang"
+        );
     }
 }

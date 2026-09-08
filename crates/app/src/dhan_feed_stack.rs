@@ -109,7 +109,7 @@ use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
 };
 use tickvault_core::websocket::pool_budget::{
-    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS,
+    ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, connection_slot_label,
 };
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, ExtendOutcome, FrameSilenceGate, LiveSubscriptionCommand,
@@ -1279,8 +1279,39 @@ impl LiveIngest {
             // underlyings. When they do not, this publishes FEWER than 5 -- a
             // short list, which the length gauge shows -- never a wrong one.
             if family == crate::volume_leaderboard::OptionFamily::Stock && wants_candidates {
+                // ---- the gainer ELIGIBILITY filter (2026-09-06 lock) ----
+                //
+                // "An instrument qualifies if its underlying is in the day's
+                // gainers; volume then decides the order." Applied HERE, on
+                // the volume-ordered rows and before the distinct pass, so
+                // membership is the underlying's day gain and order is still
+                // lots-in-window. Not applied inside `rank`, because the
+                // persisted `top_volume_rank` rows must keep recording which
+                // contracts were busiest whether or not their stock rose.
+                //
+                // Both probes are RAM: the spot store the drain writes and
+                // the previous-close store the same packet walk fills. An
+                // underlying with no spot today or no previous close is
+                // `Unknown` — counted, never treated as falling.
+                //
+                // HONEST CONSEQUENCE, recorded rather than smoothed over: on a
+                // day where every stock falls, this publishes an EMPTY list,
+                // and `plan_ranked_minute` moves nothing on an empty ranking,
+                // so the five sockets hold whatever they held. That is what
+                // the operator's rule produces on a down day; the tally below
+                // is how an operator reads "no gainers" apart from "nothing
+                // could be judged".
+                let (gainers, tally) =
+                    crate::volume_leaderboard::gainer_eligible(&ranked, |underlying_id| {
+                        let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+                        crate::volume_leaderboard::underlying_gainer_verdict(
+                            self.spot_prices.latest_paise(underlying_id, segment),
+                            self.prev_close.get(underlying_id, segment),
+                        )
+                    });
+                crate::volume_leaderboard::record_gainer_tally(tally);
                 let picked = crate::volume_leaderboard::distinct_underlying_over(
-                    &ranked,
+                    &gainers,
                     crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
                 );
                 crate::depth200_candidates::global_depth200_candidates()
@@ -1499,13 +1530,20 @@ impl LiveIngest {
     ///
     /// Takes `&self`, not `&mut self`, because the store does: nothing on this
     /// path locks, which is what lets the attach tasks read it concurrently.
+    ///
+    /// `last_price` is the raw `f32` off the wire and `exchange_secs` is the
+    /// exchange's last-trade time. The store keys freshness on the EXCHANGE
+    /// clock — a replayed frame must never overwrite a live price — and widens
+    /// the price on the read side, so the drain pays no second ryu round-trip.
     pub fn record_spot_price(
         &self,
         security_id: u64,
         segment: tickvault_common::types::ExchangeSegment,
-        last_price: f64,
+        last_price: f32,
+        exchange_secs: u32,
     ) -> crate::spot_price_store::RecordOutcome {
-        self.spot_prices.record(security_id, segment, last_price)
+        self.spot_prices
+            .record(security_id, segment, last_price, exchange_secs)
     }
 
     /// Clears every previous close for a new trading day.
@@ -5172,6 +5210,10 @@ async fn run_frame_drain(
                     )
                     .map_or(-1.0, |secs| f64::from(u32::try_from(secs).unwrap_or(u32::MAX))),
                 );
+                // The per-socket rows behind the worst-of gauge above: which
+                // socket, how stale, how many frames — what the operator
+                // console's connection table reads. Local /metrics only.
+                publish_connection_deliveries(chrono::Utc::now().timestamp_millis());
                 // Ring OCCUPANCY, the companion to the dwell gauge above.
                 //
                 // Published here rather than in `publish_fold_depth` because
@@ -5666,14 +5708,33 @@ pub fn drain_main_feed_frame(
                     | ExchangeSegment::BseEquity),
                 ) = ExchangeSegment::from_byte(tick.exchange_segment_code)
                 {
-                    // f32 -> f64 through the house widener, never `f64::from`:
-                    // a plain widening turns 10.20_f32 into 10.19999980926514
-                    // (STORAGE-GAP-02), and this value sets the centre strike
-                    // of an entire ladder.
+                    // The RAW f32 and the EXCHANGE trade time, not a widened
+                    // f64 and not the receipt clock.
+                    //
+                    // The store widens on its read side (once a minute, ~870
+                    // probes) through the house `f32_to_f64_clean`, so the
+                    // drain does not pay a second ryu round-trip per spot tick
+                    // on top of the one `tick_persistence` already makes.
+                    //
+                    // The exchange time is what makes the store safe to let
+                    // WIN over the database: the catch-up drain refolds
+                    // deferred WAL segments through this same walk while the
+                    // live socket keeps delivering, and Dhan snapshots a
+                    // dormant instrument with whatever trade time it last
+                    // printed at. Keyed on arrival, either would overwrite a
+                    // fresh price with an older one and centre a ladder on
+                    // it. Keyed on the exchange clock, the older one is
+                    // refused — the same `LATEST ON ts` order the database
+                    // path has always had.
+                    //
+                    // The outcome is tallied INSIDE the store (plain atomics,
+                    // published off the drain once a minute) rather than in
+                    // `DrainCounters`, so this arm touches no metrics registry.
                     let _outcome = ingest.record_spot_price(
                         tick.security_id,
                         segment,
-                        tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price),
+                        tick.last_traded_price,
+                        tick.exchange_timestamp,
                     );
                 }
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
@@ -6857,6 +6918,10 @@ static PER_CONN_LAST_TICK_MILLIS: [std::sync::atomic::AtomicI64;
 pub fn record_connection_tick(connection_index: u8, recv_millis: i64) {
     if let Some(slot) = PER_CONN_LAST_TICK_MILLIS.get(connection_index as usize) {
         slot.store(recv_millis, Ordering::Relaxed);
+        // Same guard, same slot: an index the stamp refused, the count refuses.
+        if let Some(frames) = PER_CONN_FRAMES.get(connection_index as usize) {
+            frames.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -6905,6 +6970,129 @@ pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
         worst = Some(worst.map_or(age, |w| w.max(age)));
     }
     worst
+}
+
+/// Frames that PRODUCED data, per connection. Companion to
+/// [`PER_CONN_LAST_TICK_MILLIS`]: that array says WHEN a socket last
+/// delivered, this one says HOW MUCH it has delivered this session.
+///
+/// Frames, not ticks or rows, for the same reason the stamp is per frame: the
+/// question is "is this socket carrying anything?", and a frame count answers
+/// it at one relaxed increment per frame instead of one per packet on the
+/// path that runs ~5,000 times a second. The per-socket lag histogram already
+/// counts the TICKS it measured; the two are shown side by side.
+static PER_CONN_FRAMES: [std::sync::atomic::AtomicU64; MAX_TOTAL_DHAN_CONNECTIONS as usize] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_TOTAL_DHAN_CONNECTIONS as usize];
+
+/// Gauge: seconds since ONE connection last delivered data. `-1` = never.
+/// Labels: `connection` (global slot), `endpoint`.
+///
+/// The per-socket row behind [`WORST_CONN_TICK_AGE_GAUGE`]. That gauge
+/// answers the yes/no question for the alarm; this one answers "WHICH one"
+/// for the operator console, and it is read on the box only — never
+/// EMF-shipped, per the 2026-08-14 cardinality rule (sixteen dimensions to
+/// answer a question a human asks while already looking).
+pub const CONN_TICK_AGE_GAUGE: &str = "tv_dhan_ws_conn_tick_age_secs";
+
+/// Gauge: data-bearing frames this connection has delivered this session.
+/// Labels: `connection`, `endpoint`. Local-only, like [`CONN_TICK_AGE_GAUGE`].
+pub const CONN_FRAMES_GAUGE: &str = "tv_dhan_ws_conn_frames";
+
+/// Which endpoint a global socket slot belongs to, from the pool tiling.
+///
+/// The slots are tiled in `DhanEndpointType::ALL` order with each type's
+/// `jitter_base()` as its first slot, so the answer is a range test per type —
+/// four comparisons, no table to keep in step with the pool. `None` for a slot
+/// past the ceiling, which the planner cannot produce.
+#[must_use]
+pub fn endpoint_for_slot(connection_index: u8) -> Option<DhanEndpointType> {
+    DhanEndpointType::ALL.into_iter().find(|endpoint| {
+        let start = endpoint.jitter_base();
+        let end = start.saturating_add(endpoint.max_connections());
+        (start..end).contains(&connection_index)
+    })
+}
+
+/// One connection's delivery record, as the console shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionDelivery {
+    /// The global socket slot.
+    pub connection_index: u8,
+    /// Which pool the slot belongs to.
+    pub endpoint: DhanEndpointType,
+    /// Seconds since the last data-bearing frame; `None` = never delivered.
+    pub tick_age_secs: Option<u64>,
+    /// Data-bearing frames this session.
+    pub frames: u64,
+}
+
+/// Every slot's delivery record at `now_millis`. Pure over the two statics, so
+/// the never-ticked and clock-stepped-backwards cases are unit tests.
+#[must_use]
+pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
+    PER_CONN_LAST_TICK_MILLIS
+        .iter()
+        .zip(PER_CONN_FRAMES.iter())
+        .enumerate()
+        .filter_map(|(index, (last, frames))| {
+            let connection_index = u8::try_from(index).ok()?;
+            let endpoint = endpoint_for_slot(connection_index)?;
+            let last = last.load(Ordering::Relaxed);
+            let tick_age_secs = (last != 0).then(|| {
+                // saturating: a clock stepped backwards reads as 0 age, never
+                // wraps into a gigantic one.
+                u64::try_from(now_millis.saturating_sub(last).max(0) / 1_000).unwrap_or(u64::MAX)
+            });
+            Some(ConnectionDelivery {
+                connection_index,
+                endpoint,
+                tick_age_secs,
+                frames: frames.load(Ordering::Relaxed),
+            })
+        })
+        .collect()
+}
+
+/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot.
+///
+/// Called from the drain's 30-second timer arm beside the worst-socket gauge.
+/// The labelled handles are resolved ONCE (at first publish, from the
+/// compile-time slot labels) and reused — the same discipline `WsLagHandles` applies to
+/// the per-tick histogram, kept here even though this path is cold, so a
+/// future move onto a hotter timer cannot quietly start allocating.
+pub fn publish_connection_deliveries(now_millis: i64) {
+    static HANDLES: std::sync::OnceLock<Vec<(metrics::Gauge, metrics::Gauge)>> =
+        std::sync::OnceLock::new();
+    let handles = HANDLES.get_or_init(|| {
+        (0..MAX_TOTAL_DHAN_CONNECTIONS)
+            .map(|slot| {
+                let endpoint = endpoint_for_slot(slot).map_or("unknown", DhanEndpointType::as_str);
+                (
+                    metrics::gauge!(
+                        CONN_TICK_AGE_GAUGE,
+                        "connection" => connection_slot_label(slot),
+                        "endpoint" => endpoint
+                    ),
+                    metrics::gauge!(
+                        CONN_FRAMES_GAUGE,
+                        "connection" => connection_slot_label(slot),
+                        "endpoint" => endpoint
+                    ),
+                )
+            })
+            .collect()
+    });
+    for delivery in connection_deliveries(now_millis) {
+        let Some((age, frames)) = handles.get(usize::from(delivery.connection_index)) else {
+            continue;
+        };
+        age.set(delivery.tick_age_secs.map_or(-1.0, |secs| {
+            f64::from(u32::try_from(secs).unwrap_or(u32::MAX))
+        }));
+        // APPROVED: a frame count rendered as a gauge; precision loss above
+        // 2^53 frames is ~57 million sessions away.
+        frames.set(delivery.frames as f64);
+    }
 }
 
 /// Gauge: how stale the WORST-performing live connection is, in seconds.
@@ -20747,6 +20935,16 @@ mod frame_walk_accounting_tests {
         p
     }
 
+    /// The spot store refuses ticks stamped before its trading-day floor, and
+    /// `ANY_LTT` is a fixed past instant — so every test that expects a price
+    /// to LAND first pins the floor to that instant's IST day. A test that
+    /// forgets this fails closed (the store refuses), never open.
+    fn floor_store_to_any_ltt(ingest: &LiveIngest) {
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(ANY_LTT));
+    }
+
     fn drain_one(ingest: &mut LiveIngest, bytes: Vec<u8>) {
         let _out = drain_main_feed_frame(
             ingest,
@@ -20772,6 +20970,7 @@ mod frame_walk_accounting_tests {
     #[test]
     fn record_spot_price_lands_a_decoded_tick_where_the_attach_tasks_read_it() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        floor_store_to_any_ltt(&ingest);
         drain_one(&mut ingest, ticker_packet_in(13, 0, 24_500.10).to_vec());
         assert_eq!(
             ingest
@@ -20806,6 +21005,7 @@ mod frame_walk_accounting_tests {
     #[test]
     fn spot_prices_holds_all_three_spot_segments() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        floor_store_to_any_ltt(&ingest);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&ticker_packet_in(13, SPOT_IDX, 24_500.0));
         bytes.extend_from_slice(&ticker_packet_in(2885, SPOT_NSE_EQ, 1_234.55));
@@ -21011,6 +21211,16 @@ mod frame_walk_accounting_tests {
     /// a process that spans midnight would compute every gain against
     /// yesterday's close and say nothing.
     #[test]
+    fn reset_prev_close_daily_clears_the_store_it_owns() {
+        use tickvault_common::types::ExchangeSegment;
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        ingest.record_previous_close(77, ExchangeSegment::NseFno, 412.25);
+        assert_eq!(ingest.prev_close().tracked(), 1);
+        ingest.reset_prev_close_daily();
+        assert_eq!(ingest.prev_close().tracked(), 0);
+        assert_eq!(ingest.prev_close().get(77, ExchangeSegment::NseFno), None);
+    }
+
     /// A process that spans an IST midnight must not centre today's ladders on
     /// yesterday's close.
     ///
@@ -21023,26 +21233,26 @@ mod frame_walk_accounting_tests {
     /// that gapped overnight centres its window several strikes off the money
     /// through entirely plausible numbers, with nothing in any log to say the
     /// price was stale.
+    ///
+    /// (Placed AFTER `reset_prev_close_daily_clears_the_store_it_owns`, not
+    /// between its `#[test]` attribute and its body: the first draft of this
+    /// test was inserted exactly there, which silently stripped the attribute
+    /// off the neighbour and turned it into a plain function nothing ran. The
+    /// compiler's only word on it was a `duplicated attribute` warning.)
     #[test]
     fn the_daily_reset_clears_the_spot_store_too() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-        ingest.record_spot_price(13, ExchangeSegment::IdxI, 24_500.0);
+        let now = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(u32::MAX);
+        assert_eq!(
+            ingest.record_spot_price(13, ExchangeSegment::IdxI, 24_500.0, now),
+            crate::spot_price_store::RecordOutcome::Stored
+        );
         assert_eq!(ingest.spot_prices().tracked(), 1);
         ingest.reset_ranking_daily();
         assert!(
             ingest.spot_prices().is_empty(),
             "yesterday's spot level must never centre today's ladder"
         );
-    }
-
-    fn reset_prev_close_daily_clears_the_store_it_owns() {
-        use tickvault_common::types::ExchangeSegment;
-        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-        ingest.record_previous_close(77, ExchangeSegment::NseFno, 412.25);
-        assert_eq!(ingest.prev_close().tracked(), 1);
-        ingest.reset_prev_close_daily();
-        assert_eq!(ingest.prev_close().tracked(), 0);
-        assert_eq!(ingest.prev_close().get(77, ExchangeSegment::NseFno), None);
     }
 
     /// A response-code-6 previous-close packet: 8-byte header, f32 close at
@@ -21539,6 +21749,16 @@ mod depth_rebalance_wiring_tests {
         // projection REFUSES a non-finite rather than writing a zero percent
         // that would read as "this contract did not move".
         ingest.record_previous_close(777, ExchangeSegment::NseFno, 100.0);
+        // The UNDERLYING too: the gainer filter judges the stock, not the
+        // contract. Spot 110 against a close of 100 is a gainer; the store is
+        // floored to the tick's own day first so the print is admitted.
+        let underlying = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+        let secs: u32 = 1_779_321_600 + 34_000;
+        ingest.record_previous_close(13, underlying, 100.0);
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(secs));
+        let _ = ingest.record_spot_price(13, underlying, 110.0, secs);
         let mut tick = tickvault_common::tick_types::ParsedTick::default();
         tick.security_id = 777;
         tick.exchange_segment_code = ExchangeSegment::NseFno.binary_code();
@@ -22028,5 +22248,94 @@ mod deaf_socket_gauge_scope_tests {
 
         let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
         assert_eq!(worst, 1_800, "depth-20 silence stays diagnostic");
+    }
+}
+
+/// The per-connection delivery rows the operator console reads.
+#[cfg(test)]
+mod connection_delivery_tests {
+    use super::*;
+
+    /// The tiling is `DhanEndpointType::ALL` order: 5 main-feed, 5 depth-20,
+    /// 5 depth-200, 1 order-update. A slot past the ceiling is nobody's.
+    #[test]
+    fn endpoint_for_slot_maps_every_slot_to_the_pool_that_dials_it() {
+        for slot in 0..MAX_TOTAL_DHAN_CONNECTIONS {
+            let endpoint = endpoint_for_slot(slot).expect("every slot under the ceiling is tiled");
+            let start = endpoint.jitter_base();
+            assert!(
+                slot >= start && slot < start + endpoint.max_connections(),
+                "slot {slot} landed in {endpoint:?}, whose range starts at {start}"
+            );
+        }
+        assert_eq!(endpoint_for_slot(0), Some(DhanEndpointType::MainFeed));
+        assert_eq!(
+            endpoint_for_slot(MAX_TOTAL_DHAN_CONNECTIONS - 1),
+            Some(DhanEndpointType::OrderUpdate)
+        );
+        assert_eq!(
+            endpoint_for_slot(MAX_TOTAL_DHAN_CONNECTIONS),
+            None,
+            "past the ceiling"
+        );
+    }
+
+    /// A stamped socket reports its age and its frame count; an unstamped one
+    /// reports NO age (never a zero, which would read as "just delivered").
+    #[test]
+    fn connection_deliveries_report_age_and_frames_and_never_for_a_silent_socket() {
+        // A slot no other test in this binary stamps: the last depth-20 one.
+        let slot = DhanEndpointType::Depth200.jitter_base() - 1;
+        let now = 1_757_300_000_000_i64;
+        let before = connection_deliveries(now)
+            .into_iter()
+            .find(|d| d.connection_index == slot)
+            .expect("every slot has a row");
+        record_connection_tick(slot, now - 12_000);
+        record_connection_tick(slot, now - 7_000);
+        let after = connection_deliveries(now)
+            .into_iter()
+            .find(|d| d.connection_index == slot)
+            .expect("every slot has a row");
+        assert_eq!(after.endpoint, DhanEndpointType::Depth20);
+        assert_eq!(
+            after.tick_age_secs,
+            Some(7),
+            "the LATEST stamp sets the age"
+        );
+        assert_eq!(
+            after.frames,
+            before.frames + 2,
+            "one count per data-bearing frame"
+        );
+        // Rows exist for every slot, stamped or not, so the console can show
+        // the sixteen sockets rather than only the ones that happened to tick.
+        assert_eq!(
+            connection_deliveries(now).len(),
+            usize::from(MAX_TOTAL_DHAN_CONNECTIONS)
+        );
+    }
+
+    /// The publish runs on the drain's 30-second arm for the whole session;
+    /// with no recorder installed (as in this test binary) it must be a
+    /// no-op, never a panic, and it must resolve its handles only once.
+    #[test]
+    fn publish_connection_deliveries_is_safe_to_call_repeatedly() {
+        let now = 1_757_300_000_000_i64;
+        publish_connection_deliveries(now);
+        publish_connection_deliveries(now + 30_000);
+    }
+
+    /// A clock stepped backwards reads as age 0, never as a wrapped giant.
+    #[test]
+    fn a_clock_step_backwards_reads_as_zero_age() {
+        let slot = DhanEndpointType::Depth200.jitter_base() - 2;
+        let now = 1_757_300_000_000_i64;
+        record_connection_tick(slot, now + 5_000);
+        let row = connection_deliveries(now)
+            .into_iter()
+            .find(|d| d.connection_index == slot)
+            .expect("every slot has a row");
+        assert_eq!(row.tick_age_secs, Some(0));
     }
 }

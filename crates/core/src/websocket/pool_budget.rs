@@ -106,6 +106,30 @@ pub const MAX_ORDER_UPDATE_CONNECTIONS: u8 = 1;
 /// unlikely.
 pub const MAX_TOTAL_DHAN_CONNECTIONS: u8 = 16;
 
+/// The metric label for every global socket slot, resolved at compile time.
+///
+/// A `"connection"` label is attached to per-socket series from the pool
+/// supervisor (instruments held) and the frame drain (tick age, frames). The
+/// path that publishes them is cold, but `crates/core/src/websocket/` is
+/// scanned as hot path by the banned-pattern gate, and a `to_string()` there
+/// is refused on principle: a label set that is bounded and known at compile
+/// time has no reason to allocate at all.
+pub const CONNECTION_SLOT_LABELS: [&str; MAX_TOTAL_DHAN_CONNECTIONS as usize] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+];
+
+/// The `"connection"` label for a global slot; `"unknown"` past the ceiling,
+/// which the planner cannot produce but a label lookup must never panic on.
+#[must_use]
+pub const fn connection_slot_label(global_index: u8) -> &'static str {
+    let index = global_index as usize;
+    if index < CONNECTION_SLOT_LABELS.len() {
+        CONNECTION_SLOT_LABELS[index]
+    } else {
+        "unknown"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Instrument caps (Dhan-side, per connection)
 // ---------------------------------------------------------------------------

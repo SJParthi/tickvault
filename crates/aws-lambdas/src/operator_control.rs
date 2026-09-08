@@ -663,40 +663,75 @@ fn prom_value(line: &str) -> Option<f64> {
 /// lie in the safe direction.
 fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
     use std::collections::BTreeMap;
-    // connection -> (buckets: le -> cumulative count, total count)
-    let mut per_conn: BTreeMap<String, (BTreeMap<String, f64>, f64)> = BTreeMap::new();
+    /// One socket's raw series, gathered before any arithmetic.
+    #[derive(Default)]
+    struct Conn {
+        buckets: BTreeMap<String, f64>,
+        count: f64,
+        endpoint: Option<String>,
+        instruments: Option<f64>,
+        frames: Option<f64>,
+        tick_age_secs: Option<f64>,
+    }
+    let mut per_conn: BTreeMap<u32, Conn> = BTreeMap::new();
 
     for line in raw {
         let Some(conn) = prom_label(line, "connection") else {
             continue;
         };
+        // A numeric slot, never a string key: "10" must sort AFTER "9", and
+        // the `unknown` bucket the drain degrades into is not a socket.
+        let Ok(slot) = conn.parse::<u32>() else {
+            continue;
+        };
         let Some(value) = prom_value(line) else {
             continue;
         };
-        let entry = per_conn
-            .entry(conn.to_string())
-            .or_insert_with(|| (BTreeMap::new(), 0.0));
+        let entry = per_conn.entry(slot).or_default();
+        if let Some(endpoint) = prom_label(line, "endpoint") {
+            entry.endpoint = Some(endpoint.to_string());
+        }
         if line.starts_with("tv_dhan_ws_lag_ms_bucket") {
             if let Some(le) = prom_label(line, "le") {
-                entry.0.insert(le.to_string(), value);
+                entry.buckets.insert(le.to_string(), value);
             }
         } else if line.starts_with("tv_dhan_ws_lag_ms_count") {
-            entry.1 = value;
+            entry.count = value;
+        } else if line.starts_with("tv_dhan_ws_conn_instruments") {
+            entry.instruments = Some(value);
+        } else if line.starts_with("tv_dhan_ws_conn_frames") {
+            entry.frames = Some(value);
+        } else if line.starts_with("tv_dhan_ws_conn_tick_age_secs") {
+            // The drain publishes -1 for "never delivered"; that is an
+            // absence, not a negative age, and must not render as a number.
+            entry.tick_age_secs = (value >= 0.0).then_some(value);
         }
     }
 
     per_conn
         .into_iter()
-        .filter(|(_, (_, count))| *count > 0.0)
-        .map(|(conn, (buckets, count))| {
+        // A socket with measured ticks OR published stats gets a row. A bare
+        // zero-count histogram with nothing else is a series the exporter
+        // pre-registered, not a socket that exists.
+        .filter(|(_, c)| {
+            c.count > 0.0 || c.instruments.is_some() || c.frames.is_some() || c.endpoint.is_some()
+        })
+        .map(|(slot, c)| {
             // Sort by numeric bound; `+Inf` sorts last by construction.
-            let mut bounds: Vec<(f64, &String, f64)> = buckets
+            let mut bounds: Vec<(f64, &String, f64)> = c
+                .buckets
                 .iter()
                 .map(|(le, cum)| (le.parse::<f64>().unwrap_or(f64::INFINITY), le, *cum))
                 .collect();
             bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
+            let count = c.count;
             let quantile = |q: f64| -> Value {
+                if count <= 0.0 {
+                    // No ticks measured: there is no percentile, and a zero
+                    // here would read as "instant delivery".
+                    return Value::Null;
+                }
                 let target = q * count;
                 // The bucket's `le` STRING is deliberately unused here — the
                 // decision below is made on the PARSED value's finiteness, for
@@ -727,7 +762,11 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
             };
 
             json!({
-                "connection": conn,
+                "connection": slot.to_string(),
+                "endpoint": c.endpoint,
+                "instruments": c.instruments,
+                "frames": c.frames,
+                "tick_age_secs": c.tick_age_secs,
                 "samples": count,
                 "p50_ms": quantile(0.50),
                 "p99_ms": quantile(0.99),
@@ -2685,9 +2724,9 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "ac313a48bdbf37a04518284f0b3a1480ffa86b0ac90924e168f58e084e0ffdef"
+            "00fab846feff040798808376562788db436781de7c7dffd84a52970faf9c6084"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_517);
+        assert_eq!(CONSOLE_HTML.len(), 48_906);
     }
 
     // --------------------------------------------------------- class ParseView
@@ -3044,6 +3083,78 @@ mod tests {
         // A series present but with zero samples must also not render a row.
         let zero: Vec<String> = vec![r#"tv_dhan_ws_lag_ms_count{connection="0"} 0"#.to_string()];
         assert!(parse_ws_lag_rows(&zero).is_empty());
+    }
+
+    /// 2026-09-08: the operator's console showed two sockets of sixteen and a
+    /// "NaN ms" p99. Every socket the app tracks now gets a row — what it
+    /// holds, what it delivered, when — whether or not its lag histogram has
+    /// samples, and the numbers ride the same raw lines.
+    #[test]
+    fn test_parse_ws_lag_rows_carries_every_socket_with_its_held_and_delivered_counts() {
+        let raw: Vec<String> = [
+            // Socket 0: healthy main-feed socket with measured lag.
+            r#"tv_dhan_ws_conn_instruments{connection="0",endpoint="main_feed"} 4600"#,
+            r#"tv_dhan_ws_conn_frames{connection="0",endpoint="main_feed"} 120500"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="0",endpoint="main_feed"} 1"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="100"} 90"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="+Inf"} 100"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="0"} 100"#,
+            // Socket 12: a depth-200 socket holding ONE contract that has
+            // never delivered — no lag samples at all. It must still appear,
+            // with NO age and NO percentile (never a zero).
+            r#"tv_dhan_ws_conn_instruments{connection="12",endpoint="depth_200"} 1"#,
+            r#"tv_dhan_ws_conn_frames{connection="12",endpoint="depth_200"} 0"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="12",endpoint="depth_200"} -1"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="12"} 0"#,
+            // The drain's degrade bucket is not a socket and gets no row.
+            r#"tv_dhan_ws_lag_ms_count{connection="unknown"} 3"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 2, "one row per socket seen, none for `unknown`");
+
+        assert_eq!(rows[0]["connection"], "0");
+        assert_eq!(rows[0]["endpoint"], "main_feed");
+        assert_eq!(rows[0]["instruments"], 4600.0);
+        assert_eq!(rows[0]["frames"], 120_500.0);
+        assert_eq!(rows[0]["tick_age_secs"], 1.0);
+        assert_eq!(rows[0]["p50_ms"], 100.0);
+        assert_eq!(rows[0]["p99_ms"], "+Inf");
+
+        assert_eq!(rows[1]["connection"], "12");
+        assert_eq!(rows[1]["endpoint"], "depth_200");
+        assert_eq!(rows[1]["instruments"], 1.0);
+        assert_eq!(rows[1]["frames"], 0.0);
+        assert!(
+            rows[1]["tick_age_secs"].is_null(),
+            "-1 is 'never', not an age"
+        );
+        assert!(
+            rows[1]["p50_ms"].is_null(),
+            "no samples, no percentile — never a zero"
+        );
+        assert!(rows[1]["p99_ms"].is_null());
+    }
+
+    /// Sockets sort NUMERICALLY: "10" after "9", not after "1".
+    #[test]
+    fn test_parse_ws_lag_rows_orders_sockets_numerically() {
+        let raw: Vec<String> = [
+            r#"tv_dhan_ws_conn_frames{connection="10",endpoint="depth_200"} 5"#,
+            r#"tv_dhan_ws_conn_frames{connection="9",endpoint="depth_20"} 5"#,
+            r#"tv_dhan_ws_conn_frames{connection="1",endpoint="main_feed"} 5"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let order: Vec<String> = parse_ws_lag_rows(&raw)
+            .iter()
+            .map(|r| r["connection"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(order, ["1", "9", "10"]);
     }
 
     #[test]

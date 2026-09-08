@@ -1278,6 +1278,7 @@ pub async fn run_depth_rebalance(
     }
     pre_register_rebalance_counters();
     crate::depth20_track::pre_register_depth20_counters();
+    crate::depth200_ranked_steer::pre_register_ranked_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
@@ -1413,7 +1414,8 @@ pub async fn run_depth_rebalance(
                     off_ranking = ?d.held_off_ranking,
                     should_hold = ?d.ranked_unheld,
                     "depth-200 diverges from the volume ranking the 2026-09-06 lock \
-                     mandates — REPORTED ONLY, no socket was moved by this line"
+                     mandates — this line only REPORTS; the ranked steering below \
+                     is what moves the sockets, at most one swap per socket per minute"
                 ),
             }
         }
@@ -1451,7 +1453,55 @@ pub async fn run_depth_rebalance(
         // the false-OK the gauge exists to prevent.
         heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
 
-        let decision = plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers);
+        // ---- depth-200: the VOLUME ranking once it exists, the ATM engine until then ----
+        //
+        // 2026-09-08. The divergence block above made the 2026-09-06 lock's
+        // gap MEASURABLE; this is the step that closes it. Once the drain has
+        // published a ranking, the five depth-200 sockets follow it —
+        // delta-only, edge-triggered, capped per minute
+        // (`depth200_ranked_steer`) — and the at-the-money engine is not
+        // consulted again this session. Before the first ranking (pre-open:
+        // every volume is zero and a ranking would be meaningless) the
+        // legacy engine keeps the sockets where the dial put them.
+        //
+        // `Some(empty)` is NOT the same as `None`: an empty ranking means the
+        // ranking layer ran and selected nothing (a quiet window, or every
+        // row refused by its monotonicity gate), and the planner answers that
+        // with zero swaps rather than a fallback to the banned engine.
+        let ranking = crate::depth200_candidates::global_depth200_candidates().latest();
+        let (decision, engine) = match ranking.as_deref() {
+            Some(ranked) => {
+                // Real socket indices, `None` for a socket that never
+                // subscribed — the planner needs the position, so the
+                // `filter_map` above (which collapses gaps) is not used here.
+                let held_slots: Vec<Option<SubscribeInstrument>> =
+                    sockets.iter().map(|s| s.held).collect();
+                let ranked_decision =
+                    crate::depth200_ranked_steer::plan_ranked_minute(&held_slots, ranked);
+                crate::depth200_ranked_steer::record_ranked_decision(&ranked_decision);
+                if ranked_decision.capped > 0 || ranked_decision.unplaced > 0 {
+                    tracing::info!(
+                        capped = ranked_decision.capped,
+                        unplaced = ranked_decision.unplaced,
+                        kept = ranked_decision.kept,
+                        ranked = ranked.len(),
+                        "depth-200 ranked steering could not place every ranked contract \
+                         this minute — the rest is retried next minute"
+                    );
+                }
+                (
+                    RebalanceDecision {
+                        atm_swaps: ranked_decision.swaps,
+                        ..RebalanceDecision::default()
+                    },
+                    "volume_ranking",
+                )
+            }
+            None => (
+                plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers),
+                "atm_until_first_ranking",
+            ),
+        };
         if decision.is_quiet() {
             // The overwhelmingly common minute. No log line: ~375 of these a
             // session would bury the ones that matter.
@@ -1460,7 +1510,8 @@ pub async fn run_depth_rebalance(
         let sent = apply_decision(&mut sockets, &decision);
         tracing::info!(
             sent,
-            atm_swaps = decision.atm_swaps.len(),
+            engine,
+            swaps = decision.atm_swaps.len(),
             top_mover_swap = decision.top_mover_swap.is_some(),
             top_mover_first = decision.top_mover_first.is_some(),
             candidates = candidates.len(),
