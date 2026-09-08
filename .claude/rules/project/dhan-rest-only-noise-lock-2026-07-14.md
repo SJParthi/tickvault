@@ -3330,3 +3330,117 @@ To keep September under $150 from a ~$164 projection, ~$14 must come out — or
 | Raise `limit_amount` | — | Quote 19 caps it at $150, already the live value |
 
 Recorded, not taken. Every one is the operator's.
+
+### §2.3v — 2026-09-08: fourteen alerts in fifty minutes, nine of them saying "nothing is lost"
+
+**The operator's report (2026-09-08, a Telegram screenshot, verbatim):**
+
+> "Then what the fuck is this issues bro"
+
+Not a request for a new alert. A complaint that the existing ones are unreadable. This
+section RETIRES noise; §3 governs ADDING pages, so no new authorization is claimed — but
+an alerting-behaviour change gets a dated row either way, because the next reader needs
+to know why a message they used to see as red now arrives amber.
+
+#### What the operator actually received, 08:32–09:21 IST
+
+Fourteen alerts. **Nine contained the words "nothing is lost" / "they are replayed" /
+"check it before assuming loss" in their own bodies.** Three were the SAME message
+re-sent at 08:34, 09:04 and 09:21. Every single one rendered as a red 🆘.
+
+The measured truth for that session, read from CloudWatch the same morning:
+
+| counter | value | meaning |
+|---|---:|---|
+| `tv_ticks_dropped_total` | 5,287 | flushes that failed |
+| `tv_ticks_spilled_total` | **5,287** | **every one rescued — identical, which is the proof** |
+| `tv_depth_rows_dropped_total` | 298,920 | depth flushes that failed |
+| `tv_depth_rows_spilled_total` | **298,920** | **every one rescued** |
+| `tv_dhan_ws_wal_dropped_total` | 0 | the durable floor held |
+| `tv_dhan_ws_park_total` | 0 | no socket parked |
+| `tv_questdb_wal_suspended_tables` | 0 | no table suspended |
+
+**Nothing was lost.** The one alert that mattered — the contract universe failing at
+09:13 — sat ELEVENTH of fourteen, wearing the same emoji as the nine that said nothing
+was wrong.
+
+#### The defect: declared severity never reached the phone
+
+`telegram_webhook.rs::severity_emoji` returned `🆘` for `state == "ALARM"`,
+unconditionally. The `Severity` declared in `error_code.rs` was never consulted.
+`HOT-PATH-02` is declared **`Severity::Low`** and arrived looking identical to a
+Critical.
+
+**FIXED** by `DEGRADE_NOT_EMERGENCY` — an explicit, four-entry list of alarms whose
+CONDITION is a self-healing degrade, which now render `⚠️`:
+
+| alarm fragment | why it is a degrade |
+|---|---|
+| `errcode-hot-path-02` | rows a failed flush rescued to spill; declared `Low` |
+| `ticks-spilling` | the tick spill tier engaging; `dropped == spilled` is the proof it worked |
+| `errcode-ws-spill-02` | one code covers "dropped" AND "deferred to replay", so it cannot honestly claim loss |
+| `aggregator-refusal-rate-high` | the ROWS ARE WRITTEN; only the per-minute candle is skipped |
+
+**FAIL-LOUD BY DEFAULT.** An alarm not named stays `🆘`. The downgrade applies only in
+the `ALARM` state, and only to conditions whose own text says nothing is lost. The
+ordering is the safety property and is bite-proven: moving the check below the emergency
+return makes it unreachable and fails the build.
+
+#### The pre-open false pager, fixed separately
+
+`aggregator-refusal-rate-high` fired at 09:07 with *"more than a quarter of prices arrive
+with a bad time stamp — normal is under 10%"*. Its period is 300 s with
+`evaluation_periods = 2`, so the windows it judged span roughly **08:57–09:07 — entirely
+before the bell**.
+
+Its numerator `tv_aggregator_tick_refused_total` folds **six** `reason` labels into one
+summed series, and three of them — `untraded_sentinel`, `untraded_timestamp`,
+`stale_trading_day` — are the *"this instrument has not traded today"* population, which
+before the open is nearly every option strike in the universe. The 25% threshold was
+calibrated against SESSION-scale figures (2.41% on 2026-08-27, 7.0% on 2026-08-28), never
+against a pre-open window. **It was measuring a quiet market and reporting a vendor
+regression.**
+
+**FIXED** by adding it to the market-hours gate's `ALARM_NAMES`, which now arms **12**
+alarms. Cost: zero.
+
+**What the gate does NOT fix, stated so it is not mistaken for fixed:** in-session the
+ratio still folds benign reasons into a defect threshold, so a genuine timestamp
+regression and a quiet market remain indistinguishable by this alarm alone. Splitting the
+reasons apart needs a new EMF name — ~$0.30/mo against a September forecast of $142.24
+and an automatic `STOP_EC2_INSTANCES` line at $135.00 — so it needs an operator lever,
+not a cost note. The per-reason split lives only in the 30-second `AGGREGATOR-DROP-01`
+log line.
+
+#### Two alerts that were CONSEQUENCES, not independent faults
+
+- **09:13, "could not work out today's contract list"** — the real one. Root-caused the
+  same day: the contract selector asked QuestDB for spot prices while its WAL apply lag
+  ran 11,503 → 27,089, so it was blind for thirty minutes after the open while the
+  process held every price in RAM. Fixed by `SpotPriceStore`.
+- **09:21, "the order-book tracker has stopped following the market"** — depth steering
+  never started, because `spawn_depth_rebalance` is called only inside the
+  `contracts_done && depth_done` branch. With contracts unresolved until 09:45 that
+  branch never ran, the heartbeat gauge published nothing, and
+  `treat_missing_data = "breaching"` turned that absence into an ALARM. **One fault, two
+  pages.** The same fix addresses both.
+
+#### Also corrected: a stale count on the surface an operator reads at 3am
+
+`market_hours_gate_failed`'s `alarm_description` said *"the ONLY path that arms the 3
+gated alarms"* and named three by hand. The list had grown to twelve. It now names the
+count and points at `ALARM_NAMES` as the authoritative list, because a hand-copied count
+in a triage message is a claim that goes stale silently — this one was wrong by 4×.
+
+#### What a PR that violates §2.3v looks like (REJECT)
+
+- Adds an alarm to `DEGRADE_NOT_EMERGENCY` whose condition can lose data. The list is for
+  conditions whose own text says nothing is lost, not for alarms that are inconvenient.
+- Moves the degrade check below the emergency return, or applies it outside the `ALARM`
+  state (both bite-proven; both silently restore the flood).
+- Removes `aggregator-refusal-rate-high` from the market-hours gate without splitting the
+  benign reasons out of its numerator first.
+- Re-adds a hand-copied alarm count to any `alarm_description`.
+- Reads "nothing was lost on 2026-09-08" as "the loss counters were zero". They were
+  5,287 and 298,920; what makes it a clean session is that each EQUALS its rescue
+  counter.
