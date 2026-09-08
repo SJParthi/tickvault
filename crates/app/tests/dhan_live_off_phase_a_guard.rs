@@ -211,11 +211,20 @@ fn test_main_spawns_rest_stack_in_dhan_off_branch() {
 #[test]
 fn test_overlay_and_gate_and_suppression_warn_exist() {
     let persist_src = strip_line_comments(&read("crates/api/src/feed_state_persist.rs"));
+    // 2026-09-08: the AND-gate (`config && persisted`) became config-only —
+    // a persisted dhan-off used to darken a config-ON boot after one stray
+    // authenticated POST. The property this pin protects is unchanged and
+    // stronger: a stale persisted TRUE can never widen a config-off lane,
+    // because the persisted value is not consulted at all.
     assert!(
-        persist_src.contains("dhan_enabled: config.dhan_enabled && p.dhan_enabled"),
-        "feed_state_persist.rs lost the Dhan overlay AND-gate — a stale \
-         data/feed-state.json with dhan_enabled=true could resurrect the \
-         retired live WS lane (operator directive 2026-07-13)"
+        persist_src.contains("dhan_enabled: config.dhan_enabled,"),
+        "feed_state_persist.rs lost the config-authoritative Dhan overlay — a stale \
+         data/feed-state.json must never resurrect a config-off lane (operator directive \
+         2026-07-13) nor darken a config-on one (2026-09-08)"
+    );
+    assert!(
+        !persist_src.contains("&& p.dhan_enabled") && !persist_src.contains("&& _p.dhan_enabled"),
+        "the persisted Dhan flag must not be consulted by the overlay in either direction"
     );
     assert!(
         persist_src.contains("pub fn dhan_overlay_suppressed("),

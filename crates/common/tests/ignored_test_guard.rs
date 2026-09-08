@@ -142,6 +142,27 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/app/src/volume_leaderboard.rs",
         "rank_sweep_cost_at_the_authorized_ceiling",
     ),
+    // Added 2026-09-08 with the per-underlying gainer memo it measures.
+    //
+    // SAME SHAPE as the rank harness directly above, and it exists for the
+    // same reason that one does: the walk it times is the honest worst case
+    // of `gainer_eligible` -- a day on which every stock is falling, so no
+    // gainer is ever collected and the walk runs to the END of the traded
+    // population (up to 20,220 contracts) once per 5-second sweep. Until
+    // 2026-09-08 that walk made TWO store probes per ROW; the memo caps the
+    // probes at the underlying count (~210). The harness prints the cost at
+    // the authorized ceiling so the CLAUDE.md O(1) row carries a MEASURED
+    // figure instead of a projection. A wall-clock number on a shared CI
+    // runner is a flake, so it is never a merge condition; the memo behaviour
+    // (bounded capacity, one verdict per underlying, the walk stopping at the
+    // exit-rank limit) is pinned by the ordinary tests in the same file that
+    // run on every PR. Run deliberately:
+    //   cargo test -p tickvault-app --lib -- --ignored --nocapture \
+    //     volume_leaderboard::tests::gainer_eligible_sweep_cost_at_the_authorized_ceiling
+    (
+        "crates/app/src/volume_leaderboard.rs",
+        "gainer_eligible_sweep_cost_at_the_authorized_ceiling",
+    ),
 ];
 
 struct Ignored {

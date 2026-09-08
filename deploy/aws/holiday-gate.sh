@@ -100,6 +100,30 @@ else
   log "holiday-stop marker put FAILED ($MARKER_PARAM) — restarters may fight today's stop"
 fi
 
+# --- Tell the operator (2026-09-08, operator sweep row 14) -------------------
+# Until today this self-stop left the operator with an instance that stopped
+# itself and a journald line nobody reads on a holiday. The same SNS topic
+# the autopilot uses carries ONE plain-English line so a wrong holiday
+# verdict on a real trading day is noticed at 08:31 IST, not at the 09:20
+# alarm gate. FAIL-OPEN: a failed publish is logged and the stop proceeds.
+ACCT=$(curl -sS -m 5 -H "X-aws-ec2-metadata-token: $TOKEN" \
+  "$IMDS/dynamic/instance-identity/document" 2>/dev/null \
+  | sed -n 's/.*"accountId"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p') || ACCT=""
+if [ -n "$ACCT" ]; then
+  IST_NOW=$(TZ='Asia/Kolkata' date +'%I:%M %p IST')
+  if aws sns publish --region "$REGION" \
+      --topic-arn "arn:aws:sns:${REGION}:${ACCT}:tv-${TV_ENV}-alerts" \
+      --subject "🔔 Holiday stop" \
+      --message "🔔 The trading box is switching itself OFF at ${IST_NOW}: today (${TODAY_IST}) is an NSE holiday, so no market data will be captured and no bill is run up. If today IS a trading day, this is WRONG — start the box from the console and check the holiday list." \
+      >/dev/null 2>&1; then
+    log "holiday-stop page published to tv-${TV_ENV}-alerts"
+  else
+    log "holiday-stop page publish FAILED — the stop still proceeds"
+  fi
+else
+  log "account id unresolved — holiday-stop page skipped (fail-open)"
+fi
+
 log "stopping instance $IID in $REGION (NSE holiday — saves ~8h of billing)"
 aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null 2>&1 \
   || log "aws ec2 stop-instances call failed (will retry on next boot)"

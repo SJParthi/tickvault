@@ -260,12 +260,21 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
     match persisted {
         None => config,
         // The persisted overlay carries ONLY the runtime toggles.
-        Some(p) => FeedsConfig {
-            // 2026-07-13: narrow-only for Dhan — config-off wins over any
-            // persisted-on (the retired live WS lane can never be
-            // overlay-resurrected); config-on + persisted-off still honors
-            // the operator's last disable (pre-Phase-A behaviour).
-            dhan_enabled: config.dhan_enabled && p.dhan_enabled,
+        Some(_p) => FeedsConfig {
+            // 2026-09-08 (operator sweep rows 1/2): the CONFIG wins for Dhan
+            // in BOTH directions. Until today a persisted `dhan_enabled:
+            // false` — one stray authenticated POST, or a file left behind
+            // from the 2026-07-13 retirement — narrowed a config-ON boot to
+            // OFF, and nothing on the live lane reads the runtime flag, so
+            // the only effect was on the NEXT boot: the whole sixteen-socket
+            // lane stayed dark while /feeds reported the operator's own
+            // choice back at them. The lane comes up from configuration at
+            // boot and from nowhere else, so the persisted value is IGNORED
+            // for Dhan and `dhan_overlay_suppressed`/the boot warn still
+            // name a stale widen. (`p` is read for the predicate's sake; the
+            // Dhan toggle is refused at the API in both directions since the
+            // same day, so a new persisted Dhan value cannot be written.)
+            dhan_enabled: config.dhan_enabled,
             // 2026-07-15: narrow-only for Groww too — the live feed is
             // retired (both brokers REST-only for market data); a stale
             // persisted `groww_enabled: true` can never re-enable it over
@@ -452,7 +461,11 @@ mod tests {
             updated_at_ist: "2026-06-26 14:31:07".to_string(),
         });
         let effective = overlay_feeds(config, persisted);
-        assert!(!effective.dhan_enabled, "persisted dhan-off narrows");
+        assert!(
+            effective.dhan_enabled,
+            "2026-09-08: a persisted dhan-off must NOT narrow a config dhan-on — the lane \
+             is started from configuration alone, and a stale file must never dark the boot"
+        );
     }
 
     /// No overlay → the config default is returned unchanged.
@@ -531,8 +544,8 @@ mod tests {
             }),
         );
         assert!(
-            !eff.dhan_enabled,
-            "a persisted dhan-off must narrow a config dhan-on"
+            eff.dhan_enabled,
+            "2026-09-08: the persisted Dhan value is ignored in both directions"
         );
     }
 
@@ -610,8 +623,9 @@ mod tests {
         });
         let effective = overlay_feeds(config, persisted);
         assert!(
-            !effective.dhan_enabled,
-            "persisted dhan-off must still narrow a config dhan-on"
+            effective.dhan_enabled,
+            "2026-09-08: config-on + persisted-off stays ON — a stale feed-state.json \
+             cannot switch the live lane off at the next boot"
         );
     }
 

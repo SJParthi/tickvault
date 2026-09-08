@@ -165,11 +165,34 @@ pub async fn set_feed(
         ));
     }
 
+    // 2026-09-08 (operator sweep rows 1/2): the DISABLE direction is refused
+    // for the same reason the enable direction is. Nothing on the live lane
+    // reads this runtime flag — the sockets kept streaming while /feeds
+    // reported OFF (a false-OFF), and the only real effect was the persisted
+    // `feed-state.json`, which until today darkened the NEXT boot. Both
+    // halves are closed together: the API refuses, and `overlay_feeds`
+    // ignores the persisted Dhan value. The live-trading gate below is kept
+    // as the second wall for the day a runtime disable is wired for real.
+    if feed == Feed::Dhan && !req.enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FeedErrorResponse {
+                error: "the Dhan live feed cannot be switched off from this \
+                     control — the sockets do not read this switch, so disabling \
+                     here would show OFF while every socket kept streaming, and \
+                     would have darkened the next start-up. To turn the live feed \
+                     off, change the configuration and restart"
+                    .to_string(),
+                allowed: toggleable_except_dhan_labels(),
+            }),
+        ));
+    }
+
     // PR-E safety gate (operator-authorized 2026-06-21): DISABLING Dhan is the
     // one dangerous direction — it blinds the system. Allowed in the no-orders
     // data-pull phase (`dry_run`), REFUSED once live trading is on (so the feed
-    // can't be killed mid-trade). Enabling Dhan is always allowed for a
-    // boot-ON lane (the Phase A gate above owns the boot-OFF case).
+    // can't be killed mid-trade). Unreachable for Dhan since the 2026-09-08
+    // refusal above; kept as the second wall.
     if feed == Feed::Dhan && !req.enabled && !state.feed_runtime().can_disable_dhan() {
         return Err((
             StatusCode::CONFLICT,
@@ -512,19 +535,32 @@ mod tests {
     // `test_set_feed_unknown_feed_is_rejected_400` below.
 
     #[tokio::test]
-    async fn test_set_feed_dhan_disable_allowed_in_no_orders_phase() {
-        // PR-E: in the default (dry_run / no-orders) phase, disabling Dhan is
-        // now allowed — the live feed loop honours the flag and goes dormant.
+    async fn test_set_feed_dhan_disable_refused_409_because_no_socket_reads_the_flag() {
+        // 2026-09-08: the PR-E "disable goes dormant" claim was false for the
+        // revived lane — no socket reads the runtime flag. A disable therefore
+        // showed OFF while streaming continued and persisted a value that
+        // darkened the next boot. Refused in the no-orders phase too, and the
+        // flag is left exactly as it was.
         let state = test_state(FeedsConfig::default());
+        let before = state.feed_runtime().is_enabled(Feed::Dhan);
         let res = set_feed(
             State(state.clone()),
             Path("dhan".to_string()),
             Json(SetFeedRequest { enabled: false }),
         )
         .await;
-        let Json(resp) = res.expect("dhan disable allowed in no-orders phase");
-        assert!(!resp.dhan_enabled, "dhan now disabled");
-        assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
+        let (status, Json(body)) = res.expect_err("dhan disable is refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("do not read this switch"),
+            "{}",
+            body.error
+        );
+        assert_eq!(
+            state.feed_runtime().is_enabled(Feed::Dhan),
+            before,
+            "flag untouched"
+        );
     }
 
     #[tokio::test]
@@ -648,8 +684,8 @@ mod tests {
         assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
     }
 
-    /// The DISABLE direction stays allowed (a no-op narrowing) when the lane
-    /// is retired by config — only the enable direction is refused.
+    /// 2026-09-08: the DISABLE direction is refused on EVERY config shape (the
+    /// sockets do not read the runtime flag), including when the lane is off by config.
     #[tokio::test]
     async fn test_set_feed_dhan_disable_still_allowed_when_config_off() {
         let state = test_state(FeedsConfig {
@@ -662,9 +698,13 @@ mod tests {
             Json(SetFeedRequest { enabled: false }),
         )
         .await;
-        let Json(resp) = res.expect("disabling the retired dhan lane is a no-op, not an error");
-        assert!(!resp.dhan_enabled);
-        assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
+        let (status, _) =
+            res.expect_err("2026-09-08: the Dhan disable is refused on every config shape");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Dhan),
+            "config-off stays off"
+        );
     }
 
     /// PR-C2 (2026-07-13): the enable refusal is UNCONDITIONAL — neither the

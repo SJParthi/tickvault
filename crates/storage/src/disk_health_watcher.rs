@@ -146,6 +146,31 @@ pub fn probe_disk_free_bytes(path: &std::path::Path) -> DiskHealthOutcome {
 /// Parse GNU `df --output=avail,size --block-size=1` output. Format is two
 /// header words then one data row of two integers. Returns
 /// `Some((avail_bytes, total_bytes))` on success.
+/// Free and total INODES of the filesystem holding `path`, via GNU
+/// `df --output=iavail,itotal`. `None` on a non-GNU `df` or a parse failure —
+/// the byte probe above is the one that decides health; this is the second
+/// number the operator has never had.
+///
+/// Infra sweep row 1 (2026-09-08): the spill and WAL tiers write MANY small
+/// files (one NDJSON per rescue, one segment per rotation), and a volume can
+/// run out of inodes with hundreds of gigabytes free — every create then
+/// fails with ENOSPC while the bytes gauge reads healthy and the free-space
+/// alarm stays green. Published as `tv_spill_dir_free_inodes` (local
+/// `/metrics` only; no EMF name, no alarm — budget rule) so the number exists
+/// before anyone needs it.
+#[must_use]
+pub fn probe_disk_free_inodes(path: &std::path::Path) -> Option<(u64, u64)> {
+    let out = Command::new("df")
+        .args(["--output=iavail,itotal", "--"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_df_gnu(&out.stdout)
+}
+
 fn parse_df_gnu(stdout: &[u8]) -> Option<(u64, u64)> {
     let s = std::str::from_utf8(stdout).ok()?;
     let mut lines = s.lines().skip(1); // drop header row
@@ -184,6 +209,8 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
     tokio::spawn(async move {
         let m_free = metrics::gauge!("tv_spill_dir_free_bytes");
         let m_total = metrics::gauge!("tv_spill_dir_total_bytes");
+        let m_free_inodes = metrics::gauge!("tv_spill_dir_free_inodes");
+        let m_total_inodes = metrics::gauge!("tv_spill_dir_total_inodes");
         let m_failed = metrics::counter!("tv_spill_dir_health_check_failed_total");
 
         info!(
@@ -216,6 +243,10 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                 } => {
                     m_free.set(free_bytes as f64);
                     m_total.set(total_bytes as f64);
+                    if let Some((free_inodes, total_inodes)) = probe_disk_free_inodes(&spill_dir) {
+                        m_free_inodes.set(free_inodes as f64);
+                        m_total_inodes.set(total_inodes as f64);
+                    }
                     // Derived per-probe, never cached: the volume can grow
                     // online (gp3 `modify-volume` is a one-command operation
                     // and was used on 2026-08-25), and a threshold resolved
@@ -425,11 +456,43 @@ mod tests {
     }
 
     #[test]
+    fn probe_disk_free_inodes_never_fabricates_a_reading() {
+        // A path that does not exist yields nothing; a real mount yields a
+        // free count bounded by its total (GNU df only — elsewhere None).
+        assert!(
+            probe_disk_free_inodes(std::path::Path::new("/definitely/not/a/mount/point")).is_none()
+        );
+        if let Some((free, total)) = probe_disk_free_inodes(std::path::Path::new("/tmp")) {
+            assert!(total > 0);
+            assert!(free <= total, "free {free} > total {total}");
+        }
+    }
+
+    #[test]
     fn test_probe_against_real_path_returns_ok_or_probe_failed() {
         // We can't assert specific numbers (CI machines vary), but on a
         // POSIX runner `df` should succeed against `/tmp` (or `/`). On a
         // hypothetical non-POSIX runner this returns ProbeFailed; either
         // outcome is valid — the test just exercises the codepath.
+        // Infra sweep row 1 (2026-09-08): the inode probe answers on a GNU
+        // `df` and is silent, never wrong, elsewhere. On a real filesystem the
+        // free count can never exceed the total.
+        if let Some((free_inodes, total_inodes)) =
+            probe_disk_free_inodes(std::path::Path::new("/tmp"))
+        {
+            assert!(
+                total_inodes > 0,
+                "a mounted filesystem reports its inode total"
+            );
+            assert!(
+                free_inodes <= total_inodes,
+                "free {free_inodes} > total {total_inodes}"
+            );
+        }
+        assert!(
+            probe_disk_free_inodes(std::path::Path::new("/definitely/not/a/mount/point")).is_none(),
+            "a path that does not exist yields no inode reading, never a fabricated one"
+        );
         let outcome = probe_disk_free_bytes(std::path::Path::new("/tmp"));
         match outcome {
             DiskHealthOutcome::Ok {
