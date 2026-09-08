@@ -884,6 +884,22 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // sustained climb and so cannot answer "how far behind now".
                     emit_wal_apply_lag_gauge(&rows);
                     let growing = lag_tracker.observe(&rows);
+                    // The join to the ingest shed gate.
+                    //
+                    // Published on EVERY parsed poll, not only when a table
+                    // fires: the shed loop needs the LEVEL (how many tables
+                    // are stuck right now), and `observe` returns the EDGE
+                    // (which crossed on this poll). Reading the edge would
+                    // report zero on every poll of a sustained backlog, which
+                    // is precisely the state the gate exists to act on.
+                    //
+                    // Deliberately NOT published on a failed probe: the
+                    // `continue` arms above leave the previous value standing
+                    // rather than writing a fabricated zero, so a database we
+                    // cannot reach never reads as a database that is healthy.
+                    tickvault_common::ingest_shed::publish_wal_apply_lag_growing(
+                        lag_tracker.reported_count(),
+                    );
                     emit_wal_lag(&growing);
                     // The applied watermark must not trust an ILP ack from a
                     // table that is suspended, lagging, or invisible: such an

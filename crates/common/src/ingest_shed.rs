@@ -80,7 +80,7 @@
 //! flush faster, and it does not remove backpressure; it arms the existing
 //! relief valve early enough to matter instead of after the volume is full.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// Free-space fraction below which inline depth stops being captured.
 pub const SHED_INLINE_DEPTH_BELOW_FREE: f64 = 0.15;
@@ -231,6 +231,102 @@ impl IngestShedGate {
 /// One writer (the disk-pressure loop, once a minute at most), many readers
 /// (the drain, per packet). That is the access pattern an atomic is for.
 pub static INGEST_SHED: IngestShedGate = IngestShedGate::new();
+
+/// How many QuestDB tables are currently latched as FALLING FURTHER BEHIND on
+/// WAL apply.
+///
+/// Written once a minute by the WAL-suspension watcher (storage crate), read
+/// once a minute by the disk-pressure loop (app crate). Two tasks that never
+/// share a handle, so — exactly like [`INGEST_SHED`] one screen above — the
+/// process-global atomic is the join rather than an `Arc` threaded through
+/// signatures neither task has a reason to share.
+///
+/// # Why this exists at all
+///
+/// Every shed trigger before it measures the DISK: a fraction, a runway in
+/// sessions, a self-measured time-to-full. All three are downstream of the
+/// failure that actually happens first. On 2026-08-25 fourteen tables stopped
+/// applying rows while the disk still looked survivable, and on 2026-09-08 the
+/// apply lag climbed 50,370 -> 94,281 across a session that never dropped a
+/// single tick and never fell below 405 GB free. Not one disk trigger could
+/// have armed on either day, because on neither day was the disk the problem.
+///
+/// The failure is the same one both times: ILP keeps ACKing, rows keep
+/// arriving, and they stop becoming QUERYABLE. Left alone it ends at a full
+/// volume — which the disk triggers would finally catch, far too late to be
+/// called a defence.
+///
+/// # Zero is the honest reading of "unknown"
+///
+/// The watcher publishes only after a poll it could parse; a probe that failed
+/// leaves the previous value standing rather than writing a fabricated zero.
+/// But the value at process start IS zero, and before the watcher's first poll
+/// that zero means "not yet measured", not "healthy". It fails toward NOT
+/// shedding, which is the same direction [`ShedLevel::from_u8`] fails on a
+/// corrupt byte and for the same reason: capturing more than strictly needed
+/// costs disk, capturing less costs ticks.
+static WAL_APPLY_LAG_GROWING_TABLES: AtomicU32 = AtomicU32::new(0);
+
+/// Publishes the WAL-apply-lag table count. Called by the watcher, once per
+/// successful poll.
+///
+/// Saturates rather than wrapping: the tracker caps its map at 256 entries, so
+/// this can never be reached in practice, and a wrap would turn "many tables
+/// stuck" into "none" — the one direction that must be impossible.
+pub fn publish_wal_apply_lag_growing(tables: usize) {
+    let v = u32::try_from(tables).unwrap_or(u32::MAX);
+    WAL_APPLY_LAG_GROWING_TABLES.store(v, Ordering::Relaxed);
+}
+
+/// The current count. One relaxed load, read once a minute by the shed loop.
+#[must_use]
+pub fn wal_apply_lag_growing() -> u32 {
+    WAL_APPLY_LAG_GROWING_TABLES.load(Ordering::Relaxed)
+}
+
+/// The WAL-apply-lag half of [`decide_shed_level_all_signals`], in isolation.
+///
+/// # Why ONE level, and no escalation to [`ShedLevel::AllDepth`]
+///
+/// Escalating would need a SECOND threshold — some number of stuck tables at
+/// which the wider cut is warranted — and this repository has never measured
+/// what that number is. `WalLagTracker`'s own header refuses an absolute lag
+/// threshold on exactly this ground: *"picking an absolute number without that
+/// measurement is the exact failure this detector exists to correct."* Picking
+/// an absolute TABLE COUNT is the same mistake wearing a different unit.
+///
+/// The obvious substitute — escalate once we are already shedding and tables
+/// are still latched — does not work either, and it is worth writing down why
+/// so nobody adds it later believing it is free. The latch is edge-triggered
+/// and clears only when lag actually FALLS, so it stays set across the poll
+/// after the shed. That rule would escalate to `AllDepth` within one minute of
+/// every single arming, collapsing the two levels into one and dropping 96% of
+/// depth rows on evidence that only ever justified 42%.
+///
+/// So this signal arms [`ShedLevel::InlineDepth`] and stops. That is the
+/// deliberately cheap end of the ladder — 5 book levels riding inside each
+/// tick packet, across the whole universe, on instruments the dedicated depth
+/// sockets already cover far more deeply. `AllDepth` stays reachable by the
+/// disk triggers, which is where an unrelieved apply backlog ends up anyway,
+/// and those have measured thresholds behind them.
+///
+/// # The hysteresis is in the detector, not duplicated here
+///
+/// Every other trigger in this module carries its own restore band because it
+/// reads a continuous quantity that can hover on a threshold. This one reads a
+/// count that is already the output of a five-consecutive-poll growth latch
+/// which clears only on a real fall — so a second band here would be a second
+/// place for the two to disagree, which the runway trigger's own header calls
+/// out as "two bugs to be found separately".
+#[must_use]
+fn decide_shed_level_by_apply_lag(current: ShedLevel, growing_tables: u32) -> ShedLevel {
+    if growing_tables == 0 {
+        // Asks for nothing. Composed with `max`, so this can never UNDO a
+        // shed another signal is holding — it simply declines to add one.
+        return ShedLevel::None;
+    }
+    current.max(ShedLevel::InlineDepth)
+}
 
 /// Converts the disk-pressure loop's percent-USED reading into the free
 /// fraction this module decides on.
@@ -629,7 +725,7 @@ pub fn decide_shed_level_by_exhaustion(
 /// where no counter of ours can even see them. Those are not comparable, so
 /// this errs toward shedding.
 #[must_use]
-#[allow(clippy::too_many_arguments)] // APPROVED: three independent measurements
+#[allow(clippy::too_many_arguments)] // APPROVED: four independent measurements
 pub fn decide_shed_level_all_signals(
     current: ShedLevel,
     free_fraction: f64,
@@ -639,14 +735,30 @@ pub fn decide_shed_level_all_signals(
     anchor: Option<(u64, u64)>,
     secs_now: u64,
     secs_of_day_ist: u32,
+    wal_lag_growing_tables: u32,
 ) -> ShedLevel {
+    // The WAL-apply signal is folded HERE, into the value every early return
+    // below hands back — not at the bottom beside the exhaustion signal.
+    //
+    // That placement is load-bearing. The three `return by_configured` paths
+    // below all mean "the self-measured exhaustion trigger has nothing to say
+    // yet": no anchor, no derivable burn rate, or outside the capture window.
+    // Not one of them is a reason to ignore a database that has stopped
+    // keeping up — and the first two are the NORMAL state for the opening
+    // minutes of a session, which is exactly when apply lag starts climbing.
+    // Folding at the bottom would have let all three skip it silently, which
+    // is the shape of bug this file's own header calls a false NON-shed.
     let by_configured = decide_shed_level_with_runway(
         current,
         free_fraction,
         free_bytes,
         session_burn_bytes,
         retention_at_floor,
-    );
+    )
+    .max(decide_shed_level_by_apply_lag(
+        current,
+        wal_lag_growing_tables,
+    ));
 
     let Some((anchor_free, anchor_secs)) = anchor else {
         return by_configured;
@@ -1309,41 +1421,50 @@ mod tests {
 
     #[test]
     fn the_combined_decision_is_never_quieter_than_any_single_signal() {
-        // The property that makes adding a third signal safe: it may only ever
-        // make the gate MORE protective. If this can fail, a change meant to
-        // catch more is silently catching less.
+        // The property that makes adding a FOURTH signal safe: it may only
+        // ever make the gate MORE protective. If this can fail, a change
+        // meant to catch more is silently catching less.
+        //
+        // The WAL-apply dimension is in this loop rather than in a test of its
+        // own precisely because that is where the risk lives: a signal folded
+        // in the wrong place could de-escalate a shed the disk had earned, and
+        // only a cross-product catches it.
         for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
             for &free_fraction in &[0.0, 0.10, 0.55, 1.0] {
                 for &free_bytes in &[1_000_u64, 60_000_000_000, 300_000_000_000] {
                     for &burn in &[0_u64, 148_000_000_000] {
                         for &at_floor in &[false, true] {
                             for anchor in [None, Some((314_000_000_000_u64, 0_u64))] {
-                                let all = decide_shed_level_all_signals(
-                                    current,
-                                    free_fraction,
-                                    free_bytes,
-                                    burn,
-                                    at_floor,
-                                    anchor,
-                                    4 * H,
-                                    39_600,
-                                );
-                                let fraction_only =
-                                    decide_shed_level(current, free_fraction, at_floor);
-                                let configured = decide_shed_level_with_runway(
-                                    current,
-                                    free_fraction,
-                                    free_bytes,
-                                    burn,
-                                    at_floor,
-                                );
-                                assert!(
-                                    all >= fraction_only && all >= configured,
-                                    "combining signals made the gate QUIETER: \
-                                     current={current:?} frac={free_fraction} \
-                                     bytes={free_bytes} burn={burn} \
-                                     floor={at_floor} anchor={anchor:?}"
-                                );
+                                for &lag in &[0_u32, 1, 14] {
+                                    let all = decide_shed_level_all_signals(
+                                        current,
+                                        free_fraction,
+                                        free_bytes,
+                                        burn,
+                                        at_floor,
+                                        anchor,
+                                        4 * H,
+                                        39_600,
+                                        lag,
+                                    );
+                                    let fraction_only =
+                                        decide_shed_level(current, free_fraction, at_floor);
+                                    let configured = decide_shed_level_with_runway(
+                                        current,
+                                        free_fraction,
+                                        free_bytes,
+                                        burn,
+                                        at_floor,
+                                    );
+                                    let by_lag = decide_shed_level_by_apply_lag(current, lag);
+                                    assert!(
+                                        all >= fraction_only && all >= configured && all >= by_lag,
+                                        "combining signals made the gate QUIETER: \
+                                         current={current:?} frac={free_fraction} \
+                                         bytes={free_bytes} burn={burn} \
+                                         floor={at_floor} anchor={anchor:?} lag={lag}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1369,11 +1490,122 @@ mod tests {
                             None,
                             4 * H,
                             39_600,
+                            // No lag: this test asserts the pre-feature behaviour is
+                            // unchanged, and a stuck database legitimately changes it.
+                            0,
                         ),
                         decide_shed_level(current, free_fraction, at_floor),
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn no_growing_tables_asks_for_nothing_at_every_level() {
+        // Zero is also the value at process start, before the watcher's first
+        // poll. It must never be read as a reason to shed, and — composed
+        // with `max` — never as a reason to restore either.
+        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
+            assert_eq!(
+                decide_shed_level_by_apply_lag(current, 0),
+                ShedLevel::None,
+                "an unmeasured or healthy database must ask for nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn one_growing_table_arms_inline_depth_and_never_more() {
+        // The whole contract of this signal in one assertion: it reaches the
+        // cheap, redundant rung and stops. A future change that escalates on
+        // a table COUNT has to come here and argue for the number it picked —
+        // which is the point, because no such number has been measured.
+        for &tables in &[1_u32, 2, 14, 256, u32::MAX] {
+            assert_eq!(
+                decide_shed_level_by_apply_lag(ShedLevel::None, tables),
+                ShedLevel::InlineDepth,
+                "{tables} stuck tables must arm inline depth, and only inline depth"
+            );
+        }
+    }
+
+    #[test]
+    fn a_growing_backlog_never_de_escalates_a_shed_the_disk_earned() {
+        // `current.max(..)` rather than a bare return. A box already at
+        // AllDepth because the volume is nearly full must not be walked back
+        // to InlineDepth by a signal that only ever justified the lower rung.
+        assert_eq!(
+            decide_shed_level_by_apply_lag(ShedLevel::AllDepth, 3),
+            ShedLevel::AllDepth
+        );
+        assert_eq!(
+            decide_shed_level_by_apply_lag(ShedLevel::InlineDepth, 3),
+            ShedLevel::InlineDepth
+        );
+    }
+
+    #[test]
+    fn the_lag_signal_survives_every_early_return_in_the_combined_decision() {
+        // THE test for this feature, and the reason the fold sits at the top
+        // of `decide_shed_level_all_signals` rather than the bottom.
+        //
+        // All three early returns mean "the self-measured exhaustion trigger
+        // has nothing to say yet": no anchor (a fresh restart), no derivable
+        // burn rate, or outside the capture window. The first two are the
+        // NORMAL state of the opening minutes of a session — which is exactly
+        // when apply lag starts climbing. A fold at the bottom would compile,
+        // pass every other test in this file, and silently do nothing for the
+        // first two hours of every trading day.
+        //
+        // Healthy disk on purpose: 55% free, no burn, retention fine. The ONLY
+        // thing asking for a shed here is the database.
+        let healthy_disk_stuck_database = |anchor, secs_of_day| {
+            decide_shed_level_all_signals(
+                ShedLevel::None,
+                0.55,
+                300_000_000_000,
+                0,
+                false,
+                anchor,
+                4 * H,
+                secs_of_day,
+                1,
+            )
+        };
+
+        // Path 1: no anchor — a restart inside the session.
+        assert_eq!(
+            healthy_disk_stuck_database(None, 39_600),
+            ShedLevel::InlineDepth,
+            "a restart must not blind the gate to a stuck database"
+        );
+        // Path 2: anchor present but no burn to derive a rate from.
+        assert_eq!(
+            healthy_disk_stuck_database(Some((300_000_000_000, 4 * H)), 39_600),
+            ShedLevel::InlineDepth,
+            "an underivable burn rate must not blind the gate either"
+        );
+        // Path 3: outside the capture window.
+        assert_eq!(
+            healthy_disk_stuck_database(Some((314_000_000_000, 0)), 0),
+            ShedLevel::InlineDepth,
+            "a stuck database out of hours is still a stuck database"
+        );
+    }
+
+    #[test]
+    fn the_published_table_count_round_trips_and_saturates_rather_than_wrapping() {
+        publish_wal_apply_lag_growing(0);
+        assert_eq!(wal_apply_lag_growing(), 0);
+        publish_wal_apply_lag_growing(14);
+        assert_eq!(wal_apply_lag_growing(), 14);
+        // Unreachable in practice (the tracker caps its map at 256), but a
+        // wrap here would turn "every table is stuck" into "none are" — the
+        // one direction that must be impossible.
+        publish_wal_apply_lag_growing(usize::MAX);
+        assert_eq!(wal_apply_lag_growing(), u32::MAX);
+        // Leave the global as the rest of the suite expects to find it.
+        publish_wal_apply_lag_growing(0);
     }
 }
