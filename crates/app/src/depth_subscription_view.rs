@@ -287,6 +287,14 @@ impl DepthSubscriptionView {
                     // without bound. A refused entry can never read as Ghost,
                     // which is the safe direction (no redial on a guess).
                     metrics::counter!(DROPPED_REFUSED_COUNTER).increment(1);
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
+                            .code_str(),
+                        source = "dropped_map_full",
+                        tracked = map.len(),
+                        cap = MAX_DROPPED_TRACKED,
+                        "depth view dropped map is full; further drops this publish are not remembered and can never read as ghost (fail-closed: no redial on a guess)"
+                    );
                     break;
                 }
                 map.insert(*key, now_secs);

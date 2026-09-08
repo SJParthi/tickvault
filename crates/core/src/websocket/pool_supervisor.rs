@@ -698,16 +698,6 @@ pub fn take_ghost_redial(connection_index: u8) -> bool {
         .is_some_and(|p| p.swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
-/// Test-only: clears every slot so tests do not see each other's requests.
-#[cfg(test)]
-// TEST-EXEMPT: cfg(test)-only helper that clears the process-global register between tests; the register tests exercise it.
-pub fn reset_ghost_redials_for_tests() {
-    for (p, l) in GHOST_PENDING.iter().zip(GHOST_LAST_ARMED.iter()) {
-        p.store(false, std::sync::atomic::Ordering::Release);
-        l.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// Why a connection stopped permanently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkReason {
@@ -4565,6 +4555,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Test-only: clears every slot so tests do not see each other's requests.
+    fn reset_ghost_redials_for_tests() {
+        for (p, l) in GHOST_PENDING.iter().zip(GHOST_LAST_ARMED.iter()) {
+            p.store(false, std::sync::atomic::Ordering::Release);
+            l.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     use proptest::prelude::*;
     use std::collections::{BTreeSet, VecDeque};
     use std::sync::Mutex;
