@@ -157,7 +157,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
-        "🔷 DHAN: more than a quarter of prices arrive with a bad time stamp — the prices ARE saved, only the per-minute summary skips them. Normal is under 10%",
+        "🔷 DHAN: more than a QUARTER of prices arrive with a bad time stamp — the prices ARE saved, only the per-minute summary skips them. Recent sessions ran 2-7%",
     ),
     (
         "aggregator-slots-exhausted",
@@ -553,7 +553,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     ),
     (
         "errcode-wal-suspend-01",
-        "The database is behind on applying writes — rows are accepted but not yet visible; if it does not catch up they stop being stored",
+        "The database is behind on applying writes — rows are SAFELY STORED but not yet visible to queries. Nothing is lost; the backlog applies when it catches up",
     ),
     (
         "errcode-ws-spill-01",
