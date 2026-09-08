@@ -200,7 +200,7 @@ where
             cadence,
             family: family.as_str(),
             feed: SNAPSHOT_FEED,
-            segment: contract.segment.as_str().to_string(),
+            segment: contract.segment.as_str(),
             rank,
             security_id,
             underlying_id,

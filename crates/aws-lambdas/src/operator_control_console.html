@@ -120,7 +120,7 @@
     <section data-tab="overview">
       <div class="card">
         <div class="hero">
-          <div class="bignum"><div class="n" id="ticksbig">0</div><div class="c">official minute rows captured today</div><div class="c" id="feedsplit"></div></div>
+          <div class="bignum"><div class="n" id="ticksbig">—</div><div class="c">official minute rows captured today</div><div class="c" id="feedsplit"></div></div>
           <div class="pills">
             <div class="pill"><div class="v" id="p_inst">—</div><div class="k">instance</div></div>
             <div class="pill"><div class="v" id="p_app">—</div><div class="k">app</div></div>
@@ -391,12 +391,12 @@ async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML=
       const failed=Object.keys(ra).filter(k=>k!=='ok'&&k!=='rate_limited'&&k!=='skipped'&&k!=='boundary_skipped').reduce((s,k)=>s+(ra[k]||0),0);
       pull='pulls today: '+ok.toLocaleString()+' ok · '+failed.toLocaleString()+' failed · '+rlim.toLocaleString()+' rate-limited';
       if(rl&&(rl.p50_ms!=null||rl.p99_ms!=null)) pull+=' — last hour: p50 '+fmtLagMs(rl.p50_ms)+' / p99 '+fmtLagMs(rl.p99_ms)+' after minute close';
-    } else { pull='no official-candle pulls recorded today'; }
+    } else if(j.rest_audit_error){ pull=esc(j.rest_audit_error); } else { pull='no official-candle pulls recorded today'; }
     const detail='<div class="muted">'+(h&&h.reason?esc(h.reason)+' · ':'')+pull+'</div>';
     return '<div class="pr"><div class="t"><b>'+esc(f.name)+'</b> — <span class="'+(f.enabled?'ok':'bad')+'">'+(f.enabled?'ENABLED':'disabled')+'</span>'
       +' · lane '+(f.lane?'<span class="ok">running</span>':'<span class="warn">not running</span>')+' '+badge+detail+'</div>'
       +'<button class="'+(f.enabled?'b-stop':'b-go')+' mini" onclick="feedToggle(\''+safeName+'\','+(!f.enabled)+')">'+(f.enabled?'⏹ turn OFF':'▶ turn ON')+'</button></div>'; }).join('');
-  const errs=[j.feeds_error,j.health_error].filter(Boolean).join(' · ');
+  const errs=[j.feeds_error,j.health_error,j.rest_audit_error].filter(Boolean).join(' · ');
   if(errs) $('feedsmsg').textContent=errs; }
 async function feedToggle(feed,enabled){
   if(!enabled && !confirm('Turn OFF "'+feed+'"? Its official-candle pulls (spot + option chain) stop until you turn it back on.')){ toast('cancelled'); return; }

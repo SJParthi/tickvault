@@ -1198,7 +1198,22 @@ impl LiveIngest {
         ) {
             return (0, 0);
         }
-        if self.top_volume.is_none() {
+        // Two consumers of this pass now, and they are gated separately.
+        //
+        // `wants_rows` is the original one: no writer, no rows to write.
+        // `wants_candidates` is the depth-200 steering publish (2026-09-08),
+        // which reads the SAME Stock/5s ranking and must keep working when the
+        // top-volume writer thread failed to spawn -- steering is not a
+        // persistence feature, and coupling it to one would make a rare degrade
+        // of the table a silent degrade of the depth pool.
+        //
+        // The early exit is kept for the case where NEITHER wants anything,
+        // because ranking to discover that would pay the ~900 us sort on the
+        // 1-second arm for nothing.
+        let wants_rows = self.top_volume.is_some();
+        let wants_candidates =
+            cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
+        if !wants_rows && !wants_candidates {
             return (0, 0);
         }
 
@@ -1208,6 +1223,12 @@ impl LiveIngest {
             crate::volume_leaderboard::OptionFamily::Index,
             crate::volume_leaderboard::OptionFamily::Stock,
         ] {
+            // Only the Stock family feeds the candidates, so with no writer
+            // there is nothing the Index pass could produce. Skipping it keeps
+            // the writer-less degrade at ONE sort per 5 seconds instead of two.
+            if !wants_rows && family != crate::volume_leaderboard::OptionFamily::Stock {
+                continue;
+            }
             // Ranked into a scratch the leaderboard owns, then COPIED out
             // before the closures below borrow `self` again. Holding the
             // borrow across the projection would need `rank`'s slice and
@@ -1231,7 +1252,45 @@ impl LiveIngest {
                     |_| true,
                 )
                 .to_vec();
+
+            // ---- the depth-200 steering publish (2026-09-08) ----
+            //
+            // Off THIS pass, deliberately, and NOT via
+            // `rank_distinct_underlying`: that method ranks, and a second rank
+            // on the same cadence in the same tick would measure a window this
+            // one has already consumed -- every delta 0, the order collapsed to
+            // the security_id tie-break, silently. See its own doc comment.
+            //
+            // Placed BEFORE the `is_empty` skip so an empty ranking publishes
+            // an EMPTY list rather than nothing at all. Those are different
+            // answers: "nothing traded" is a reading, "we have not ranked" is
+            // the absence of one, and the reader refuses to claim a divergence
+            // from the second.
+            //
+            // Stock only, per the 2026-09-06 lock: index options are banned
+            // from depth entirely, so publishing them would hand the steering
+            // loop the very set the lock forbids.
+            //
+            // HONEST BOUND, stated because it is not exact: this is the greedy
+            // distinct-underlying pass over the top
+            // `TOP_VOLUME_RANK_PER_FAMILY` (250) rather than over the whole
+            // sorted population, because 250 is what this pass materialised.
+            // The two agree whenever those 250 rows contain at least 5 distinct
+            // underlyings. When they do not, this publishes FEWER than 5 -- a
+            // short list, which the length gauge shows -- never a wrong one.
+            if family == crate::volume_leaderboard::OptionFamily::Stock && wants_candidates {
+                let picked = crate::volume_leaderboard::distinct_underlying_over(
+                    &ranked,
+                    crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
+                );
+                crate::depth200_candidates::global_depth200_candidates()
+                    .publish(crate::depth200_candidates::candidates_from_ranked(&picked));
+            }
+
             if ranked.is_empty() {
+                continue;
+            }
+            if !wants_rows {
                 continue;
             }
 
@@ -21515,6 +21574,89 @@ mod depth_rebalance_wiring_tests {
         assert!(
             rows >= 1,
             "the same board with the writer attached must write rows, got {rows}"
+        );
+    }
+
+    /// The depth-200 steering publish rides the 5-SECOND ranking pass.
+    ///
+    /// Asserts on the process-wide view because that is the seam under test —
+    /// the drain writes it and the steering loop reads it, and a test against a
+    /// private instance would prove the module works while the wiring did not
+    /// exist. Written to be parallel-safe: every test in this module ranks the
+    /// SAME fixture contract, so the assertions are "was published" and
+    /// "contains 777", both of which any concurrent publisher of this fixture
+    /// also satisfies. Nothing here asserts an ABSENCE on the global, which is
+    /// the assertion a parallel run could break.
+    #[test]
+    fn the_five_second_pass_publishes_the_depth200_steering_candidates() {
+        let mut ingest = ranking_fixture();
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        ingest.snapshot_top_volume(
+            in_window,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+        );
+        let published = crate::depth200_candidates::global_depth200_candidates()
+            .latest()
+            .expect("the 5s pass must PUBLISH, even if the ranking were empty");
+        assert!(
+            published.iter().any(|c| c.security_id == 777),
+            "the ranked stock option must reach the steering view, got {published:?}"
+        );
+    }
+
+    /// Steering is not a persistence feature.
+    ///
+    /// The boot path tolerates a failed top-volume writer-thread spawn by
+    /// leaving the writer unattached. Before this wiring that early return also
+    /// skipped the ranking, so a rare degrade of one TABLE would have become a
+    /// silent degrade of the depth POOL — the pool would have steered on
+    /// nothing, with no counter to say so.
+    #[test]
+    fn candidates_are_published_even_when_no_snapshot_writer_is_attached() {
+        let mut ingest = ranking_ingest(false);
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        let (rows, refused) = ingest.snapshot_top_volume(
+            in_window,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+        );
+        assert_eq!(
+            (rows, refused),
+            (0, 0),
+            "no writer still means no rows -- only the candidates changed"
+        );
+        let published = crate::depth200_candidates::global_depth200_candidates()
+            .latest()
+            .expect("a writer-less lane must still publish steering candidates");
+        assert!(
+            published.iter().any(|c| c.security_id == 777),
+            "got {published:?}"
+        );
+    }
+
+    /// The published list is bounded by the socket budget, not by the board.
+    ///
+    /// Five sockets exist, so publishing 250 rows would hand the steering loop
+    /// a wish-list it can never satisfy and make every divergence report read
+    /// as 245 unheld contracts every minute.
+    #[test]
+    fn the_published_list_never_exceeds_the_depth200_socket_budget() {
+        let mut ingest = ranking_fixture();
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        ingest.snapshot_top_volume(
+            in_window,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+        );
+        let published = crate::depth200_candidates::global_depth200_candidates()
+            .latest()
+            .expect("published");
+        assert!(
+            published.len() <= crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
+            "published {} for {} sockets",
+            published.len(),
+            crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET
         );
     }
 

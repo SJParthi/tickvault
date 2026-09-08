@@ -1365,6 +1365,59 @@ pub async fn run_depth_rebalance(
         // refuses forever.
         let held: Vec<SubscribeInstrument> = sockets.iter().filter_map(|s| s.held).collect();
 
+        // ---- the volume-ranking divergence report (2026-09-08) ----
+        //
+        // READ-ONLY. This changes no subscription and sends no command.
+        //
+        // The 2026-09-06 lock puts the top five STOCK-option contracts by
+        // traded volume on these five sockets, each a distinct underlying. This
+        // loop selects on `close_pct_from_prev_day` of the underlying SPOT
+        // instead, so four of the five carry NIFTY/BANKNIFTY INDEX options --
+        // the class the lock bans. Nothing measured that gap; it was found by
+        // reading the code.
+        //
+        // Acting on it here would move five deep sockets onto books whose depth
+        // has never been measured, on the strength of a ranking that has never
+        // steered anything. The lock's own text records 800 rows/minute against
+        // 100,800 when thin contracts took these sockets on 2026-08-26. So this
+        // makes the violation MEASURABLE first and leaves the sockets alone --
+        // measure, then move, in that order.
+        //
+        // Read AFTER the reconcile, which is the only moment `held` means
+        // "acked on the wire" rather than "sent and hoped for", matching the
+        // discipline `publish_depth_subscriptions` already documents.
+        {
+            let held_keys: Vec<(u64, ExchangeSegment)> =
+                held.iter().map(|i| (i.security_id, i.segment)).collect();
+            match crate::depth200_candidates::report_divergence(
+                crate::depth200_candidates::global_depth200_candidates(),
+                &held_keys,
+            ) {
+                // Before the drain's first 5-second ranking -- and every minute
+                // of a session in which the drain never ranks at all. Logged at
+                // debug rather than info: on a healthy morning this is true for
+                // under a minute, and a per-minute info line for a transient
+                // startup state is how a log stops being read.
+                None => tracing::debug!(
+                    held = held_keys.len(),
+                    "depth-200 volume ranking not yet published — no divergence claimed"
+                ),
+                Some(d) if d.is_aligned() => tracing::debug!(
+                    held = d.held_total,
+                    "depth-200 holds exactly what the volume ranking selects"
+                ),
+                Some(d) => tracing::info!(
+                    held = d.held_total,
+                    sockets_off_ranking = d.held_off_ranking.len(),
+                    ranked_unheld = d.ranked_unheld.len(),
+                    off_ranking = ?d.held_off_ranking,
+                    should_hold = ?d.ranked_unheld,
+                    "depth-200 diverges from the volume ranking the 2026-09-06 lock \
+                     mandates — REPORTED ONLY, no socket was moved by this line"
+                ),
+            }
+        }
+
         // ---- depth-20: the windows and the movers, every minute ----
         //
         // Runs BEFORE the depth-200 quiet check, because that check

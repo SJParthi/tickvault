@@ -155,8 +155,21 @@ pub struct TopVolumeRankRow {
     pub family: &'static str,
     /// Feed that produced the volume (`dhan`).
     pub feed: &'static str,
-    /// Segment SYMBOL string (`NSE_FNO`, ...). Owned — the caller holds it.
-    pub segment: String,
+    /// Segment SYMBOL string (`NSE_FNO`, ...).
+    ///
+    /// `&'static str`, like `family` and `feed` beside it. It was `String`
+    /// until 2026-09-08, and the producer filled it with
+    /// `contract.segment.as_str().to_string()` — where `ExchangeSegment::as_str`
+    /// ALREADY returns `&'static str` and this consumer immediately calls
+    /// `.as_str()` on it again. A heap allocation and a copy, round-tripping a
+    /// static string back to itself.
+    ///
+    /// That is 250 rows per family x 2 families x 2 cadences = ~500-600
+    /// `String`s per second, on the frame-drain task, in a codebase whose first
+    /// principle is zero allocation on the hot path. Its two neighbours were
+    /// already `&'static str`, so the type was the odd one out as well as the
+    /// costly one.
+    pub segment: &'static str,
     /// 1-based position within its family at this snapshot.
     pub rank: i64,
     /// The contract's own security id.
@@ -414,7 +427,7 @@ impl TopVolumeRankWriter {
             .context("family")?
             .symbol("feed", r.feed)
             .context("feed")?
-            .symbol("segment", r.segment.as_str())
+            .symbol("segment", r.segment)
             .context("segment")?
             .column_i64("rank", r.rank)
             .context("rank")?
@@ -838,7 +851,7 @@ mod tests {
             cadence: SnapshotCadence::FiveSecond,
             family: "stock_option",
             feed: "dhan",
-            segment: "NSE_FNO".to_string(),
+            segment: "NSE_FNO",
             rank: 1,
             security_id: 44_321,
             underlying_id: 2885,
