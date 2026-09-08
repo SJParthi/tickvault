@@ -157,7 +157,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
-        "🔷 DHAN: more than a quarter of prices arrive with a bad time stamp — the prices ARE saved, only the per-minute summary skips them. Normal is under 10%",
+        "🔷 DHAN: more than a QUARTER of prices arrive with a bad time stamp — the prices ARE saved, only the per-minute summary skips them. Recent sessions ran 2-7%",
     ),
     (
         "aggregator-slots-exhausted",
@@ -553,7 +553,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     ),
     (
         "errcode-wal-suspend-01",
-        "The database is behind on applying writes — rows are accepted but not yet visible; if it does not catch up they stop being stored",
+        "The database is behind on applying writes — rows are SAFELY STORED but not yet visible to queries. Nothing is lost; the backlog applies when it catches up",
     ),
     (
         "errcode-ws-spill-01",
@@ -621,12 +621,73 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
     }
 }
 
+/// Alarms whose CONDITION is a self-healing degrade, not an emergency.
+///
+/// Every one of these fires while the system is doing exactly what it was
+/// built to do: a flush could not reach the database, so the rows went to the
+/// spill file and will be replayed. Their own message bodies say so — "nothing
+/// is lost, they are replayed", "check it before assuming loss".
+///
+/// WHY THIS LIST EXISTS (2026-09-08, from a real operator complaint with a
+/// screenshot). Between 08:32 and 09:21 IST the operator's phone took FOURTEEN
+/// alerts. Nine of them contained the words "nothing is lost" in their own
+/// body, three were the SAME message re-sent at 08:34, 09:04 and 09:21 — and
+/// every single one rendered as a red 🆘, because the line below returned 🆘
+/// for `state == "ALARM"` unconditionally. The declared `Severity` in
+/// `error_code.rs` never reached the phone at all: `HOT-PATH-02` is declared
+/// **Low** and arrived looking identical to a Critical.
+///
+/// The measured truth for that session: dropped == spilled on both the tick
+/// and the depth path (every rescued row re-ingestable), WAL-dropped zero,
+/// sockets parked zero. Nothing was lost. The ONE alert that mattered — the
+/// contract universe failing at 09:13 — sat eleventh of fourteen, wearing the
+/// same emoji as the nine that said nothing was wrong.
+///
+/// FAIL-LOUD BY DEFAULT: an alarm not named here keeps 🆘. This list downgrades
+/// only conditions whose own text says nothing is lost, and adding to it is a
+/// deliberate act with a reason attached — never a way to quieten something
+/// inconvenient.
+const DEGRADE_NOT_EMERGENCY: &[&str] = &[
+    // Rows a failed flush rescued to the spill file, replayed on the next
+    // successful flush. Declared Severity::Low; rendered 🆘 until today.
+    "errcode-hot-path-02",
+    // The tick spill tier engaging. `dropped == spilled` is the proof the
+    // rescue worked, and this alarm fires on exactly that path.
+    "ticks-spilling",
+    // "EITHER a frame was dropped OR replay deferred segments, which loses
+    // nothing" — one alarm covering both, so it cannot honestly claim loss.
+    "errcode-ws-spill-02",
+    // Ticks the per-minute candle summary skipped. The ROWS ARE WRITTEN; only
+    // the candle is missed, and the emit site says so in capitals.
+    "aggregator-refusal-rate-high",
+];
+
+/// True when this alarm's condition is a self-healing degrade.
+///
+/// Matched on the alarm NAME fragment, which is stable across environments
+/// (`tv-prod-…` / `tv-dev-…` share the fragment), rather than on the message
+/// body, which is prose and would drift.
+#[must_use]
+pub fn is_degrade_not_emergency(subject: &str) -> bool {
+    let lower = subject.to_lowercase();
+    DEGRADE_NOT_EMERGENCY
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
 /// Map alarm severity / subject to a leading emoji per charter §D rule
 /// 5+10. Legacy parity: `_severity_emoji` (the legacy `"deploy ok" in`
 /// clause is a subset of the `"ok" in` clause — one contains-check here).
 pub fn severity_emoji(subject: &str, alarm_state: Option<&str>) -> &'static str {
     let subject_lower = subject.to_lowercase();
     let state = alarm_state.unwrap_or("").to_uppercase();
+    // Checked BEFORE the ALARM arm, and only for the ALARM state: a degrade
+    // returning to OK is still a ✅, and an alarm that is not in the list is
+    // still an emergency. The order is the whole safety property — moving this
+    // below the 🆘 return makes it unreachable and silently restores the flood.
+    if state == "ALARM" && is_degrade_not_emergency(subject) {
+        return "⚠️";
+    }
     if subject_lower.contains("fail") || subject_lower.contains("critical") || state == "ALARM" {
         return "🆘";
     }
@@ -738,7 +799,7 @@ pub fn house_line(alarm: &Value) -> String {
     let emoji = if state.is_empty() {
         "🔔"
     } else {
-        severity_emoji("", Some(&state))
+        severity_emoji(&name, Some(&state))
     };
     format!("{emoji} {phrase}\n{ist_time} IST")
 }
@@ -937,7 +998,7 @@ pub fn repeat_alarm_line(alarm: &Value, streak: u32) -> String {
     let state = value_str_or(alarm.get("NewStateValue"), "ALARM").to_uppercase();
     let phrase = alarm_phrase(&name);
     let ist_time = ist_12h(&value_str_or(alarm.get("StateChangeTime"), ""));
-    let emoji = severity_emoji("", Some(&state));
+    let emoji = severity_emoji(&name, Some(&state));
     let window_mins = (ALARM_REPEAT_COALESCE_SECS / 60.0).round() as u64;
     format!(
         "{emoji} Still down: {phrase} ({} page in {window_mins} min) — {ist_time} IST",
@@ -1309,6 +1370,182 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_degrade_not_emergency, severity_emoji};
+
+    /// The exact alerts from the operator's 2026-09-08 screenshot.
+    ///
+    /// Nine of fourteen carried "nothing is lost" in their own body and every
+    /// one rendered 🆘. These four are the repeat offenders; each must now
+    /// render ⚠️ so the ones that mean something can be seen.
+    #[test]
+    fn a_degrade_that_says_nothing_is_lost_is_not_an_emergency() {
+        for alarm in [
+            "tv-prod-errcode-hot-path-02",
+            "tv-prod-ticks-spilling",
+            "tv-prod-errcode-ws-spill-02",
+            "tv-prod-aggregator-refusal-rate-high",
+        ] {
+            assert_eq!(
+                severity_emoji(alarm, Some("ALARM")),
+                "⚠️",
+                "{alarm} says nothing is lost — it must not wear the emergency emoji"
+            );
+        }
+    }
+
+    /// FAIL LOUD BY DEFAULT. Anything not explicitly named stays 🆘.
+    ///
+    /// This is the half that keeps the list honest: it must be impossible to
+    /// quieten an alarm by forgetting to think about it.
+    #[test]
+    fn an_alarm_not_on_the_degrade_list_keeps_the_emergency_emoji() {
+        for alarm in [
+            // The ONE that mattered on 2026-09-08, buried eleventh of fourteen.
+            "tv-prod-dhan-contract-universe-failed",
+            "tv-prod-dhan-live-lane-down",
+            "tv-prod-wal-frames-not-recovered",
+            "tv-prod-questdb-wal-suspended",
+            "tv-prod-some-alarm-nobody-has-classified-yet",
+        ] {
+            assert_eq!(
+                severity_emoji(alarm, Some("ALARM")),
+                "🆘",
+                "{alarm} is not a known degrade and must stay loud"
+            );
+        }
+    }
+
+    /// A degrade RECOVERING is still a recovery, and a degrade that is not in
+    /// the ALARM state is not being downgraded by accident.
+    #[test]
+    fn the_degrade_downgrade_applies_only_to_the_alarm_state() {
+        assert_eq!(severity_emoji("tv-prod-ticks-spilling", Some("OK")), "✅");
+        assert_eq!(
+            severity_emoji("tv-prod-ticks-spilling", Some("INSUFFICIENT_DATA")),
+            "⚠️"
+        );
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT THE 2026-09-08 DEAD-ON-ARRIVAL BUG.
+    ///
+    /// The three tests above all call `severity_emoji(alarm_name, ...)`
+    /// directly — and PRODUCTION NEVER CALLS IT THAT WAY. Both CloudWatch
+    /// renderers read the alarm name into a local and then passed `""`:
+    ///
+    /// ```text
+    /// let name = value_str_or(alarm.get("AlarmName"), "unknown-alarm");
+    /// let emoji = severity_emoji("", Some(&state));   // <- the name dropped
+    /// ```
+    ///
+    /// So `is_degrade_not_emergency("")` was false for every fragment, every
+    /// degrade still rendered red, and all 59 tests passed. The classifier was
+    /// correct and unreachable.
+    ///
+    /// That is the same shape as a reader querying a different store than the
+    /// writer fills: every behavioural test of the piece passes, and the
+    /// system does not do the thing. The only test that catches it is one that
+    /// goes through the door production goes through — so these assert on the
+    /// RENDERED LINE, never on the classifier.
+    #[test]
+    fn the_rendered_house_line_downgrades_a_degrade_and_only_a_degrade() {
+        let degrade = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-ticks-spilling",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-09-08T03:04:00.000+0000",
+        }));
+        assert!(
+            degrade.starts_with('\u{26a0}'),
+            "the rendered line for a degrade must open with the warning emoji, got: {degrade}"
+        );
+
+        // The one that MATTERED on 2026-09-08, buried eleventh of fourteen.
+        let real = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-dhan-contract-universe-failed",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-09-08T03:43:00.000+0000",
+        }));
+        assert!(
+            real.starts_with('\u{1f198}'),
+            "a real failure must stay loud in the RENDERED line, got: {real}"
+        );
+
+        // A degrade recovering is still a recovery.
+        let recovered = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-ticks-spilling",
+            "NewStateValue": "OK",
+            "StateChangeTime": "2026-09-08T04:00:00.000+0000",
+        }));
+        assert!(
+            recovered.starts_with('\u{2705}'),
+            "recovery must render as a recovery, got: {recovered}"
+        );
+    }
+
+    /// The repeat renderer is a SECOND door into the same classifier, and it
+    /// carried the identical `severity_emoji("", ...)` defect. Three of the
+    /// fourteen alerts on 2026-09-08 were repeats, so this is not a
+    /// hypothetical second path — it is a third of the flood.
+    #[test]
+    fn the_rendered_repeat_line_downgrades_a_degrade_and_only_a_degrade() {
+        let degrade = repeat_alarm_line(
+            &serde_json::json!({
+                "AlarmName": "tv-prod-errcode-hot-path-02",
+                "NewStateValue": "ALARM",
+                "StateChangeTime": "2026-09-08T03:34:00.000+0000",
+            }),
+            3,
+        );
+        assert!(
+            degrade.starts_with('\u{26a0}'),
+            "a repeated degrade must not re-page as an emergency, got: {degrade}"
+        );
+
+        let real = repeat_alarm_line(
+            &serde_json::json!({
+                "AlarmName": "tv-prod-dhan-live-lane-down",
+                "NewStateValue": "ALARM",
+                "StateChangeTime": "2026-09-08T03:34:00.000+0000",
+            }),
+            3,
+        );
+        assert!(
+            real.starts_with('\u{1f198}'),
+            "a repeated real failure must stay loud, got: {real}"
+        );
+    }
+
+    /// Source-level pin on the wiring itself, because the two tests above are
+    /// behavioural and a future refactor could reintroduce the empty-subject
+    /// call in a THIRD renderer that has no rendered-line test yet.
+    ///
+    /// The rule is narrow and mechanical: no production call site may pass an
+    /// empty string literal as the subject while passing a real state. That is
+    /// the exact shape that made the classifier unreachable.
+    #[test]
+    fn no_renderer_passes_an_empty_subject_with_a_real_state() {
+        let src = include_str!("telegram_webhook.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        assert!(
+            !production.contains("severity_emoji(\"\", Some("),
+            "a production renderer passes an empty subject to severity_emoji \
+             while passing a real alarm state.\n\
+             That drops the alarm NAME, so every degrade classification is \
+             dead code and the operator gets the 2026-09-08 flood back: nine \
+             notices whose own bodies say nothing is lost, all rendered red."
+        );
+    }
+    /// The classifier matches on the name FRAGMENT, so it works in every
+    /// environment without a per-environment list.
+    #[test]
+    fn is_degrade_not_emergency_matches_across_environments() {
+        assert!(is_degrade_not_emergency("tv-prod-ticks-spilling"));
+        assert!(is_degrade_not_emergency("tv-dev-ticks-spilling"));
+        assert!(is_degrade_not_emergency("TV-PROD-TICKS-SPILLING"));
+        assert!(!is_degrade_not_emergency("tv-prod-dhan-live-lane-down"));
+    }
+
     use super::*;
 
     fn ist_12h_re() -> regex_lite::Re {

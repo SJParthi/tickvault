@@ -335,6 +335,19 @@ pub const FEED_API_UNREACHABLE: &str =
 /// legacy: `_BOX_UNREACHABLE` (handler.py:639) — verbatim.
 pub const BOX_UNREACHABLE: &str = "box unreachable (SSM offline or instance stopped)";
 
+/// The box answered and the `REST_AUDIT` line was present, but no row could be
+/// read out of it. Distinct from an ABSENT line and from a genuinely empty one:
+/// the query ran and produced something unreadable, which is a shape failure,
+/// not a report of zero pulls.
+pub const REST_AUDIT_UNPARSEABLE: &str = "the box sent a REST_AUDIT line no row could be read from — today's pull count is unknown, not zero";
+
+/// The box answered, but its snapshot carries no `REST_AUDIT` line. Distinct
+/// from [`BOX_UNREACHABLE`]: the box IS reachable and the rest of the snapshot
+/// parsed, so this reports a malformed answer rather than no answer — and,
+/// critically, neither of them reports "zero pulls today".
+pub const REST_AUDIT_ABSENT: &str =
+    "the box snapshot carried no REST_AUDIT line — today's pull count is unknown, not zero";
+
 /// legacy: `_FEEDS_TIMEOUT_SECS = 28.0` (handler.py:685). Budget arithmetic
 /// (review fix M1, 2026-07-16): the snapshot's curls are `--max-time` bounded
 /// at 8s + 8s (app /api/feeds + /api/feeds/health) + 4s + 4s (the two
@@ -915,8 +928,28 @@ pub fn parse_feeds_view(stdout: &str) -> Value {
             "feeds_error": BOX_UNREACHABLE,
             "health": null,
             "health_error": BOX_UNREACHABLE,
-            "rest_audit": {},
-            "rest_lat_hour": {},
+            // `null` + an error field, exactly like the two above it.
+            //
+            // This read `{}` until 2026-09-08, and the console renders an empty
+            // map as the sentence "no official-candle pulls recorded today" —
+            // so an UNREADABLE box and a box that genuinely pulled nothing
+            // produced the identical words.
+            //
+            // On 2026-09-08 the operator read that sentence while the cadence
+            // lane was healthy: the per-minute decision line ran continuously
+            // (11:09 → 11:16 IST, `rows=1510`, `unknown=0`) and
+            // `tv_rest_1m_fire_heartbeat` read 1.0 from 09:15 IST — a gauge its
+            // own emit site sets ONLY after a `spot_1m_rest` flush ACK. Rows
+            // were being fetched and persisted the whole time.
+            //
+            // A false ALARM manufactured by an unreadable data path is the
+            // inverse of the false-OK the rest of this file is built to avoid,
+            // and it costs the same thing: trust in the surface. The two fields
+            // above already knew that; this one was left behind.
+            "rest_audit": null,
+            "rest_audit_error": BOX_UNREACHABLE,
+            "rest_lat_hour": null,
+            "rest_lat_hour_error": BOX_UNREACHABLE,
         });
     }
     let (feeds, feeds_error) = extract_marked_json(stdout, "FEEDS_BEGIN", "FEEDS_END");
@@ -942,12 +975,38 @@ pub fn parse_feeds_view(stdout: &str) -> Value {
             fields.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
+    // THREE outcomes, not two. The console renders an empty map as the
+    // sentence "no official-candle pulls recorded today", so anything that
+    // degrades to `{}` becomes a claim about the LANE rather than about the
+    // READ — and on 2026-09-08 that claim was false while the lane was
+    // persisting every minute.
+    let (rest_audit, rest_audit_error) = match fields.get("REST_AUDIT") {
+        // Present and empty: the box ran the query and it returned no rows.
+        // The only one of the three that genuinely means "zero pulls".
+        Some(raw) if raw.is_empty() => (json!({}), Value::Null),
+        Some(raw) => {
+            let parsed = parse_rest_audit(raw);
+            if parsed.as_object().is_some_and(serde_json::Map::is_empty) {
+                // Non-empty input that yielded no row is a SHAPE failure —
+                // the query answered with something we cannot read. Reporting
+                // it as zero would be inventing the answer.
+                (Value::Null, json!(REST_AUDIT_UNPARSEABLE))
+            } else {
+                (parsed, Value::Null)
+            }
+        }
+        // No `REST_AUDIT` line at all. `map_or("")` used to fold this into the
+        // empty-string arm above, which is how an unreadable snapshot came to
+        // render as a confident zero.
+        None => (Value::Null, json!(REST_AUDIT_ABSENT)),
+    };
     json!({
         "feeds": feeds,
         "feeds_error": feeds_error,
         "health": health,
         "health_error": health_error,
-        "rest_audit": parse_rest_audit(fields.get("REST_AUDIT").map_or("", String::as_str)),
+        "rest_audit": rest_audit,
+        "rest_audit_error": rest_audit_error,
         "rest_lat_hour": parse_rest_lat_hour(fields.get("REST_LAT_HOUR").map_or("", String::as_str)),
     })
 }
@@ -2600,13 +2659,35 @@ mod tests {
         // business growing the frontend carve-out to hold a comment about the
         // deletion. The reasoning lives in `parse_view` above — a Rust file
         // under no such budget — and the HTML keeps a one-line pointer to it.
+        //
+        // RE-BLESSED 2026-09-08 — the false-alarm fix.
+        //
+        // Three in-line edits, no new JS lines (the shrink-only volume budget
+        // is untouched, deliberately — see the two failed attempts recorded
+        // above for why that matters):
+        //
+        //   1. the feed card's `else` now checks `rest_audit_error` first, so
+        //      an unreadable read renders the reason verbatim instead of the
+        //      sentence "no official-candle pulls recorded today";
+        //   2. `rest_audit_error` joins the `errs` strip beside its two
+        //      siblings, which have carried their errors since they were
+        //      written;
+        //   3. the hero's `ticksbig` default changes from the literal `0` to
+        //      `—`, matching every pill on the same card. A render that never
+        //      reached `countUp` was showing a fabricated zero that an
+        //      operator could not tell from a measured one.
+        //
+        // The cost of not doing this, measured: on 2026-09-08 the console
+        // reported no official-candle pulls all morning while the cadence lane
+        // was persisting every minute — `tv_rest_1m_fire_heartbeat` read 1.0
+        // from 09:15 IST, and that gauge is set only after a flush ACK.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "80c1e36337f340f6523c5b5501a6f9c128a7b36c0bb66d7a74da24ad435474c3"
+            "ac313a48bdbf37a04518284f0b3a1480ffa86b0ac90924e168f58e084e0ffdef"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_435);
+        assert_eq!(CONSOLE_HTML.len(), 47_517);
     }
 
     // --------------------------------------------------------- class ParseView
@@ -3959,12 +4040,51 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_feeds_view_rest_lane_empty_or_garbage_is_empty() {
-        // Empty/absent/garbage values yield {} — the card then says
-        // "no pulls recorded today", never fabricated zeros (Rule 11).
-        let out = parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\n");
-        assert_eq!(out["rest_audit"], json!({}));
-        assert_eq!(out["rest_lat_hour"], json!({}));
+    fn test_parse_feeds_view_distinguishes_absent_unreadable_and_genuinely_zero() {
+        // REWRITTEN 2026-09-08. This test previously asserted that "empty /
+        // absent / garbage values yield {}", with a comment citing Rule 11 —
+        // and it was pinning the very conflation Rule 11 forbids. `{}` renders
+        // in the console as "no official-candle pulls recorded today", so an
+        // UNREADABLE snapshot and an IDLE lane produced identical words.
+        //
+        // The operator hit exactly that on 2026-09-08: the console said no
+        // pulls had been recorded while the cadence lane was healthy — its
+        // per-minute decision line ran continuously (11:09 → 11:16 IST,
+        // `rows=1510`, `unknown=0`) and `tv_rest_1m_fire_heartbeat` read 1.0
+        // from 09:15 IST, a gauge its emit site sets ONLY after a
+        // `spot_1m_rest` flush ACK. The rows were landing. The read was blind.
+        //
+        // Avoiding a fabricated zero NUMBER while emitting a fabricated zero
+        // CLAIM is not honesty, so all three cases are now distinct.
+
+        // 1. ABSENT — no REST_AUDIT line in the snapshot at all.
+        let absent = parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\n");
+        assert_eq!(absent["rest_audit"], json!(null));
+        assert_eq!(absent["rest_audit_error"], json!(REST_AUDIT_ABSENT));
+
+        // 2. PRESENT BUT UNREADABLE — the query answered with something no
+        //    row can be read from. A shape failure, never a count of zero.
+        let garbage =
+            parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\nREST_AUDIT=;;garbage;a,b;<x>,ok,3;\n");
+        assert_eq!(garbage["rest_audit"], json!(null));
+        assert_eq!(garbage["rest_audit_error"], json!(REST_AUDIT_UNPARSEABLE));
+
+        // 3. PRESENT AND EMPTY — the query ran and returned no rows. The ONE
+        //    case that genuinely means "zero pulls today", and the only one
+        //    the console may render as that sentence.
+        let genuinely_zero = parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\nREST_AUDIT=\n");
+        assert_eq!(genuinely_zero["rest_audit"], json!({}));
+        assert_eq!(genuinely_zero["rest_audit_error"], json!(null));
+
+        // 4. UNREACHABLE BOX — the third error, and it must not look like any
+        //    of the above either.
+        let unreachable = parse_feeds_view("");
+        assert_eq!(unreachable["rest_audit"], json!(null));
+        assert_eq!(unreachable["rest_audit_error"], json!(BOX_UNREACHABLE));
+
+        // The pure parsers keep their own contract: they answer `{}` for input
+        // they cannot read, and the CALLER above is what decides that `{}`
+        // from a non-empty input is an error rather than a zero.
         assert_eq!(
             parse_rest_audit(";;garbage;a,b;<x>,ok,3;dhan,ok,x;"),
             json!({})
@@ -3975,10 +4095,18 @@ mod tests {
     #[test]
     fn test_parse_feeds_view_json_body_never_mistaken_for_labeled_line() {
         // A '=' inside the marker-delimited JSON must not leak into the
-        // labeled-line scan.
+        // labeled-line scan. The proof is now STRONGER than the old
+        // `== json!({})`: if the fake line leaked, `REST_AUDIT` would be
+        // PRESENT, and the result would carry either a parsed value or the
+        // UNPARSEABLE error — never the ABSENT one.
         let stdout = "FEEDS_BEGIN\n{\"note\": \"REST_AUDIT=fake\"}\nFEEDS_END\n";
         let out = parse_feeds_view(stdout);
-        assert_eq!(out["rest_audit"], json!({}));
+        assert_eq!(out["rest_audit"], json!(null));
+        assert_eq!(
+            out["rest_audit_error"],
+            json!(REST_AUDIT_ABSENT),
+            "a REST_AUDIT= inside the JSON body must not register as a real line"
+        );
     }
 
     // -------------------------------------- class FeedsViewCommandsPinned

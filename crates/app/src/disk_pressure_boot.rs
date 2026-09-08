@@ -36,7 +36,7 @@ use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::ingest_shed::{
     INGEST_SHED, decide_shed_level_all_signals, free_fraction_from_used_pct, runway_sessions,
-    seconds_to_disk_full,
+    seconds_to_disk_full, wal_apply_lag_growing,
 };
 use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::disk_pressure::{
@@ -378,6 +378,15 @@ async fn run_disk_pressure_loop(
                 burn_anchor,
                 now_secs,
                 secs_of_day_ist(),
+                // The database's own verdict, joined here rather than given a
+                // task of its own: the WAL watcher already polls once a
+                // minute and this loop already decides once a minute, so the
+                // two share a cadence and the join costs one relaxed atomic
+                // load. See `decide_shed_level_by_apply_lag` for why a
+                // growing apply backlog is a shed signal at all — briefly, it
+                // is the failure that PRECEDES a full disk, and every other
+                // trigger in this loop measures the disk.
+                wal_apply_lag_growing(),
             );
             // Published every poll, not only on a transition: a runway that
             // is quietly shortening across a session is the signal an

@@ -749,6 +749,19 @@ impl VolumeLeaderboard {
     /// when the true top five are five strikes of one stock, this forces four
     /// substitutions into thinner books — the shape that produced 800
     /// rows/minute against 100,800 on 2026-08-26.
+    ///
+    /// # ⚠ It RANKS, so it consumes the cadence window
+    ///
+    /// This calls [`Self::rank`], which rolls every contract's baseline for
+    /// `cadence` forward. Calling it in the same timer tick as another `rank`
+    /// on the SAME cadence leaves the second caller measuring an
+    /// already-consumed window: every delta is 0 and the order degenerates to
+    /// the `security_id` tie-break, silently.
+    ///
+    /// A caller that already holds a ranked slice — the 5-second snapshot arm
+    /// does — must use [`distinct_underlying_over`] on that slice instead of
+    /// calling this. Recorded here because that is exactly the wiring the
+    /// depth-200 publish was first attempted with on 2026-09-08.
     pub fn rank_distinct_underlying<F, L>(
         &mut self,
         family: OptionFamily,
@@ -768,18 +781,7 @@ impl VolumeLeaderboard {
         // `truncate` clamps; this path allocates first, so it must clamp first.
         let k = k.min(MAX_TRACKED_CONTRACTS);
         let ordered = self.rank(family, cadence, MAX_TRACKED_CONTRACTS, lot_of, eligible);
-        let mut seen: Vec<u64> = Vec::with_capacity(k);
-        let mut out: Vec<RankedContract> = Vec::with_capacity(k);
-        for row in ordered {
-            if out.len() >= k {
-                break;
-            }
-            if seen.contains(&row.underlying_id) {
-                continue;
-            }
-            seen.push(row.underlying_id);
-            out.push(*row);
-        }
+        let out = distinct_underlying_over(ordered, k);
         // `rank` above set this to the INTERMEDIATE sweep length (up to the
         // whole map), because that is what it materialised. What this path
         // actually hands the caller is `out`, and a gauge documented as "the
@@ -834,6 +836,46 @@ impl VolumeLeaderboard {
         self.stock.clear();
         self.scratch.clear();
     }
+}
+
+/// Greedy "at most one contract per underlying" pass over an already-ordered
+/// ranking.
+///
+/// Extracted from [`VolumeLeaderboard::rank_distinct_underlying`] on 2026-09-08
+/// so a caller that ALREADY holds a ranked slice can apply the same rule
+/// without ranking again — and "without ranking again" is the load-bearing
+/// half. [`VolumeLeaderboard::rank`] rolls each contract's per-cadence baseline
+/// forward as it sweeps, so a second `rank` on the same cadence inside one
+/// timer tick measures a window that has already been consumed: every delta
+/// comes back 0 and the order collapses to the `security_id` tie-break. That is
+/// a confident, completely wrong ranking with no counter to show for it, which
+/// is the class this repository keeps removing.
+///
+/// `ordered` must already be sorted best-first; this function does not sort and
+/// makes no attempt to check, because the only honest check is the sort itself.
+///
+/// O(k × distinct-seen) with both bounded by `k`. `k` is 5 on the depth-200
+/// path, so the linear `contains` is cheaper than a set.
+#[must_use]
+pub fn distinct_underlying_over(ordered: &[RankedContract], k: usize) -> Vec<RankedContract> {
+    // CLAMPED before the allocations. `Vec::with_capacity(k)` PANICS on a
+    // capacity overflow and the release profile is `panic = "abort"`, so an
+    // unclamped caller-supplied `k` is a process abort rather than a bad
+    // ranking.
+    let k = k.min(MAX_TRACKED_CONTRACTS);
+    let mut seen: Vec<u64> = Vec::with_capacity(k);
+    let mut out: Vec<RankedContract> = Vec::with_capacity(k);
+    for row in ordered {
+        if out.len() >= k {
+            break;
+        }
+        if seen.contains(&row.underlying_id) {
+            continue;
+        }
+        seen.push(row.underlying_id);
+        out.push(*row);
+    }
+    out
 }
 
 /// Percent change against the previous close, or `None` when it cannot be
@@ -1318,6 +1360,57 @@ mod tests {
         assert_eq!(ranked.len(), 2, "underlying 100 is filtered out");
         assert_eq!(ranked[0].security_id, 2, "volume still decides the order");
         assert_eq!(ranked[1].security_id, 3);
+    }
+
+    #[test]
+    fn distinct_underlying_over_clamps_k_rather_than_aborting_the_process() {
+        // The pure pass, tested directly rather than only through
+        // `rank_distinct_underlying`. It gained a SECOND caller on 2026-09-08
+        // (the depth-200 candidate publish reuses it on an already-ranked
+        // slice, because calling `rank` twice in one tick consumes the window
+        // and silently collapses the order) — so a defect here now reaches two
+        // places, and transitive coverage through one of them is no longer
+        // enough.
+        let row = |sid: u64, underlying: u64| RankedContract {
+            security_id: sid,
+            segment: ExchangeSegment::NseFno,
+            underlying_id: underlying,
+            volume: 0,
+            window_lots_milli: 0,
+        };
+
+        // Distinctness: five strikes of one name yield ONE entry.
+        let one_name: Vec<RankedContract> = (0..5).map(|s| row(s, 42)).collect();
+        let picked = distinct_underlying_over(&one_name, 5);
+        assert_eq!(
+            picked.len(),
+            1,
+            "five strikes of one name are one candidate"
+        );
+        assert_eq!(picked[0].security_id, 0, "the first — i.e. heaviest — wins");
+
+        // Order is preserved from the caller's sort; this fn never re-sorts.
+        let many: Vec<RankedContract> = (0..8).map(|s| row(s, s)).collect();
+        let five = distinct_underlying_over(&many, 5);
+        assert_eq!(
+            five.iter().map(|c| c.security_id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+
+        // THE reason the clamp exists. `Vec::with_capacity(k)` panics on a
+        // capacity overflow and the release profile is `panic = "abort"`, so
+        // an unclamped k from a caller would be a process abort — the whole
+        // trading lane — rather than a short list.
+        let clamped = distinct_underlying_over(&many, usize::MAX);
+        assert_eq!(
+            clamped.len(),
+            8,
+            "an absurd k must clamp and return what exists, never abort"
+        );
+
+        // Honest under-fill, and the empty case.
+        assert_eq!(distinct_underlying_over(&many, 0).len(), 0);
+        assert_eq!(distinct_underlying_over(&[], 5).len(), 0);
     }
 
     #[test]

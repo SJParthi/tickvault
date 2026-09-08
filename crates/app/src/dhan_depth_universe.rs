@@ -1015,10 +1015,11 @@ pub fn ymd_to_epoch_micros(ymd: u32) -> Option<i64> {
 // TEST-EXEMPT: async composition of load_depth_candidates + select_depth_universe, each separately tested.
 pub async fn load_depth_universe_from_master(
     questdb: &tickvault_common::config::QuestDbConfig,
+    spot_store: &crate::spot_price_store::SpotPriceStore,
     date_ist: &str,
     today_ymd: u32,
 ) -> Option<DepthSelection> {
-    let candidates = load_depth_candidates(questdb, date_ist, today_ymd).await;
+    let candidates = load_depth_candidates(questdb, spot_store, date_ist, today_ymd).await;
     if candidates.is_empty() {
         return None;
     }
@@ -1084,6 +1085,12 @@ pub async fn load_depth_universe_from_master(
 // TEST-EXEMPT: async composition of read_contract_artifact + fetch_spot_prices + parse_symbol_map + depth_candidates_from_master, each separately tested.
 pub async fn load_depth_candidates(
     questdb: &tickvault_common::config::QuestDbConfig,
+    // The drain's own view of today's spot prices. Depth centres its windows
+    // on the same numbers the contract path does, so it takes the same
+    // primary source -- leaving it on the database alone would have kept the
+    // depth selector blind for the same thirty minutes the contract selector
+    // lost on 2026-09-08.
+    spot_store: &crate::spot_price_store::SpotPriceStore,
     date_ist: &str,
     today_ymd: u32,
 ) -> Vec<DepthCandidate> {
@@ -1099,12 +1106,33 @@ pub async fn load_depth_candidates(
             return Vec::new();
         }
     };
-    let prices = crate::dhan_contract_universe::fetch_spot_prices(questdb, {
+    let mut prices = crate::dhan_contract_universe::fetch_spot_prices(questdb, {
         // Same day bound the contract path uses; the artifact rows are
         // already today's by filename.
         crate::dhan_universe::ist_midnight_nanos(date_ist)
     })
     .await;
+    // RAM overlaid on the database, RAM winning, for the reasons the contract
+    // path's own comment gives: the database cannot see the last N minutes
+    // while its apply lag runs, and RAM cannot see anything from before this
+    // process booted. Same order, same precedence, deliberately -- the two
+    // selectors centring their windows on different prices would put depth on
+    // a strike the contract set does not carry.
+    //
+    // The SPLIT is logged for the same reason the contract path logs it, and
+    // it matters MORE here: this runs once per minute against the contract
+    // path's once-per-attach, so a silently-unfed store would read exactly
+    // like a working one 375 times a session. The counts are taken before the
+    // merge because `extend` makes the two sources indistinguishable after it.
+    let from_questdb = prices.len();
+    let ram = spot_store.snapshot_prices();
+    let from_ram = ram.len();
+    prices.extend(ram);
+    tracing::debug!(
+        spot_from_ram = from_ram,
+        spot_from_questdb = from_questdb,
+        "depth: spot prices merged (RAM wins on overlap)"
+    );
     // The same symbol map the contract path reads: depth groups by underlying
     // SYMBOL, and the spot prices come back keyed on (security_id, segment).
     let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);

@@ -1247,6 +1247,11 @@ fn publish_depth_subscriptions(
 // TEST-EXEMPT: async loop over secs_until_next_rebalance + load_depth_candidates + fetch_movers + plan_minute + apply_decision, each separately tested.
 pub async fn run_depth_rebalance(
     questdb: tickvault_common::config::QuestDbConfig,
+    // The drain's live spot levels. This loop re-centres depth windows every
+    // minute, so it takes the same primary source the contract selector does
+    // -- two selectors centring on different prices would put depth on a
+    // strike the contract set does not carry.
+    spot_store: std::sync::Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: String,
     today_ymd: u32,
     today_ist_micros: i64,
@@ -1345,8 +1350,13 @@ pub async fn run_depth_rebalance(
         // the iteration on purpose -- see `publish_depth_subscriptions`.
         publish_depth_subscriptions(&subscription_view, &sockets, &depth20);
 
-        let candidates =
-            crate::dhan_depth_universe::load_depth_candidates(&questdb, &date_ist, today_ymd).await;
+        let candidates = crate::dhan_depth_universe::load_depth_candidates(
+            &questdb,
+            &spot_store,
+            &date_ist,
+            today_ymd,
+        )
+        .await;
         let movers = fetch_movers(&questdb, today_ist_micros).await;
 
         // What the four index sockets are believed to hold, in dial order.
@@ -1354,6 +1364,59 @@ pub async fn run_depth_rebalance(
         // the same fact drift, and a drift here produces swaps the guard
         // refuses forever.
         let held: Vec<SubscribeInstrument> = sockets.iter().filter_map(|s| s.held).collect();
+
+        // ---- the volume-ranking divergence report (2026-09-08) ----
+        //
+        // READ-ONLY. This changes no subscription and sends no command.
+        //
+        // The 2026-09-06 lock puts the top five STOCK-option contracts by
+        // traded volume on these five sockets, each a distinct underlying. This
+        // loop selects on `close_pct_from_prev_day` of the underlying SPOT
+        // instead, so four of the five carry NIFTY/BANKNIFTY INDEX options --
+        // the class the lock bans. Nothing measured that gap; it was found by
+        // reading the code.
+        //
+        // Acting on it here would move five deep sockets onto books whose depth
+        // has never been measured, on the strength of a ranking that has never
+        // steered anything. The lock's own text records 800 rows/minute against
+        // 100,800 when thin contracts took these sockets on 2026-08-26. So this
+        // makes the violation MEASURABLE first and leaves the sockets alone --
+        // measure, then move, in that order.
+        //
+        // Read AFTER the reconcile, which is the only moment `held` means
+        // "acked on the wire" rather than "sent and hoped for", matching the
+        // discipline `publish_depth_subscriptions` already documents.
+        {
+            let held_keys: Vec<(u64, ExchangeSegment)> =
+                held.iter().map(|i| (i.security_id, i.segment)).collect();
+            match crate::depth200_candidates::report_divergence(
+                crate::depth200_candidates::global_depth200_candidates(),
+                &held_keys,
+            ) {
+                // Before the drain's first 5-second ranking -- and every minute
+                // of a session in which the drain never ranks at all. Logged at
+                // debug rather than info: on a healthy morning this is true for
+                // under a minute, and a per-minute info line for a transient
+                // startup state is how a log stops being read.
+                None => tracing::debug!(
+                    held = held_keys.len(),
+                    "depth-200 volume ranking not yet published — no divergence claimed"
+                ),
+                Some(d) if d.is_aligned() => tracing::debug!(
+                    held = d.held_total,
+                    "depth-200 holds exactly what the volume ranking selects"
+                ),
+                Some(d) => tracing::info!(
+                    held = d.held_total,
+                    sockets_off_ranking = d.held_off_ranking.len(),
+                    ranked_unheld = d.ranked_unheld.len(),
+                    off_ranking = ?d.held_off_ranking,
+                    should_hold = ?d.ranked_unheld,
+                    "depth-200 diverges from the volume ranking the 2026-09-06 lock \
+                     mandates — REPORTED ONLY, no socket was moved by this line"
+                ),
+            }
+        }
 
         // ---- depth-20: the windows and the movers, every minute ----
         //
@@ -1450,13 +1513,16 @@ pub struct AttachInputs {
 // TEST-EXEMPT: async composition of load_depth_candidates + fetch_movers, both tested.
 pub async fn load_attach_inputs(
     questdb: &tickvault_common::config::QuestDbConfig,
+    spot_store: &crate::spot_price_store::SpotPriceStore,
     date_ist: &str,
     today_ymd: u32,
     today_ist_micros: i64,
 ) -> AttachInputs {
     AttachInputs {
-        candidates: crate::dhan_depth_universe::load_depth_candidates(questdb, date_ist, today_ymd)
-            .await,
+        candidates: crate::dhan_depth_universe::load_depth_candidates(
+            questdb, spot_store, date_ist, today_ymd,
+        )
+        .await,
         movers: fetch_movers(questdb, today_ist_micros).await,
     }
 }

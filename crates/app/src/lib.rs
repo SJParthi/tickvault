@@ -109,6 +109,7 @@ pub mod contract_underlying_map;
 pub mod daily_archive_boot;
 pub mod daily_task_marker;
 pub mod depth200_atm;
+pub mod depth200_candidates;
 pub mod depth20_layout;
 pub mod depth20_track;
 pub mod depth_rebalance;
@@ -190,6 +191,7 @@ pub mod rest_candle_fold;
 /// signal kind × runtime source × IST clock × trading calendar →
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
+pub mod spot_price_store;
 /// Projects the in-RAM volume leaderboard into `top_volume_rank` rows —
 /// the pure step between the ranking and the table the operator asked for.
 pub mod top_volume_snapshot;
