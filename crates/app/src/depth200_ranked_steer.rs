@@ -121,6 +121,15 @@ impl RankedDecision {
 /// lowest-indexed socket holding something off the ranking. Nothing else is
 /// optimised — with five of each there is nothing to gain from a smarter
 /// pairing, and a simpler rule is one a reader can verify against the log.
+///
+/// # The hysteresis band (2026-09-08 SECOND)
+///
+/// `ranked` is longer than the socket count: the first
+/// [`crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET`] rows are the ENTRY
+/// set and the rest is the band. A contract is placed only from the entry
+/// set; a contract already held is KEPT while it stays anywhere in the list.
+/// So a held contract that slips from fifth to sixth for one window is not
+/// swapped out and back — the churn the 2026-09-07 lock names a band for.
 #[must_use]
 pub fn plan_ranked_minute(
     held: &[Option<SubscribeInstrument>],
@@ -134,8 +143,9 @@ pub fn plan_ranked_minute(
         .flatten()
         .map(|i| (i.security_id, i.segment.binary_code()))
         .collect();
-    // Candidates NOT held anywhere, best first.
-    let mut to_place = ranked
+    // ENTRY candidates NOT held anywhere, best first. The band is never
+    // placed from — it only decides what is kept, below.
+    let mut to_place = crate::depth200_candidates::entry_set(ranked)
         .iter()
         .filter(|c| !held_keys.contains(&c.key()))
         .peekable();
@@ -315,6 +325,11 @@ mod tests {
     /// refused ones are counted and retried next minute.
     #[test]
     fn the_per_minute_cap_refuses_and_counts_the_overflow() {
+        // The cap equals the entry set today, so it can only be REACHED, not
+        // exceeded: with more off-ranking sockets than entry candidates the
+        // planner sends exactly `cap` swaps and the surplus sockets keep what
+        // they hold. The band rows (beyond the entry set) are never placed —
+        // that is `band_contracts_are_never_placed_into_a_socket` below.
         let n = MAX_RANKED_SWAPS_PER_MINUTE + 2;
         let ranked: Vec<_> = (1..=n as u64)
             .map(|i| candidate(100 + i, i, 1000 - i))
@@ -322,7 +337,75 @@ mod tests {
         let holds: Vec<_> = (1..=n as u64).map(|i| held(9000 + i, IDX)).collect();
         let d = plan_ranked_minute(&holds, &ranked);
         assert_eq!(d.swaps.len(), MAX_RANKED_SWAPS_PER_MINUTE);
-        assert_eq!(d.capped, 2);
+        assert_eq!(d.capped, 0, "nothing beyond the entry set is ever queued");
+        assert_eq!(d.unplaced, 0);
+    }
+
+    /// The hysteresis band: a held contract that slipped OUT of the entry set
+    /// but is still inside the published list is KEPT, not swapped out.
+    #[test]
+    fn a_held_contract_inside_the_band_is_kept_and_not_swapped() {
+        let band = crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS as u64;
+        // Ranks 1..=8 (5 entry + 3 band).
+        let ranked: Vec<_> = (1..=band).map(|i| candidate(i, 10 * i, 1000 - i)).collect();
+        // Socket 0 holds rank 6 (the first band row); the other four hold
+        // ranks 1..4, so entry rank 5 is unheld.
+        let holds = [
+            held(6, FNO),
+            held(1, FNO),
+            held(2, FNO),
+            held(3, FNO),
+            held(4, FNO),
+        ];
+        let d = plan_ranked_minute(&holds, &ranked);
+        assert_eq!(d.kept, 5, "rank 6 is inside the band and is kept");
+        assert!(
+            d.is_quiet(),
+            "no socket is off the ranking, so nothing moves"
+        );
+        // Rank 5 is unheld but has no home; it is counted, never forced.
+        assert_eq!(d.unplaced, 1);
+    }
+
+    /// Band rows decide what is KEPT, never what is PLACED: an off-ranking
+    /// socket takes an entry-set contract, and if the entry set is exhausted
+    /// it keeps what it holds rather than taking a band row.
+    #[test]
+    fn band_contracts_are_never_placed_into_a_socket() {
+        let band = crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS as u64;
+        let entry = crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET as u64;
+        let ranked: Vec<_> = (1..=band).map(|i| candidate(i, 10 * i, 1000 - i)).collect();
+        // All five sockets hold entry rows except socket 4, which holds an
+        // index option (off the ranking entirely).
+        let holds = [
+            held(1, FNO),
+            held(2, FNO),
+            held(3, FNO),
+            held(4, FNO),
+            held(9001, IDX),
+        ];
+        let d = plan_ranked_minute(&holds, &ranked);
+        assert_eq!(d.swaps.len(), 1);
+        assert_eq!(
+            d.swaps[0].new.security_id, entry,
+            "the last ENTRY row, never a band row"
+        );
+        // Now the entry set is fully held; a second off-ranking socket must
+        // NOT be handed a band row.
+        let holds = [
+            held(1, FNO),
+            held(2, FNO),
+            held(3, FNO),
+            held(4, FNO),
+            held(5, FNO),
+            held(9002, IDX),
+        ];
+        let d = plan_ranked_minute(&holds, &ranked);
+        assert!(
+            d.is_quiet(),
+            "band rows are not placed; the socket keeps its contract"
+        );
+        assert_eq!(d.kept, 5);
     }
 
     /// I-P1-11: the same numeric id in another SEGMENT is a different

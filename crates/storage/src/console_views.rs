@@ -108,6 +108,16 @@ pub const VIEW_DEPTH_NAMED: &str = "market_depth_named";
 /// `depth_persistence::MARKET_DEPTH_TABLE`; equality is pinned by
 /// `test_depth_base_matches_persistence_const`.
 const NAMED_VIEW_DEPTH_BASE: &str = "market_depth";
+/// Wire-format names of the two per-cadence top-volume views (operator
+/// 2026-09-08: "1s table and 5s tables also separately"). ONE table stores
+/// both cadences under the `tf` column; these views are the separate faces of
+/// it, so the two cadences can be queried as their own tables without storing
+/// every row twice.
+pub const VIEW_TOP_VOLUME_1S: &str = "top_volume_rank_1s";
+pub const VIEW_TOP_VOLUME_5S: &str = "top_volume_rank_5s";
+/// Top-volume base table. Mirrors `top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE`;
+/// equality is pinned by `test_top_volume_base_matches_persistence_const`.
+const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume_rank";
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -189,6 +199,28 @@ pub fn depth_named_view_ddl() -> String {
     )
 }
 
+/// DDL for one per-cadence top-volume view (`top_volume_rank_1s` /
+/// `top_volume_rank_5s`): the ranking rows of ONE cadence, joined to the
+/// instrument master so `symbol_name` reads beside the rank.
+///
+/// `cadence` is the `tf` SYMBOL literal (`1s` / `5s`) — the same wire strings
+/// `SnapshotCadence::as_str` writes, pinned by
+/// `test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences`.
+pub fn top_volume_cadence_view_ddl(view: &str, cadence: &str) -> String {
+    let dim = lifecycle_dim_subquery();
+    format!(
+        "CREATE OR REPLACE VIEW {view} AS \
+         SELECT t.ts, t.rank, il.symbol_name, il.display_name, il.instrument_type, t.family, \
+         t.volume, t.gain_pct, t.subscribed, t.underlying_id, \
+         t.feed, t.segment, t.security_id, t.tf \
+         FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
+         LEFT JOIN {dim} \
+         ON t.security_id = il.security_id \
+         AND t.segment = il.exchange_segment \
+         AND t.feed = il.feed \
+         WHERE t.tf = '{cadence}';"
+    )
+}
 /// Issue one view-DDL statement to QuestDB's `/exec` endpoint.
 ///
 /// Mirrors `shadow_persistence::run_ddl` levels exactly: `/exec` is
@@ -291,6 +323,23 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &depth_named_view_ddl(),
     )
     .await;
+    // The two per-cadence top-volume faces (2026-09-08). Same posture as
+    // depth: attempted last and independently, warn-fail on a box where
+    // `top_volume_rank` has not been created yet.
+    run_view_ddl(
+        &client,
+        &base_url,
+        VIEW_TOP_VOLUME_1S,
+        &top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_1S, "1s"),
+    )
+    .await;
+    run_view_ddl(
+        &client,
+        &base_url,
+        VIEW_TOP_VOLUME_5S,
+        &top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_5S, "5s"),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,14 +355,69 @@ mod tests {
     // carries all THREE console views, and every new view must join it or the
     // shared invariants (single statement, LEFT JOIN, dry-run isolation) would
     // silently not apply to it.
-    fn both_ddls() -> [(&'static str, String); 3] {
+    fn both_ddls() -> [(&'static str, String); 5] {
         [
             ("ticks_named", ticks_named_view_ddl()),
             ("candles_named", candles_named_view_ddl()),
             ("market_depth_named", depth_named_view_ddl()),
+            (
+                "top_volume_rank_1s",
+                top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_1S, "1s"),
+            ),
+            (
+                "top_volume_rank_5s",
+                top_volume_cadence_view_ddl(VIEW_TOP_VOLUME_5S, "5s"),
+            ),
         ]
     }
 
+    #[test]
+    fn test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences() {
+        // Each view must be ONE statement, read the one base table, and
+        // filter on exactly its own cadence literal — the wire strings
+        // `SnapshotCadence` writes. A view that forgot the WHERE would show
+        // both cadences interleaved, which is the shape the operator asked to
+        // be rid of.
+        for (view, cadence) in [(VIEW_TOP_VOLUME_1S, "1s"), (VIEW_TOP_VOLUME_5S, "5s")] {
+            let ddl = top_volume_cadence_view_ddl(view, cadence);
+            assert_eq!(ddl.matches(';').count(), 1, "{view}: one statement");
+            assert!(
+                ddl.contains(&format!("FROM {NAMED_VIEW_TOP_VOLUME_BASE} t")),
+                "{view}"
+            );
+            assert!(
+                ddl.contains(&format!("WHERE t.tf = '{cadence}'")),
+                "{view}: {ddl}"
+            );
+            assert!(
+                ddl.contains("LEFT JOIN"),
+                "{view}: unmapped ranks must still show"
+            );
+            assert!(
+                ddl.contains("t.rank"),
+                "{view}: the rank column is the point of the view"
+            );
+        }
+        assert_eq!(
+            tickvault_storage_cadence_1s(),
+            "1s",
+            "the view literal must match the persisted cadence string"
+        );
+    }
+
+    fn tickvault_storage_cadence_1s() -> &'static str {
+        crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.as_str()
+    }
+
+    #[test]
+    fn test_top_volume_base_matches_persistence_const() {
+        assert_eq!(
+            NAMED_VIEW_TOP_VOLUME_BASE,
+            crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE
+        );
+        assert_eq!(VIEW_TOP_VOLUME_1S, "top_volume_rank_1s");
+        assert_eq!(VIEW_TOP_VOLUME_5S, "top_volume_rank_5s");
+    }
     #[test]
     fn test_depth_named_view_ddl_is_single_terminated_statement() {
         let ddl = depth_named_view_ddl();
