@@ -1279,8 +1279,39 @@ impl LiveIngest {
             // underlyings. When they do not, this publishes FEWER than 5 -- a
             // short list, which the length gauge shows -- never a wrong one.
             if family == crate::volume_leaderboard::OptionFamily::Stock && wants_candidates {
+                // ---- the gainer ELIGIBILITY filter (2026-09-06 lock) ----
+                //
+                // "An instrument qualifies if its underlying is in the day's
+                // gainers; volume then decides the order." Applied HERE, on
+                // the volume-ordered rows and before the distinct pass, so
+                // membership is the underlying's day gain and order is still
+                // lots-in-window. Not applied inside `rank`, because the
+                // persisted `top_volume_rank` rows must keep recording which
+                // contracts were busiest whether or not their stock rose.
+                //
+                // Both probes are RAM: the spot store the drain writes and
+                // the previous-close store the same packet walk fills. An
+                // underlying with no spot today or no previous close is
+                // `Unknown` — counted, never treated as falling.
+                //
+                // HONEST CONSEQUENCE, recorded rather than smoothed over: on a
+                // day where every stock falls, this publishes an EMPTY list,
+                // and `plan_ranked_minute` moves nothing on an empty ranking,
+                // so the five sockets hold whatever they held. That is what
+                // the operator's rule produces on a down day; the tally below
+                // is how an operator reads "no gainers" apart from "nothing
+                // could be judged".
+                let (gainers, tally) =
+                    crate::volume_leaderboard::gainer_eligible(&ranked, |underlying_id| {
+                        let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+                        crate::volume_leaderboard::underlying_gainer_verdict(
+                            self.spot_prices.latest_paise(underlying_id, segment),
+                            self.prev_close.get(underlying_id, segment),
+                        )
+                    });
+                crate::volume_leaderboard::record_gainer_tally(tally);
                 let picked = crate::volume_leaderboard::distinct_underlying_over(
-                    &ranked,
+                    &gainers,
                     crate::depth200_candidates::DEPTH_200_SOCKET_BUDGET,
                 );
                 crate::depth200_candidates::global_depth200_candidates()
@@ -21718,6 +21749,16 @@ mod depth_rebalance_wiring_tests {
         // projection REFUSES a non-finite rather than writing a zero percent
         // that would read as "this contract did not move".
         ingest.record_previous_close(777, ExchangeSegment::NseFno, 100.0);
+        // The UNDERLYING too: the gainer filter judges the stock, not the
+        // contract. Spot 110 against a close of 100 is a gainer; the store is
+        // floored to the tick's own day first so the print is admitted.
+        let underlying = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+        let secs: u32 = 1_779_321_600 + 34_000;
+        ingest.record_previous_close(13, underlying, 100.0);
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(secs));
+        let _ = ingest.record_spot_price(13, underlying, 110.0, secs);
         let mut tick = tickvault_common::tick_types::ParsedTick::default();
         tick.security_id = 777;
         tick.exchange_segment_code = ExchangeSegment::NseFno.binary_code();

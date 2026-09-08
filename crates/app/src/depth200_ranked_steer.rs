@@ -80,6 +80,7 @@ pub const RANKED_SWAP_OUTCOMES: [&str; 3] = ["planned", "capped", "socket_empty"
 /// CloudWatch agent can see, not a dropped first sample (the loss-series
 /// seeding lesson of 2026-08-28).
 pub fn pre_register_ranked_counters() {
+    crate::volume_leaderboard::pre_register_gainer_filter_counter();
     for outcome in RANKED_SWAP_OUTCOMES {
         metrics::counter!(RANKED_SWAPS_COUNTER, "outcome" => outcome).increment(0);
     }
