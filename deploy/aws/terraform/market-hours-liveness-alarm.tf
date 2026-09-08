@@ -350,7 +350,9 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # 2026-07-17 (dashboard tidy): dhan-exchange-lag-p99-high retired —
       # its gauge's only publisher (run_dhan_lag_publisher, dormant since
       # the PR-C2 lane deletion) is deleted with the dead Dhan-lag chain.
-      # The gate now arms 3 alarms (dhan_live_lane_down joined 2026-08-18).
+      # Joined 2026-08-18. For HOW MANY alarms the gate arms, read ALARM_NAMES
+      # above -- it is the authoritative list. A count written in prose here
+      # goes stale the next time one is added, and six of them had (2026-09-08).
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         # aggregator_no_seals retired 2026-07-15 (dead monitor — see
@@ -412,7 +414,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # `breaching` is only safe while something disables the actions
         # overnight, and this list is that something. Authorization and the
         # binding constraints are the dated §2.3b row in
-        # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 4 alarms.
+        # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES above.
         aws_cloudwatch_metric_alarm.dhan_no_ticks_flowing.alarm_name,
         # 2026-08-21: the two SPILL-TIER alarms JOIN the gate.
         #
@@ -425,7 +427,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # happens, on a box that is deliberately going away.
         #
         # Authorization and the binding constraints are the dated §2.3c row in
-        # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 6 alarms.
+        # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES above (it is authoritative).
         aws_cloudwatch_metric_alarm.tick_spill_replay_failing.alarm_name,
         aws_cloudwatch_metric_alarm.ticks_spilling.alarm_name,
         # 2026-08-26: depth_steering_stalled JOINS the gate, for the same
@@ -439,7 +441,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # from 17:30 to 08:30 and all weekend, which without this list is a
         # page every single evening.
         #
-        # The gate now arms 8 alarms — this one and the deaf-socket
+        # Count: read ALARM_NAMES above. This one and the deaf-socket
         # sibling added the same day.
         aws_cloudwatch_metric_alarm.depth_steering_stalled.alarm_name,
         # 2026-09-08: aggregator_refusal_rate_high JOINS the gate, because it
@@ -491,7 +493,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # the two alarms above warn about.
         #
         # Authorization and the binding constraints are the dated §2.3i row in
-        # dhan-rest-only-noise-lock-2026-07-14.md. The gate now arms 8
+        # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES
         # alarms — this one and the depth-steering sibling added the same day.
         aws_cloudwatch_metric_alarm.dhan_worst_socket_deaf.alarm_name,
         # 2026-09-01: the THREE "did it run?" alarms JOIN the gate.
@@ -530,7 +532,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # loudly by the start-watchdog, and these three are checks ON the
         # checks, not the primary signal.
         #
-        # The gate now arms 11 alarms.
+        # Count: read ALARM_NAMES above (it is authoritative).
         aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,
         aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,
         aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
@@ -561,7 +563,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 2 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the gated alarms (the ALARM_NAMES
 # env list above — the surviving 2026-07-06 silent-feed set; count 12 → 8 in
 # PR-C2 2026-07-14: realtime-guarantee-critical/-degraded + ws-pool-all-dead
 # + ws-failed-connections retired with the Dhan lane; → 7 same day via the
@@ -593,7 +595,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the
   # dead Dhan-lag publisher chain) lives HERE in
   # the comment; the description keeps only the operator-actionable core.
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 12 gated alarms - the Lambda's ALARM_NAMES env is the authoritative list and is the ONLY place to read the current set (CORRECTED 2026-09-08: this description said 'the 3 gated alarms' and named three by hand while the list had grown to twelve. A hand-copied count in a triage message is a claim that goes stale silently, and this one was wrong by 4x on the surface an operator reads at 3am. History, retained: trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify EVERY alarm named in the Lambda's ALARM_NAMES env (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the gated alarms - the Lambda's ALARM_NAMES env is the authoritative list and is the ONLY place to read the current set (CORRECTED 2026-09-08: this description said a COUNT and named alarms by hand; the count was wrong by 4x and the number is now removed entirely rather than re-pinned, because a hand-copied count in a triage surface goes stale in silence and this one did. A hand-copied count in a triage message is a claim that goes stale silently, and this one was wrong by 4x on the surface an operator reads at 3am. History, retained: trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify EVERY alarm named in the Lambda's ALARM_NAMES env (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -610,7 +612,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 2 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
+  # gated alarms named in ALARM_NAMES (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
   # retired 2026-07-14; groww-exchange-lag-p99-high + aggregator-no-seals
   # retired 2026-07-15 with the Groww live feed; boundary-catchup-storm-dhan
   # retired 2026-07-17 with the stage-3 tick-aggregator deletion;

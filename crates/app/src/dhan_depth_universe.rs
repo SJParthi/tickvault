@@ -1118,7 +1118,21 @@ pub async fn load_depth_candidates(
     // process booted. Same order, same precedence, deliberately -- the two
     // selectors centring their windows on different prices would put depth on
     // a strike the contract set does not carry.
-    prices.extend(spot_store.snapshot_prices());
+    //
+    // The SPLIT is logged for the same reason the contract path logs it, and
+    // it matters MORE here: this runs once per minute against the contract
+    // path's once-per-attach, so a silently-unfed store would read exactly
+    // like a working one 375 times a session. The counts are taken before the
+    // merge because `extend` makes the two sources indistinguishable after it.
+    let from_questdb = prices.len();
+    let ram = spot_store.snapshot_prices();
+    let from_ram = ram.len();
+    prices.extend(ram);
+    tracing::debug!(
+        spot_from_ram = from_ram,
+        spot_from_questdb = from_questdb,
+        "depth: spot prices merged (RAM wins on overlap)"
+    );
     // The same symbol map the contract path reads: depth groups by underlying
     // SYMBOL, and the spot prices come back keyed on (security_id, segment).
     let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);

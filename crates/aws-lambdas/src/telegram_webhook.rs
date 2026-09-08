@@ -799,7 +799,7 @@ pub fn house_line(alarm: &Value) -> String {
     let emoji = if state.is_empty() {
         "🔔"
     } else {
-        severity_emoji("", Some(&state))
+        severity_emoji(&name, Some(&state))
     };
     format!("{emoji} {phrase}\n{ist_time} IST")
 }
@@ -998,7 +998,7 @@ pub fn repeat_alarm_line(alarm: &Value, streak: u32) -> String {
     let state = value_str_or(alarm.get("NewStateValue"), "ALARM").to_uppercase();
     let phrase = alarm_phrase(&name);
     let ist_time = ist_12h(&value_str_or(alarm.get("StateChangeTime"), ""));
-    let emoji = severity_emoji("", Some(&state));
+    let emoji = severity_emoji(&name, Some(&state));
     let window_mins = (ALARM_REPEAT_COALESCE_SECS / 60.0).round() as u64;
     format!(
         "{emoji} Still down: {phrase} ({} page in {window_mins} min) — {ist_time} IST",
@@ -1426,6 +1426,116 @@ mod tests {
         );
     }
 
+    /// THE TEST THAT WOULD HAVE CAUGHT THE 2026-09-08 DEAD-ON-ARRIVAL BUG.
+    ///
+    /// The three tests above all call `severity_emoji(alarm_name, ...)`
+    /// directly — and PRODUCTION NEVER CALLS IT THAT WAY. Both CloudWatch
+    /// renderers read the alarm name into a local and then passed `""`:
+    ///
+    /// ```text
+    /// let name = value_str_or(alarm.get("AlarmName"), "unknown-alarm");
+    /// let emoji = severity_emoji("", Some(&state));   // <- the name dropped
+    /// ```
+    ///
+    /// So `is_degrade_not_emergency("")` was false for every fragment, every
+    /// degrade still rendered red, and all 59 tests passed. The classifier was
+    /// correct and unreachable.
+    ///
+    /// That is the same shape as a reader querying a different store than the
+    /// writer fills: every behavioural test of the piece passes, and the
+    /// system does not do the thing. The only test that catches it is one that
+    /// goes through the door production goes through — so these assert on the
+    /// RENDERED LINE, never on the classifier.
+    #[test]
+    fn the_rendered_house_line_downgrades_a_degrade_and_only_a_degrade() {
+        let degrade = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-ticks-spilling",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-09-08T03:04:00.000+0000",
+        }));
+        assert!(
+            degrade.starts_with('\u{26a0}'),
+            "the rendered line for a degrade must open with the warning emoji, got: {degrade}"
+        );
+
+        // The one that MATTERED on 2026-09-08, buried eleventh of fourteen.
+        let real = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-dhan-contract-universe-failed",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-09-08T03:43:00.000+0000",
+        }));
+        assert!(
+            real.starts_with('\u{1f198}'),
+            "a real failure must stay loud in the RENDERED line, got: {real}"
+        );
+
+        // A degrade recovering is still a recovery.
+        let recovered = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-ticks-spilling",
+            "NewStateValue": "OK",
+            "StateChangeTime": "2026-09-08T04:00:00.000+0000",
+        }));
+        assert!(
+            recovered.starts_with('\u{2705}'),
+            "recovery must render as a recovery, got: {recovered}"
+        );
+    }
+
+    /// The repeat renderer is a SECOND door into the same classifier, and it
+    /// carried the identical `severity_emoji("", ...)` defect. Three of the
+    /// fourteen alerts on 2026-09-08 were repeats, so this is not a
+    /// hypothetical second path — it is a third of the flood.
+    #[test]
+    fn the_rendered_repeat_line_downgrades_a_degrade_and_only_a_degrade() {
+        let degrade = repeat_alarm_line(
+            &serde_json::json!({
+                "AlarmName": "tv-prod-errcode-hot-path-02",
+                "NewStateValue": "ALARM",
+                "StateChangeTime": "2026-09-08T03:34:00.000+0000",
+            }),
+            3,
+        );
+        assert!(
+            degrade.starts_with('\u{26a0}'),
+            "a repeated degrade must not re-page as an emergency, got: {degrade}"
+        );
+
+        let real = repeat_alarm_line(
+            &serde_json::json!({
+                "AlarmName": "tv-prod-dhan-live-lane-down",
+                "NewStateValue": "ALARM",
+                "StateChangeTime": "2026-09-08T03:34:00.000+0000",
+            }),
+            3,
+        );
+        assert!(
+            real.starts_with('\u{1f198}'),
+            "a repeated real failure must stay loud, got: {real}"
+        );
+    }
+
+    /// Source-level pin on the wiring itself, because the two tests above are
+    /// behavioural and a future refactor could reintroduce the empty-subject
+    /// call in a THIRD renderer that has no rendered-line test yet.
+    ///
+    /// The rule is narrow and mechanical: no production call site may pass an
+    /// empty string literal as the subject while passing a real state. That is
+    /// the exact shape that made the classifier unreachable.
+    #[test]
+    fn no_renderer_passes_an_empty_subject_with_a_real_state() {
+        let src = include_str!("telegram_webhook.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        assert!(
+            !production.contains("severity_emoji(\"\", Some("),
+            "a production renderer passes an empty subject to severity_emoji \
+             while passing a real alarm state.\n\
+             That drops the alarm NAME, so every degrade classification is \
+             dead code and the operator gets the 2026-09-08 flood back: nine \
+             notices whose own bodies say nothing is lost, all rendered red."
+        );
+    }
     /// The classifier matches on the name FRAGMENT, so it works in every
     /// environment without a per-environment list.
     #[test]
