@@ -258,7 +258,7 @@ pub enum RetentionClass {
 ///
 /// Checked BEFORE the market-data test in [`retention_class`], because
 /// `market_depth` is also HOUR-partitioned and would otherwise be swept on
-/// the 35-day market-data window by virtue of that membership alone.
+/// the 15-day market-data window by virtue of that membership alone.
 const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
 
 /// True when `table` belongs to the [`RetentionClass::Intraday`] window —
@@ -305,6 +305,11 @@ const SECONDS_PER_MINUTE: u32 = 60;
 /// ticks + candles + chain); tightening chain further toward current-day is
 /// a follow-up knob if disk pressure demands it.
 ///
+/// *(2026-09-08 note: the 35-day figures in this and the two paragraphs
+/// around it are the 2026-07-16 history. The window is `market_data_hot_days`,
+/// whose default has been **15** since the 2026-09-06 disk decision, and the
+/// text elsewhere in this file that described the LIVE window now says 15.)*
+///
 /// **First-sweep burst (dated honest note, 2026-07-16 round-2 MEDIUM):**
 /// the 90 → 35 day move makes every chain partition aged 36..90 days
 /// drop-eligible AT ONCE — up to ~55 DAY partitions × 2 tables ≈ 110
@@ -331,7 +336,7 @@ const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
 /// tables (2026-07-16); everything else is Standard.
 pub(crate) fn retention_class(table: &str) -> RetentionClass {
     // Depth FIRST. `market_depth` is also HOUR-partitioned, so testing the
-    // market-data list before this would classify it on the 35-day window by
+    // market-data list before this would classify it on the 15-day window by
     // virtue of that membership alone — 735 GB on a 100 GB root, and the
     // sweep would never fire before the disk filled.
     if DEPTH_TABLES.contains(&table) {
@@ -340,7 +345,7 @@ pub(crate) fn retention_class(table: &str) -> RetentionClass {
         // BEFORE the market-data test, for exactly the reason Depth is before
         // both: `ticks` is HOUR_PARTITIONED and the second-level candles are
         // in `candle_table_names()`, so either would otherwise be classified
-        // on the 35-day window by virtue of that membership alone.
+        // on the 15-day window by virtue of that membership alone.
         RetentionClass::Intraday
     } else if HOUR_PARTITIONED_TABLES.contains(&table)
         || crate::shadow_persistence::candle_table_names().contains(&table)
@@ -3050,7 +3055,7 @@ mod tests {
     // -----------------------------------------------------------------
     // INTRADAY class (2026-08-19) — ticks + second-level candles are
     // current-day; minute-level and above are the history that indicators
-    // and strategies read and keep the 35-day window.
+    // and strategies read and keep the 15-day window.
     // -----------------------------------------------------------------
 
     #[test]
@@ -3069,7 +3074,7 @@ mod tests {
             assert_eq!(
                 retention_class(table),
                 RetentionClass::Intraday,
-                "{table} must be current-day, not on the 35-day market-data window"
+                "{table} must be current-day, not on the 15-day market-data window"
             );
         }
     }
@@ -3094,7 +3099,7 @@ mod tests {
         // Pins the literal list against the timeframe enum in the ONE
         // direction that matters: a new second-level timeframe added to
         // `TfIndex` without being added to `INTRADAY_TABLES` would silently
-        // inherit the 35-day window. The list stays literal on purpose (the
+        // inherit the 15-day window. The list stays literal on purpose (the
         // class boundary is a retention decision, not an enum property), so
         // this test is what keeps the two honest.
         let second_level: Vec<&str> = crate::shadow_persistence::candle_table_names()
@@ -3251,17 +3256,17 @@ mod tests {
     #[test]
     fn market_depth_is_its_own_retention_class_not_market_data() {
         // `market_depth` is HOUR-partitioned, so a naive class check that
-        // tests the market-data list first would classify it on the 35-day
+        // tests the market-data list first would classify it on the 15-day
         // window — 735 GB minimum on a 100 GB root at the measured ~21 GB/day.
         // The depth test must come FIRST, and this proves it does.
         assert_eq!(
             retention_class(crate::depth_persistence::MARKET_DEPTH_TABLE),
             RetentionClass::Depth,
-            "market_depth must NOT inherit the 35-day market-data window"
+            "market_depth must NOT inherit the 15-day market-data window"
         );
         // Re-blessed 2026-08-19: `ticks` moved to the Intraday class, so the
         // market-data comparator here is now a MINUTE candle — the data that
-        // actually still lives on the 35-day window.
+        // actually still lives on the 15-day window.
         assert_eq!(retention_class("candles_1m"), RetentionClass::MarketData);
     }
 

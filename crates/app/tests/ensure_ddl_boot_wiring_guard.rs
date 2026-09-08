@@ -126,6 +126,14 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // depth pools begin silently overwriting each other's levels. Same
         // retry loop as `ticks`, so neither is retried without the other.
         ("ensure_market_depth_table", "src/candle_ddl_boot.rs"),
+        // top_volume_rank — the 1 s / 5 s volume-ranking snapshots
+        // (2026-09-06). Written every second by its offload writer from the
+        // first ranking sweep; until 2026-09-08 its ensure fn had ZERO
+        // production callers, so a fresh volume would have let the first ILP
+        // row auto-create it with none of its 6-key DEDUP
+        // (ts, tf, family, feed, security_id, segment). Same retry loop as
+        // `ticks` and `market_depth`.
+        ("ensure_top_volume_rank_table", "src/candle_ddl_boot.rs"),
         ("run_live_table_ddl_at_boot", "src/main.rs"),
         // rest_fetch_audit — every REST leg's forensics
         ("ensure_rest_fetch_audit_table", "src/spot_1m_rest_boot.rs"),

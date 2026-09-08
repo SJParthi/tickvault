@@ -3539,3 +3539,24 @@ storm the swap-cap counters already report, and it is fail-closed in the safe
 direction (a forgotten drop can never read as a ghost, so it never causes a
 redial). The three-condition filter on `swap_emptied_socket` does not see it,
 and must not.
+
+**Second addendum (2026-09-08, after the hostile sweep) — six more
+`WS-GAP-02` sources, all log-only, and the two the observability audit said
+were "recorded in the wrong file" are accepted here explicitly.** Every one is
+invisible to the three-condition `swap_emptied_socket` filter by construction,
+and must stay so:
+
+| `source` | Where | Why it earns no page |
+|---|---|---|
+| `gainer_verdicts_all_unknown` | `dhan_feed_stack.rs`, once per session | Both depth pools hold the boot dial while every gainer verdict is `Unknown`. The consequence — no ranked steering — is the shape `depth_steering_stalled` (family 5) and `dhan-contract-universe-failed` already page on when it is a defect; on a morning the code-6 previous close simply has not arrived yet it is NORMAL for a few minutes. Log-only by the scope lock's own words ("2026-09-08 (SECOND)"); this row is the §2 record the observability audit asked for. |
+| `no_ranking_by_0920` | `depth_rebalance.rs`, once per session | Same reasoning, and it fires on every NSE holiday boot by design (nothing trades, nothing ranks) — a pager here pages on every holiday. |
+| `gainer_board_empty_by_1000` | `depth_rebalance.rs`, once per session | A ranking IS published but admits no stock option at 10:00 IST: every underlying is down on the day, so the gainer filter the operator locked on 2026-09-06 selects nothing and both pools hold their set. That is the filter working, not a fault — audit row 29 of 2026-09-08 found the stillness was SILENT, so it is now said once. Paging on it would page on every broad down-day. |
+| `depth_seed_refused` / `depth_seed_unreadable` / `depth_seed_stale` / `depth_seed_artifact_missing` | `depth_seed.rs`, `dhan_feed_stack.rs` | A refused or absent seed means the boot dial runs as it did before the seed existed — the pre-2026-09-08 behaviour, never a loss. An expiry rollover refuses a whole seed legitimately every Friday. Counted on `tv_depth_seed_rows_total{outcome}` and the new `tv_depth_seed_file_total{outcome}` (local `/metrics` only). |
+| `ghost_redial_exhausted` | `dhan_feed_stack.rs`, once per socket per session | A socket redialled `GHOST_REDIAL_SESSION_CEILING` (8) times still delivers the ghost: the vendor is not honouring the unsubscribe code. The socket keeps its WORKING set — nothing is lost, the ghost's rows are still written — and the session-long read-out is `tv_dhan_feed_depth_total{outcome="ghost_exhausted"}`. The fix for it is the code, not a pager. |
+
+Also bounded the same day, with no pager: ghost redials are now spaced
+pool-wide (`GHOST_REDIAL_POOL_SPACING_SECS` = 20 s, so sixteen ghosting
+sockets cannot fan out into an 805) and capped per socket per session, and a
+contract dropped by BOTH pools takes its grace from the NEWER drop so a
+legitimate depth-200 unsubscribe of a contract depth-20 dropped earlier no
+longer reads as a ghost and redials a healthy socket.

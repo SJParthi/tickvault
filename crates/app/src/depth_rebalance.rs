@@ -62,6 +62,21 @@ use crate::movers::StockMove;
 pub const RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST: u32 =
     tickvault_common::constants::TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST + 5 * 60;
 
+/// 10:00 IST — forty-five minutes after the capture window opens.
+///
+/// A ranking that IS published but carries ZERO gainer-eligible stock-option
+/// contracts at this point means the whole market is down on the day (every
+/// verdict was `NotGainer`) — the operator's filter is then correctly
+/// selecting nothing, and both depth pools hold whatever they carry for the
+/// rest of the session. That is the truthful state, not a defect, but it must
+/// not be SILENT: the hostile audit of 2026-09-08 (row 29) found nothing
+/// said so. Deliberately later than the 09:20 deadline above, because the
+/// first sweeps after the bell legitimately see few or no gainers while the
+/// previous-close store is still filling; a 09:15:05 latch would fire on
+/// every healthy morning. Log-sink only, once per session.
+pub const GAINER_BOARD_EMPTY_DEADLINE_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST + 45 * 60;
+
 /// The segment a STOCK option trades in.
 ///
 /// Not derived per row, and that is deliberate. [`crate::dhan_depth_universe::contract_segment_for_underlying`]
@@ -1341,6 +1356,7 @@ pub async fn run_depth_rebalance(
 
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
+    let mut gainer_board_empty_reported = false;
     loop {
         let second = u64::from(ist_second_of_day_now() % 60);
         tokio::time::sleep(std::time::Duration::from_secs(secs_until_next_rebalance(
@@ -1408,6 +1424,36 @@ pub async fn run_depth_rebalance(
                  drain's 5-second arm, and whether any stock-option tick reached the fold."
             );
         }
+        // ---- "gainer board empty by 10:00" (2026-09-08, audit row 29) ----
+        //
+        // Distinct from the arm above: a ranking EXISTS, it just admits no
+        // stock option, because no underlying is up on the day. The sockets
+        // will keep their current set all session and every counter reads
+        // green. Once per session, coded, log-sink only — the all-falling day
+        // is real and the filter is doing what the operator asked; the line
+        // exists so the stillness is a decision he can read, not a silence.
+        if !gainer_board_empty_reported
+            && (GAINER_BOARD_EMPTY_DEADLINE_SECS_OF_DAY_IST
+                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST)
+                .contains(&secs_of_day)
+            && crate::depth20_ranked_steer::global_depth20_candidates()
+                .latest()
+                .is_some_and(|list| list.is_empty())
+        {
+            gainer_board_empty_reported = true;
+            tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "gainer_board_empty_by_1000",
+                secs_of_day,
+                deadline = GAINER_BOARD_EMPTY_DEADLINE_SECS_OF_DAY_IST,
+                "depth steering: the volume ranking is published but NO stock-option contract \
+                 is gainer-eligible forty-five minutes into the session — every underlying \
+                 is down on the day, so the depth-20 and depth-200 pools will hold their \
+                 current set until a stock turns positive. This is the gainer filter working \
+                 as locked, not a fault; it is reported once so the stillness is not silent."
+            );
+        }
         if secs_of_day >= tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST {
             if !post_close_logged {
                 post_close_logged = true;
@@ -1422,13 +1468,21 @@ pub async fn run_depth_rebalance(
                 //
                 // Written ONCE, here, from what the sockets HOLD — the steered
                 // state after the hysteresis band — and only if a ranking was
-                // published this session. A session that never ranked still
-                // holds the boot dial (index options), and a seed of those
-                // would be refused at read time anyway; not writing it is
-                // simply the honest form of the same answer.
+                // published this session OR the pools were dialed from a seed
+                // this boot. A session that never ranked still holds the boot
+                // dial (index options), and a seed of those would be refused
+                // at read time anyway; not writing it is simply the honest
+                // form of the same answer. The seeded-boot arm is the
+                // 2026-09-08 hostile-sweep finding: a process RESTARTED after
+                // 15:40 has no ranking of its own, so without it a post-close
+                // restart left yesterday's file in place — and the sockets it
+                // holds (the seed itself, ranked and admitted the day before)
+                // are exactly what tomorrow should start from.
                 if crate::depth200_candidates::global_depth200_candidates()
                     .latest()
                     .is_some()
+                    || crate::depth_seed::boot_seeded(crate::depth_seed::SeedPool::Depth200)
+                    || crate::depth_seed::boot_seeded(crate::depth_seed::SeedPool::Depth20)
                 {
                     write_tomorrows_seed(&date_ist, &sockets, &depth20);
                 }
@@ -1518,15 +1572,23 @@ pub async fn run_depth_rebalance(
                     let ranked_20 =
                         crate::depth20_ranked_steer::plan_depth20_ranked_minute(&held_20, ranked);
                     crate::depth20_ranked_steer::record_depth20_ranked_decision(&ranked_20);
-                    if ranked_20.capped > 0 || ranked_20.unplaced > 0 {
+                    // One line per minute that MOVED anything or could not,
+                    // with every count the counters carry. Nothing on the box
+                    // scrapes `/metrics`, so this line is the only read-out of
+                    // ranked-steering churn that reaches CloudWatch — the
+                    // 2026-09-08 observability audit's gap 1. A quiet minute
+                    // (nothing planned, nothing refused) still logs nothing.
+                    let planned_20 = ranked_20.plan.swap_count();
+                    if planned_20 > 0 || ranked_20.capped > 0 || ranked_20.unplaced > 0 {
                         tracing::info!(
+                            planned = planned_20,
                             capped = ranked_20.capped,
                             unplaced = ranked_20.unplaced,
                             unfunded_departures = ranked_20.unfunded_departures,
                             kept = ranked_20.kept,
                             ranked = ranked.len(),
-                            "depth-20 ranked steering could not place every ranked contract \
-                             this minute — the rest is retried next minute"
+                            "depth-20 ranked steering this minute — planned swaps go to the wire; \
+                             capped and unplaced are retried next minute"
                         );
                     }
                     (ranked_20.plan, "volume_ranking")
@@ -1599,14 +1661,19 @@ pub async fn run_depth_rebalance(
                 let ranked_decision =
                     crate::depth200_ranked_steer::plan_ranked_minute(&held_slots, ranked);
                 crate::depth200_ranked_steer::record_ranked_decision(&ranked_decision);
-                if ranked_decision.capped > 0 || ranked_decision.unplaced > 0 {
+                // Same per-minute read-out as depth-20 above (observability
+                // audit gap 1): every count the counters carry, in one line,
+                // only on a minute that moved or refused something.
+                let planned_200 = ranked_decision.swaps.len();
+                if planned_200 > 0 || ranked_decision.capped > 0 || ranked_decision.unplaced > 0 {
                     tracing::info!(
+                        planned = planned_200,
                         capped = ranked_decision.capped,
                         unplaced = ranked_decision.unplaced,
                         kept = ranked_decision.kept,
                         ranked = ranked.len(),
-                        "depth-200 ranked steering could not place every ranked contract \
-                         this minute — the rest is retried next minute"
+                        "depth-200 ranked steering this minute — planned swaps go to the wire; \
+                         capped and unplaced are retried next minute"
                     );
                 }
                 (
@@ -3043,6 +3110,54 @@ mod fifth_socket_tests {
         );
     }
 
+    /// Audit row 29 (2026-09-08): an all-falling day leaves the gainer board
+    /// empty and, before this latch, nothing said so. The latch must sit AFTER
+    /// the 09:20 no-ranking latch (a board cannot be empty before it exists),
+    /// INSIDE the capture window, and must read the depth-20 list — the pool
+    /// whose published set is the gainer-eligible top set itself.
+    #[test]
+    fn the_empty_gainer_board_is_reported_once_after_ten_and_never_before_the_ranking_exists() {
+        assert!(
+            crate::depth_rebalance::RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST
+                < crate::depth_rebalance::GAINER_BOARD_EMPTY_DEADLINE_SECS_OF_DAY_IST,
+            "an empty board can only be judged after a ranking is expected to exist"
+        );
+        assert!(
+            crate::depth_rebalance::GAINER_BOARD_EMPTY_DEADLINE_SECS_OF_DAY_IST
+                < tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST,
+            "the latch must be reachable inside the capture window"
+        );
+        assert_eq!(
+            crate::depth_rebalance::GAINER_BOARD_EMPTY_DEADLINE_SECS_OF_DAY_IST,
+            10 * 3600,
+            "10:00 IST — late enough that the previous-close store has filled"
+        );
+        let source = include_str!("depth_rebalance.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let no_ranking = production
+            .find("source = \"no_ranking_by_0920\"")
+            .expect("the 09:20 latch exists");
+        let empty_board = production
+            .find("source = \"gainer_board_empty_by_1000\"")
+            .expect("the empty-board latch exists in the production half");
+        assert!(
+            empty_board > no_ranking,
+            "the empty-board latch follows the no-ranking latch"
+        );
+        let region = &production[no_ranking..empty_board];
+        assert!(
+            region.contains("global_depth20_candidates()")
+                && region.contains("is_some_and(|list| list.is_empty())"),
+            "the verdict reads the PUBLISHED depth-20 list and requires it to exist and be empty"
+        );
+        assert!(
+            region.contains("gainer_board_empty_reported = true"),
+            "the latch is once per session"
+        );
+    }
+
     /// The seed for tomorrow's dial is written at the capture-window close,
     /// from HOLDINGS, and only when a ranking was published this session.
     #[test]
@@ -3061,10 +3176,19 @@ mod fifth_socket_tests {
             write > gate,
             "the seed is written inside the post-close gate"
         );
-        let guard = production[gate..write].contains("global_depth200_candidates()");
+        let region = &production[gate..write];
         assert!(
-            guard,
+            region.contains("global_depth200_candidates()"),
             "the write is gated on a ranking having been published"
+        );
+        // ...OR on the pools having been dialed from a seed this boot: a
+        // process restarted after 15:40 has no ranking of its own, and
+        // without this arm a post-close restart left yesterday's file in
+        // place (2026-09-08 hostile sweep, finding #12).
+        assert!(
+            region.contains("boot_seeded(crate::depth_seed::SeedPool::Depth200)")
+                && region.contains("boot_seeded(crate::depth_seed::SeedPool::Depth20)"),
+            "a seeded boot must also write tomorrow's seed"
         );
         // And both pre-ranking arms HOLD a seeded pool.
         assert_eq!(

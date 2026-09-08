@@ -1139,6 +1139,23 @@ pub struct LiveIngest {
     /// a tick is seen, and a structure reached through `&mut self` on a
     /// single-owner path needs no concurrent map.
     leaderboard: crate::volume_leaderboard::VolumeLeaderboard,
+    /// `true` while [`refold_wal_frames`] is re-folding a WAL backlog through
+    /// this ingest. The ranking observer is SKIPPED for the duration.
+    ///
+    /// Found by the 2026-09-08 hostile sweep, and it is the replay's second
+    /// way of poisoning the board. A replayed frame is older than the live
+    /// cumulative the leaderboard holds, so each one is refused as a fall —
+    /// and after `RELATCH_AFTER_CONSECUTIVE_LOWER` (32) of them in a row the
+    /// gate RE-LATCHES to the stale value and reseeds the baseline there. The
+    /// next live tick then measures the whole replayed gap as one window's
+    /// trading, and the contract takes a depth socket it did not earn. A
+    /// post-replay rebaseline cannot help, because it seeds from the SAME
+    /// stale value. The only correct input for a ranking that means "busy
+    /// NOW" is a frame that arrived now, so replayed frames do not reach it
+    /// at all; a contract they would have introduced is seeded by its first
+    /// live tick instead, with the window-0 first reading the seed rule
+    /// already requires.
+    replaying_wal: bool,
     /// The top-volume snapshot writer, already split for offload.
     ///
     /// `None` unless a caller opts in, so every existing construction site and
@@ -1549,6 +1566,7 @@ impl LiveIngest {
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
+            replaying_wal: false,
             top_volume: None,
         }
     }
@@ -2657,6 +2675,12 @@ impl LiveIngest {
     }
 
     fn observe_for_ranking(&mut self, tick: &ParsedTick) {
+        // A replayed frame is not "now". See the `replaying_wal` field: feeding
+        // it here re-latches the gate to a stale cumulative and the next live
+        // tick reads the whole gap as one window. One bool load per tick.
+        if self.replaying_wal {
+            return;
+        }
         let Some(segment) =
             tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
         else {
@@ -3246,6 +3270,9 @@ pub struct DrainCounters {
     depth_unsubscribed_grace: metrics::Counter,
     /// Redials actually ARMED by the ghost detector (after the per-socket cooldown).
     depth_ghost_redials: metrics::Counter,
+    /// Sockets that hit the per-session ghost-redial ceiling and were told
+    /// to stop redialling (once per socket per session).
+    depth_ghost_exhausted: metrics::Counter,
     truncated: metrics::Counter,
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
@@ -3319,6 +3346,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_ghost: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost"),
         depth_unsubscribed_grace: metrics::counter!(DEPTH_COUNTER, "outcome" => "unsubscribed_grace"),
         depth_ghost_redials: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_redial"),
+        depth_ghost_exhausted: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_exhausted"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
         xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
@@ -3467,7 +3495,12 @@ pub const SEALS_RESCUED_COUNTER: &str = "tv_dhan_feed_seals_rescued_total";
 /// * `ghost` — packets for an instrument this process unsubscribed at least
 ///   `GHOST_GRACE_SECS` ago and the vendor is STILL streaming. The signal that
 ///   the unsubscribe RequestCode was ignored; each one asks that socket to
-///   redial (`request_ghost_redial`, cooled down per socket). Expected 0.
+///   redial (`request_ghost_redial`, cooled down per socket, spaced pool-wide,
+///   and capped per socket per session). Expected 0.
+/// * `ghost_redial` — redials actually ARMED by the detector. Expected 0.
+/// * `ghost_exhausted` — sockets that took the session ceiling of ghost
+///   redials and still deliver the ghost: the vendor is not honouring the
+///   unsubscribe code at all. Once per socket per session. Expected 0.
 /// * `unsubscribed_grace` — packets for an instrument unsubscribed less than
 ///   the grace ago. Normal for a few seconds after every swap; counted so the
 ///   vendor's unsubscribe latency is measurable, never acted on.
@@ -4926,24 +4959,58 @@ async fn run_frame_drain(
                                 // the `error!` fires at most once per cooldown
                                 // per socket -- inherently throttled, no
                                 // power-of-two ladder needed.
-                                if outcome.ghost > 0
-                                    && tickvault_core::websocket::pool_supervisor::request_ghost_redial(
+                                if outcome.ghost > 0 {
+                                    use tickvault_core::websocket::pool_supervisor::{
+                                        GHOST_REDIAL_SESSION_CEILING, GhostRedialRefusal,
+                                        ghost_ceiling_first_hit, ghost_redials_taken,
+                                        request_ghost_redial,
+                                    };
+                                    match request_ghost_redial(
                                         frame.connection_index,
                                         received_at_nanos / NANOS_PER_SEC_I64,
-                                    )
-                                {
-                                    c.depth_ghost_redials.increment(1);
-                                    error!(
-                                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                        source = "unsubscribe_ignored",
-                                        connection_index = frame.connection_index,
-                                        endpoint = frame.endpoint.as_str(),
-                                        ghost_packets = outcome.ghost,
-                                        "a depth socket is still delivering an instrument it was told to \
-                                         unsubscribe more than the grace ago -- the unsubscribe was ignored \
-                                         or lost, so the socket is asked to redial and replay its current \
-                                         set (log-sink only; counted under `ghost` on the depth counter)"
-                                    );
+                                    ) {
+                                        Ok(()) => {
+                                            c.depth_ghost_redials.increment(1);
+                                            error!(
+                                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                                source = "unsubscribe_ignored",
+                                                connection_index = frame.connection_index,
+                                                endpoint = frame.endpoint.as_str(),
+                                                ghost_packets = outcome.ghost,
+                                                redials_taken = ghost_redials_taken(frame.connection_index),
+                                                "a depth socket is still delivering an instrument it was told to \
+                                                 unsubscribe more than the grace ago -- the unsubscribe was ignored \
+                                                 or lost, so the socket is asked to redial and replay its current \
+                                                 set (log-sink only; counted under `ghost` on the depth counter)"
+                                            );
+                                        }
+                                        // Said ONCE per socket per session: after the
+                                        // ceiling the ghost keeps being counted on every
+                                        // frame, and a line per frame would be the flood.
+                                        Err(GhostRedialRefusal::SessionCeiling)
+                                            if ghost_ceiling_first_hit(frame.connection_index) =>
+                                        {
+                                            c.depth_ghost_exhausted.increment(1);
+                                            error!(
+                                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                                source = "ghost_redial_exhausted",
+                                                connection_index = frame.connection_index,
+                                                endpoint = frame.endpoint.as_str(),
+                                                ceiling = GHOST_REDIAL_SESSION_CEILING,
+                                                "a depth socket has been redialled the session ceiling of times \
+                                                 for a ghost instrument and STILL delivers it -- the unsubscribe \
+                                                 RequestCode is not honoured by the vendor. No further redials \
+                                                 this session; the socket keeps its working set and the ghost \
+                                                 keeps being counted (log-sink only; `ghost_exhausted` on the \
+                                                 depth counter). This is the read-out the scope lock names for \
+                                                 a wrong unsubscribe code."
+                                            );
+                                        }
+                                        // Cooling down, pool-spaced, already at the
+                                        // ceiling, or out of range: the ghost is already
+                                        // counted; nothing more to say per frame.
+                                        Err(_) => {}
+                                    }
                                 }
                             }
                             None => {
@@ -9036,11 +9103,23 @@ async fn attach_depth_when_available(
                             );
                         }
                     }
-                    Err(err) => tracing::debug!(
-                        %err,
-                        "depth seed present but today's contract artifact is unreadable — \
-                         nothing to validate against, dialing without the seed"
-                    ),
+                    Err(err) => {
+                        // A seed that cannot be validated is not applied, and
+                        // until 2026-09-08 that was `debug!` with no counter —
+                        // a whole boot on the index dial with nothing saying
+                        // why. Log-sink only, counted on the seed-file
+                        // counter; the artifact's own reader has already
+                        // logged its failure at its own level.
+                        crate::depth_seed::record_seed_file_outcome("artifact_missing");
+                        warn!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            source = "depth_seed_artifact_missing",
+                            %err,
+                            "depth seed present but today's contract artifact is unreadable — \
+                             nothing to validate against, dialing without the seed (log-sink \
+                             only; counted under `artifact_missing` on the seed-file counter)"
+                        );
+                    }
                 }
             }
         }
@@ -10419,6 +10498,10 @@ pub fn refold_wal_frames(
     frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
+    // Held for the whole backlog; cleared at the single exit below. See the
+    // `replaying_wal` field for why a replayed frame must never reach the
+    // volume ranking.
+    ingest.replaying_wal = true;
 
     // CORRECTED 2026-08-28. This block used `Utc::now()` for BOTH values, and
     // justified it with: "the tick's own exchange timestamp, which decides the
@@ -10818,13 +10901,16 @@ pub fn refold_wal_frames(
         );
     }
 
-    // A replay hands the leaderboard a backlog with no sweep between the
-    // frames, so without this the first LIVE sweep would read the whole
-    // backlog as one window's trading and hand depth sockets to whatever was
-    // busiest during the outage. Both production replay sites (the boot
-    // STAGE-C replay and the catch-up drain) come through here, which is why
-    // the rebaseline lives in this function and not at either caller.
-    ingest.leaderboard.rebaseline_all();
+    // The ranking observer was held off for the whole backlog (see the
+    // `replaying_wal` field): a replayed frame re-latches the monotonicity
+    // gate to a stale cumulative, and a post-replay rebaseline seeds from
+    // that same stale value — so the first live tick after it would still
+    // read the whole gap as one window. Skipping the observer is the only
+    // shape that leaves the live baselines untouched. Both production replay
+    // sites (the boot STAGE-C replay and the catch-up drain) come through
+    // here, which is why the guard is set and cleared in this function and
+    // not at either caller.
+    ingest.replaying_wal = false;
     out
 }
 
@@ -19380,6 +19466,57 @@ mod wal_refold_tests {
         assert_eq!(with_sink.depth_pending_rows(), 7);
     }
 
+    /// A replayed frame must never reach the volume ranking: the guard is set
+    /// at the top of `refold_wal_frames`, cleared at its single exit, and
+    /// checked first thing in `observe_for_ranking`. Found by the 2026-09-08
+    /// hostile sweep (finding #27 — a replay re-latched the gate to a stale
+    /// cumulative and the next live tick read the whole gap as one window).
+    #[test]
+    fn refold_wal_frames_holds_the_ranking_observer_off_for_the_whole_backlog() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        let body = production
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub fn ").next())
+            .expect("refold_wal_frames body");
+        let set = body
+            .find("ingest.replaying_wal = true;")
+            .expect("the guard is SET inside refold_wal_frames");
+        let clear = body
+            .find("ingest.replaying_wal = false;")
+            .expect("the guard is CLEARED inside refold_wal_frames");
+        assert!(set < clear, "set before clear");
+        // The LOOP header, not the first "for " in prose — the doc comments above the
+        // loop say "for why" and "for exactly" long before any frame is folded.
+        let first_frame_work = body
+            .find("\n    for (frame_seq, ")
+            .expect("the refold loops over frames");
+        assert!(
+            set < first_frame_work,
+            "the guard is set BEFORE any frame is folded"
+        );
+        assert!(
+            !body.contains("rebaseline_all"),
+            "a post-replay rebaseline seeds from the same stale value — the observer \
+             is skipped instead"
+        );
+        let observer = production
+            .split("fn observe_for_ranking(&mut self")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("observe_for_ranking body");
+        let check = observer
+            .find("if self.replaying_wal {")
+            .expect("the observer checks the guard");
+        let first_probe = observer
+            .find("owner_of(")
+            .expect("the observer probes the contract map");
+        assert!(check < first_probe, "the guard is checked before any probe");
+    }
+
     /// FINDING 12 (2026-09-02): a replay that LOST ticks must emit the coded
     /// WS-SPILL-01 line from INSIDE the refold, so every caller reports it.
     /// The emit sits on the `out.lost > 0` arm; pin the arm, its code and its
@@ -21955,6 +22092,22 @@ mod late_seed_tests {
 mod depth_rebalance_wiring_tests {
     use super::*;
 
+    /// The steering views are PROCESS globals (`global_depth200_candidates`,
+    /// `global_depth20_candidates`): every `snapshot_top_volume` call publishes
+    /// into them, so two of these tests running on parallel threads can read
+    /// each other's publish — a test that ranks nothing lands an EMPTY list
+    /// between another test's snapshot and its `.latest()`. Serialise the
+    /// tests that touch the views (the house pattern the sweep tests below use
+    /// for the ghost register). Poison-safe: one failed test must not cascade
+    /// into every other test reporting a poisoned lock.
+    static PUBLISHED_VIEWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_published_views() -> std::sync::MutexGuard<'static, ()> {
+        PUBLISHED_VIEWS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn instrument(id: u64) -> SubscribeInstrument {
         SubscribeInstrument {
             security_id: id,
@@ -22049,6 +22202,7 @@ mod depth_rebalance_wiring_tests {
     /// so this pair is what separates "opted out" from "opted in and empty".
     #[test]
     fn with_top_volume_writer_is_what_turns_silence_into_rows() {
+        let _serial = lock_published_views();
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
         let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
@@ -22081,6 +22235,7 @@ mod depth_rebalance_wiring_tests {
     /// the assertion a parallel run could break.
     #[test]
     fn the_five_second_pass_publishes_the_depth200_steering_candidates() {
+        let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
@@ -22106,6 +22261,7 @@ mod depth_rebalance_wiring_tests {
     /// nothing, with no counter to say so.
     #[test]
     fn candidates_are_published_even_when_no_snapshot_writer_is_attached() {
+        let _serial = lock_published_views();
         let mut ingest = ranking_ingest(false);
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
@@ -22135,6 +22291,7 @@ mod depth_rebalance_wiring_tests {
     /// bound is the entry set PLUS the band, never the whole board.
     #[test]
     fn the_published_list_never_exceeds_the_depth200_entry_set_plus_band() {
+        let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
@@ -22155,6 +22312,7 @@ mod depth_rebalance_wiring_tests {
 
     #[test]
     fn a_folded_tick_reaches_the_board_and_a_snapshot_in_the_window_writes_rows() {
+        let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
@@ -22170,6 +22328,7 @@ mod depth_rebalance_wiring_tests {
 
     #[test]
     fn the_same_board_writes_nothing_outside_the_capture_window() {
+        let _serial = lock_published_views();
         // Same fixture, same board, only the clock differs. Deleting the gate
         // in `snapshot_top_volume` makes THIS fail -- which the cheap version
         // of the test could not do.
@@ -22189,6 +22348,7 @@ mod depth_rebalance_wiring_tests {
 
     #[test]
     fn snapshot_top_volume_writes_nothing_outside_the_capture_window() {
+        let _serial = lock_published_views();
         // The clock gate runs FIRST, before any ranking work. Outside the
         // window there is nothing to publish, and ranking to discover that
         // would pay the sort ~23,000 times a session for nothing.
@@ -22205,6 +22365,7 @@ mod depth_rebalance_wiring_tests {
 
     #[test]
     fn snapshot_top_volume_writes_nothing_without_a_writer() {
+        let _serial = lock_published_views();
         // The honest degrade when the writer thread could not be spawned: no
         // rows, and specifically NOT a synchronous flush on the frame drain.
         // In-window, so the clock gate cannot be what makes this pass.

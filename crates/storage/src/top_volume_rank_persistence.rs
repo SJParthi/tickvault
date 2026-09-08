@@ -183,6 +183,12 @@ pub struct TopVolumeRankRow {
     pub gain_pct: f64,
     /// Whether this contract actually held a depth subscription at this
     /// snapshot. The column that makes the table an audit rather than trivia.
+    ///
+    /// Read from the steering loops' LAST publish, which happens once a
+    /// minute per pool — so inside one minute the value can lag a swap by up
+    /// to that minute, and always in the understating direction (a contract
+    /// just swapped IN reads `false` until the next publish). See
+    /// `depth_subscription_view` for why that direction is the honest one.
     pub subscribed: bool,
 }
 
@@ -243,14 +249,23 @@ pub fn top_volume_rank_ensure_statements() -> Vec<String> {
 /// Creates the `top_volume_rank` table if absent (schema-self-heal order:
 /// CREATE -> per-column ALTER -> DEDUP ENABLE; never a table drop).
 ///
-/// Fail-SOFT: every failure logs at `error!` with `STORAGE-GAP-03` and
-/// returns. The honest consequence, stated rather than hidden: a failed
-/// ensure leaves the table to be auto-created by the first ILP write WITHOUT
-/// `DEDUP UPSERT KEYS` — a duplicate-row window until a later ensure
+/// Fail-SOFT per statement: every failure logs at `error!` with
+/// `STORAGE-GAP-03` and the walk continues, so one refused statement never
+/// hides the next. The honest consequence, stated rather than hidden: a
+/// failed ensure leaves the table to be auto-created by the first ILP write
+/// WITHOUT `DEDUP UPSERT KEYS` — a duplicate-row window until a later ensure
 /// succeeds. Blocking the boot instead would trade a duplicate-row window
 /// for no session at all.
-// TEST-EXEMPT: live-QuestDB DDL runner; the statement list it sends is pure and is asserted by the ensure-statement tests below.
-pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) {
+///
+/// Returns `true` only when EVERY statement was accepted, so the boot's
+/// bounded retry loop (`candle_ddl_boot::run_live_table_ddl_at_boot`) can
+/// re-run it beside `ticks` and `market_depth`. Until 2026-09-08 this fn
+/// returned `()` and had ZERO production callers — the table was written by
+/// its offload writer every second and ensured by nothing, so a fresh
+/// volume (the 2026-09-08 nuke) would have let the first ILP row auto-create
+/// it with no DEDUP key at all.
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement list it sends is pure and is asserted by the ensure-statement tests below, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -269,9 +284,10 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) {
                  ensured (the first ILP write may auto-create it WITHOUT dedup, \
                  a duplicate-row window until the next successful boot)"
             );
-            return;
+            return false;
         }
     };
+    let mut all_accepted = true;
     for ddl in &top_volume_rank_ensure_statements() {
         match client
             .get(&base_url)
@@ -281,6 +297,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) {
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
+                all_accepted = false;
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 error!(
@@ -294,6 +311,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) {
                 );
             }
             Err(err) => {
+                all_accepted = false;
                 error!(
                     code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                     stage = "ensure_ddl",
@@ -304,6 +322,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) {
             }
         }
     }
+    all_accepted
 }
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
@@ -645,10 +664,14 @@ impl TopVolumeRankWriter {
 ///
 /// What four batches actually buy here is far more than on the depth path,
 /// because the volume is not comparable. Depth is a MEASURED ~63,800 rows/s;
-/// this table emits one snapshot per cadence — 250 rows at 1 s and 5 at 5 s,
-/// so ~255 rows/s, roughly 250x less. Four batches is therefore ~4 seconds of
-/// stall absorbed rather than depth's ~600 ms. The queue should never fill in
-/// practice; bounded is still bounded.
+/// this table emits one snapshot per FAMILY per cadence — up to 250 rows for
+/// each of the two option families on BOTH the 1 s and the 5 s sweep, so
+/// ~600 rows/s at most (500/s from the 1 s arm, ~100/s from the 5 s arm),
+/// roughly 100x less. Four batches is therefore ~1 second of stall absorbed
+/// rather than depth's ~600 ms. (Until 2026-09-08 this line read "250 rows at
+/// 1 s and 5 at 5 s, ~255 rows/s" — the 5 s figure was the depth-200 SOCKET
+/// count, not the row count, and the index family was not counted at all.)
+/// The queue should never fill in practice; bounded is still bounded.
 pub const TOP_VOLUME_FLUSH_QUEUE_DEPTH: usize = 4;
 
 /// Consecutive full-queue flushes the producer may RETAIN before it stops
@@ -663,7 +686,7 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// 4 MiB, EIGHT TIMES TIGHTER than the depth path's 32 MiB, and that is the
 /// point rather than an oversight: a single depth-200 snapshot is 400 rows and
 /// a burst can breach a byte ceiling inside one span, whereas a top-volume
-/// snapshot is a bounded 255 rows of ~120 B ILP ≈ 30 KB/s. 4 MiB is ~136
+/// snapshot is a bounded ~600 rows/s of ~120 B ILP ≈ 72 KB/s. 4 MiB is ~58
 /// seconds of backlog at that rate — an eternity for a table whose next
 /// snapshot supersedes the last one. A ceiling sized for depth's traffic would
 /// hold minutes of stale rankings that nothing downstream wants.
@@ -1252,7 +1275,7 @@ mod tests {
     #[test]
     fn the_producer_byte_ceiling_is_far_tighter_than_the_depth_path() {
         // Not a style preference — a sizing claim, pinned so it cannot drift
-        // into depth's 32 MiB by copy-paste. This table emits ~255 rows/s
+        // into depth's 32 MiB by copy-paste. This table emits ~600 rows/s
         // against depth's measured ~63,800, so a ceiling sized for depth would
         // hold minutes of stale rankings nothing downstream wants.
         assert!(

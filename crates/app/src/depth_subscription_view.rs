@@ -96,6 +96,16 @@ pub const GHOST_GRACE_SECS: i64 = tickvault_core::websocket::pool_supervisor::GH
 /// the map is the only memory of what this process ever dropped.
 pub const DROPPED_RETENTION_SECS: i64 = 600;
 
+/// Oldest LAST PUBLISH a ghost verdict may be reached against, in seconds.
+///
+/// Two graces. Each pool publishes once a minute, so a healthy steering task
+/// keeps this age under ~60 s; a frame clock 180 s past the last publish is
+/// a forward clock step or a dead steering loop, and in either case the
+/// dropped map is not evidence a redial can act on. The bound holds a
+/// forward NTP step of up to 180 s to at most the drops that were ALREADY
+/// past the grace, and refuses everything beyond it.
+pub const GHOST_VERDICT_MAX_PUBLISH_AGE_SECS: i64 = 2 * GHOST_GRACE_SECS;
+
 /// Hard cap on the dropped map. A publish drops at most a socket's worth of
 /// instruments per pool per minute (≤ 4 swaps × 5 sockets × 2 pools), so ten
 /// minutes of retention is a few hundred entries; the cap is a fail-closed
@@ -126,6 +136,10 @@ pub struct DepthSubscriptionView {
     /// the boot dial fills sockets before either loop has published, and a
     /// detector that read that window as "ghost" would redial healthy sockets.
     published_once: AtomicBool,
+    /// Epoch seconds of the LAST publish by either pool. A ghost verdict is
+    /// refused when the frame's clock has run more than
+    /// [`GHOST_VERDICT_MAX_PUBLISH_AGE_SECS`] past it — see that constant.
+    last_publish_secs: std::sync::atomic::AtomicI64,
 }
 
 impl DepthSubscriptionView {
@@ -241,6 +255,23 @@ impl DepthSubscriptionView {
             Some(dropped_at) if now_secs.saturating_sub(*dropped_at) < GHOST_GRACE_SECS => {
                 DepthFrameClass::RecentlyDropped
             }
+            // A ghost verdict needs a TRUSTWORTHY "now". The steering loops
+            // publish every minute, so a frame clock more than two graces
+            // past the last publish means either the wall clock stepped
+            // forward (an NTP correction makes every recent drop read as
+            // ghost at once — a redial storm on healthy sockets) or the
+            // steering task is dead (then no drop is fresh and the map is
+            // stale). Both refuse, in the safe direction: no redial on a
+            // clock nobody has confirmed. Found by the 2026-09-08 hostile
+            // sweep (finding #21).
+            Some(_)
+                if now_secs.saturating_sub(
+                    self.last_publish_secs
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) > GHOST_VERDICT_MAX_PUBLISH_AGE_SECS =>
+            {
+                DepthFrameClass::Unknown
+            }
             Some(_) => DepthFrameClass::Ghost,
             None => DepthFrameClass::Unknown,
         }
@@ -281,26 +312,41 @@ impl DepthSubscriptionView {
             }
         }
         for key in previous.iter() {
-            if !next.contains(key) && !map.contains_key(key) {
-                if map.len() >= MAX_DROPPED_TRACKED {
-                    // Fail-closed: refuse to remember more rather than grow
-                    // without bound. A refused entry can never read as Ghost,
-                    // which is the safe direction (no redial on a guess).
-                    metrics::counter!(DROPPED_REFUSED_COUNTER).increment(1);
-                    tracing::warn!(
-                        code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
-                            .code_str(),
-                        source = "dropped_map_full",
-                        tracked = map.len(),
-                        cap = MAX_DROPPED_TRACKED,
-                        "depth view dropped map is full; further drops this publish are not remembered and can never read as ghost (fail-closed: no redial on a guess)"
-                    );
-                    break;
-                }
-                map.insert(*key, now_secs);
+            if next.contains(key) {
+                continue;
             }
+            // The NEWER drop wins. A contract can sit in BOTH pools (the top
+            // five are normally inside the top 250): depth-20 drops it at T,
+            // depth-200 drops it at T+300. Keeping the T stamp made the first
+            // frames after the SECOND unsubscribe read as ghosts — the grace
+            // had long elapsed against a drop that was not the one the socket
+            // was still honouring — and redialled a healthy socket. Found by
+            // the 2026-09-08 hostile sweep. Overwriting never grows the map,
+            // so the cap below is only consulted for a NEW key.
+            if let Some(stamp) = map.get_mut(key) {
+                *stamp = now_secs;
+                continue;
+            }
+            if map.len() >= MAX_DROPPED_TRACKED {
+                // Fail-closed: refuse to remember more rather than grow
+                // without bound. A refused entry can never read as Ghost,
+                // which is the safe direction (no redial on a guess).
+                metrics::counter!(DROPPED_REFUSED_COUNTER).increment(1);
+                tracing::warn!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
+                        .code_str(),
+                    source = "dropped_map_full",
+                    tracked = map.len(),
+                    cap = MAX_DROPPED_TRACKED,
+                    "depth view dropped map is full; further drops this publish are not remembered and can never read as ghost (fail-closed: no redial on a guess)"
+                );
+                break;
+            }
+            map.insert(*key, now_secs);
         }
         self.dropped.store(Arc::new(map));
+        self.last_publish_secs
+            .store(now_secs, std::sync::atomic::Ordering::Release);
         self.published_once
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -530,6 +576,66 @@ mod tests {
         );
     }
 
+    /// A contract held by BOTH pools (the top five are normally inside the
+    /// top 250): depth-20 drops it at T, depth-200 drops it at T+300. The
+    /// grace must run from the SECOND drop — the one the socket is still
+    /// honouring — or the first frames after it read as a ghost and a healthy
+    /// socket is redialled. Found by the 2026-09-08 hostile sweep; the older
+    /// `!map.contains_key` guard kept the T stamp and this test failed on it.
+    #[test]
+    fn a_contract_dropped_by_both_pools_gets_its_grace_from_the_newer_drop() {
+        let view = DepthSubscriptionView::new();
+        view.publish_depth20_at([(1, NSE_FNO)], T0);
+        view.publish_depth200_at([(1, NSE_FNO)], T0);
+        // depth-20 lets it go first...
+        view.publish_depth20_at(std::iter::empty(), T0 + 60);
+        // ...it is still HELD by depth-200, so it is not even dropped yet.
+        assert_eq!(view.classify_raw(1, FNO, T0 + 61), DepthFrameClass::Held);
+        // depth-200 drops it 300 s later: the grace runs from HERE.
+        view.publish_depth200_at(std::iter::empty(), T0 + 360);
+        assert_eq!(
+            view.classify_raw(1, FNO, T0 + 360 + GHOST_GRACE_SECS - 1),
+            DepthFrameClass::RecentlyDropped,
+            "inside the grace of the newer drop — never a ghost"
+        );
+        assert_eq!(
+            view.classify_raw(1, FNO, T0 + 360 + GHOST_GRACE_SECS),
+            DepthFrameClass::Ghost
+        );
+    }
+
+    /// A frame clock more than two graces past the last publish — a forward
+    /// clock step, or a dead steering loop — refuses the ghost verdict
+    /// rather than redialling on a clock nobody has confirmed.
+    #[test]
+    fn a_ghost_verdict_is_refused_when_the_last_publish_is_too_old() {
+        let view = DepthSubscriptionView::new();
+        view.publish_depth20_at([(1, NSE_FNO)], T0);
+        view.publish_depth20_at(std::iter::empty(), T0 + 60);
+        // Inside the publish-age bound: a real ghost.
+        assert_eq!(
+            view.classify_raw(1, FNO, T0 + 60 + GHOST_VERDICT_MAX_PUBLISH_AGE_SECS),
+            DepthFrameClass::Ghost
+        );
+        // One second past it (the clock stepped, or nobody has published in
+        // three minutes): refused, never a redial.
+        assert_eq!(
+            view.classify_raw(1, FNO, T0 + 60 + GHOST_VERDICT_MAX_PUBLISH_AGE_SECS + 1),
+            DepthFrameClass::Unknown
+        );
+        // A fresh publish restores the verdict.
+        view.publish_depth200_at(
+            std::iter::empty(),
+            T0 + 60 + GHOST_VERDICT_MAX_PUBLISH_AGE_SECS,
+        );
+        assert_eq!(
+            view.classify_raw(1, FNO, T0 + 60 + GHOST_VERDICT_MAX_PUBLISH_AGE_SECS + 1),
+            DepthFrameClass::Ghost
+        );
+        assert_eq!(GHOST_VERDICT_MAX_PUBLISH_AGE_SECS, 2 * GHOST_GRACE_SECS);
+        assert!(GHOST_VERDICT_MAX_PUBLISH_AGE_SECS < DROPPED_RETENTION_SECS);
+    }
+
     #[test]
     fn dropped_count_falls_when_entries_are_evicted_after_the_retention_window() {
         let view = DepthSubscriptionView::new();
@@ -561,17 +667,17 @@ mod tests {
     #[test]
     fn classify_raw_keys_on_the_composite_so_a_segment_twin_is_not_a_ghost() {
         // I-P1-11: dropping id 27 on NSE_FNO says nothing about id 27 on IDX_I.
+        // Probe inside the publish-freshness window (a verdict older than
+        // GHOST_VERDICT_MAX_PUBLISH_AGE_SECS after the last publish is refused).
+        let probe_at = T0 + 60 + GHOST_GRACE_SECS + 1;
         let view = DepthSubscriptionView::new();
         view.publish_depth20_at([(27, NSE_FNO)], T0);
         view.publish_depth20_at(std::iter::empty(), T0 + 60);
         assert_eq!(
-            view.classify_raw(27, IDX.binary_code(), T0 + 10_000),
+            view.classify_raw(27, IDX.binary_code(), probe_at),
             DepthFrameClass::Unknown
         );
-        assert_eq!(
-            view.classify_raw(27, FNO, T0 + 10_000),
-            DepthFrameClass::Ghost
-        );
+        assert_eq!(view.classify_raw(27, FNO, probe_at), DepthFrameClass::Ghost);
     }
 
     #[test]
