@@ -3513,3 +3513,20 @@ long before this store fills. A page here would be a fourth pager for a
 condition three others already report. If the cap is ever lowered toward the
 live count, this row is the one that says the refusal needs its own filter —
 on `$.source = "spot_price_store_full"`, never on the bare code.
+
+### §2.3w — 2026-09-08: the ghost-instrument redial is LOG-ONLY by design
+
+**This section authorizes NOTHING and adds no page.** Two new `WS-GAP-02`
+emit sites arrive with the ghost-instrument detector
+(`websocket-connection-scope-lock.md` "2026-09-08 (THIRD)"): `source =
+"ghost_instrument"` (core, `warn!`, the connection task scheduling the redial)
+and `source = "unsubscribe_ignored"` (app, `error!`, the drain arming it).
+The only `WS-GAP-02` CloudWatch filter is §2.3m's three-condition pattern
+scoped to `swap_emptied_socket`, so both new sources are structurally
+invisible to it — correct, because the condition SELF-HEALS: the socket
+redials within the 180 s cooldown and the counter
+`tv_dhan_feed_depth_total{outcome="ghost_redial"}` is the read-out. A page
+for a condition the code repairs on its own is the false-alarm class this
+file records repeatedly. If the ghost count is non-zero session after
+session, that is the unsubscribe RequestCode being wrong, and the fix is the
+code — not a pager.

@@ -2596,3 +2596,89 @@ vacuous-pass shape closed in #1884 arriving one structure later.
 - Applies the depth-20 ranking from the frame drain, or lets one socket take
   more than four swaps in a minute.
 - Presents the boot dial as ranked before the first 5-second sweep exists.
+
+### 2026-09-08 (THIRD, same day) — the boot dial is SEEDED from the previous close, depth-200 gains its band, and an ignored unsubscribe now redials the socket
+
+**No new authorization is claimed.** This is the record of items 1, 3 and 4 of
+the (SECOND) section's "STILL not delivered" list being delivered, in one
+change, with the properties the lock makes binding stated per item.
+
+#### Item 1 — the boot dial (`crates/app/src/depth_seed.rs`)
+
+| Property | Implementation |
+|---|---|
+| Source | the socket HOLDINGS at the capture-window close (15:40 IST), written to `data/instrument-cache/depth-seed-latest.json` only if a ranking was published that session. Never the ranking itself: what the sockets held is what was ranked AND admitted, which is the honest "yesterday's best" |
+| Validation | every seeded id is checked against TODAY's contract artifact — `OPTSTK`, CE/PE, `NSE_FNO`, expiry ≥ today. An expired or unknown id is refused per contract and counted (`tv_depth_seed_rows_total{outcome}`); a seed that survives partially fills the lead slots and the boot dial fills the rest |
+| Hold | a seeded pool HOLDS STILL until the first ranking of the session (`seed_until_first_ranking`), so the index at-the-money dial no longer runs for ~15 minutes on sockets that already carry yesterday's top set |
+| Fail direction | absent, unreadable, wrong-day, or all-refused seed → the existing boot dial, with an `info!` naming the outcome. Never an empty socket |
+| Bounded | ≤ 250 + ≤ 5 entries by construction; the validation index is built once per boot |
+
+The bare nuke of 2026-09-08 deleted `instrument-cache`, so the first session
+after it runs on the boot dial — the seed appears from the second session.
+
+#### Item 3 — depth-200 hysteresis (`depth200_candidates.rs`, `depth200_ranked_steer.rs`)
+
+`DEPTH200_EXIT_UNDERLYINGS` = 5 + `DEPTH200_HYSTERESIS_RANKS` (3) = 8. The
+published list is the top 8 distinct underlyings; the ENTRY set is its first 5.
+A held contract anywhere in the 8 is kept; only a contract outside the 8 is
+swapped, and only for an unheld contract inside the first 5. Band contracts are
+never placed. Same shape as depth-20's 250/300, at the scale of five sockets.
+
+#### Item 4 — the ghost instrument (`depth_subscription_view.rs`, `dhan_feed_stack.rs`, core `pool_supervisor.rs`)
+
+The FOURTH-quote section named the unsubscribe RequestCode (24 vs 25) as
+UNVERIFIED-LIVE and said a socket that silently keeps delivering an
+unsubscribed contract "is not detected". It is now:
+
+| Property | Implementation |
+|---|---|
+| Detection | each depth PACKET on a live socket is classified O(1) against the published held sets and a dropped map. Only an instrument THIS process dropped ≥ `GHOST_GRACE_SECS` (90 s) ago, still arriving, is a ghost. Never-held is `Unknown` — the swap-in window is that shape and must not redial |
+| Counted | `tv_dhan_feed_depth_total{outcome="ghost" \| "unsubscribed_grace" \| "ghost_redial"}` |
+| Remedy | `request_ghost_redial(connection_index)` arms a per-socket register (cooldown 180 s); the connection task takes it on its existing 1 s idle tick and redials through the normal backoff ladder as `ReconnectReason::GhostInstrument`. The replay re-subscribes the guard's CURRENT set, which excludes the ghost, so the vendor's view is rebuilt from ours |
+| Rows | STILL WRITTEN. The levels arrived; capture is not suspended for an instrument we did not want. Only the verdict and the redial are new |
+| Log | one `error!` per armed redial (`code = WS-GAP-02`, `source = "unsubscribe_ignored"`), log-sink only; the cooldown is the throttle |
+
+**This is the safety net the FOURTH-quote section said must exist before the
+apply cadence is raised.** If code 25 is wrong for an endpoint, every swap
+becomes an add, the ghost shows within 90 s, and the socket is rebuilt within
+the cooldown instead of sitting at 804 for the session.
+
+#### Also delivered: the two per-cadence faces of `top_volume_rank`
+
+`top_volume_rank_1s` and `top_volume_rank_5s` (`console_views.rs`) — views over
+the ONE table filtered on `tf`, joined to the instrument master. The operator's
+words were "1s table and 5s tables also separately"; one stored table with two
+faces gives that without writing every row twice.
+
+#### ⚠ STILL not delivered (Rule 11)
+
+1. **The apply cadence is one minute, not five seconds.** The ranking runs every
+   5 s; the delta is applied once a minute at :08. The operator asked for the
+   5-second cadence a fourth time on 2026-09-08 (*"every 5 seconds needs to be
+   resubscribed … in O(1) latency"*). The FOURTH-quote section's ordering —
+   probe the unsubscribe code live FIRST, then raise the cadence — still binds;
+   the ghost redial above makes a wrong code SELF-HEALING rather than fatal,
+   which is what makes the raise safe to do next, but the raise itself needs
+   its own dated row and is not smuggled in here.
+2. **A swap is not O(1) on the wire.** Ranking is O(n log n) at 900 µs; the
+   subscription CHANGE is one unsubscribe + one subscribe per swap with a 2 s
+   wire budget, serialised per socket. The honest claim is "delta-only, capped
+   per socket, edge-triggered" — never "O(1) resubscribe".
+3. **Churn is UNMEASURED** for both pools until the first live session with
+   this build; `tv_depth20_ranked_swaps_total` / `tv_depth200_ranked_swaps_total`
+   are the read-out.
+4. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The ghost counter
+   is now the instrument that verifies it: a session with `ghost = 0` and
+   `unsubscribed_grace > 0` is the evidence that 25 works.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Seeds from the ranking rather than the holdings, or applies a seed without
+  validating every id against today's contract set.
+- Lets a seeded pool be re-dialled by the index engine before the first ranking.
+- Places a band contract into a depth-200 socket, or evicts a held contract
+  that is inside the band.
+- Classifies a never-held instrument as a ghost (redials healthy sockets on
+  every swap).
+- Drops ghost rows instead of writing them.
+- Raises the apply cadence under cover of this section.

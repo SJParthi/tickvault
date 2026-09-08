@@ -1289,6 +1289,7 @@ pub async fn run_depth_rebalance(
     crate::depth20_track::pre_register_depth20_counters();
     crate::depth200_ranked_steer::pre_register_ranked_counters();
     crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
+    crate::depth_seed::pre_register_seed_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
@@ -1417,6 +1418,20 @@ pub async fn run_depth_rebalance(
                     "depth rebalance: past the capture window — steering holds every socket \
                      where it is until the box stops"
                 );
+                // ---- tomorrow's seed (2026-09-08 THIRD) ----
+                //
+                // Written ONCE, here, from what the sockets HOLD — the steered
+                // state after the hysteresis band — and only if a ranking was
+                // published this session. A session that never ranked still
+                // holds the boot dial (index options), and a seed of those
+                // would be refused at read time anyway; not writing it is
+                // simply the honest form of the same answer.
+                if crate::depth200_candidates::global_depth200_candidates()
+                    .latest()
+                    .is_some()
+                {
+                    write_tomorrows_seed(&date_ist, &sockets, &depth20);
+                }
             }
             continue;
         }
@@ -1516,6 +1531,17 @@ pub async fn run_depth_rebalance(
                     }
                     (ranked_20.plan, "volume_ranking")
                 }
+                // A pool dialed from yesterday's close HOLDS until the first
+                // ranking: re-planning the layout here would move the seeded
+                // stock options back onto index windows at 09:08, undoing the
+                // seed minutes before the ranking could keep it.
+                None if crate::depth_seed::boot_seeded(crate::depth_seed::SeedPool::Depth20) => (
+                    crate::depth20_track::Depth20Plan {
+                        sockets_left_alone: held_20.len(),
+                        ..crate::depth20_track::Depth20Plan::default()
+                    },
+                    "seed_until_first_ranking",
+                ),
                 None => {
                     let layout = crate::depth20_layout::build_depth20_layout(&candidates, &movers);
                     (
@@ -1591,6 +1617,11 @@ pub async fn run_depth_rebalance(
                     "volume_ranking",
                 )
             }
+            // Same hold as depth-20 above: a seeded pool is not handed to the
+            // at-the-money engine, which would re-centre it onto index pairs.
+            None if crate::depth_seed::boot_seeded(crate::depth_seed::SeedPool::Depth200) => {
+                (RebalanceDecision::default(), "seed_until_first_ranking")
+            }
             None => (
                 plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers),
                 "atm_until_first_ranking",
@@ -1612,6 +1643,40 @@ pub async fn run_depth_rebalance(
             movers = movers.len(),
             "depth rebalance moved sockets"
         );
+    }
+}
+
+/// Writes what the depth sockets hold to the seed file the next boot dials
+/// from. Fail-soft: a write failure is logged at warn and costs nothing else —
+/// tomorrow simply dials as today did.
+// TEST-EXEMPT: thin composition of DepthSeed::from_holdings + write_depth_seed, both tested in depth_seed.rs; the call site is pinned by the_loop_writes_tomorrows_seed_at_the_capture_window_close.
+fn write_tomorrows_seed(
+    date_ist: &str,
+    sockets: &[RebalanceSocket],
+    depth20: &[crate::depth20_track::Depth20LiveSocket],
+) {
+    let seed = crate::depth_seed::DepthSeed::from_holdings(
+        date_ist,
+        sockets.iter().filter_map(|s| s.held),
+        depth20.iter().flat_map(|s| s.held.iter().copied()),
+    );
+    if seed.is_empty() {
+        return;
+    }
+    let path = crate::depth_seed::seed_path();
+    match crate::depth_seed::write_depth_seed(&path, &seed) {
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            depth_200 = seed.depth_200.len(),
+            depth_20 = seed.depth_20.len(),
+            "depth rebalance: wrote the close-of-session holdings as tomorrow's dial seed"
+        ),
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            %err,
+            "depth rebalance: could not write tomorrow's dial seed — the next boot dials \
+             the index at-the-money set until its first ranking"
+        ),
     }
 }
 
@@ -2975,6 +3040,37 @@ mod fifth_socket_tests {
         assert!(
             production.contains("TopMoverSocket::seeded(held,"),
             "the rebalance loop must seed the top-mover tracker from what the socket holds"
+        );
+    }
+
+    /// The seed for tomorrow's dial is written at the capture-window close,
+    /// from HOLDINGS, and only when a ranking was published this session.
+    #[test]
+    fn the_loop_writes_tomorrows_seed_at_the_capture_window_close() {
+        let source = include_str!("depth_rebalance.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let gate = production
+            .find("TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST {")
+            .expect("the post-close gate exists");
+        let write = production
+            .find("write_tomorrows_seed(&date_ist, &sockets, &depth20)")
+            .expect("the seed write call exists");
+        assert!(
+            write > gate,
+            "the seed is written inside the post-close gate"
+        );
+        let guard = production[gate..write].contains("global_depth200_candidates()");
+        assert!(
+            guard,
+            "the write is gated on a ranking having been published"
+        );
+        // And both pre-ranking arms HOLD a seeded pool.
+        assert_eq!(
+            production.matches("seed_until_first_ranking").count(),
+            2,
+            "depth-20 and depth-200 each hold a seeded pool until the first ranking"
         );
     }
 }

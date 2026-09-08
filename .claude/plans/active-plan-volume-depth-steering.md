@@ -148,6 +148,9 @@ rather than hidden.
     `plan_ranked_minute` suite in `depth200_ranked_steer.rs`
   - **Landed 2026-09-08** (PR #1890 wired the swap engine; the gainer filter, the
     lots-in-window key and the zero-lot exclusion followed in the depth-20 PR)
+- [x] Item 4 — boot seed from the previous close, depth-200 hysteresis band, ghost-instrument redial, per-cadence top-volume views (2026-09-08 THIRD)
+  - Files: crates/app/src/depth_seed.rs (NEW), crates/app/src/depth_rebalance.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/depth200_candidates.rs, crates/app/src/depth200_ranked_steer.rs, crates/app/src/depth_subscription_view.rs, crates/core/src/websocket/pool_supervisor.rs, crates/storage/src/console_views.rs
+  - Tests: apply_depth_seed tests (8), entry_set_is_the_first_budget_rows_and_the_rest_is_the_band, a_held_contract_inside_the_band_is_kept_and_not_swapped, band_contracts_are_never_placed_into_a_socket, the_loop_writes_tomorrows_seed_at_the_capture_window_close, publish_depth20_at_marks_a_dropped_instrument_recently_dropped_inside_the_grace_and_ghost_after_it, an_instrument_never_held_is_unknown_never_ghost, a_live_socket_delivering_a_ghost_instrument_is_redialled_with_the_ghost_reason, request_ghost_redial_is_refused_inside_the_cooldown_and_allowed_after_it, test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences
 
 ## Item 2's two architectural decisions (Rule 15 — decided BEFORE the wiring PR)
 

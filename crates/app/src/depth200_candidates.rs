@@ -103,6 +103,43 @@ const _: () = assert!(
      two disagree, the published ranking is sized for a pool that does not exist"
 );
 
+/// How many DISTINCT-underlying contracts the ranking publishes: the five
+/// ENTRY slots plus a hysteresis band of three.
+///
+/// The 2026-09-07 lock names a hysteresis band as the remedy for a churning
+/// per-window board, and until 2026-09-08 (SECOND) depth-200 had none: the
+/// published list was exactly five, so a held contract that slipped to sixth
+/// for ONE five-second window was swapped out and, a window later, swapped
+/// back. Each of those is two wire calls on a deep socket whose book takes
+/// seconds to refill.
+///
+/// The rule is the depth-20 one, scaled to five sockets: a contract ENTERS
+/// only from the first [`DEPTH_200_SOCKET_BUDGET`] ranks; a contract already
+/// held is KEPT while it stays anywhere inside this longer list. Three ranks
+/// of band, not one, because the distinct-underlying pass makes rank 6 a
+/// different STOCK from rank 5, and a stock that is the sixth-busiest one
+/// window and the fifth the next is precisely the churn a band exists for.
+///
+/// Derived from the budget rather than written as `8`, so a change to the
+/// socket count moves the band with it.
+pub const DEPTH200_EXIT_UNDERLYINGS: usize = DEPTH_200_SOCKET_BUDGET + DEPTH200_HYSTERESIS_RANKS;
+
+/// The band width — see [`DEPTH200_EXIT_UNDERLYINGS`].
+pub const DEPTH200_HYSTERESIS_RANKS: usize = 3;
+
+const _: () = assert!(
+    DEPTH200_EXIT_UNDERLYINGS > DEPTH_200_SOCKET_BUDGET,
+    "a band no wider than the entry set is not a band"
+);
+
+/// The ENTRY set of a published ranking: the contracts that may be swapped
+/// IN. The remainder of the list is the hysteresis band, which only decides
+/// what is KEPT.
+#[must_use]
+pub fn entry_set(ranked: &[Depth200Candidate]) -> &[Depth200Candidate] {
+    &ranked[..ranked.len().min(DEPTH_200_SOCKET_BUDGET)]
+}
+
 /// The in-band "no ranking has been published yet" value for both gauges.
 ///
 /// Negative because a length and a count are both non-negative, so this cannot
@@ -242,6 +279,14 @@ impl Divergence {
 /// report a held index option as "on the ranking" because a stock option
 /// happens to share its number, which is the failure this whole change exists
 /// to make visible.
+///
+/// Since the hysteresis band (2026-09-08 SECOND) the two halves read
+/// DIFFERENT parts of the list, on purpose: `held_off_ranking` is judged
+/// against the WHOLE published list (a held contract inside the band is not
+/// off the ranking — the planner keeps it), while `ranked_unheld` is judged
+/// against the [`entry_set`] only (a band contract that holds no socket is not
+/// a contract the planner would ever place, so reporting it as "should hold"
+/// would be a divergence nothing can close).
 #[must_use]
 pub fn diverge(held: &[(u64, ExchangeSegment)], ranked: &[Depth200Candidate]) -> Divergence {
     let ranked_keys: Vec<(u64, u8)> = ranked.iter().map(Depth200Candidate::key).collect();
@@ -257,7 +302,7 @@ pub fn diverge(held: &[(u64, ExchangeSegment)], ranked: &[Depth200Candidate]) ->
         .map(|((id, seg), _)| (*id, *seg))
         .collect();
 
-    let ranked_unheld = ranked
+    let ranked_unheld = entry_set(ranked)
         .iter()
         .filter(|c| !held_keys.contains(&c.key()))
         .map(|c| (c.security_id, c.segment))
@@ -481,6 +526,41 @@ mod tests {
         let held = [(1_u64, FNO)];
         let d = report_divergence(&view, &held).expect("an empty ranking is still a ranking");
         assert_eq!(d.held_off_ranking, vec![(1, FNO)]);
+    }
+
+    /// The hysteresis band: the published list is entry set + band, and the
+    /// two halves are read by different questions.
+    #[test]
+    fn entry_set_is_the_first_budget_rows_and_the_rest_is_the_band() {
+        let ranked: Vec<_> = (1..=DEPTH200_EXIT_UNDERLYINGS as u64)
+            .map(|i| candidate(i, 10 * i, 1000 - i))
+            .collect();
+        assert_eq!(entry_set(&ranked).len(), DEPTH_200_SOCKET_BUDGET);
+        assert_eq!(entry_set(&ranked)[0].security_id, 1);
+        // A short list is its own entry set — no panic, no padding.
+        let short = [candidate(1, 10, 9), candidate(2, 20, 8)];
+        assert_eq!(entry_set(&short).len(), 2);
+        assert!(entry_set(&[]).is_empty());
+    }
+
+    #[test]
+    fn diverge_treats_a_band_contract_as_on_the_ranking_and_never_as_unheld() {
+        let ranked: Vec<_> = (1..=DEPTH200_EXIT_UNDERLYINGS as u64)
+            .map(|i| candidate(i, 10 * i, 1000 - i))
+            .collect();
+        // Holding ranks 1..4 and the first BAND row (6); entry rank 5 unheld.
+        let held = [(1_u64, FNO), (2, FNO), (3, FNO), (4, FNO), (6, FNO)];
+        let d = diverge(&held, &ranked);
+        assert!(
+            d.held_off_ranking.is_empty(),
+            "a held band contract is not off the ranking: {:?}",
+            d.held_off_ranking
+        );
+        assert_eq!(
+            d.ranked_unheld,
+            vec![(5, FNO)],
+            "only ENTRY rows can be 'should hold'; band rows 7 and 8 must not appear"
+        );
     }
 
     #[test]

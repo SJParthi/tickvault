@@ -115,6 +115,7 @@ pub mod depth20_layout;
 pub mod depth20_ranked_steer;
 pub mod depth20_track;
 pub mod depth_rebalance;
+pub mod depth_seed;
 pub mod depth_subscription_view;
 /// `[groww_universe]` process-global daily Groww watch-set + shared-master
 /// rider (2026-07-15 live-feed retirement re-home of the activation daily
