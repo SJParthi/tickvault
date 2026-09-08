@@ -4138,6 +4138,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "papaya",
  "proptest",
  "reqwest",
  "rustls",

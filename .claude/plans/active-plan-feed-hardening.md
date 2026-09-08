@@ -4337,3 +4337,147 @@ the pipe can no longer park the parent, and a partial capture says so in its own
 holds the pipe and still runs. What changed is that the parent no longer waits on it
 forever. **NOT claimed:** that this bounds every blocking call in the MCP server; it bounds
 `run_with_timeout`'s readers, which is the one this defect is in.
+
+---
+
+## Item 41 — Read spot prices from RAM, not from QuestDB
+
+**Status:** IMPLEMENTED 2026-09-08. Deploy deferred to the 15:46 IST post-close
+window (market-hours guard + the Quote 21 REJECT on in-session restarts).
+
+### Design
+
+Locating at-the-money needs one number per underlying: today's spot level. The
+contract and depth selectors obtained it with a QuestDB round trip
+(`SELECT security_id, segment, ltp FROM ticks ... LATEST ON ts PARTITION BY
+security_id, segment`). That is not O(1), it is blind to database lag, and it
+breaks the charter's RAM-first rule (rule 2 of the eleven always-on rules) on a
+path that decides what the lane subscribes.
+
+`SpotPriceStore` (`crates/app/src/spot_price_store.rs`) is a
+`papaya::HashMap<(SecurityId, ExchangeSegment), AtomicI64>` holding today's
+latest traded price in paise. The drain writes it on the tick path through
+`&self`; the contract and depth attach tasks read it through `&self` from their
+own tasks. No lock on either side.
+
+`load_contract_universe` and `load_depth_candidates` now take the store and
+overlay it OVER the QuestDB result, RAM winning. Both sources, because neither
+alone is sufficient: RAM cannot see a price from before this process booted (a
+mid-session restart would lose an illiquid stock that traded at 09:20 and not
+since), and QuestDB cannot see the last N minutes while its apply lag runs.
+
+`rupees_to_paise` is shared by both paths so the conversion cannot drift.
+
+### The measurement that motivated it (2026-09-08, live)
+
+| IST | ingest ticks / 5 min | `priced_underlyings` | `stock_options` |
+|---|---:|---:|---:|
+| 09:15 (open) | 103,887 | 0 | 0 |
+| 09:30 | 106,124 | 0 | 0 |
+| 09:44:11 | 102,902 | 118 (indices only) | 0 |
+| **09:45:14** | 104,801 | **861** | **20,224** |
+
+`tv_questdb_wal_apply_lag_max`: 11,503 at 09:00 → 27,089 at 09:55, climbing.
+
+Thirty minutes of the session with 0 of 20,224 stock options and no
+stock-option depth, while the process held every price it needed in memory.
+
+### Edge cases
+
+- **Only spot segments are admitted** (`IdxI`, `NseEquity`, `BseEquity`). A
+  derivative's price is its premium, not the underlying's level; admitting one
+  would centre that stock's whole ladder on the wrong number.
+- **A segment byte the enum cannot name** is refused — the filter is one
+  binding pattern over `from_byte`, so both conditions must hold.
+- **Non-finite, zero, negative, or past-2^53 prices** are refused before they
+  can place a ladder; zero would put at-the-money at the bottom of every ladder.
+- **The same numeric id in two segments** is two instruments (I-P1-11).
+- **Cap** at `MAX_TRACKED_INSTRUMENTS = 25_000`: a NEW instrument past it is
+  refused with a counter and a coded error; a TRACKED one is never evicted.
+- **Mid-session restart**: RAM starts empty, QuestDB carries the morning, the
+  overlay covers both.
+
+### Failure modes
+
+- **The store and the reader end up being different stores.** Silent, and the
+  exact shape of the outage this fixes — the drain fills one, the reader
+  queries an empty one, the universe sits at zero and nothing says so.
+  Verified this passes every behavioural test, which is why
+  `the_attach_tasks_read_the_drains_own_spot_store` exists as a source guard.
+- **A contract segment enters the filter.** Silent and plausible: ~50 strikes
+  centred on a premium. Pinned by
+  `only_the_three_spot_variants_may_price_an_underlying`.
+- **QuestDB unavailable**: RAM still answers. This is the improvement.
+- **Both empty**: the universe reports `no_spot_rows`, as it already did.
+
+### Test plan
+
+New, all in-tree: 11 in `spot_price_store`, 5 in
+`dhan_feed_stack::frame_walk_accounting_tests`, 1 source-identity guard.
+Full app suite 1,977 passed / 0 failed / 2 ignored.
+
+Bite-proven, each mutation applied and reverted:
+
+| mutation | test that failed |
+|---|---|
+| filter widened to admit every segment | `a_derivative_tick_never_prices_an_underlying` |
+| `record_spot_price` made a no-op | `record_spot_price_lands_a_decoded_tick_where_the_attach_tasks_read_it` |
+| reader constructs its own store | `the_attach_tasks_read_the_drains_own_spot_store` |
+| boot constructs a fresh store | `the_attach_tasks_read_the_drains_own_spot_store` |
+| `NseFno` added to the filter | `only_the_three_spot_variants_may_price_an_underlying` |
+| guard's own anchor broken | the guard fails loud rather than grading a wrong slice |
+
+The last one is recorded because the first version of that guard anchored on a
+fragment `cargo fmt` reflowed; the slice silently widened to the whole file and
+failed on correct code. A guard that cannot find its target must say so.
+
+### Rollback
+
+Config-free and reversible by revert. The store is additive; removing the
+overlay restores the QuestDB-only behaviour exactly, because the database query
+is unchanged and still runs.
+
+### Observability
+
+- `tv_spot_price_store_tracked` (gauge, published from the READ side — what the
+  consumer could see, not what the writer believes it stored)
+- `tv_spot_price_store_refused_total`, `tv_spot_price_store_rejected_value_total`
+- `spot_from_ram` and `spot_from_questdb` on the `contract universe resolved`
+  line: without them a healthy RAM path and a healthy database path are
+  indistinguishable, so a silently-unfed store reads exactly like a working one
+  for as long as the database keeps up.
+
+**Not EMF-selected.** Three names would be ~$0.90/mo against a September
+forecast of $142.24 and an automatic `STOP_EC2_INSTANCES` line at $135.00 —
+already $7.24 over. Per the standing rule this needs a lever, not a cost note,
+and no lever is taken here. The signals are local and on the log line; shipping
+them to CloudWatch is a separate operator decision.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the store
+is O(1) average on both sides and bounded fail-closed at 25,000; the drain arm
+admits exactly three spot segments and is pinned in source; the reader and the
+writer are proven to be the same store by a guard that bites in both
+directions.
+
+**NOT claimed:** that this fixes the QuestDB WAL apply lag. It is untouched and
+still growing (11,503 → 27,089 across 2026-09-08); it remains task #21.
+**NOT claimed:** that the 30-minute wait is now zero. RAM answers as soon as the
+first spot tick is decoded, which is seconds after the open rather than thirty
+minutes — but nothing here has run against a live open, so that is what the
+code must do, not what the box has reported. The first session after deploy is
+the measurement, and `spot_from_ram` on the resolved line is where it reads.
+
+### Per-item guarantee matrix
+
+Carried by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+(15-row + 7-row). Rows exercised by this item: code coverage (17 new tests),
+testing coverage (unit + concurrency + source-guard), code checks (fmt, clippy
+`-D warnings -W clippy::perf`, banned-pattern, pub-fn-test, data-integrity,
+plan-gate all clean), performance (O(1) per tick, allocation-free after first
+write; the O(n) snapshot is flagged not relabelled), monitoring/logging (above),
+functionalities (every new pub fn has a call site and a test), extreme check
+(six bite-proofs, all reverted). Resilience rows: no new tick-drop path — the
+arm records and never gates the fold; no ring, spill or DLQ change; O(1)
+uniqueness on the I-P1-11 composite key.

@@ -1453,19 +1453,14 @@ pub fn parse_spot_prices(body: &str) -> Result<HashMap<(u64, u8), i64>, String> 
         let Some(ltp) = cols[2].as_f64() else {
             continue;
         };
-        // Non-finite or non-positive is refused, not stored: a price of zero
-        // would place at-the-money at the bottom of every ladder.
-        if !ltp.is_finite() || ltp <= 0.0 {
+        // ONE conversion, shared with the RAM path. Written twice these would
+        // drift, and the fallback would centre ladders one rounding step from
+        // the primary — an off-by-one strike no log explains. Non-finite,
+        // non-positive and past-exact-integer prices are refused inside it: a
+        // price of zero would put at-the-money at the bottom of every ladder.
+        let Some(paise) = crate::spot_price_store::rupees_to_paise(ltp) else {
             continue;
-        }
-        let paise = (ltp * 100.0).round();
-        if paise > 9_007_199_254_740_991.0 {
-            continue;
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        // APPROVED: bounded above by the line before and below by the `<= 0.0`
-        // guard — a whole number well inside i64.
-        let paise = paise as i64;
+        };
         out.insert((id, seg), paise);
     }
     Ok(out)
@@ -1500,6 +1495,13 @@ pub fn spot_paise_by_symbol(
 // TEST-EXEMPT: async I/O composition (file read + HTTP GET); every pure part it calls — read_contract_artifact, parse_symbol_map, parse_spot_prices, spot_paise_by_symbol, select_contract_universe — is separately tested above.
 pub async fn load_contract_universe(
     questdb: &tickvault_common::config::QuestDbConfig,
+    // Today's spot prices as the DRAIN saw them, with no database in the
+    // path. Primary source since 2026-09-08: on that day ticks arrived at
+    // 103,887 per five minutes from the 09:15 open while the QuestDB join
+    // returned nothing until 09:45, because an ACKed row is not queryable
+    // until it is APPLIED and the apply lag ran 11,503 -> 27,089 across the
+    // session. Thirty minutes, 20,224 stock options, zero subscribed.
+    spot_store: &crate::spot_price_store::SpotPriceStore,
     date_ist: &str,
     today_ymd: u32,
     today_ist_nanos: i64,
@@ -1548,7 +1550,23 @@ pub async fn load_contract_universe(
         }
     };
 
-    let prices = fetch_spot_prices(questdb, today_ist_nanos).await;
+    // Both sources, RAM last, because neither alone is sufficient.
+    //
+    // RAM holds only what THIS process has decoded since it booted, so a
+    // mid-session restart leaves it blind to an illiquid stock that traded at
+    // 09:20 and not since -- that stock's ladder would be absent for the rest
+    // of the day. QuestDB holds it. Conversely QuestDB cannot see the last N
+    // minutes at all while its apply lag runs, which is the thirty-minute
+    // blackout this pairing exists to end.
+    //
+    // Overlaid in this order so RAM WINS every conflict: it is the fresher of
+    // the two by construction -- the database's copy of a price is the same
+    // tick, later.
+    let mut prices = fetch_spot_prices(questdb, today_ist_nanos).await;
+    let from_questdb = prices.len();
+    let ram = spot_store.snapshot_prices();
+    let from_ram = ram.len();
+    prices.extend(ram);
     let spot = spot_paise_by_symbol(&symbols, &prices);
 
     // Publish the contract -> underlying/family mapping the ranking layer reads
@@ -1588,6 +1606,11 @@ pub async fn load_contract_universe(
         // sum of "the source returned nothing" and "nothing the source returned
         // matched", which are opposite defects.
         spot_rows_available = prices.len(),
+        // WHICH source answered. Without this a healthy RAM path and a healthy
+        // database path are indistinguishable, so a silently-unfed store reads
+        // exactly like a working one for as long as the database keeps up.
+        spot_from_ram = from_ram,
+        spot_from_questdb = from_questdb,
         symbol_map_entries = symbols.len(),
         selected = selection.instruments.len(),
         index_futures = selection.index_futures,
