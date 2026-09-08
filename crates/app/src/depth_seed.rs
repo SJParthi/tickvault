@@ -460,18 +460,15 @@ pub fn boot_seeded(pool: SeedPool) -> bool {
     BOOT_SEEDED[pool.index()].load(Ordering::Acquire)
 }
 
-/// Test-only reset of the process-global flags.
-#[cfg(test)]
-// TEST-EXEMPT: cfg(test)-only helper that clears process-global state between tests; every seed test exercises it.
-pub fn reset_boot_seeded_for_tests() {
-    for flag in &BOOT_SEEDED {
-        flag.store(false, Ordering::Release);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Test-only reset of the process-global flags.
+    fn reset_boot_seeded_for_tests() {
+        for flag in &BOOT_SEEDED {
+            flag.store(false, Ordering::Release);
+        }
+    }
 
     // The boot-seeded flags are process-global; tests that set or read them
     // run one at a time so a parallel sibling cannot leave a flag set.

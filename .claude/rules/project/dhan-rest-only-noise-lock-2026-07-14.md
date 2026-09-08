@@ -3530,3 +3530,12 @@ for a condition the code repairs on its own is the false-alarm class this
 file records repeatedly. If the ghost count is non-zero session after
 session, that is the unsubscribe RequestCode being wrong, and the fix is the
 code — not a pager.
+
+**Addendum (same evening):** the depth view's dropped-map cap refusal
+(`source = "dropped_map_full"`, `tv_depth_view_dropped_refused_total`) is a
+third `WS-GAP-02` source and is likewise log-only: it fires only when more than
+4,096 contracts leave the depth pools inside ten minutes, which is a steering
+storm the swap-cap counters already report, and it is fail-closed in the safe
+direction (a forgotten drop can never read as a ghost, so it never causes a
+redial). The three-condition filter on `swap_emptied_socket` does not see it,
+and must not.
