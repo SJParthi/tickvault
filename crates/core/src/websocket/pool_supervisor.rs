@@ -6120,6 +6120,53 @@ mod tests {
         );
     }
 
+    /// The taken-count is a plain read: zero before any arm, exactly the number
+    /// of successful arms after, and zero (never a panic) for an index outside
+    /// the register.
+    #[test]
+    fn ghost_redials_taken_counts_successful_arms_and_reads_zero_out_of_range() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        assert_eq!(ghost_redials_taken(7), 0, "nothing armed yet");
+        assert!(request_ghost_redial(7, 9_000_000).is_ok());
+        assert_eq!(ghost_redials_taken(7), 1, "one successful arm");
+        assert_eq!(
+            request_ghost_redial(7, 9_000_000 + 1),
+            Err(GhostRedialRefusal::CoolingDown),
+            "a refused arm must not count"
+        );
+        assert_eq!(ghost_redials_taken(7), 1);
+        assert_eq!(
+            ghost_redials_taken(u8::MAX),
+            0,
+            "out of range reads zero, never panics"
+        );
+    }
+
+    /// The once-per-socket report latch returns true on the FIRST call for a
+    /// socket and false on every call after, which is what makes the caller's
+    /// report once-per-session; an out-of-range index is refused (false) so the
+    /// caller never logs for a socket the register does not cover.
+    #[test]
+    fn ghost_ceiling_first_hit_is_true_once_per_socket_and_false_out_of_range() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        assert!(ghost_ceiling_first_hit(9), "first consult reports");
+        assert!(!ghost_ceiling_first_hit(9), "second consult is silent");
+        assert!(
+            ghost_ceiling_first_hit(10),
+            "a sibling socket has its own latch"
+        );
+        assert!(
+            !ghost_ceiling_first_hit(u8::MAX),
+            "out of range is refused rather than reported"
+        );
+    }
+
     #[test]
     fn the_ghost_register_covers_every_authorized_connection_index() {
         // 5 main + 5 depth-20 + 5 depth-200 + 1 order-update = 16 sockets,

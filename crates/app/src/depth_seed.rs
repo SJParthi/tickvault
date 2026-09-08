@@ -885,6 +885,20 @@ mod tests {
         assert!(only_200.any_applied());
     }
 
+    /// The file-level outcome recorder takes only the three named labels and
+    /// never panics without a recorder installed (the boot path calls it
+    /// before metrics may be wired, and a seed problem must not take the boot
+    /// down with it).
+    #[test]
+    fn record_seed_file_outcome_accepts_every_named_label_without_a_recorder() {
+        for outcome in SEED_FILE_OUTCOMES {
+            record_seed_file_outcome(outcome);
+        }
+        // Twice: the second increment on an existing series is the steady-state
+        // shape, and it must be as safe as the first.
+        record_seed_file_outcome("unreadable");
+    }
+
     #[test]
     fn boot_seeded_reads_each_pools_own_flag() {
         let _serialised = BOOT_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
