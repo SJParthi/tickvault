@@ -120,9 +120,110 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     info!("candle DDL boot complete — retired-object sweep + candle ensure + named views done");
 }
 
+/// Attempts at the `ticks` + `market_depth` DDL before the boot gives up.
+///
+/// Six attempts five seconds apart is thirty seconds — the same order as the
+/// candle probe's bound, and deliberately NOT unbounded: a QuestDB that will
+/// not accept a `CREATE TABLE` in half a minute is the boot-probe escalation
+/// codes' problem, and holding the lane behind it would turn a schema gap into
+/// a dark session.
+pub const LIVE_TABLE_DDL_ATTEMPTS: u32 = 6;
+/// Seconds between `ticks` / `market_depth` DDL attempts.
+pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
+
+/// Ensure the two LIVE-writer tables — `ticks` and `market_depth` — with
+/// their DEDUP keys, retrying a refusal instead of running the session on
+/// whatever ILP auto-creates.
+///
+/// # Why a retry, when the candle DDL above gets one probe and one shot
+///
+/// Before 2026-09-08 `main.rs` awaited each ensure ONCE and discarded the
+/// verdict. The readiness probe in [`run_candle_ddl_at_boot`] answers
+/// `SELECT 1`, which a QuestDB still replaying its own WAL, or holding a
+/// table in a suspended state, answers happily — and then refuses the DDL.
+/// Every refusal was logged and counted, and the boot continued: the first
+/// ILP row auto-created `ticks` without `capture_seq` and `feed` in its key
+/// (a replay then DUPLICATES instead of collapsing) and `market_depth` without
+/// `depth_kind` (the two depth pools then OVERWRITE each other's levels).
+/// Both are silent — rows land, counts look right — and both last the
+/// session, because nothing re-ran the DDL.
+///
+/// The ensure fns now return whether every statement was accepted, and this
+/// loop re-runs BOTH until they are or the bound is spent. Re-running an
+/// already-accepted table is free: every statement is `IF NOT EXISTS` or an
+/// idempotent `DEDUP ENABLE`.
+///
+/// Returns `true` when both tables were ensured on some attempt. On
+/// exhaustion it returns `false` after a coded `error!` naming the
+/// consequence — never a panic, and never a silent continue.
+// TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
+    for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
+        let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
+        let depth_ok =
+            tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
+        if ticks_ok && depth_ok {
+            info!(
+                attempt,
+                "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
+                 (depth_kind DEDUP) ensured"
+            );
+            return true;
+        }
+        if attempt < LIVE_TABLE_DDL_ATTEMPTS {
+            warn!(
+                attempt,
+                attempts = LIVE_TABLE_DDL_ATTEMPTS,
+                ticks_ok,
+                depth_ok,
+                backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
+                "live-table DDL refused — retrying so the session does not run on an \
+                 ILP-auto-created table with the DEDUP key missing"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(LIVE_TABLE_DDL_BACKOFF_SECS)).await;
+        }
+    }
+    error!(
+        code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+        attempts = LIVE_TABLE_DDL_ATTEMPTS,
+        backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
+        "live-table DDL boot EXHAUSTED — ticks and/or market_depth could not be \
+         ensured. Consequence: the first ILP write may auto-create the table \
+         WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
+         pools overwrite each other's levels — until a later boot's ensure succeeds. \
+         Check QuestDB's WAL state (`wal_tables()`) before the next session."
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retry bound stays inside the same half-minute class as the
+    /// candle probe: attempts × backoff must never grow into a boot stall.
+    #[test]
+    fn live_table_ddl_retry_bound_is_thirty_seconds() {
+        assert_eq!(
+            u64::from(LIVE_TABLE_DDL_ATTEMPTS) * LIVE_TABLE_DDL_BACKOFF_SECS,
+            30
+        );
+        assert!(LIVE_TABLE_DDL_ATTEMPTS >= 2, "one attempt is not a retry");
+    }
+
+    /// Against a port nothing listens on, every attempt fails, the loop
+    /// spends its bound, and the verdict is `false` — never a hang and
+    /// never a panic. Paused tokio time makes the five-second backoffs free.
+    #[tokio::test(start_paused = true)]
+    async fn run_live_table_ddl_at_boot_gives_up_after_the_bound_and_reports_false() {
+        let questdb = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert!(!run_live_table_ddl_at_boot(&questdb).await);
+    }
 
     /// The inline await in `build_shared_infra` is bounded by the quiet
     /// probe: attempts × backoff must stay ≤ 60s so a down QuestDB can

@@ -177,28 +177,32 @@ fn rule_file_pins_csv_body_cap() {
 
 #[test]
 fn min_universe_size_less_than_max() {
-    assert!(
-        MIN_DAILY_UNIVERSE_SIZE < MAX_DAILY_UNIVERSE_SIZE,
-        "MIN must be less than MAX — degenerate envelope otherwise"
-    );
+    const {
+        assert!(
+            MIN_DAILY_UNIVERSE_SIZE < MAX_DAILY_UNIVERSE_SIZE,
+            "MIN must be less than MAX — degenerate envelope otherwise"
+        );
+    }
 }
 
 #[test]
 fn all_boot_timeouts_are_positive() {
     // Defensive — a zero timeout would mean "no time allowed" which
     // would fail every boot trivially.
-    assert!(BOOT_STEP_AUTH_TIMEOUT_SECS > 0);
-    assert!(BOOT_STEP_IP_WHITELIST_TIMEOUT_SECS > 0);
-    assert!(BOOT_STEP_QUESTDB_DDL_TIMEOUT_SECS > 0);
-    assert!(INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS > 0);
+    const { assert!(BOOT_STEP_AUTH_TIMEOUT_SECS > 0) };
+    const { assert!(BOOT_STEP_IP_WHITELIST_TIMEOUT_SECS > 0) };
+    const { assert!(BOOT_STEP_QUESTDB_DDL_TIMEOUT_SECS > 0) };
+    const { assert!(INSTRUMENT_FETCH_PER_ATTEMPT_TIMEOUT_SECS > 0) };
 }
 
 #[test]
 fn auth_timeout_at_least_3x_individual_retry_budget() {
     // Per §19 docstring: "3 × 20s retries" → total ≥ 60s. Defensive
     // ratchet against shrinking the budget without rule-file edit.
-    assert!(
-        BOOT_STEP_AUTH_TIMEOUT_SECS >= 3 * 20,
-        "auth timeout must accommodate 3 × 20s internal retries per §19"
-    );
+    const {
+        assert!(
+            BOOT_STEP_AUTH_TIMEOUT_SECS >= 3 * 20,
+            "auth timeout must accommodate 3 × 20s internal retries per §19"
+        );
+    }
 }

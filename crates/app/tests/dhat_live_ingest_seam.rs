@@ -165,6 +165,22 @@ static DHAT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn ingest_tick_seam_does_not_allocate_per_tick() {
     let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    // The four instruments are STOCK-OPTION contracts to the ranking layer, so
+    // the per-tick `observe` (the 2026-09-06 volume board) runs INSIDE the
+    // measured window instead of short-circuiting on "not a contract". Until
+    // 2026-09-08 this gate measured a seam that skipped the board entirely —
+    // vacuous for the one per-tick structure added since it was written.
+    tickvault_app::contract_underlying_map::global_contract_underlying_map().publish_from_legs(
+        &(0..4i64)
+            .map(|i| tickvault_app::contract_underlying_map::LegIds {
+                contract_security_id: 13 + i,
+                underlying_security_id: 1_000 + i,
+                contract_segment: tickvault_common::types::ExchangeSegment::IdxI,
+                family: tickvault_app::volume_leaderboard::OptionFamily::Stock,
+                lot_size: 75,
+            })
+            .collect::<Vec<_>>(),
+    );
 
     // WARM-UP, OUTSIDE the measured window. First touch of an instrument
     // allocates its aggregator slot and registers its metric keys — a real
@@ -172,7 +188,9 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
     // would make this gate fail for the wrong reason and teach the next reader
     // to raise the budget instead of finding the leak.
     for i in 0..4u64 {
-        let _ = ingest.ingest_tick_at(&tick(13 + i, 100.0, SESSION_EPOCH_SECS), i, 0, 1_000);
+        let mut t = tick(13 + i, 100.0, SESSION_EPOCH_SECS);
+        t.volume = 1;
+        let _ = ingest.ingest_tick_at(&t, i, 0, 1_000);
     }
 
     let profiler = dhat::Profiler::builder().testing().build();
@@ -180,7 +198,7 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
     for n in 0..FOLDS {
         // Vary price and timestamp so the fold does real work — a constant
         // tick could be short-circuited and would prove nothing.
-        let t = tick(
+        let mut t = tick(
             13 + (n % 4),
             100.0 + (n % 97) as f32 * 0.05,
             // See SESSION_EPOCH_SECS. This gate shipped with `1_000` — January
@@ -191,6 +209,11 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
             // either way. Found 2026-08-15 while diagnosing the frame gate.
             SESSION_EPOCH_SECS + (n % 600) as u32,
         );
+        // Cumulative volume, rising every tick, so the 2026-09-06 volume board
+        // (`observe`, per accepted tick) does real work inside the window. A
+        // zero is ignored before the board is touched, which is what made this
+        // gate vacuous for that seam until 2026-09-08.
+        t.volume = 2 + n as u32;
         let _ = ingest.ingest_tick_at(&t, n, (n % 3) as u32, 1_000 + n);
     }
 

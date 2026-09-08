@@ -2968,6 +2968,51 @@ Not done tonight deliberately: it is a third change to a watchdog repaired
 hours earlier, under time pressure, on an alarm that cannot fire for at least
 24 hours. Recording it so the next session decides rather than rediscovers.
 
+#### 2026-09-08 — the mirror now carries the newest DEPLOY-RELEVANT sha, closing the docs-only false mismatch
+
+**No new authorization is claimed.** This is the fix the 2026-09-02 evening
+note above named and deliberately did not take ("NOT taken here… Recording it
+so the next session decides rather than rediscovers"). Nothing is added to
+CloudWatch, nothing is spent.
+
+**The defect, restated in one line:** `deploy-aws.yml` is path-filtered, so a
+docs-only merge advances main HEAD without a deploy; a mirror of bare HEAD
+therefore made `tv-<env>-binary-sha-stale` report a mismatch that reflected no
+operational difference — a page after any Friday docs merge left over a
+weekend.
+
+**The fix (`postmerge-catchup.yml`, probe step):** the mirror value is now the
+NEWEST commit on main that touched one of `deploy-aws.yml`'s own
+`on.push.paths` — `crates/**`, `Cargo.toml`, `Cargo.lock`,
+`deploy/systemd/**`, `deploy/docker/**`, `config/**`,
+`deploy/aws/cloudwatch-agent.json`, `deploy/aws/prometheus.yaml`,
+`.github/workflows/deploy-aws.yml` — resolved with one
+`repos/:repo/commits?sha=main&path=<p>&per_page=1` call per path and the
+newest committer date winning. That is exactly the shape the same workflow
+already uses to decide whether `terraform-apply.yml` needs a dispatch
+(`tf_touched`), so the precedent is in the same file. `desired-git-sha` now
+means *"the sha the box SHOULD be running"*, which is the question the
+watchdog asks.
+
+**What survives, deliberately:** a FAILED code deploy still leaves
+`binary-git-sha` behind the mirror and still pages — the mirror advances on
+every code merge whether or not the deploy that followed it succeeded, which
+is the whole value of the signal. Only the docs-only case stops manufacturing
+a mismatch.
+
+**Fail direction:** any API failure in the path walk falls back to bare HEAD
+with a `::warning::`, i.e. to the pre-2026-09-08 behaviour — a possibly-false
+mismatch, never a missed real one. The path list is a hand-kept copy of
+`deploy-aws.yml`'s trigger; a path added there and not here means a change
+of that class deploys without moving the mirror, so the watchdog would read
+the box as UP TO DATE while it is one commit behind for that class only. That
+is the honest limit, and it is stated at the site.
+
+**What a PR that violates this note looks like (REJECT):** moves the mirror
+write into `deploy-aws.yml` (permanently green — the trap the 2026-09-02
+addendum records); drops the HEAD fallback so an API blip mirrors nothing;
+or adds a trigger path to `deploy-aws.yml` without adding it to the walk.
+
 ## ⚠ MEASURED 2026-09-05 — the September forecast is $130.39 against an automatic shutdown at $135.00. Every cost note above is stale AGAIN, and this time in the dangerous direction.
 
 **This section authorizes NOTHING.** It records a live reading and withdraws a
