@@ -467,6 +467,11 @@ pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms
 /// suffered: some caller built a set with a repeat in it. The instrument is
 /// named in the log line beside this.
 pub const SUBSCRIBE_DUPLICATE_METRIC: &str = "tv_dhan_ws_subscribe_duplicate_total";
+/// Counter: a swap whose unsubscribe the wire REFUSED (`Ok(Err)`), so the guard
+/// was put back to the instrument the socket still delivers
+/// ([`SubscribeGuard::undo_swap`]). In-process only — not EMF-selected; the
+/// coded `warn!` beside the increment is the operator surface.
+pub const SWAP_GUARD_REVERTED_METRIC: &str = "tv_dhan_ws_swap_guard_reverted_total";
 
 // ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
@@ -1951,6 +1956,35 @@ impl SubscribeGuard {
             unsubscribe: Some(old),
             subscribe: Some(new),
         })
+    }
+
+    /// Puts `old` back where `new` sits — the inverse of a [`Self::try_swap`]
+    /// whose UNSUBSCRIBE the wire REFUSED outright (`Ok(Err)`).
+    ///
+    /// `try_swap` records the new instrument BEFORE the wire moves, so that a
+    /// redial replays the chosen strike. That is right for a timeout, where the
+    /// frame may have landed. It is wrong for a refused write: nothing landed,
+    /// the socket still delivers `old`, and a guard naming `new` would plan the
+    /// next minute's swap from an intent that never went out and replay the
+    /// wrong set on the next redial. Returns `false` — and changes nothing —
+    /// when `new` is not held or `old` is already held elsewhere, so a stale
+    /// undo can never introduce the duplicate the 804 guard exists to prevent.
+    // O(1) EXEMPT: the same two scans as `try_swap` — n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+    pub fn undo_swap(&mut self, new: SubscribeInstrument, old: SubscribeInstrument) -> bool {
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+        if new == old || self.instruments.contains(&old) {
+            return false;
+        }
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, once per minute.
+        match self.instruments.iter().position(|held| *held == new) {
+            Some(at) => {
+                if let Some(slot) = self.instruments.get_mut(at) {
+                    *slot = old;
+                }
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -3900,7 +3934,33 @@ where
                                 .await
                                 {
                                     Ok(Ok(())) => unsubscribe_succeeded = true,
-                                    Ok(Err(_)) => wire_failed = true,
+                                    Ok(Err(_)) => {
+                                        wire_failed = true;
+                                        // The wire REFUSED the unsubscribe: nothing
+                                        // landed, the socket still delivers OLD, and
+                                        // `try_swap` recorded NEW before the wire
+                                        // moved. Put the guard back so the next
+                                        // minute is planned from what the socket
+                                        // holds and a redial replays the same. A
+                                        // TIMEOUT is deliberately NOT reverted —
+                                        // the frame may have landed, and a guard
+                                        // naming NEW is what makes that redial land
+                                        // the chosen strike.
+                                        if guard.undo_swap(new, old) {
+                                            metrics::counter!(SWAP_GUARD_REVERTED_METRIC)
+                                                .increment(1);
+                                            warn!(
+                                                code =
+                                                    ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                                endpoint = supervisor.slot().endpoint.as_str(),
+                                                pool_index = supervisor.slot().pool_index,
+                                                security_id = old.security_id,
+                                                "swap: the wire refused the unsubscribe — \
+                                                 guard reverted to the instrument this socket \
+                                                 still delivers; the swap is retried next minute"
+                                            );
+                                        }
+                                    }
                                     Err(_elapsed) => {
                                         wire_failed = true;
                                         wire_timed_out = true;
@@ -4446,6 +4506,38 @@ mod tests {
         assert_eq!(swap.unsubscribe, Some(si(1)));
         assert_eq!(swap.subscribe, Some(si(2)));
         assert!(!swap.is_no_op());
+    }
+
+    #[test]
+    fn undo_swap_puts_the_old_instrument_back_in_the_same_slot() {
+        // The wire REFUSED the unsubscribe: nothing landed, the socket still
+        // delivers 2, and the guard — which recorded 9 before the wire moved —
+        // must be put back so the next minute plans from what the socket holds.
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![si(1), si(2), si(3)])
+            .expect("three instruments");
+        let _ = g.try_swap(si(2), si(9)).expect("holds the old one");
+        assert!(
+            g.undo_swap(si(9), si(2)),
+            "the swap's NEW instrument is held and reverts"
+        );
+        assert_eq!(
+            g.instruments.as_slice(),
+            &[si(1), si(2), si(3)],
+            "same slot, same order"
+        );
+        assert!(
+            !g.undo_swap(si(9), si(2)),
+            "a second undo finds nothing to revert"
+        );
+        assert!(
+            !g.undo_swap(si(3), si(1)),
+            "never reverts onto an instrument already held — that is the 804 duplicate"
+        );
+        assert!(
+            !g.undo_swap(si(3), si(3)),
+            "a no-op swap has nothing to undo"
+        );
+        assert_eq!(g.instruments.as_slice(), &[si(1), si(2), si(3)]);
     }
 
     // -- the 804 guard: no connection may carry one instrument twice --------

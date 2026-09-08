@@ -222,6 +222,18 @@ pub struct DhanRestStackParams {
     >,
     /// Order-leg P&L sink threaded from main.rs boot (None = feature OFF).
     pub leg_pnl_tx: Option<tokio::sync::mpsc::Sender<crate::order_runtime::LegPnlEvent>>,
+    /// The dual-instance lock verdict, SHARED with the live tick lane.
+    ///
+    /// Created by the boot and handed to BOTH stacks. This stack stores
+    /// `true` on `AcquireOutcome::Acquired` and the heartbeat clears it if the
+    /// lock is ever lost; the tick lane REFUSES to dial while it reads `false`
+    /// (`dhan_feed_stack::run_dhan_feed_stack`). Until 2026-09-08 the flag was
+    /// created INSIDE this task and reached the lane only implicitly — the
+    /// lane waited for the token manager, which this stack registers after
+    /// acquiring the lock — so a lost lock left the lane dialing on a second
+    /// box's token with nothing checking. Sharing the flag makes the ordering
+    /// a check rather than a coincidence.
+    pub instance_lock_held: Arc<AtomicBool>,
 }
 
 /// Capacity of the order-update ws-audit tee channel (2026-08-10). Sized to
@@ -350,7 +362,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // that cannot acquire the lock simply stays down (loud, coalesced) while
     // Groww + shared infra keep running.
     // -----------------------------------------------------------------------
-    let instance_lock_held = Arc::new(AtomicBool::new(false));
+    // Shared with the live tick lane (see `DhanRestStackParams::instance_lock_held`).
+    let instance_lock_held = Arc::clone(&params.instance_lock_held);
     let ssm_client = Arc::new(secret_manager::create_ssm_client_public().await);
 
     let env = {

@@ -215,6 +215,18 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/budget-guard/ping-state"
       },
       {
+        # 2026-09-08 (the two hourly guards over the same box disagreed): the
+        # out-of-window force-stop now honours the SAME keep-alive marker the
+        # start-watchdog curfew reads (/tickvault/<env>/keep-alive-until) —
+        # an operator's evening `keep-alive` was left alone by one Lambda and
+        # stopped by the other within the hour. READ-ONLY: this guard never
+        # writes the marker; the console owns it. Scoped to the single ARN.
+        Sid      = "ReadKeepAliveOverride"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
@@ -263,6 +275,10 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"
+      # 2026-09-08: the keep-alive override the curfew already honours (same
+      # parameter as start-watchdog-lambda.tf KEEP_ALIVE_PARAM — one marker,
+      # two readers, so the guards cannot disagree).
+      KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
     }
   }
 }

@@ -1357,13 +1357,62 @@ const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 /// answer in two seconds is the exact database that RAM exists to outrun.
 pub const SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS: u64 = 2;
 
-/// Counter of backstop reads by `outcome` — `answered` or `timed_out`.
+/// Counter of backstop reads by `outcome` — `answered` or `timed_out` are
+/// counted once per READ; `stale_row` and `unstamped_row` are counted once
+/// per ROW the read returned and the age gate refused.
 ///
 /// A timed-out backstop is NOT a failure of the selection (RAM still centres
 /// every ladder it has a price for); it is the number that says how often the
 /// database was too slow to be consulted, which is the trend the WAL apply-lag
-/// alarm reports from the other side.
+/// alarm reports from the other side. A refused row is likewise not a failure:
+/// it is a price the database holds that is too old to centre a ladder on, and
+/// the count is what separates "the backstop had nothing" from "the backstop
+/// had only stale prices" — two different reasons for the same empty map.
 pub const SPOT_BACKSTOP_COUNTER: &str = "tv_spot_backstop_total";
+
+/// Oldest a backstop row may be, in seconds, and still centre a ladder.
+///
+/// The query already bounds rows to TODAY, which is what stopped yesterday's
+/// close from pricing at-the-money. It did not stop this morning's price from
+/// doing the same thing at two in the afternoon: `LATEST ON` returns a stock's
+/// last print whenever it happened, so an illiquid stock that traded once at
+/// 09:20 and never since was handed to the selector at 14:00 as if it were
+/// current, and its window was centred four and a half hours stale with no
+/// log saying so. RAM cannot catch it either — RAM only ever holds what THIS
+/// process decoded, and the whole point of the backstop is the stock RAM never
+/// saw.
+///
+/// Fifteen minutes is the widest gap the selector's own consumers tolerate: the
+/// per-minute re-fit measured a median strike spacing of 2.63% of price and an
+/// average intraday drift of 0.8 strikes per DAY (2026-08-27), so a price up to
+/// fifteen minutes old is, in almost every case, still inside the same strike.
+/// Anything older is refused and COUNTED, so the ladder that loses its price
+/// shows up as `underlyings_without_spot` plus a `stale_row` count rather than
+/// as a window quietly centred on the morning.
+///
+/// Strictly longer than the read budget and strictly shorter than a session,
+/// both pinned: a floor under the budget would refuse rows the read itself was
+/// still fetching, and one over a session would never refuse anything.
+pub const SPOT_BACKSTOP_MAX_AGE_SECS: u64 = 900;
+
+/// Rows the backstop read returned, split into the prices the age gate let
+/// through and the counts of what it refused.
+///
+/// Both refusal counts are carried rather than folded into the map's length
+/// because the caller logs them: an empty map with `stale_refused = 300` is a
+/// database that fell behind the session, and an empty map with both counts at
+/// zero is a database that has no rows for today at all. Those need different
+/// operator actions and are indistinguishable from the map alone.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SpotPriceRows {
+    /// `(security_id, segment) -> paise` for every row inside the age floor.
+    pub prices: HashMap<(u64, u8), i64>,
+    /// Rows whose `ts` fell before the freshness floor.
+    pub stale_refused: usize,
+    /// Rows with no parseable `ts` — fail-closed, because a price whose age is
+    /// unknown cannot be shown to be fresh.
+    pub unstamped_refused: usize,
+}
 
 /// The budget the backstop gets, from how much RAM already knows.
 ///
@@ -1425,8 +1474,11 @@ pub async fn fetch_spot_prices_backstop(
 #[must_use]
 pub fn build_spot_price_query(today_ist_nanos: i64) -> String {
     let today_micros = today_ist_nanos / 1_000;
+    // `ts` rides along so the reader can AGE each row: the day bound keeps
+    // yesterday out, the age gate in `parse_spot_prices_since` keeps this
+    // morning out of this afternoon. See `SPOT_BACKSTOP_MAX_AGE_SECS`.
     format!(
-        "SELECT security_id, segment, ltp FROM ticks \
+        "SELECT security_id, segment, ltp, ts FROM ticks \
          WHERE feed = 'dhan' AND ts >= {today_micros} AND ltp > 0 \
          LATEST ON ts PARTITION BY security_id, segment;"
     )
@@ -1470,19 +1522,52 @@ pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String
 }
 
 /// Converts a QuestDB `/exec` dataset of `[security_id, segment, ltp]` into a
-/// price map keyed on the I-P1-11 composite, in paise.
+/// price map keyed on the I-P1-11 composite, in paise — with NO age gate.
+///
+/// Every row inside the day bound is accepted whatever its `ts`. Production
+/// reads go through [`parse_spot_prices_since`]; this form exists for callers
+/// that have already established the rows are current, and it is what the
+/// wire-format tests pin, since the age gate is a separate concern from the
+/// column shapes.
 ///
 /// # Errors
 ///
 /// Malformed JSON or a missing `dataset` array.
 pub fn parse_spot_prices(body: &str) -> Result<HashMap<(u64, u8), i64>, String> {
+    parse_spot_rows(body, None).map(|rows| rows.prices)
+}
+
+/// [`parse_spot_prices`] with the age gate: a row whose `ts` (column 3, the
+/// IST-as-epoch designated timestamp the `ticks` table stores) is BEFORE
+/// `freshness_floor_ist_nanos` is refused and counted as stale; a row with no
+/// parseable `ts` is refused and counted as unstamped. Fail-closed on both,
+/// because a price that cannot be shown to be fresh must not centre a ladder.
+///
+/// The floor is a parameter rather than a clock read so the gate is pure and
+/// its two refusal arms are testable at exact boundaries.
+///
+/// # Errors
+///
+/// Malformed JSON or a missing `dataset` array.
+pub fn parse_spot_prices_since(
+    body: &str,
+    freshness_floor_ist_nanos: i64,
+) -> Result<SpotPriceRows, String> {
+    parse_spot_rows(body, Some(freshness_floor_ist_nanos))
+}
+
+/// The one parser behind both public forms. `floor = None` means no gate.
+fn parse_spot_rows(body: &str, floor: Option<i64>) -> Result<SpotPriceRows, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Err("spot price response is not valid JSON".to_owned());
     };
     let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
         return Err("spot price response has no `dataset` array".to_owned());
     };
-    let mut out = HashMap::with_capacity(rows.len());
+    let mut out = SpotPriceRows {
+        prices: HashMap::with_capacity(rows.len()),
+        ..SpotPriceRows::default()
+    };
     for row in rows {
         let Some(cols) = row.as_array() else { continue };
         if cols.len() < 3 {
@@ -1529,10 +1614,57 @@ pub fn parse_spot_prices(body: &str) -> Result<HashMap<(u64, u8), i64>, String> 
         let Some(paise) = crate::spot_price_store::rupees_to_paise(ltp) else {
             continue;
         };
-        out.insert((id, seg), paise);
+        if let Some(floor) = floor {
+            // QuestDB renders the designated timestamp as an RFC 3339 string
+            // with a `Z` suffix. The column holds IST-as-epoch (the house
+            // convention every `ist_midnight_nanos` caller relies on), so the
+            // `Z` is a rendering artefact and the parsed instant IS the
+            // IST-epoch value — no offset is added, exactly as the day bound
+            // in `build_spot_price_query` adds none.
+            let stamped = cols
+                .get(3)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+                .and_then(|dt| dt.timestamp_nanos_opt());
+            match stamped {
+                None => {
+                    out.unstamped_refused = out.unstamped_refused.saturating_add(1);
+                    continue;
+                }
+                Some(ts) if ts < floor => {
+                    out.stale_refused = out.stale_refused.saturating_add(1);
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
+        out.prices.insert((id, seg), paise);
     }
     Ok(out)
 }
+
+/// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
+/// same convention the `ticks` designated timestamp is written in.
+fn ist_now_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// The oldest `ts` the backstop accepts on this read: now minus
+/// [`SPOT_BACKSTOP_MAX_AGE_SECS`], never earlier than the day bound.
+#[must_use]
+pub fn spot_backstop_freshness_floor(now_ist_nanos: i64, today_ist_nanos: i64) -> i64 {
+    let age = i64::try_from(SPOT_BACKSTOP_MAX_AGE_SECS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(NANOS_PER_SEC);
+    now_ist_nanos.saturating_sub(age).max(today_ist_nanos)
+}
+
+/// Nanoseconds in one second — the unit the `ticks` designated timestamp and
+/// every IST-epoch helper in this module share.
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Joins the symbol map and the price map into the `symbol -> paise` form
 /// selection consumes.
@@ -1741,8 +1873,27 @@ pub async fn fetch_spot_prices(
             return HashMap::new();
         }
     };
-    match parse_spot_prices(&body) {
-        Ok(p) => p,
+    let floor = spot_backstop_freshness_floor(ist_now_nanos(), today_ist_nanos);
+    match parse_spot_prices_since(&body, floor) {
+        Ok(rows) => {
+            if rows.stale_refused > 0 || rows.unstamped_refused > 0 {
+                metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "stale_row")
+                    .increment(rows.stale_refused as u64);
+                metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "unstamped_row")
+                    .increment(rows.unstamped_refused as u64);
+                tracing::warn!(
+                    accepted = rows.prices.len(),
+                    stale_refused = rows.stale_refused,
+                    unstamped_refused = rows.unstamped_refused,
+                    max_age_secs = SPOT_BACKSTOP_MAX_AGE_SECS,
+                    "spot prices: the database backstop returned rows older than the \
+                     age floor — refused rather than centred on; a ladder that only \
+                     the backstop could price now reads as without_spot instead of \
+                     being centred on this morning"
+                );
+            }
+            rows.prices
+        }
         Err(err) => {
             tracing::error!(err, "contract universe: spot price response unparseable");
             HashMap::new()
@@ -3551,6 +3702,97 @@ mod spot_backstop_tests {
             SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS >= 1,
             "a zero budget never asks at all"
         );
+    }
+
+    /// The query must carry `ts` as the FOURTH column, or the age gate has
+    /// nothing to age and refuses every row as unstamped — an empty map that
+    /// looks exactly like "no rows today".
+    #[test]
+    fn build_spot_price_query_carries_ts_as_the_fourth_column() {
+        let sql = build_spot_price_query(1_700_000_000_000_000_000);
+        assert!(
+            sql.starts_with("SELECT security_id, segment, ltp, ts FROM ticks"),
+            "column order is the wire contract parse_spot_prices_since reads: {sql}"
+        );
+    }
+
+    /// The age floor is strictly inside the session and strictly longer than
+    /// the read budget. Under the budget it would refuse rows the read was
+    /// still fetching; over a session it would never refuse anything and the
+    /// 09:20-print-at-14:00 shape would be back with the constant in place.
+    #[test]
+    fn spot_backstop_max_age_secs_sits_between_the_read_budget_and_a_session() {
+        assert!(SPOT_BACKSTOP_MAX_AGE_SECS > QUESTDB_EXEC_TIMEOUT_SECS);
+        const SESSION_SECS: u64 = 6 * 3600 + 15 * 60;
+        assert!(SPOT_BACKSTOP_MAX_AGE_SECS < SESSION_SECS);
+    }
+
+    /// The floor is `now - max_age`, never earlier than the day bound: before
+    /// 09:15 the day bound is the tighter of the two and must win, or the
+    /// floor would reach into yesterday and re-admit what the query already
+    /// keeps out.
+    #[test]
+    fn spot_backstop_freshness_floor_is_now_minus_max_age_clamped_to_today() {
+        let today = 1_700_000_000_000_000_000;
+        let age = i64::try_from(SPOT_BACKSTOP_MAX_AGE_SECS).expect("fits") * NANOS_PER_SEC;
+        let midday = today + 5 * 3600 * NANOS_PER_SEC;
+        assert_eq!(spot_backstop_freshness_floor(midday, today), midday - age);
+        let just_after_midnight = today + 60 * NANOS_PER_SEC;
+        assert_eq!(
+            spot_backstop_freshness_floor(just_after_midnight, today),
+            today,
+            "the day bound wins when now - age would fall before it"
+        );
+    }
+
+    /// The gate at exact boundaries: a row AT the floor is fresh, one
+    /// nanosecond before it is stale, and a row with no `ts` is refused as
+    /// unstamped rather than admitted as fresh. The fixture is the real wire
+    /// shape — `ts` rendered RFC 3339 with a `Z`, holding IST-as-epoch.
+    #[test]
+    fn parse_spot_prices_since_refuses_stale_and_unstamped_rows_and_keeps_the_rest() {
+        // 2026-09-08T14:00:00Z as IST-as-epoch nanos.
+        let floor = chrono::DateTime::parse_from_rfc3339("2026-09-08T14:00:00.000000Z")
+            .expect("fixture")
+            .timestamp_nanos_opt()
+            .expect("fits");
+        let body = r#"{"dataset":[
+            [1,"NSE_EQ",100.0,"2026-09-08T14:00:00.000000Z"],
+            [2,"NSE_EQ",200.0,"2026-09-08T13:59:59.999999Z"],
+            [3,"NSE_EQ",300.0,"2026-09-08T14:30:12.345678Z"],
+            [4,"NSE_EQ",400.0],
+            [5,"NSE_EQ",500.0,"not a timestamp"],
+            [6,"NSE_EQ",600.0,null]
+        ]}"#;
+        let rows = parse_spot_prices_since(body, floor).expect("parses");
+        assert_eq!(
+            rows.prices.get(&(1, 1)),
+            Some(&10_000),
+            "at the floor is fresh"
+        );
+        assert!(
+            rows.prices.get(&(2, 1)).is_none(),
+            "one microsecond before is stale"
+        );
+        assert_eq!(rows.prices.get(&(3, 1)), Some(&30_000));
+        assert_eq!(rows.prices.len(), 2);
+        assert_eq!(rows.stale_refused, 1);
+        assert_eq!(
+            rows.unstamped_refused, 3,
+            "missing, unparseable and null ts are all refused, never admitted"
+        );
+    }
+
+    /// The ungated form is unchanged by the gate: it neither reads nor
+    /// requires the fourth column, so the wire-format pins above stay honest.
+    #[test]
+    fn parse_spot_prices_ignores_the_ts_column_and_never_refuses_on_age() {
+        let body = r#"{"dataset":[
+            [1,"NSE_EQ",100.0,"1999-01-01T00:00:00.000000Z"],
+            [2,"NSE_EQ",200.0]
+        ]}"#;
+        let p = parse_spot_prices(body).expect("parses");
+        assert_eq!(p.len(), 2);
     }
 
     /// A backstop that cannot answer inside its budget yields an EMPTY map

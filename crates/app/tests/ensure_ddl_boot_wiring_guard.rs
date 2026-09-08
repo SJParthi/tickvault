@@ -114,11 +114,19 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
             "src/option_chain_1m_boot.rs",
         ),
         ("ensure_option_chain_1m_table", "src/cadence_boot.rs"),
+        // ticks — the live lane's own table. Its 5-key DEDUP
+        // (ts, security_id, segment, capture_seq, feed) is what makes a WAL
+        // replay idempotent; an ILP-auto-created table has none of it.
+        // Ensured through the bounded retry loop since 2026-09-08 — a single
+        // fire-and-forget attempt left the key missing for a whole session.
+        ("ensure_ticks_table", "src/candle_ddl_boot.rs"),
         // market_depth — the depth-20 + depth-200 common table (2026-08-15).
         // Its DEDUP key carries a `depth_kind` discriminator no other table
         // needs; an ILP-auto-created table arrives without it and the two
-        // depth pools begin silently overwriting each other's levels.
-        ("ensure_market_depth_table", "src/main.rs"),
+        // depth pools begin silently overwriting each other's levels. Same
+        // retry loop as `ticks`, so neither is retried without the other.
+        ("ensure_market_depth_table", "src/candle_ddl_boot.rs"),
+        ("run_live_table_ddl_at_boot", "src/main.rs"),
         // rest_fetch_audit — every REST leg's forensics
         ("ensure_rest_fetch_audit_table", "src/spot_1m_rest_boot.rs"),
         // tf_consistency_audit — 15:40 IST verifier

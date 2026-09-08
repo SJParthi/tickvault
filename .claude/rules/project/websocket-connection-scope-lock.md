@@ -2485,14 +2485,14 @@ fallback to the banned engine.
 
 #### ⚠ What is NOT delivered (Rule 11)
 
-1. **depth-20 still runs the 2026-08-26 layout** (NIFTY/BANKNIFTY ±12 on two
-   sockets, movers on three) — index options, which Quote B bans. Its steering
-   works on 50-instrument sockets matched by set-overlap
-   (`depth20_track::plan_depth20_minute`), a different swap shape from the
-   one-contract depth-200 socket, and the ranking layer publishes only the
-   depth-200 top five today. Wiring it needs a 250-row publish plus a set-diff
-   planner with its own cap. **BLOCKED on that work, recorded, not silently
-   deferred.**
+1. ~~**depth-20 still runs the 2026-08-26 layout**~~ **DELIVERED later the same
+   day — see "2026-09-08 (SECOND)" below.** The ranking layer publishes the
+   gainer-eligible top set (up to 300 rows) for depth-20 and
+   `depth20_ranked_steer::plan_depth20_ranked_minute` steers the five
+   50-instrument sockets from it with a per-socket cap; the 2026-08-26 layout
+   survives only as the pre-first-ranking fallback. The strikethrough is kept
+   because this item was true when the section above it was written that
+   morning.
 2. **The boot dial still selects index at-the-money contracts for depth-200**
    (`select_depth_universe`). For the first minute(s) of a session, until the
    drain's first 5-second ranking exists, the five sockets carry the banned
@@ -2523,4 +2523,76 @@ fallback to the banned engine.
 - Removes the per-minute cap, or lets one socket take two swaps in a minute.
 - Falls back to the at-the-money engine after a ranking has been published.
 - Empties a socket to "match" a short ranking.
-- Claims depth-20 is on the volume ranking — it is not.
+- Claims depth-20 is on the volume ranking without the 2026-09-08 (SECOND) contract below — entry at 250, exit at 300, gainer filter before the cut, zero-lot rows excluded.
+
+### 2026-09-08 (SECOND, same day) — DEPTH-20 IS NOW RANKED TOO, and what the wiring audit found on the way
+
+**No new authorization is claimed.** This is the record of item 1 of the section
+above being delivered, plus the defects an adversarial audit of the ranking
+pipeline found while it was wired — each fixed in the same change and stated
+here because the next reader will otherwise find the fixed shape and wonder
+what the old one was.
+
+#### What is now on the wire (`crates/app/src/depth20_ranked_steer.rs`)
+
+| Property the lock makes binding | Implementation |
+|---|---|
+| Stock options only | the published list is the STOCK family's gainer-eligible top set; index options never reach it |
+| Top 250 | entries are taken from the first `DEPTH20_ENTRY_RANKS` = 250 by lots-in-window |
+| Delta-only, edge-triggered | a held contract inside the published list is never touched; only ranked-but-unheld contracts arrive, and only into slots freed by held-but-off-list departures |
+| Capped per window | at most `DEPTH_SWAP_COMMAND_CHANNEL_DEPTH` (4) swaps per socket per minute; the rest is retried next minute and counted |
+| Hysteresis | `DEPTH20_EXIT_RANKS` = 300: a held contract that slips to rank 251–300 is KEPT. The 2026-09-07 section names a hysteresis band as the remedy for a churning per-window board; this is it, at 50 ranks |
+| Composite key | held-vs-ranked comparison on `(security_id, segment)`; the first draft compared on the id alone and the test that pins it fails on that draft |
+| Gainer filter BEFORE the cut | the filter runs over the FULL volume-ordered population and stops once 300 gainers are collected. The first draft cut to 250 and THEN filtered, so a gainer ranked 251st by volume could never reach depth while a non-gainer above it consumed the slot |
+| Zero-lot rows excluded | a contract with 0 lots in the window is not on the board. Before this the board was PADDED with every seeded contract at key 0 in `security_id` order — a depth set of "whichever low ids ticked first", which is the arbitrary tie the 2026-09-06 section forbids |
+| Replay is not trading | a WAL replay re-seeds every window baseline (`rebaseline_all`) after the refold, so a 2M-frame backlog cannot read as one window's volume and hand out 250 sockets at the bell |
+| Previous close from the packet | the gainer verdict needs the stock's previous close; the code-6 packet is one door, and since today the `day_close` field of a Full/Quote packet on `NSE_EQ` is the second (first write wins). Without it every verdict was `Unknown` on any morning the code-6 packet did not arrive |
+| All-unknown latch | if every gainer verdict is `Unknown` on a non-empty board, one coded `error!` (`source = "gainer_verdicts_all_unknown"`, log-sink only) says so once per session, instead of two green depth pools holding the boot dial all day |
+| Post-close gate | after 15:40 IST the steering loop plans nothing: the frozen last ranking was being re-planned every minute until the box stopped |
+| No-ranking detection | at 09:20 IST a steering view that is still `None` logs one coded `error!` (`source = "no_ranking_by_0920"`, log-sink only) — the 2026-09-08 morning's thirty silent minutes would have been one line at 09:20 |
+| Refused unsubscribe | `SubscribeGuard::undo_swap` puts the OLD instrument back when the wire REFUSES the unsubscribe (`Ok(Err)`), so the guard never names a strike the socket does not carry; a TIMEOUT is deliberately not reverted (the frame may have landed, and the redial must replay the chosen strike) |
+
+The DHAT gate on the ingest seam now publishes a contract map before it
+measures, so the per-tick `observe` runs INSIDE the measured window; until
+today the gate measured a seam that skipped the ranking board, which is the
+vacuous-pass shape closed in #1884 arriving one structure later.
+
+#### ⚠ What is STILL not delivered (Rule 11)
+
+1. **The boot dial still puts index at-the-money contracts on the depth sockets
+   until the first ranking (~09:15–09:16).** Seeding the dial from the previous
+   session's persisted `top_volume_rank` is designed but NOT built: yesterday's
+   contract ids can be expired on an expiry rollover, so the seed must be
+   validated against today's attached contract set, and the boot-time QuestDB
+   read has the WAL-apply-lag exposure `SpotPriceStore` was built to escape.
+   Item 2 of the section above stands.
+2. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The operator's
+   Dhan pack (uploaded 2026-09-08) reads `25 = Unsubscribe — Full Market Depth`,
+   which is what ships; the 24-vs-25 split recorded in the annexure is not
+   retired by a document, only by a live probe.
+3. **Depth-200 has no hysteresis band.** Its planner is one contract per socket
+   and swaps whenever the top five distinct underlyings change; churn is
+   measured by `tv_depth200_ranked_swaps_total`, not bounded by a band.
+4. **A frame arriving for an instrument the guard does not hold is not
+   detected.** If the unsubscribe silently fails at Dhan's side, the socket
+   keeps delivering the OLD contract and nothing counts it. Detecting it needs
+   a per-socket held-set lookup on the depth decode path, and that is a hot-path
+   change with its own DHAT gate — recorded, not smuggled in.
+5. **The per-minute steering applies a ranking that is one 5-second window
+   old.** That is the cadence the operator asked for; on a thin option it means
+   a contract can leave the board because it did not trade in that one window.
+   The exit band is what keeps that from being a swap.
+6. **Churn is UNMEASURED** for depth-20 as it is for depth-200; the first live
+   session is the measurement, and `tv_depth20_ranked_swaps_total{outcome}` is
+   where it lands.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Filters gainers AFTER cutting to the top 250 (drops gainers below the cut).
+- Ranks a zero-lot contract (pads the board with arbitrary low ids).
+- Removes the exit band, or lets a held contract leave the board on a single
+  window in which it did not trade while an arrival funds it.
+- Reverts the guard on a TIMED-OUT unsubscribe (the frame may have landed).
+- Applies the depth-20 ranking from the frame drain, or lets one socket take
+  more than four swaps in a minute.
+- Presents the boot dial as ranked before the first 5-second sweep exists.

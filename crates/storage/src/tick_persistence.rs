@@ -555,10 +555,18 @@ pub fn ticks_ensure_statements() -> Vec<String> {
 /// A failed ensure leaves the table to be auto-created by the first ILP write
 /// WITHOUT the DEDUP keys — an intra-second duplicate/collapse window until a
 /// later ensure succeeds. That consequence is logged, never swallowed.
+///
+/// Returns `true` only when EVERY statement was accepted. Until 2026-09-08 the
+/// verdict was discarded: the boot ran this once, and a QuestDB that answered
+/// its readiness probe but refused the DDL (a WAL-suspended or still-loading
+/// table) left the DEDUP key missing for the whole session with one log line
+/// as the only trace. The caller now retries on `false` —
+/// `candle_ddl_boot::run_live_table_ddl_at_boot`.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via
 // ticks_ensure_statements(), and the 200 / 500 / unreachable arms are exercised
 // by the mock-HTTP tokio tests below.
-pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
+#[must_use = "a false verdict means the DEDUP key may be missing; retry it"]
+pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
     // APPROVED: QuestDB base URL, once per ensure_ticks_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
@@ -580,9 +588,10 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
                  ILP write may auto-create the table WITHOUT the 5-key DEDUP, \
                  which collapses intra-second ticks until a later ensure succeeds"
             );
-            return;
+            return false;
         }
     };
+    let mut every_statement_accepted = true;
     for ddl in &ticks_ensure_statements() {
         match client
             .get(&base_url)
@@ -605,6 +614,7 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
                     "ticks DDL returned non-2xx — the 5-key DEDUP may be missing, \
                      which collapses intra-second ticks"
                 );
+                every_statement_accepted = false;
             }
             Err(err) => {
                 metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_ddl")
@@ -616,9 +626,11 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
                     ddl = ddl.as_str(),
                     "ticks DDL request failed"
                 );
+                every_statement_accepted = false;
             }
         }
     }
+    every_statement_accepted
 }
 
 // ---------------------------------------------------------------------------
@@ -4311,19 +4323,25 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_ticks_table_mock_200_completes() {
         let port = spawn_mock_http(MOCK_HTTP_200).await;
-        ensure_ticks_table(&mock_cfg(port)).await;
+        assert!(
+            ensure_ticks_table(&mock_cfg(port)).await,
+            "every statement accepted ⇒ the verdict is true"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_ticks_table_mock_500_degrades_without_panic() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_ticks_table(&mock_cfg(port)).await;
+        assert!(
+            !ensure_ticks_table(&mock_cfg(port)).await,
+            "a refused statement must surface as false so the boot retries"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_ticks_table_unreachable_degrades_without_panic() {
         // Port 1 is reserved and never listening — a real transport failure.
-        ensure_ticks_table(&mock_cfg(1)).await;
+        assert!(!ensure_ticks_table(&mock_cfg(1)).await);
     }
 
     #[tokio::test]

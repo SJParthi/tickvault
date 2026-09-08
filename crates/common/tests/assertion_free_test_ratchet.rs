@@ -86,7 +86,12 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// signature already guarantees it. `..._with_reachable_mock` was worse than
 /// vacuous -- its own comment said it used a port that is NOT reachable, so the
 /// name contradicted the body. A name is the only thing most readers check.
-const ASSERTION_FREE_BUDGET: usize = 165;
+///
+/// 165 -> 164 on 2026-09-08: measured by CI on the depth-20 ranking PR, not
+/// derived — the change touched tests in `volume_leaderboard`, `hard_stop_guard`
+/// and the pool supervisor and one fewer assertion-free test remained. Lowered
+/// in the same change, as this ratchet's own failure message demands.
+const ASSERTION_FREE_BUDGET: usize = 164;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [
