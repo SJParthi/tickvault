@@ -79,7 +79,12 @@ pub const LATENCY_COMMANDS: [&str; 8] = [
     // The raw lines are shipped and the percentiles computed in Rust rather
     // than in awk: bucket arithmetic that silently produces a plausible wrong
     // number is exactly the failure this panel exists to end.
-    r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_dhan_ws_lag_ms_(bucket|count|sum)' | sed 's/^/WSLAT_RAW=/' || true",
+    //
+    // 2026-09-08: the per-connection gauges ride the same line — instruments
+    // held on the wire, data-bearing frames, and seconds since the last one —
+    // so the console can show all sixteen sockets, not only the ones whose
+    // lag histogram happened to have samples.
+    r"curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_dhan_ws_(lag_ms_(bucket|count|sum)|conn_[a-z_]+)' | sed 's/^/WSLAT_RAW=/' || true",
 ];
 
 /// legacy: `_STORAGE_COMMANDS` (handler.py:591-595).

@@ -878,6 +878,156 @@ pub fn distinct_underlying_over(ordered: &[RankedContract], k: usize) -> Vec<Ran
     out
 }
 
+// ---------------------------------------------------------------------------
+// Gainer eligibility (2026-09-06 lock: gainer = filter, volume = order)
+// ---------------------------------------------------------------------------
+
+/// The segment a STOCK option's underlying trades in.
+///
+/// The [`OptionFamily::Stock`] board ranks `NSE_FNO` contracts whose
+/// underlying is an NSE cash equity — the same `(underlying, NSE_EQ)` key the
+/// spot store and the previous-close store hold. Index options are never on
+/// the depth path (the lock bans them), so this is the only underlying
+/// segment the eligibility filter needs, and naming it once keeps the two
+/// lookups below from ever disagreeing about which store row is "the
+/// underlying".
+pub const STOCK_OPTION_UNDERLYING_SEGMENT: ExchangeSegment = ExchangeSegment::NseEquity;
+
+/// Metric: how the gainer filter judged each ranked contract's underlying,
+/// per 5-second pass. Labels are [`GAINER_VERDICT_LABELS`]. Local exporter
+/// only — never EMF-shipped (three series a human reads while already
+/// looking at the console; the cardinality rule in the noise lock §2.3).
+pub const GAINER_FILTER_COUNTER: &str = "tv_depth200_gainer_filter_total";
+
+/// Every label value [`GAINER_FILTER_COUNTER`] can carry, for pre-registration
+/// (the CloudWatch agent drops the first sample of an unseen series).
+pub const GAINER_VERDICT_LABELS: [&str; 3] = ["gainer", "not_gainer", "unknown"];
+
+/// Whether an underlying counts as a gainer for depth eligibility.
+///
+/// The 2026-09-06 lock: *"An instrument qualifies if its underlying is in the
+/// day's gainers; volume then decides the order."* A contract on a FALLING
+/// stock is not a candidate however busy it is; a contract whose underlying
+/// cannot be judged is not a candidate either, and is counted separately so
+/// a day where nothing can be judged (no previous closes arrived) reads as
+/// `unknown`, never as "no gainers".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainerVerdict {
+    /// Spot is strictly above the previous close.
+    Gainer,
+    /// Spot is at or below the previous close.
+    NotGainer,
+    /// Either input is absent or not a price (no spot today, no previous
+    /// close, non-finite, non-positive).
+    Unknown,
+}
+
+impl GainerVerdict {
+    /// The metric label for this verdict.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gainer => "gainer",
+            Self::NotGainer => "not_gainer",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Judges one underlying from the RAM spot price (paise, as the spot store
+/// holds it) and the previous close (rupees, as the prev-close store holds
+/// it).
+///
+/// The comparison is done in INTEGER paise on both sides, through the same
+/// `rupees_to_paise` the ladder-centring path uses — so a previous close that
+/// cannot centre a ladder cannot make a gainer either, and no float ever
+/// enters the decision. Zero and negative previous closes are the documented
+/// sentinels and land in `Unknown`, never in `NotGainer`.
+#[must_use]
+pub fn underlying_gainer_verdict(
+    spot_paise: Option<i64>,
+    prev_close: Option<f64>,
+) -> GainerVerdict {
+    let (Some(spot), Some(close_paise)) = (
+        spot_paise,
+        prev_close.and_then(crate::spot_price_store::rupees_to_paise),
+    ) else {
+        return GainerVerdict::Unknown;
+    };
+    if spot <= 0 {
+        return GainerVerdict::Unknown;
+    }
+    if spot > close_paise {
+        GainerVerdict::Gainer
+    } else {
+        GainerVerdict::NotGainer
+    }
+}
+
+/// How many underlyings fell into each verdict during one filter pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GainerTally {
+    /// Contracts whose underlying is a gainer — the eligible set.
+    pub gainer: usize,
+    /// Contracts whose underlying is flat or falling.
+    pub not_gainer: usize,
+    /// Contracts whose underlying could not be judged.
+    pub unknown: usize,
+}
+
+/// Keeps only the ranked contracts whose underlying `verdict_of` calls a
+/// gainer, PRESERVING the volume order. Pure.
+///
+/// `verdict_of` is called once per ranked row with the underlying id, so the
+/// caller pays one spot-store probe and one prev-close probe per row of the
+/// top 250 — cold, once per 5 seconds, and both probes O(1).
+///
+/// Applied AFTER the volume sort rather than inside `rank` deliberately: the
+/// persisted `top_volume_rank` rows must keep recording which contracts were
+/// busiest whether or not their stock rose, so the filter narrows only what
+/// the DEPTH steering is handed, never the record.
+#[must_use]
+pub fn gainer_eligible<F>(
+    ranked: &[RankedContract],
+    verdict_of: F,
+) -> (Vec<RankedContract>, GainerTally)
+where
+    F: Fn(u64) -> GainerVerdict,
+{
+    let mut out: Vec<RankedContract> = Vec::with_capacity(ranked.len());
+    let mut tally = GainerTally::default();
+    for row in ranked {
+        match verdict_of(row.underlying_id) {
+            GainerVerdict::Gainer => {
+                tally.gainer = tally.gainer.saturating_add(1);
+                out.push(*row);
+            }
+            GainerVerdict::NotGainer => tally.not_gainer = tally.not_gainer.saturating_add(1),
+            GainerVerdict::Unknown => tally.unknown = tally.unknown.saturating_add(1),
+        }
+    }
+    (out, tally)
+}
+
+/// Publishes one pass's tally onto [`GAINER_FILTER_COUNTER`].
+pub fn record_gainer_tally(tally: GainerTally) {
+    for (label, n) in [
+        ("gainer", tally.gainer),
+        ("not_gainer", tally.not_gainer),
+        ("unknown", tally.unknown),
+    ] {
+        metrics::counter!(GAINER_FILTER_COUNTER, "verdict" => label)
+            .increment(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+}
+
+/// Seeds every verdict series at zero so its first real sample is not the
+/// one the agent drops.
+pub fn pre_register_gainer_filter_counter() {
+    for label in GAINER_VERDICT_LABELS {
+        metrics::counter!(GAINER_FILTER_COUNTER, "verdict" => label).increment(0);
+    }
+}
 /// Percent change against the previous close, or `None` when it cannot be
 /// computed honestly.
 ///
@@ -1853,5 +2003,135 @@ mod tests {
     /// differ by 6x, which is what makes the units-vs-lots distinction bite.
     fn lot_of_fixture(c: &RankedContract) -> Option<u32> {
         Some(if c.security_id == 1 { 200 } else { 1_200 })
+    }
+
+    // ---- gainer eligibility (2026-09-06 lock) ----
+
+    #[test]
+    fn underlying_gainer_verdict_is_an_integer_paise_compare() {
+        use GainerVerdict::{Gainer, NotGainer};
+        assert_eq!(underlying_gainer_verdict(Some(11_000), Some(100.0)), Gainer);
+        assert_eq!(
+            underlying_gainer_verdict(Some(10_000), Some(100.0)),
+            NotGainer,
+            "flat is not a gainer"
+        );
+        assert_eq!(
+            underlying_gainer_verdict(Some(9_999), Some(100.0)),
+            NotGainer
+        );
+        assert_eq!(
+            underlying_gainer_verdict(Some(10_001), Some(100.0)),
+            Gainer,
+            "one paise above the close is a gainer — the compare is exact, not a float band"
+        );
+    }
+
+    #[test]
+    fn underlying_gainer_verdict_refuses_to_judge_from_a_missing_or_sentinel_input() {
+        use GainerVerdict::Unknown;
+        assert_eq!(
+            underlying_gainer_verdict(None, Some(100.0)),
+            Unknown,
+            "no spot today"
+        );
+        assert_eq!(
+            underlying_gainer_verdict(Some(11_000), None),
+            Unknown,
+            "no previous close"
+        );
+        assert_eq!(
+            underlying_gainer_verdict(Some(11_000), Some(0.0)),
+            Unknown,
+            "the zero sentinel"
+        );
+        assert_eq!(underlying_gainer_verdict(Some(11_000), Some(-1.0)), Unknown);
+        assert_eq!(
+            underlying_gainer_verdict(Some(11_000), Some(f64::NAN)),
+            Unknown
+        );
+        assert_eq!(
+            underlying_gainer_verdict(Some(11_000), Some(f64::INFINITY)),
+            Unknown
+        );
+        assert_eq!(
+            underlying_gainer_verdict(Some(0), Some(100.0)),
+            Unknown,
+            "a zero spot is an absence"
+        );
+        assert_eq!(underlying_gainer_verdict(Some(-5), Some(100.0)), Unknown);
+    }
+
+    #[test]
+    fn gainer_eligible_keeps_the_volume_order_and_drops_falling_and_unknown_underlyings() {
+        let ranked = [
+            stock(1, 100, 900), // gainer
+            stock(2, 200, 800), // falling
+            stock(3, 300, 700), // unknown
+            stock(4, 100, 600), // gainer, same underlying as #1
+            stock(5, 400, 500), // gainer
+        ];
+        let (eligible, tally) = gainer_eligible(&ranked, |underlying| match underlying {
+            100 | 400 => GainerVerdict::Gainer,
+            200 => GainerVerdict::NotGainer,
+            _ => GainerVerdict::Unknown,
+        });
+        let ids: Vec<u64> = eligible.iter().map(|c| c.security_id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 4, 5],
+            "membership by gain, order by the ranking"
+        );
+        assert_eq!(
+            tally,
+            GainerTally {
+                gainer: 3,
+                not_gainer: 1,
+                unknown: 1
+            }
+        );
+        let picked = distinct_underlying_over(&eligible, 5);
+        let picked_ids: Vec<u64> = picked.iter().map(|c| c.security_id).collect();
+        assert_eq!(
+            picked_ids,
+            vec![1, 5],
+            "after the filter the distinct pass still keeps one contract per underlying"
+        );
+    }
+
+    #[test]
+    fn gainer_eligible_on_a_down_day_is_empty_and_the_tally_says_why() {
+        let ranked = [stock(1, 100, 900), stock(2, 200, 800)];
+        let (eligible, tally) = gainer_eligible(&ranked, |_| GainerVerdict::NotGainer);
+        assert!(
+            eligible.is_empty(),
+            "no gainers means no candidates — sockets hold"
+        );
+        assert_eq!(tally.not_gainer, 2);
+        assert_eq!(
+            tally.unknown, 0,
+            "a down day must not read as an unjudgeable day"
+        );
+    }
+
+    #[test]
+    fn record_gainer_tally_accepts_every_shape_and_label_covers_every_verdict_once() {
+        let labels = [
+            GainerVerdict::Gainer.label(),
+            GainerVerdict::NotGainer.label(),
+            GainerVerdict::Unknown.label(),
+        ];
+        assert_eq!(labels, GAINER_VERDICT_LABELS);
+        record_gainer_tally(GainerTally {
+            gainer: 1,
+            not_gainer: 2,
+            unknown: 3,
+        });
+    }
+
+    #[test]
+    fn pre_register_gainer_filter_counter_seeds_every_label_without_panicking() {
+        pre_register_gainer_filter_counter();
+        pre_register_gainer_filter_counter();
     }
 }

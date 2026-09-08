@@ -1106,11 +1106,19 @@ pub async fn load_depth_candidates(
             return Vec::new();
         }
     };
-    let mut prices = crate::dhan_contract_universe::fetch_spot_prices(questdb, {
+    // RAM first: its size sets the database budget (see
+    // `fetch_spot_prices_backstop`). This runs once a MINUTE, so a stalled
+    // backstop consulted at its full budget would cost the steering loop ten
+    // of every sixty seconds for a read that can only add stragglers.
+    let ram = spot_store.snapshot_prices();
+    let from_ram = ram.len();
+    let mut prices = crate::dhan_contract_universe::fetch_spot_prices_backstop(
+        questdb,
         // Same day bound the contract path uses; the artifact rows are
         // already today's by filename.
-        crate::dhan_universe::ist_midnight_nanos(date_ist)
-    })
+        crate::dhan_universe::ist_midnight_nanos(date_ist),
+        from_ram,
+    )
     .await;
     // RAM overlaid on the database, RAM winning, for the reasons the contract
     // path's own comment gives: the database cannot see the last N minutes
@@ -1125,8 +1133,6 @@ pub async fn load_depth_candidates(
     // like a working one 375 times a session. The counts are taken before the
     // merge because `extend` makes the two sources indistinguishable after it.
     let from_questdb = prices.len();
-    let ram = spot_store.snapshot_prices();
-    let from_ram = ram.len();
     prices.extend(ram);
     tracing::debug!(
         spot_from_ram = from_ram,
