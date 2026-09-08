@@ -2455,3 +2455,72 @@ is correct and not a bug; the 5s board is where a thin book gets a fair reading.
   still exactly as load-bearing.
 - Re-subscribes unconditionally rather than on the delta, or removes the
   per-window swap cap, on the grounds that the set churns more.
+
+### 2026-09-08 — DEPTH-200 RANKED STEERING WIRED; depth-20 NOT, and the dial still puts index options on the wire
+
+**No new authorization is claimed.** This is the record of the 2026-09-06 and
+2026-09-07 sections above being ACTED ON, and of exactly how far. PR #1890
+built the lots-in-window ranking and published its top five distinct
+underlyings (`depth200_candidates`), then only LOGGED the divergence between
+that ranking and what the five depth-200 sockets held — every socket kept
+following the at-the-money engine the lock bans. Recorded here because the
+`REJECT` list above says re-subscribing unconditionally is a violation, and the
+next reader needs to know which half of the lock is on the wire and which is
+not.
+
+#### What is now on the wire (`crates/app/src/depth200_ranked_steer.rs`)
+
+| Property the lock makes binding | Implementation |
+|---|---|
+| Delta-only | a socket already holding a ranked contract is never touched; only sockets holding something OFF the ranking swap, and only onto contracts held nowhere |
+| Edge-triggered | a minute where holdings and ranking agree costs zero wire calls |
+| Capped per window | `MAX_RANKED_SWAPS_PER_MINUTE` = 5, and never more than one swap per socket per minute (the reconcile-before-plan discipline the loop already had); refusals counted as `tv_depth200_ranked_swaps_total{outcome="capped"}` |
+| Distinct underlyings | inherited from the published ranking (`distinct_underlying_over`), not re-derived at a second site |
+| I-P1-11 | held-vs-ranked comparison on the `(security_id, segment)` composite; a held index option never reads as "already holding" the stock option that shares its number (pinned by test) |
+
+The at-the-money engine is consulted only until the FIRST ranking of the
+session is published; from then on it is bypassed for the rest of the session.
+`Some(empty)` (the ranking ran and selected nothing) moves nothing — it is not a
+fallback to the banned engine.
+
+#### ⚠ What is NOT delivered (Rule 11)
+
+1. **depth-20 still runs the 2026-08-26 layout** (NIFTY/BANKNIFTY ±12 on two
+   sockets, movers on three) — index options, which Quote B bans. Its steering
+   works on 50-instrument sockets matched by set-overlap
+   (`depth20_track::plan_depth20_minute`), a different swap shape from the
+   one-contract depth-200 socket, and the ranking layer publishes only the
+   depth-200 top five today. Wiring it needs a 250-row publish plus a set-diff
+   planner with its own cap. **BLOCKED on that work, recorded, not silently
+   deferred.**
+2. **The boot dial still selects index at-the-money contracts for depth-200**
+   (`select_depth_universe`). For the first minute(s) of a session, until the
+   drain's first 5-second ranking exists, the five sockets carry the banned
+   class. Pre-open there is no volume to rank on, so this is the honest
+   starting state — but it means the lock is met from ~09:16, not 09:00.
+3. **The apply cadence is one minute, not five seconds.** The ranking is
+   recomputed every 5 s on the drain; the steering loop applies the latest
+   ranking once a minute at :08. Applying every 5 s would put swap I/O on the
+   frame drain, which this same lock forbids. The subscribed set therefore
+   reflects the ranking as of the last sweep before the minute mark.
+4. **The unsubscribe RequestCode (24 vs 25) is still UNVERIFIED-LIVE**, exactly
+   as the FOURTH-quote section records. Ranked steering does not raise the
+   swap cadence — it is still at most one swap per socket per minute — so it
+   multiplies that risk by nothing, but it does not retire it either.
+5. **Churn is UNMEASURED.** `tv_depth200_ranked_swaps_total{outcome}` is the
+   measurement; the first live session is when it exists. A routinely non-zero
+   `capped` count is the signal the 2026-09-07 section names for a longer
+   window or a hysteresis band — never for reverting the key.
+6. **A socket is never emptied.** With fewer than five ranked contracts, a
+   socket holding an off-ranking contract keeps it rather than being
+   unsubscribed to nothing (an empty depth socket delivers nothing, and the
+   unsubscribe code is unverified). A socket that never subscribed (`None`)
+   cannot take a swap and is counted `socket_empty`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Applies the ranking every 5 s from the frame drain (swap I/O on the hot path).
+- Removes the per-minute cap, or lets one socket take two swaps in a minute.
+- Falls back to the at-the-money engine after a ranking has been published.
+- Empties a socket to "match" a short ranking.
+- Claims depth-20 is on the volume ranking — it is not.

@@ -110,6 +110,7 @@ pub mod daily_archive_boot;
 pub mod daily_task_marker;
 pub mod depth200_atm;
 pub mod depth200_candidates;
+pub mod depth200_ranked_steer;
 pub mod depth20_layout;
 pub mod depth20_track;
 pub mod depth_rebalance;

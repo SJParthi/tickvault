@@ -3444,3 +3444,27 @@ in a triage message is a claim that goes stale silently — this one was wrong b
 - Reads "nothing was lost on 2026-09-08" as "the loss counters were zero". They were
   5,287 and 298,920; what makes it a clean session is that each EQUALS its rescue
   counter.
+
+### §2.3v — 2026-09-08: the RAM spot store's capacity refusal is LOG-ONLY by design, and the WS-GAP-03 page cannot hear it
+
+**This section authorizes NOTHING and adds no page.** It records a new
+`WS-GAP-03` emit site so the next reader does not mistake it for a gap in the
+alert set.
+
+`crates/app/src/spot_price_store.rs` refuses a NEW instrument past
+`MAX_TRACKED_INSTRUMENTS` (25,000) with `error!(code = "WS-GAP-03",
+source = "spot_price_store_full")`, throttled to powers of two so a storm of
+refusals cannot flood the sink. The only `WS-GAP-03` CloudWatch filter is
+§2.3d-i's THREE-condition pattern, scoped to `$.source =
+"fell_back_to_indices"`, so this new source is **structurally invisible to
+it** — which is correct: `WS-GAP-03` has ~50 emit sites and a bare-code filter
+is the RISK-GAP-03 noise trap this file records. The refusal is COUNTED
+(`tv_spot_price_store_refused_total`) and the count is what an operator reads.
+
+**Why it earns no page today:** the live universe is ~869 spot instruments
+against a 25,000 cap; reaching the cap means the universe grew ~29× first,
+which pages through `dhan-contract-universe-failed` and the collapse alarm
+long before this store fills. A page here would be a fourth pager for a
+condition three others already report. If the cap is ever lowered toward the
+live count, this row is the one that says the refusal needs its own filter —
+on `$.source = "spot_price_store_full"`, never on the bare code.
