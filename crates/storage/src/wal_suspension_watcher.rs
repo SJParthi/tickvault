@@ -534,8 +534,50 @@ pub struct WalLagTracker {
 struct LagState {
     last_lag: i64,
     growing_polls: u32,
+    /// Consecutive polls on which the lag FELL (above the floor). The
+    /// report latch releases only after [`WAL_APPLY_LAG_RELEASE_POLLS`] of
+    /// them — see the constant for why one is not enough.
+    falling_polls: u32,
+    /// Consecutive PARTIAL polls on which this table was absent. A complete
+    /// poll evicts an absentee at once; a partial one cannot tell absence from
+    /// a parse skip, so it waits for [`WAL_LAG_ABSENT_POLLS_TO_EVICT`].
+    absent_polls: u32,
     reported: bool,
 }
+
+/// Consecutive FALLING polls (above the floor) before a latched table is
+/// released.
+///
+/// One fall was the release condition until 2026-09-08, and a hostile review
+/// of that showed why it is wrong for a signal that now arms a shed: arming
+/// needs five non-decreasing polls, releasing needed one fall of one txn, so
+/// ordinary apply jitter — a backlog that oscillates around a plateau —
+/// released and re-armed on a ~six-minute period. Each release handed the
+/// inline-depth rung back and each re-arm took it again: periodic holes in
+/// the order-book capture, on a database that was stuck the whole time.
+///
+/// Two consecutive falls is the smallest release that jitter cannot produce
+/// (up-down-up-down never strings two falls together), while a backlog that
+/// is genuinely draining passes it in two minutes. Below the floor still
+/// releases at once — that is a recovery, not a fall.
+pub const WAL_APPLY_LAG_RELEASE_POLLS: u32 = 2;
+
+/// Consecutive PARTIAL polls a tracked table may be absent from before it is
+/// evicted.
+///
+/// A COMPLETE poll is first-hand evidence about every table the server has,
+/// so absence from one evicts immediately. A partial poll — one where the
+/// parser skipped a malformed row — cannot distinguish "gone" from "skipped",
+/// which is why the first draft of the eviction (same day) refused to evict
+/// on a partial view at all. That left a hole its own review found: ONE
+/// permanently-malformed row (the 2026-08-26 class) makes EVERY poll partial,
+/// and a latched table that was then dropped or renamed could never be evicted
+/// — so the eviction did not work on exactly the drift it was written for.
+///
+/// Symmetric with the arming window: a table missing from as many consecutive
+/// polls as it took to latch it is not being skipped by a flaky row, it is
+/// gone.
+pub const WAL_LAG_ABSENT_POLLS_TO_EVICT: u32 = WAL_APPLY_LAG_GROWING_POLLS;
 
 impl WalLagTracker {
     #[must_use]
@@ -592,15 +634,42 @@ impl WalLagTracker {
         rows: &[WalTableRow],
         complete: bool,
     ) -> Vec<(String, i64)> {
+        let present: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.name.as_str()).collect();
         if complete {
             // A complete view is first-hand evidence about every table the
             // server has. A tracked name missing from it no longer exists,
             // so its latch is stale by construction.
-            let present: std::collections::HashSet<&str> =
-                rows.iter().map(|r| r.name.as_str()).collect();
             self.state.retain(|name, _| present.contains(name.as_str()));
+        } else {
+            // A partial view cannot tell "gone" from "skipped". Count the
+            // absence instead of acting on it, and evict only once it has
+            // outlasted the arming window — see WAL_LAG_ABSENT_POLLS_TO_EVICT.
+            self.state.retain(|name, entry| {
+                if present.contains(name.as_str()) {
+                    return true;
+                }
+                entry.absent_polls = entry.absent_polls.saturating_add(1);
+                entry.absent_polls < WAL_LAG_ABSENT_POLLS_TO_EVICT
+            });
         }
         self.observe_inner(rows)
+    }
+
+    /// True when a 2xx poll came back with ZERO rows while at least one table
+    /// is latched as stuck.
+    ///
+    /// The lag-tracker twin of [`WalSuspensionTracker::is_suspicious_empty`],
+    /// and it was missing until 2026-09-08: an empty dataset is a legitimate
+    /// answer before any table exists, but a server that is mid-restart also
+    /// answers 2xx with nothing — and with eviction on a complete view, that
+    /// one poll would evict every latch, publish zero stuck tables, hand the
+    /// shed back, and re-arm five polls later. A sawtooth on a database that
+    /// never recovered. The caller skips the poll instead, so the latch
+    /// survives until a poll that actually names the tables.
+    #[must_use]
+    pub fn is_suspicious_empty(&self, rows: &[WalTableRow]) -> bool {
+        rows.is_empty() && self.reported_count() > 0
     }
 
     fn observe_inner(&mut self, rows: &[WalTableRow]) -> Vec<(String, i64)> {
@@ -611,6 +680,17 @@ impl WalLagTracker {
                 // `select *` precisely so a server rename degrades rather than
                 // errors). No lag reading means no lag verdict — never a
                 // fabricated zero.
+                //
+                // And never a fabricated STUCK either. Until 2026-09-08 this
+                // arm left the table's existing entry untouched, so a table
+                // that had latched and then lost its lag columns to a server
+                // rename stayed `reported = true` for the process lifetime:
+                // present on every poll (so never evicted), unreadable on
+                // every poll (so never released), and holding the ingest shed
+                // armed with nothing anywhere saying why. Unknown is not
+                // stuck. The entry is dropped and rebuilt from the next poll
+                // that carries a reading.
+                self.state.remove(&row.name);
                 continue;
             };
             let lag = seq.saturating_sub(writer);
@@ -645,24 +725,34 @@ impl WalLagTracker {
             let entry = self.state.entry(row.name.clone()).or_insert(LagState {
                 last_lag: lag,
                 growing_polls: 0,
+                falling_polls: 0,
+                absent_polls: 0,
                 reported: false,
             });
+            // Named on this poll, so any partial-view absence streak ends.
+            entry.absent_polls = 0;
 
             if lag < WAL_APPLY_LAG_MIN_TXN {
                 // Below the floor is the healthy state: reset everything,
                 // including the report latch, so a genuine second episode
                 // pages again.
                 entry.growing_polls = 0;
+                entry.falling_polls = 0;
                 entry.reported = false;
                 entry.last_lag = lag;
                 continue;
             }
 
             if lag < entry.last_lag {
-                // Apply is catching up. Not the condition.
+                // Apply is catching up. Not the condition — but ONE fall is
+                // not a release either, see WAL_APPLY_LAG_RELEASE_POLLS.
                 entry.growing_polls = 0;
-                entry.reported = false;
+                entry.falling_polls = entry.falling_polls.saturating_add(1);
+                if entry.falling_polls >= WAL_APPLY_LAG_RELEASE_POLLS {
+                    entry.reported = false;
+                }
             } else {
+                entry.falling_polls = 0;
                 entry.growing_polls = entry.growing_polls.saturating_add(1);
             }
             entry.last_lag = lag;
@@ -961,6 +1051,21 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // mid-incident); the latch below fires only after a sustained
                     // non-falling window and so cannot answer "how far behind now".
                     emit_wal_apply_lag_gauge(&rows);
+                    if lag_tracker.is_suspicious_empty(&rows) {
+                        // The lag twin of the suspension check above: an
+                        // empty 2xx while tables are latched stuck is a
+                        // server mid-restart, not a mass recovery. Skipping
+                        // keeps the latch AND the published count standing,
+                        // so the shed is not handed back on a poll that saw
+                        // nothing.
+                        debug!(
+                            latched = lag_tracker.reported_count(),
+                            "wal_tables() returned zero rows while tables are latched \
+                             as lagging — treating as a suspicious transient, latch \
+                             preserved"
+                        );
+                        continue;
+                    }
                     let growing = lag_tracker.observe_with_completeness(&rows, skipped == 0);
                     // The join to the ingest shed gate.
                     //
@@ -974,7 +1079,10 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // Deliberately NOT published on a failed probe: the
                     // `continue` arms above leave the previous value standing
                     // rather than writing a fabricated zero, so a database we
-                    // cannot reach never reads as a database that is healthy.
+                    // cannot reach never reads as a database that is healthy
+                    // — until the probe goes BLIND, at which point the Err arm
+                    // below publishes zero, because five minutes of no
+                    // evidence is not evidence of a backlog either.
                     tickvault_common::ingest_shed::publish_wal_apply_lag_growing(
                         lag_tracker.reported_count(),
                     );
@@ -984,9 +1092,18 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // ack is the 2026-08-25 lie (rows ACKed, never applied),
                     // and a watermark that believed it would archive WAL
                     // segments unread. Clean = every row parsed, none
-                    // suspended, no growing lag.
+                    // suspended, no table LATCHED as lagging.
+                    //
+                    // The LEVEL, not the edge. Until 2026-09-08 this read
+                    // `growing.is_empty()` — the tables that crossed on THIS
+                    // poll — so on every poll after the one that latched, the
+                    // watermark was told the database was clean while the
+                    // backlog stood exactly where it was. An ack trusted on
+                    // such a poll archives frames that were never applied.
                     crate::wal_applied_watermark::applied_watermark().note_questdb_probe(
-                        skipped == 0 && delta.currently_suspended == 0 && growing.is_empty(),
+                        skipped == 0
+                            && delta.currently_suspended == 0
+                            && lag_tracker.reported_count() == 0,
                     );
                     // Attempt recovery, CONDITIONALLY. The module header
                     // above says a resume is an operator decision because it
@@ -1028,6 +1145,16 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                         blind_announced = true;
                         metrics::gauge!("tv_questdb_wal_suspended_tables")
                             .set(WAL_SUSPENDED_TABLES_GAUGE_BLIND);
+                        // The shed gate's count is withdrawn along with the
+                        // gauge. A single failed poll leaves the last count
+                        // standing (a database we cannot reach is not a
+                        // healthy one), but a BLIND probe holding a stale
+                        // `>= 1` would pin the inline-depth shed for the
+                        // rest of the session on evidence five minutes old
+                        // and getting older — a shed nothing can hand back.
+                        // `ingest_shed` documents zero as "not measured", and
+                        // that is exactly what this is.
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_growing(0);
                         error!(
                             code = ErrorCode::WalSuspend01TableSuspended.code_str(),
                             source = "probe_blind",
@@ -1741,6 +1868,136 @@ mod tests {
             0,
             "the first COMPLETE view after the drift clears the stale latch"
         );
+    }
+
+    /// A latched table that is absent from PARTIAL polls is evicted once the
+    /// absence has outlasted the arming window — never on the first one.
+    ///
+    /// Pins the hole the first eviction left: one permanently-malformed row
+    /// makes EVERY poll partial, and a dropped or renamed latched table could
+    /// then never be evicted at all.
+    #[test]
+    fn a_table_absent_from_enough_partial_polls_is_evicted() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        assert_eq!(t.reported_count(), 1, "precondition: latched");
+        for poll in 1..WAL_LAG_ABSENT_POLLS_TO_EVICT {
+            t.observe_with_completeness(&[lag_row("ticks", 100_100, 100_000)], false);
+            assert_eq!(
+                t.reported_count(),
+                1,
+                "absent for {poll} partial poll(s) is still 'unseen', not 'gone'"
+            );
+        }
+        t.observe_with_completeness(&[lag_row("ticks", 100_100, 100_000)], false);
+        assert_eq!(
+            t.reported_count(),
+            0,
+            "absent from as many partial polls as it took to latch: gone"
+        );
+        assert_eq!(t.tracked_len(), 1);
+
+        // And a single reappearance resets the streak — a table that is
+        // skipped on alternate polls is flaky, not gone.
+        let mut u = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            u.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        for _ in 0..3 {
+            u.observe_with_completeness(&[lag_row("ticks", 100_100, 100_000)], false);
+            u.observe_with_completeness(&[lag_row("market_depth", 200_000, 100_000)], false);
+        }
+        assert_eq!(
+            u.reported_count(),
+            1,
+            "the streak reset on every reappearance"
+        );
+    }
+
+    /// A PRESENT row that has lost its lag columns is UNKNOWN, not stuck.
+    ///
+    /// Pins the HIGH finding of the 2026-09-08 second hostile pass: a latched
+    /// table whose `writerTxn`/`sequencerTxn` cells went absent (the server
+    /// rename `select *` is written to tolerate) stayed present on every poll
+    /// (so was never evicted) and unreadable on every poll (so was never
+    /// released) — holding the ingest shed armed for the process lifetime.
+    #[test]
+    fn a_present_row_without_lag_columns_releases_a_stale_latch() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        assert_eq!(t.reported_count(), 1, "precondition: latched");
+        t.observe(&[row("market_depth", false)]);
+        assert_eq!(
+            t.reported_count(),
+            0,
+            "no reading is no verdict — a latch cannot outlive the evidence it was built on"
+        );
+        assert_eq!(
+            t.tracked_len(),
+            0,
+            "the entry is rebuilt from the next reading"
+        );
+        // A fresh reading starts a fresh window, not a resumed one.
+        let fired = t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        assert!(fired.is_empty());
+        assert_eq!(t.reported_count(), 0);
+    }
+
+    /// One fall of one txn is jitter, not a release.
+    ///
+    /// Pins the hysteresis finding: arming needs five non-decreasing polls,
+    /// release needed ONE fall, so a backlog oscillating on a plateau released
+    /// and re-armed on a ~six-minute period — periodic holes in order-book
+    /// capture on a database that was stuck throughout.
+    #[test]
+    fn one_falling_poll_does_not_release_the_latch_but_two_do() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        assert_eq!(t.reported_count(), 1);
+
+        // Jitter: down one txn, up one txn, forever. Never releases.
+        for _ in 0..6 {
+            t.observe(&[lag_row("market_depth", 199_999, 100_000)]);
+            assert_eq!(t.reported_count(), 1, "one fall is jitter");
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+            assert_eq!(
+                t.reported_count(),
+                1,
+                "and it must not re-arm from zero either"
+            );
+        }
+
+        // A genuine drain: two consecutive falls, still above the floor.
+        t.observe(&[lag_row("market_depth", 180_000, 100_000)]);
+        assert_eq!(t.reported_count(), 1);
+        t.observe(&[lag_row("market_depth", 160_000, 100_000)]);
+        assert_eq!(
+            t.reported_count(),
+            0,
+            "{WAL_APPLY_LAG_RELEASE_POLLS} consecutive falls is a backlog draining"
+        );
+    }
+
+    /// An empty 2xx while tables are latched is a server mid-restart, and the
+    /// caller must skip it rather than evict everything.
+    #[test]
+    fn an_empty_poll_while_latched_is_suspicious_not_a_mass_recovery() {
+        let mut t = WalLagTracker::new();
+        assert!(
+            !t.is_suspicious_empty(&[]),
+            "nothing latched: empty is a real answer"
+        );
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        assert!(t.is_suspicious_empty(&[]));
+        assert!(!t.is_suspicious_empty(&[lag_row("ticks", 100, 100)]));
     }
 
     /// The name accessor reports exactly what the map holds.

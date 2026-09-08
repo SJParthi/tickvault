@@ -1492,6 +1492,37 @@ mod tests {
                                          bytes={free_bytes} burn={burn} \
                                          floor={at_floor} anchor={anchor:?} lag={lag}"
                                     );
+                                    // The UPPER bound, added 2026-09-08 by a
+                                    // hostile re-read of this test: the lower
+                                    // bound alone was satisfied by the very
+                                    // ratchet defect (5) this PR fixed, because
+                                    // a ratchet only ever makes `all` LARGER.
+                                    // The combined decision may be exactly the
+                                    // max of its parts and nothing more —
+                                    // there is no fifth signal hiding inside
+                                    // the composition, and `current` alone is
+                                    // not a reason to shed.
+                                    let exhaustion = anchor
+                                        .and_then(|(af, asecs)| {
+                                            seconds_to_disk_full(af, asecs, free_bytes, 4 * H)
+                                        })
+                                        .and_then(|secs_to_full| {
+                                            seconds_left_in_capture_window(39_600).map(|left| {
+                                                decide_shed_level_by_exhaustion(
+                                                    current,
+                                                    secs_to_full,
+                                                    left,
+                                                )
+                                            })
+                                        })
+                                        .unwrap_or(ShedLevel::None);
+                                    assert!(
+                                        all <= configured.max(by_lag).max(exhaustion),
+                                        "combining signals INVENTED a shed no single signal \
+                                         asked for (a ratchet): current={current:?} \
+                                         frac={free_fraction} bytes={free_bytes} burn={burn} \
+                                         floor={at_floor} anchor={anchor:?} lag={lag} all={all:?}"
+                                    );
                                 }
                             }
                         }

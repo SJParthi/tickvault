@@ -553,7 +553,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     ),
     (
         "errcode-wal-suspend-01",
-        "The database is behind on applying writes — rows are SAFELY STORED but not yet visible to queries. Nothing is lost; the backlog applies when it catches up",
+        "The database has STOPPED applying writes to a table — rows are accepted and sit in its write-ahead log but never become visible, and it will NOT catch up by itself. The box tries a bounded auto-resume first; if that fails someone must resume that table by hand (the runbook has the exact command), and if the disk was full, fix that before resuming",
     ),
     (
         "errcode-ws-spill-01",
@@ -648,18 +648,31 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
 /// deliberate act with a reason attached — never a way to quieten something
 /// inconvenient.
 const DEGRADE_NOT_EMERGENCY: &[&str] = &[
-    // Rows a failed flush rescued to the spill file, replayed on the next
-    // successful flush. Declared Severity::Low; rendered 🆘 until today.
-    "errcode-hot-path-02",
     // The tick spill tier engaging. `dropped == spilled` is the proof the
     // rescue worked, and this alarm fires on exactly that path.
     "ticks-spilling",
-    // "EITHER a frame was dropped OR replay deferred segments, which loses
-    // nothing" — one alarm covering both, so it cannot honestly claim loss.
-    "errcode-ws-spill-02",
     // Ticks the per-minute candle summary skipped. The ROWS ARE WRITTEN; only
     // the candle is missed, and the emit site says so in capitals.
     "aggregator-refusal-rate-high",
+    // ⚠ TWO ENTRIES REMOVED 2026-09-08, hours after this list was written, by
+    // an observability audit that read each alarm's EMIT SITES rather than
+    // its phrase:
+    //
+    // - `errcode-ws-spill-02` is declared `Severity::Critical`, its terraform
+    //   entry says "discrete PERMANENT data loss", and its three emit sites in
+    //   `ws_frame_spill.rs` all read "frame dropped (durable floor lost)". The
+    //   ring-took-it degrade path emits WS-GAP-03, not this code, so this code
+    //   has NO nothing-lost arm. Downgrading it hid the one alarm that means
+    //   bytes are gone.
+    // - `errcode-hot-path-02` is declared Low, but its alarm covers the
+    //   `dropped` + `spill_error` arm ("permanently gone") and the DEPTH
+    //   `dropped` arm, which has no spill tier at all. Mixed is not "nothing
+    //   lost", and a mixed alarm downgraded is a permanent loss wearing a
+    //   warning.
+    //
+    // The list is ONLY for alarms whose EVERY arm is a rescue. The flood the
+    // operator screenshotted was four `ticks-spilling` repeats, which are
+    // still covered; the two removed here fired zero times that morning.
 ];
 
 /// True when this alarm's condition is a self-healing degrade.
@@ -1375,14 +1388,16 @@ mod tests {
     /// The exact alerts from the operator's 2026-09-08 screenshot.
     ///
     /// Nine of fourteen carried "nothing is lost" in their own body and every
-    /// one rendered 🆘. These four are the repeat offenders; each must now
-    /// render ⚠️ so the ones that mean something can be seen.
+    /// one rendered 🆘. These TWO are the repeat offenders whose bodies are
+    /// honest about it; each must now render ⚠️ so the ones that mean
+    /// something can be seen. (hot-path-02 and ws-spill-02 were on this list
+    /// for one evening and were removed: ws-spill-02 is Critical permanent
+    /// loss, and hot-path-02 has a loss arm — a name-level downgrade would
+    /// have quietened both.)
     #[test]
     fn a_degrade_that_says_nothing_is_lost_is_not_an_emergency() {
         for alarm in [
-            "tv-prod-errcode-hot-path-02",
             "tv-prod-ticks-spilling",
-            "tv-prod-errcode-ws-spill-02",
             "tv-prod-aggregator-refusal-rate-high",
         ] {
             assert_eq!(
@@ -1400,6 +1415,10 @@ mod tests {
     #[test]
     fn an_alarm_not_on_the_degrade_list_keeps_the_emergency_emoji() {
         for alarm in [
+            // Removed from the degrade list 2026-09-08: ws-spill-02 is a
+            // Critical PERMANENT loss and hot-path-02 carries a loss arm.
+            "tv-prod-errcode-ws-spill-02",
+            "tv-prod-errcode-hot-path-02",
             // The ONE that mattered on 2026-09-08, buried eleventh of fourteen.
             "tv-prod-dhan-contract-universe-failed",
             "tv-prod-dhan-live-lane-down",
@@ -1489,7 +1508,7 @@ mod tests {
     fn the_rendered_repeat_line_downgrades_a_degrade_and_only_a_degrade() {
         let degrade = repeat_alarm_line(
             &serde_json::json!({
-                "AlarmName": "tv-prod-errcode-hot-path-02",
+                "AlarmName": "tv-prod-ticks-spilling",
                 "NewStateValue": "ALARM",
                 "StateChangeTime": "2026-09-08T03:34:00.000+0000",
             }),
