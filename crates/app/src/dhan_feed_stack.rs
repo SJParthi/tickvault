@@ -1120,6 +1120,15 @@ pub struct LiveIngest {
     /// the only place the packet is seen, and because a store reached through
     /// `&mut self` on a single-owner path needs no concurrent map.
     prev_close: crate::prev_close_store::PrevCloseStore,
+    /// Today's spot level per underlying, shared with the attach tasks.
+    ///
+    /// `Arc` and a concurrent map, UNLIKE its two neighbours here, and the
+    /// difference is the whole reason it exists: `prev_close` and `leaderboard`
+    /// are read only by this drain through `&mut self`, while this one is
+    /// WRITTEN here and READ from the contract and depth attach tasks minutes
+    /// later. That is the case `papaya` is for, and the reason the aggregator's
+    /// header gives for rejecting it is the reason to accept it here.
+    spot_prices: std::sync::Arc<crate::spot_price_store::SpotPriceStore>,
     /// Cumulative volume per contract, ranked per option family.
     ///
     /// Beside `prev_close` and for the same reason: the drain is the only place
@@ -1366,6 +1375,10 @@ impl LiveIngest {
             inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
             dead_class_latch: AtomicU8::new(0),
+            // Created HERE rather than passed in, so one drain can never end
+            // up writing a store a different reader is holding. Boot clones
+            // the `Arc` straight back out for the attach tasks.
+            spot_prices: std::sync::Arc::new(crate::spot_price_store::SpotPriceStore::new()),
             aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
             writer,
             seq_refused: 0,
@@ -1411,6 +1424,29 @@ impl LiveIngest {
         previous_close: f64,
     ) -> crate::prev_close_store::RecordOutcome {
         self.prev_close.record(security_id, segment, previous_close)
+    }
+
+    /// Hands out the shared spot-price store.
+    ///
+    /// The attach tasks hold their own `Arc` clone taken at boot; this exists
+    /// so a test can read back what the drain wrote without reaching into the
+    /// field.
+    #[must_use]
+    pub fn spot_prices(&self) -> &std::sync::Arc<crate::spot_price_store::SpotPriceStore> {
+        &self.spot_prices
+    }
+
+    /// Records the spot level observed on a tick.
+    ///
+    /// Takes `&self`, not `&mut self`, because the store does: nothing on this
+    /// path locks, which is what lets the attach tasks read it concurrently.
+    pub fn record_spot_price(
+        &self,
+        security_id: u64,
+        segment: tickvault_common::types::ExchangeSegment,
+        last_price: f64,
+    ) -> crate::spot_price_store::RecordOutcome {
+        self.spot_prices.record(security_id, segment, last_price)
     }
 
     /// Clears every previous close for a new trading day.
@@ -2413,6 +2449,18 @@ impl LiveIngest {
     pub fn reset_ranking_daily(&mut self) {
         self.leaderboard.reset_daily();
         self.prev_close.reset_daily();
+        // The spot store rides the SAME reset, and joining it here rather than
+        // adding a second rollover site is the point: one place decides what a
+        // new trading day clears, so a store cannot be added to the drain and
+        // silently miss the boundary.
+        //
+        // What it prevents is specific and quiet. A process that spans an IST
+        // midnight -- an operator manual start, or a stop that did not take --
+        // would otherwise centre today's option ladders on YESTERDAY's close.
+        // For an index that gapped overnight that is a window several strikes
+        // off the money, arrived at through entirely plausible-looking numbers,
+        // with nothing in any log to say the price was stale.
+        self.spot_prices.reset_daily();
     }
 
     fn observe_for_ranking(&mut self, tick: &ParsedTick) {
@@ -5530,6 +5578,45 @@ pub fn drain_main_feed_frame(
                 // timestamp, not an absent one, and is EXCLUDED rather than
                 // recorded as zero.
                 record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                // The price at-the-money is located from, recorded where it is
+                // decoded and nowhere else.
+                //
+                // Before 2026-09-08 the contract and depth selectors obtained
+                // this by querying QuestDB. On that day ticks arrived at
+                // 103,887 per five minutes from the 09:15 open and the join
+                // returned nothing until 09:45 -- an ACKed row is not queryable
+                // until it is APPLIED, and the apply lag ran 11,503 -> 27,089
+                // across the session. Thirty minutes; 20,224 stock options and
+                // every stock-option depth socket, unsubscribed.
+                //
+                // SPOT SEGMENTS ONLY, and the filter is the point rather than
+                // an optimisation: a derivative's own price is its premium, not
+                // the underlying's level, so recording one would centre that
+                // stock's whole ladder on the wrong number. It also keeps the
+                // store at ~870 entries against a 25,000 cap and makes this arm
+                // an integer compare for the ~96% of ticks that are contracts.
+                //
+                // The segment check and the enum conversion are ONE condition
+                // deliberately. `from_byte` alone admits every segment the enum
+                // knows, contracts included; a bare code compare alone admits a
+                // byte the enum cannot name. The binding pattern requires both:
+                // a code the enum recognises AND one of the three spot variants.
+                if let Some(
+                    segment @ (ExchangeSegment::IdxI
+                    | ExchangeSegment::NseEquity
+                    | ExchangeSegment::BseEquity),
+                ) = ExchangeSegment::from_byte(tick.exchange_segment_code)
+                {
+                    // f32 -> f64 through the house widener, never `f64::from`:
+                    // a plain widening turns 10.20_f32 into 10.19999980926514
+                    // (STORAGE-GAP-02), and this value sets the centre strike
+                    // of an entire ladder.
+                    let _outcome = ingest.record_spot_price(
+                        tick.security_id,
+                        segment,
+                        tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price),
+                    );
+                }
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
@@ -8065,6 +8152,16 @@ async fn attach_depth_when_available(
     // contract universe attaches here too, because locating at-the-money needs
     // live prices that do not exist at boot.
     main_feed_budget: Arc<RingByteBudget>,
+    // The drain's own view of today's spot levels, shared not copied.
+    //
+    // This task locates at-the-money, and until 2026-09-08 it asked QuestDB
+    // for the prices. That cost thirty minutes of the open: ticks arrived at
+    // 103,887 per five minutes from 09:15 and the join returned nothing until
+    // 09:45, because an ACKed row is not queryable until it is APPLIED and the
+    // apply lag ran 11,503 -> 27,089 across the session. The database is now
+    // the backstop for what this store cannot know -- prices from before this
+    // process booted -- and no longer the primary.
+    spot_prices: Arc<crate::spot_price_store::SpotPriceStore>,
     // How many main-feed connections the SPOT universe already consumed.
     //
     // `plan_pool` sizes a set against the FULL per-endpoint connection cap and
@@ -8354,6 +8451,7 @@ async fn attach_depth_when_available(
         } else {
             match crate::dhan_depth_universe::load_depth_universe_from_master(
                 &questdb,
+                &spot_prices,
                 &today_date,
                 ymd_from_ist_date(&today_date),
             )
@@ -8388,6 +8486,7 @@ async fn attach_depth_when_available(
             // from another's.
             let inputs = crate::depth_rebalance::load_attach_inputs(
                 &questdb,
+                &spot_prices,
                 &today_date,
                 ymd_from_ist_date(&today_date),
                 today_nanos / 1_000,
@@ -8475,6 +8574,7 @@ async fn attach_depth_when_available(
         // tasks at once.
         let contracts = crate::dhan_contract_universe::load_contract_universe(
             &questdb,
+            &spot_prices,
             &today_date,
             ymd_from_ist_date(&today_date),
             today_nanos,
@@ -9083,7 +9183,12 @@ async fn attach_depth_when_available(
                 // exactly ONE instrument, which is what makes a one-for-one
                 // swap meaningful; depth-20 holds up to 50 and needs its own
                 // shape, which is a separate change.
-                spawn_depth_rebalance(&questdb, &today_date, std::mem::take(&mut depth_commands));
+                spawn_depth_rebalance(
+                    &questdb,
+                    &spot_prices,
+                    &today_date,
+                    std::mem::take(&mut depth_commands),
+                );
                 return;
             }
         }
@@ -9175,6 +9280,7 @@ pub fn depth20_track_sockets(
 // TEST-EXEMPT: spawn wrapper over depth200_rebalance_sockets + run_depth_rebalance, both tested.
 fn spawn_depth_rebalance(
     questdb: &tickvault_common::config::QuestDbConfig,
+    spot_prices: &Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: &str,
     dialed: Vec<(
         DhanEndpointType,
@@ -9204,6 +9310,7 @@ fn spawn_depth_rebalance(
     let today_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
     tokio::spawn(crate::depth_rebalance::run_depth_rebalance(
         questdb,
+        Arc::clone(spot_prices),
         date_ist,
         today_ymd,
         today_micros,
@@ -10525,6 +10632,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
     .with_inline_depth(DepthIngest::new(&params.questdb));
 
+    // Taken immediately, so the attach tasks read the SAME store this drain
+    // writes. Cloning the `Arc` here rather than constructing a second store
+    // is the whole point: two stores would each look healthy while the reader
+    // saw an empty one, and the contract universe would sit at zero with every
+    // counter reading normal -- which is exactly the failure this path exists
+    // to end.
+    let spot_prices_for_attach = std::sync::Arc::clone(ingest.spot_prices());
+
     // The top-volume snapshot writer, split for offload BEFORE it is handed to
     // the ingest -- so the ingest can only ever hold the producer half. The
     // thread is spawned here rather than inside the ingest because the sink is
@@ -11349,6 +11464,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             Arc::clone(&depth_budget),
             Arc::clone(&depth200_budget),
             Arc::clone(&main_feed_budget),
+            spot_prices_for_attach,
             main_feed_connections_for(
                 params.main_feed_instruments.len(),
                 usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS),
@@ -12445,6 +12561,66 @@ mod tests {
                 "from round 1 the memory bound must still stop the drain"
             );
         }
+    }
+
+    /// The attach tasks must read the store the DRAIN writes, not one of their
+    /// own.
+    ///
+    /// This is the only assertion standing between the code and a silent
+    /// return of the 2026-09-08 outage. Every behavioural test in this file
+    /// passes with a second `SpotPriceStore` constructed inside the reader:
+    /// the drain fills its store, the reader queries an empty one, the
+    /// contract universe sits at zero, and no counter, log or test says
+    /// anything is wrong. Verified by doing exactly that — the whole suite
+    /// stayed green — which is why this test exists at all.
+    ///
+    /// Pinned in the SOURCE because the wiring it protects is inside an
+    /// async I/O composition that is TEST-EXEMPT by construction.
+    #[test]
+    fn the_attach_tasks_read_the_drains_own_spot_store() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let production = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production text precedes the first test module");
+
+        // Exactly ONE store is ever built. A second `new()` anywhere in the
+        // lane is the disconnection, spelled out.
+        assert_eq!(
+            production.matches("SpotPriceStore::new()").count(),
+            1,
+            "the lane must construct exactly one spot-price store; a second one              is a reader that will never see a price"
+        );
+
+        // Boot takes its handle from the drain, by cloning the drain's Arc.
+        assert!(
+            production.contains("Arc::clone(ingest.spot_prices())"),
+            "boot must hand the attach tasks the DRAIN's store, not a fresh one"
+        );
+
+        // And that clone is what the attach task actually receives.
+        let spawn = production
+            .split("tokio::spawn(attach_depth_when_available(")
+            .nth(1)
+            .expect("the attach spawn must exist");
+        assert!(
+            spawn.contains("spot_prices_for_attach"),
+            "the attach spawn must pass the cloned handle"
+        );
+
+        // The reader side, in the crate that consumes it: the contract
+        // selector must snapshot the store it was GIVEN. Checked here rather
+        // than in its own file because this is the test that knows both ends
+        // of the wire are meant to be the same store.
+        let selector = include_str!("dhan_contract_universe.rs");
+        assert!(
+            selector.contains("spot_store.snapshot_prices()"),
+            "the contract selector must read the store passed to it"
+        );
+        assert!(
+            !selector.contains("SpotPriceStore::new()"),
+            "the contract selector must never build its own store — it would be              empty forever and the universe would sit at zero in silence"
+        );
     }
 
     #[test]
@@ -20486,6 +20662,13 @@ mod frame_walk_accounting_tests {
     /// folded, so these assertions hold whatever the clock says.
     const ANY_LTT: u32 = 1_755_141_600;
 
+    // Wire codes for the three spot segments, for building test packets only.
+    // Production filters on the ENUM VARIANTS, not on numbers -- so these are
+    // asserted against `binary_code()` below rather than trusted.
+    const SPOT_IDX: u8 = 0;
+    const SPOT_NSE_EQ: u8 = 1;
+    const SPOT_BSE_EQ: u8 = 4;
+
     fn ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
         let mut p = [0u8; 16];
         p[0] = 2; // response code: ticker
@@ -20496,6 +20679,140 @@ mod frame_walk_accounting_tests {
         p[12..16].copy_from_slice(&ltt.to_le_bytes());
         p
     }
+
+    /// The same packet with the segment byte under the caller's control, so a
+    /// test can prove which segments reach the spot-price store.
+    fn ticker_packet_in(security_id: u32, segment: u8, ltp: f32) -> [u8; 16] {
+        let mut p = ticker_packet(security_id, ltp, ANY_LTT);
+        p[3] = segment;
+        p
+    }
+
+    fn drain_one(ingest: &mut LiveIngest, bytes: Vec<u8>) {
+        let _out = drain_main_feed_frame(
+            ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            1_000_000,
+            1_000,
+            counters(),
+        );
+    }
+
+    /// The end-to-end property the 2026-09-08 fix rests on: a decoded spot tick
+    /// puts its price in the store WITHOUT a database anywhere in the path.
+    ///
+    /// This is the assertion that would have caught the outage. On that day the
+    /// contract selector asked QuestDB for these prices and got nothing for
+    /// thirty minutes after the open, while the drain held every one of them.
+    #[test]
+    fn record_spot_price_lands_a_decoded_tick_where_the_attach_tasks_read_it() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        drain_one(&mut ingest, ticker_packet_in(13, 0, 24_500.10).to_vec());
+        assert_eq!(
+            ingest
+                .spot_prices()
+                .latest_paise(13, tickvault_common::types::ExchangeSegment::IdxI),
+            Some(2_450_010),
+            "the price the drain just decoded must be readable with no query"
+        );
+    }
+
+    /// Only SPOT segments may price an underlying.
+    ///
+    /// A derivative's own price is its PREMIUM, not the underlying's level, so
+    /// admitting one would centre that stock's entire option ladder on the
+    /// wrong number — a silent, plausible-looking corruption of ~50 strikes.
+    #[test]
+    fn a_derivative_tick_never_prices_an_underlying() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let mut bytes = Vec::new();
+        // NSE_FNO (2) and BSE_FNO (8): contracts, not levels.
+        bytes.extend_from_slice(&ticker_packet_in(77, 2, 412.25));
+        bytes.extend_from_slice(&ticker_packet_in(78, 8, 88.10));
+        drain_one(&mut ingest, bytes);
+        assert!(
+            ingest.spot_prices().is_empty(),
+            "an option premium is not a spot level and must never reach the store"
+        );
+    }
+
+    /// All three spot segments are admitted — the filter must not be so narrow
+    /// it silently drops BSE equities or the indices.
+    #[test]
+    fn spot_prices_holds_all_three_spot_segments() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&ticker_packet_in(13, SPOT_IDX, 24_500.0));
+        bytes.extend_from_slice(&ticker_packet_in(2885, SPOT_NSE_EQ, 1_234.55));
+        bytes.extend_from_slice(&ticker_packet_in(500_325, SPOT_BSE_EQ, 1_240.00));
+        drain_one(&mut ingest, bytes);
+        assert_eq!(
+            ingest.spot_prices().tracked(),
+            3,
+            "indices, NSE equities and BSE equities are all spot levels"
+        );
+    }
+
+    /// The test packets must carry the codes the enum actually assigns.
+    ///
+    /// Every other test in this group builds its packets from these three
+    /// constants, so if the enum's numbering ever moved they would all keep
+    /// passing while testing the wrong segments entirely.
+    #[test]
+    fn the_test_packet_segment_codes_are_the_enums_own() {
+        use tickvault_common::types::ExchangeSegment;
+        assert_eq!(SPOT_IDX, ExchangeSegment::IdxI.binary_code());
+        assert_eq!(SPOT_NSE_EQ, ExchangeSegment::NseEquity.binary_code());
+        assert_eq!(SPOT_BSE_EQ, ExchangeSegment::BseEquity.binary_code());
+    }
+
+    /// The filter must name the three spot variants and NOTHING else.
+    ///
+    /// A behavioural test can only prove the segments it thinks to try. This
+    /// pins the arm itself, so adding `NseFno` to the pattern — which would
+    /// centre every stock's ladder on an option premium, silently and
+    /// plausibly — fails the build rather than waiting to be noticed in a
+    /// strike that looks slightly wrong.
+    #[test]
+    fn only_the_three_spot_variants_may_price_an_underlying() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // Anchored on two fragments `cargo fmt` cannot split, and asserted
+        // present FIRST. The earlier version of this guard anchored on
+        // `if let Some(segment @ (`, which fmt reflowed across a newline; the
+        // slice then silently widened to the whole file, matched
+        // `ExchangeSegment::NseFno` somewhere unrelated, and failed on correct
+        // code. A guard that cannot find its target must SAY so rather than
+        // grade whatever it happened to slice.
+        const OPEN: &str = "segment @ (";
+        const CLOSE: &str = ") = ExchangeSegment::from_byte(tick.exchange_segment_code)";
+        let start = src.find(OPEN).expect("the spot-price filter must exist");
+        let end = src[start..]
+            .find(CLOSE)
+            .expect("the spot-price filter must end at the from_byte conversion");
+        let arm = &src[start..start + end];
+        for spot in [
+            "ExchangeSegment::IdxI",
+            "ExchangeSegment::NseEquity",
+            "ExchangeSegment::BseEquity",
+        ] {
+            assert!(arm.contains(spot), "the filter must admit {spot}");
+        }
+        for contract in ["ExchangeSegment::NseFno", "ExchangeSegment::BseFno"] {
+            assert!(
+                !arm.contains(contract),
+                "{contract} is a CONTRACT segment: its price is a premium, not the \
+                 underlying's level, and admitting it would centre that stock's \
+                 whole option ladder on the wrong number"
+            );
+        }
+    }
+
     /// A frame that stacks many packets and hits an unknown response code
     /// part-way must report HOW MUCH it threw away, not just that it gave up.
     ///
@@ -20635,6 +20952,30 @@ mod frame_walk_accounting_tests {
     /// a process that spans midnight would compute every gain against
     /// yesterday's close and say nothing.
     #[test]
+    /// A process that spans an IST midnight must not centre today's ladders on
+    /// yesterday's close.
+    ///
+    /// The store's own `reset_daily` had NO production caller when it was
+    /// written — the same dormant shape `PrevCloseStore::reset_daily` and
+    /// `VolumeLeaderboard::reset_daily` each carried, and which this repo's
+    /// O(1) table records twice as "bounded by the deploy schedule, not by the
+    /// code". The box stopping at 17:30 is a schedule, not a bound: a manual
+    /// start or a stop that did not take spans the boundary, and then an index
+    /// that gapped overnight centres its window several strikes off the money
+    /// through entirely plausible numbers, with nothing in any log to say the
+    /// price was stale.
+    #[test]
+    fn the_daily_reset_clears_the_spot_store_too() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        ingest.record_spot_price(13, ExchangeSegment::IdxI, 24_500.0);
+        assert_eq!(ingest.spot_prices().tracked(), 1);
+        ingest.reset_ranking_daily();
+        assert!(
+            ingest.spot_prices().is_empty(),
+            "yesterday's spot level must never centre today's ladder"
+        );
+    }
+
     fn reset_prev_close_daily_clears_the_store_it_owns() {
         use tickvault_common::types::ExchangeSegment;
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);

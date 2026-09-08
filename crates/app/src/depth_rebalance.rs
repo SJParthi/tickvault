@@ -1247,6 +1247,11 @@ fn publish_depth_subscriptions(
 // TEST-EXEMPT: async loop over secs_until_next_rebalance + load_depth_candidates + fetch_movers + plan_minute + apply_decision, each separately tested.
 pub async fn run_depth_rebalance(
     questdb: tickvault_common::config::QuestDbConfig,
+    // The drain's live spot levels. This loop re-centres depth windows every
+    // minute, so it takes the same primary source the contract selector does
+    // -- two selectors centring on different prices would put depth on a
+    // strike the contract set does not carry.
+    spot_store: std::sync::Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: String,
     today_ymd: u32,
     today_ist_micros: i64,
@@ -1345,8 +1350,13 @@ pub async fn run_depth_rebalance(
         // the iteration on purpose -- see `publish_depth_subscriptions`.
         publish_depth_subscriptions(&subscription_view, &sockets, &depth20);
 
-        let candidates =
-            crate::dhan_depth_universe::load_depth_candidates(&questdb, &date_ist, today_ymd).await;
+        let candidates = crate::dhan_depth_universe::load_depth_candidates(
+            &questdb,
+            &spot_store,
+            &date_ist,
+            today_ymd,
+        )
+        .await;
         let movers = fetch_movers(&questdb, today_ist_micros).await;
 
         // What the four index sockets are believed to hold, in dial order.
@@ -1450,13 +1460,16 @@ pub struct AttachInputs {
 // TEST-EXEMPT: async composition of load_depth_candidates + fetch_movers, both tested.
 pub async fn load_attach_inputs(
     questdb: &tickvault_common::config::QuestDbConfig,
+    spot_store: &crate::spot_price_store::SpotPriceStore,
     date_ist: &str,
     today_ymd: u32,
     today_ist_micros: i64,
 ) -> AttachInputs {
     AttachInputs {
-        candidates: crate::dhan_depth_universe::load_depth_candidates(questdb, date_ist, today_ymd)
-            .await,
+        candidates: crate::dhan_depth_universe::load_depth_candidates(
+            questdb, spot_store, date_ist, today_ymd,
+        )
+        .await,
         movers: fetch_movers(questdb, today_ist_micros).await,
     }
 }

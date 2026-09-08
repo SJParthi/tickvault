@@ -20,6 +20,7 @@ tickvault-trading = { path = "../trading" }
 tickvault-storage = { path = "../storage" }
 tickvault-api = { path = "../api" }
 tokio = { workspace = true }
+papaya = { workspace = true }
 governor = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
