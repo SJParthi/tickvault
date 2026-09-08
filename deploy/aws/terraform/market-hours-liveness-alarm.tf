@@ -442,6 +442,40 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # The gate now arms 8 alarms — this one and the deaf-socket
         # sibling added the same day.
         aws_cloudwatch_metric_alarm.depth_steering_stalled.alarm_name,
+        # 2026-09-08: aggregator_refusal_rate_high JOINS the gate, because it
+        # was firing on windows that lie ENTIRELY BEFORE THE MARKET OPENS.
+        #
+        # THE INCIDENT. The operator was paged at 09:07 IST with "more than a
+        # quarter of prices arrive with a bad time stamp -- normal is under
+        # 10%". The alarm's period is 300 s with evaluation_periods = 2, so the
+        # windows it judged spanned roughly 08:57-09:07 -- the pre-open, when
+        # almost nothing has printed.
+        #
+        # WHY THAT PRODUCES A HIGH RATIO WITH NOTHING WRONG. The numerator
+        # tv_aggregator_tick_refused_total folds SIX reason labels (the EMF
+        # processor sums label values into one series). Three of them --
+        # untraded_sentinel, untraded_timestamp, stale_trading_day -- are the
+        # "this instrument has not traded today" population, which before the
+        # bell is nearly every option strike in the universe. The ratio is
+        # therefore structurally high pre-open and says nothing about the feed.
+        # The 25% threshold was calibrated against SESSION-scale figures
+        # (2.41% on 2026-08-27, 7.0% on 2026-08-28), never against a pre-open
+        # window.
+        #
+        # WHY THE GATE IS THE RIGHT FIX AND NOT A NARROWED NUMERATOR. Splitting
+        # the benign reasons out of the numerator is the better long-term
+        # answer and is NOT taken here: the six reasons share one metric name
+        # by construction, so separating them means a new EMF name -- ~$0.30/mo
+        # against a September forecast of $142.24 and an automatic
+        # STOP_EC2_INSTANCES line at $135.00. That needs an operator lever, not
+        # a cost note. The gate costs nothing and removes the false page today.
+        #
+        # WHAT THE GATE DOES NOT FIX, stated so it is not mistaken for fixed:
+        # in-session the ratio still folds benign reasons into a defect
+        # threshold, so a genuine timestamp regression and a quiet market are
+        # still not distinguishable by this alarm alone. The per-reason split
+        # lives only in the 30-second AGGREGATOR-DROP-01 log line.
+        aws_cloudwatch_metric_alarm.aggregator_refusal_rate_high.alarm_name,
         # 2026-08-26: dhan_worst_socket_deaf JOINS the gate — OPERATOR-APPROVED
         # ("Yes, phone me", 2026-08-26).
         #
@@ -559,7 +593,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the
   # dead Dhan-lag publisher chain) lives HERE in
   # the comment; the description keeps only the operator-actionable core.
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 3 gated alarms (market-hours-liveness-missing, app-log-ingestion-silent, dhan-live-lane-down - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 3 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 12 gated alarms - the Lambda's ALARM_NAMES env is the authoritative list and is the ONLY place to read the current set (CORRECTED 2026-09-08: this description said 'the 3 gated alarms' and named three by hand while the list had grown to twelve. A hand-copied count in a triage message is a claim that goes stale silently, and this one was wrong by 4x on the surface an operator reads at 3am. History, retained: trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify EVERY alarm named in the Lambda's ALARM_NAMES env (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
