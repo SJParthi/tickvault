@@ -415,8 +415,18 @@ pub const CONTRACT_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_contract_universe_fa
 /// drops each series' FIRST observed sample as its baseline, so a reason that
 /// is not pre-registered loses its first increment — and on a once-per-session
 /// counter, its first increment is its only one.
-pub const CONTRACT_FAILURE_REASONS: [&str; 7] = [
+pub const CONTRACT_FAILURE_REASONS: [&str; 9] = [
     "artifact_unreadable",
+    // The price SOURCE returned zero rows. Split out of `no_ladders` on
+    // 2026-09-08: that reason fires for BOTH "no prices arrived" and "prices
+    // arrived and none matched", so it could never say which, and the two have
+    // nothing in common but the symptom.
+    "no_spot_rows",
+    // The price source returned rows and NOT ONE joined onto the symbol map —
+    // an identity defect, not a data-availability one. Reported separately
+    // because it is the shape a key or segment change produces, and it would
+    // otherwise read as a quiet market.
+    "spot_keys_unmatched",
     // The late-attach loop reached its deadline or the 15:30 hard stop with
     // contracts never on the wire. Emitted by `record_contract_give_up`, NOT
     // by the classifier: at a give-up there is no `ContractSelection` to
@@ -458,7 +468,22 @@ pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static s
     match selection.atm_window_reason {
         // Guarded on the denominator: a master with genuinely no stock options
         // reports `no_ladders` legitimately and must not page for it.
-        "no_ladders" if selection.stock_option_underlyings > 0 => reasons.push("no_ladders"),
+        //
+        // Since 2026-09-08 the guarded arm ALSO says which side failed. Both
+        // sub-reasons ride WITH `no_ladders` rather than replacing it, so the
+        // alarm built on that name keeps firing exactly as before and the new
+        // labels are additional detail, not a silent re-route.
+        "no_ladders" if selection.stock_option_underlyings > 0 => {
+            reasons.push("no_ladders");
+            if selection.spot_rows_available == 0 {
+                reasons.push("no_spot_rows");
+            } else {
+                // Rows arrived and the ladder set is still empty: every one of
+                // them failed to join. Not a market condition — a key or
+                // segment mismatch between the price source and the symbol map.
+                reasons.push("spot_keys_unmatched");
+            }
+        }
         "no_room" => reasons.push("no_room"),
         "applied" if selection.atm_window_used < STOCK_OPTION_ATM_STRIKES_EACH_SIDE => {
             reasons.push("window_shrunk");
@@ -592,6 +617,26 @@ pub struct ContractSelection {
     /// Underlyings whose options were REFUSED because no live spot price was
     /// available to locate at-the-money. Never guessed.
     pub underlyings_without_spot: usize,
+    /// Price rows the SOURCE returned, before the join onto the symbol map.
+    ///
+    /// The number that separates the two ways `underlyings_without_spot` can
+    /// reach its maximum, which are opposite problems with an identical
+    /// symptom:
+    ///
+    /// - `spot_rows_available == 0` — the price SOURCE gave us nothing. A
+    ///   persistence, query-window or database-lag problem; the identity
+    ///   plumbing is untested because it never ran.
+    /// - `spot_rows_available > 0` with `underlyings_without_spot` still at the
+    ///   denominator — rows arrived and NONE of them joined. An identity
+    ///   problem: the `(security_id, segment)` composites the source returned
+    ///   are not the ones the symbol map holds.
+    ///
+    /// Recorded 2026-09-08, after a live session where every stock option was
+    /// absent and the log said only `priced_underlyings: 0` — which is the sum
+    /// of both cases and therefore names neither. From outside the box the two
+    /// were indistinguishable, and the fix for one is no help against the
+    /// other.
+    pub spot_rows_available: usize,
     /// Stock underlyings the master listed an option chain for, priced or not.
     ///
     /// The DENOMINATOR of the pricing quorum, and the number
@@ -1531,11 +1576,19 @@ pub async fn load_contract_universe(
     }
 
     let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
-    let selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+    let mut selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+    // Carried on the selection rather than logged here alone, so the pure
+    // classifier below can tell the two failures apart without re-reading I/O.
+    selection.spot_rows_available = prices.len();
 
     tracing::info!(
         contracts_in_artifact = contracts.len(),
         priced_underlyings = spot.len(),
+        // The join's INPUT beside its OUTPUT. `priced_underlyings` alone is the
+        // sum of "the source returned nothing" and "nothing the source returned
+        // matched", which are opposite defects.
+        spot_rows_available = prices.len(),
+        symbol_map_entries = symbols.len(),
         selected = selection.instruments.len(),
         index_futures = selection.index_futures,
         stock_futures = selection.stock_futures,
@@ -2520,8 +2573,51 @@ mod tests {
         assert!(contract_verdict_reasons(&sel).is_empty());
 
         // ...but with a real master behind it, it IS the 2026-08-20 defect.
+        // `spot_rows_available` defaults to 0, so this is the no-prices half.
         sel.stock_option_underlyings = 208;
-        assert_eq!(contract_verdict_reasons(&sel), vec!["no_ladders"]);
+        assert_eq!(
+            contract_verdict_reasons(&sel),
+            vec!["no_ladders", "no_spot_rows"]
+        );
+    }
+
+    /// THE 2026-09-08 SPLIT. `no_ladders` fires for two opposite defects, and
+    /// before this the counter could not say which — so an operator paged at
+    /// 09:15 could not tell "the price source is empty" from "the price source
+    /// is fine and its keys do not match ours".
+    ///
+    /// Both sub-reasons ride WITH `no_ladders`, never instead of it: the alarm
+    /// built on that name must keep firing exactly as it did.
+    #[test]
+    fn contract_verdict_reasons_separates_no_prices_from_prices_that_did_not_join() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_ladders";
+        sel.stock_option_underlyings = 208;
+
+        // The source gave us nothing — a persistence / query-window problem.
+        sel.spot_rows_available = 0;
+        let empty_source = contract_verdict_reasons(&sel);
+        assert!(empty_source.contains(&"no_ladders"), "{empty_source:?}");
+        assert!(empty_source.contains(&"no_spot_rows"), "{empty_source:?}");
+        assert!(
+            !empty_source.contains(&"spot_keys_unmatched"),
+            "an empty source is not a key mismatch: {empty_source:?}"
+        );
+
+        // Rows arrived and NOT ONE joined — an identity problem. Same symptom,
+        // opposite fix, and the only thing that separates them is this number.
+        sel.spot_rows_available = 4_312;
+        let unmatched = contract_verdict_reasons(&sel);
+        assert!(unmatched.contains(&"no_ladders"), "{unmatched:?}");
+        assert!(unmatched.contains(&"spot_keys_unmatched"), "{unmatched:?}");
+        assert!(
+            !unmatched.contains(&"no_spot_rows"),
+            "rows WERE available: {unmatched:?}"
+        );
     }
 
     /// Every reason the classifier can produce must be in the pre-registration
