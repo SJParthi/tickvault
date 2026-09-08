@@ -1593,9 +1593,8 @@ mod tests {
             "a stuck database out of hours is still a stuck database"
         );
     }
-
     #[test]
-    fn the_published_table_count_round_trips_and_saturates_rather_than_wrapping() {
+    fn publish_wal_apply_lag_growing_saturates_rather_than_wrapping() {
         publish_wal_apply_lag_growing(0);
         assert_eq!(wal_apply_lag_growing(), 0);
         publish_wal_apply_lag_growing(14);
@@ -1606,6 +1605,22 @@ mod tests {
         publish_wal_apply_lag_growing(usize::MAX);
         assert_eq!(wal_apply_lag_growing(), u32::MAX);
         // Leave the global as the rest of the suite expects to find it.
+        publish_wal_apply_lag_growing(0);
+    }
+
+    #[test]
+    fn wal_apply_lag_growing_reads_back_what_the_watcher_published() {
+        // The read half of the join, asserted on its own: a value the watcher
+        // stores must be the value the shed loop acts on. Trivially true of
+        // one atomic today, and the place a future change to a smarter
+        // carrier (a window, a decay, a per-table map) has to keep proving.
+        publish_wal_apply_lag_growing(3);
+        assert_eq!(wal_apply_lag_growing(), 3);
+        assert_eq!(
+            decide_shed_level_by_apply_lag(ShedLevel::None, wal_apply_lag_growing()),
+            ShedLevel::InlineDepth,
+            "what is read back must be what the gate decides on"
+        );
         publish_wal_apply_lag_growing(0);
     }
 }
