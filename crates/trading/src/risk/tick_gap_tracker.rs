@@ -74,7 +74,30 @@ pub struct TickGapTracker {
     /// Total stale LTP alerts emitted (for metrics/alerting).
     total_stale_alerts: u64,
     /// Aggregated warning gaps since last summary log (security_id, gap_secs).
-    /// Flushed every LOG_SUMMARY_INTERVAL_SECS into a single summary line.
+    /// Flushed every `LOG_SUMMARY_INTERVAL_SECS` into a single summary line.
+    ///
+    /// ⚠ UNBOUNDED WITHIN A FLUSH WINDOW, and the `with_capacity(64)` at
+    /// construction is a PRE-SIZE, not a bound (the distinction CLAUDE.md's
+    /// O(1) table records as insufficient for `oms/engine` and
+    /// `order_runtime`). One entry is pushed per WARN EVENT, not per
+    /// instrument — and unlike the ERROR arm, which latches on
+    /// `error_gap_alerted`, the WARN arm has NO edge latch, so a single
+    /// instrument gapping repeatedly pushes repeatedly. Its only drain is
+    /// `flush_warning_summary`, called from inside `record_tick` and gated on
+    /// 30 seconds elapsed, so a burst inside one window is bounded by nothing
+    /// but the burst.
+    ///
+    /// DORMANT, which is why this is recorded rather than repaired:
+    /// `record_tick` has ZERO production callers (`main.rs` states "no
+    /// producer today", and the surviving caller is
+    /// `detect_stale_instruments`). The Vec cannot grow at all as the tree
+    /// stands, and optimising a structure with no live writer changes nothing
+    /// a trade depends on — the 2026-08-20 `spot_bar_store` lesson.
+    ///
+    /// The correct fix WHEN a tick producer is wired is an edge latch on the
+    /// WARN arm mirroring `error_gap_alerted`, NOT a cap: a latch bounds this
+    /// at one entry per instrument AND stops the duplicate warnings at
+    /// source, where a cap would silently discard real gaps.
     pending_warn_gaps: Vec<(u64, u32)>,
     /// Wall-clock of last summary log emission.
     last_summary_log: Instant,
@@ -329,7 +352,24 @@ impl TickGapTracker {
             .unwrap_or(0);
 
         // Include up to 3 worst security_ids for debugging.
-        // O(1) EXEMPT: begin — cold path, called once every 30s (not per tick)
+        //
+        // O(1) EXEMPT: begin — O(n log n) sort + one `format!` per sample,
+        // where n is the warnings accumulated since the last flush.
+        //
+        // ⚠ CORRECTED 2026-09-08. This marker read "cold path, called once
+        // every 30s (not per tick)". The CADENCE is 30 seconds; the CONTEXT
+        // is not cold — `flush_warning_summary` is called SYNCHRONOUSLY from
+        // inside `record_tick`, which is the per-tick entry point. It is a
+        // periodic pause of the caller, not background work, exactly as
+        // CLAUDE.md draws the distinction for `catch_up_seal_all`.
+        //
+        // The verdict is unchanged and still EXEMPT: n is small, the work is
+        // bounded by the flush interval, and a summary line is worth its cost.
+        // What was wrong is only the WORDS — "cold path" tells a reader
+        // auditing the tick path for allocations to stop reading here, and
+        // this block allocates. That is the reassuring-direction staleness
+        // CLAUDE.md's O(1) table header exists to warn about, and it is the
+        // more expensive direction to be wrong in.
         self.pending_warn_gaps
             .sort_unstable_by_key(|&(_, gap)| std::cmp::Reverse(gap));
         let worst_3: Vec<_> = self.pending_warn_gaps.iter().take(3).collect();

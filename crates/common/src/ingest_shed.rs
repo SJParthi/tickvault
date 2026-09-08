@@ -318,14 +318,45 @@ pub fn wal_apply_lag_growing() -> u32 {
 /// which clears only on a real fall — so a second band here would be a second
 /// place for the two to disagree, which the runway trigger's own header calls
 /// out as "two bugs to be found separately".
+///
+/// # Why this takes NO `current`, unlike every sibling in this module
+///
+/// ⚠ It took one on 2026-09-08, for a few hours, and that was a REAL DEFECT
+/// found by an adversarial sweep of this very commit. The body was
+/// `current.max(ShedLevel::InlineDepth)`, which looked like the same
+/// never-de-escalate discipline the fractional and runway triggers use. It
+/// is not. Those two READ `current` because they own restore BANDS — they
+/// must know where they are to decide whether to hand a rung back. This one
+/// has no restore band at all, so reading `current` bought nothing and cost
+/// this:
+///
+/// The disk trigger can legitimately return `None` from `AllDepth` once the
+/// volume recovers (`free_fraction >= RESTORE_INLINE_DEPTH_ABOVE_FREE`) —
+/// which is exactly what the nightly archival reclaim produces. With
+/// `current` folded in here, that became
+/// `max(None, AllDepth.max(InlineDepth)) = AllDepth`, **permanently**, for as
+/// long as any one table stayed lag-latched. The header above refuses to
+/// escalate to `AllDepth` because it would drop 96% of depth rows on evidence
+/// that justified 42% — and the ratchet reached that outcome anyway, through
+/// the other door: not by escalating, but by making the disk's restore
+/// unreachable.
+///
+/// Passing `current` was also REDUNDANT for its stated purpose. The caller
+/// already composes `decide_shed_level_with_runway(current, ..)` into the same
+/// `max`, so a shed the disk CURRENTLY warrants is carried there. All
+/// `current` added here was memory of a shed the disk no longer wants.
+///
+/// So the contract is now structural rather than promised: with no `current`
+/// in scope, this function cannot latch, and a future edit that wants it back
+/// has to change the signature and answer this comment.
 #[must_use]
-fn decide_shed_level_by_apply_lag(current: ShedLevel, growing_tables: u32) -> ShedLevel {
+fn decide_shed_level_by_apply_lag(growing_tables: u32) -> ShedLevel {
     if growing_tables == 0 {
         // Asks for nothing. Composed with `max`, so this can never UNDO a
         // shed another signal is holding — it simply declines to add one.
         return ShedLevel::None;
     }
-    current.max(ShedLevel::InlineDepth)
+    ShedLevel::InlineDepth
 }
 
 /// Converts the disk-pressure loop's percent-USED reading into the free
@@ -755,10 +786,7 @@ pub fn decide_shed_level_all_signals(
         session_burn_bytes,
         retention_at_floor,
     )
-    .max(decide_shed_level_by_apply_lag(
-        current,
-        wal_lag_growing_tables,
-    ));
+    .max(decide_shed_level_by_apply_lag(wal_lag_growing_tables));
 
     let Some((anchor_free, anchor_secs)) = anchor else {
         return by_configured;
@@ -1456,7 +1484,7 @@ mod tests {
                                         burn,
                                         at_floor,
                                     );
-                                    let by_lag = decide_shed_level_by_apply_lag(current, lag);
+                                    let by_lag = decide_shed_level_by_apply_lag(lag);
                                     assert!(
                                         all >= fraction_only && all >= configured && all >= by_lag,
                                         "combining signals made the gate QUIETER: \
@@ -1502,17 +1530,15 @@ mod tests {
     }
 
     #[test]
-    fn no_growing_tables_asks_for_nothing_at_every_level() {
+    fn no_growing_tables_asks_for_nothing() {
         // Zero is also the value at process start, before the watcher's first
         // poll. It must never be read as a reason to shed, and — composed
         // with `max` — never as a reason to restore either.
-        for &current in &[ShedLevel::None, ShedLevel::InlineDepth, ShedLevel::AllDepth] {
-            assert_eq!(
-                decide_shed_level_by_apply_lag(current, 0),
-                ShedLevel::None,
-                "an unmeasured or healthy database must ask for nothing"
-            );
-        }
+        assert_eq!(
+            decide_shed_level_by_apply_lag(0),
+            ShedLevel::None,
+            "an unmeasured or healthy database must ask for nothing"
+        );
     }
 
     #[test]
@@ -1523,7 +1549,7 @@ mod tests {
         // which is the point, because no such number has been measured.
         for &tables in &[1_u32, 2, 14, 256, u32::MAX] {
             assert_eq!(
-                decide_shed_level_by_apply_lag(ShedLevel::None, tables),
+                decide_shed_level_by_apply_lag(tables),
                 ShedLevel::InlineDepth,
                 "{tables} stuck tables must arm inline depth, and only inline depth"
             );
@@ -1531,17 +1557,64 @@ mod tests {
     }
 
     #[test]
-    fn a_growing_backlog_never_de_escalates_a_shed_the_disk_earned() {
-        // `current.max(..)` rather than a bare return. A box already at
-        // AllDepth because the volume is nearly full must not be walked back
-        // to InlineDepth by a signal that only ever justified the lower rung.
-        assert_eq!(
-            decide_shed_level_by_apply_lag(ShedLevel::AllDepth, 3),
-            ShedLevel::AllDepth
+    fn a_recovered_disk_is_handed_back_even_while_the_database_is_still_stuck() {
+        // ⚠ REPLACES `a_growing_backlog_never_de_escalates_a_shed_the_disk_earned`,
+        // which asserted a RATCHET and was therefore pinning a defect.
+        //
+        // That test read `decide_shed_level_by_apply_lag(AllDepth, 3) ==
+        // AllDepth` and called it "never de-escalates a shed the disk
+        // earned". Its own name was the tell: once the volume recovers, the
+        // disk no longer WANTS that shed, and its restore band is the
+        // mechanism for handing the rung back. Folding `current` in here made
+        // that band unreachable, so a box that hit AllDepth on a full volume
+        // and then fully recovered — the nightly archival reclaim — would sit
+        // at AllDepth for the life of the process, dropping 96% of depth rows
+        // on evidence that justified 42%.
+        //
+        // This asserts the property that actually matters, at the level where
+        // it actually lives: the COMBINED decision. A shed the disk currently
+        // warrants is still carried, because the same `max` folds in
+        // `decide_shed_level_with_runway(current, ..)`.
+
+        // Disk fully recovered (55% free, no burn, retention fine), database
+        // still stuck, gate currently at the deepest rung.
+        let recovered = decide_shed_level_all_signals(
+            ShedLevel::AllDepth,
+            0.55,
+            300_000_000_000,
+            0,
+            false,
+            None,
+            4 * H,
+            39_600,
+            3,
         );
         assert_eq!(
-            decide_shed_level_by_apply_lag(ShedLevel::InlineDepth, 3),
-            ShedLevel::InlineDepth
+            recovered,
+            ShedLevel::InlineDepth,
+            "a recovered disk must hand back the deep rung; only the cheap \
+             rung the database is still asking for may remain"
+        );
+
+        // And the other direction, unchanged: a disk that STILL wants the
+        // deepest rung keeps it, because the runway/fraction signal carries it
+        // through the same `max`.
+        let still_full = decide_shed_level_all_signals(
+            ShedLevel::AllDepth,
+            0.01,
+            1_000,
+            0,
+            true,
+            None,
+            4 * H,
+            39_600,
+            3,
+        );
+        assert_eq!(
+            still_full,
+            ShedLevel::AllDepth,
+            "a database asking for the cheap rung must never walk back a shed \
+             the disk currently warrants"
         );
     }
 
@@ -1617,7 +1690,7 @@ mod tests {
         publish_wal_apply_lag_growing(3);
         assert_eq!(wal_apply_lag_growing(), 3);
         assert_eq!(
-            decide_shed_level_by_apply_lag(ShedLevel::None, wal_apply_lag_growing()),
+            decide_shed_level_by_apply_lag(wal_apply_lag_growing()),
             ShedLevel::InlineDepth,
             "what is read back must be what the gate decides on"
         );

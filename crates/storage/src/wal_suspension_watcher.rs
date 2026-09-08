@@ -496,14 +496,27 @@ pub const WAL_SUSPENDED_TABLES_GAUGE_BLIND: f64 = -1.0;
 /// That state is operationally identical to suspension (ILP keeps ACKing;
 /// rows stop becoming visible) and had no detector at all.
 ///
-/// # Why "growing", not "large"
+/// # Why "not falling", not "large"
 ///
 /// This repository has never measured what a normal session's peak lag looks
 /// like, and picking an absolute number without that measurement is the
-/// exact failure this detector exists to correct. Monotonic growth needs no
-/// baseline: a healthy busy table's lag oscillates as apply catches up, a
-/// stuck one's only rises. The floor suppresses noise; the growth is the
-/// signal.
+/// exact failure this detector exists to correct. A relative test needs no
+/// baseline: a healthy busy table's lag OSCILLATES as apply catches up, so a
+/// fall clears the count; a stuck one's never falls. The floor suppresses
+/// noise; the absence of a fall is the signal.
+///
+/// CORRECTED 2026-09-08 by a hostile re-read: this paragraph said "a stuck
+/// one's only rises", which reads as a test for STRICT growth. The code has
+/// always tested NON-DECREASING (`if lag < entry.last_lag` resets, so
+/// `lag == last_lag` counts), and that is the behaviour worth keeping rather
+/// than the sentence: a lag pinned FLAT at 27,000 txns above the floor is a
+/// backlog that never drains, and every row inside it is un-queryable for as
+/// long as it holds. For the thing this signal feeds -- shedding order-book
+/// writes so apply can catch up -- flat and rising call for the identical
+/// response, and treating flat as healthy would have withheld it exactly when
+/// the backlog had stopped moving. Only the wording was wrong, and it was
+/// wrong in the direction that would have prompted someone to "fix" the code
+/// toward less protection.
 ///
 /// Pure and allocation-free per observation apart from the map itself, which
 /// is bounded by the table count (~30 in this product). Edge-latched: a
@@ -535,7 +548,62 @@ impl WalLagTracker {
     ///
     /// A table already reported stays silent until its lag actually falls,
     /// which clears the latch (Rule 4: edge-triggered alerts).
+    ///
+    /// This is the COMPLETE-view form. A partial parse must go through
+    /// [`Self::observe_with_completeness`] instead, or a table that vanished
+    /// only because its row failed to parse stays latched forever -- see the
+    /// note there.
     pub fn observe(&mut self, rows: &[WalTableRow]) -> Vec<(String, i64)> {
+        self.observe_with_completeness(rows, true)
+    }
+
+    /// Feed one SUCCESSFUL but possibly PARTIAL poll's rows.
+    ///
+    /// `complete` is false when the parse skipped one or more malformed rows.
+    ///
+    /// # Why absence must evict on a COMPLETE view
+    ///
+    /// Before 2026-09-08 this map had no removal site at all -- `grep` for
+    /// `.remove` / `.retain` / `.clear` across this file returned zero. A
+    /// table latched `reported = true` that then stopped appearing in `rows`
+    /// (dropped, renamed, or lost to the parse-skip path this module already
+    /// documents happening on 2026-08-26) kept [`Self::reported_count`] at
+    /// one or more for the PROCESS LIFETIME. That count is now the input to
+    /// the ingest shed, so a single stale name pinned depth shedding on for
+    /// the rest of the session with nothing anywhere saying why -- a shed
+    /// that cannot be handed back is strictly worse than one that never
+    /// armed, because it silently costs order-book capture on a healthy box.
+    ///
+    /// The sibling [`WalSuspensionTracker`] never had this problem: it
+    /// rebuilds its whole set every poll, so absence clears itself. This
+    /// tracker accumulates instead, which is what makes an explicit eviction
+    /// necessary.
+    ///
+    /// # Why it must NOT evict on a PARTIAL view
+    ///
+    /// Identical reasoning to the sibling's falling edge: on a partial poll,
+    /// absence is SILENCE, not a report. Evicting there would clear the latch
+    /// of a genuinely-stuck table on the very drift that made the view
+    /// partial, and the next poll would re-arm it from zero -- turning a
+    /// latched episode into a five-minute sawtooth that never reaches the
+    /// shed it was built to trigger.
+    pub fn observe_with_completeness(
+        &mut self,
+        rows: &[WalTableRow],
+        complete: bool,
+    ) -> Vec<(String, i64)> {
+        if complete {
+            // A complete view is first-hand evidence about every table the
+            // server has. A tracked name missing from it no longer exists,
+            // so its latch is stale by construction.
+            let present: std::collections::HashSet<&str> =
+                rows.iter().map(|r| r.name.as_str()).collect();
+            self.state.retain(|name, _| present.contains(name.as_str()));
+        }
+        self.observe_inner(rows)
+    }
+
+    fn observe_inner(&mut self, rows: &[WalTableRow]) -> Vec<(String, i64)> {
         let mut fired = Vec::new();
         for row in rows {
             let (Some(seq), Some(writer)) = (row.sequencer_txn, row.writer_txn) else {
@@ -615,6 +683,16 @@ impl WalLagTracker {
     #[must_use]
     pub fn tracked_len(&self) -> usize {
         self.state.len()
+    }
+
+    /// The table names the lag map currently holds.
+    ///
+    /// Exists so the cap's REFUSAL is assertable by identity and not only by
+    /// count: a map that evicted an incumbent to admit a newcomer has the
+    /// same `tracked_len` as one that refused the newcomer, and those are
+    /// opposite behaviours.
+    pub fn tracked_names(&self) -> impl Iterator<Item = &str> {
+        self.state.keys().map(String::as_str)
     }
 
     #[must_use]
@@ -877,13 +955,13 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // The 2026-08-25 gap: a table can stop applying rows
                     // WITHOUT the `suspended` flag ever being set, and that
                     // is the state that actually happened. See
-                    // `WalLagTracker` for why the signal is growth rather
-                    // than magnitude.
+                    // `WalLagTracker` for why the signal is relative (a lag
+                    // that will not fall) rather than absolute magnitude.
                     // The GAUGE fires every poll (the number an operator asks for
-                    // mid-incident); the growth signal below fires only on a
-                    // sustained climb and so cannot answer "how far behind now".
+                    // mid-incident); the latch below fires only after a sustained
+                    // non-falling window and so cannot answer "how far behind now".
                     emit_wal_apply_lag_gauge(&rows);
-                    let growing = lag_tracker.observe(&rows);
+                    let growing = lag_tracker.observe_with_completeness(&rows, skipped == 0);
                     // The join to the ingest shed gate.
                     //
                     // Published on EVERY parsed poll, not only when a table
@@ -1561,6 +1639,139 @@ mod tests {
         assert_eq!(m.reported_count(), 0);
     }
 
+    /// A lag pinned PERFECTLY FLAT above the floor still latches.
+    ///
+    /// Pins DEFECT 3 of the 2026-09-08 hostile pass, which read the tracker's
+    /// prose ("a stuck one's only rises") as a promise of a STRICT-growth
+    /// test and found the code testing NON-DECREASING instead. The prose was
+    /// corrected rather than the code: a backlog that never moves is one
+    /// whose rows never become queryable, which is the harm this signal
+    /// exists to trigger a shed for. Written as a test so a future reader
+    /// cannot "restore" strict growth and quietly withdraw the protection.
+    #[test]
+    fn a_lag_pinned_perfectly_flat_above_the_floor_still_latches() {
+        let mut t = WalLagTracker::new();
+        let mut fired_at = None;
+        for poll in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            // Byte-identical lag every single poll: 27,089 behind, the live
+            // reading recorded on 2026-09-08 when it stopped climbing.
+            let fired = t.observe(&[lag_row("market_depth", 127_089, 100_000)]);
+            if !fired.is_empty() {
+                assert_eq!(fired[0].1, 27_089);
+                fired_at = Some(poll);
+                break;
+            }
+        }
+        assert_eq!(
+            fired_at,
+            Some(WAL_APPLY_LAG_GROWING_POLLS),
+            "a lag that is flat above the floor never drains and must latch on \
+             the same poll a rising one does — flat and rising call for the \
+             identical response from the shed this feeds"
+        );
+    }
+
+    /// A COMPLETE poll that no longer names a latched table evicts it.
+    ///
+    /// Pins DEFECT 2 of the 2026-09-08 hostile pass. Before that fix this map
+    /// had no removal site anywhere, so `reported_count()` — now the ingest
+    /// shed's input — could never fall back to zero once a name latched and
+    /// then vanished. The shed would have stayed armed for the process
+    /// lifetime with nothing saying why.
+    #[test]
+    fn observe_with_completeness_evicts_a_latched_table_a_complete_poll_no_longer_names() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        assert_eq!(
+            t.reported_count(),
+            1,
+            "precondition: the table must actually be latched"
+        );
+
+        // The table is gone from a COMPLETE view — dropped, renamed, or the
+        // 2026-09-05 wipe. Another healthy table keeps the poll non-empty so
+        // this is not the suspicious-empty shape.
+        let fired = t.observe(&[lag_row("ticks", 100_100, 100_000)]);
+        assert!(
+            fired.is_empty(),
+            "a healthy table below the floor fires nothing"
+        );
+        assert_eq!(
+            t.reported_count(),
+            0,
+            "a name absent from a COMPLETE view is stale and must be evicted, \
+             or the shed it feeds can never be handed back"
+        );
+        assert_eq!(
+            t.tracked_len(),
+            1,
+            "only the table the server named is kept"
+        );
+    }
+
+    /// A PARTIAL poll must NOT evict — absence there is silence, not a report.
+    ///
+    /// The mirror of the sibling tracker's 2026-08-26 correction. Evicting on
+    /// a partial view would clear a genuinely-stuck table's latch on exactly
+    /// the drift that made the view partial, and it would re-arm from zero
+    /// next poll: a five-minute sawtooth that never reaches the shed.
+    #[test]
+    fn observe_with_completeness_never_evicts_a_table_a_partial_poll_could_not_see() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        assert_eq!(t.reported_count(), 1, "precondition: latched");
+
+        // Same rows as the eviction test above, but the parse skipped some.
+        t.observe_with_completeness(&[lag_row("ticks", 100_100, 100_000)], false);
+        assert_eq!(
+            t.reported_count(),
+            1,
+            "on a PARTIAL view the missing table is unobserved, not recovered"
+        );
+        assert_eq!(t.tracked_len(), 2, "the latched table is still tracked");
+
+        // And the eviction still happens the moment a complete view arrives.
+        t.observe_with_completeness(&[lag_row("ticks", 100_100, 100_000)], true);
+        assert_eq!(
+            t.reported_count(),
+            0,
+            "the first COMPLETE view after the drift clears the stale latch"
+        );
+    }
+
+    /// The name accessor reports exactly what the map holds.
+    ///
+    /// Exists because the cap test asserts a REFUSAL by identity, and an
+    /// accessor that quietly disagreed with the map would make that
+    /// assertion pass while the opposite behaviour shipped.
+    #[test]
+    fn tracked_names_reports_exactly_what_the_map_holds() {
+        let mut t = WalLagTracker::new();
+        assert_eq!(
+            t.tracked_names().count(),
+            0,
+            "a fresh tracker holds nothing"
+        );
+
+        t.observe(&[
+            lag_row("ticks", 100, 100),
+            lag_row("market_depth", 100, 100),
+        ]);
+        let mut names: Vec<&str> = t.tracked_names().collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["market_depth", "ticks"]);
+        assert_eq!(
+            names.len(),
+            t.tracked_len(),
+            "the accessor and the count must never disagree — the cap test \
+             asserts a refusal through both"
+        );
+    }
+
     /// Recovery clears the latch, so a SECOND genuine episode pages again.
     /// Without this the first stall of the day would be the only one ever
     /// reported.
@@ -1690,25 +1901,44 @@ mod tests {
     /// (~30 in this product)" — caller convention, not a bound. `row.name` is
     /// server-supplied, so a QuestDB that starts reporting per-partition names
     /// would grow it for the process lifetime.
+    ///
+    /// REWRITTEN 2026-09-08 with the eviction fix. The original built its
+    /// scenario by sending the over-cap name in a poll of its OWN — which,
+    /// once absence on a COMPLETE view evicts, legitimately means "the server
+    /// now has exactly one table", so the map empties and the newcomer is
+    /// admitted with room to spare. The old shape was never the real one
+    /// either: `wal_tables()` returns EVERY table on EVERY poll, so the cap
+    /// can only ever be reached by a single poll carrying more names than the
+    /// ceiling. Testing it that way exercises the refusal for real instead of
+    /// through an arrangement the server cannot produce.
     #[test]
     fn the_lag_tracker_refuses_a_new_table_past_its_ceiling() {
         let mut t = WalLagTracker::new();
-        // Fill to the ceiling.
-        let rows: Vec<WalTableRow> = (0..MAX_LAG_TRACKED_TABLES)
+        let full: Vec<WalTableRow> = (0..MAX_LAG_TRACKED_TABLES)
             .map(|i| lag_row(&format!("t{i}"), 100, 100))
             .collect();
-        t.observe(&rows);
+        t.observe(&full);
         assert_eq!(t.tracked_len(), MAX_LAG_TRACKED_TABLES);
-        // One more distinct name is REFUSED, not admitted.
-        t.observe(&[lag_row("one_too_many", 100, 100)]);
+
+        // The real shape: one poll naming every existing table PLUS a new one.
+        let mut over_cap = full.clone();
+        over_cap.push(lag_row("one_too_many", 100, 100));
+        t.observe(&over_cap);
         assert_eq!(
             t.tracked_len(),
             MAX_LAG_TRACKED_TABLES,
             "past the ceiling a NEW table is refused; the map is a fixed size"
         );
+        assert!(
+            !t.tracked_names().any(|n| n == "one_too_many"),
+            "the refused name must not be the one that got in"
+        );
+
         // An ALREADY-tracked table keeps working — refusal must not blind the
         // detector to what it was already watching.
-        let fired = t.observe(&[lag_row("t0", 500_000, 100)]);
+        let mut climbing = over_cap.clone();
+        climbing[0] = lag_row("t0", 500_000, 100);
+        let fired = t.observe(&climbing);
         assert!(
             fired.is_empty(),
             "one poll is not yet the growing condition"
