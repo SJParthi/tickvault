@@ -152,3 +152,29 @@ Worst-case wire cost with today's caps at 5 s: 300 swaps/min = 600 messages/min 
 | Not possible from this container | `cargo audit` / `cargo deny` (not installed); live CloudWatch/QuestDB reads (tickvault-logs MCP failed to connect); the GitHub MCP had bad credentials, so PR state came from the public REST API |
 
 ## 8. Build verification on the PR #1901 head
+
+Run in a clean worktree of `b89f2720e`, cold build, each step under `timeout 1500`; nothing in the worktree was modified.
+
+| Step | Command | Result | Verdict |
+|---|---|---|---|
+| 1 | `cargo fmt --all --check` | no diff, exit 0 | PASS |
+| 2 | `cargo test -p tickvault-app --lib -- contract_underlying_map dhan_contract_universe volume_leaderboard depth200 depth20 depth_seed depth_subscription_view spot_price_store` | `ok. 396 passed; 0 failed; 2 ignored; 1727 filtered out` | PASS |
+| 3 | `cargo test -p tickvault-common --test rust_only_guard --test browser_surface_and_toolchain_guard --test cloudwatch_app_alarms_wiring --test loss_counter_visibility_guard` | 12 + 27 + 7 + 27 passed; 0 failed | PASS |
+| 4 | `cargo test -p tickvault-storage --test loss_series_seeding_guard --test dedup_segment_meta_guard --test emf_selector_producer_guard` | 9 + 3 + 7 passed; 0 failed | PASS |
+| 5 | `cargo test -p tickvault-trading --test dhan_exit_order_lockout_guard` | `ok. 14 passed; 0 failed` | PASS |
+| 6 | `cargo clippy -p tickvault-app --lib -- -D warnings -W clippy::perf` | zero warnings | PASS |
+| 7 | `bash .claude/hooks/banned-pattern-scanner.sh` (main) | exit 0 | PASS |
+
+**What this does and does not prove.** Every requested gate is green on the PR head, which matches CI. None of these steps can detect the duplicated `#[test]` (§2): rustc emits only a warning for a duplicated attribute, the orphaned function compiles silently, and the filtered run above counts what ran, not what was meant to run. The proof of that defect is `git show origin/claude/pensive-heisenberg-u2by0j:crates/app/src/contract_underlying_map.rs | sed -n '1131,1132p;1225p'`.
+
+## 9. Ordered next actions (each a separate PR, one at a time per the serial-PR rule)
+
+1. Fix PR #1901's duplicated `#[test]` and the "+7" claim; merge it (it is otherwise sound).
+2. Open a fresh branch cherry-picking the five salvageable `claude/integration` hunks; close `claude/integration` without merging.
+3. Seed the four `tv_dhan_feed_depth_total` ghost outcomes at zero, then read one live session to settle the unsubscribe RequestCode. This is step 0 of the 5-second cadence.
+4. Implement the futures-primary ATM lock (§4) or record explicitly that it is deferred; today the rule and the code disagree.
+5. Take a budget lever before the $135 line: the operator's call between the Quote 17 I/O revert (saves $34.20/mo) and the EIP release ($3.60/mo).
+6. Correct `MemoryHigh` or `QDB_MEM_LIMIT` so the two sum below the host; derive them from `/proc/meminfo` the way the RAM-store budget already does.
+7. Add the 804-respawn path, the per-minute rolling swap budget, and the RAM-only 5 s planner arm (§6), then flip the cadence.
+8. Add `tickvault-app` and `tickvault-storage` to the weekly mutation lane; add the five missing tests from B17.
+9. Annotate operator-charter rule 13 and the CLAUDE.md dependency table.
