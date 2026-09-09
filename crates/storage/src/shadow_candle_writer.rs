@@ -439,7 +439,8 @@ impl ShadowCandleWriter {
                 return Ok(());
             }
         }
-        self.buffer
+        let buf = self
+            .buffer
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
             // Feed-provenance label (operator 2026-06-19, "same tables + feed
@@ -478,7 +479,27 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_f64(change_pct) failed")?
             .column_f64("open_gap_pct", row.open_gap_pct)
             .with_context(|| "candle append: column_f64(open_gap_pct) failed")?
-            .at(TimestampNanos::new(row.timestamp_ist_nanos))
+            // The vendor's PENDING order-book totals at this bar's last
+            // observed packet — resting orders, NOT executed volume. Written
+            // unconditionally, `0` included: the fold has already applied the
+            // last-non-zero rule, so a `0` here means the whole bar saw no
+            // book, which is a fact worth storing rather than a gap.
+            .column_i64("total_buy_qty", row.total_buy_qty)
+            .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
+            .column_i64("total_sell_qty", row.total_sell_qty)
+            .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
+        // Net volume is the ONE column deliberately omitted rather than
+        // zero-filled when absent. Omitting an ILP column persists NULL, and
+        // NULL is the honest value for "there was no previous bar to compare
+        // against" — the day's first bar of this timeframe, or one whose
+        // predecessor belongs to a different IST day. Writing `0` there would
+        // draw a FLAT bar on a chart, which is a different claim: `0` means
+        // the price did not move. Two distinct facts, two distinct storages.
+        if let Some(net_volume) = row.net_volume {
+            buf.column_i64("net_volume", net_volume)
+                .with_context(|| "candle append: column_i64(net_volume) failed")?;
+        }
+        buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
         Ok(())
@@ -678,8 +699,9 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.oi_pct_from_prev_day = -0.2;
-        state.volume_pct_from_prev_day = 12.3;
+        state.bucket_open_prev_close = 24_200.10;
+        state.total_buy_qty = 89_600;
+        state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, feed)
     }
 
@@ -1206,6 +1228,9 @@ mod tests {
             open_pct: 0.4,
             change_pct: 1.5,
             open_gap_pct: 0.2,
+            net_volume: Some(1234),
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
         };
         w.append_row(&novel_row).expect("append novel-feed row");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1284,6 +1309,9 @@ mod tests {
                 open_pct: 0.4,
                 change_pct: 1.5,
                 open_gap_pct: 0.2,
+                net_volume: Some(1234),
+                total_buy_qty: 89_600,
+                total_sell_qty: 4_800,
             };
             w.append_row(&row).expect("append per-TF row");
             let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");

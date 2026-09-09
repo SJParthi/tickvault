@@ -136,8 +136,7 @@ impl BufferedSeal {
     /// stamps it as the `feed` SYMBOL so the two feeds never collide under the
     /// shared candle DEDUP key.
     ///
-    /// Note: the `state.close_pct_from_prev_day` / `oi_pct_from_prev_day` /
-    /// `volume_pct_from_prev_day` fields are 0.0 unless the caller
+    /// Note: the `state.close_pct_from_prev_day` field is 0.0 unless the caller
     /// stamps them before constructing. Per locked decision L-H6 the
     /// stamping is the storage-writer slice's job, NOT the cell
     /// type's — the cell type stays segment-agnostic and pct-cache-agnostic.

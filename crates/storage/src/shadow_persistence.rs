@@ -16,7 +16,7 @@
 //!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
 //!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (15 columns)
+//! ## Schema (18 columns)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
@@ -34,7 +34,10 @@
 //!     close_pct_from_prev_day  DOUBLE,
 //!     open_pct                 DOUBLE,
 //!     change_pct               DOUBLE,
-//!     open_gap_pct             DOUBLE
+//!     open_gap_pct             DOUBLE,
+//!     net_volume               LONG,
+//!     total_buy_qty            LONG,
+//!     total_sell_qty           LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
@@ -242,7 +245,10 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 close_pct_from_prev_day     DOUBLE, \
                 open_pct                    DOUBLE, \
                 change_pct                  DOUBLE, \
-                open_gap_pct                DOUBLE\
+                open_gap_pct                DOUBLE, \
+                net_volume                  LONG, \
+                total_buy_qty               LONG, \
+                total_sell_qty              LONG\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
@@ -272,6 +278,28 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         let alter_open_gap_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
         let _ = run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
+        // 2026-09-09: net volume — the bar's volume signed by whether it
+        // closed above or below the bar before it, which is the line Dhan's
+        // chart plots. NULL (never 0) when there is no previous bar to
+        // compare against, so a first-of-day bar is blank rather than flat.
+        //
+        // `total_buy_qty` / `total_sell_qty` are the vendor's PENDING
+        // order-book totals at the bar's last observed packet — resting
+        // orders, NOT executed volume. Nothing may treat their difference as
+        // a buy/sell imbalance of trades.
+        //
+        // Additive + idempotent like every self-heal above: an existing table
+        // gains the columns with NULLs for its historical rows, and no
+        // populated table is ever dropped (SEBI retention).
+        let alter_net_volume =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS net_volume LONG;");
+        let _ = run_ddl(&client, &base_url, table, &alter_net_volume).await;
+        let alter_total_buy_qty =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_buy_qty LONG;");
+        let _ = run_ddl(&client, &base_url, table, &alter_total_buy_qty).await;
+        let alter_total_sell_qty =
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_sell_qty LONG;");
+        let _ = run_ddl(&client, &base_url, table, &alter_total_sell_qty).await;
         // Feed-provenance label (operator 2026-06-19, "same tables + feed
         // column"): broker source (`'dhan'`/`'groww'`). It IS part of the DEDUP
         // key now (`DEDUP_KEY_CANDLES` includes `feed`), so a Dhan candle and a

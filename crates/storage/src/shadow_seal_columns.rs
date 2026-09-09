@@ -120,6 +120,30 @@ pub struct ShadowSealRow {
     /// (today's 09:15 open vs yesterday's close). Lands in the
     /// `open_gap_pct` DOUBLE column (operator request 2026-06-02).
     pub open_gap_pct: f64,
+    /// The bar's volume SIGNED by direction — the line Dhan's chart plots as
+    /// "Net Volume": positive when the bar closed above the previous bar,
+    /// negative when below, `0` when the price did not move.
+    ///
+    /// `None` means **no previous bar to compare against** — the day's first
+    /// bar of this timeframe, a bar whose predecessor belongs to a different
+    /// IST day, or a bar with an unusable close. It lands as a **NULL**
+    /// column, never as `0`: on a chart, `0` draws a flat bar and NULL draws
+    /// nothing, and those are different facts.
+    ///
+    /// Derived at conversion time from
+    /// [`LiveCandleState::net_volume`](tickvault_trading::candles::LiveCandleState::net_volume)
+    /// rather than stored on the state, so it costs no per-instrument RAM.
+    pub net_volume: Option<i64>,
+    /// `LiveCandleState::total_buy_qty` (`u32`) widened to `i64`. The vendor's
+    /// total PENDING BUY-order quantity resting in the book at this bar's last
+    /// observed packet — **not executed volume**. `0` is the vendor's ABSENT
+    /// sentinel (a Ticker-mode packet carries no book), and is persisted as
+    /// `0` rather than NULL because the fold already applied the
+    /// last-non-zero rule: a `0` here means the whole bar saw no book.
+    pub total_buy_qty: i64,
+    /// `LiveCandleState::total_sell_qty` (`u32`) widened to `i64`. Same
+    /// semantics as `total_buy_qty` — pending SELL orders, not trades.
+    pub total_sell_qty: i64,
 }
 
 impl ShadowSealRow {
@@ -168,6 +192,16 @@ impl ShadowSealRow {
             // the per-instrument RAM budget (operator request 2026-06-02).
             change_pct: seal.state.close_pct_from_prev_day,
             open_gap_pct: seal.state.open_gap_pct,
+            // Derived, not stored: the state carries the two INPUTS (the
+            // bar's own volume and the previous bar's close, snapshotted at
+            // bucket open) and this is the one place they become a signed
+            // figure. Keeping the derivation here rather than on
+            // `LiveCandleState` costs no per-instrument RAM at the 25,000-slot
+            // ceiling, and `net_volume()` owns every refusal — non-finite,
+            // non-positive, missing baseline — in one place.
+            net_volume: seal.state.net_volume(),
+            total_buy_qty: i64::from(seal.state.total_buy_qty),
+            total_sell_qty: i64::from(seal.state.total_sell_qty),
         }
     }
 }

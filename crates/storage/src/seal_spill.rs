@@ -55,8 +55,9 @@
 //! | 56   | 8 | `low: f64`                      |
 //! | 64   | 8 | `close: f64`                    |
 //! | 72   | 8 | `close_pct_from_prev_day: f64`  |
-//! | 80   | 8 | `oi_pct_from_prev_day: f64`     |
-//! | 88   | 8 | `volume_pct_from_prev_day: f64` |
+//! | 80   | 8 | `bucket_open_prev_close: f64`   |
+//! | 88   | 4 | `total_buy_qty: u32`            |
+//! | 92   | 4 | `total_sell_qty: u32`           |
 //! | 96   | 8 | `open_pct: f64` (§31 Option 2)  |
 //! | 104  | 8 | `change_pct: f64` (2026-06-02)  |
 //! | 112  | 8 | `open_gap_pct: f64` (2026-06-02)|
@@ -134,8 +135,19 @@ pub struct SerializedSeal {
     pub low: f64,
     pub close: f64,
     pub close_pct_from_prev_day: f64,
-    pub oi_pct_from_prev_day: f64,
-    pub volume_pct_from_prev_day: f64,
+    /// Close of the PREVIOUS sealed bar, snapshotted at bucket open. Occupies
+    /// bytes 80..88 — vacated by `oi_pct_from_prev_day`, whose DDL column was
+    /// removed 2026-05-28 and which has written a literal `0.0` into every
+    /// record since. An OLD record therefore decodes `0.0` here, which is
+    /// exactly the "no baseline" sentinel, so pre-existing spill files replay
+    /// correctly with `net_volume = NULL` and NO format-version bump.
+    pub bucket_open_prev_close: f64,
+    /// Vendor pending buy-order total, bytes 88..92 — the low half of the
+    /// 8 bytes vacated by `volume_pct_from_prev_day` (same 2026-05-28 removal,
+    /// same always-zero guarantee, same backward compatibility).
+    pub total_buy_qty: u32,
+    /// Vendor pending sell-order total, bytes 92..96 — the high half.
+    pub total_sell_qty: u32,
     /// §31 Option 2 (2026-06-01): % vs the official 09:15 session open.
     /// Serialised into the previously-reserved bytes 96..104 — old spill
     /// records (zero padding there) decode `open_pct = 0.0`, backward-compatible.
@@ -178,8 +190,9 @@ impl SerializedSeal {
         buf[56..64].copy_from_slice(&self.low.to_le_bytes());
         buf[64..72].copy_from_slice(&self.close.to_le_bytes());
         buf[72..80].copy_from_slice(&self.close_pct_from_prev_day.to_le_bytes());
-        buf[80..88].copy_from_slice(&self.oi_pct_from_prev_day.to_le_bytes());
-        buf[88..96].copy_from_slice(&self.volume_pct_from_prev_day.to_le_bytes());
+        buf[80..88].copy_from_slice(&self.bucket_open_prev_close.to_le_bytes());
+        buf[88..92].copy_from_slice(&self.total_buy_qty.to_le_bytes());
+        buf[92..96].copy_from_slice(&self.total_sell_qty.to_le_bytes());
         // §31 Option 2: open_pct in the first 8 reserved bytes.
         buf[96..104].copy_from_slice(&self.open_pct.to_le_bytes());
         // Operator request 2026-06-02: change_pct + open_gap_pct.
@@ -250,12 +263,11 @@ impl SerializedSeal {
             close_pct_from_prev_day: f64::from_le_bytes([
                 buf[72], buf[73], buf[74], buf[75], buf[76], buf[77], buf[78], buf[79],
             ]),
-            oi_pct_from_prev_day: f64::from_le_bytes([
+            bucket_open_prev_close: f64::from_le_bytes([
                 buf[80], buf[81], buf[82], buf[83], buf[84], buf[85], buf[86], buf[87],
             ]),
-            volume_pct_from_prev_day: f64::from_le_bytes([
-                buf[88], buf[89], buf[90], buf[91], buf[92], buf[93], buf[94], buf[95],
-            ]),
+            total_buy_qty: u32::from_le_bytes([buf[88], buf[89], buf[90], buf[91]]),
+            total_sell_qty: u32::from_le_bytes([buf[92], buf[93], buf[94], buf[95]]),
             // §31 Option 2: bytes 96..104 (zero in pre-§31 records → 0.0).
             open_pct: f64::from_le_bytes([
                 buf[96], buf[97], buf[98], buf[99], buf[100], buf[101], buf[102], buf[103],
@@ -291,8 +303,8 @@ impl From<&BufferedSeal> for SerializedSeal {
     /// storage-side wire-format record. `O(1)`, zero allocation.
     ///
     /// Field-by-field copy. The 3 Wave-5 pct fields
-    /// (`close_pct_from_prev_day` / `oi_pct_from_prev_day` /
-    /// `volume_pct_from_prev_day`) are carried through unchanged —
+    /// (`close_pct_from_prev_day` / `bucket_open_prev_close` /
+    /// `total_buy_qty` / `total_sell_qty`) are carried through unchanged —
     /// per locked decision L-H6 they're stamped by the seal-time
     /// caller BEFORE the seal enters the ring, so by the time we
     /// serialise them the values are already correct (or 0.0 on
@@ -318,8 +330,9 @@ impl From<&BufferedSeal> for SerializedSeal {
             low: b.state.low,
             close: b.state.close,
             close_pct_from_prev_day: b.state.close_pct_from_prev_day,
-            oi_pct_from_prev_day: b.state.oi_pct_from_prev_day,
-            volume_pct_from_prev_day: b.state.volume_pct_from_prev_day,
+            bucket_open_prev_close: b.state.bucket_open_prev_close,
+            total_buy_qty: b.state.total_buy_qty,
+            total_sell_qty: b.state.total_sell_qty,
             open_pct: b.state.open_pct,
             // change_pct == close_pct_from_prev_day (derived, not a state field).
             change_pct: b.state.close_pct_from_prev_day,
@@ -352,8 +365,9 @@ impl SerializedSeal {
         state.oi = self.oi;
         state.tick_count = self.tick_count;
         state.close_pct_from_prev_day = self.close_pct_from_prev_day;
-        state.oi_pct_from_prev_day = self.oi_pct_from_prev_day;
-        state.volume_pct_from_prev_day = self.volume_pct_from_prev_day;
+        state.bucket_open_prev_close = self.bucket_open_prev_close;
+        state.total_buy_qty = self.total_buy_qty;
+        state.total_sell_qty = self.total_sell_qty;
         // §31 Option 2: already-stamped at original seal; session_open is
         // irrelevant on replay (open_pct is the persisted value).
         state.open_pct = self.open_pct;
@@ -963,8 +977,9 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            oi_pct_from_prev_day: -0.2,
-            volume_pct_from_prev_day: 12.3,
+            bucket_open_prev_close: 24_200.10,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
             open_pct: 7.7,
             change_pct: 1.5,
             open_gap_pct: 0.8,
@@ -1023,8 +1038,9 @@ mod tests {
             low: 0.0,
             close: 0.0,
             close_pct_from_prev_day: -3.5,
-            oi_pct_from_prev_day: -10.0,
-            volume_pct_from_prev_day: -100.0,
+            bucket_open_prev_close: -10.0,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
             open_pct: -50.0,
             change_pct: -3.5,
             open_gap_pct: -1.2,
@@ -1659,8 +1675,9 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.oi_pct_from_prev_day = -0.2;
-        state.volume_pct_from_prev_day = 12.3;
+        state.bucket_open_prev_close = 24_200.10;
+        state.total_buy_qty = 89_600;
+        state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 
@@ -1681,8 +1698,9 @@ mod tests {
         assert_eq!(serialised.low, 99.0);
         assert_eq!(serialised.close, 102.5);
         assert_eq!(serialised.close_pct_from_prev_day, 1.5);
-        assert_eq!(serialised.oi_pct_from_prev_day, -0.2);
-        assert_eq!(serialised.volume_pct_from_prev_day, 12.3);
+        assert_eq!(serialised.bucket_open_prev_close, 24_200.10);
+        assert_eq!(serialised.total_buy_qty, 89_600);
+        assert_eq!(serialised.total_sell_qty, 4_800);
     }
 
     #[test]
@@ -1799,13 +1817,10 @@ mod tests {
             original.state.close_pct_from_prev_day
         );
         assert_eq!(
-            recovered.state.oi_pct_from_prev_day,
-            original.state.oi_pct_from_prev_day
+            recovered.state.bucket_open_prev_close,
+            original.state.bucket_open_prev_close
         );
-        assert_eq!(
-            recovered.state.volume_pct_from_prev_day,
-            original.state.volume_pct_from_prev_day
-        );
+        assert_eq!(recovered.state.total_buy_qty, original.state.total_buy_qty);
     }
 
     #[test]
