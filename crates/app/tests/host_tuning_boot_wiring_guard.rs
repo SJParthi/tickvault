@@ -331,10 +331,33 @@ fn deploy_self_heals_a_stale_questdb_memory_cap() {
     // Writing the value without recreating the container would fix the FILE and
     // leave the RUNNING database throttled until something else happened to
     // restart it — a fix that reports success while changing nothing.
+    //
+    // 2026-09-09 — THE NAME. This assertion read `--force-recreate questdb`
+    // for the whole life of the step, and it PASSED the entire time, on a
+    // command that could never do anything: the compose service is
+    // `tv-questdb` (deploy/docker/docker-compose.yml), so `questdb` matched no
+    // service, and the step's own `|| echo WARNING` swallowed the miss. The
+    // guard was not merely wrong about a spelling — it CERTIFIED A NO-OP, and
+    // a reader auditing "does the corrected cap reach the running container?"
+    // would have found this green and stopped. That is the false-OK class this
+    // repository's audit rules forbid, arriving inside the guard written to
+    // prevent it, and it is the same lesson the comment above records about
+    // literal anchoring: a literal that is WRONG is worse than a literal that
+    // is merely brittle, because a brittle one fails loudly.
+    //
+    // Anchored on the real service name now, and the dead spelling is asserted
+    // GONE so a revert cannot pass by putting the correct name beside it.
     assert!(
-        deploy.contains("--force-recreate questdb"),
-        "the deploy path corrects the .env but never recreates questdb, so the \
-         corrected cap would not take effect on the running container"
+        deploy.contains("--force-recreate tv-questdb"),
+        "the deploy path corrects the .env but never recreates tv-questdb, so \
+         the corrected cap would not take effect on the running container"
+    );
+    assert!(
+        !deploy.contains("--force-recreate questdb"),
+        "the deploy path recreates a compose service called `questdb`, which \
+         does not exist — the service is `tv-questdb`. That command is a \
+         silent no-op behind `|| echo WARNING`, so the corrected memory cap \
+         would never reach the running container while every signal read green"
     );
 
     // And it must only recreate when the value actually CHANGED — recreating the

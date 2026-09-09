@@ -385,7 +385,7 @@ jobs:
           IID=${{ steps.iid.outputs.id }}
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb && docker ps --format \"{{.Names}} {{.Status}}\" | grep -i quest"]' \
+            --parameters 'commands=["cd /opt/tickvault/repo/deploy/docker && docker compose restart tv-questdb && docker ps --format \"{{.Names}} {{.Status}}\" | grep -i quest"]' \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
           aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
