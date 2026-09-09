@@ -781,8 +781,11 @@ impl AggregatorCell {
                 prices,
                 bucket_start,
                 bucket_start_cumulative,
-                use_day_open,
-                first_bucket_of_day,
+                BucketOpenContext {
+                    use_day_open,
+                    first_bucket_of_day,
+                    prev_close: net_volume_baseline(&self.last_sealed[ord], bucket_start),
+                },
                 cumulative_volume,
                 fold_secs,
             );
@@ -860,6 +863,15 @@ impl AggregatorCell {
         // risk of a later bucket claiming it.
         if bucket_start > open_start {
             self.armed_for_day_open[ord] = false;
+            // The bar we are about to seal IS the new bar's predecessor, so
+            // its close is read from the OPEN slot here rather than from
+            // `last_sealed` (which still holds the bar before it). Captured
+            // BEFORE the replace: `mem::replace` reserves the mutable borrow
+            // while its second argument is evaluated.
+            //
+            // The day gate still applies — a bucket crossing can itself be a
+            // day boundary when `force_seal_all` did not run overnight.
+            let prev_close_for_new_bucket = net_volume_baseline(&self.slots[ord], bucket_start);
             let mut sealed_state = std::mem::replace(
                 &mut self.slots[ord],
                 open_bucket(
@@ -867,11 +879,14 @@ impl AggregatorCell {
                     prices,
                     bucket_start,
                     bucket_start_cumulative,
-                    false,
-                    // An intraday crossing is never the day's first bar, so
-                    // the running session extremes must NOT be adopted here —
-                    // this is the scope guarantee of plan Item 6.
-                    false,
+                    BucketOpenContext {
+                        use_day_open: false,
+                        // An intraday crossing is never the day's first bar,
+                        // so the running session extremes must NOT be adopted
+                        // here — the scope guarantee of plan Item 6.
+                        first_bucket_of_day: false,
+                        prev_close: prev_close_for_new_bucket,
+                    },
                     cumulative_volume,
                     fold_secs,
                 ),
@@ -1122,11 +1137,15 @@ fn open_bucket(
     prices: TickPrices,
     bucket_start: u32,
     bucket_start_cumulative: u64,
-    use_day_open: bool,
-    first_bucket_of_day: bool,
+    ctx: BucketOpenContext,
     cumulative_volume: u64,
     fold_secs: u32,
 ) -> LiveCandleState {
+    let BucketOpenContext {
+        use_day_open,
+        first_bucket_of_day,
+        prev_close: bucket_open_prev_close,
+    } = ctx;
     let price = prices.last_traded_price;
     // `day_open` is already `0.0` unless the raw field was strictly positive
     // (NaN included), so this test carries the original `> 0.0` semantics.
@@ -1153,9 +1172,16 @@ fn open_bucket(
         // never the raw wire field.
         prev_day_close: prices.day_close,
         close_pct_from_prev_day: 0.0,
-        bucket_open_prev_close: 0.0,
-        total_buy_qty: 0,
-        total_sell_qty: 0,
+        // Snapshotted AT OPEN, never read at seal. `fold_late_hlc` mutates
+        // `last_sealed[ord].close` in place and re-emits only the amended
+        // bar, so a late tick to bar N would otherwise retroactively flip the
+        // sign of bar N+1 — a row already written and never re-emitted.
+        bucket_open_prev_close,
+        // Same last-non-zero rule as `fold_in_bucket`: seed only from a real
+        // reading, so an opening Ticker-mode packet leaves the field at 0
+        // ("absent") for a later Quote/Full packet in this bucket to fill.
+        total_buy_qty: tick.total_buy_quantity,
+        total_sell_qty: tick.total_sell_quantity,
         // Uses the ALREADY-GATED widened value, not the raw wire field. The
         // raw read here was the last hole through which an absurd or
         // subnormal `day_open` reached a persisted column after every other
@@ -1183,6 +1209,56 @@ fn open_bucket(
         adopt_exchange_day_extremes(&mut state, tick);
     }
     state
+}
+
+/// The three per-bucket decisions the caller has already made, bundled so
+/// they cannot be passed in the wrong order.
+///
+/// `use_day_open` and `first_bucket_of_day` are adjacent booleans with
+/// entirely different meanings — positionally they were silently swappable,
+/// and a swap compiles cleanly while corrupting the day's first bar. Naming
+/// them at every call site costs nothing (the struct is three words, `Copy`,
+/// and inlines away) and removes a whole class of quiet mistake.
+#[derive(Clone, Copy, Debug)]
+struct BucketOpenContext {
+    /// Open the bar at the exchange-published session open rather than the
+    /// last traded price — the day's FIRST bar of each timeframe.
+    use_day_open: bool,
+    /// Adopt the exchange-published session extremes as this bar's range.
+    /// **The day's FIRST bucket only** — `day_high`/`day_low` are RUNNING
+    /// session extremes and would smear the day's range across every later bar.
+    first_bucket_of_day: bool,
+    /// Close of the previous sealed bar of this timeframe; `0.0` means "no
+    /// baseline" and makes [`LiveCandleState::net_volume`] report `None`.
+    prev_close: f64,
+}
+
+/// The baseline a bar's net-volume sign is measured against: the close of the
+/// PREVIOUS sealed bar of this timeframe, or `0.0` meaning "no baseline"
+/// (which [`LiveCandleState::net_volume`] reports as `None`, never as flat).
+///
+/// Two refusals, and the second is the one that is easy to miss:
+///
+/// 1. Nothing has sealed yet — the day's first bar of this timeframe has no
+///    predecessor, and `0.0` is the honest answer.
+/// 2. The last seal belongs to a DIFFERENT IST day. `last_sealed` is cleared
+///    only by the day-boundary `force_seal_all`, which runs at shutdown — so
+///    on any day that path did not execute (a crash, a mid-session restart,
+///    a weekend gap) it can still hold YESTERDAY's bar. Signing today's first
+///    bar against yesterday's close reports an OVERNIGHT GAP as intraday
+///    direction, on exactly the bar an operator looks at hardest.
+///
+/// # Complexity
+/// O(1) — two integer divides and a compare. No allocation.
+#[inline]
+fn net_volume_baseline(last_sealed: &LiveCandleState, bucket_start: u32) -> f64 {
+    if last_sealed.is_uninitialised() {
+        return 0.0;
+    }
+    if last_sealed.bucket_start_ist_secs / 86_400 != bucket_start / 86_400 {
+        return 0.0;
+    }
+    last_sealed.close
 }
 
 /// Adopts the exchange-published session extremes into a bar's range.
@@ -1334,6 +1410,26 @@ fn fold_in_bucket(
         crate::candles::fold_counters::fold_counters()
             .oi_zero_ignored
             .increment(1);
+    }
+    // The vendor's PENDING order-book totals, folded under the SAME rule as
+    // OI two blocks up, and for the same reason: `0` is the ABSENT sentinel,
+    // not a book that emptied. A Ticker-mode packet carries no book at all,
+    // and an equity outside its call-auction window reports nothing — so a
+    // lighter packet arriving later must never erase a real reading an
+    // earlier tick in this bucket established.
+    //
+    // "Anything beats nothing, otherwise newest wins" is copied deliberately
+    // rather than simplified to last-non-zero-wins: this feed carries no
+    // sequence number, so an out-of-order packet holding a REAL reading is
+    // strictly better than the 0 we would otherwise keep.
+    //
+    // NOT executed volume. These are resting orders, and nothing downstream
+    // may treat their difference as a buy/sell imbalance of trades.
+    if tick.total_buy_quantity != 0 && (state.total_buy_qty == 0 || tick_is_newest) {
+        state.total_buy_qty = tick.total_buy_quantity;
+    }
+    if tick.total_sell_quantity != 0 && (state.total_sell_qty == 0 || tick_is_newest) {
+        state.total_sell_qty = tick.total_sell_quantity;
     }
     // Exchange cumulative volume only ever rises, so a bucket's traded volume
     // is monotone too. `saturating_sub` bounded the ARITHMETIC against
@@ -1577,6 +1673,141 @@ mod tests {
         newer.open_interest = 4_500;
         cell.consume_tick(TfIndex::M1, &newer, 0, strategy, 30);
         assert_eq!(cell.snapshot(TfIndex::M1).oi, 4_500);
+    }
+
+    // -- net-volume wiring (operator 2026-09-09: reproduce the chart line) ---
+
+    #[test]
+    fn the_days_first_bar_has_no_previous_close_and_reports_no_net_volume() {
+        // The distinction the whole `Option` exists for: the first bar of the
+        // session has no predecessor, which is NOT the same as "the price did
+        // not move". Reporting 0 here would draw a flat bar on a chart where
+        // the honest answer is a blank.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        let first = tick_at(OPEN, 100.00, 500);
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 500);
+
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.bucket_open_prev_close, 0.0, "no baseline exists yet");
+        assert_eq!(bar.net_volume(), None, "blank, never a fabricated flat");
+    }
+
+    #[test]
+    fn the_second_bar_signs_its_volume_against_the_first_bars_close() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // Bar 1 closes at 100.
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
+        // Bar 2 opens in the next minute and trades UP.
+        let up = tick_at(OPEN + 60, 101.00, 1_300);
+        cell.consume_tick(TfIndex::M1, &up, 500, strategy, 1_300);
+
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            bar.bucket_open_prev_close,
+            f32_to_f64_clean(100.00),
+            "the sealing bar's close is the new bar's baseline"
+        );
+        assert_eq!(bar.volume, 800, "1_300 cumulative less the 500 carried in");
+        assert_eq!(
+            bar.net_volume(),
+            Some(800),
+            "closed above the previous bar, so the volume signs positive"
+        );
+    }
+
+    #[test]
+    fn a_bar_that_closes_below_the_previous_one_signs_negative() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
+        let down = tick_at(OPEN + 60, 99.00, 1_100);
+        cell.consume_tick(TfIndex::M1, &down, 500, strategy, 1_100);
+
+        assert_eq!(cell.snapshot(TfIndex::M1).net_volume(), Some(-600));
+    }
+
+    #[test]
+    fn yesterdays_close_is_never_used_as_todays_baseline() {
+        // `last_sealed` is cleared only by the day-boundary force-seal, which
+        // runs at shutdown. On any day that did not happen — a crash, a
+        // mid-session restart, a weekend — it still holds YESTERDAY's bar.
+        // Signing today's first bar against it would report an OVERNIGHT GAP
+        // as intraday direction, on the bar an operator reads hardest.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // Yesterday: two bars, so one genuinely seals.
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 60, 100.00, 900),
+            500,
+            strategy,
+            900,
+        );
+
+        // Today, with no force-seal in between: the first bar of a NEW day.
+        let today = tick_at(OPEN + 86_400, 130.00, 40);
+        cell.consume_tick(TfIndex::M1, &today, 900, strategy, 940);
+
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            bar.bucket_open_prev_close, 0.0,
+            "a cross-day baseline is refused, not carried"
+        );
+        assert_eq!(bar.net_volume(), None);
+    }
+
+    #[test]
+    fn a_blank_book_packet_never_erases_a_real_one() {
+        // `0` is the vendor's ABSENT sentinel — a Ticker-mode packet carries
+        // no book at all. The same rule OI already had, for the same reason.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        let mut with_book = tick_at(OPEN, 100.00, 500);
+        with_book.total_buy_quantity = 89_600;
+        with_book.total_sell_quantity = 4_800;
+        cell.consume_tick(TfIndex::M1, &with_book, 0, strategy, 500);
+
+        // Same bucket, later, no book fields at all.
+        let blank = tick_at(OPEN + 10, 100.50, 700);
+        assert_eq!(blank.total_buy_quantity, 0, "fixture models Ticker mode");
+        cell.consume_tick(TfIndex::M1, &blank, 0, strategy, 700);
+
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.total_buy_qty, 89_600, "a lighter packet is not news");
+        assert_eq!(bar.total_sell_qty, 4_800);
+    }
+
+    #[test]
+    fn an_out_of_order_packet_carrying_a_real_book_beats_holding_nothing() {
+        // This feed carries no sequence number, so "newest wins" alone would
+        // discard a real reading that merely arrived late. Anything beats
+        // nothing; only then does newest win.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // Newest packet first, and it carries no book.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 20, 100.00, 900),
+            0,
+            strategy,
+            900,
+        );
+        // An EARLIER packet arrives afterwards, carrying a real reading.
+        let mut late = tick_at(OPEN + 3, 99.90, 400);
+        late.total_buy_quantity = 12_500;
+        late.total_sell_quantity = 3_100;
+        cell.consume_tick(TfIndex::M1, &late, 0, strategy, 400);
+
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.total_buy_qty, 12_500);
+        assert_eq!(bar.total_sell_qty, 3_100);
     }
 
     pub(super) fn tick_at(ts: u32, price: f32, cum_volume: u32) -> ParsedTick {
