@@ -841,8 +841,9 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.oi_pct_from_prev_day = -0.2;
-        state.volume_pct_from_prev_day = 12.3;
+        state.bucket_open_prev_close = 24_200.10;
+        state.total_buy_qty = 89_600;
+        state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 

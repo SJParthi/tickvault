@@ -1153,8 +1153,9 @@ fn open_bucket(
         // never the raw wire field.
         prev_day_close: prices.day_close,
         close_pct_from_prev_day: 0.0,
-        oi_pct_from_prev_day: 0.0,
-        volume_pct_from_prev_day: 0.0,
+        bucket_open_prev_close: 0.0,
+        total_buy_qty: 0,
+        total_sell_qty: 0,
         // Uses the ALREADY-GATED widened value, not the raw wire field. The
         // raw read here was the last hole through which an absurd or
         // subnormal `day_open` reached a persisted column after every other
