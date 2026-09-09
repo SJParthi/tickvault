@@ -37,7 +37,8 @@
 //! CREATE TABLE IF NOT EXISTS top_volume_rank (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
 //!     segment SYMBOL, rank LONG, security_id LONG,
-//!     underlying_id LONG, volume LONG, gain_pct DOUBLE,
+//!     underlying_id LONG, volume LONG, window_lots_milli LONG,
+//!     gain_pct DOUBLE,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);
@@ -50,12 +51,23 @@
 //! symbol, and inventing one here would be fabrication. Join to
 //! `instrument_lifecycle` for names.
 //!
+//! `window_lots_milli` is THE SORT KEY and `volume` is not, which is the one
+//! thing a reader of this table has to know. `volume` is the vendor's
+//! CUMULATIVE day volume for the contract -- it only ever rises, so ordering
+//! by it would rank "busy since 09:15", not "busy now". `window_lots_milli`
+//! is the lots traded INSIDE the window that just closed, normalised by lot
+//! size and scaled by 1000 (integer milli-lots, never a float): a 1s row
+//! measures one second, a 5s row measures five. Both columns are stored so a
+//! row can be checked against the ranking that produced it.
+//!
 //! ## Honest volume
 //!
 //! At the authorized 250 contracts per family, both families, 09:15-15:39:
 //! 500 rows/second x 22,440 s = ~11.2M rows for the `1s` stream plus ~2.2M
-//! for `5s` -- ~13.4M rows, ~860 MB per session at the ~64 B row width. A
-//! session already writes ~307 GB, so this is ~0.28% -- real, and small.
+//! for `5s` -- ~13.4M rows, ~970 MB per session at the ~72 B row width (the
+//! `window_lots_milli` LONG added 8 B/row on 2026-09-09; the figure was ~860
+//! MB at 64 B and is restated rather than left stale). A session already
+//! writes ~307 GB, so this is ~0.32% -- real, and small.
 //! The `5s` rows are numerically a subset of the `1s` rows and are kept
 //! anyway because they mean something different: a `5s` row is the ranking
 //! that ACTUALLY DROVE a re-steer decision, which is the row an audit wants.
@@ -63,9 +75,9 @@
 //! RETENTION, stated because it is a standing commitment and not a one-day
 //! cost: `HOUR_PARTITIONED_TABLES` membership puts this table in
 //! `RetentionClass::MarketData`, whose window is `market_data_hot_days`
-//! (default 15). ~860 MB/session x 15 sessions is roughly **13 GB resident**
-//! on the 600 GB volume -- about 2%. That is the deliberate trade: 15 days of
-//! "was the busiest contract actually watched?" for 2% of the disk. It is
+//! (default 15). ~970 MB/session x 15 sessions is roughly **14.5 GB resident**
+//! on the 600 GB volume -- about 2.4%. That is the deliberate trade: 15 days of
+//! "was the busiest contract actually watched?" for 2.4% of the disk. It is
 //! NOT exempt from the sweep; an exempt table growing most of a gigabyte a
 //! day is the disk-fill class that cost 2026-09-04 an entire session.
 

@@ -26,6 +26,16 @@
 //! would finally have an operator surface. That part was right: the read-out
 //! deliberately skips `out_of_session`, so both had been invisible.
 //!
+//! **2026-09-09: a THIRD reason joined them** — `future_trading_day`, a tick
+//! the vendor stamped for a LATER IST day than our own receipt clock. It is
+//! candle-only for the identical reason (the row is written; only the bucket
+//! is skipped) and it is on the warn gate, never the pager. Reaching it needs
+//! a clock skew of nine hours or more and it has never been observed, which
+//! makes it exactly the kind of reason a future reader would be tempted to
+//! "promote" to the pager on the grounds that it is rare. Rarity is not the
+//! test — PERMANENCE is. The test is whether the row survives; all three of
+//! these leave the tick in `ticks`, so none of them may latch this alarm.
+//!
 //! The mistake was adding them to *this* gate. Measured on the 2026-08-31
 //! production session:
 //!
@@ -78,8 +88,14 @@ fn feed_stack_src() -> String {
 /// it is a visible diff on this line, not an invisible behavioural change.
 const PAGER_GATE: &str = "if d_price > 0 || d_ts > 0 || d_slot > 0 {";
 
-/// The separate, non-paging gate the two vendor-clock reasons belong on.
-const WARN_GATE: &str = "if d_stale > 0 || d_oob > 0 {";
+/// The separate, non-paging gate the vendor-clock reasons belong on.
+///
+/// Widened to THREE reasons on 2026-09-09 when `refused_future_trading_day`
+/// joined the candle-only set. It belongs here and not on the pager for the
+/// same reason as its two siblings: the ROW IS WRITTEN, only the candle
+/// bucket is skipped, so it is not tick loss and must never latch a
+/// `ok_recovery = false` alarm.
+const WARN_GATE: &str = "if d_stale > 0 || d_oob > 0 || d_future > 0 {";
 
 /// Both gates sit at the same indentation inside the `tokio::select!` arm, so
 /// a block ends at the first closing brace on that indentation.
@@ -106,7 +122,7 @@ fn block_of<'a>(src: &'a str, gate: &str) -> &'a str {
 }
 
 #[test]
-fn the_pager_gate_excludes_the_two_vendor_clock_reasons() {
+fn the_pager_gate_excludes_every_vendor_clock_reason() {
     let src = feed_stack_src();
 
     // Non-vacuity first: if either gate cannot be found the rest of this test
@@ -121,26 +137,30 @@ fn the_pager_gate_excludes_the_two_vendor_clock_reasons() {
     );
     assert!(
         src.contains(WARN_GATE),
-        "the non-paging warn! gate {WARN_GATE:?} is missing — the two \
+        "the non-paging warn! gate {WARN_GATE:?} is missing — the \
          vendor-clock reasons must still be reported somewhere, just never at \
          ERROR level. Deleting it silently restores the blind spot the split \
          was written to close."
     );
 
     let pager_block = block_of(&src, PAGER_GATE);
-    for field in ["refused_stale_trading_day", "refused_out_of_band_timestamp"] {
+    for field in [
+        "refused_stale_trading_day",
+        "refused_out_of_band_timestamp",
+        "refused_future_trading_day",
+    ] {
         assert!(
             !pager_block.contains(field),
             "{field:?} appears inside the AGGREGATOR-DROP-01 pager block. \
-             Both reasons are candle-only — the row IS written — and both run \
-             at vendor-clock rates. They belong on the warn! beneath, never on \
-             a line whose code is metric-filtered at ERROR level."
+             Every one of these is candle-only — the row IS written — and \
+             each runs at vendor-clock rates. They belong on the warn! beneath, \
+             never on a line whose code is metric-filtered at ERROR level."
         );
     }
 }
 
 #[test]
-fn the_warn_block_reports_both_vendor_clock_reasons_and_never_pages() {
+fn the_warn_block_reports_every_vendor_clock_reason_and_never_pages() {
     let src = feed_stack_src();
     let block = block_of(&src, WARN_GATE);
 
@@ -171,7 +191,11 @@ fn the_warn_block_reports_both_vendor_clock_reasons_and_never_pages() {
          error-code-alarms.tf filters that string with NO level predicate, so \
          a warn containing it pages exactly like an error would."
     );
-    for field in ["refused_stale_trading_day", "refused_out_of_band_timestamp"] {
+    for field in [
+        "refused_stale_trading_day",
+        "refused_out_of_band_timestamp",
+        "refused_future_trading_day",
+    ] {
         assert!(
             block.contains(field),
             "{field:?} is missing from the warn! block — it would then have no \
