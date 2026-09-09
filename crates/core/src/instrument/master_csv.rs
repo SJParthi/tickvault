@@ -390,6 +390,68 @@ pub fn parse_strike_paise(value: &str) -> i64 {
     paise
 }
 
+/// `LOT_SIZE` as a whole contract multiplier, or `0` when the field is not
+/// one.
+///
+/// # Why this is not `parse::<u32>()`
+///
+/// Because the vendor does not send an integer. MEASURED against the live
+/// `api-scrip-master-detailed.csv` on 2026-09-09: every row's `LOT_SIZE` reads
+/// `1.0`, `75.0`, `250.0` — a DECIMAL string, exactly like the sibling
+/// `STRIKE_PRICE` column this module already parses through `f64`. A direct
+/// `"75.0".parse::<u32>()` is an `Err`, so the integer parse collapsed EVERY
+/// contract in the master to the absent sentinel.
+///
+/// That was not a cosmetic loss. `lot_size` is the denominator of the ranking
+/// sort key (`window_lots_milli = delta_units * 1000 / lot_size`), and a leg
+/// with no lot size is refused outright by `legs_from_artifact`. So a zero
+/// here emptied the contract-to-underlying map, which left `owner_of` with no
+/// answer for any tick, which left the volume leaderboard with nothing to
+/// observe — and the top-volume ranking produced not one row, all session,
+/// with every counter reading healthy. Measured on the box the same day:
+/// 115,052 artifact rows, every one `z:0`; 113,746 option legs refused;
+/// `mapped_contracts: 0`.
+///
+/// The unit test that guarded this column passed throughout, because its
+/// fixtures were written as `75` and `250`. A fixture that does not carry the
+/// vendor's own shape proves nothing about the vendor.
+///
+/// # Why a fractional lot is refused rather than truncated
+///
+/// A lot size is a count of units in one contract; `75.5` is not one. Rounding
+/// or truncating it would silently mis-scale that contract's rank against
+/// every other contract for the life of the artifact, and a wrong lot size is
+/// worse than an absent one — absent is refused loudly at the map build, wrong
+/// is believed. Only a value whose fraction is exactly zero is a lot size.
+#[must_use]
+pub fn parse_lot_size(value: &str) -> u32 {
+    let trimmed = value.trim();
+    // The integer form first, so the common path never touches floating point
+    // and a value beyond `u32` is refused rather than rounded into range.
+    if let Ok(whole) = trimmed.parse::<u32>() {
+        return whole;
+    }
+    let Ok(units) = trimmed.parse::<f64>() else {
+        return 0;
+    };
+    // Rejects NaN, both infinities, zero and every negative in one test: none
+    // of them is a number of units in a contract.
+    if !units.is_finite() || units <= 0.0 {
+        return 0;
+    }
+    if units.fract() != 0.0 {
+        return 0;
+    }
+    if units > f64::from(u32::MAX) {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // APPROVED: bounded above by the `u32::MAX` check, below by the `<= 0.0`
+    // guard, and whole by the `fract()` check — the cast is exact.
+    let units = units as u32;
+    units
+}
+
 /// `numerator / denominator` as an exact `f64`, with no lossy cast.
 ///
 /// # Why this exists instead of `a as f64 / b as f64`
@@ -586,13 +648,15 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             underlying_symbol: i_underlying
                 .and_then(|i| fields.get(i))
                 .map_or_else(String::new, |v| v.trim().to_uppercase()),
-            // Absent, blank, non-numeric and negative all collapse to the same
-            // 0 sentinel: none of them is a lot size, and distinguishing them
-            // here would only move the refusal to a caller that has less
-            // context about why the row is unusable.
+            // Absent, blank, non-numeric, negative and fractional all collapse
+            // to the same 0 sentinel: none of them is a lot size, and
+            // distinguishing them here would only move the refusal to a caller
+            // that has less context about why the row is unusable. The vendor
+            // sends this column as a DECIMAL (`75.0`), so the parse goes
+            // through `parse_lot_size`, never a bare integer parse.
             lot_size: i_lot
                 .and_then(|i| fields.get(i))
-                .map_or(0, |v| v.trim().parse::<u32>().unwrap_or(0)),
+                .map_or(0, |v| parse_lot_size(v)),
         });
     }
 
@@ -1146,21 +1210,99 @@ mod tests {
                 "1,,BLANK,NSE,D,,OPTSTK,",
                 "2,,TEXT,NSE,D,,OPTSTK,NA",
                 "3,,NEGATIVE,NSE,D,,OPTSTK,-75",
-                "4,,DECIMAL,NSE,D,,OPTSTK,75.0",
-                "5,,ZERO,NSE,D,,OPTSTK,0",
-                "6,,PADDED,NSE,D,,OPTSTK,  75  ",
+                "4,,ZERO,NSE,D,,OPTSTK,0",
+                "5,,ZERODECIMAL,NSE,D,,OPTSTK,0.0",
+                "6,,FRACTIONAL,NSE,D,,OPTSTK,75.5",
+                "7,,NAN,NSE,D,,OPTSTK,NaN",
+                "8,,INFINITE,NSE,D,,OPTSTK,inf",
+                "9,,PADDED,NSE,D,,OPTSTK,  75  ",
             ],
         );
-        // Blank, non-numeric, negative, decimal and an explicit zero are all
-        // the SAME answer — we do not know this contract's multiplier — and
-        // every one must land on 0 so the single downstream refusal covers
-        // them all. A `75.0` that silently parsed as 75 would be worse: the
-        // vendor writing a decimal there is a format change we must notice.
-        for id in [1_u64, 2, 3, 4, 5] {
+        // Blank, non-numeric, negative, zero, an exact-zero decimal, a
+        // FRACTIONAL value, NaN and infinity are all the SAME answer — we do
+        // not know this contract's multiplier — and every one must land on 0
+        // so the single downstream refusal covers them all.
+        //
+        // The fractional case is the one worth stating: `75.5` is not a count
+        // of units in a contract, and truncating it to 75 would silently
+        // mis-scale that contract's rank against every other contract for the
+        // life of the artifact. A wrong lot size is worse than an absent one —
+        // absent is refused loudly at the map build, wrong is believed.
+        for id in [1_u64, 2, 3, 4, 5, 6, 7, 8] {
             assert_eq!(rows_by_id(&body, id).lot_size, 0, "id {id}");
         }
         // Padding is NOT unusable — the parser trims, as it does elsewhere.
-        assert_eq!(rows_by_id(&body, 6).lot_size, 75);
+        assert_eq!(rows_by_id(&body, 9).lot_size, 75);
+    }
+
+    #[test]
+    fn the_vendors_own_decimal_lot_size_shape_is_read_not_refused() {
+        // MEASURED against `images.dhan.co/api-data/api-scrip-master-detailed.csv`
+        // on 2026-09-09: the live file writes `LOT_SIZE` as `1.0`, never `1`.
+        //
+        // Until this test existed the parser used `parse::<u32>()`, which is
+        // an `Err` on every one of those, so EVERY contract in the master read
+        // as having no lot size. The consequence was not cosmetic: the ranking
+        // sort key divides by the lot size, and a leg without one is refused
+        // at the contract-to-underlying map build — so the map published
+        // empty, no tick could be attributed to an underlying, and the
+        // top-volume ranking produced zero rows all session while every
+        // counter read healthy (box, 2026-09-09: 115,052 artifact rows all
+        // carrying lot size 0; 113,746 option legs refused; map size 0).
+        //
+        // The test that guarded this column was green throughout, because its
+        // fixtures were `75` and `250`. A fixture that does not carry the
+        // vendor's own shape proves nothing about the vendor, which is why
+        // these values are copied from the live file rather than invented.
+        let header = format!("{HEADER},INSTRUMENT,LOT_SIZE");
+        let body = master_with(
+            &header,
+            &[
+                "1,,CURRENCYFUT,NSE,D,,FUTCUR,1.0",
+                "2,,NIFTYOPT,NSE,D,,OPTIDX,75.0",
+                "3,,BANKOPT,NSE,D,,OPTIDX,35.0",
+                "4,,STOCKOPT,NSE,D,,OPTSTK,250.0",
+                "5,,INTEGERFORM,NSE,D,,OPTSTK,600",
+            ],
+        );
+        assert_eq!(rows_by_id(&body, 1).lot_size, 1);
+        assert_eq!(rows_by_id(&body, 2).lot_size, 75);
+        assert_eq!(rows_by_id(&body, 3).lot_size, 35);
+        assert_eq!(rows_by_id(&body, 4).lot_size, 250);
+        // The integer form must keep working: the vendor is free to change
+        // back, and a parser that only handled decimals would break the same
+        // way in the other direction.
+        assert_eq!(rows_by_id(&body, 5).lot_size, 600);
+    }
+
+    #[test]
+    fn parse_lot_size_refuses_what_is_not_a_whole_positive_count() {
+        // Direct unit coverage of the helper, so the shape is pinned even if
+        // the CSV fixtures above are ever restructured.
+        assert_eq!(parse_lot_size("75"), 75);
+        assert_eq!(parse_lot_size("75.0"), 75);
+        assert_eq!(parse_lot_size("75.000000"), 75);
+        assert_eq!(parse_lot_size(" 1.0 "), 1);
+        assert_eq!(parse_lot_size("4294967295"), u32::MAX);
+        for bad in [
+            "",
+            "  ",
+            "NA",
+            "-1",
+            "-1.0",
+            "0",
+            "0.0",
+            "75.5",
+            "0.9",
+            "NaN",
+            "inf",
+            "-inf",
+            "1e400",
+            "4294967296",
+            "4294967296.0",
+        ] {
+            assert_eq!(parse_lot_size(bad), 0, "input {bad:?}");
+        }
     }
 
     #[test]
