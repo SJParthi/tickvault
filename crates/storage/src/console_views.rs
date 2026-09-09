@@ -252,7 +252,7 @@ pub fn top_volume_cadence_view_ddl(cadence: TopVolumeCadence) -> String {
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
          SELECT t.ts, t.rank, il.symbol_name, il.display_name, il.instrument_type, t.family, \
-         t.volume, t.gain_pct, t.subscribed, t.underlying_id, \
+         t.volume, t.window_lots_milli, t.gain_pct, t.subscribed, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
          FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
          LEFT JOIN {dim} \

@@ -1565,8 +1565,28 @@ impl LiveIngest {
         // action this caller could take that the writer has not already taken:
         // it is one snapshot of a leaderboard that will be re-ranked a second
         // from now.
-        if appended > 0
-            && let Some(writer) = self.top_volume.as_mut()
+        // CORRECTED 2026-09-09: the gate was `appended > 0`, so a sweep that
+        // appended NOTHING could never re-offer rows a PREVIOUS sweep is still
+        // holding. `TopVolumeRankWriter::flush` retains its batch on a
+        // `QueueFull` hand-off (`pending` stays non-zero) and relies on a later
+        // flush to re-offer it -- but the two paths that produce no rows, an
+        // empty ranked set and a family with no writer, `continue` straight
+        // past this gate. The retained rows then sat unretried until some later
+        // sweep happened to append again, which on a quiet cadence is a real
+        // delay. Gating on PENDING as well re-offers them on the very next
+        // sweep. `flush` itself early-returns when `pending == 0`, so an idle
+        // sweep still costs nothing.
+        //
+        // NOT fixed by this, and stated because it was VERIFIED in source
+        // rather than assumed: an `append_row` that fails PART-WAY leaves the
+        // questdb-rs buffer in `TableWritten` state, which refuses every later
+        // row. `pending` is incremented only AFTER every `?` in `append_row`,
+        // so that case leaves `pending == 0` -- this gate reads false, and
+        // `flush` would early-return on `pending == 0` regardless. Recovering
+        // it needs the buffer cleared in `append_row`'s own error path, which
+        // is a separate change in the storage crate.
+        if let Some(writer) = self.top_volume.as_mut()
+            && (appended > 0 || writer.pending() > 0)
         {
             drop(writer.flush());
         }
