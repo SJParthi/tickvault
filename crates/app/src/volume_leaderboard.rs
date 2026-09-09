@@ -1251,7 +1251,7 @@ mod tests {
     /// FIRST in-window sweep measures from the contract's first observe and
     /// reports ~15 minutes of volume as one one-second window.
     #[test]
-    fn rolling_baselines_out_of_window_makes_the_first_ranked_window_measure_the_window() {
+    fn roll_baselines_out_of_window_makes_the_first_ranked_window_measure_the_window() {
         let mut lb = VolumeLeaderboard::new();
 
         // 09:00 — first observe seeds the baseline at this volume.
@@ -1277,7 +1277,7 @@ mod tests {
     /// The roll is per CADENCE. Rolling the 1s baseline must not disturb the 5s
     /// one — they measure different windows and share only the contract.
     #[test]
-    fn rolling_one_cadences_baseline_leaves_the_other_alone() {
+    fn roll_baselines_for_one_cadence_leaves_the_other_alone() {
         let mut lb = VolumeLeaderboard::new();
         lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
         lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
