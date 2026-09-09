@@ -3579,3 +3579,53 @@ from an existing family, never a new page.
 | `GAP-SEC-01` `error!` (empty bearer token, paper mode) | coded log, once at boot | LIVE mode now REFUSES to boot on an empty API bearer token (the feed toggle sits on a publicly funnelled port); paper mode keeps the documented dev passthrough and says so once. Not a page: it is a boot-time configuration fact, and the operator is the one who seeded the value. |
 | `LAMBDA-NOTIFY-01` total-delivery failure | Lambda invocation ERROR | `telegram_webhook::handle` now returns `Err` when NOT ONE message of a batch reached Telegram. This is not a new alarm: the function's EXISTING `Errors` alarm fires, and its email fan-out is the leg that survives a dead bot token. A partial failure stays `Ok` (SNS would redeliver and re-page the ones that landed). |
 | `holiday-gate.sh` self-stop page | one SNS publish to the existing `tv-<env>-alerts` topic | Not a new alarm or family: the same topic and Lambda the autopilot uses, one plain-English line when the box switches itself off for an NSE holiday, so a wrong holiday verdict on a trading day is noticed at 08:31 IST instead of at the 09:20 alarm gate. |
+
+**Fourth addendum (2026-09-09) — one new counter, log-sink/local only, no page.**
+`tv_top_volume_rank_append_failed_total` (`dhan_feed_stack.rs`) counts snapshot
+rows the ILP buffer REFUSED at append time. Until 2026-09-09 that arm was
+`if writer.append_row(row).is_ok()` with no else — a per-row append error
+produced fewer rows with nothing anywhere reporting it, so a short snapshot read
+exactly like a quiet minute (the writer's own discard counter covers the FLUSH
+arms, never this one). Local `/metrics` only: **no EMF name and no alarm**, per
+the September budget position (forecast $142.24 against the $135.00 automatic
+`STOP_EC2_INSTANCES` line — a new EMF name is ~$0.30/mo and §2.3n's standing rule
+requires a LEVER, not a cost note). Zero on a healthy session, so any non-zero
+reading is the whole signal; it is the number an operator reads AFTER an existing
+family-(5) page, never a new page.
+
+⚠ CORRECTED the same day: "local `/metrics` only" was the whole plan and it was
+not enough. `loss_counter_visibility_guard` refused it — a counter that measures
+loss and reaches NO operator surface is worse than no counter, because the loss
+is measured, the measurement is discarded, and the dashboard stays green. The
+guard offers three ways out and the budget rules out the expensive one, so the
+arm now also carries a **throttled `warn!`** (powers of two, so one bad sweep
+refusing up to 500 rows logs the 1st/2nd/4th and reports onset AND magnitude
+without flooding), carrying `code = WS-GAP-03`, `source = "top_volume_append_failed"`
+and the counter NAME as a field so a grep for the counter lands on the line.
+**Still no page and still no EMF name:** the single WS-GAP-03 filter requires
+`$.level = "ERROR"` AND `$.source = "fell_back_to_indices"`, and this is a WARN
+with a different source, so it is invisible to it by construction. Recorded
+because the original plan read as complete and was not — free visibility existed
+and was simply not taken.
+
+**Fifth addendum (2026-09-09) — three counters and one log-field, all
+LOG-SINK/COUNTER-ONLY.** No CloudWatch alarm, no EMF name, no budget lever.
+The September forecast is $142.24 against a $135.00 automatic-stop line
+(measured 2026-09-06), so a new pager needs an operator lever first; these are
+numbers an operator reads AFTER a page from an existing family, never a new
+page.
+
+| Surface | Shape | Why it earns no page |
+|---|---|---|
+| `tv_aggregator_tick_refused_total{reason="future_trading_day"}` | counter, per tick | The vendor stamped a tick for a LATER IST day than our own receipt clock. It joins the CANDLE-ONLY set — the row is written, only the bucket is skipped — so it is not tick loss, and reaching it needs a ≥9 h clock skew that has never been observed. Its 30 s read-out is the existing `AGGREGATOR-DROP-01` sibling `warn!`, which now carries `refused_future_trading_day` beside the stale and out-of-band fields. Paging on it would page for a condition whose whole point is that it is rare. |
+| `tv_depth_rebalance_swaps_refused_total{reason="ack_pending"}` | counter, per refused swap | A socket whose previous swap has not been acknowledged refuses a second one for that minute. Self-healing by construction: the ack lands and the next minute plans again. A sustained non-zero rate means the connection task is not answering, which the socket's own idle watchdog and the ghost-redial counter already report. |
+| `tv_spot_backstop_total{outcome="failed"}` | counter, per backstop call | The QuestDB spot read did not happen — client build, non-2xx, unreadable body, send error, or an unparseable response. Until today all five returned an empty map that the wrapper counted as `answered`, so the one surface for "the database is not answering" asserted success on four of its five failure paths. The consequence is already visible as `without_spot` ladders and, when total, as the `WS-GAP-03 / fell_back_to_indices` alarm; this makes the CAUSE readable rather than adding a second pager for the same event. All five outcomes are now seeded at zero on first use, so the first failure episode is not swallowed by the agent's dropped-first-sample rule. |
+
+Also added, and likewise log-only: five `WS-GAP-03` emit sites in
+`dhan_contract_universe::fetch_spot_prices` (`source` = `spot_backstop_client_build`
+/ `_unreadable` / `_non_2xx` / `_send_failed` / `_unparseable`). They were
+UNCODED `error!` lines, so none of the 27 coded metric filters could match
+them; they are now coded and therefore greppable and triage-able. They remain
+invisible to the §2.3d-i `WS-GAP-03` alarm by construction — that filter is
+scoped to `$.source = "fell_back_to_indices"`, and widening it to the bare
+code would page on ordinary connection churn across ~50 emit sites.

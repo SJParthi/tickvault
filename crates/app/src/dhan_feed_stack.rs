@@ -886,6 +886,25 @@ pub const INGEST_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_refused_total";
 /// cannot distinguish from an ordinary down day. Local `/metrics` only.
 pub const PREV_CLOSE_DISAGREEMENT_COUNTER: &str = "tv_prev_close_store_tick_disagreement_total";
 
+/// Counter: ticks the previous-close store's trading-day floor refused because
+/// the vendor stamped them for a day other than the session's.
+///
+/// Zero on a healthy day. Its paired store [`crate::spot_price_store`] has
+/// always refused these; this store did not until 2026-09-09, and because the
+/// write rule is first-write-wins a single stale-day packet latched yesterday's
+/// close as the whole session's baseline for that underlying — measuring every
+/// one of its strikes against the wrong number, visible only as a `not_gainer`
+/// tally that reads like an ordinary down day. Local `/metrics` only.
+pub const PREV_CLOSE_WRONG_DAY_COUNTER: &str = "tv_prev_close_store_wrong_day_total";
+
+/// Snapshot rows the ILP buffer REFUSED at append time.
+///
+/// Local `/metrics` only, like its neighbour: no EMF name and no alarm, per
+/// the September budget position (forecast $142.24 against the $135.00
+/// automatic-stop line). Zero on a healthy session, so any non-zero reading is
+/// the whole signal.
+pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_failed_total";
+
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
 /// # Why this function exists at all — the two-atomic hazard
@@ -1074,6 +1093,19 @@ pub struct LiveIngest {
     /// Ticks refused for `out_of_band_timestamp` — 2,008,916 measured in one
     /// session. Corruption-adjacent and likewise not normal.
     refused_out_of_band_ts: u64,
+    /// Ticks refused for `future_trading_day` — the vendor stamped a tick for
+    /// a LATER IST day than our own receipt clock.
+    ///
+    /// Its OWN field rather than a share of `refused_stale_trading_day`,
+    /// though the two are mirror images (a stamp behind us vs ahead of us),
+    /// because they carry opposite operator meanings. Stale is ROUTINE and
+    /// large: Dhan sends the last TRADE time, so every dormant contract is
+    /// stale by construction and the field runs to millions a session. A
+    /// FORWARD stamp cannot be explained that way at all — it needs a vendor
+    /// clock fault or a corrupt packet, and one of them arriving is a fact
+    /// worth seeing. Blended into the stale field it would be a rounding
+    /// error inside a number nobody reads twice.
+    refused_future_trading_day: u64,
     seals_emitted: u64,
     seals_dropped: u64,
     /// Bars the fold produced for a timeframe nobody asked for.
@@ -1140,6 +1172,18 @@ pub struct LiveIngest {
     /// Pre-resolved handle for [`PREV_CLOSE_DISAGREEMENT_COUNTER`], so the
     /// per-tick path pays one atomic add and never a registry lookup.
     prev_close_disagreement_counter: metrics::Counter,
+    /// Ticks refused by the previous-close store's trading-day floor: the
+    /// vendor stamped the packet for a day other than the session's. Zero on
+    /// a healthy day. Its paired store (`SpotPriceStore`) has always had this
+    /// floor; this one gained it 2026-09-09, and the counter is what makes a
+    /// refusal readable instead of merely silent.
+    prev_close_wrong_day: u64,
+    /// Pre-resolved handle for [`PREV_CLOSE_WRONG_DAY_COUNTER`].
+    prev_close_wrong_day_counter: metrics::Counter,
+    /// Snapshot rows the ILP buffer refused at append time this session.
+    top_volume_append_failures: u64,
+    /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
+    top_volume_append_failure_counter: metrics::Counter,
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1421,7 +1465,6 @@ impl LiveIngest {
                 continue;
             }
 
-            let aggregator = &self.aggregator;
             let prev_close = &self.prev_close;
             let view = crate::depth_subscription_view::global_depth_subscription_view();
             let projection = crate::top_volume_snapshot::project_snapshot(
@@ -1429,16 +1472,35 @@ impl LiveIngest {
                 cadence,
                 family,
                 &ranked,
-                |security_id, segment| {
-                    // Both halves must be real. A missing LTP or a missing
-                    // previous close yields a non-finite, which the projection
-                    // REFUSES and counts -- never a fabricated zero percent,
-                    // which would read as "this contract did not move".
-                    let ltp = aggregator
-                        .last_ltp(Feed::Dhan, security_id, segment.binary_code())
-                        .unwrap_or(f64::NAN);
-                    let close = prev_close.get(security_id, segment).unwrap_or(f64::NAN);
-                    crate::volume_leaderboard::eligible_gain_pct(ltp, close).unwrap_or(f64::NAN)
+                |underlying_id| {
+                    // The UNDERLYING's move, from the SAME two RAM stores the
+                    // gainer verdict reads a few lines above -- so the column
+                    // and the filter can never disagree about whether this
+                    // contract's stock was up.
+                    //
+                    // Until 2026-09-09 this probed the CONTRACT's own previous
+                    // close. Nothing has ever written one, so every row
+                    // returned `None` -> NaN -> refused as `NonFiniteGain`:
+                    // the table was EMPTY every session and the refusal
+                    // counter was the only place it showed.
+                    //
+                    // The first repair of that probed the underlying, but with
+                    // the STOCK segment hardcoded for BOTH families. This loop
+                    // runs Index as well, and an index option's underlying is
+                    // an index id (NIFTY=13) -- so it asked the stores for
+                    // `(13, NSE_EQ)`. That is the I-P1-11 collision, and it
+                    // fails in whichever direction the data happens to take:
+                    // no such equity and every index row is refused, or an
+                    // equity really does carry id 13 and the row is ACCEPTED
+                    // wearing that stock's percentage under an index's name.
+                    // `underlying_segment` derives it from the family, so
+                    // neither is expressible.
+                    let segment = crate::volume_leaderboard::underlying_segment(family);
+                    crate::volume_leaderboard::underlying_gain_pct(
+                        spot_prices.latest_paise(underlying_id, segment),
+                        prev_close.get(underlying_id, segment),
+                    )
+                    .unwrap_or(f64::NAN)
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
             );
@@ -1450,6 +1512,45 @@ impl LiveIngest {
             for row in &projection.rows {
                 if writer.append_row(row).is_ok() {
                     appended = appended.saturating_add(1);
+                } else {
+                    // Counted AND said out loud, not swallowed. Until
+                    // 2026-09-09 a per-row ILP append error produced FEWER
+                    // rows with nothing anywhere reporting it -- the writer's
+                    // own discard counter covers the flush arms, never this
+                    // one. A short snapshot then reads exactly like a quiet
+                    // minute.
+                    //
+                    // The surface is the LOG, not CloudWatch: the September
+                    // forecast sits above the budget's automatic
+                    // STOP_EC2_INSTANCES line, so a new EMF name needs an
+                    // operator lever rather than a cost note. The warn is free,
+                    // greppable, and invisible to every alarm -- the one
+                    // WS-GAP-03 filter requires $.level = "ERROR" AND
+                    // $.source = "fell_back_to_indices", and this is a WARN
+                    // with a different source.
+                    //
+                    // Throttled on powers of two because one bad sweep can
+                    // refuse up to 500 rows: the 1st, 2nd, 4th ... failure of
+                    // the session is logged, which reports the onset at once
+                    // and the MAGNITUDE without flooding the sink.
+                    refused = refused.saturating_add(1);
+                    self.top_volume_append_failures =
+                        self.top_volume_append_failures.saturating_add(1);
+                    self.top_volume_append_failure_counter.increment(1);
+                    // `counter` is a FIELD, not decoration: an operator who
+                    // greps the counter name lands on this line, and the
+                    // loss-counter visibility guard can only SEE that this
+                    // counter has a surface if the name appears beside a log.
+                    if self.top_volume_append_failures.is_power_of_two() {
+                        tracing::warn!(
+                            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                .code_str(),
+                            counter = TOP_VOLUME_APPEND_FAILURE_COUNTER,
+                            source = "top_volume_append_failed",
+                            failures = self.top_volume_append_failures,
+                            "top_volume_rank: the ILP buffer refused a snapshot row. That sweep's snapshot is SHORT -- ranks are missing from the table and it reads exactly like a quiet minute. Ranking and depth steering are unaffected (both run from RAM); only the queryable record is incomplete."
+                        );
+                    }
                 }
             }
         }
@@ -1574,6 +1675,7 @@ impl LiveIngest {
             refused_out_of_session: 0,
             refused_stale_trading_day: 0,
             refused_out_of_band_ts: 0,
+            refused_future_trading_day: 0,
             seals_emitted: 0,
             seals_skipped: 0,
             seals_rescued: 0,
@@ -1593,6 +1695,18 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
+            prev_close_wrong_day: 0,
+            prev_close_wrong_day_counter: {
+                let c = metrics::counter!(PREV_CLOSE_WRONG_DAY_COUNTER);
+                c.increment(0);
+                c
+            },
+            top_volume_append_failures: 0,
+            top_volume_append_failure_counter: {
+                let c = metrics::counter!(TOP_VOLUME_APPEND_FAILURE_COUNTER);
+                c.increment(0);
+                c
+            },
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             replaying_wal: false,
@@ -1605,6 +1719,19 @@ impl LiveIngest {
     #[must_use]
     pub const fn prev_close_disagreements(&self) -> u64 {
         self.prev_close_disagreements
+    }
+
+    /// Ticks refused by the previous-close trading-day floor this session.
+    #[must_use]
+    pub const fn prev_close_wrong_day(&self) -> u64 {
+        self.prev_close_wrong_day
+    }
+
+    /// Snapshot rows the ILP buffer refused at append time this session.
+    /// Zero on a healthy session.
+    #[must_use]
+    pub const fn top_volume_append_failures(&self) -> u64 {
+        self.top_volume_append_failures
     }
 
     /// The previous-close store, for the gainer-eligibility filter.
@@ -1704,7 +1831,7 @@ impl LiveIngest {
     /// returned apart so the caller can report them without also reporting the
     /// shut-market case.
     #[must_use]
-    pub const fn refusals(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub const fn refusals(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
         (
             self.refused_price,
             self.refused_timestamp,
@@ -1712,6 +1839,7 @@ impl LiveIngest {
             self.refused_out_of_session,
             self.refused_stale_trading_day,
             self.refused_out_of_band_ts,
+            self.refused_future_trading_day,
         )
     }
 
@@ -2517,9 +2645,21 @@ impl LiveIngest {
         // being thrown away by the fold before reaching a writer built to
         // take them. It is candle-only and not a full acceptance because an
         // out-of-band second still cannot be placed in a bucket.
+        // `future_trading_day` joins the candle-only set on 2026-09-09, in the
+        // same change that created it, because a refusal the caller does not
+        // consume is worse than no refusal at all: the fold declines the tick
+        // and every arm below then treats it as a FULL acceptance, so it
+        // reaches the volume leaderboard. That is the exact failure the long
+        // comment beneath this block describes for `stale_trading_day` — a
+        // tick carrying another day's CUMULATIVE VOLUME sets the contract's
+        // baseline to a foreign number, and today's real volume then reads as
+        // a fall that the monotonicity gate defends until the 32-tick
+        // re-latch. Candle-only and not hard, for the same reason as its
+        // mirror: the ROW is a real last-traded price and is kept.
         let candle_only_refusal = (stats.out_of_session
             || stats.untraded_sentinel
             || stats.stale_trading_day
+            || stats.future_trading_day
             || stats.untraded_timestamp
             || stats.out_of_band_timestamp
             || stats.slot_exhausted)
@@ -2591,6 +2731,9 @@ impl LiveIngest {
                 if stats.stale_trading_day {
                     self.refused_stale_trading_day =
                         self.refused_stale_trading_day.saturating_add(1);
+                } else if stats.future_trading_day {
+                    self.refused_future_trading_day =
+                        self.refused_future_trading_day.saturating_add(1);
                 } else if stats.out_of_band_timestamp {
                     self.refused_out_of_band_ts = self.refused_out_of_band_ts.saturating_add(1);
                 } else {
@@ -2650,12 +2793,63 @@ impl LiveIngest {
     /// insert happens ONCE per instrument per day (first write wins — the
     /// field is constant through the session). Ticker-mode packets carry
     /// `0.0`, which the store refuses without a line; a NaN is refused the same
-    /// way. Only the stock-option UNDERLYING segment is written: that is the
-    /// segment the gainer verdict probes, and writing every segment would cost
-    /// a probe per tick for a value nothing reads.
+    /// way.
+    ///
+    /// BOTH underlying segments are written -- `IDX_I` and `NSE_EQ`. The stock
+    /// one is what the gainer verdict probes; the index one is what the Index
+    /// family's persisted `gain_pct` needs, and without it the index half of
+    /// `top_volume_rank` is refused every session. A derivative is still never
+    /// written: its `day_close` is the premium's previous close, which paired
+    /// with an underlying's spot would manufacture a percentage from two
+    /// different instruments.
     fn record_prev_close_from_tick(&mut self, tick: &ParsedTick) {
-        let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
-        if tick.exchange_segment_code != segment.binary_code() {
+        // BOTH underlying segments, not just the stock one.
+        //
+        // Until 2026-09-09 this kept `NSE_EQ` alone, which is right for the
+        // gainer filter (Stock-only by the 2026-09-06 lock) and wrong for the
+        // persisted `top_volume_rank` rows, which are written for the Index
+        // family too. With no index previous close in RAM, every index row's
+        // `gain_pct` resolved to `None` -> NaN -> refused, so the index half
+        // of the table was empty for an invisible reason.
+        //
+        // `IDX_I` is admitted for exactly the same reason the spot store
+        // admits it: an index IS the underlying of its own option chain. A
+        // DERIVATIVE is still refused -- its `day_close` is the premium's
+        // previous close, and pairing that with an underlying's spot would
+        // manufacture a percentage out of two different instruments.
+        //
+        // The enum conversion and the segment test are ONE condition, as on
+        // the spot-store arm: `from_byte` alone admits every segment the enum
+        // knows, contracts included; a bare code compare alone admits a byte
+        // the enum cannot name.
+        let Some(
+            segment @ (tickvault_common::types::ExchangeSegment::IdxI
+            | tickvault_common::types::ExchangeSegment::NseEquity),
+        ) = tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
+        else {
+            return;
+        };
+        // The trading-day floor its PAIRED store already has.
+        //
+        // `SpotPriceStore` refuses a tick stamped for an earlier day; this
+        // store did not, and the two are read as a PAIR -- `underlying_gain_pct`
+        // divides one by the other. So a stale-day packet at 09:05 was refused
+        // by the spot store and ACCEPTED here, and because the rule below is
+        // first-write-wins it then latched yesterday's close as the session's
+        // baseline: every strike of that underlying is measured against the
+        // wrong number all day, and the only symptom is a `not_gainer` tally
+        // that reads like an ordinary down day.
+        //
+        // The day comes from the spot store deliberately rather than from a
+        // second field here: the two stores are already reset together on the
+        // drain's day-rollover arm, so one owner is one thing to keep true.
+        // Ticks stamped for a FUTURE day are refused by the same compare --
+        // a vendor clock fault must not be able to latch a baseline either.
+        if crate::spot_price_store::ist_day_of(tick.exchange_timestamp)
+            != self.spot_prices.trading_day()
+        {
+            self.prev_close_wrong_day = self.prev_close_wrong_day.saturating_add(1);
+            self.prev_close_wrong_day_counter.increment(1);
             return;
         }
         let close = tick.day_close;
@@ -4841,7 +5035,7 @@ async fn run_frame_drain(
     // Last reported aggregator-refusal totals, so the 30s arm can report a
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
-    let mut last_refusals: (u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0);
+    let mut last_refusals: (u64, u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0, 0);
     // IST day the ranking state belongs to. Zero means "not yet established",
     // which is why the first pass adopts the day SILENTLY: logging a rollover
     // on the first 30-second tick of every session would report a midnight
@@ -5317,6 +5511,7 @@ async fn run_frame_drain(
                 let d_slot = now.2.saturating_sub(last_refusals.2);
                 let d_stale = now.4.saturating_sub(last_refusals.4);
                 let d_oob = now.5.saturating_sub(last_refusals.5);
+                let d_future = now.6.saturating_sub(last_refusals.6);
                 // `out_of_session` (now.3) is still deliberately NOT reported:
                 // it is the designed refusal for a tick outside the fold
                 // window, and folding it in here would page for normal
@@ -5376,19 +5571,23 @@ async fn run_frame_drain(
                 // The two candle-only VENDOR data-quality reasons. They were
                 // buried in `out_of_session`, which the pager above skips, so
                 // until 2026-09-01 neither had ANY operator surface. Reported
-                // at WARN precisely so they inform without paging: in both
-                // cases the ROW IS WRITTEN and only the candle bucket is
+                // at WARN precisely so they inform without paging: in every
+                // case the ROW IS WRITTEN and only the candle bucket is
                 // skipped, so this is a trend to watch, never a tick-loss
                 // count and never a 2am page.
-                if d_stale > 0 || d_oob > 0 {
+                if d_stale > 0 || d_oob > 0 || d_future > 0 {
                     warn!(
                         refused_stale_trading_day = d_stale,
                         refused_out_of_band_timestamp = d_oob,
+                        refused_future_trading_day = d_future,
                         "Dhan live feed: the aggregator skipped the candle bucket for \
                          some ticks in the last 30s because the vendor stamped them for \
                          another trading day or outside the plausible time band. The \
                          ROWS ARE STILL WRITTEN -- this is not tick loss. A rising rate \
-                         is a vendor data-quality signal."
+                         is a vendor data-quality signal. A non-zero \
+                         refused_future_trading_day is the rarest of the three and the \
+                         only one that cannot be explained by a dormant contract: it \
+                         means a stamp AHEAD of our own clock."
                     );
                 }
 
@@ -16373,6 +16572,138 @@ mod tests {
     }
 
     #[test]
+    fn top_volume_append_failures_start_at_zero_and_are_readable_without_a_recorder() {
+        // The accessor exists so a per-row ILP append refusal is COUNTED
+        // rather than swallowed by the old `if append_row(..).is_ok()`, which
+        // made a short snapshot read exactly like a quiet minute. Zero on a
+        // fresh ingest, and readable with no metrics recorder installed —
+        // the counter handle is resolved at construction.
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(ingest.top_volume_append_failures(), 0);
+    }
+
+    /// A packet stamped for a different trading day must not latch the
+    /// session's previous close, and an INDEX underlying must be recorded.
+    ///
+    /// Two defects from the 2026-09-09 sweep, in the one function that carries
+    /// both.
+    ///
+    /// The day floor: `SpotPriceStore` has always refused an off-day packet
+    /// and this store did not, while the two are read as a PAIR by
+    /// `underlying_gain_pct`. Because the write rule is first-write-wins, one
+    /// stale-day packet latched YESTERDAY's close as the whole session's
+    /// baseline for that underlying — every strike of it then measured against
+    /// the wrong number, surfacing only as a `not_gainer` tally that reads like
+    /// an ordinary down day.
+    ///
+    /// The index segment: the recorder kept `NSE_EQ` alone, which is right for
+    /// the gainer filter (Stock-only) and wrong for the persisted rows, which
+    /// are written for the Index family too. With no index previous close in
+    /// RAM, every index row's `gain_pct` resolved to NaN and was refused, so
+    /// the index half of `top_volume_rank` was empty for an invisible reason.
+    #[test]
+    fn an_off_day_packet_never_latches_a_close_and_an_index_underlying_is_recorded() {
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        // A real session day rather than the epoch, so "wrong day" below is a
+        // day EARLIER than the session and not merely a different number.
+        const SESSION_SECS: u32 = 1_757_000_000;
+        let session_day = crate::spot_price_store::ist_day_of(SESSION_SECS);
+        ingest.spot_prices().reset_for_trading_day(session_day);
+
+        let packet = |id: u64, segment: ExchangeSegment, close: f32, secs: u32| ParsedTick {
+            security_id: id,
+            exchange_segment_code: segment.binary_code(),
+            day_close: close,
+            exchange_timestamp: secs,
+            ..Default::default()
+        };
+
+        // ---- the day floor ----
+        // Yesterday's packet arrives FIRST, which is the dangerous order: with
+        // first-write-wins, whatever lands first owns the session.
+        let yesterday = SESSION_SECS - 86_400;
+        ingest.record_prev_close_from_tick(&packet(
+            2885,
+            ExchangeSegment::NseEquity,
+            999.00,
+            yesterday,
+        ));
+        assert_eq!(
+            ingest.prev_close_wrong_day(),
+            1,
+            "an off-day packet must be refused and counted"
+        );
+        assert_eq!(
+            ingest.prev_close().get(2885, ExchangeSegment::NseEquity),
+            None,
+            "the OUTCOME, not just the counter: nothing may be latched from an \
+             off-day packet"
+        );
+
+        // Today's packet then owns the session, as it should.
+        ingest.record_prev_close_from_tick(&packet(
+            2885,
+            ExchangeSegment::NseEquity,
+            1_402.35,
+            SESSION_SECS,
+        ));
+        assert_eq!(
+            ingest.prev_close().get(2885, ExchangeSegment::NseEquity),
+            Some(1_402.35),
+        );
+
+        // A FUTURE-dated packet is refused by the same compare — a vendor clock
+        // fault must not be able to latch a baseline either.
+        ingest.record_prev_close_from_tick(&packet(
+            3045,
+            ExchangeSegment::NseEquity,
+            111.00,
+            SESSION_SECS + 86_400,
+        ));
+        assert_eq!(ingest.prev_close_wrong_day(), 2);
+        assert_eq!(
+            ingest.prev_close().get(3045, ExchangeSegment::NseEquity),
+            None
+        );
+
+        // ---- the index segment ----
+        // NIFTY. Before 2026-09-09 this was dropped by the segment gate and
+        // every index row's gain percentage was refused downstream.
+        ingest.record_prev_close_from_tick(&packet(
+            13,
+            ExchangeSegment::IdxI,
+            24_100.50,
+            SESSION_SECS,
+        ));
+        assert_eq!(
+            ingest.prev_close().get(13, ExchangeSegment::IdxI),
+            Some(24_100.50),
+            "an index IS the underlying of its own option chain"
+        );
+
+        // A CONTRACT is still refused: its `day_close` is the premium's
+        // previous close, and pairing that with an underlying's spot would
+        // manufacture a percentage out of two different instruments.
+        ingest.record_prev_close_from_tick(&packet(
+            45_678,
+            ExchangeSegment::NseFno,
+            88.25,
+            SESSION_SECS,
+        ));
+        assert_eq!(
+            ingest.prev_close().get(45_678, ExchangeSegment::NseFno),
+            None
+        );
+        assert_eq!(
+            ingest.prev_close_wrong_day(),
+            2,
+            "a contract is refused by the SEGMENT gate, not the day gate — the \
+             two refusals must stay distinguishable"
+        );
+    }
+    #[test]
     fn prev_close_disagreements_count_a_later_packet_that_contradicts_the_first_and_never_apply_it()
     {
         // Identity sweep rows 20/21 (2026-09-08): the previous close is
@@ -16389,6 +16720,15 @@ mod tests {
             day_close: close,
             ..Default::default()
         };
+
+        // The recorder gained the trading-day floor its PAIRED store always
+        // had (2026-09-09), so the fixture must sit ON the session's day.
+        // Without this the packets below are all refused as wrong-day and the
+        // test would pass while measuring nothing — the vacuous shape this
+        // sweep was looking for.
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(0));
 
         assert_eq!(ingest.prev_close_disagreements(), 0);
 
@@ -16992,7 +17332,7 @@ mod tests {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         assert_eq!(
             ingest.refusals(),
-            (0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0),
             "a fresh fold has refused nothing"
         );
 
@@ -17010,7 +17350,7 @@ mod tests {
             "a NaN price must be refused, got {outcome:?}"
         );
 
-        let (price, ts, slot, oos, stale, oob) = ingest.refusals();
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
         assert_eq!(price, 1, "the price refusal must be counted for the report");
         assert_eq!((ts, slot), (0, 0), "only the price counter moves");
         assert_eq!(
@@ -17019,10 +17359,10 @@ mod tests {
              bucket is deliberately excluded from the page"
         );
         assert_eq!(
-            (stale, oob),
-            (0, 0),
-            "the two reasons split out of the blended out-of-session field on \
-             2026-09-01 must stay zero for a plain bad-price refusal"
+            (stale, oob, future),
+            (0, 0, 0),
+            "the three reasons split out of the blended out-of-session field \
+             must stay zero for a plain bad-price refusal"
         );
     }
 
@@ -17060,7 +17400,7 @@ mod tests {
 
         let _ = ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
 
-        let (price, ts, slot, oos, stale, oob) = ingest.refusals();
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
         assert_eq!(
             oob, 1,
             "the out-of-band refusal must land in its own field, which the 30s \
@@ -17072,8 +17412,64 @@ mod tests {
              30s report deliberately skips — that blending is the defect"
         );
         assert_eq!(
-            (price, ts, slot, stale),
-            (0, 0, 0, 0),
+            (price, ts, slot, stale, future),
+            (0, 0, 0, 0, 0),
+            "no other refusal counter moves"
+        );
+    }
+
+    /// A tick the vendor stamped for a FUTURE trading day must be booked as a
+    /// candle-only refusal, not swept through as a full acceptance.
+    ///
+    /// This is the bite-proof for the defect the fold gate shipped with: the
+    /// aggregator declined the tick and returned `future_trading_day`, and the
+    /// drain consumed the flag NOWHERE — neither `hard_refusal` nor
+    /// `candle_only_refusal` mentioned it — so the tick fell past both early
+    /// returns and reached `observe_for_ranking` carrying ANOTHER DAY'S
+    /// cumulative volume. That is precisely the baseline poisoning the comment
+    /// above `record_prev_close_from_tick` describes for its mirror,
+    /// `stale_trading_day`.
+    ///
+    /// Removing `stats.future_trading_day` from `candle_only_refusal` makes
+    /// this fail on the outcome, which is the half that matters: the counter
+    /// assertion alone would still pass.
+    #[test]
+    fn a_future_dated_tick_is_a_candle_only_refusal_and_never_ranks() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+
+        // A plausible in-band exchange stamp (so it is not `out_of_band`) that
+        // nonetheless lands on a LATER IST day than the receipt clock below.
+        // 1_779_408_000 is 2026-05-23 00:00:00 IST; the receipt is a full day
+        // behind it, which is the ≥9h skew this arm exists for.
+        let packet = ticker_packet(13, 100.0, 1_779_408_000);
+        let parsed = dispatch_frame(&packet, 1_779_321_600_000_000_000)
+            .expect("a well-formed ticker packet must parse with a forward ltt");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        assert_ne!(
+            tick.received_at_nanos, 0,
+            "the gate stands down on a zero receipt — without one this test \
+             would prove nothing"
+        );
+
+        let outcome = ingest.ingest_tick(&tick, 42, 1_779_321_600_000);
+
+        assert!(
+            matches!(outcome, IngestOutcome::WrittenOutOfSession),
+            "a forward-stamped tick must be written and NOT folded; \
+             got {outcome:?}"
+        );
+
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
+        assert_eq!(
+            future, 1,
+            "the forward stamp must land in its OWN field so the 30s report \
+             can tell it apart from the routine stale case"
+        );
+        assert_eq!(
+            (price, ts, slot, oos, stale, oob),
+            (0, 0, 0, 0, 0, 0),
             "no other refusal counter moves"
         );
     }
@@ -21596,35 +21992,64 @@ mod frame_walk_accounting_tests {
     #[test]
     fn only_the_three_spot_variants_may_price_an_underlying() {
         let src = include_str!("dhan_feed_stack.rs");
-        // Anchored on two fragments `cargo fmt` cannot split, and asserted
-        // present FIRST. The earlier version of this guard anchored on
-        // `if let Some(segment @ (`, which fmt reflowed across a newline; the
-        // slice then silently widened to the whole file, matched
-        // `ExchangeSegment::NseFno` somewhere unrelated, and failed on correct
-        // code. A guard that cannot find its target must SAY so rather than
-        // grade whatever it happened to slice.
+        // Scans EVERY segment-binding arm rather than the first one.
+        //
+        // The previous version found the FIRST `segment @ (` and read forward
+        // to the from_byte conversion. That was single-arm reasoning, and on
+        // 2026-09-09 a second arm arrived (the previous-close recorder, which
+        // admits IDX_I and NSE_EQ). The scan then began at that arm and ran
+        // forward to the SPOT filter's conversion thousands of lines later,
+        // slicing everything in between — the exact silent widening the old
+        // comment warned about, one anchor further out. Anchoring harder would
+        // have bought a third repeat; grading every arm cannot widen at all.
         const OPEN: &str = "segment @ (";
-        const CLOSE: &str = ") = ExchangeSegment::from_byte(tick.exchange_segment_code)";
-        let start = src.find(OPEN).expect("the spot-price filter must exist");
-        let end = src[start..]
-            .find(CLOSE)
-            .expect("the spot-price filter must end at the from_byte conversion");
-        let arm = &src[start..start + end];
-        for spot in [
-            "ExchangeSegment::IdxI",
-            "ExchangeSegment::NseEquity",
-            "ExchangeSegment::BseEquity",
-        ] {
-            assert!(arm.contains(spot), "the filter must admit {spot}");
+        const CLOSE: &str = "ExchangeSegment::from_byte(tick.exchange_segment_code)";
+        let arms: Vec<&str> = src
+            .split(OPEN)
+            .skip(1)
+            .filter_map(|tail| tail.find(CLOSE).map(|end| &tail[..end]))
+            .collect();
+        // Anti-vacuity: a scan that matched nothing passes every loop below.
+        assert!(
+            arms.len() >= 2,
+            "expected at least 2 segment-binding arms, found {}",
+            arms.len()
+        );
+        // The rule that binds EVERY arm: a contract's price is a premium, not
+        // the underlying's level, so admitting one would centre that stock's
+        // whole option ladder — or its gain percentage — on the wrong number.
+        for arm in &arms {
+            for contract in ["ExchangeSegment::NseFno", "ExchangeSegment::BseFno"] {
+                assert!(
+                    !arm.contains(contract),
+                    "{contract} is a CONTRACT segment and must not be admitted \
+                     by any underlying filter; arm was: {arm}"
+                );
+            }
         }
-        for contract in ["ExchangeSegment::NseFno", "ExchangeSegment::BseFno"] {
-            assert!(
-                !arm.contains(contract),
-                "{contract} is a CONTRACT segment: its price is a premium, not the \
-                 underlying's level, and admitting it would centre that stock's \
-                 whole option ladder on the wrong number"
-            );
-        }
+        // The spot-price filter admits all three spot variants.
+        assert!(
+            arms.iter().any(|arm| {
+                arm.contains("ExchangeSegment::IdxI")
+                    && arm.contains("ExchangeSegment::NseEquity")
+                    && arm.contains("ExchangeSegment::BseEquity")
+            }),
+            "no arm admits all three spot variants — the spot-price filter is \
+             missing or narrowed"
+        );
+        // The previous-close recorder admits the two UNDERLYING segments the
+        // two option families need, and deliberately not BSE equity: no BSE
+        // stock underlies an NSE option chain, and the store is capped.
+        assert!(
+            arms.iter().any(|arm| {
+                arm.contains("ExchangeSegment::IdxI")
+                    && arm.contains("ExchangeSegment::NseEquity")
+                    && !arm.contains("ExchangeSegment::BseEquity")
+            }),
+            "no arm admits exactly the two underlying segments — without the \
+             index one, every index row's gain percentage is refused and the \
+             index half of `top_volume_rank` is empty"
+        );
     }
 
     /// A frame that stacks many packets and hits an unknown response code

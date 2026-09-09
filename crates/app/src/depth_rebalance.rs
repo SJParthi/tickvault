@@ -943,8 +943,13 @@ pub const REBALANCE_SWAPS_REFUSED: &str = "tv_depth_rebalance_swaps_refused_tota
 /// swap that is decided and then quietly dropped is the worst outcome
 /// available, because the socket stays on a stale contract while every log
 /// line says the rebalance is working.
-pub const REBALANCE_REFUSAL_REASONS: [&str; 4] =
-    ["no_socket", "channel_full", "channel_closed", "not_held"];
+pub const REBALANCE_REFUSAL_REASONS: [&str; 5] = [
+    "no_socket",
+    "channel_full",
+    "channel_closed",
+    "not_held",
+    "ack_pending",
+];
 
 /// Pre-register the counters so a session that never refuses anything still
 /// publishes a zero, rather than a gap an alarm cannot distinguish from a dead
@@ -967,6 +972,27 @@ pub fn pre_register_rebalance_counters() {
 /// state with no sequence number for us to detect the loss. A full channel is
 /// a refusal, counted, and retried next minute; a stalled drain is tick loss.
 fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
+    // A socket with an UNRECONCILED ack takes no second swap.
+    //
+    // `socket.pending` holds ONE oneshot receiver. Overwriting it drops the
+    // previous receiver, and the connection side treats a dead receiver as a
+    // no-op — so nothing errors, nothing is counted, and the first swap's
+    // verdict is simply gone. Worse, `pending.old` is then the INTERMEDIATE
+    // instrument rather than the one the socket actually carried, so if the
+    // wire later refuses, `reconcile_pending_swaps` reverts `held` to a
+    // contract the socket never held. The guard and the published view would
+    // both name a strike the socket is not carrying, indefinitely, while
+    // `tv_depth200_ranked_swaps_total` read success the whole time.
+    //
+    // Reachable because `reconcile_pending_swaps` deliberately KEEPS a pending
+    // ack when `try_recv` is empty — the connection may simply not have
+    // answered yet — and the planner then plans from the optimistically
+    // advanced `held`. Skipping costs one minute of staleness on one socket;
+    // the alternative costs the rest of the session on that socket.
+    if socket.pending.is_some() {
+        metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "ack_pending").increment(1);
+        return false;
+    }
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let command = LiveSubscriptionCommand::Swap {
         old: swap.old,
@@ -1305,6 +1331,7 @@ pub async fn run_depth_rebalance(
     crate::depth200_ranked_steer::pre_register_ranked_counters();
     crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
     crate::depth_seed::pre_register_seed_counters();
+    crate::dhan_contract_universe::pre_register_spot_backstop_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
@@ -2795,6 +2822,66 @@ mod apply_tests {
         }
     }
 
+    /// A socket whose ack has not come back yet takes NO second swap.
+    ///
+    /// Without the gate the second `send_swap` overwrote `socket.pending`,
+    /// dropping the first oneshot receiver. The connection side treats a dead
+    /// receiver as a no-op, so the first verdict vanished with nothing
+    /// counted — and `pending.old` became the INTERMEDIATE instrument, so a
+    /// later refusal reverted `held` to a contract the socket never carried.
+    /// The guard and the published view would then both name a strike the
+    /// wire is not carrying for the rest of the session, while the swap
+    /// counter read success.
+    ///
+    /// Reachable on any minute where the connection has not answered yet:
+    /// `reconcile_pending_swaps` deliberately KEEPS such a pending, and the
+    /// planner plans from the optimistically advanced `held`.
+    #[test]
+    fn a_socket_with_an_unreconciled_ack_takes_no_second_swap() {
+        let (s0, mut r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+
+        let first = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(apply_decision(&mut sockets, &first), 1);
+        assert!(
+            sockets[0].pending.is_some(),
+            "the first swap awaits its ack"
+        );
+
+        // The connection has not answered. Next minute plans another swap for
+        // the same socket, from the optimistically advanced hold.
+        let second = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_001, 1_002)],
+            ..RebalanceDecision::default()
+        };
+        assert_eq!(
+            apply_decision(&mut sockets, &second),
+            0,
+            "an unreconciled socket must refuse the second swap rather than \
+             overwrite the ack it is still waiting on"
+        );
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_001, ExchangeSegment::NseFno)),
+            "the refused second swap must not move the believed hold again"
+        );
+
+        // The first verdict is still recoverable — which is the whole point.
+        take_ack(&mut r0)
+            .send(SwapOutcome::Held)
+            .expect("the first receiver must still be alive");
+        assert_eq!(reconcile_pending_swaps(&mut sockets), 0);
+        assert!(sockets[0].pending.is_none());
+        assert_eq!(
+            sockets[0].held,
+            Some(instrument(1_001, ExchangeSegment::NseFno)),
+            "the socket really carries what the first swap put there"
+        );
+    }
+
     #[test]
     fn a_held_ack_keeps_the_advanced_believed_hold() {
         let (s0, mut r0) = socket(4, 1_000);
@@ -2990,12 +3077,50 @@ mod apply_tests {
 
     #[test]
     fn every_refusal_reason_is_a_registered_label() {
-        // A reason string that is not in the list is a counter nothing
-        // pre-registers, so its series appears only after the first failure —
-        // and an absent series is indistinguishable from a dead process.
-        assert!(REBALANCE_REFUSAL_REASONS.contains(&"no_socket"));
-        assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_full"));
-        assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_closed"));
+        // Scans the SOURCE for every `"reason" =>` literal emitted against
+        // `REBALANCE_SWAPS_REFUSED` and holds it against the registry, in both
+        // directions.
+        //
+        // Until 2026-09-09 this named three by hand — `no_socket`,
+        // `channel_full`, `channel_closed` — while `not_held` and the newer
+        // `ack_pending` were live emit sites. A label the pre-register loop
+        // never seeds publishes NOTHING on its first refusal, because the
+        // CloudWatch agent drops the first sample of a label set it has never
+        // seen, and the first refusal is the one worth reading. A hand-written
+        // subset under an "every" name is how that stayed invisible.
+        let src = include_str!("depth_rebalance.rs");
+        let mut found: Vec<&str> = Vec::new();
+        for tail in src
+            .split("REBALANCE_SWAPS_REFUSED, \"reason\" => \"")
+            .skip(1)
+        {
+            let Some(label) = tail.split('"').next() else {
+                continue;
+            };
+            if !found.contains(&label) {
+                found.push(label);
+            }
+        }
+        // Anti-vacuity: a scan that matched nothing would pass every
+        // assertion below and prove nothing at all.
+        assert!(
+            found.len() >= 4,
+            "expected at least 4 emitted reason labels, found {found:?}"
+        );
+        for label in &found {
+            assert!(
+                REBALANCE_REFUSAL_REASONS.contains(label),
+                "`{label}` is emitted but never pre-registered — its first \
+                 refusal would publish nothing"
+            );
+        }
+        for reason in REBALANCE_REFUSAL_REASONS {
+            assert!(
+                found.contains(&reason),
+                "`{reason}` is pre-registered but no longer emitted — a stale \
+                 label is a series that can never move"
+            );
+        }
         pre_register_rebalance_counters();
     }
 }

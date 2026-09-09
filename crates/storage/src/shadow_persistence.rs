@@ -151,18 +151,35 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Create all 21 plain candle tables + the per-seal audit table if they
-/// do not already exist, with DEDUP UPSERT enabled on each.
+/// Create every plain candle table + the per-seal audit table if they do not
+/// already exist, with DEDUP UPSERT enabled on each.
 ///
-/// Idempotent: safe to call on every boot. Failures are logged at
-/// `error!` level (Telegram-routable per `error_level_meta_guard.rs`
-/// Rule 5) but do NOT block boot — the writer falls back to ring/spill
-/// on subsequent ILP errors.
+/// Idempotent: safe to call on every boot, and safe to call repeatedly within
+/// one boot — every statement is `IF NOT EXISTS`, an `ADD COLUMN IF NOT
+/// EXISTS`, or an idempotent `DEDUP ENABLE`.
 ///
-/// Requires a running QuestDB; covered by boot integration in CI and
-/// by manual `make doctor` post-boot.
+/// # The returned verdict
+///
+/// `true` when every KEY-BEARING statement was accepted: each table's
+/// `CREATE ... DEDUP UPSERT KEYS` and each `DEDUP ENABLE`. The six
+/// `ADD COLUMN IF NOT EXISTS` self-heals for older schemas are best-effort and
+/// do not affect it -- a missing back-filled column is a gap in old rows, not
+/// a table that dedups wrongly forever.
+///
+/// Added 2026-09-09. Until then this returned nothing and its caller could not
+/// retry, while its sibling `run_live_table_ddl_at_boot` had been given a
+/// six-attempt loop for exactly this hazard: the readiness probe answers
+/// `SELECT 1`, which a QuestDB still replaying its own WAL answers happily and
+/// then refuses the DDL. A refused CREATE here is worse than elsewhere,
+/// because `drop_legacy_candle_objects` runs immediately BEFORE it and drops
+/// `candles_1s` on any boot whose sweep version moved: the seal writer's first
+/// ILP row then auto-creates that table with NO dedup key, and every replay
+/// duplicates into it for the life of the table, silently.
+///
+/// Requires a running QuestDB; covered by boot integration in CI and by manual
+/// `make doctor`.
 // TEST-EXEMPT: requires a running QuestDB; tested via boot integration in CI and by `make doctor`. WIRING-EXEMPT: boot wiring lives in crates/app/src/main.rs alongside ensure_instrument_tables.
-pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
+pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -189,10 +206,11 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 "site" => "shadow_ensure_tables"
             )
             .increment(1);
-            return;
+            return false;
         }
     };
 
+    let mut all_keyed = true;
     for table in candle_table_names() {
         // Schema self-heal: candle tables created before the
         // security_id LONG fix have `security_id` / `tick_count` typed
@@ -228,7 +246,7 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
-        run_ddl(&client, &base_url, table, &create_ddl).await;
+        all_keyed &= run_ddl(&client, &base_url, table, &create_ddl).await;
 
         // Schema self-heal: candle tables created before the
         // close_pct_from_prev_day column existed (pre-2026-05-28 Engine-B
@@ -237,23 +255,23 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         // observability-architecture.md "Schema self-heal at boot").
         let alter_ddl =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS close_pct_from_prev_day DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_ddl).await;
+        let _ = run_ddl(&client, &base_url, table, &alter_ddl).await;
 
         // §31 Option 2 (2026-06-01): self-heal the `open_pct` column for
         // tables created before it existed. Free on every boot.
         let alter_open_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_pct DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_open_pct).await;
+        let _ = run_ddl(&client, &base_url, table, &alter_open_pct).await;
 
         // Operator request 2026-06-02: self-heal the `change_pct` +
         // `open_gap_pct` columns for tables created before they existed.
         // Free on every boot (QuestDB ignores ADD when the column exists).
         let alter_change_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_change_pct).await;
+        let _ = run_ddl(&client, &base_url, table, &alter_change_pct).await;
         let alter_open_gap_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
+        let _ = run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
         // Feed-provenance label (operator 2026-06-19, "same tables + feed
         // column"): broker source (`'dhan'`/`'groww'`). It IS part of the DEDUP
         // key now (`DEDUP_KEY_CANDLES` includes `feed`), so a Dhan candle and a
@@ -261,7 +279,7 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         // BEFORE the DEDUP-ENABLE migration below so the key column exists on
         // pre-existing tables. Additive + idempotent.
         let alter_feed = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;");
-        run_ddl(&client, &base_url, table, &alter_feed).await;
+        let _ = run_ddl(&client, &base_url, table, &alter_feed).await;
         // Brownfield NULL-feed backfill (worst-case coverage, no-hallucination):
         // rows persisted under the OLD 3-col key have `feed=NULL`. Without this,
         // a new `feed='dhan'` row for the same `(ts, security_id, segment)` is a
@@ -273,15 +291,16 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         // before the key is re-applied).
         let backfill_feed =
             format!("UPDATE {table} SET feed = '{CANDLE_FEED_DHAN}' WHERE feed IS NULL;");
-        run_ddl(&client, &base_url, table, &backfill_feed).await;
+        let _ = run_ddl(&client, &base_url, table, &backfill_feed).await;
         // Brownfield DEDUP migration: re-enable the UPSERT key with `feed`
         // included so EXISTING candle tables (created before the feed-in-key
         // change) get the new 4-col key. Idempotent — re-enabling the same key
         // is a no-op; greenfield tables already have it from the CREATE DDL.
         let dedup_enable =
             format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
-        run_ddl(&client, &base_url, table, &dedup_enable).await;
+        all_keyed &= run_ddl(&client, &base_url, table, &dedup_enable).await;
     }
+    all_keyed
 }
 
 /// Returns `true` if `table` already exists with `security_id` typed
@@ -739,17 +758,28 @@ async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) 
 /// `405 Method Not Allowed` for POST. The `query` parameter is
 /// URL-encoded by reqwest's query-string builder. (The #T1a precursor
 /// briefly switched this to POST to keep DDL out of access logs — that
-/// regressed every candle-table DDL to 405; reverted here.)
-async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
+/// Runs one DDL statement. Returns whether QuestDB accepted it.
+///
+/// The verdict was added 2026-09-09 and matters for exactly two of the eight
+/// statements this runs: the `CREATE TABLE ... DEDUP UPSERT KEYS` and the
+/// `DEDUP ENABLE`. If either is refused and the boot continues anyway, the
+/// seal writer's first ILP row AUTO-CREATES the table without its key, and
+/// every replayed or re-flushed bar then duplicates instead of collapsing --
+/// silently, for the life of that table. The `ADD COLUMN IF NOT EXISTS`
+/// statements are self-heal for older schemas and stay best-effort.
+async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> bool {
     match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
             info!(table, "candle table ready");
+            true
         }
         Ok(resp) => {
             warn!(table, status = %resp.status(), "DDL non-2xx");
+            false
         }
         Err(err) => {
             error!(table, ?err, "DDL request failed");
+            false
         }
     }
 }

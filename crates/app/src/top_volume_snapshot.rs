@@ -46,6 +46,11 @@ pub enum SnapshotRefusal {
     /// The 1-based rank overflowed `i64` — unreachable at any real `k`, and
     /// refused anyway rather than wrapped.
     RankOutOfRange,
+    /// `window_lots_milli` did not fit a signed 64-bit column. Unreachable at
+    /// any real lot size (it would need ~9.2e15 milli-lots in one window) and
+    /// refused rather than wrapped, because a negative rank key stored as the
+    /// reason a contract ranked first is worse than an absent row.
+    LotsOutOfRange,
 }
 
 impl SnapshotRefusal {
@@ -56,6 +61,7 @@ impl SnapshotRefusal {
             Self::IdTooLargeForSignedColumn => "id_too_large",
             Self::NonFiniteGain => "non_finite_gain",
             Self::RankOutOfRange => "rank_out_of_range",
+            Self::LotsOutOfRange => "lots_out_of_range",
         }
     }
 }
@@ -140,6 +146,15 @@ pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
 
 /// Projects one family's ranked slice into storable rows.
 ///
+/// `gain_pct_of` is called with the **UNDERLYING's** id, not the contract's.
+/// That is the whole point of the 2026-09-09 fix: it used to be called with
+/// `(contract.security_id, contract.segment)`, and nothing has ever written a
+/// previous close for an `NSE_FNO` contract, so the probe returned `None` on
+/// every row, became `NaN`, and each row was refused as `NonFiniteGain` —
+/// **the table was empty for the whole session while every counter read
+/// healthy.** Handing the closure the underlying id makes the wrong lookup
+/// unrepresentable rather than merely corrected.
+///
 /// `gain_pct_of` and `is_subscribed` are supplied by the caller because the
 /// leaderboard holds neither: gains come from the tick that carried the
 /// contract's LTP and previous close, and subscription state belongs to the
@@ -158,7 +173,7 @@ pub fn project_snapshot<G, S>(
     is_subscribed: S,
 ) -> SnapshotProjection
 where
-    G: Fn(u64, ExchangeSegment) -> f64,
+    G: Fn(u64) -> f64,
     S: Fn(u64, ExchangeSegment) -> bool,
 {
     let ts = floor_to_second(snapshot_ts_ist_nanos);
@@ -189,7 +204,13 @@ where
             continue;
         };
 
-        let gain_pct = gain_pct_of(contract.security_id, contract.segment);
+        let Ok(window_lots_milli) = i64::try_from(contract.window_lots_milli) else {
+            refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
+            continue;
+        };
+
+        // The UNDERLYING's move, keyed on the underlying — see the fn doc.
+        let gain_pct = gain_pct_of(contract.underlying_id);
         if !gain_pct.is_finite() {
             refusals.push((contract.security_id, SnapshotRefusal::NonFiniteGain));
             continue;
@@ -207,6 +228,7 @@ where
             // u32 -> i64 is lossless; no saturation is possible and none is
             // written, so a future widening of the field cannot hide here.
             volume: i64::from(contract.volume),
+            window_lots_milli,
             gain_pct,
             subscribed: is_subscribed(contract.security_id, contract.segment),
         });
@@ -219,13 +241,21 @@ where
 mod tests {
     use super::*;
 
+    /// Like [`contract`], naming the underlying explicitly for the tests that
+    /// exercise the gain closure — which is keyed on the UNDERLYING.
+    fn contract_under(security_id: u64, underlying_id: u64, volume: u32) -> RankedContract {
+        contract(security_id, underlying_id, volume)
+    }
+
     fn contract(security_id: u64, underlying_id: u64, volume: u32) -> RankedContract {
         RankedContract {
             security_id,
             segment: ExchangeSegment::NseFno,
             underlying_id,
             volume,
-            window_lots_milli: 0,
+            // A rank key distinct from `volume`, so a test that asserts the
+            // stored key cannot pass by accidentally reading the volume.
+            window_lots_milli: u64::from(volume) * 3,
         }
     }
 
@@ -263,7 +293,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 1.5,
+            |_| 1.5,
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 3);
@@ -282,7 +312,7 @@ mod tests {
             SnapshotCadence::FiveSecond,
             OptionFamily::Index,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| true,
         );
         assert!(
@@ -302,7 +332,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 2.0,
+            |_| 2.0,
             |sid, _| sid == 10,
         );
         assert!(p.rows[0].subscribed);
@@ -317,7 +347,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         let index = project_snapshot(
@@ -325,7 +355,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Index,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         assert_eq!(stock.rows[0].family, "stock");
@@ -344,7 +374,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 1);
@@ -365,7 +395,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         assert!(p.rows.is_empty());
@@ -376,19 +406,22 @@ mod tests {
     fn project_snapshot_refuses_a_nan_or_infinite_gain() {
         // The §28.4 poisoning class one table over: a NaN in a DOUBLE makes
         // every later comparison on the column silently false.
+        // Distinct UNDERLYINGS, because the gain closure is keyed on the
+        // underlying id since 2026-09-09 — three strikes of one stock share
+        // one gain by construction and could not be told apart here.
         let ranked = [
-            contract(10, 1, 500),
-            contract(11, 1, 400),
-            contract(12, 1, 300),
+            contract_under(10, 91, 500),
+            contract_under(11, 92, 400),
+            contract_under(12, 93, 300),
         ];
         let p = project_snapshot(
             NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |sid, _| match sid {
-                10 => f64::NAN,
-                11 => f64::INFINITY,
+            |underlying_id| match underlying_id {
+                91 => f64::NAN,
+                92 => f64::INFINITY,
                 _ => 3.25,
             },
             |_, _| false,
@@ -427,11 +460,72 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         let ranks: Vec<i64> = p.rows.iter().map(|r| r.rank).collect();
         assert_eq!(ranks, vec![1, 3]);
+    }
+
+    #[test]
+    fn project_snapshot_stores_the_rank_key_not_only_the_cumulative_volume() {
+        // The sort key has been lots-in-window since 2026-09-07, and until
+        // 2026-09-09 the table stored ONLY cumulative `volume` — so a reader
+        // could see rank 1 holding less volume than rank 40 with nothing in
+        // the row to explain the order. This asserts the number the ordering
+        // was actually computed from is on the row.
+        let ranked = [contract(10, 91, 500), contract(11, 92, 400)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| 1.0,
+            |_, _| false,
+        );
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(p.rows[0].window_lots_milli, 1_500);
+        assert_eq!(p.rows[1].window_lots_milli, 1_200);
+        // And it is genuinely a different column from `volume`.
+        assert_ne!(p.rows[0].window_lots_milli, p.rows[0].volume);
+    }
+
+    #[test]
+    fn project_snapshot_refuses_a_rank_key_that_would_wrap_the_signed_column() {
+        let mut c = contract(10, 91, 500);
+        c.window_lots_milli = u64::MAX;
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &[c],
+            |_| 1.0,
+            |_, _| false,
+        );
+        assert!(p.rows.is_empty());
+        assert_eq!(p.refusals, vec![(10, SnapshotRefusal::LotsOutOfRange)]);
+    }
+
+    #[test]
+    fn project_snapshot_asks_the_gain_closure_for_the_underlying_not_the_contract() {
+        // The 2026-09-09 defect in one assertion: the closure used to be
+        // handed the CONTRACT id and segment, and no previous close is ever
+        // stored for an NSE_FNO contract, so every row was refused as
+        // NonFiniteGain and the table stayed empty all session.
+        let ranked = [contract(4_431, 2_885, 500)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |id| {
+                assert_eq!(id, 2_885, "the gain closure must receive the UNDERLYING id");
+                7.5
+            },
+            |_, _| false,
+        );
+        assert_eq!(p.rows.len(), 1);
+        assert!((p.rows[0].gain_pct - 7.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -442,7 +536,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         assert_eq!(p.rows[0].volume, i64::from(u32::MAX));
@@ -455,7 +549,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &[],
-            |_, _| 0.0,
+            |_| 0.0,
             |_, _| false,
         );
         assert!(p.rows.is_empty());
@@ -468,16 +562,16 @@ mod tests {
         // caller's single number for "how much of this snapshot is missing",
         // so it must not report only the first kind it met.
         let ranked = [
-            contract(u64::MAX, 1, 500),
-            contract(10, 1, 400),
-            contract(11, 1, 300),
+            contract_under(u64::MAX, 91, 500),
+            contract_under(10, 92, 400),
+            contract_under(11, 93, 300),
         ];
         let p = project_snapshot(
             NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |sid, _| if sid == 10 { f64::NAN } else { 1.0 },
+            |underlying_id| if underlying_id == 92 { f64::NAN } else { 1.0 },
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 1);
@@ -491,6 +585,7 @@ mod tests {
             SnapshotRefusal::IdTooLargeForSignedColumn.as_str(),
             SnapshotRefusal::NonFiniteGain.as_str(),
             SnapshotRefusal::RankOutOfRange.as_str(),
+            SnapshotRefusal::LotsOutOfRange.as_str(),
         ];
         let mut sorted = labels;
         sorted.sort_unstable();

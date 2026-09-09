@@ -2147,7 +2147,7 @@ cross-underlying comparison — all STAND.
 | depth-20 | **250 instruments** = 5 sockets × 50, the highest-volume stock-option contracts |
 | depth-200 | **5 instruments** = 5 sockets × 1, the highest-volume stock-option contracts, **each a distinct underlying** |
 | Budget | UNCHANGED — 250 + 5. This changes WHICH, never how many |
-| Ranking key | **cumulative day volume**, read at byte offset 22 (`QUOTE_OFFSET_VOLUME`, const-asserted; the field is shared by the Quote AND Full layouts, not Full-only, and is ABSENT — reading 0 — in Ticker mode). ⚠ **The cumulative semantic is INFERRED, not proven, and the citation this row originally carried was FALSE.** It read "vendor-cumulative since session open, Dhan Ticket #5525125". That ticket is about PrevClose routing — `dhan_locked_facts.rs` records code 6, 16-byte packet, price@8, OI@12 under it and contains **zero** volume facts. The real state: `docs/operator/track-2-monotonicity-select.md` says the only mathematical proof "was unrunnable", and its `**Overall verdict:**` line is still the unfilled template `CONFIRMED CUMULATIVE | REFUTED | INSUFFICIENT`. So cumulative rests on three weak indicators plus vendor-SDK convention. **This is the single most load-bearing unproven input in the design** — if the field is a per-packet delta, the monotonicity gate refuses nearly everything. Running that SELECT on a live session is the cheapest high-value verification available. |
+| Ranking key | **cumulative day volume**, read at byte offset 22 (`QUOTE_OFFSET_VOLUME`, const-asserted; the field is shared by the Quote AND Full layouts, not Full-only, and is ABSENT — reading 0 — in Ticker mode). ✅ **PROVEN CUMULATIVE 2026-09-09, live.** This row previously read "INFERRED, not proven … the single most load-bearing unproven input in the design", and called running the Track 2 SELECT "the cheapest high-value verification available". It was run: **9,879,724 ticks across 8,675 instruments in one session, 157 monotonicity violations = 0.0016%** (`.claude/plans/research/track-2-result-2026-09-09.md`; the runbook `docs/operator/track-2-monotonicity-select.md` carries the resolved banner). A per-packet delta field would fall on roughly half of all ticks, not on one in 630,000. The 157 are arrival artefacts — intra-second transposition and the documented slow-consumer skip — and are exactly what `VolumeLeaderboard`'s monotonicity gate refuses; the measurement now SIZES that gate's workload rather than leaving it hypothetical. The FALSE citation this row once carried ("Dhan Ticket #5525125", which is about PrevClose routing and contains zero volume facts) stays retired. Also measured the same run: **IDX_I carries `volume = 0` on every one of 866,796 index ticks**, so an index can never be ranked by volume and only its option contracts can — a property the design already relies on and had never checked. |
 | Gainer role | **eligibility filter, not the sort key.** An instrument qualifies if its underlying is in the day's gainers; volume then decides the order. This keeps the ordered set monotonic, and therefore stable |
 | **Family split** | index options and stock options are ranked in **SEPARATE leaderboards**, never one blended list |
 | Ranking cadence | every **5 seconds** |
@@ -2682,3 +2682,189 @@ faces gives that without writing every row twice.
   every swap).
 - Drops ghost rows instead of writing them.
 - Raises the apply cadence under cover of this section.
+
+### 2026-09-09 — THE VOLUME RANKING BECOMES VISIBLE; and the 5-SECOND APPLY CADENCE IS ORDERED BUT NOT SHIPPED, with the reason
+
+**The verbatim operator demands (2026-09-09, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude just remove this one minute swap dude what happened to new volume ranking tables dude because we have now 5second swap right that too focusing only on options strikes top right"
+
+> "Morning will I see the precise volume ranking or not bro meanwhile Ar eyou sure about precise volume ranking vaze don its quantity percentage diff and in this also how will you always find ghe per engage change dude that's my main question because morning I need evryhhting need to be ready dude okay"
+
+#### Part 1 — the answer to the ranking question was NO, and three defects said so
+
+The honest answer to *"will I see the precise volume ranking"* on the build that
+was live this morning is **no, the table would have been EMPTY**, and the reason
+was not one bug but three, each verified in source before it was touched:
+
+| # | Defect | Evidence | Consequence at 09:15 |
+|---|---|---|---|
+| 1 | The snapshot asked the previous-close store for the **CONTRACT's** own close on `NSE_FNO`. The store's ONE production write door, `record_prev_close_from_tick`, returns early unless the segment is `NseEquity` — so the probe returned `None` on every row → `NaN` → refused as `NonFiniteGain` | `dhan_feed_stack.rs` (the `project_snapshot` closure) vs `:2656`; `record_prev_close` has zero production callers | **Every row of every snapshot dropped. The table empty all session while every counter read healthy.** |
+| 2 | `window_lots_milli` — **the actual sort key since the 2026-09-07 lock** — was on `RankedContract` and was NOT a column of `TopVolumeRankRow`. Only cumulative `volume` was stored | `top_volume_rank_persistence.rs` column list | Rank 1 could hold less volume than rank 40 with nothing in the row to explain the order |
+| 3 | `console_views::ensure_named_views` runs inside `run_candle_ddl_at_boot`, which `main.rs` calls BEFORE `run_live_table_ddl_at_boot` creates `top_volume_rank`. The view DDL warn-fails and is never retried in-boot | `main.rs:3745` vs `:3792`; `console_views.rs:288-296` | On a fresh volume `top_volume_rank_1s` / `_5s` **do not exist for the whole session** — the operator's own words for this table were *"only using db i can see this"* |
+
+**Fixed, in this order.** (1) `gain_pct` is now the **UNDERLYING's** percent
+change, computed by `underlying_gain_pct` from the **same two RAM inputs** that
+`underlying_gainer_verdict` turns into the gainer boolean — so the column and the
+filter cannot disagree, and the closure is keyed on `underlying_id` so the wrong
+lookup is unrepresentable rather than merely corrected. This is also what
+`eligible_gain_pct` was written for: its own `MAX_PLAUSIBLE_GAIN_PCT` doc states a
+deep-out-of-the-money option "can move that far" and is "not what this function is
+fed", so the old call site was wrong twice. (2) `window_lots_milli LONG` joins the
+table through the house `CREATE → ADD COLUMN IF NOT EXISTS → DEDUP ENABLE`
+self-heal, so the order is checkable from the row rather than taken on trust.
+(3) The named views are **re-ensured** after the rank table exists — additive
+rather than a re-order, because the candle ordering above it is load-bearing and
+every view statement is `CREATE OR REPLACE`.
+
+**So the answer to "how will you always find the percentage change":** it is the
+underlying stock's move — spot against its previous close, both from RAM, both
+the gainer filter's own inputs. It is NOT the option contract's own move: nothing
+in this system has ever stored a previous close for an `NSE_FNO` contract, and
+inventing one would be a fabricated number in the column that decides eligibility.
+
+#### Part 2 — the 5-second apply cadence is NOT shipped, and this is the evidence
+
+The operator ordered the one-minute swap removed in favour of the 5-second swap.
+**It is not shipped today**, and the reason is a specific, checkable fact rather
+than caution:
+
+| Fact | Evidence |
+|---|---|
+| Dhan error 804 is classified `DisconnectClass::Fatal` | `pool_supervisor.rs:521-543` |
+| Fatal ⇒ `park(ParkReason::FatalDisconnect)`, and `allows_one_respawn()` returns **`false`** for it | `pool_supervisor.rs:1247-1256`, `:866-871` |
+| `take_ghost_redial` is consulted **only** while `action == SupervisorAction::Continue`. A parked socket has LEFT that loop | `pool_supervisor.rs:4634-4638` |
+| **Therefore the ghost-redial detector shipped 2026-09-08 (THIRD) structurally CANNOT recover an 804-parked socket.** Parking bypasses the redial ladder | derived from the three rows above |
+| depth-200 socket capacity is **1**. If the unsubscribe RequestCode (24 vs 25, still UNVERIFIED-LIVE) is wrong, swap #1 asks Dhan for 2 > 1 ⇒ 804 on the **first swap, at any cadence** | `pool_supervisor.rs:2058`, `:2136-2146` |
+
+The 2026-09-08 (THIRD) section claimed the ghost redial "makes a wrong code
+SELF-HEALING rather than fatal, which is what makes the raise safe to do next."
+**That claim is WITHDRAWN.** It is true for a socket that keeps *delivering* a
+ghost, and false for one that has been *parked* — and 804 parks. The cadence raise
+would therefore be session-ending, not self-healing, and 5 s gives twelve times the
+chances per hour to reach it.
+
+Three further blockers stack behind that one, each independently sufficient:
+per-socket swap caps are enforced per CALL and hold no cross-call state
+(`depth20_ranked_steer.rs:77,87,116`), so 5 s yields 240 swaps/socket/minute
+against a documented budget of 4; `send_swap` sets `socket.pending` with no
+`pending.is_some()` guard, so a second dispatch corrupts the revert target
+(`depth_rebalance.rs:987-990`); the per-iteration `load_depth_candidates` +
+`fetch_movers` are two QuestDB queries whose RAM-empty budget is **10 s**, longer
+than a 5 s tick (`dhan_contract_universe.rs:1423-1428`); and
+`depth_steering_stalled`'s 180 s threshold, written against a 60 s loop, becomes 36
+missed iterations (`live-lane-alarms.tf:829`).
+
+**The ordering the 2026-09-06 FOURTH-quote section already binds stands: probe the
+unsubscribe code on a live session FIRST, then raise the cadence.** The instrument
+for that probe now exists and is live — `tv_dhan_feed_depth_total{outcome="ghost"}`
+against `{outcome="unsubscribed_grace"}`. A session that ends with `ghost = 0` and
+`unsubscribed_grace > 0` is the evidence that code 25 works, and the cadence raise
+becomes a small change the following day.
+
+**What a PR that violates this section looks like (REJECT):** raises the apply
+cadence before that probe reads clean; ships the raise without converting the
+per-call swap caps to rolling per-minute budgets, guarding `send_swap` on
+`pending`, moving the two QuestDB queries off the per-iteration path, and lowering
+the stall threshold in the same change; computes `gain_pct` from the CONTRACT's
+previous close (nothing writes one); or drops `window_lots_milli` from the row on
+the grounds that `volume` is already there — `volume` has not been the sort key
+since 2026-09-07.
+
+### 2026-09-09 — STOCK FUTURES BECOME THE PRIMARY PRICE FOR ATM ±25, AND THE WINDOW FREEZES FOR THE DAY
+
+**The verbatim operator demand (2026-09-09, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude see dotn sue futures as the fallback dude just use futures as the primary dude espeically to fidn this atm plus minus and stickign fully with that for the entire current day dude okay?"
+
+Given in DIRECT response to a design study that recommended futures as a
+**fallback** for lot size and spot price and recommended **against** using them
+to centre the strike window. The operator read that recommendation and reversed
+its central conclusion. **That is his call and it governs.** The study's reasoning
+is preserved below rather than deleted, because the numbers in it are measured and
+the next reader is entitled to see what was traded away.
+
+#### What this authorizes
+
+| Surface | Was | Now |
+|---|---|---|
+| Price used to centre the stock-option **ATM ±25** window | the stock's SPOT last-traded price | **the stock's nearest-expiry FUTURE's last-traded price, as PRIMARY** |
+| Spot price | the only source | the **fallback**, used when the future has not printed |
+| Window lifetime | re-fit until 09:30, then frozen | **chosen once and frozen for the whole trading day** |
+| Lot size | option's own `z`, refuse if absent | unchanged by this quote — the futures lot-size fallback stays a separate decision |
+
+**The futures are already subscribed and this costs no new connection or fetch.**
+All 1,270 `FUTSTK` contracts are classified at `dhan_contract_universe.rs:813`,
+pushed at priority 1–2 into `picked`, surfaced as `ContractSelection::instruments`
+and dialled onto the main feed in Full mode. Their ticks already reach the drain,
+are lag-recorded and folded. The ONLY thing stopping a future's price reaching the
+selector is the binding pattern at `dhan_feed_stack.rs:6172-6176`, which admits
+`IdxI | NseEquity | BseEquity` and nothing else. Widening it to `NseFno` is one
+enum arm; `SpotPriceStore::record` is already segment-agnostic and keyed on the
+I-P1-11 composite, and ~1,270 futures against a 25,000 cap with ~870 live entries
+is inside the ceiling.
+
+#### ⚠ The honest measurement, which argued the other way
+
+Recorded because the operator overruled it knowingly and a future reader must not
+mistake this for a numbers-driven decision:
+
+| Quantity | Measured |
+|---|---|
+| Median strike spacing, 210 F&O underlyings, current expiry (2026-08-27) | **2.63% of price** |
+| Gap needed to move the nearest-strike pick by ONE step (half a spacing) | **1.32%** |
+| Typical near-month equity futures premium (cost of carry, ~1 month) | **~0.5%** — *Assumed, not derivable in-repo* |
+
+So on the median name the futures price does not change which strike is chosen,
+and when it does the ±25 window shifts by one strike — 24 of 25 per side unchanged.
+**The measured benefit to centring accuracy is therefore approximately zero.**
+
+**What the change DOES buy, and it is real:** coverage. A stock with no spot print
+is refused into `underlyings_without_spot` and gets no options at all that day —
+measured 2026-08-21: 725 priced, **8 without**, ≈780 option contracts absent for
+the session. A future that printed when the spot did not now supplies the centre.
+How many of those 8 had a futures tick is **Unknown** — no counter exists, and a
+stock too illiquid to print a spot usually has an equally illiquid future.
+
+#### The freeze is the half with real consequences, in both directions
+
+"Sticking fully with that for the entire current day" makes the window **immutable
+once chosen**. That is stricter than today, where a top-up runs until 09:30.
+
+- **For:** the subscribed set stops moving, so a contract cannot silently leave
+  depth mid-session, and the day's capture is reproducible from one decision.
+- **Against, stated plainly:** if the underlying moves more than 25 strikes from
+  where it was centred, the true at-the-money leaves the captured window and
+  **nothing re-centres it**. Measured drift is 2.20% ≈ 0.8 strikes on an average
+  day and **6.0 strikes** on the worst single underlying of 2026-08-27 — well
+  inside 25, so this is a tail risk rather than a daily one. It must be COUNTED:
+  a session where the live price leaves the window is exactly the case the
+  operator would want to know about, and freezing removes the mechanism that
+  would otherwise hide it.
+
+#### What this quote does NOT authorize
+
+- **Previous close from futures.** A future's previous close is not the stock's;
+  feeding it to the gainer test invents a percentage change from two unrelated
+  numbers. The `PrevCloseStore` gate at `dhan_feed_stack.rs:2796-2800` stays
+  `IdxI | NseEquity`. This is the one row that would manufacture a confidently
+  wrong answer, and it stays shut.
+- Any change to `STOCK_OPTION_ATM_STRIKES_EACH_SIDE` (25), the 60% pricing quorum,
+  the socket or instrument budgets, or the subscription set.
+- Index options: NIFTY/BANKNIFTY full-chain selection is unchanged and takes no
+  futures price.
+- Live order fire; `dry_run` stays true; the §28 frozen area is untouched.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Uses a far-month future rather than the **nearest non-expired** expiry — a stale
+  far-month print would centre a ladder on an hours-old number.
+- Lets a futures price overwrite a **fresher** spot print (the store's
+  later-exchange-time-wins rule and its trading-day floor both still bind).
+- Widens `PrevCloseStore` to `NseFno`.
+- Re-centres the window after it is frozen, or freezes it without counting the
+  case where the live price leaves the window.
+- Presents futures centring as an accuracy improvement — the measurement above
+  says it is a coverage change, and the honest claim is the coverage one.

@@ -397,6 +397,21 @@ pub const DEPTH20_SWAPS_REFUSED: &str = "tv_depth20_track_swaps_refused_total";
 /// The counter for diffs that could not be paired, by side.
 pub const DEPTH20_UNPAIRED: &str = "tv_depth20_track_unpaired_total";
 
+/// Every `reason` label [`DEPTH20_SWAPS_REFUSED`] is emitted with.
+///
+/// Named rather than inlined into the pre-register loop so a test can hold it
+/// against the emit sites in BOTH directions. The 2026-09-09 sweep found the
+/// old test enumerating three of five by hand: `not_held` and the new
+/// `ack_pending` were live call sites that nothing seeded and nothing checked,
+/// so their first refusal — the one that matters — published nothing.
+pub const DEPTH20_REFUSAL_REASONS: [&str; 5] = [
+    "channel_full",
+    "channel_closed",
+    "no_socket",
+    "not_held",
+    "ack_pending",
+];
+
 /// Registers every counter at zero.
 ///
 /// An alarm on a counter that has never been emitted reads as missing data
@@ -404,7 +419,7 @@ pub const DEPTH20_UNPAIRED: &str = "tv_depth20_track_unpaired_total";
 /// until the first swap.
 pub fn pre_register_depth20_counters() {
     metrics::counter!(DEPTH20_SWAPS_SENT).increment(0);
-    for reason in ["channel_full", "channel_closed", "no_socket", "not_held"] {
+    for reason in DEPTH20_REFUSAL_REASONS {
         metrics::counter!(DEPTH20_SWAPS_REFUSED, "reason" => reason).increment(0);
     }
     for side in ["arrival", "departure"] {
@@ -443,6 +458,29 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
             );
             continue;
         };
+        // The unreconciled-ack gate, ported from `send_swap` on 2026-09-09.
+        //
+        // Depth-200 refuses a second swap while the first is unanswered; this
+        // pool did not, and it carries 250 instruments to depth-200's five.
+        // `held` advances OPTIMISTICALLY on a successful `try_send`, and
+        // `reconcile_pending_depth20_swaps` deliberately KEEPS a pending ack
+        // when `try_recv` is empty — the connection may simply not have
+        // answered yet. So without this gate the planner plans from a belief
+        // the wire has never confirmed, and each further minute stacks another
+        // unconfirmed swap on top of it. The published view then names strikes
+        // the socket is not carrying, `record_dropped` stamps contracts it may
+        // still be delivering, and ninety seconds later those frames classify
+        // as ghosts and redial a socket that was doing what it was told —
+        // while every counter reads green.
+        //
+        // Skipping costs one minute of staleness on ONE socket; the plan is
+        // recomputed next minute from whatever the ack settled, so nothing is
+        // lost, only deferred. The alternative costs the rest of the session.
+        if !socket.pending.is_empty() {
+            metrics::counter!(DEPTH20_SWAPS_REFUSED, "reason" => "ack_pending")
+                .increment(socket_plan.swaps.len() as u64);
+            continue;
+        }
         for (release, take) in &socket_plan.swaps {
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             let command = LiveSubscriptionCommand::Swap {
@@ -1191,5 +1229,46 @@ mod adversarial_tests {
             plan_depth20_minute(&held, &want).is_quiet(),
             "an unchanged full session produced traffic"
         );
+    }
+
+    #[test]
+    fn every_depth20_refusal_reason_is_a_registered_label() {
+        // The depth-20 twin of the depth-200 scan, added 2026-09-09 with the
+        // `ack_pending` gate. This pool had NO such test at all while carrying
+        // 250 instruments to depth-200's five, so a label that nothing seeded
+        // would have gone unnoticed here for longer and cost more.
+        //
+        // Both directions: an emitted-but-unregistered label publishes nothing
+        // on its first refusal (the agent drops the first sample of an unseen
+        // label set), and a registered-but-unemitted label is a series that can
+        // never move.
+        let src = include_str!("depth20_track.rs");
+        let mut found: Vec<&str> = Vec::new();
+        for tail in src.split("DEPTH20_SWAPS_REFUSED, \"reason\" => \"").skip(1) {
+            let Some(label) = tail.split('"').next() else {
+                continue;
+            };
+            if !found.contains(&label) {
+                found.push(label);
+            }
+        }
+        assert!(
+            found.len() >= 5,
+            "expected at least 5 emitted reason labels, found {found:?}"
+        );
+        for label in &found {
+            assert!(
+                DEPTH20_REFUSAL_REASONS.contains(label),
+                "`{label}` is emitted but never pre-registered — its first \
+                 refusal would publish nothing"
+            );
+        }
+        for reason in DEPTH20_REFUSAL_REASONS {
+            assert!(
+                found.contains(&reason),
+                "`{reason}` is pre-registered but no longer emitted"
+            );
+        }
+        pre_register_depth20_counters();
     }
 }

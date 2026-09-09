@@ -561,12 +561,54 @@ impl TokenManager {
                 token_cache::load_token_cache(&manager.credentials.client_id)
         {
             manager.token.store(Arc::new(Some(cached_token)));
-            info!(
-                expires_at = %manager.current_expiry_display(),
-                "using cached token — skipped Dhan auth HTTP call"
-            );
-            notifier.notify(NotificationEvent::AuthenticationSuccess);
-            return Ok(manager);
+            // PROBE BEFORE ADOPTING — the same one HTTP call the SSM branch
+            // above makes, for the same reason, which this branch was missing.
+            //
+            // Dhan allows ONE active token per account. The scheduled minter
+            // runs at 06:05 IST and that mint INVALIDATES whatever this box
+            // cached yesterday. So on any boot where the SSM read fails for an
+            // ordinary reason -- a transport blip, an IAM hiccup -- control
+            // reaches here holding a token that parses perfectly, has not
+            // expired by its own `exp`, and is already dead.
+            //
+            // Adopting it then RETURNS, skipping the mint below, and the box
+            // runs the whole session 401-ing every REST leg and the WebSocket
+            // handshake while the log says "using cached token" and the
+            // notifier says AuthenticationSuccess. Every operator-facing signal
+            // reads healthy; the first real symptom is no ticks at 09:15, and
+            // the only alarm that catches it is `dhan-no-ticks-flowing`, ten
+            // minutes into the session.
+            //
+            // `shared_token_rejected_by_broker` guards only the case where SSM
+            // was READ and its token was REFUSED. An SSM read FAILURE leaves
+            // that flag false, which is precisely the path that reaches an
+            // unprobed cache.
+            //
+            // On failure the token is cleared and control falls through to the
+            // mint below, so a probe that cannot run (network down, Dhan down)
+            // costs a mint, never a wedged boot. Found by the 2026-09-09
+            // boot-path sweep.
+            match manager.get_user_profile().await {
+                Ok(_) => {
+                    info!(
+                        expires_at = %manager.current_expiry_display(),
+                        "using cached token — VERIFIED against /v2/profile, so a token the \
+                         06:05 minter has since invalidated cannot be adopted silently"
+                    );
+                    notifier.notify(NotificationEvent::AuthenticationSuccess);
+                    return Ok(manager);
+                }
+                Err(e) => {
+                    manager.token.store(Arc::new(None));
+                    warn!(
+                        error = %e,
+                        "the cached Dhan token parses and has not expired, but Dhan REJECTED \
+                         it — the scheduled minter almost certainly re-minted after this cache \
+                         was written, and Dhan allows one active token per account. Falling \
+                         through to mint."
+                    );
+                }
+            }
         }
 
         // Slow path: full auth via Dhan API.
