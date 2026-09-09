@@ -833,6 +833,25 @@ jobs:
       # but if user-data never ran (rebuilt instance) OR QuestDB was stopped, the
       # app boots and hits BOOT-02 (QuestDB readiness deadline 60s). Idempotent:
       # `docker compose up -d` is a no-op when containers are already running.
+      # 2026-09-09 CLEAR-AND-RETRY-ONCE: `up -d` is NOT always a no-op — when the
+      # resolved config differs from what a container was created with, compose
+      # RECREATES it, and its recreate path renames the old container to
+      # `<id>_<service>` as a backup before creating the replacement. On the
+      # 2026-09-09 deploy of 2e681b94c that path failed twice, deterministically,
+      # with different container ids (`9ed786971d89_tv-questdb`, then
+      # `d437d47db47c_tv-questdb`) — `Error response from daemon: No such
+      # container: <id>` — so it is the recreate implementation, not a race. The
+      # binary swap runs ABOVE this step and had already succeeded, so the box
+      # was serving the new code while the deploy reported FATAL and skipped the
+      # B9 provenance write, leaving `binary-git-sha` stale and the
+      # tv-prod-binary-sha-stale alarm armed against a box that was actually fine.
+      # Attempt 1 is unchanged. Only on failure do we remove THIS project's
+      # containers (`docker compose ps -aq` lists the renamed backup too — a
+      # rename keeps the compose labels) and run `up -d` again, which then has
+      # nothing to recreate and simply creates. Data is untouched: the volumes
+      # are named (`tv-questdb-data`, `tv-loki-data`) and `docker rm` never
+      # removes a named volume. Two failures still exit FATAL, so a genuinely
+      # broken compose file can never be papered over as a recovery.
       # Z+ L3 RECONCILE: prove the running state matches the desired state.
       # B4 QuestDB console fix (2026-07-03): persist TV_QDB_HTTP_BIND=0.0.0.0 in
       # the compose project .env (gitignored — survives the reset --hard above)
@@ -969,7 +988,7 @@ jobs:
               "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
-              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d) || (echo FATAL: docker compose up failed or exceeded 600s; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
+              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose up attempt 1 failed - a recreate leaves the old container renamed to <id>_<service> and the daemon can then refuse to start it; removing the containers of this compose project and retrying once (named volumes and data are untouched)\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
               "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:9000/index.html || { echo \"FATAL: console shell page (/index.html) not served as a complete HTTP 200 within 5s on the box\"; exit 1; }",
               "systemctl daemon-reload",
@@ -984,7 +1003,7 @@ jobs:
               "QDB_BEFORE=$(grep -E \"^QDB_MEM_LIMIT=\" $ENVF | tail -1 || true)",
               "grep -qE \"^QDB_MEM_LIMIT=\" $ENVF && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=$QDB_WANT/\" $ENVF || echo \"QDB_MEM_LIMIT=$QDB_WANT\" >> $ENVF",
               "QDB_AFTER=$(grep -E \"^QDB_MEM_LIMIT=\" $ENVF | tail -1 || true)",
-              "if [ \"$QDB_BEFORE\" != \"$QDB_AFTER\" ]; then echo \"questdb-mem: CORRECTED [$QDB_BEFORE] -> [$QDB_AFTER] — recreating questdb so the new cap takes effect\"; (cd /opt/tickvault/repo/deploy/docker && docker compose up -d --force-recreate questdb) || echo \"questdb-mem: WARNING recreate failed — cap applies on next container start\"; else echo \"questdb-mem: already $QDB_AFTER\"; fi",
+              "if [ \"$QDB_BEFORE\" != \"$QDB_AFTER\" ]; then echo \"questdb-mem: CORRECTED [$QDB_BEFORE] -> [$QDB_AFTER] — recreating questdb so the new cap takes effect\"; (cd /opt/tickvault/repo/deploy/docker && { docker compose up -d --force-recreate tv-questdb || { docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; docker compose up -d; }; }) || echo \"questdb-mem: WARNING recreate failed — cap applies on next container start\"; else echo \"questdb-mem: already $QDB_AFTER\"; fi",
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
               "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
