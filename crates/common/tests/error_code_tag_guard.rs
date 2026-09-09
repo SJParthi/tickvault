@@ -280,7 +280,18 @@ fn scan_corpus_exists_and_is_substantial() {
 /// breached with nothing but a counter nobody was reading to say so. It now
 /// carries `WS-SPILL-02`. The budget comes down with it, in the same change,
 /// per the rule the line above states.
-const UNCODED_ERROR_BUDGET: usize = 82;
+///
+/// 82 -> 77 (2026-09-09). FIVE sites coded in one change, all in
+/// `dhan_contract_universe::fetch_spot_prices` — the QuestDB spot backstop's
+/// client-build, non-2xx, unreadable-body, send and unparseable-response arms.
+/// They mattered because that function is the fallback the contract selector
+/// reaches for when RAM has no price, and an UNCODED `error!` is invisible to
+/// all 27 coded metric filters: the database could be refusing every read and
+/// the only surface was ladders attributed to `without_spot`, which reads as
+/// "this stock did not trade" rather than "we could not price it". Each now
+/// carries `WS-GAP-03` with a `source` naming which arm failed. The budget
+/// comes down with them, in the same change, per the rule two lines above.
+const UNCODED_ERROR_BUDGET: usize = 77;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.

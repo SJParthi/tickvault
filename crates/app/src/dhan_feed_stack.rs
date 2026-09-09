@@ -5542,8 +5542,8 @@ async fn run_frame_drain(
                 // The two candle-only VENDOR data-quality reasons. They were
                 // buried in `out_of_session`, which the pager above skips, so
                 // until 2026-09-01 neither had ANY operator surface. Reported
-                // at WARN precisely so they inform without paging: in both
-                // cases the ROW IS WRITTEN and only the candle bucket is
+                // at WARN precisely so they inform without paging: in every
+                // case the ROW IS WRITTEN and only the candle bucket is
                 // skipped, so this is a trend to watch, never a tick-loss
                 // count and never a 2am page.
                 if d_stale > 0 || d_oob > 0 || d_future > 0 {
