@@ -887,6 +887,33 @@ pub fn distinct_underlying_over(ordered: &[RankedContract], k: usize) -> Vec<Ran
 /// underlying".
 pub const STOCK_OPTION_UNDERLYING_SEGMENT: ExchangeSegment = ExchangeSegment::NseEquity;
 
+/// The segment this family's UNDERLYING trades in.
+///
+/// # Why this exists rather than a constant at each call site
+///
+/// [`STOCK_OPTION_UNDERLYING_SEGMENT`] is right for the eligibility filter,
+/// which is Stock-only by the 2026-09-06 lock. It is WRONG for the persisted
+/// `top_volume_rank` rows, which are written for BOTH families — and until
+/// 2026-09-09 the `gain_pct` closure used it unconditionally.
+///
+/// An index option's `underlying_id` is an index id (NIFTY=13, BANKNIFTY=25,
+/// SENSEX=51). Probing `(13, NSE_EQ)` is exactly the I-P1-11 collision this
+/// repository bans: at best it finds nothing and every index row is refused
+/// `NonFiniteGain` so the index half of the table is empty; at worst an NSE
+/// cash equity carries id 13 — low ids are where equities live — and the row
+/// is ACCEPTED carrying that stock's percentage under an index's name, with
+/// no NaN to catch it and no refusal counter moving.
+///
+/// Deriving the segment from the family makes the wrong pairing
+/// unrepresentable instead of merely corrected.
+#[must_use]
+pub const fn underlying_segment(family: OptionFamily) -> ExchangeSegment {
+    match family {
+        OptionFamily::Index => ExchangeSegment::IdxI,
+        OptionFamily::Stock => STOCK_OPTION_UNDERLYING_SEGMENT,
+    }
+}
+
 /// Metric: how the gainer filter judged each ranked contract's underlying,
 /// per 5-second pass. Labels are [`GAINER_VERDICT_LABELS`]. Local exporter
 /// only — never EMF-shipped (three series a human reads while already
