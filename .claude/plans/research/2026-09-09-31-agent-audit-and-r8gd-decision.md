@@ -178,3 +178,82 @@ Run in a clean worktree of `b89f2720e`, cold build, each step under `timeout 150
 7. Add the 804-respawn path, the per-minute rolling swap budget, and the RAM-only 5 s planner arm (§6), then flip the cadence.
 8. Add `tickvault-app` and `tickvault-storage` to the weekly mutation lane; add the five missing tests from B17.
 9. Annotate operator-charter rule 13 and the CLAUDE.md dependency table.
+
+## 10. Compound-failure permutation sweep (six agents, 2026-09-09, read-only)
+
+Method: every row is TWO OR MORE faults at once, traced in source, tagged
+Verified / Assumed / Unknown. Six domain tables (107 rows) live in the session
+scratchpad; this section keeps the rows that change a decision. Three agent
+claims were checked by hand and corrected before landing here (marked ✱).
+
+Legend: **Lost?** = ticks/depth/day permanently lost · **Heals?** = without a
+human · **Pages?** = a Telegram reaches the operator · ✅ safe · ⚠️ bounded
+gap · ❌ silent or unrecoverable.
+
+| # | When these happen together… | …what the system does today | Lost? | Heals? | Pages? | Verdict | Evidence |
+|---|---|---|---|---|---|---|---|
+| S1 | Disk 100% AND restart mid-session | replay hits ENOSPC; RAM-only frames at the kill are gone | Yes (bounded) | Partial | WS-SPILL-01, spill-dir-free-low | ⚠️ | Verified |
+| S2 | Table WAL-suspended AND ILP still ACKing AND archiver running | acks parked; resume refused under 25% free; recount sees only APPLIED rows | Unknown | No | questdb-wal-suspended | ⚠️ | Verified/Assumed |
+| S3 | Inodes exhausted, bytes free | inode gauge local only; spill/WAL creates fail | Bounded | No | free-bytes alarm stays GREEN | ⚠️ | Verified |
+| S4 | Clock stepped ≥48 h forward AND prune runs before replay | `prune_active_segments` deletes un-replayed live segments | **Yes** | No | NONE | ❌ | Verified (`main.rs:1750` → `ws_frame_spill.rs:3800`) |
+| S5 | Hour-granular depth archive verified AND boot WAL refold writes old-timestamp rows AND disk pressure overrides the deferral | pending-data guard checks spill dirs only, never the WAL `replaying/` dir; recount→DROP round-trip is admitted unclosable | Yes, one round-trip window | No | NONE | ❌→⚠️ ✱ narrow | Verified (`partition_archive.rs:2107-2126, 1940-1975`) |
+| S6 | Rollback to a pre-TVW4 binary AND depth backlog | unknown endpoint mapped to MainFeed; depth frames counted and skipped | **Yes** (depth) | No | NONE (`warn!`) | ❌ | Verified |
+| S7 | Suspended tables AND resume refused AND day path already reclaimed | livelock until a human frees disk | Bounded | No | two alarms | ❌ | Verified |
+| W1 | Dhan 804 on a depth-200 socket AND ghost-redial armed | 804 = Fatal → park; no respawn for any park reason; ghost register polled only under `Continue` | depth, session | **No** | park alarm | ❌ | Verified (`pool_supervisor.rs:511-540, 863, 1554, 4681`) |
+| W2 | Unsubscribe TIMES OUT (not reverted by design) AND subscribe sent | Dhan holds OLD+NEW = 2 > 1 → 804 → W1 on the FIRST swap | depth, session | No | park | ❌ | Verified + cap semantics Unknown live |
+| W3 | Token killed server-side AND all 16 sockets redial AND 805 | 5 s floor + jitter, cooldown; ~5 s upstream gap (no sequence number) | ~5 s | ~5 s | lane-down/park | ⚠️ | Verified |
+| W4 | Socket pongs but delivers nothing AND outside 09:20–15:40 | ping resets the idle watchdog; deaf alarm gated | socket | No | RISK-GAP-03 only | ⚠️ | Verified |
+| W5 | 805 arrives as a bare RST AND herd redial | classified Transient; ladder evicts the oldest sibling | rolling pool loss | No | no-ticks ~10 min | ❌ | Verified |
+| W6 | NSE holiday AND manual start AND marker missing | gate opens fail-open; ~7 false pages | none | n/a | false pages | ⚠️ | Verified |
+| R1 | No code-6 previous close AND `day_close = 0` on NSE_EQ | every gainer verdict Unknown; depth holds the BANNED index boot dial all day; 10:00 latch mislabels it "all down" | wrong depth set | No | **No** (0 terraform hits on either `source`) | ❌ | Verified |
+| R2 | Code-6 door is last-write-wins on ANY segment, no day floor, no disagreement counter AND reconnects re-send code-6 | one stale/corrupt value re-bases every strike of a stock; tick door is first-write-wins + counted | wrong gainer set | No | No | ❌ | Verified (`prev_close_store.rs:175` vs `dhan_feed_stack.rs:2895`) |
+| R3 | Code-6 arm has NO segment gate | ~23k NSE_FNO closes fill a 25k store nobody reads; expiry-week widening can refuse a real spot close | stock never a gainer | No | No | ⚠️ | Count Assumed |
+| R4 | u32 volume wrap AND monotonicity gate AND relatch 32 | liquid contract back in seconds; a thin one stays off the board | thin contract | Partial | No | ⚠️ | Verified |
+| R5 | Half-day / Muhurat session AND fixed 09:15–15:40 gates | no ranking; boot dial all session; latches misfire | wrong depth set | No | No | ⚠️ | Verified (`constants.rs:1369/1381`) |
+| R6 | Reused derivative id AND seed validation | seed compares expiry/strike/leg but NOT underlying | unranked contract until first ranking | Yes | No | ⚠️ | Verified (`depth_seed.rs:456`) |
+| R7 | Ticks/depth DDL fail AND rank DDL ok | named `_1s/_5s` views never re-ensured; empty views all session | operator view | Next boot | No | ⚠️ | Verified |
+| I1 | Budget 90% ($135) stops the box mid-session AND autopilot runs every 15 min | autopilot checks ONLY the holiday marker → restarts the box; native action is one-shot per period → runs unchecked to $150 | money | wrong way | yes | ❌ | Verified (`aws-autopilot.sh:200-229`) |
+| I2 | …AND `hard_stop_guard` stops at $150 + disables `daily_start` | breach stop writes NO keep-down marker; autopilot restarts ≤15 min later; hourly guard stops again → stop/start war, ~18 pages/day to month end | 25% of hours billed past cap | Fights itself | ~18/day | ❌ | Verified (`hard_stop_guard.rs:465-472`) |
+| I3 | AZ capacity refusal AND terraform-apply suppressed (bot merge) | `budget.tf instance_ids` names a terminated box → both kill-switches no-op | budget guard gone | No | No | ❌ | Verified |
+| I4 | In-hours deploy AND 3M-frame WAL replay AND `MemoryHigh=20G` AND host OOM | `Restart=always` → `StartLimitBurst=5/3600` → unit `failed`; only rollback runs `reset-failed` | day | No | lane-down (gated) | ⚠️ | Verified (unit values differ from the rule files ✱) |
+| I5 | Over-commit 20G+12.5G+0.64G = 33.1 > 31.3 GiB | app −900 and QuestDB −500 both floor; adj-0 daemons (ssm-agent, cloudwatch-agent, dockerd, sshd) die FIRST | box unreachable | No | Late | ❌ | Verified math / tie-break Assumed |
+| I6 | Full disk AND SSM never registers AND Instance Connect down | modify-volume works but FS never grows (no growpart in user-data); detach/attach denied | day+ | No | disk alarms | ❌ | Verified / Unknown |
+| I7 | Stale `nse_holidays` lists a real trading day | gate stops the box at 08:32 and stamps the marker; every restarter honours it → silent all day after one 🔔 line | **whole day** | No | Once | ❌ | Verified (`holiday-gate.sh`) |
+| I8 | EventBridge drops `daily_start` AND the 08:45 check AND the GH cron | dark until a human; start-watchdog-not-invoked is blind (hourly curfew keeps Invocations ≥ 1) | day | No | boot-heartbeat once | ❌ | Verified |
+| M1 | `MemoryHigh` reclaim throttles the reader AND QuestDB WAL-apply bursts on the SHARED core 2 | TCP rcvbuf fills → Dhan skips forward; ring-dwell measures AFTER the reader and reads healthy; nothing samples Recv-Q | **Yes, upstream, invisible** | No | RESOURCE-02 only | ❌ | Verified |
+| M2 | Offload writer exits cleanly | producer `try_send` → SinkGone → rescue; no respawn | No (rescued) | rescue only | ticks-spilling | ⚠️ | Verified |
+| M3 | 25k aggregator slots AND additive re-fit AND expiry week | slots never released; first exhaustion logged only; no slots-in-use gauge | candles for new instruments | Never | after the fact | ⚠️ | Verified |
+| M4 | `classify_raw` on every depth packet | O(1), but NO DHAT gate | — | — | — | ⚠️ | Verified |
+| A1 | Market-hours gate reads "not running" at 09:20 (box mid-restart) ✱ | `SkipInstanceDown` returns Ok with all 12 alarms still DISABLED; Errors = 0, Invocations = 1; nothing detects it. (SSM and DescribeInstances errors fail OPEN to Enable — the agent's broader claim was wrong.) | alarms for the session | No | No | ❌ | Verified (`market_hours_gate.rs:77-86, 146-166`) |
+| A2 | Gate rule not invoked (scheduler drop) | not-invoked alarm needs 3 missed days | 3 days blind | No | Late | ❌ | Verified |
+| A3 | Telegram token flaky, 1 of N lands | handler returns Ok; N−1 pages lost silently | pages | No | No | ⚠️ | Verified (`telegram_webhook.rs:1281`) |
+| A4 | app.log stream dies, errors.jsonl fine | `preopen-ready-secs` AND the divergence alarm's own nested leg go silent | readiness alarm | No | No | ❌ | Verified |
+| A5 | 14 EMF counters created lazily in failure arms | agent drops the first sample → first episode never charted | first episode | n/a | Late | ⚠️ | Assumed |
+| A6 | 31 new counters (swaps, ghosts, seeds, spot/prev-close refusals, rank append) | local `/metrics` only; zero CloudWatch, zero audit rows | defect signals | n/a | No | ❌ | Verified |
+| A7 | Weekend, `daily-budget-digest-not-invoked` (cron MON-FRI, breaching, 86400×1) | fires every Saturday and Sunday | 2 false pages/week | n/a | false | ❌ | Verified (`budget-guards.tf:115,459`) |
+
+### 10.1 Scorecard
+
+| Domain | Rows | ✅ | ⚠️ | ❌ | Worst single finding |
+|---|---|---|---|---|---|
+| Storage / durability | 16 | 3 | 8 | 5 | S4 clock-step prune deletes un-replayed WAL; S6 rollback skips depth silently |
+| Sockets / depth | 17 | 4 | 9 | 4 | W1+W2: a timed-out unsubscribe → 804 → parked for the session, redial unreachable |
+| Ranking / steering | 16 | 6 | 8 | 2 | R1+R2: previous-close door last-write-wins, all-Unknown holds the banned index dial, no page |
+| AWS infra / lifecycle | 18 | 4 | 5 | 9 | I1+I2: three budget-blind restarters undo both kill-switches |
+| Memory / runtime | 19 | 12 | 6 | 1 | M1: upstream loss has no instrument at all |
+| Alerting / audit | 21 | 7 | 9 | 5 | A1: one bad 09:20 read disarms 12 alarms with Errors = 0 |
+| **Total** | **107** | **36** | **45** | **26** | |
+
+### 10.2 New CRITICAL rows (not in §5)
+
+1. **I1/I2 — the budget kill-switch fights its own restarters.** `execute_breach_stop` stops the box and disables the start rule but writes no keep-down marker; autopilot (every 15 min, checks only the holiday marker), the 08:45 start-watchdog check, and `deploy-aws.yml` case A all restart it. Fix: the breach stop stamps the same SSM marker the holiday gate uses; all three already honour it.
+2. **A1 — the alarm gate fails closed on a transient instance-state read.** A box restarting at 09:20 leaves the whole live-lane family disarmed for the session with no detector. Fix: publish `tv_market_hours_gate_armed` after `enable_alarm_actions` and alarm `< 12` at 09:35 on market days.
+3. **M1 — upstream tick loss has no sensor.** Sample the 16 sockets' `Recv-Q` on the existing 30 s arm as a per-connection max gauge (one EMF name; needs the §2.3n lever).
+4. **S4 — a forward clock step deletes live WAL segments.** Bound `prune_active_segments` to segments already marked applied by the watermark, never by age alone.
+5. **R2 — two previous-close doors, two rules.** Make the code-6 door first-write-wins, day-floored and counted, exactly like the tick door; gate it to `IdxI | NseEquity`.
+
+### 10.3 Corrections made while folding (so nobody re-derives them)
+
+- ✱ P6 row 3 overstated: the SSM-error and DescribeInstances-error arms fail OPEN (Enable). Only `SkipInstanceDown` disarms. Recorded as A1 in that narrower form.
+- ✱ S5 downgraded from ❌ to ⚠️: the race is one recount→DROP round-trip and the code says so; the ACKed-but-unapplied half during apply lag is Unknown, not Verified.
+- ✱ Rule-file drift, verified in `deploy/systemd/tickvault.service`: `MemoryHigh=20G` (rules say 15G), `StartLimitBurst=5` over 3600 s (rules say 8 over 600 s), `AllowedCPUs=1-2` with QuestDB `cpuset 2,3` — core 2 is shared.
