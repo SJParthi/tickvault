@@ -173,10 +173,32 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
             tickvault_storage::top_volume_rank_persistence::ensure_top_volume_rank_table(questdb)
                 .await;
         if ticks_ok && depth_ok && rank_ok {
+            // Re-ensure the named views now that `top_volume_rank` EXISTS.
+            //
+            // `run_candle_ddl_at_boot` already ran `ensure_named_views`, and it
+            // runs FIRST — before this function creates `top_volume_rank`. So on
+            // any boot where that table was absent (a fresh volume, or the
+            // 2026-09-08 nuke) the two per-cadence views
+            // `top_volume_rank_1s` / `top_volume_rank_5s` referenced a table
+            // that did not yet exist, their DDL warn-failed, and nothing retried
+            // it in-boot: the base table then filled all session while
+            // `SELECT * FROM top_volume_rank_1s` answered "table does not
+            // exist". The operator's own words for this table were *"only using
+            // db i can see this"*, so the views failing is the failure mode he
+            // would actually meet.
+            //
+            // Re-ensuring rather than MOVING the first call is deliberate: the
+            // candle ordering above is load-bearing (the legacy-matview drop
+            // sweep must precede the CREATE TABLE loop, and the candle views
+            // validate against those tables), and every statement here is
+            // `CREATE OR REPLACE`, so a second pass on an already-correct view
+            // is free. Additive beats re-ordering on a boot path.
+            tickvault_storage::console_views::ensure_named_views(questdb).await;
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured"
+                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured, and the \
+                 named views re-ensured against the now-existing rank table"
             );
             return true;
         }

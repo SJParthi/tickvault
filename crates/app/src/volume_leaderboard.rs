@@ -958,6 +958,54 @@ pub fn underlying_gainer_verdict(
     }
 }
 
+/// The UNDERLYING's percent change — the same number, from the same two
+/// inputs, that [`underlying_gainer_verdict`] turns into a boolean.
+///
+/// # Why this exists and why it takes the verdict's inputs, not its own
+///
+/// The persisted `top_volume_rank.gain_pct` and the gainer FILTER must never
+/// be able to disagree. If the column were computed from a different source
+/// than the verdict, a row could read `+5.0` and still have been filtered out
+/// as not-a-gainer, and no reader could tell which half was wrong. Taking the
+/// identical `(spot_paise, prev_close)` pair makes that contradiction
+/// unrepresentable: the sign of this value IS the verdict.
+///
+/// # Why the UNDERLYING and not the contract
+///
+/// Until 2026-09-09 the snapshot asked for the CONTRACT's own previous close.
+/// Nothing has ever written one — `record_prev_close_from_tick` stores only
+/// [`STOCK_OPTION_UNDERLYING_SEGMENT`] — so the probe returned `None` on every
+/// row, became `NaN`, and the projection refused the row as `NonFiniteGain`.
+/// **Every row of every snapshot was dropped, so the table was empty for the
+/// whole session while every counter read healthy.**
+///
+/// Feeding the underlying is also what [`eligible_gain_pct`] was written for:
+/// its own [`MAX_PLAUSIBLE_GAIN_PCT`] doc says a deep-out-of-the-money option
+/// "can move that far" and is "not what this function is fed". So the old call
+/// site was wrong twice — a NaN in the ordinary case, and a bound that would
+/// have refused a legitimately explosive strike in the case where a contract
+/// close did exist.
+///
+/// O(1): two `Option` unwraps, one integer compare, one divide. Cold — once
+/// per ranked row on the snapshot arm, never per tick.
+#[must_use]
+pub fn underlying_gain_pct(spot_paise: Option<i64>, prev_close: Option<f64>) -> Option<f64> {
+    let (Some(spot), Some(close_paise)) = (
+        spot_paise,
+        prev_close.and_then(crate::spot_price_store::rupees_to_paise),
+    ) else {
+        return None;
+    };
+    if spot <= 0 || close_paise <= 0 {
+        return None;
+    }
+    // Paise on BOTH sides. A ratio is scale-invariant, so this is the same
+    // percentage the rupee values give, without a second rounding. Both are
+    // bounded by `rupees_to_paise`'s own ceiling, far inside f64's exact
+    // integer range, so neither widening loses a digit.
+    eligible_gain_pct(spot as f64, close_paise as f64)
+}
+
 /// How many underlyings fell into each verdict during one filter pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GainerTally {
@@ -2145,6 +2193,69 @@ mod tests {
     }
 
     // ---- gainer eligibility (2026-09-06 lock) ----
+
+    #[test]
+    fn underlying_gain_pct_agrees_with_the_verdict_it_shares_inputs_with() {
+        // THE property this function exists for: the persisted column and the
+        // gainer FILTER read the same two inputs, so a row can never say "+5%"
+        // and have been filtered out as not-a-gainer. Sign of the percentage
+        // IS the verdict.
+        for (spot_paise, close_rupees) in [
+            (110_00_i64, 100.0_f64), // up
+            (90_00, 100.0),          // down
+            (100_00, 100.0),         // flat
+        ] {
+            let pct = underlying_gain_pct(Some(spot_paise), Some(close_rupees));
+            let verdict = underlying_gainer_verdict(Some(spot_paise), Some(close_rupees));
+            match verdict {
+                GainerVerdict::Gainer => assert!(
+                    pct.is_some_and(|p| p > 0.0),
+                    "a gainer must carry a positive percent, got {pct:?}"
+                ),
+                GainerVerdict::NotGainer => assert!(
+                    pct.is_some_and(|p| p <= 0.0),
+                    "a non-gainer must never carry a positive percent, got {pct:?}"
+                ),
+                GainerVerdict::Unknown => assert_eq!(pct, None),
+            }
+        }
+    }
+
+    #[test]
+    fn underlying_gain_pct_is_none_wherever_the_verdict_is_unknown() {
+        // The two must refuse on exactly the same inputs, or the column would
+        // carry a number for a row the filter could not judge.
+        for (spot, close) in [
+            (None, Some(100.0_f64)),
+            (Some(110_00_i64), None),
+            (Some(0), Some(100.0)),
+            (Some(-1), Some(100.0)),
+            (Some(110_00), Some(0.0)),
+            (Some(110_00), Some(f64::NAN)),
+        ] {
+            assert_eq!(
+                underlying_gainer_verdict(spot, close),
+                GainerVerdict::Unknown
+            );
+            assert_eq!(
+                underlying_gain_pct(spot, close),
+                None,
+                "spot={spot:?} close={close:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn underlying_gain_pct_computes_the_same_percent_the_rupee_form_would() {
+        // Paise on both sides of the ratio; a ratio is scale-invariant, so the
+        // answer must equal the rupee computation to the last bit.
+        let paise = underlying_gain_pct(Some(112_35_i64), Some(100.0)).expect("finite");
+        let rupees = eligible_gain_pct(112.35, 100.0).expect("finite");
+        assert!(
+            (paise - rupees).abs() < 1e-9,
+            "paise {paise} vs rupees {rupees}"
+        );
+    }
 
     #[test]
     fn underlying_gainer_verdict_is_an_integer_paise_compare() {
