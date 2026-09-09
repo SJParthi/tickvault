@@ -2771,3 +2771,100 @@ the stall threshold in the same change; computes `gain_pct` from the CONTRACT's
 previous close (nothing writes one); or drops `window_lots_milli` from the row on
 the grounds that `volume` is already there — `volume` has not been the sort key
 since 2026-09-07.
+
+### 2026-09-09 — STOCK FUTURES BECOME THE PRIMARY PRICE FOR ATM ±25, AND THE WINDOW FREEZES FOR THE DAY
+
+**The verbatim operator demand (2026-09-09, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude see dotn sue futures as the fallback dude just use futures as the primary dude espeically to fidn this atm plus minus and stickign fully with that for the entire current day dude okay?"
+
+Given in DIRECT response to a design study that recommended futures as a
+**fallback** for lot size and spot price and recommended **against** using them
+to centre the strike window. The operator read that recommendation and reversed
+its central conclusion. **That is his call and it governs.** The study's reasoning
+is preserved below rather than deleted, because the numbers in it are measured and
+the next reader is entitled to see what was traded away.
+
+#### What this authorizes
+
+| Surface | Was | Now |
+|---|---|---|
+| Price used to centre the stock-option **ATM ±25** window | the stock's SPOT last-traded price | **the stock's nearest-expiry FUTURE's last-traded price, as PRIMARY** |
+| Spot price | the only source | the **fallback**, used when the future has not printed |
+| Window lifetime | re-fit until 09:30, then frozen | **chosen once and frozen for the whole trading day** |
+| Lot size | option's own `z`, refuse if absent | unchanged by this quote — the futures lot-size fallback stays a separate decision |
+
+**The futures are already subscribed and this costs no new connection or fetch.**
+All 1,270 `FUTSTK` contracts are classified at `dhan_contract_universe.rs:813`,
+pushed at priority 1–2 into `picked`, surfaced as `ContractSelection::instruments`
+and dialled onto the main feed in Full mode. Their ticks already reach the drain,
+are lag-recorded and folded. The ONLY thing stopping a future's price reaching the
+selector is the binding pattern at `dhan_feed_stack.rs:6172-6176`, which admits
+`IdxI | NseEquity | BseEquity` and nothing else. Widening it to `NseFno` is one
+enum arm; `SpotPriceStore::record` is already segment-agnostic and keyed on the
+I-P1-11 composite, and ~1,270 futures against a 25,000 cap with ~870 live entries
+is inside the ceiling.
+
+#### ⚠ The honest measurement, which argued the other way
+
+Recorded because the operator overruled it knowingly and a future reader must not
+mistake this for a numbers-driven decision:
+
+| Quantity | Measured |
+|---|---|
+| Median strike spacing, 210 F&O underlyings, current expiry (2026-08-27) | **2.63% of price** |
+| Gap needed to move the nearest-strike pick by ONE step (half a spacing) | **1.32%** |
+| Typical near-month equity futures premium (cost of carry, ~1 month) | **~0.5%** — *Assumed, not derivable in-repo* |
+
+So on the median name the futures price does not change which strike is chosen,
+and when it does the ±25 window shifts by one strike — 24 of 25 per side unchanged.
+**The measured benefit to centring accuracy is therefore approximately zero.**
+
+**What the change DOES buy, and it is real:** coverage. A stock with no spot print
+is refused into `underlyings_without_spot` and gets no options at all that day —
+measured 2026-08-21: 725 priced, **8 without**, ≈780 option contracts absent for
+the session. A future that printed when the spot did not now supplies the centre.
+How many of those 8 had a futures tick is **Unknown** — no counter exists, and a
+stock too illiquid to print a spot usually has an equally illiquid future.
+
+#### The freeze is the half with real consequences, in both directions
+
+"Sticking fully with that for the entire current day" makes the window **immutable
+once chosen**. That is stricter than today, where a top-up runs until 09:30.
+
+- **For:** the subscribed set stops moving, so a contract cannot silently leave
+  depth mid-session, and the day's capture is reproducible from one decision.
+- **Against, stated plainly:** if the underlying moves more than 25 strikes from
+  where it was centred, the true at-the-money leaves the captured window and
+  **nothing re-centres it**. Measured drift is 2.20% ≈ 0.8 strikes on an average
+  day and **6.0 strikes** on the worst single underlying of 2026-08-27 — well
+  inside 25, so this is a tail risk rather than a daily one. It must be COUNTED:
+  a session where the live price leaves the window is exactly the case the
+  operator would want to know about, and freezing removes the mechanism that
+  would otherwise hide it.
+
+#### What this quote does NOT authorize
+
+- **Previous close from futures.** A future's previous close is not the stock's;
+  feeding it to the gainer test invents a percentage change from two unrelated
+  numbers. The `PrevCloseStore` gate at `dhan_feed_stack.rs:2796-2800` stays
+  `IdxI | NseEquity`. This is the one row that would manufacture a confidently
+  wrong answer, and it stays shut.
+- Any change to `STOCK_OPTION_ATM_STRIKES_EACH_SIDE` (25), the 60% pricing quorum,
+  the socket or instrument budgets, or the subscription set.
+- Index options: NIFTY/BANKNIFTY full-chain selection is unchanged and takes no
+  futures price.
+- Live order fire; `dry_run` stays true; the §28 frozen area is untouched.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Uses a far-month future rather than the **nearest non-expired** expiry — a stale
+  far-month print would centre a ladder on an hours-old number.
+- Lets a futures price overwrite a **fresher** spot print (the store's
+  later-exchange-time-wins rule and its trading-day floor both still bind).
+- Widens `PrevCloseStore` to `NseFno`.
+- Re-centres the window after it is frozen, or freezes it without counting the
+  case where the live price leaves the window.
+- Presents futures centring as an accuracy improvement — the measurement above
+  says it is a coverage change, and the honest claim is the coverage one.
