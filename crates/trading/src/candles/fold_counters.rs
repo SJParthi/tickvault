@@ -245,9 +245,14 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
         // published, so each of their FIRST episodes -- the novel failure,
         // not the routine one -- was silently discarded.
         //
-        // All seven are seeded. The cost is seven zero-increments once per
-        // process and nothing else: label values fold into one summed series
-        // per host, so this adds no EMF name and no money.
+        // EVERY handle on this struct is seeded — thirteen of them since
+        // 2026-09-09, when a sweep found the block stopped after the eight
+        // `tick_*` ones and left five siblings blind. The cost is thirteen
+        // zero-increments once per process and nothing else: label values fold
+        // into one summed series per host, so this adds no EMF name and no
+        // money. Seeding EVERY handle rather than the ones that look important
+        // is the point — the block was already an enumeration once, and the
+        // enumeration is what went stale.
         resolved.tick_discarded_late.increment(0);
         resolved.tick_refused_price.increment(0);
         resolved.tick_refused_timestamp.increment(0);
@@ -256,6 +261,20 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
         resolved.tick_refused_future_trading_day.increment(0);
         resolved.tick_untraded_timestamp.increment(0);
         resolved.tick_out_of_band_timestamp.increment(0);
+        // Added 2026-09-09. The block above seeded the eight `tick_*` handles
+        // and stopped there, while five more handles on the SAME struct went
+        // unseeded — and one of them, `slot_exhausted`, is alarmed at
+        // `Sum >= 1` over a single evaluation period on a metric that is zero
+        // on a healthy lane. Its first sample is therefore both the event the
+        // alarm exists for and the sample the agent discards, and the log line
+        // beside it latches after the first instrument too: instrument #1 was
+        // silent in BOTH channels. The alarm could only ever fire one
+        // instrument late.
+        resolved.slot_exhausted.increment(0);
+        resolved.session_high_recovered.increment(0);
+        resolved.session_low_recovered.increment(0);
+        resolved.session_extreme_regressed_high.increment(0);
+        resolved.session_extreme_regressed_low.increment(0);
         resolved
     })
 }

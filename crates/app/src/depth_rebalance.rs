@@ -3077,12 +3077,50 @@ mod apply_tests {
 
     #[test]
     fn every_refusal_reason_is_a_registered_label() {
-        // A reason string that is not in the list is a counter nothing
-        // pre-registers, so its series appears only after the first failure —
-        // and an absent series is indistinguishable from a dead process.
-        assert!(REBALANCE_REFUSAL_REASONS.contains(&"no_socket"));
-        assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_full"));
-        assert!(REBALANCE_REFUSAL_REASONS.contains(&"channel_closed"));
+        // Scans the SOURCE for every `"reason" =>` literal emitted against
+        // `REBALANCE_SWAPS_REFUSED` and holds it against the registry, in both
+        // directions.
+        //
+        // Until 2026-09-09 this named three by hand — `no_socket`,
+        // `channel_full`, `channel_closed` — while `not_held` and the newer
+        // `ack_pending` were live emit sites. A label the pre-register loop
+        // never seeds publishes NOTHING on its first refusal, because the
+        // CloudWatch agent drops the first sample of a label set it has never
+        // seen, and the first refusal is the one worth reading. A hand-written
+        // subset under an "every" name is how that stayed invisible.
+        let src = include_str!("depth_rebalance.rs");
+        let mut found: Vec<&str> = Vec::new();
+        for tail in src
+            .split("REBALANCE_SWAPS_REFUSED, \"reason\" => \"")
+            .skip(1)
+        {
+            let Some(label) = tail.split('"').next() else {
+                continue;
+            };
+            if !found.contains(&label) {
+                found.push(label);
+            }
+        }
+        // Anti-vacuity: a scan that matched nothing would pass every
+        // assertion below and prove nothing at all.
+        assert!(
+            found.len() >= 4,
+            "expected at least 4 emitted reason labels, found {found:?}"
+        );
+        for label in &found {
+            assert!(
+                REBALANCE_REFUSAL_REASONS.contains(label),
+                "`{label}` is emitted but never pre-registered — its first \
+                 refusal would publish nothing"
+            );
+        }
+        for reason in REBALANCE_REFUSAL_REASONS {
+            assert!(
+                found.contains(&reason),
+                "`{reason}` is pre-registered but no longer emitted — a stale \
+                 label is a series that can never move"
+            );
+        }
         pre_register_rebalance_counters();
     }
 }
