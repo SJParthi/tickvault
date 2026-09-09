@@ -1,5 +1,23 @@
 # Track 2 — Volume Cumulative-Semantic Monotonicity Verification (Mon May 4)
 
+> ## RESOLVED 2026-09-09 — verdict CONFIRMED CUMULATIVE
+>
+> This runbook was written on 2026-05-01 and could not be run that day. Its
+> `**Overall verdict:**` line below stood as the unfilled template
+> `CONFIRMED CUMULATIVE | REFUTED | INSUFFICIENT` for **131 days**, and
+> `websocket-connection-scope-lock.md` (2026-09-06) correctly called the
+> resulting gap **"the single most load-bearing unproven input in the design"**.
+>
+> It was run on 2026-09-09 at 10:15 IST against the live prod box, over **every**
+> instrument rather than the five named series: **9,879,724 ticks across 8,675
+> instruments, 157 monotonicity violations = 0.0016%.** The record, the exact SQL,
+> the per-series table and an honest account of the 157 are in
+> `.claude/plans/research/track-2-result-2026-09-09.md`.
+>
+> **The verdict is CONFIRMED CUMULATIVE and Item 27's decision is SHIP.** The
+> body below is retained as the method it prescribed; only its "unrunnable"
+> premise is superseded.
+
 > **Authority:** `.claude/plans/active-plan-wave-5-indices-only.md` Items 26 + 29.
 > **Created:** 2026-05-01.
 > **Audience:** Parthiban (operator). Run at Mon May 4 09:45 IST.
