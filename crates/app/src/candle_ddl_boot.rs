@@ -338,7 +338,12 @@ mod tests {
     fn the_candle_boot_retries_the_ensure_and_reports_exhaustion() {
         let src = include_str!("candle_ddl_boot.rs");
         let body = src
-            .split("pub async fn run_candle_ddl_at_boot")
+            // Split so the literal is not itself a declaration: the pub-fn
+            // test guard scans source line by line, and a bare
+            // `pub async fn <name>` inside a string reads to it as a NEW
+            // untested function. Assembling it keeps the assertion identical
+            // and stops a test about the scanner tripping the scanner.
+            .split(concat!("pub async ", "fn run_candle_ddl_at_boot"))
             .nth(1)
             .expect("the candle boot fn must exist");
         let body = body
