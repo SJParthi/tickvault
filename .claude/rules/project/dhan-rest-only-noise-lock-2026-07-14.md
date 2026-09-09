@@ -3593,6 +3593,21 @@ requires a LEVER, not a cost note). Zero on a healthy session, so any non-zero
 reading is the whole signal; it is the number an operator reads AFTER an existing
 family-(5) page, never a new page.
 
+⚠ CORRECTED the same day: "local `/metrics` only" was the whole plan and it was
+not enough. `loss_counter_visibility_guard` refused it — a counter that measures
+loss and reaches NO operator surface is worse than no counter, because the loss
+is measured, the measurement is discarded, and the dashboard stays green. The
+guard offers three ways out and the budget rules out the expensive one, so the
+arm now also carries a **throttled `warn!`** (powers of two, so one bad sweep
+refusing up to 500 rows logs the 1st/2nd/4th and reports onset AND magnitude
+without flooding), carrying `code = WS-GAP-03`, `source = "top_volume_append_failed"`
+and the counter NAME as a field so a grep for the counter lands on the line.
+**Still no page and still no EMF name:** the single WS-GAP-03 filter requires
+`$.level = "ERROR"` AND `$.source = "fell_back_to_indices"`, and this is a WARN
+with a different source, so it is invisible to it by construction. Recorded
+because the original plan read as complete and was not — free visibility existed
+and was simply not taken.
+
 **Fifth addendum (2026-09-09) — three counters and one log-field, all
 LOG-SINK/COUNTER-ONLY.** No CloudWatch alarm, no EMF name, no budget lever.
 The September forecast is $142.24 against a $135.00 automatic-stop line

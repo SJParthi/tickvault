@@ -102,6 +102,13 @@ skip = [
     { crate = "rustls-webpki", reason = "follows rustls version split" },
     { crate = "tokio-rustls", reason = "follows rustls version split" },
     { crate = "socket2", reason = "AWS SDK + tokio version split" },
+    # 2026-09-09: the API server pins tower-http 0.7.1 directly (it uses only
+    # CorsLayer), while reqwest 0.13.4 still pulls 0.6.x transitively. Both
+    # versions therefore compile. Accepted deliberately rather than pinning
+    # back: the split disappears when reqwest moves to 0.7, and until then the
+    # cost is one small duplicated crate in the graph, not a behaviour risk --
+    # nothing in this workspace passes a tower-http type across the boundary.
+    { crate = "tower-http", reason = "reqwest 0.13.4 uses 0.6.x, the API server pins 0.7.x" },
     # --- Proc-macro ecosystem duplicates ---
     { crate = "syn", reason = "proc-macro crates straddle syn 1.x and 2.x" },
     # --- Other transitive duplicates ---
