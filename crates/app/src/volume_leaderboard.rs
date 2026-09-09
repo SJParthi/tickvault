@@ -112,11 +112,17 @@
 //! handles are resolved there too, so [`VolumeLeaderboard::observe`] — the
 //! per-tick path — allocates nothing in steady state.
 //!
-//! **`rank_distinct_underlying` DOES allocate**, two `Vec`s of `k` per call. It
-//! is the depth-200 path, called once per cadence with `k = 5`, not per tick.
-//! Stated because an earlier version of this header said "allocation happens
-//! once at construction" without qualification, which was true of `rank` and
-//! false of that path.
+//! **The two post-sort passes DO allocate**, and neither is per tick:
+//! [`distinct_underlying_over`] takes two `Vec`s of `k` (the depth-200 path,
+//! `k = 5`), and [`gainer_eligible`] takes one `Vec` of `limit` plus a
+//! per-underlying verdict memo (the depth-20 path, `limit = 300`). Both run
+//! once per 5-second sweep on the drain's timer arm. Stated because an earlier
+//! version of this header said "allocation happens once at construction"
+//! without qualification, which was true of `rank` and false of these paths,
+//! and a later version named a `rank_distinct_underlying` method that was
+//! deleted on 2026-09-08 (its only callers were its own tests — the production
+//! depth-200 publish had used `distinct_underlying_over` since the day it was
+//! wired).
 
 use std::collections::HashMap;
 
@@ -297,9 +303,14 @@ pub const RELATCH_AFTER_CONSECUTIVE_LOWER: u16 = 32;
 
 /// One tracked contract plus the state the re-latch needs.
 ///
-/// `Copy`, 8 bytes wider than the contract alone; at the 25,000 cap that is
-/// ~200 KB per family and it buys the difference between a transient
-/// mis-ranking and a socket frozen for the session.
+/// `Copy`. Its payload is the 40-byte contract, the 2-byte run counter and
+/// one `u32` baseline per cadence, so with padding it is ~56 bytes; the map
+/// entry adds the 16-byte composite key and the hash table's own overhead,
+/// so at the 25,000-per-family cap the structure is ~1.5–2 MB per family,
+/// ~4 MB in all. (An earlier version of this comment said "8 bytes wider than
+/// the contract, ~200 KB per family", which counted neither the baselines
+/// nor the map.) It buys the difference between a transient mis-ranking and
+/// a socket frozen for the session.
 #[derive(Debug, Clone, Copy)]
 struct Tracked {
     contract: RankedContract,
@@ -667,6 +678,20 @@ impl VolumeLeaderboard {
     /// previous layout rather than subscribing an empty set: a depth pool
     /// reported as enabled while carrying nothing is the false-OK the scope
     /// lock bans.
+    ///
+    /// # `k` and what the ranked gauge then means
+    ///
+    /// The production 5-second arm calls this with `k = usize::MAX` (clamped
+    /// by `truncate`) so that ONE sort yields the FULL traded population,
+    /// which the gainer filter and the distinct-underlying pass then narrow
+    /// without ranking a second time — a second `rank` on the same cadence
+    /// inside one tick would measure an already-consumed window. So
+    /// `tv_volume_leaderboard_ranked` reports the number of contracts that
+    /// TRADED in the window (the sorted population), not the 250 or 5 the
+    /// depth pools were handed; the handed counts are on the steering side.
+    /// The sort is O(n log n) in that traded population — MEASURED at 900 µs
+    /// for the 20,220-contract worst case by
+    /// `rank_sweep_cost_at_the_authorized_ceiling`.
     pub fn rank<F, L>(
         &mut self,
         family: OptionFamily,
@@ -752,59 +777,6 @@ impl VolumeLeaderboard {
         &self.scratch
     }
 
-    /// Materialises the top `k`, at most ONE contract per underlying.
-    ///
-    /// The depth-200 rule: operator, 2026-09-06, *"ensure on depth 200 top 5
-    /// should never ever be same symbols strike"*.
-    ///
-    /// Greedy over the volume order, so each underlying is represented by its
-    /// heaviest contract. **The honest cost, which the scope lock records:**
-    /// when the true top five are five strikes of one stock, this forces four
-    /// substitutions into thinner books — the shape that produced 800
-    /// rows/minute against 100,800 on 2026-08-26.
-    ///
-    /// # ⚠ It RANKS, so it consumes the cadence window
-    ///
-    /// This calls [`Self::rank`], which rolls every contract's baseline for
-    /// `cadence` forward. Calling it in the same timer tick as another `rank`
-    /// on the SAME cadence leaves the second caller measuring an
-    /// already-consumed window: every delta is 0 and the order degenerates to
-    /// the `security_id` tie-break, silently.
-    ///
-    /// A caller that already holds a ranked slice — the 5-second snapshot arm
-    /// does — must use [`distinct_underlying_over`] on that slice instead of
-    /// calling this. Recorded here because that is exactly the wiring the
-    /// depth-200 publish was first attempted with on 2026-09-08.
-    pub fn rank_distinct_underlying<F, L>(
-        &mut self,
-        family: OptionFamily,
-        cadence: SnapshotCadence,
-        k: usize,
-        lot_of: L,
-        eligible: F,
-    ) -> Vec<RankedContract>
-    where
-        F: Fn(&RankedContract) -> bool,
-        L: Fn(&RankedContract) -> Option<u32>,
-    {
-        // CLAMPED before the allocations below. `Vec::with_capacity(k)` PANICS
-        // on a capacity overflow, and the release profile is `panic = "abort"`,
-        // so an unclamped caller-supplied `k` is a process abort rather than a
-        // bad ranking. `rank` is already safe by construction because
-        // `truncate` clamps; this path allocates first, so it must clamp first.
-        let k = k.min(MAX_TRACKED_CONTRACTS);
-        let ordered = self.rank(family, cadence, MAX_TRACKED_CONTRACTS, lot_of, eligible);
-        let out = distinct_underlying_over(ordered, k);
-        // `rank` above set this to the INTERMEDIATE sweep length (up to the
-        // whole map), because that is what it materialised. What this path
-        // actually hands the caller is `out`, and a gauge documented as "the
-        // size of the last materialised ranking" reporting 20,000 when five
-        // sockets were filled is the wrong number for the only question an
-        // operator asks of it.
-        self.family_ref(family).ranked_gauge.set(out.len() as f64);
-        out
-    }
-
     /// Contracts currently tracked for a family.
     #[must_use]
     pub fn tracked(&self, family: OptionFamily) -> usize {
@@ -849,39 +821,24 @@ impl VolumeLeaderboard {
         self.stock.clear();
         self.scratch.clear();
     }
-
-    /// Moves EVERY tracked contract's per-cadence baselines up to its current
-    /// cumulative volume, so the next window on every cadence measures only
-    /// what trades from now on.
-    ///
-    /// Called once a WAL replay has finished re-folding a backlog. A replay
-    /// feeds the leaderboard frames that are minutes or hours old, in order,
-    /// with no sweep between them: the first replayed frame seeds a contract's
-    /// baseline and every later one advances its volume, so the first LIVE
-    /// sweep after the replay would report the entire backlog as "lots traded
-    /// in the window" — the whole-day-in-one-window shape the seed rule exists
-    /// to prevent, arriving through the recovery path instead of the tracking
-    /// path. Found by the 2026-09-08 adversarial sweep.
-    ///
-    /// O(tracked) once per replay, on the boot/catch-up path, never per tick.
-    /// Refusal counters and the re-latch state are untouched: this moves the
-    /// measuring stick, not the record of what was refused.
-    pub fn rebaseline_all(&mut self) {
-        for family in [&mut self.index, &mut self.stock] {
-            for tracked in family.volumes.values_mut() {
-                tracked.baseline = [tracked.contract.volume; WINDOW_COUNT];
-            }
-        }
-    }
 }
 
 /// Greedy "at most one contract per underlying" pass over an already-ordered
 /// ranking.
 ///
-/// Extracted from [`VolumeLeaderboard::rank_distinct_underlying`] on 2026-09-08
-/// so a caller that ALREADY holds a ranked slice can apply the same rule
-/// without ranking again — and "without ranking again" is the load-bearing
-/// half. [`VolumeLeaderboard::rank`] rolls each contract's per-cadence baseline
+/// The depth-200 rule: operator, 2026-09-06, *"ensure on depth 200 top 5
+/// should never ever be same symbols strike"*. Greedy over the volume order,
+/// so each underlying is represented by its heaviest contract. **The honest
+/// cost, which the scope lock records:** when the true top five are five
+/// strikes of one stock, this forces four substitutions into thinner books —
+/// the shape that produced 800 rows/minute against 100,800 on 2026-08-26.
+///
+/// A free function over an ALREADY-ranked slice, deliberately — the
+/// production 5-second arm ranks the full population ONCE and applies this
+/// to that slice. It was extracted on 2026-09-08 from a `rank_distinct_underlying`
+/// method that ranked internally, and that method was deleted the same day
+/// once its only callers were its own tests, because "without ranking again"
+/// is the load-bearing half. [`VolumeLeaderboard::rank`] rolls each contract's per-cadence baseline
 /// forward as it sweeps, so a second `rank` on the same cadence inside one
 /// timer tick measures a window that has already been consumed: every delta
 /// comes back 0 and the order collapses to the `security_id` tie-break. That is
@@ -1015,12 +972,19 @@ pub struct GainerTally {
 /// Keeps the first `limit` ranked contracts whose underlying `verdict_of` calls a
 /// gainer, PRESERVING the volume order. Pure.
 ///
-/// `verdict_of` is called once per ranked row with the underlying id, so the
-/// caller pays one spot-store probe and one prev-close probe per row VISITED,
-/// and the walk STOPS once `limit` gainers are collected — so on an ordinary
-/// day it visits a few hundred rows of a population that may be thousands.
-/// The tally counts only the rows visited. Formerly one probe per row of the
-/// top 250 — cold, once per 5 seconds, and both probes O(1).
+/// `verdict_of` is called once per DISTINCT underlying visited (memoised —
+/// the ~102 strikes of one stock share a verdict), so the caller pays one
+/// spot-store probe and one prev-close probe per underlying, and the walk
+/// STOPS once `limit` gainers are collected — so on an ordinary day it visits
+/// a few hundred rows of a population that may be thousands. The tally counts
+/// rows visited, not probes made. **The honest worst case, which is a real
+/// day and not a corner:** every stock falling, so nothing is ever collected
+/// and the walk runs to the END of the ranked population — O(n) in the traded
+/// population with one hash probe per row, MEASURED by
+/// `gainer_eligible_sweep_cost_at_the_authorized_ceiling`. Cold: once per
+/// 5-second sweep on the drain's timer arm, never per tick. (Until 2026-09-08
+/// the probes were per ROW, so that same down day cost ~40,000 store probes
+/// per sweep; the memo caps them at the underlying count whatever the day.)
 ///
 /// Applied AFTER the volume sort rather than inside `rank` deliberately: the
 /// persisted `top_volume_rank` rows must keep recording which contracts were
@@ -1037,11 +1001,23 @@ where
 {
     let mut out: Vec<RankedContract> = Vec::with_capacity(ranked.len().min(limit));
     let mut tally = GainerTally::default();
+    // One verdict per UNDERLYING, not per row. A stock's ~102 strikes share
+    // one spot and one previous close, so the verdict is identical for every
+    // one of them; without the memo a down day — every underlying falling,
+    // nothing collected, the walk running to the END of the population —
+    // paid two store probes per row across all ~20,000. The memo caps the
+    // probes at the number of underlyings (~210) whatever the day looks like.
+    // Sized for the measured F&O underlying count; a larger day grows it
+    // once. Cold path: one 5-second sweep, never per tick.
+    let mut memo: HashMap<u64, GainerVerdict> = HashMap::with_capacity(GAINER_MEMO_CAPACITY);
     for row in ranked {
         if out.len() >= limit {
             break;
         }
-        match verdict_of(row.underlying_id) {
+        let verdict = *memo
+            .entry(row.underlying_id)
+            .or_insert_with(|| verdict_of(row.underlying_id));
+        match verdict {
             GainerVerdict::Gainer => {
                 tally.gainer = tally.gainer.saturating_add(1);
                 out.push(*row);
@@ -1052,6 +1028,12 @@ where
     }
     (out, tally)
 }
+
+/// Pre-size for the per-underlying verdict memo in [`gainer_eligible`]:
+/// the 2026-08-21 measured F&O underlying count (208) rounded up. A larger
+/// population grows the map once per call, on the cold sweep, and is not a
+/// refusal.
+pub const GAINER_MEMO_CAPACITY: usize = 256;
 
 /// Publishes one pass's tally onto [`GAINER_FILTER_COUNTER`].
 pub fn record_gainer_tally(tally: GainerTally) {
@@ -1090,8 +1072,28 @@ pub fn eligible_gain_pct(ltp: f64, prev_close: f64) -> Option<f64> {
         return None;
     }
     let pct = (ltp - prev_close) / prev_close * 100.0;
-    pct.is_finite().then_some(pct)
+    // Finite is not the same as plausible. A previous close of 0.01 against
+    // a 240-rupee LTP yields +2,400,000% — finite, sortable, and nonsense —
+    // and it was persisted as a DOUBLE until 2026-09-08 (identity sweep row
+    // 22). No NSE stock or option moves ten-fold in a session against its
+    // own previous close; a value past the bound is a corrupt input, not a
+    // move, and is refused the same way a NaN is.
+    if pct.is_finite() && pct.abs() <= MAX_PLAUSIBLE_GAIN_PCT {
+        Some(pct)
+    } else {
+        None
+    }
 }
+
+/// The widest percent move against the previous close that is treated as a
+/// real reading rather than a corrupt previous close.
+///
+/// 1,000% is a ten-fold move in one session. Stocks with F&O have no daily
+/// circuit band, but a ten-fold move has never happened on the NSE cash
+/// segment in a session, and deep-out-of-the-money OPTIONS — which can move
+/// that far — are not what this function is fed: the gainer verdict reads
+/// the UNDERLYING's spot against the underlying's previous close.
+pub const MAX_PLAUSIBLE_GAIN_PCT: f64 = 1_000.0;
 
 #[cfg(test)]
 mod tests {
@@ -1107,15 +1109,6 @@ mod tests {
         }
     }
 
-    fn idx(id: u64, underlying: u64, volume: u32) -> RankedContract {
-        RankedContract {
-            security_id: id,
-            segment: ExchangeSegment::NseFno,
-            underlying_id: underlying,
-            volume,
-            window_lots_milli: 0,
-        }
-    }
     /// Observe a contract as TRADING inside the window.
     ///
     /// The 2026-09-07 lock seeds a newly tracked contract's baseline to its
@@ -1154,6 +1147,15 @@ mod tests {
     /// meaningful while the normalisation gets its own dedicated tests.
     fn lot1(_: &RankedContract) -> Option<u32> {
         Some(1)
+    }
+
+    /// The production depth-200 shape: ONE full-population rank of the stock
+    /// family on the 1-second cadence, then the greedy distinct pass over it.
+    /// Mirrors `LiveIngest::snapshot_top_volume`, which is the only
+    /// production caller of `distinct_underlying_over`.
+    fn distinct_over_full_rank(lb: &mut VolumeLeaderboard, k: usize) -> Vec<RankedContract> {
+        let ordered = lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
+        distinct_underlying_over(ordered, k)
     }
 
     #[test]
@@ -1608,13 +1610,10 @@ mod tests {
 
     #[test]
     fn distinct_underlying_over_clamps_k_rather_than_aborting_the_process() {
-        // The pure pass, tested directly rather than only through
-        // `rank_distinct_underlying`. It gained a SECOND caller on 2026-09-08
-        // (the depth-200 candidate publish reuses it on an already-ranked
-        // slice, because calling `rank` twice in one tick consumes the window
-        // and silently collapses the order) — so a defect here now reaches two
-        // places, and transitive coverage through one of them is no longer
-        // enough.
+        // The pure pass, tested directly. The production depth-200 candidate
+        // publish applies it to an already-ranked slice (calling `rank` twice
+        // in one tick consumes the window and silently collapses the order),
+        // so a defect here reaches the five deep sockets directly.
         let row = |sid: u64, underlying: u64| RankedContract {
             security_id: sid,
             segment: ExchangeSegment::NseFno,
@@ -1658,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_distinct_underlying_takes_the_heaviest_contract_per_name() {
+    fn distinct_over_the_full_rank_takes_the_heaviest_contract_per_name() {
         // The depth-200 rule. Five strikes of one stock become one entry, and
         // the remaining four slots go to the next four names.
         let mut lb = VolumeLeaderboard::new();
@@ -1676,7 +1675,7 @@ mod tests {
                 OptionFamily::Stock,
             );
         }
-        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
+        let picked = distinct_over_full_rank(&mut lb, 5);
         assert_eq!(picked.len(), 5);
         assert_eq!(
             picked[0].security_id, 0,
@@ -1690,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_distinct_underlying_returns_fewer_than_k_rather_than_repeating_a_name() {
+    fn distinct_over_the_full_rank_returns_fewer_than_k_rather_than_repeating_a_name() {
         // Honest under-fill. Returning four when only four names exist is
         // correct; padding with a second strike of a name would break the
         // operator's rule silently.
@@ -1702,7 +1701,7 @@ mod tests {
                 OptionFamily::Stock,
             );
         }
-        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
+        let picked = distinct_over_full_rank(&mut lb, 5);
         assert_eq!(picked.len(), 4, "only four distinct underlyings exist");
     }
 
@@ -1741,7 +1740,7 @@ mod tests {
             );
         }
 
-        let picked = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
+        let picked = distinct_over_full_rank(&mut lb, 5);
 
         assert_eq!(picked.len(), 5);
         assert_eq!(
@@ -1787,7 +1786,7 @@ mod tests {
         // A sweep rolls the baseline; trade again so the second sweep has a window.
         trade(&mut lb, stock(50, 100, 3), OptionFamily::Stock);
 
-        let five = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
+        let five = distinct_over_full_rank(&mut lb, 5);
         assert_eq!(five.len(), 1, "the depth-200 path sees the same one");
         assert_eq!(five[0].security_id, 50);
     }
@@ -1834,10 +1833,11 @@ mod tests {
         }
         let per_sweep = start.elapsed() / ROUNDS;
 
-        // The depth-200 path sorts the WHOLE map, not the top 250.
+        // The depth-200 path: ONE full-population sort (k = usize::MAX) and
+        // the greedy distinct pass over it — the production 5-second arm shape.
         let start5 = std::time::Instant::now();
         for _ in 0..ROUNDS {
-            let five = lb.rank_distinct_underlying(OptionFamily::Stock, S1, 5, lot1, all);
+            let five = distinct_over_full_rank(&mut lb, 5);
             std::hint::black_box(five.len());
         }
         let per_distinct = start5.elapsed() / ROUNDS;
@@ -1848,7 +1848,7 @@ mod tests {
         println!(
             "MEASURED at {CONTRACTS} contracts:\n  \
              rank(top {DEPTH_20})        = {per_sweep:?}  -> {duty:.4}% duty at 5s\n  \
-             rank_distinct_underlying(5) = {per_distinct:?}  -> {duty5:.4}% duty at 5s"
+             full rank + distinct(5)    = {per_distinct:?}  -> {duty5:.4}% duty at 5s"
         );
 
         // Not a gate on the number -- a gate on the SHAPE. A sweep that took a
@@ -1899,6 +1899,30 @@ mod tests {
         assert_eq!(eligible_gain_pct(100.0, -1.0), None, "negative prev close");
         assert_eq!(eligible_gain_pct(f64::INFINITY, 100.0), None);
         assert_eq!(eligible_gain_pct(100.0, f64::INFINITY), None);
+        // Identity sweep row 22 (2026-09-08): finite but impossible. A
+        // previous close of one paisa against a 240-rupee print is a corrupt
+        // input, and it used to persist as +2,400,000%.
+        assert_eq!(
+            eligible_gain_pct(240.0, 0.01),
+            None,
+            "a corrupt previous close"
+        );
+        let crash = eligible_gain_pct(0.01, 240.0)
+            .expect("a real crash to one paisa is inside the bound and is kept");
+        assert!(
+            (crash - (-99.995_833_333_333_33)).abs() < 1e-9,
+            "a crash is a large NEGATIVE move, never refused for size alone: {crash}"
+        );
+        assert_eq!(
+            eligible_gain_pct(100.0 + MAX_PLAUSIBLE_GAIN_PCT, 100.0),
+            Some(MAX_PLAUSIBLE_GAIN_PCT),
+            "the bound itself is admitted"
+        );
+        assert_eq!(
+            eligible_gain_pct(100.0 + MAX_PLAUSIBLE_GAIN_PCT + 1.0, 100.0),
+            None,
+            "one percent past the bound is refused"
+        );
     }
 
     #[test]
@@ -2251,28 +2275,6 @@ mod tests {
         pre_register_gainer_filter_counter();
     }
 
-    /// A replayed backlog must not become one window's trading: after
-    /// `rebaseline_all` the next window on EVERY cadence reads 0 until the
-    /// contract trades again.
-    #[test]
-    fn rebaseline_all_makes_the_next_window_measure_only_live_trading() {
-        let mut lb = VolumeLeaderboard::new();
-        // A "replay": frames in order with no sweep between them.
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
-        lb.observe(stock(1, 100, 900_000), OptionFamily::Stock);
-        lb.observe(idx(2, 13, 500), OptionFamily::Index);
-        lb.observe(idx(2, 13, 700_000), OptionFamily::Index);
-        lb.rebaseline_all();
-        assert!(lb.rank(OptionFamily::Stock, S1, 10, lot1, all).is_empty());
-        assert!(lb.rank(OptionFamily::Stock, S5, 10, lot1, all).is_empty());
-        assert!(lb.rank(OptionFamily::Index, S1, 10, lot1, all).is_empty());
-        // Live trading after the replay is measured from the rebaselined value.
-        lb.observe(stock(1, 100, 900_050), OptionFamily::Stock);
-        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].window_lots_milli, 50 * LOTS_SCALE);
-    }
-
     /// The gainer walk stops once `limit` gainers are collected, and the tally
     /// counts only what was visited — so a 20,000-row population costs a few
     /// hundred probes on an ordinary day, not 40,000.
@@ -2299,6 +2301,62 @@ mod tests {
             "rows 1, 3, 5 were visited; 7+ were not"
         );
         assert_eq!(tally.unknown, 0);
+    }
+
+    /// The memo: a stock's many strikes share one verdict, so the store is
+    /// probed once per underlying, not once per row — and on a down day the
+    /// walk still reaches the end of the population without a probe per row.
+    #[test]
+    fn gainer_eligible_probes_each_underlying_once_however_many_strikes_it_has() {
+        use std::cell::Cell;
+        // 5 underlyings × 40 strikes, all falling, so nothing is collected and
+        // the walk visits every row.
+        let ranked: Vec<RankedContract> = (0..200u64)
+            .map(|i| stock(i, i % 5, 10_000 - i as u32))
+            .collect();
+        let probes = Cell::new(0usize);
+        let (eligible, tally) = gainer_eligible(&ranked, 300, |_| {
+            probes.set(probes.get() + 1);
+            GainerVerdict::NotGainer
+        });
+        assert!(eligible.is_empty());
+        assert_eq!(tally.not_gainer, 200, "every row was visited and tallied");
+        assert_eq!(
+            probes.get(),
+            5,
+            "but the store was probed once per underlying"
+        );
+    }
+
+    /// MEASURES the gainer walk at the authorized ceiling on its WORST day —
+    /// every underlying falling, so the walk cannot stop early. `#[ignore]`d
+    /// like `rank_sweep_cost_at_the_authorized_ceiling`: a wall-clock number
+    /// must never become a flaky CI gate.
+    #[test]
+    #[ignore = "wall-clock measurement, not a gate"]
+    fn gainer_eligible_sweep_cost_at_the_authorized_ceiling() {
+        const CONTRACTS: u64 = 20_220;
+        const UNDERLYINGS: u64 = 210;
+        let ranked: Vec<RankedContract> = (0..CONTRACTS)
+            .map(|i| stock(i, i % UNDERLYINGS, 5_000_000 - i as u32))
+            .collect();
+        let _ = gainer_eligible(&ranked, 300, |_| GainerVerdict::NotGainer);
+        const ROUNDS: u32 = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let (out, tally) = gainer_eligible(&ranked, 300, |_| GainerVerdict::NotGainer);
+            std::hint::black_box((out.len(), tally.not_gainer));
+        }
+        let per_walk = start.elapsed() / ROUNDS;
+        let duty = per_walk.as_secs_f64() / 5.0 * 100.0;
+        println!(
+            "MEASURED gainer walk at {CONTRACTS} contracts / {UNDERLYINGS} underlyings, \
+             all falling: {per_walk:?} -> {duty:.4}% duty at 5s"
+        );
+        assert!(
+            per_walk < std::time::Duration::from_secs(1),
+            "the down-day walk must not approach the 5s cadence: {per_walk:?}"
+        );
     }
 
     /// Gainers ranked below the persisted cut still reach the depth pool: the

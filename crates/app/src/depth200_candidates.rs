@@ -11,12 +11,16 @@
 //! SPOT instead, so four of the five sockets carry NIFTY/BANKNIFTY INDEX
 //! options — the exact class the lock bans.
 //!
-//! [`crate::volume_leaderboard::VolumeLeaderboard::rank_distinct_underlying`]
-//! computes the right answer and has zero production callers, because it needs
-//! `&mut self` on the ingest that lives on the frame-drain task while
+//! The ranking that computes the right answer — one full-population `rank`
+//! on the 1-second cadence, then
+//! [`crate::volume_leaderboard::distinct_underlying_over`] on that slice —
+//! needs `&mut self` on the ingest that lives on the frame-drain task, while
 //! `run_depth_rebalance` is a separate `tokio::spawn` with no handle to it. A
 //! `Mutex` on the drain's state is not available: that is the per-packet hot
-//! path.
+//! path. *(This paragraph named a `rank_distinct_underlying` method until
+//! 2026-09-08; it was deleted that day once its only callers were its own
+//! tests — the drain had always applied the free function to the slice it
+//! already held.)*
 //!
 //! So this module is the seam. The drain PUBLISHES the ranking it already
 //! computes; the steering loop READS it. Same shape, same reasoning and the

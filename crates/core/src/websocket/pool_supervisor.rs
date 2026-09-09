@@ -659,6 +659,32 @@ pub const GHOST_REDIAL_COOLDOWN_SECS: i64 = 180;
 /// by the caller as such).
 pub const GHOST_REDIAL_SLOTS: usize = 32;
 
+/// Minimum spacing between two ghost-triggered redials ANYWHERE in the pool.
+///
+/// The per-socket cooldown bounds one socket; it does not bound the pool. If
+/// every depth socket delivers a ghost in the same minute (an unsubscribe
+/// code Dhan ignores does exactly that, on every socket at once), sixteen
+/// per-socket registers arm in the same second and sixteen redials go out
+/// together — the shape Dhan answers with 805 ("too many requests") and this
+/// pool answers with a park. Twenty seconds spaces them to at most three a
+/// minute pool-wide; with the 180 s per-socket cooldown, sixteen ghosting
+/// sockets are all rebuilt inside ~5½ minutes instead of all at once. Found
+/// by the 2026-09-08 hostile sweep.
+pub const GHOST_REDIAL_POOL_SPACING_SECS: i64 = 20;
+
+/// Ghost redials ONE socket may take in a session before the register
+/// refuses to arm it again.
+///
+/// A redial replays the guard's current set and clears a ghost that Dhan
+/// merely lost; a ghost that survives EVERY redial is an unsubscribe code Dhan
+/// does not honour at all, and redialling that socket every three minutes
+/// until the box stops is churn that repairs nothing and risks 805. Eight is
+/// 24 minutes of honest retrying; past it the socket keeps its (working) set
+/// and the ghost keeps being counted, which is the read-out the scope lock
+/// names for a wrong code. Found by the 2026-09-08 hostile sweep, which
+/// measured the previous behaviour as an unbounded, unpaged loop.
+pub const GHOST_REDIAL_SESSION_CEILING: u32 = 8;
+
 /// `true` while a ghost redial is armed for that slot and not yet taken.
 static GHOST_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
@@ -667,27 +693,91 @@ static GHOST_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
 static GHOST_LAST_ARMED: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
 
+/// Ghost redials ARMED per slot this process lifetime, for the ceiling.
+static GHOST_ARMED_COUNT: [std::sync::atomic::AtomicU32; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Epoch seconds of the last ghost redial ARMED on ANY slot, for the
+/// pool-wide spacing.
+static GHOST_POOL_LAST_ARMED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Why a ghost-redial request was not armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhostRedialRefusal {
+    /// The index is past the register (never a panic — counted by the caller).
+    OutOfRange,
+    /// This socket was redialled less than [`GHOST_REDIAL_COOLDOWN_SECS`] ago.
+    CoolingDown,
+    /// Another socket was redialled less than
+    /// [`GHOST_REDIAL_POOL_SPACING_SECS`] ago.
+    PoolSpacing,
+    /// This socket has taken [`GHOST_REDIAL_SESSION_CEILING`] redials already;
+    /// the caller should say so ONCE and stop asking.
+    SessionCeiling,
+}
+
 /// Asks the connection at `connection_index` to redial because it delivered a
-/// ghost instrument. Returns `true` if the request was ARMED, `false` if it
-/// was refused by the cooldown or the index is out of range.
+/// ghost instrument. `Ok(())` if the request was ARMED; otherwise the reason
+/// it was refused.
 ///
-/// Called from the frame drain, so it is one relaxed load and at most two
-/// atomic stores — no allocation, no lock, O(1). The connection task picks the
-/// request up on its next one-second idle tick ([`take_ghost_redial`]).
-pub fn request_ghost_redial(connection_index: u8, now_epoch_secs: i64) -> bool {
-    let Some(last) = GHOST_LAST_ARMED.get(usize::from(connection_index)) else {
-        return false;
+/// Called from the frame drain, so it is a handful of relaxed loads and at
+/// most four atomic stores — no allocation, no lock, O(1). The connection
+/// task picks the request up on its next one-second idle tick
+/// ([`take_ghost_redial`]). The two-load-then-store shape is deliberately not
+/// a CAS: the only concurrent caller is the drain itself, one frame at a time,
+/// so a lost race is impossible and a CAS would buy nothing.
+pub fn request_ghost_redial(
+    connection_index: u8,
+    now_epoch_secs: i64,
+) -> Result<(), GhostRedialRefusal> {
+    let idx = usize::from(connection_index);
+    let (Some(last), Some(pending), Some(count)) = (
+        GHOST_LAST_ARMED.get(idx),
+        GHOST_PENDING.get(idx),
+        GHOST_ARMED_COUNT.get(idx),
+    ) else {
+        return Err(GhostRedialRefusal::OutOfRange);
     };
-    let Some(pending) = GHOST_PENDING.get(usize::from(connection_index)) else {
-        return false;
-    };
+    if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_REDIAL_SESSION_CEILING {
+        return Err(GhostRedialRefusal::SessionCeiling);
+    }
     let previous = last.load(std::sync::atomic::Ordering::Relaxed);
     if now_epoch_secs.saturating_sub(previous) < GHOST_REDIAL_COOLDOWN_SECS {
-        return false;
+        return Err(GhostRedialRefusal::CoolingDown);
+    }
+    let pool_previous = GHOST_POOL_LAST_ARMED.load(std::sync::atomic::Ordering::Relaxed);
+    if now_epoch_secs.saturating_sub(pool_previous) < GHOST_REDIAL_POOL_SPACING_SECS {
+        return Err(GhostRedialRefusal::PoolSpacing);
     }
     last.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
+    GHOST_POOL_LAST_ARMED.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
+    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     pending.store(true, std::sync::atomic::Ordering::Release);
-    true
+    Ok(())
+}
+
+/// Ghost redials this slot has taken this process lifetime. `0` for an
+/// out-of-range index.
+#[must_use]
+pub fn ghost_redials_taken(connection_index: u8) -> u32 {
+    GHOST_ARMED_COUNT
+        .get(usize::from(connection_index))
+        .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether a slot's ceiling has already been reported, per slot.
+static GHOST_CEILING_REPORTED: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+
+/// `true` the FIRST time it is asked per slot per process lifetime; `false`
+/// thereafter and for an out-of-range index. The drain uses it to report a
+/// socket reaching [`GHOST_REDIAL_SESSION_CEILING`] exactly once rather than
+/// on every ghost frame after it.
+#[must_use]
+pub fn ghost_ceiling_first_hit(connection_index: u8) -> bool {
+    GHOST_CEILING_REPORTED
+        .get(usize::from(connection_index))
+        .is_some_and(|r| !r.swap(true, std::sync::atomic::Ordering::AcqRel))
 }
 
 /// Takes (and clears) a pending ghost redial for `connection_index`.
@@ -4557,10 +4647,18 @@ mod tests {
     use super::*;
     /// Test-only: clears every slot so tests do not see each other's requests.
     fn reset_ghost_redials_for_tests() {
-        for (p, l) in GHOST_PENDING.iter().zip(GHOST_LAST_ARMED.iter()) {
+        for (((p, l), c), r) in GHOST_PENDING
+            .iter()
+            .zip(GHOST_LAST_ARMED.iter())
+            .zip(GHOST_ARMED_COUNT.iter())
+            .zip(GHOST_CEILING_REPORTED.iter())
+        {
             p.store(false, std::sync::atomic::Ordering::Release);
             l.store(0, std::sync::atomic::Ordering::Relaxed);
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+            r.store(false, std::sync::atomic::Ordering::Release);
         }
+        GHOST_POOL_LAST_ARMED.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     use proptest::prelude::*;
@@ -5913,7 +6011,10 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let now = 1_000_000_i64;
-        assert!(request_ghost_redial(7, now), "first request on a slot arms");
+        assert!(
+            request_ghost_redial(7, now).is_ok(),
+            "first request on a slot arms"
+        );
         assert!(take_ghost_redial(7), "the connection task takes it");
         assert!(!take_ghost_redial(7), "taking clears the slot");
         assert!(!take_ghost_redial(6), "another slot is untouched");
@@ -5926,17 +6027,18 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let now = 2_000_000_i64;
-        assert!(request_ghost_redial(9, now));
+        assert!(request_ghost_redial(9, now).is_ok());
         assert!(take_ghost_redial(9));
         // Inside the cooldown: refused, and nothing is re-armed.
-        assert!(!request_ghost_redial(
-            9,
-            now + GHOST_REDIAL_COOLDOWN_SECS - 1
-        ));
+        assert_eq!(
+            request_ghost_redial(9, now + GHOST_REDIAL_COOLDOWN_SECS - 1),
+            Err(GhostRedialRefusal::CoolingDown)
+        );
         assert!(!take_ghost_redial(9));
         // At the cooldown boundary: armed again.
-        assert!(request_ghost_redial(9, now + GHOST_REDIAL_COOLDOWN_SECS));
+        assert!(request_ghost_redial(9, now + GHOST_REDIAL_COOLDOWN_SECS).is_ok());
         assert!(take_ghost_redial(9));
+        assert_eq!(ghost_redials_taken(9), 2);
     }
 
     #[test]
@@ -5946,10 +6048,123 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let idx = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
-        assert!(!request_ghost_redial(idx, 3_000_000));
+        assert_eq!(
+            request_ghost_redial(idx, 3_000_000),
+            Err(GhostRedialRefusal::OutOfRange)
+        );
         assert!(!take_ghost_redial(idx));
-        assert!(!request_ghost_redial(u8::MAX, 3_000_000));
+        assert_eq!(
+            request_ghost_redial(u8::MAX, 3_000_000),
+            Err(GhostRedialRefusal::OutOfRange)
+        );
         assert!(!take_ghost_redial(u8::MAX));
+        assert_eq!(ghost_redials_taken(u8::MAX), 0);
+        assert!(!ghost_ceiling_first_hit(u8::MAX));
+    }
+
+    /// Sixteen sockets ghosting in the same second must not go out as
+    /// sixteen redials: the pool-wide spacing lets one through and refuses
+    /// the rest until it has elapsed (the 805 shape). The per-socket cooldown
+    /// is unchanged by it.
+    #[test]
+    fn ghost_redials_are_spaced_pool_wide_so_a_storm_cannot_fan_out_at_once() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        let now = 4_000_000_i64;
+        assert!(request_ghost_redial(1, now).is_ok());
+        assert_eq!(
+            request_ghost_redial(2, now),
+            Err(GhostRedialRefusal::PoolSpacing),
+            "a DIFFERENT socket inside the pool spacing is refused"
+        );
+        assert_eq!(
+            request_ghost_redial(2, now + GHOST_REDIAL_POOL_SPACING_SECS - 1),
+            Err(GhostRedialRefusal::PoolSpacing)
+        );
+        assert!(request_ghost_redial(2, now + GHOST_REDIAL_POOL_SPACING_SECS).is_ok());
+        assert!(take_ghost_redial(1));
+        assert!(take_ghost_redial(2));
+        assert!(
+            GHOST_REDIAL_POOL_SPACING_SECS < GHOST_REDIAL_COOLDOWN_SECS,
+            "spacing tighter than the per-socket cooldown, or the cooldown is moot"
+        );
+    }
+
+    /// A socket whose ghost survives EVERY redial stops being redialled at the
+    /// session ceiling, and the ceiling is reportable exactly once.
+    #[test]
+    fn a_socket_stops_being_redialled_at_the_session_ceiling_and_says_so_once() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        let mut now = 5_000_000_i64;
+        for n in 0..GHOST_REDIAL_SESSION_CEILING {
+            assert!(request_ghost_redial(3, now).is_ok(), "arm #{n}");
+            assert!(take_ghost_redial(3));
+            now += GHOST_REDIAL_COOLDOWN_SECS;
+        }
+        assert_eq!(ghost_redials_taken(3), GHOST_REDIAL_SESSION_CEILING);
+        assert_eq!(
+            request_ghost_redial(3, now),
+            Err(GhostRedialRefusal::SessionCeiling)
+        );
+        assert!(!take_ghost_redial(3), "nothing armed past the ceiling");
+        assert!(ghost_ceiling_first_hit(3), "reported once...");
+        assert!(!ghost_ceiling_first_hit(3), "...and never again");
+        assert!(
+            request_ghost_redial(4, now + GHOST_REDIAL_POOL_SPACING_SECS).is_ok(),
+            "another socket is unaffected by a sibling's ceiling"
+        );
+    }
+
+    /// The taken-count is a plain read: zero before any arm, exactly the number
+    /// of successful arms after, and zero (never a panic) for an index outside
+    /// the register.
+    #[test]
+    fn ghost_redials_taken_counts_successful_arms_and_reads_zero_out_of_range() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        assert_eq!(ghost_redials_taken(7), 0, "nothing armed yet");
+        assert!(request_ghost_redial(7, 9_000_000).is_ok());
+        assert_eq!(ghost_redials_taken(7), 1, "one successful arm");
+        assert_eq!(
+            request_ghost_redial(7, 9_000_000 + 1),
+            Err(GhostRedialRefusal::CoolingDown),
+            "a refused arm must not count"
+        );
+        assert_eq!(ghost_redials_taken(7), 1);
+        assert_eq!(
+            ghost_redials_taken(u8::MAX),
+            0,
+            "out of range reads zero, never panics"
+        );
+    }
+
+    /// The once-per-socket report latch returns true on the FIRST call for a
+    /// socket and false on every call after, which is what makes the caller's
+    /// report once-per-session; an out-of-range index is refused (false) so the
+    /// caller never logs for a socket the register does not cover.
+    #[test]
+    fn ghost_ceiling_first_hit_is_true_once_per_socket_and_false_out_of_range() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        assert!(ghost_ceiling_first_hit(9), "first consult reports");
+        assert!(!ghost_ceiling_first_hit(9), "second consult is silent");
+        assert!(
+            ghost_ceiling_first_hit(10),
+            "a sibling socket has its own latch"
+        );
+        assert!(
+            !ghost_ceiling_first_hit(u8::MAX),
+            "out of range is refused rather than reported"
+        );
     }
 
     #[test]

@@ -159,6 +159,16 @@ pub const STALE_DAY_COUNTER: &str = "tv_spot_price_store_stale_day_total";
 /// held — a replayed or re-ordered frame arriving after a fresher one.
 pub const OLDER_THAN_HELD_COUNTER: &str = "tv_spot_price_store_older_than_held_total";
 
+/// Counter for a tick refused because its exchange trade time is from AFTER
+/// today's IST day — a vendor clock fault or a garbage timestamp.
+///
+/// Added 2026-09-08 (identity sweep row 29). Before this gate the store
+/// refused yesterday and accepted ANY later second, so one tick stamped
+/// tomorrow pinned its slot: every real tick that followed read as
+/// `OlderThanHeld`, and the counter that moved counted the VICTIMS, never the
+/// cause. Refusing the future-dated tick is what keeps that counter honest.
+pub const FUTURE_DAY_COUNTER: &str = "tv_spot_price_store_future_day_total";
+
 /// Gauge: how many instruments the store currently prices.
 ///
 /// The number that separates "the RAM path is warming up" from "the RAM path
@@ -180,6 +190,9 @@ pub enum RecordOutcome {
     /// A tick whose trade time is OLDER than the one already held. Replayed
     /// and re-ordered frames land here; the fresher price is kept.
     OlderThanHeld,
+    /// The exchange trade time is from AFTER today's IST day. Never stored:
+    /// stored, it would out-rank every honest tick for the rest of the day.
+    FutureTradingDay,
     /// The map is at its ceiling and this instrument is not already in it.
     RefusedAtCapacity,
 }
@@ -289,6 +302,7 @@ pub struct SpotPriceStore {
     rejected_value: AtomicU64,
     stale_day: AtomicU64,
     older_than_held: AtomicU64,
+    future_day: AtomicU64,
     refused_capacity: AtomicU64,
 }
 
@@ -324,6 +338,7 @@ impl SpotPriceStore {
             rejected_value: AtomicU64::new(0),
             stale_day: AtomicU64::new(0),
             older_than_held: AtomicU64::new(0),
+            future_day: AtomicU64::new(0),
             refused_capacity: AtomicU64::new(0),
         }
     }
@@ -355,9 +370,20 @@ impl SpotPriceStore {
             self.rejected_value.fetch_add(1, Ordering::Relaxed);
             return RecordOutcome::RejectedValue;
         }
-        if ist_day_of(exchange_secs) < self.trading_day.load(Ordering::Relaxed) {
+        let tick_day = ist_day_of(exchange_secs);
+        let trading_day = self.trading_day.load(Ordering::Relaxed);
+        if tick_day < trading_day {
             self.stale_day.fetch_add(1, Ordering::Relaxed);
             return RecordOutcome::StaleTradingDay;
+        }
+        // The symmetric gate. Without it a single tick stamped tomorrow (a
+        // vendor clock fault, a garbage timestamp) would be STORED, and the
+        // later-time-wins rule below would then refuse every honest tick for
+        // the rest of the session as `OlderThanHeld` — counting the victims
+        // and never the cause.
+        if tick_day > trading_day {
+            self.future_day.fetch_add(1, Ordering::Relaxed);
+            return RecordOutcome::FutureTradingDay;
         }
         let word = pack(exchange_secs, last_price.to_bits());
         let pinned = self.prices.pin();
@@ -507,7 +533,15 @@ impl SpotPriceStore {
         metrics::counter!(STALE_DAY_COUNTER).absolute(self.stale_day.load(Ordering::Relaxed));
         metrics::counter!(OLDER_THAN_HELD_COUNTER)
             .absolute(self.older_than_held.load(Ordering::Relaxed));
+        metrics::counter!(FUTURE_DAY_COUNTER).absolute(self.future_day.load(Ordering::Relaxed));
         metrics::counter!(REFUSED_COUNTER).absolute(self.refused_capacity.load(Ordering::Relaxed));
+    }
+
+    /// Ticks refused because their exchange trade time was from a LATER IST
+    /// day than the one this store is gated to.
+    #[must_use]
+    pub fn future_day_refusals(&self) -> u64 {
+        self.future_day.load(Ordering::Relaxed)
     }
 
     /// Refusals so far, as `(rejected_value, stale_day, older_than_held,
@@ -636,6 +670,44 @@ mod tests {
         assert_eq!(s.latest_paise(2885, NSE_EQ), None);
         assert!(s.is_empty(), "a refused tick must not create a slot");
         assert_eq!(s.refusals().1, 1);
+    }
+
+    /// Identity sweep row 29 (2026-09-08): before the future-day gate, one tick
+    /// stamped tomorrow was STORED and then out-ranked every honest tick for
+    /// the rest of the session — `older_than_held` counted the victims.
+    #[test]
+    fn future_day_refusals_count_a_trade_stamped_tomorrow_and_the_slot_is_not_pinned() {
+        let s = store();
+        assert_eq!(s.record(2885, NSE_EQ, 1234.55, T0), RecordOutcome::Stored);
+        let tomorrow = T0 + u32::try_from(SECONDS_PER_DAY).unwrap_or(86_400);
+        assert_eq!(
+            s.record(2885, NSE_EQ, 9999.99, tomorrow),
+            RecordOutcome::FutureTradingDay,
+            "a tick from a later IST day must never be stored"
+        );
+        assert_eq!(
+            s.latest_paise(2885, NSE_EQ),
+            Some(123_455),
+            "the honest price survives the garbage stamp"
+        );
+        assert_eq!(
+            s.record(2885, NSE_EQ, 1234.60, T0 + 1),
+            RecordOutcome::Stored,
+            "the NEXT honest tick still lands — the slot was never pinned"
+        );
+        assert_eq!(s.future_day_refusals(), 1);
+        assert_eq!(
+            s.refusals().2,
+            0,
+            "nothing was counted as older-than-held — the cause is counted, not the victims"
+        );
+        // A brand-new instrument whose FIRST tick is future-dated gets no slot.
+        assert_eq!(
+            s.record(11_536, NSE_EQ, 100.0, tomorrow),
+            RecordOutcome::FutureTradingDay
+        );
+        assert_eq!(s.latest_paise(11_536, NSE_EQ), None);
+        assert_eq!(s.future_day_refusals(), 2);
     }
 
     #[test]

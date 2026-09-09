@@ -1692,6 +1692,28 @@ fn writer_loop(
 /// `WS-SPILL-01` log + counter so the writer thread keeps draining the channel
 /// instead of dying. The next record retries the open.
 fn open_segment_resilient(wal_dir: &Path) -> Option<BufWriter<File>> {
+    // Operator sweep row 22 (2026-09-08): the directory is created at boot,
+    // but a mid-session `rm -rf data/ws_wal` (the Quote 21 wipe shape, or an
+    // operator clearing disk by hand) left every later segment open failing
+    // with ENOENT until restart — the durable floor gone for the session
+    // while the writer "stayed alive". Re-creating it here costs one
+    // `mkdir -p` per segment rotation on the background writer thread, never
+    // per frame, and is idempotent when the directory exists.
+    // O(1) EXEMPT: segment-rotation path on the dedicated background writer thread, never the per-frame append
+    if let Err(err) = std::fs::create_dir_all(wal_dir) {
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            stage = "create_dir",
+            error = %err,
+            "WAL spill writer could not create the WAL directory — will retry; thread stays alive"
+        );
+        metrics::counter!(
+            "tv_ws_frame_spill_write_errors_total",
+            "stage" => "create_dir"
+        )
+        .increment(1);
+        return None;
+    }
     match open_new_segment(wal_dir) {
         Ok(w) => Some(w),
         Err(err) => {

@@ -1239,8 +1239,13 @@ impl MultiTfAggregator {
     /// O(N × [`TF_COUNT`]). Driven at a multi-second cadence — but NOT on a
     /// background task: the caller drives this from the frame drain's own
     /// `tokio::select!`, so a sweep is a periodic PAUSE of the drain, not
-    /// work that happens beside it. UNMEASURED at the 25,000-instrument
-    /// target. (The literal `21` this line used to carry was stale; cite the
+    /// work that happens beside it. MEASURED at the 25,000-slot x
+    /// [`TF_COUNT`] ceiling by `catch_up_seal_all_sweep_cost_at_the_authorized_ceiling`
+    /// in this file: 9.67 ms, 16.1 ns per cell (2026-08-21, release, x86 dev
+    /// container), a 0.2% duty cycle at the 5 s cadence — recorded in
+    /// CLAUDE.md's O(1) table. (This line read "UNMEASURED" until 2026-09-08,
+    /// three weeks after the harness landed.
+    /// The literal `21` this line once carried was stale; cite the
     /// constant so it cannot go stale again.)
     pub fn catch_up_seal_all<F>(&mut self, cutoff_secs: u32, mut on_seal: F) -> usize
     where

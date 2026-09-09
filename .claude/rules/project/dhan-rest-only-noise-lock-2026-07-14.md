@@ -3539,3 +3539,43 @@ storm the swap-cap counters already report, and it is fail-closed in the safe
 direction (a forgotten drop can never read as a ghost, so it never causes a
 redial). The three-condition filter on `swap_emptied_socket` does not see it,
 and must not.
+
+**Second addendum (2026-09-08, after the hostile sweep) — six more
+`WS-GAP-02` sources, all log-only, and the two the observability audit said
+were "recorded in the wrong file" are accepted here explicitly.** Every one is
+invisible to the three-condition `swap_emptied_socket` filter by construction,
+and must stay so:
+
+| `source` | Where | Why it earns no page |
+|---|---|---|
+| `gainer_verdicts_all_unknown` | `dhan_feed_stack.rs`, once per session | Both depth pools hold the boot dial while every gainer verdict is `Unknown`. The consequence — no ranked steering — is the shape `depth_steering_stalled` (family 5) and `dhan-contract-universe-failed` already page on when it is a defect; on a morning the code-6 previous close simply has not arrived yet it is NORMAL for a few minutes. Log-only by the scope lock's own words ("2026-09-08 (SECOND)"); this row is the §2 record the observability audit asked for. |
+| `no_ranking_by_0920` | `depth_rebalance.rs`, once per session | Same reasoning, and it fires on every NSE holiday boot by design (nothing trades, nothing ranks) — a pager here pages on every holiday. |
+| `gainer_board_empty_by_1000` | `depth_rebalance.rs`, once per session | A ranking IS published but admits no stock option at 10:00 IST: every underlying is down on the day, so the gainer filter the operator locked on 2026-09-06 selects nothing and both pools hold their set. That is the filter working, not a fault — audit row 29 of 2026-09-08 found the stillness was SILENT, so it is now said once. Paging on it would page on every broad down-day. |
+| `depth_seed_refused` / `depth_seed_unreadable` / `depth_seed_stale` / `depth_seed_artifact_missing` | `depth_seed.rs`, `dhan_feed_stack.rs` | A refused or absent seed means the boot dial runs as it did before the seed existed — the pre-2026-09-08 behaviour, never a loss. An expiry rollover refuses a whole seed legitimately every Friday. Counted on `tv_depth_seed_rows_total{outcome}` and the new `tv_depth_seed_file_total{outcome}` (local `/metrics` only). |
+| `ghost_redial_exhausted` | `dhan_feed_stack.rs`, once per socket per session | A socket redialled `GHOST_REDIAL_SESSION_CEILING` (8) times still delivers the ghost: the vendor is not honouring the unsubscribe code. The socket keeps its WORKING set — nothing is lost, the ghost's rows are still written — and the session-long read-out is `tv_dhan_feed_depth_total{outcome="ghost_exhausted"}`. The fix for it is the code, not a pager. |
+
+Also bounded the same day, with no pager: ghost redials are now spaced
+pool-wide (`GHOST_REDIAL_POOL_SPACING_SECS` = 20 s, so sixteen ghosting
+sockets cannot fan out into an 805) and capped per socket per session, and a
+contract dropped by BOTH pools takes its grace from the NEWER drop so a
+legitimate depth-200 unsubscribe of a contract depth-20 dropped earlier no
+longer reads as a ghost and redials a healthy socket.
+
+**Third addendum (2026-09-08, evening — the compound/identity/operator sweeps).**
+Every item below is LOG-ONLY or COUNTER-ONLY on the local `/metrics` exporter:
+no CloudWatch alarm, no EMF name, no budget lever, no page. The September
+forecast is $142.24 against a $135.00 automatic-stop line, so a new pager needs
+an operator lever first; these are the numbers an operator reads AFTER a page
+from an existing family, never a new page.
+
+| Surface | Shape | Why it earns no page |
+|---|---|---|
+| `tv_prev_close_store_tick_disagreement_total` | counter, per tick on the stock-option underlying segment | A later Full/Quote packet whose `day_close` CONTRADICTS the held previous close is counted and never applied (first write wins). The field is constant through a session by the vendor's own definition, so a non-zero reading is a corrupt packet — a fact for the identity audit, not an action. |
+| `tv_spot_price_store_future_day_total` | counter | A trade time stamped for a FUTURE trading day is refused at the RAM spot store, symmetric with the stale-day refusal. One clock-fault packet used to pin the slot for the session (later-time-wins); now it cannot. |
+| `WS-GAP-03` + `source = "symbol_map_collision"` | `warn!`, once per artifact parse | A symbol in the mapping artifact resolving to two different `(security_id, segment)` pairs — the I-P1-11 class through the ISIN join. Last row wins deterministically; the count (`tv_dhan_contract_symbol_collisions_total`) says look at the join. Invisible to the three-condition `fell_back_to_indices` filter by construction. |
+| `tv_dhan_feed_drain_frames_total{outcome="length_mismatch"}` | counter, per main-feed packet | The vendor's own `message_length` stamp disagreed with the fixed size the walk decodes on. Counted, never acted on — the depth path has had the same counter since 2026-08-15. UNVERIFIED-LIVE whether Dhan's stamp equals the packet size for every code; a constant non-zero rate means the stamp semantics differ, not that packets are wrong. |
+| `tv_depth_seed_rows_total{outcome="refused_identity_changed"}` | counter, once per boot | A seeded contract id that names a DIFFERENT (expiry, strike, leg) today than at the close it was captured — Dhan documents derivative ids as unstable. Refused per row; the boot dial fills the slot. Joins the `depth_seed_refused` `warn!` fields. |
+| `tv_spill_dir_free_inodes` / `tv_spill_dir_total_inodes` | gauges, every disk-health poll | The spill and WAL tiers write many small files; a volume can exhaust inodes with hundreds of GB free while the byte gauge and its alarm read healthy. The number now exists; alarming it needs a lever. |
+| `GAP-SEC-01` `error!` (empty bearer token, paper mode) | coded log, once at boot | LIVE mode now REFUSES to boot on an empty API bearer token (the feed toggle sits on a publicly funnelled port); paper mode keeps the documented dev passthrough and says so once. Not a page: it is a boot-time configuration fact, and the operator is the one who seeded the value. |
+| `LAMBDA-NOTIFY-01` total-delivery failure | Lambda invocation ERROR | `telegram_webhook::handle` now returns `Err` when NOT ONE message of a batch reached Telegram. This is not a new alarm: the function's EXISTING `Errors` alarm fires, and its email fan-out is the leg that survives a dead bot token. A partial failure stays `Ok` (SNS would redeliver and re-page the ones that landed). |
+| `holiday-gate.sh` self-stop page | one SNS publish to the existing `tv-<env>-alerts` topic | Not a new alarm or family: the same topic and Lambda the autopilot uses, one plain-English line when the box switches itself off for an NSE holiday, so a wrong holiday verdict on a trading day is noticed at 08:31 IST instead of at the 09:20 alarm gate. |
