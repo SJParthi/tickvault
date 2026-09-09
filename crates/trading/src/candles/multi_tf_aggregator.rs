@@ -173,6 +173,10 @@ pub struct ConsumeStats {
     /// `true` when the tick fell outside the `[09:15, 15:40)` IST candle
     /// window. Nothing was folded.
     pub out_of_session: bool,
+    /// `true` when the vendor stamped this tick for a LATER IST day than our
+    /// own receipt clock. Nothing was folded, and — crucially — the watermark
+    /// was NOT advanced.
+    pub future_trading_day: bool,
     /// `true` when the slot table was at [`AGGREGATOR_MAX_SLOTS`] and this
     /// instrument therefore has NO fold state. Fail-closed: nothing was
     /// folded, and the caller must treat it as a real data loss.
@@ -295,6 +299,7 @@ impl ConsumeStats {
             && !self.refused_timestamp
             && !self.untraded_sentinel
             && !self.stale_trading_day
+            && !self.future_trading_day
             && !self.untraded_timestamp
             && !self.out_of_band_timestamp
     }
@@ -916,6 +921,50 @@ impl MultiTfAggregator {
         // advance as `stale_trading_day`. Comparing like with like removes the
         // shape entirely rather than arguing it is small.
         let fold_secs = fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos);
+
+        // FUTURE TRADING DAY gate — BEFORE the advance, and that ordering is
+        // the entire point.
+        //
+        // The advance below is `>`, so a tick from the PAST can never move the
+        // watermark; the stale-day gate under it is safe for that reason. A
+        // tick from the FUTURE had no such guard, and the asymmetry is not
+        // theoretical: `fold_clock_ist_secs` returns the VENDOR's stamp
+        // whenever receipt and exchange disagree by more than the trusted band
+        // (`tf_index.rs`), and a stamp one day ahead disagrees by ~86,400 s —
+        // far outside it. So one clock-fault packet stamped for tomorrow was
+        // returned verbatim, advanced the watermark into day D+1, and every
+        // honest tick for the REST OF THE SESSION then failed the stale-day
+        // gate below: all 24 timeframes stop folding, for every instrument,
+        // with no error — only a rising refusal counter.
+        //
+        // The receipt clock is the right reference and the only one available:
+        // it is OUR machine's clock, disciplined by chrony and gated at boot by
+        // BOOT-03, whereas the thing under suspicion is the vendor's stamp.
+        // `SpotPriceStore` already refuses a future-dated trade for exactly
+        // this reason (`spot_price_store.rs`, `FutureTradingDay`); the fold was
+        // the half that had the guard on one side only. Found by the
+        // 2026-09-09 time-permutation sweep.
+        //
+        // `received_at_nanos <= 0` is the documented "no receipt" sentinel — a
+        // WAL frame written before the TVW3 format carried a receipt. With no
+        // second clock there is nothing to compare against, so the gate stands
+        // down rather than guessing; those frames are replay, not live.
+        //
+        // O(1): one compare, one divide, one compare. No allocation.
+        if tick.received_at_nanos > 0 {
+            let receipt_ist_secs = tick.received_at_nanos / 1_000_000_000
+                + crate::candles::tf_index::IST_UTC_OFFSET_SECS;
+            if i64::from(fold_secs) / 86_400 > receipt_ist_secs / 86_400 {
+                crate::candles::fold_counters::fold_counters()
+                    .tick_refused_future_trading_day
+                    .increment(1);
+                return ConsumeStats {
+                    future_trading_day: true,
+                    ..ConsumeStats::default()
+                };
+            }
+        }
+
         if fold_secs > self.watermark_secs {
             self.watermark_secs = fold_secs;
         }
@@ -1923,6 +1972,79 @@ mod tests {
     /// Both halves are asserted, because either alone would be a false pass:
     /// unseeded MUST fold (proving the defect is real and the test can see
     /// it), seeded MUST refuse (proving the seed closes it).
+    /// ONE vendor packet stamped for tomorrow used to end candles for the day.
+    ///
+    /// `fold_clock_ist_secs` returns the VENDOR's stamp whenever receipt and
+    /// exchange disagree by more than the trusted band, and a stamp one day
+    /// ahead disagrees by ~86,400 s. That value then advanced the watermark
+    /// into day D+1, and every honest tick afterwards failed the stale-day
+    /// gate: all 24 timeframes stop folding, for every instrument, with only a
+    /// rising refusal counter to show for it.
+    ///
+    /// Both halves are asserted because either alone would be a false pass:
+    /// the future tick MUST be refused, and the honest tick after it MUST
+    /// still fold.
+    #[test]
+    fn a_future_dated_tick_is_refused_and_never_poisons_the_watermark() {
+        let today_in_session = DAY + 33_300 + 60;
+        // Receipt is genuinely today: IST secs -> UTC nanos.
+        let receipt_now_nanos = (i64::from(today_in_session)
+            - crate::candles::tf_index::IST_UTC_OFFSET_SECS)
+            * 1_000_000_000;
+
+        let mut agg = MultiTfAggregator::default();
+
+        // A packet the vendor stamped for TOMORROW, received now.
+        let mut future = tick(13, SEG_IDX, today_in_session + 86_400, 100.0, 1);
+        future.received_at_nanos = receipt_now_nanos;
+        let stats = agg.consume_tick(Feed::Dhan, &future, None, |_, _, _, _, _| {
+            panic!("a future-dated tick must never seal a bar")
+        });
+        assert!(
+            stats.future_trading_day,
+            "a stamp one day ahead of our own receipt clock must be refused"
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 13, SEG_IDX).is_none(),
+            "and must not take a slot — the gate runs before slot allocation"
+        );
+
+        // THE POINT: an honest tick right after it still folds.
+        let mut honest = tick(13, SEG_IDX, today_in_session, 100.0, 2);
+        honest.received_at_nanos = receipt_now_nanos;
+        let stats = agg.consume_tick(Feed::Dhan, &honest, None, |_, _, _, _, _| {});
+        assert!(
+            !stats.stale_trading_day,
+            "the future tick must not have advanced the watermark — before this \
+             gate, every honest tick for the rest of the session read as stale"
+        );
+        assert!(
+            !stats.future_trading_day,
+            "and an honest tick is not itself future-dated"
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 13, SEG_IDX).is_some(),
+            "the honest tick folds normally"
+        );
+    }
+
+    /// The gate stands down with no receipt to compare against, so a WAL frame
+    /// written before the TVW3 format carried one folds exactly as it did
+    /// before. `received_at_nanos == 0` is the documented sentinel.
+    #[test]
+    fn a_future_dated_tick_with_no_receipt_clock_is_judged_as_before() {
+        let today_in_session = DAY + 33_300 + 60;
+        let mut agg = MultiTfAggregator::default();
+        // Default `received_at_nanos` is 0 — the sentinel.
+        let t = tick(13, SEG_IDX, today_in_session + 86_400, 100.0, 1);
+        assert_eq!(t.received_at_nanos, 0, "fixture must exercise the sentinel");
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        assert!(
+            !stats.future_trading_day,
+            "with no second clock the gate must not guess"
+        );
+    }
+
     #[test]
     fn a_prior_day_replay_frame_folds_unseeded_and_is_refused_once_seeded() {
         let yesterday_in_session = DAY - 86_400 + 33_300 + 60;
@@ -2545,6 +2667,7 @@ mod tests {
             refused_timestamp: _,
             untraded_sentinel: _,
             stale_trading_day: _,
+            future_trading_day: _,
             untraded_timestamp: _,
             out_of_band_timestamp: _,
         } = ConsumeStats::default();
@@ -2594,6 +2717,13 @@ mod tests {
                 "stale_trading_day",
                 ConsumeStats {
                     stale_trading_day: true,
+                    ..ConsumeStats::default()
+                },
+            ),
+            (
+                "future_trading_day",
+                ConsumeStats {
+                    future_trading_day: true,
                     ..ConsumeStats::default()
                 },
             ),

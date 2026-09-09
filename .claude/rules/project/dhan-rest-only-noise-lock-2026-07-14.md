@@ -3592,3 +3592,25 @@ the September budget position (forecast $142.24 against the $135.00 automatic
 requires a LEVER, not a cost note). Zero on a healthy session, so any non-zero
 reading is the whole signal; it is the number an operator reads AFTER an existing
 family-(5) page, never a new page.
+
+**Fifth addendum (2026-09-09) — three counters and one log-field, all
+LOG-SINK/COUNTER-ONLY.** No CloudWatch alarm, no EMF name, no budget lever.
+The September forecast is $142.24 against a $135.00 automatic-stop line
+(measured 2026-09-06), so a new pager needs an operator lever first; these are
+numbers an operator reads AFTER a page from an existing family, never a new
+page.
+
+| Surface | Shape | Why it earns no page |
+|---|---|---|
+| `tv_aggregator_tick_refused_total{reason="future_trading_day"}` | counter, per tick | The vendor stamped a tick for a LATER IST day than our own receipt clock. It joins the CANDLE-ONLY set — the row is written, only the bucket is skipped — so it is not tick loss, and reaching it needs a ≥9 h clock skew that has never been observed. Its 30 s read-out is the existing `AGGREGATOR-DROP-01` sibling `warn!`, which now carries `refused_future_trading_day` beside the stale and out-of-band fields. Paging on it would page for a condition whose whole point is that it is rare. |
+| `tv_depth_rebalance_swaps_refused_total{reason="ack_pending"}` | counter, per refused swap | A socket whose previous swap has not been acknowledged refuses a second one for that minute. Self-healing by construction: the ack lands and the next minute plans again. A sustained non-zero rate means the connection task is not answering, which the socket's own idle watchdog and the ghost-redial counter already report. |
+| `tv_spot_backstop_total{outcome="failed"}` | counter, per backstop call | The QuestDB spot read did not happen — client build, non-2xx, unreadable body, send error, or an unparseable response. Until today all five returned an empty map that the wrapper counted as `answered`, so the one surface for "the database is not answering" asserted success on four of its five failure paths. The consequence is already visible as `without_spot` ladders and, when total, as the `WS-GAP-03 / fell_back_to_indices` alarm; this makes the CAUSE readable rather than adding a second pager for the same event. All five outcomes are now seeded at zero on first use, so the first failure episode is not swallowed by the agent's dropped-first-sample rule. |
+
+Also added, and likewise log-only: five `WS-GAP-03` emit sites in
+`dhan_contract_universe::fetch_spot_prices` (`source` = `spot_backstop_client_build`
+/ `_unreadable` / `_non_2xx` / `_send_failed` / `_unparseable`). They were
+UNCODED `error!` lines, so none of the 27 coded metric filters could match
+them; they are now coded and therefore greppable and triage-able. They remain
+invisible to the §2.3d-i `WS-GAP-03` alarm by construction — that filter is
+scoped to `$.source = "fell_back_to_indices"`, and widening it to the bare
+code would page on ordinary connection churn across ~50 emit sites.

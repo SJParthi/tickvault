@@ -1370,6 +1370,33 @@ pub const SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS: u64 = 2;
 /// had only stale prices" — two different reasons for the same empty map.
 pub const SPOT_BACKSTOP_COUNTER: &str = "tv_spot_backstop_total";
 
+/// Every `outcome` label [`SPOT_BACKSTOP_COUNTER`] can carry.
+pub const SPOT_BACKSTOP_OUTCOMES: [&str; 5] = [
+    "answered",
+    "failed",
+    "timed_out",
+    "stale_row",
+    "unstamped_row",
+];
+
+/// Seeds every outcome at zero once per process.
+///
+/// The CloudWatch agent computes a counter delta PER LABEL SET and DROPS the
+/// first sample of a set it has never seen. So a label whose first increment
+/// IS the event publishes nothing on the one occasion that matters — and
+/// `failed` is exactly that shape: it fires only when the database read did
+/// not happen. This file's own history records the same rule swallowing
+/// `tv_depth_rows_spilled_total` on 2026-08-28 and leaving 104,540 rows
+/// permanently unclassifiable.
+///
+/// Costs five zero-increments once. Label values fold into one summed series
+/// per host, so this adds no EMF name and no money.
+pub fn pre_register_spot_backstop_counters() {
+    for outcome in SPOT_BACKSTOP_OUTCOMES {
+        metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => outcome).increment(0);
+    }
+}
+
 /// Oldest a backstop row may be, in seconds, and still centre a ladder.
 ///
 /// The query already bounds rows to TODAY, which is what stopped yesterday's
@@ -1440,11 +1467,34 @@ pub async fn fetch_spot_prices_backstop(
     today_ist_nanos: i64,
     ram_prices: usize,
 ) -> HashMap<(u64, u8), i64> {
+    // Seeded HERE, not only at the depth-rebalance pre-register site, because
+    // the contract attach calls this long before that loop starts — and a
+    // seed that lands after the first increment is no seed at all.
+    static SEED: std::sync::Once = std::sync::Once::new();
+    SEED.call_once(pre_register_spot_backstop_counters);
     let budget = std::time::Duration::from_secs(spot_backstop_budget_secs(ram_prices));
     match tokio::time::timeout(budget, fetch_spot_prices(questdb, today_ist_nanos)).await {
-        Ok(prices) => {
+        Ok(Some(prices)) => {
             metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "answered").increment(1);
             prices
+        }
+        // The read FAILED — client build, non-2xx, unreadable body, send
+        // error, or an unparseable response. Every one of those used to
+        // return an empty map, which the arm above then counted as
+        // `answered`: a QuestDB outage during contract attach read as a
+        // backstop that had answered and simply found nothing. The ONLY
+        // outcome distinguished was the timeout, so the one surface an
+        // operator has for "the database is not answering" asserted success
+        // on four of its five failure paths.
+        //
+        // It is `failed` and not a second timeout label because the two call
+        // for different things: a timeout means the database is slow and RAM
+        // carried the session; a failure means the read did not happen at
+        // all, and on a boot before the drain has priced anything that is the
+        // difference between a narrower ladder set and none.
+        Ok(None) => {
+            metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "failed").increment(1);
+            HashMap::new()
         }
         Err(_elapsed) => {
             metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "timed_out").increment(1);
@@ -1875,14 +1925,18 @@ pub async fn load_contract_universe(
 pub async fn fetch_spot_prices(
     questdb: &tickvault_common::config::QuestDbConfig,
     today_ist_nanos: i64,
-) -> HashMap<(u64, u8), i64> {
+) -> Option<HashMap<(u64, u8), i64>> {
     let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
         .build()
     else {
-        tracing::error!("contract universe: HTTP client build failed — no stock options");
-        return HashMap::new();
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "spot_backstop_client_build",
+            "contract universe: HTTP client build failed — no stock options"
+        );
+        return None;
     };
     let sql = build_spot_price_query(today_ist_nanos);
     let body = match client
@@ -1894,17 +1948,32 @@ pub async fn fetch_spot_prices(
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(b) => b,
             Err(err) => {
-                tracing::error!(?err, "contract universe: spot price response unreadable");
-                return HashMap::new();
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    source = "spot_backstop_unreadable",
+                    ?err,
+                    "contract universe: spot price response unreadable"
+                );
+                return None;
             }
         },
         Ok(resp) => {
-            tracing::error!(status = %resp.status(), "contract universe: spot price query non-2xx");
-            return HashMap::new();
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "spot_backstop_non_2xx",
+                status = %resp.status(),
+                "contract universe: spot price query non-2xx"
+            );
+            return None;
         }
         Err(err) => {
-            tracing::error!(?err, "contract universe: spot price query failed");
-            return HashMap::new();
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "spot_backstop_send_failed",
+                ?err,
+                "contract universe: spot price query failed"
+            );
+            return None;
         }
     };
     let floor = spot_backstop_freshness_floor(ist_now_nanos(), today_ist_nanos);
@@ -1926,11 +1995,16 @@ pub async fn fetch_spot_prices(
                      being centred on this morning"
                 );
             }
-            rows.prices
+            Some(rows.prices)
         }
         Err(err) => {
-            tracing::error!(err, "contract universe: spot price response unparseable");
-            HashMap::new()
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "spot_backstop_unparseable",
+                err,
+                "contract universe: spot price response unparseable"
+            );
+            None
         }
     }
 }
@@ -1942,6 +2016,40 @@ mod tests {
     /// make a genuine failure look like a flake and vice versa. Poisoning is
     /// recovered rather than propagated, the house pattern.
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The seed must name EVERY outcome the counter can carry, or the label it
+    /// misses keeps the defect the seeding exists to remove: the CloudWatch
+    /// agent drops the first sample of a label set it has never seen, so an
+    /// unseeded label publishes nothing on its first episode — and `failed`
+    /// has no second episode to fall back on when the read is what is broken.
+    ///
+    /// Asserting against the SOURCE rather than the metric registry is
+    /// deliberate: the registry is process-global, so a test that read it
+    /// would be order-dependent against every other test that increments a
+    /// counter. The source is the thing that can drift.
+    #[test]
+    fn pre_register_spot_backstop_counters_seeds_every_outcome_label() {
+        let src = include_str!("dhan_contract_universe.rs");
+        for outcome in super::SPOT_BACKSTOP_OUTCOMES {
+            assert!(
+                src.contains(&format!("\"outcome\" => \"{outcome}\"")),
+                "{outcome} is in SPOT_BACKSTOP_OUTCOMES but no site emits it — \
+                 either the label is dead or an emit site was renamed"
+            );
+        }
+        assert_eq!(
+            super::SPOT_BACKSTOP_OUTCOMES.len(),
+            5,
+            "an outcome was added or removed — update the seed list AND this \
+             pin together, so the pair cannot drift"
+        );
+        // Non-vacuous: the function must actually loop the list, not just
+        // declare it.
+        assert!(
+            src.contains("for outcome in SPOT_BACKSTOP_OUTCOMES"),
+            "pre_register_spot_backstop_counters must seed from the list"
+        );
+    }
 
     fn crow(id: u64) -> super::ContractRow {
         super::ContractRow {

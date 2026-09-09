@@ -58,19 +58,22 @@ pub(crate) struct FoldCounters {
     pub(crate) cumulative_regression: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
-    /// `tick_refused` carries a `reason` label with **SIX** distinct values.
-    /// One field per value, because collapsing them would merge six
+    /// `tick_refused` carries a `reason` label with **SEVEN** distinct values.
+    /// One field per value, because collapsing them would merge seven
     /// independent refusal causes into one series and make the counter
     /// useless for telling a bad price from a bad timestamp.
     ///
     /// (THREE until 2026-08-26, when `stale_trading_day` and
     /// `untraded_timestamp` were added; the comment then said FIVE and stayed
     /// wrong through the addition of `out_of_band_timestamp`. Corrected to SIX
-    /// on 2026-08-29. The count is stated here because it is exactly the kind
-    /// of number that silently goes stale — and this comment, which SAYS so in
-    /// its own next sentence, then did.)
+    /// on 2026-08-29, and to SEVEN on 2026-09-09 with `future_trading_day`.
+    /// The count is stated here because it is exactly the kind of number that
+    /// silently goes stale — and this comment, which SAYS so in its own next
+    /// sentence, then did. What stops the fourth repeat is not care but
+    /// `the_reason_count_in_the_doc_matches_the_handles`, which fails the
+    /// build when the two disagree; it is what caught this one.)
     ///
-    /// ⚠ TWO of the six are HARD refusals and FOUR are candle-only:
+    /// ⚠ TWO of the seven are HARD refusals and FIVE are candle-only:
     ///
     /// | reason | row written to `ticks`? |
     /// |---|---|
@@ -80,9 +83,10 @@ pub(crate) struct FoldCounters {
     /// | `stale_trading_day` | YES |
     /// | `untraded_timestamp` | YES |
     /// | `out_of_band_timestamp` | YES |
+    /// | `future_trading_day` | YES |
     ///
     /// So this counter is NOT a loss count. Reading it as one overstates
-    /// tick loss by whatever share the four candle-only reasons hold — which
+    /// tick loss by whatever share the five candle-only reasons hold — which
     /// on 2026-08-28 was most of 5,748,026.
     pub(crate) tick_refused_price: metrics::Counter,
     pub(crate) tick_refused_timestamp: metrics::Counter,
@@ -90,6 +94,9 @@ pub(crate) struct FoldCounters {
     /// Ticks whose IST DATE was older than the newest date seen — a stale
     /// last-trade time. Candle-only refusal; the row is still written.
     pub(crate) tick_refused_stale_trading_day: metrics::Counter,
+    /// Ticks refused because the vendor stamped them for a LATER IST day
+    /// than our own receipt clock. See the gate in `multi_tf_aggregator`.
+    pub(crate) tick_refused_future_trading_day: metrics::Counter,
     /// Per-TIMEFRAME discards: a tick that arrived too late to be placed in
     /// that timeframe's bucket and was dropped.
     ///
@@ -104,7 +111,7 @@ pub(crate) struct FoldCounters {
     ///
     /// CORRECTED 2026-08-29: this used to justify the split by saying that
     /// family "means the whole tick was refused and nothing was folded". That
-    /// is true of only TWO of its six reasons — the other four are
+    /// is true of only TWO of its seven reasons — the other five are
     /// candle-only and their rows ARE written (see the table above). The
     /// separation is still right; the reason given for it was wrong, and it
     /// was the reason a reader would use to interpret 5.7 million refusals as
@@ -164,6 +171,10 @@ impl FoldCounters {
             tick_refused_untraded_sentinel: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
                 "reason" => "untraded_sentinel"
+            ),
+            tick_refused_future_trading_day: metrics::counter!(
+                "tv_aggregator_tick_refused_total",
+                "reason" => "future_trading_day"
             ),
             tick_refused_stale_trading_day: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
@@ -230,11 +241,11 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
         // and this file's sibling doctrine says so in as many words: the
         // CloudWatch agent computes its delta PER LABEL SET, so seeding one
         // reason leaves the others exactly as blind. The 5.7 million was
-        // dominated by two of the six reasons; the other four had never
+        // dominated by two of the seven reasons; the others had never
         // published, so each of their FIRST episodes -- the novel failure,
         // not the routine one -- was silently discarded.
         //
-        // All six are seeded. The cost is six zero-increments once per
+        // All seven are seeded. The cost is seven zero-increments once per
         // process and nothing else: label values fold into one summed series
         // per host, so this adds no EMF name and no money.
         resolved.tick_discarded_late.increment(0);
@@ -242,6 +253,7 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
         resolved.tick_refused_timestamp.increment(0);
         resolved.tick_refused_untraded_sentinel.increment(0);
         resolved.tick_refused_stale_trading_day.increment(0);
+        resolved.tick_refused_future_trading_day.increment(0);
         resolved.tick_untraded_timestamp.increment(0);
         resolved.tick_out_of_band_timestamp.increment(0);
         resolved
@@ -289,6 +301,7 @@ mod seeding_tests {
             "tick_refused_timestamp",
             "tick_refused_untraded_sentinel",
             "tick_refused_stale_trading_day",
+            "tick_refused_future_trading_day",
             "tick_untraded_timestamp",
             "tick_out_of_band_timestamp",
         ] {
@@ -308,12 +321,12 @@ mod seeding_tests {
         let src = include_str!("fold_counters.rs");
         let handles = src.matches("\"tv_aggregator_tick_refused_total\",").count();
         assert_eq!(
-            handles, 6,
+            handles, 7,
             "the number of tick_refused reason handles changed -- update the \
-             SIX in the doc comment and this pin together"
+             SEVEN in the doc comment and this pin together"
         );
         assert!(
-            src.contains("carries a `reason` label with **SIX** distinct values"),
+            src.contains("carries a `reason` label with **SEVEN** distinct values"),
             "the doc comment must state the real handle count"
         );
     }

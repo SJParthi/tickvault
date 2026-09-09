@@ -1082,6 +1082,19 @@ pub struct LiveIngest {
     /// Ticks refused for `out_of_band_timestamp` — 2,008,916 measured in one
     /// session. Corruption-adjacent and likewise not normal.
     refused_out_of_band_ts: u64,
+    /// Ticks refused for `future_trading_day` — the vendor stamped a tick for
+    /// a LATER IST day than our own receipt clock.
+    ///
+    /// Its OWN field rather than a share of `refused_stale_trading_day`,
+    /// though the two are mirror images (a stamp behind us vs ahead of us),
+    /// because they carry opposite operator meanings. Stale is ROUTINE and
+    /// large: Dhan sends the last TRADE time, so every dormant contract is
+    /// stale by construction and the field runs to millions a session. A
+    /// FORWARD stamp cannot be explained that way at all — it needs a vendor
+    /// clock fault or a corrupt packet, and one of them arriving is a fact
+    /// worth seeing. Blended into the stale field it would be a rounding
+    /// error inside a number nobody reads twice.
+    refused_future_trading_day: u64,
     seals_emitted: u64,
     seals_dropped: u64,
     /// Bars the fold produced for a timeframe nobody asked for.
@@ -1604,6 +1617,7 @@ impl LiveIngest {
             refused_out_of_session: 0,
             refused_stale_trading_day: 0,
             refused_out_of_band_ts: 0,
+            refused_future_trading_day: 0,
             seals_emitted: 0,
             seals_skipped: 0,
             seals_rescued: 0,
@@ -1747,7 +1761,7 @@ impl LiveIngest {
     /// returned apart so the caller can report them without also reporting the
     /// shut-market case.
     #[must_use]
-    pub const fn refusals(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub const fn refusals(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
         (
             self.refused_price,
             self.refused_timestamp,
@@ -1755,6 +1769,7 @@ impl LiveIngest {
             self.refused_out_of_session,
             self.refused_stale_trading_day,
             self.refused_out_of_band_ts,
+            self.refused_future_trading_day,
         )
     }
 
@@ -2560,9 +2575,21 @@ impl LiveIngest {
         // being thrown away by the fold before reaching a writer built to
         // take them. It is candle-only and not a full acceptance because an
         // out-of-band second still cannot be placed in a bucket.
+        // `future_trading_day` joins the candle-only set on 2026-09-09, in the
+        // same change that created it, because a refusal the caller does not
+        // consume is worse than no refusal at all: the fold declines the tick
+        // and every arm below then treats it as a FULL acceptance, so it
+        // reaches the volume leaderboard. That is the exact failure the long
+        // comment beneath this block describes for `stale_trading_day` — a
+        // tick carrying another day's CUMULATIVE VOLUME sets the contract's
+        // baseline to a foreign number, and today's real volume then reads as
+        // a fall that the monotonicity gate defends until the 32-tick
+        // re-latch. Candle-only and not hard, for the same reason as its
+        // mirror: the ROW is a real last-traded price and is kept.
         let candle_only_refusal = (stats.out_of_session
             || stats.untraded_sentinel
             || stats.stale_trading_day
+            || stats.future_trading_day
             || stats.untraded_timestamp
             || stats.out_of_band_timestamp
             || stats.slot_exhausted)
@@ -2634,6 +2661,9 @@ impl LiveIngest {
                 if stats.stale_trading_day {
                     self.refused_stale_trading_day =
                         self.refused_stale_trading_day.saturating_add(1);
+                } else if stats.future_trading_day {
+                    self.refused_future_trading_day =
+                        self.refused_future_trading_day.saturating_add(1);
                 } else if stats.out_of_band_timestamp {
                     self.refused_out_of_band_ts = self.refused_out_of_band_ts.saturating_add(1);
                 } else {
@@ -4884,7 +4914,7 @@ async fn run_frame_drain(
     // Last reported aggregator-refusal totals, so the 30s arm can report a
     // DELTA rather than a cumulative that looks alarming forever after one
     // bad minute.
-    let mut last_refusals: (u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0);
+    let mut last_refusals: (u64, u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0, 0);
     // IST day the ranking state belongs to. Zero means "not yet established",
     // which is why the first pass adopts the day SILENTLY: logging a rollover
     // on the first 30-second tick of every session would report a midnight
@@ -5360,6 +5390,7 @@ async fn run_frame_drain(
                 let d_slot = now.2.saturating_sub(last_refusals.2);
                 let d_stale = now.4.saturating_sub(last_refusals.4);
                 let d_oob = now.5.saturating_sub(last_refusals.5);
+                let d_future = now.6.saturating_sub(last_refusals.6);
                 // `out_of_session` (now.3) is still deliberately NOT reported:
                 // it is the designed refusal for a tick outside the fold
                 // window, and folding it in here would page for normal
@@ -5423,15 +5454,19 @@ async fn run_frame_drain(
                 // cases the ROW IS WRITTEN and only the candle bucket is
                 // skipped, so this is a trend to watch, never a tick-loss
                 // count and never a 2am page.
-                if d_stale > 0 || d_oob > 0 {
+                if d_stale > 0 || d_oob > 0 || d_future > 0 {
                     warn!(
                         refused_stale_trading_day = d_stale,
                         refused_out_of_band_timestamp = d_oob,
+                        refused_future_trading_day = d_future,
                         "Dhan live feed: the aggregator skipped the candle bucket for \
                          some ticks in the last 30s because the vendor stamped them for \
                          another trading day or outside the plausible time band. The \
                          ROWS ARE STILL WRITTEN -- this is not tick loss. A rising rate \
-                         is a vendor data-quality signal."
+                         is a vendor data-quality signal. A non-zero \
+                         refused_future_trading_day is the rarest of the three and the \
+                         only one that cannot be explained by a dormant contract: it \
+                         means a stamp AHEAD of our own clock."
                     );
                 }
 
@@ -17046,7 +17081,7 @@ mod tests {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         assert_eq!(
             ingest.refusals(),
-            (0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0),
             "a fresh fold has refused nothing"
         );
 
@@ -17064,7 +17099,7 @@ mod tests {
             "a NaN price must be refused, got {outcome:?}"
         );
 
-        let (price, ts, slot, oos, stale, oob) = ingest.refusals();
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
         assert_eq!(price, 1, "the price refusal must be counted for the report");
         assert_eq!((ts, slot), (0, 0), "only the price counter moves");
         assert_eq!(
@@ -17073,10 +17108,10 @@ mod tests {
              bucket is deliberately excluded from the page"
         );
         assert_eq!(
-            (stale, oob),
-            (0, 0),
-            "the two reasons split out of the blended out-of-session field on \
-             2026-09-01 must stay zero for a plain bad-price refusal"
+            (stale, oob, future),
+            (0, 0, 0),
+            "the three reasons split out of the blended out-of-session field \
+             must stay zero for a plain bad-price refusal"
         );
     }
 
@@ -17114,7 +17149,7 @@ mod tests {
 
         let _ = ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
 
-        let (price, ts, slot, oos, stale, oob) = ingest.refusals();
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
         assert_eq!(
             oob, 1,
             "the out-of-band refusal must land in its own field, which the 30s \
@@ -17126,8 +17161,64 @@ mod tests {
              30s report deliberately skips — that blending is the defect"
         );
         assert_eq!(
-            (price, ts, slot, stale),
-            (0, 0, 0, 0),
+            (price, ts, slot, stale, future),
+            (0, 0, 0, 0, 0),
+            "no other refusal counter moves"
+        );
+    }
+
+    /// A tick the vendor stamped for a FUTURE trading day must be booked as a
+    /// candle-only refusal, not swept through as a full acceptance.
+    ///
+    /// This is the bite-proof for the defect the fold gate shipped with: the
+    /// aggregator declined the tick and returned `future_trading_day`, and the
+    /// drain consumed the flag NOWHERE — neither `hard_refusal` nor
+    /// `candle_only_refusal` mentioned it — so the tick fell past both early
+    /// returns and reached `observe_for_ranking` carrying ANOTHER DAY'S
+    /// cumulative volume. That is precisely the baseline poisoning the comment
+    /// above `record_prev_close_from_tick` describes for its mirror,
+    /// `stale_trading_day`.
+    ///
+    /// Removing `stats.future_trading_day` from `candle_only_refusal` makes
+    /// this fail on the outcome, which is the half that matters: the counter
+    /// assertion alone would still pass.
+    #[test]
+    fn a_future_dated_tick_is_a_candle_only_refusal_and_never_ranks() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+
+        // A plausible in-band exchange stamp (so it is not `out_of_band`) that
+        // nonetheless lands on a LATER IST day than the receipt clock below.
+        // 1_779_408_000 is 2026-05-23 00:00:00 IST; the receipt is a full day
+        // behind it, which is the ≥9h skew this arm exists for.
+        let packet = ticker_packet(13, 100.0, 1_779_408_000);
+        let parsed = dispatch_frame(&packet, 1_779_321_600_000_000_000)
+            .expect("a well-formed ticker packet must parse with a forward ltt");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        assert_ne!(
+            tick.received_at_nanos, 0,
+            "the gate stands down on a zero receipt — without one this test \
+             would prove nothing"
+        );
+
+        let outcome = ingest.ingest_tick(&tick, 42, 1_779_321_600_000);
+
+        assert!(
+            matches!(outcome, IngestOutcome::WrittenOutOfSession),
+            "a forward-stamped tick must be written and NOT folded; \
+             got {outcome:?}"
+        );
+
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
+        assert_eq!(
+            future, 1,
+            "the forward stamp must land in its OWN field so the 30s report \
+             can tell it apart from the routine stale case"
+        );
+        assert_eq!(
+            (price, ts, slot, oos, stale, oob),
+            (0, 0, 0, 0, 0, 0),
             "no other refusal counter moves"
         );
     }
