@@ -232,3 +232,108 @@ fn self_test_code_only_strips_comments_keeps_code() {
     assert!(!stripped.contains("in a comment"));
     assert!(stripped.contains("let x = close_pct_from_prev_day;"));
 }
+
+// ============================================================================
+// 7. Net volume + the book totals (2026-09-09) — the SAME five-link chain.
+//
+//    These are LONG columns, not DOUBLE, and `net_volume` is the one column in
+//    the whole candle schema that is deliberately OMITTED rather than
+//    zero-filled when absent: omitting an ILP column persists NULL, and NULL is
+//    the honest value for "there was no previous bar to compare against".
+//    Writing `0` would draw a FLAT bar on a chart, which is a different claim.
+//    That distinction is the thing most likely to be "tidied away" by a future
+//    refactor, so it is pinned by name here.
+// ============================================================================
+
+/// Assert a LONG candle column is wired across DDL, ALTER self-heal, ILP
+/// write, seal-row struct and the console view.
+fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
+    let (sp_path, sp_raw) = storage_src("shadow_persistence.rs");
+    let sp = code_only(&sp_raw);
+    assert!(
+        sp.contains(&format!("{col}                  LONG"))
+            || sp.contains(&format!("{col}               LONG"))
+            || sp.contains(&format!("{col}              LONG"))
+            || sp.contains(&format!("{col} LONG")),
+        "{}: candle CREATE TABLE DDL must declare `{col} LONG`.",
+        sp_path.display()
+    );
+    assert!(
+        sp.contains(&format!("ADD COLUMN IF NOT EXISTS {col} LONG")),
+        "{}: candle tables created before {col} existed must auto-migrate via \
+         `ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS {col} LONG;`. Without \
+         it an upgraded deployment keeps the old schema and the column stays \
+         empty forever (schema self-heal).",
+        sp_path.display()
+    );
+
+    let (w_path, w_raw) = storage_src("shadow_candle_writer.rs");
+    let w = code_only(&w_raw);
+    assert!(
+        w.contains(&format!(".column_i64(\"{col}\"")),
+        "{}: the ILP append builder must emit `.column_i64(\"{col}\", ...)` — \
+         a DDL column never written stays NULL forever.",
+        w_path.display()
+    );
+
+    let (r_path, r_raw) = storage_src("shadow_seal_columns.rs");
+    let r = code_only(&r_raw);
+    assert!(
+        r.contains(&format!("pub {col}: {row_type}")),
+        "{}: the persisted seal-row struct must carry `pub {col}: {row_type}`.",
+        r_path.display()
+    );
+
+    let (v_path, v_raw) = storage_src("console_views.rs");
+    let v = code_only(&v_raw);
+    assert!(
+        v.contains(&format!("c.{col}")),
+        "{}: the `candles_named` analyst view must project `c.{col}` — a \
+         stored column an operator cannot see in the console is a column that \
+         does not exist as far as they are concerned.",
+        v_path.display()
+    );
+}
+
+#[test]
+fn net_volume_column_wired_end_to_end() {
+    // `Option<i64>`, not `i64`: the Option IS the NULL, and collapsing it to a
+    // bare i64 is exactly the regression this pins.
+    assert_long_column_wired_end_to_end("net_volume", "Option<i64>");
+}
+
+#[test]
+fn total_buy_qty_column_wired_end_to_end() {
+    assert_long_column_wired_end_to_end("total_buy_qty", "i64");
+}
+
+#[test]
+fn total_sell_qty_column_wired_end_to_end() {
+    assert_long_column_wired_end_to_end("total_sell_qty", "i64");
+}
+
+#[test]
+fn net_volume_is_written_conditionally_so_absent_persists_as_null() {
+    // The behavioural half the presence checks above cannot see: the write
+    // must sit behind an `if let Some(...)`. An unconditional
+    // `.column_i64("net_volume", row.net_volume.unwrap_or(0))` would satisfy
+    // every other assertion in this file while silently turning "no previous
+    // bar" into "the price did not move" on every first bar of every session,
+    // for all 24 timeframes, forever.
+    let (path, raw) = storage_src("shadow_candle_writer.rs");
+    let code = code_only(&raw);
+    assert!(
+        code.contains("if let Some(net_volume) = row.net_volume"),
+        "{}: `net_volume` must be written only when present, so an absent \
+         baseline persists as NULL rather than as a fabricated flat bar. \
+         Restore the `if let Some(net_volume) = row.net_volume` guard.",
+        path.display()
+    );
+    assert!(
+        !code.contains("row.net_volume.unwrap_or(0)"),
+        "{}: never zero-fill `net_volume`. `0` means the price did not move; \
+         NULL means there was no previous bar. Collapsing them makes the \
+         day's first bar indistinguishable from a flat one.",
+        path.display()
+    );
+}

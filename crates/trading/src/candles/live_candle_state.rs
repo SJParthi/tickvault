@@ -52,10 +52,36 @@ pub struct LiveCandleState {
     /// `close - prev_day.close` / `prev_day.close` * 100.0. Stamped at
     /// seal time.
     pub close_pct_from_prev_day: f64,
-    /// `oi - prev_day.oi` / `prev_day.oi` * 100.0. Stamped at seal time.
-    pub oi_pct_from_prev_day: f64,
-    /// `volume / prev_day.volume * 100.0`. Stamped at seal time.
-    pub volume_pct_from_prev_day: f64,
+    /// Close of the PREVIOUS sealed bar of this timeframe, snapshotted when
+    /// THIS bucket opened. `0.0` means "no usable baseline" — first bar of
+    /// the session, or a previous bar from an earlier trading day.
+    ///
+    /// Snapshotted at bucket OPEN, deliberately, not read at seal time. The
+    /// late-tick amend path (`fold_late_hlc`) mutates `last_sealed[ord].close`
+    /// in place and re-emits ONLY the amended bar. Reading the previous close
+    /// at seal time would therefore let an amend to bar N retroactively change
+    /// the sign of bar N+1 — which was already written and is never re-emitted.
+    /// Snapshotting at open makes that impossible: N+1's baseline is frozen
+    /// before N can be amended.
+    ///
+    /// Occupies the 8 bytes vacated by `oi_pct_from_prev_day`, whose DDL column
+    /// was removed 2026-05-28 and which has been permanently `0.0` since (pinned
+    /// by `the_dropped_volume_and_oi_percentages_are_deliberately_not_stamped`).
+    pub bucket_open_prev_close: f64,
+    /// Vendor's total PENDING buy-order quantity in the book, last non-zero
+    /// value seen in this bucket. NOT executed volume — these are resting
+    /// orders. `0` is the vendor's absent sentinel (Ticker-mode packets carry
+    /// no book), so last-NON-ZERO wins, exactly as `oi` does: a lighter packet
+    /// must never erase a real reading.
+    pub total_buy_qty: u32,
+    /// Vendor's total PENDING sell-order quantity. Same contract as
+    /// [`Self::total_buy_qty`].
+    ///
+    /// This field and `total_buy_qty` together occupy the 8 bytes vacated by
+    /// `volume_pct_from_prev_day` (same 2026-05-28 removal). The struct is
+    /// therefore UNCHANGED at 128 bytes and every downstream size assertion
+    /// holds without being raised.
+    pub total_sell_qty: u32,
     /// Today's SESSION open (the official 09:15 open). Static per trading
     /// day; last non-zero value wins. Feeds `open_pct` at seal.
     pub session_open: f64,
@@ -88,8 +114,9 @@ impl LiveCandleState {
             close_ts_ist_secs: 0,
             prev_day_close: 0.0,
             close_pct_from_prev_day: 0.0,
-            oi_pct_from_prev_day: 0.0,
-            volume_pct_from_prev_day: 0.0,
+            bucket_open_prev_close: 0.0,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
             session_open: 0.0,
             open_pct: 0.0,
             open_gap_pct: 0.0,
@@ -172,6 +199,66 @@ impl LiveCandleState {
         self.close_pct_from_prev_day = pct_change(self.close, self.prev_day_close);
         self.open_pct = pct_change(self.close, self.session_open);
         self.open_gap_pct = pct_change(self.session_open, self.prev_day_close);
+    }
+
+    /// Signed volume, the quantity a broker chart plots as "Net Volume":
+    /// `+volume` when this bar closed above the previous bar, `-volume` when
+    /// below, `0` when unchanged.
+    ///
+    /// Returns `None` — persisted as SQL NULL — when the question cannot be
+    /// asked. That distinction is the whole reason this returns an `Option`:
+    /// `0` here means "the price did not move", and it must NOT also mean
+    /// "there was no previous bar". `close_pct_from_prev_day` above collapses
+    /// both onto `0.0` because its column has carried that sentinel since the
+    /// first row ever written; this column is new, so it can be honest.
+    ///
+    /// # The four refusals
+    ///
+    /// - **No baseline** (`bucket_open_prev_close == 0.0`) — the first bar of
+    ///   the session, or a previous bar from an earlier trading day. A chart
+    ///   has no bar to the left of its first bar either.
+    /// - **Untraded bar** (`close == 0.0`) — `0.0` is this pipeline's absent
+    ///   price sentinel, not a real price of zero.
+    /// - **Non-finite either side** — `NaN` fails BOTH `>` and `<` under
+    ///   partial ordering, so an unguarded comparison would silently land on
+    ///   the `else` arm and persist `0` (a real "flat" reading) for a poisoned
+    ///   input. Refused explicitly instead.
+    /// - **Volume beyond the signed ceiling** — negating a `u64` past
+    ///   `i64::MAX` wraps POSITIVE, turning a sell bar into a buy bar. The
+    ///   saturating conversion below makes that unrepresentable; the same
+    ///   hazard is already handled this way on the tick-persistence path.
+    ///
+    /// # Why the comparison is exact and not a tolerance
+    ///
+    /// Both sides come from `f32_to_f64_clean`, so an unchanged price is
+    /// bit-identical on both and compares equal. A widening `f32 as f64`
+    /// would make `10.20` become `10.19999980926514` and report an unchanged
+    /// price as a RISE — systematically, on every flat bar. That is why
+    /// [`Self::bucket_open_prev_close`] is `f64` and copied verbatim rather
+    /// than stored narrow and re-widened.
+    ///
+    /// # Complexity
+    /// O(1) — two compares and one negate on fields already in this struct.
+    /// Zero allocation. Runs once per SEAL, never once per tick.
+    #[inline]
+    #[must_use]
+    pub fn net_volume(&self) -> Option<i64> {
+        let prev = self.bucket_open_prev_close;
+        let close = self.close;
+        if prev <= 0.0 || close <= 0.0 || !prev.is_finite() || !close.is_finite() {
+            return None;
+        }
+        // Saturate BEFORE the sign is applied: `-(u64 as i64)` on a value past
+        // `i64::MAX` wraps to a positive number, which would persist a sell bar
+        // as a buy bar.
+        let magnitude = i64::try_from(self.volume).unwrap_or(i64::MAX);
+        if close > prev {
+            Some(magnitude)
+        } else if close < prev {
+            Some(-magnitude)
+        } else {
+            Some(0)
+        }
     }
 }
 
@@ -507,16 +594,101 @@ mod tests {
         );
     }
 
-    /// The dropped columns stay dropped: their DDL columns were removed in
-    /// 2026-05-28 (spot has no OI, indices have no volume), so computing them
-    /// would fill fields nothing reads.
+    /// The two dropped percentage fields (`oi_pct_from_prev_day`,
+    /// `volume_pct_from_prev_day`) are GONE, not merely unstamped.
+    ///
+    /// Their DDL columns were removed 2026-05-28 (spot has no OI, indices have
+    /// no volume) and the fields then sat in every bar holding a permanent
+    /// `0.0` — 16 bytes per state, multiplied by `TF_COUNT` slots and again by
+    /// `last_sealed`, in a struct pinned at exactly 128 bytes by three separate
+    /// compile-time assertions with zero slack between them.
+    ///
+    /// Reclaiming those 16 bytes is what pays for `bucket_open_prev_close`
+    /// (8) + `total_buy_qty` (4) + `total_sell_qty` (4). This test is the
+    /// replacement for the old "they are never stamped" pin: it asserts the
+    /// struct did not grow, which is the property the assertions downstream
+    /// actually depend on.
     #[test]
-    fn the_dropped_volume_and_oi_percentages_are_deliberately_not_stamped() {
+    fn reclaiming_the_dropped_percentages_kept_the_state_at_128_bytes() {
+        assert_eq!(
+            std::mem::size_of::<LiveCandleState>(),
+            128,
+            "LiveCandleState changed size — BufferedSeal (<=144), AggregatorCell \
+             (MAX_AGGREGATOR_CELL_BYTES) and SerializedSeal (SEAL_SPILL_RECORD_SIZE) \
+             all assume 128 and every one of them is at zero slack today."
+        );
+    }
+
+    /// The four refusals, each one a real hazard rather than defensive noise.
+    #[test]
+    fn net_volume_refuses_every_question_it_cannot_answer() {
         let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
         s.volume = 1_000;
-        s.oi = 500;
-        s.stamp_seal_percentages();
-        assert_eq!(s.volume_pct_from_prev_day, 0.0);
-        assert_eq!(s.oi_pct_from_prev_day, 0.0);
+
+        // No baseline: the first bar of a session has nothing to its left.
+        s.bucket_open_prev_close = 0.0;
+        assert_eq!(s.net_volume(), None);
+
+        // Untraded bar: 0.0 is the absent-price sentinel, not a price.
+        s.bucket_open_prev_close = 100.0;
+        s.close = 0.0;
+        assert_eq!(s.net_volume(), None);
+
+        // Non-finite: NaN fails BOTH `>` and `<`, so an unguarded compare
+        // would silently persist 0 — a real "flat" reading — for garbage.
+        s.close = f64::NAN;
+        assert_eq!(s.net_volume(), None);
+        s.close = 100.0;
+        s.bucket_open_prev_close = f64::INFINITY;
+        assert_eq!(s.net_volume(), None);
+    }
+
+    #[test]
+    fn net_volume_signs_by_direction_and_zero_means_flat() {
+        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
+        s.volume = 1_000;
+        s.bucket_open_prev_close = 100.0;
+
+        s.close = 101.0;
+        assert_eq!(s.net_volume(), Some(1_000), "a rise is positive volume");
+        s.close = 99.0;
+        assert_eq!(s.net_volume(), Some(-1_000), "a fall is negative volume");
+        s.close = 100.0;
+        assert_eq!(
+            s.net_volume(),
+            Some(0),
+            "an unchanged close is a real, reportable zero — distinct from None"
+        );
+    }
+
+    /// `-(u64 as i64)` past `i64::MAX` wraps POSITIVE, which would persist a
+    /// sell bar as a buy bar. The saturating conversion makes that
+    /// unrepresentable.
+    #[test]
+    fn net_volume_saturates_instead_of_wrapping_a_sell_bar_into_a_buy_bar() {
+        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
+        s.bucket_open_prev_close = 100.0;
+        s.close = 99.0; // a FALL — the sign must stay negative
+        s.volume = u64::MAX;
+        let nv = s.net_volume().expect("finite inputs");
+        assert!(nv < 0, "a fall must never persist as a positive net volume");
+        assert_eq!(nv, -i64::MAX);
+    }
+
+    /// The comparison must be exact, not a widened `f32`. `10.20_f32 as f64`
+    /// is `10.19999980926514`; comparing that against a decimal-clean `10.2`
+    /// reports an UNCHANGED price as a rise, on every flat bar, forever.
+    #[test]
+    fn an_unchanged_price_is_flat_and_not_a_fabricated_rise() {
+        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
+        s.volume = 500;
+        let clean = tickvault_common::price_precision::f32_to_f64_clean(10.20_f32);
+        s.bucket_open_prev_close = clean;
+        s.close = clean;
+        assert_eq!(
+            s.net_volume(),
+            Some(0),
+            "identical decimal-clean prices must compare equal"
+        );
     }
 }
