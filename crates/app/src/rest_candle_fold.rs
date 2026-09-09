@@ -617,8 +617,13 @@ pub fn sealed_bucket_to_seal(
         close_ts_ist_secs: b.last_bar_ist_secs.saturating_add(60),
         prev_day_close: 0.0,
         close_pct_from_prev_day: 0.0,
-        oi_pct_from_prev_day: 0.0,
-        volume_pct_from_prev_day: 0.0,
+        // REST bars carry no order book and no intra-session previous close:
+        // the fetcher hands us whole minutes, not a live tape. Zero is the
+        // documented "no baseline" sentinel, so `net_volume` persists NULL
+        // rather than a fabricated sign.
+        bucket_open_prev_close: 0.0,
+        total_buy_qty: 0,
+        total_sell_qty: 0,
         session_open: b.open,
         open_pct: 0.0,
         open_gap_pct: 0.0,

@@ -113,9 +113,11 @@ pub struct SealDlqRecord {
     #[serde(default)]
     pub close_pct_from_prev_day: f64,
     #[serde(default)]
-    pub oi_pct_from_prev_day: f64,
+    pub bucket_open_prev_close: f64,
     #[serde(default)]
-    pub volume_pct_from_prev_day: f64,
+    pub total_buy_qty: u32,
+    #[serde(default)]
+    pub total_sell_qty: u32,
     /// §31 Option 2 (2026-06-01): % vs the official 09:15 session open.
     #[serde(default)]
     pub open_pct: f64,
@@ -158,8 +160,9 @@ impl From<&SerializedSeal> for SealDlqRecord {
             low: s.low,
             close: s.close,
             close_pct_from_prev_day: s.close_pct_from_prev_day,
-            oi_pct_from_prev_day: s.oi_pct_from_prev_day,
-            volume_pct_from_prev_day: s.volume_pct_from_prev_day,
+            bucket_open_prev_close: s.bucket_open_prev_close,
+            total_buy_qty: s.total_buy_qty,
+            total_sell_qty: s.total_sell_qty,
             open_pct: s.open_pct,
             change_pct: s.change_pct,
             open_gap_pct: s.open_gap_pct,
@@ -190,8 +193,9 @@ impl From<&SealDlqRecord> for SerializedSeal {
             low: r.low,
             close: r.close,
             close_pct_from_prev_day: r.close_pct_from_prev_day,
-            oi_pct_from_prev_day: r.oi_pct_from_prev_day,
-            volume_pct_from_prev_day: r.volume_pct_from_prev_day,
+            bucket_open_prev_close: r.bucket_open_prev_close,
+            total_buy_qty: r.total_buy_qty,
+            total_sell_qty: r.total_sell_qty,
             open_pct: r.open_pct,
             change_pct: r.change_pct,
             open_gap_pct: r.open_gap_pct,
@@ -423,8 +427,9 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            oi_pct_from_prev_day: -0.2,
-            volume_pct_from_prev_day: 12.3,
+            bucket_open_prev_close: 24_200.10,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
             open_pct: 7.7,
             change_pct: 1.5,
             open_gap_pct: 0.8,
@@ -459,8 +464,9 @@ mod tests {
         assert_eq!(r.low, 0.0);
         assert_eq!(r.close, 0.0);
         assert_eq!(r.close_pct_from_prev_day, 0.0);
-        assert_eq!(r.oi_pct_from_prev_day, 0.0);
-        assert_eq!(r.volume_pct_from_prev_day, 0.0);
+        assert_eq!(r.bucket_open_prev_close, 0.0);
+        assert_eq!(r.total_buy_qty, 0);
+        assert_eq!(r.total_sell_qty, 0);
     }
 
     #[test]
@@ -492,8 +498,9 @@ mod tests {
             "low",
             "close",
             "close_pct_from_prev_day",
-            "oi_pct_from_prev_day",
-            "volume_pct_from_prev_day",
+            "bucket_open_prev_close",
+            "total_buy_qty",
+            "total_sell_qty",
             "open_pct",
             "change_pct",
             "open_gap_pct",
@@ -522,8 +529,9 @@ mod tests {
         assert_eq!(r.low, s.low);
         assert_eq!(r.close, s.close);
         assert_eq!(r.close_pct_from_prev_day, s.close_pct_from_prev_day);
-        assert_eq!(r.oi_pct_from_prev_day, s.oi_pct_from_prev_day);
-        assert_eq!(r.volume_pct_from_prev_day, s.volume_pct_from_prev_day);
+        assert_eq!(r.bucket_open_prev_close, s.bucket_open_prev_close);
+        assert_eq!(r.total_buy_qty, s.total_buy_qty);
+        assert_eq!(r.total_sell_qty, s.total_sell_qty);
     }
 
     #[test]
@@ -553,8 +561,9 @@ mod tests {
             low: 0.0,
             close: 0.0,
             close_pct_from_prev_day: -3.5,
-            oi_pct_from_prev_day: -10.0,
-            volume_pct_from_prev_day: -100.0,
+            bucket_open_prev_close: -10.0,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
             open_pct: -50.0,
             change_pct: -3.5,
             open_gap_pct: -1.2,

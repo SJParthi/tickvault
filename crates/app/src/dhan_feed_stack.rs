@@ -1513,15 +1513,44 @@ impl LiveIngest {
                 if writer.append_row(row).is_ok() {
                     appended = appended.saturating_add(1);
                 } else {
-                    // Counted, not swallowed. Until 2026-09-09 a per-row ILP
-                    // append error produced FEWER rows with nothing anywhere
-                    // reporting it -- the writer's own discard counter covers
-                    // the flush arms, never this one. A short snapshot then
-                    // reads exactly like a quiet minute.
+                    // Counted AND said out loud, not swallowed. Until
+                    // 2026-09-09 a per-row ILP append error produced FEWER
+                    // rows with nothing anywhere reporting it -- the writer's
+                    // own discard counter covers the flush arms, never this
+                    // one. A short snapshot then reads exactly like a quiet
+                    // minute.
+                    //
+                    // The surface is the LOG, not CloudWatch: the September
+                    // forecast sits above the budget's automatic
+                    // STOP_EC2_INSTANCES line, so a new EMF name needs an
+                    // operator lever rather than a cost note. The warn is free,
+                    // greppable, and invisible to every alarm -- the one
+                    // WS-GAP-03 filter requires $.level = "ERROR" AND
+                    // $.source = "fell_back_to_indices", and this is a WARN
+                    // with a different source.
+                    //
+                    // Throttled on powers of two because one bad sweep can
+                    // refuse up to 500 rows: the 1st, 2nd, 4th ... failure of
+                    // the session is logged, which reports the onset at once
+                    // and the MAGNITUDE without flooding the sink.
                     refused = refused.saturating_add(1);
                     self.top_volume_append_failures =
                         self.top_volume_append_failures.saturating_add(1);
                     self.top_volume_append_failure_counter.increment(1);
+                    // `counter` is a FIELD, not decoration: an operator who
+                    // greps the counter name lands on this line, and the
+                    // loss-counter visibility guard can only SEE that this
+                    // counter has a surface if the name appears beside a log.
+                    if self.top_volume_append_failures.is_power_of_two() {
+                        tracing::warn!(
+                            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                .code_str(),
+                            counter = TOP_VOLUME_APPEND_FAILURE_COUNTER,
+                            source = "top_volume_append_failed",
+                            failures = self.top_volume_append_failures,
+                            "top_volume_rank: the ILP buffer refused a snapshot row. That sweep's snapshot is SHORT -- ranks are missing from the table and it reads exactly like a quiet minute. Ranking and depth steering are unaffected (both run from RAM); only the queryable record is incomplete."
+                        );
+                    }
                 }
             }
         }
