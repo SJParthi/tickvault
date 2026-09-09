@@ -2682,3 +2682,92 @@ faces gives that without writing every row twice.
   every swap).
 - Drops ghost rows instead of writing them.
 - Raises the apply cadence under cover of this section.
+
+### 2026-09-09 — THE VOLUME RANKING BECOMES VISIBLE; and the 5-SECOND APPLY CADENCE IS ORDERED BUT NOT SHIPPED, with the reason
+
+**The verbatim operator demands (2026-09-09, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude just remove this one minute swap dude what happened to new volume ranking tables dude because we have now 5second swap right that too focusing only on options strikes top right"
+
+> "Morning will I see the precise volume ranking or not bro meanwhile Ar eyou sure about precise volume ranking vaze don its quantity percentage diff and in this also how will you always find ghe per engage change dude that's my main question because morning I need evryhhting need to be ready dude okay"
+
+#### Part 1 — the answer to the ranking question was NO, and three defects said so
+
+The honest answer to *"will I see the precise volume ranking"* on the build that
+was live this morning is **no, the table would have been EMPTY**, and the reason
+was not one bug but three, each verified in source before it was touched:
+
+| # | Defect | Evidence | Consequence at 09:15 |
+|---|---|---|---|
+| 1 | The snapshot asked the previous-close store for the **CONTRACT's** own close on `NSE_FNO`. The store's ONE production write door, `record_prev_close_from_tick`, returns early unless the segment is `NseEquity` — so the probe returned `None` on every row → `NaN` → refused as `NonFiniteGain` | `dhan_feed_stack.rs` (the `project_snapshot` closure) vs `:2656`; `record_prev_close` has zero production callers | **Every row of every snapshot dropped. The table empty all session while every counter read healthy.** |
+| 2 | `window_lots_milli` — **the actual sort key since the 2026-09-07 lock** — was on `RankedContract` and was NOT a column of `TopVolumeRankRow`. Only cumulative `volume` was stored | `top_volume_rank_persistence.rs` column list | Rank 1 could hold less volume than rank 40 with nothing in the row to explain the order |
+| 3 | `console_views::ensure_named_views` runs inside `run_candle_ddl_at_boot`, which `main.rs` calls BEFORE `run_live_table_ddl_at_boot` creates `top_volume_rank`. The view DDL warn-fails and is never retried in-boot | `main.rs:3745` vs `:3792`; `console_views.rs:288-296` | On a fresh volume `top_volume_rank_1s` / `_5s` **do not exist for the whole session** — the operator's own words for this table were *"only using db i can see this"* |
+
+**Fixed, in this order.** (1) `gain_pct` is now the **UNDERLYING's** percent
+change, computed by `underlying_gain_pct` from the **same two RAM inputs** that
+`underlying_gainer_verdict` turns into the gainer boolean — so the column and the
+filter cannot disagree, and the closure is keyed on `underlying_id` so the wrong
+lookup is unrepresentable rather than merely corrected. This is also what
+`eligible_gain_pct` was written for: its own `MAX_PLAUSIBLE_GAIN_PCT` doc states a
+deep-out-of-the-money option "can move that far" and is "not what this function is
+fed", so the old call site was wrong twice. (2) `window_lots_milli LONG` joins the
+table through the house `CREATE → ADD COLUMN IF NOT EXISTS → DEDUP ENABLE`
+self-heal, so the order is checkable from the row rather than taken on trust.
+(3) The named views are **re-ensured** after the rank table exists — additive
+rather than a re-order, because the candle ordering above it is load-bearing and
+every view statement is `CREATE OR REPLACE`.
+
+**So the answer to "how will you always find the percentage change":** it is the
+underlying stock's move — spot against its previous close, both from RAM, both
+the gainer filter's own inputs. It is NOT the option contract's own move: nothing
+in this system has ever stored a previous close for an `NSE_FNO` contract, and
+inventing one would be a fabricated number in the column that decides eligibility.
+
+#### Part 2 — the 5-second apply cadence is NOT shipped, and this is the evidence
+
+The operator ordered the one-minute swap removed in favour of the 5-second swap.
+**It is not shipped today**, and the reason is a specific, checkable fact rather
+than caution:
+
+| Fact | Evidence |
+|---|---|
+| Dhan error 804 is classified `DisconnectClass::Fatal` | `pool_supervisor.rs:521-543` |
+| Fatal ⇒ `park(ParkReason::FatalDisconnect)`, and `allows_one_respawn()` returns **`false`** for it | `pool_supervisor.rs:1247-1256`, `:866-871` |
+| `take_ghost_redial` is consulted **only** while `action == SupervisorAction::Continue`. A parked socket has LEFT that loop | `pool_supervisor.rs:4634-4638` |
+| **Therefore the ghost-redial detector shipped 2026-09-08 (THIRD) structurally CANNOT recover an 804-parked socket.** Parking bypasses the redial ladder | derived from the three rows above |
+| depth-200 socket capacity is **1**. If the unsubscribe RequestCode (24 vs 25, still UNVERIFIED-LIVE) is wrong, swap #1 asks Dhan for 2 > 1 ⇒ 804 on the **first swap, at any cadence** | `pool_supervisor.rs:2058`, `:2136-2146` |
+
+The 2026-09-08 (THIRD) section claimed the ghost redial "makes a wrong code
+SELF-HEALING rather than fatal, which is what makes the raise safe to do next."
+**That claim is WITHDRAWN.** It is true for a socket that keeps *delivering* a
+ghost, and false for one that has been *parked* — and 804 parks. The cadence raise
+would therefore be session-ending, not self-healing, and 5 s gives twelve times the
+chances per hour to reach it.
+
+Three further blockers stack behind that one, each independently sufficient:
+per-socket swap caps are enforced per CALL and hold no cross-call state
+(`depth20_ranked_steer.rs:77,87,116`), so 5 s yields 240 swaps/socket/minute
+against a documented budget of 4; `send_swap` sets `socket.pending` with no
+`pending.is_some()` guard, so a second dispatch corrupts the revert target
+(`depth_rebalance.rs:987-990`); the per-iteration `load_depth_candidates` +
+`fetch_movers` are two QuestDB queries whose RAM-empty budget is **10 s**, longer
+than a 5 s tick (`dhan_contract_universe.rs:1423-1428`); and
+`depth_steering_stalled`'s 180 s threshold, written against a 60 s loop, becomes 36
+missed iterations (`live-lane-alarms.tf:829`).
+
+**The ordering the 2026-09-06 FOURTH-quote section already binds stands: probe the
+unsubscribe code on a live session FIRST, then raise the cadence.** The instrument
+for that probe now exists and is live — `tv_dhan_feed_depth_total{outcome="ghost"}`
+against `{outcome="unsubscribed_grace"}`. A session that ends with `ghost = 0` and
+`unsubscribed_grace > 0` is the evidence that code 25 works, and the cadence raise
+becomes a small change the following day.
+
+**What a PR that violates this section looks like (REJECT):** raises the apply
+cadence before that probe reads clean; ships the raise without converting the
+per-call swap caps to rolling per-minute budgets, guarding `send_swap` on
+`pending`, moving the two QuestDB queries off the per-iteration path, and lowering
+the stall threshold in the same change; computes `gain_pct` from the CONTRACT's
+previous close (nothing writes one); or drops `window_lots_milli` from the row on
+the grounds that `volume` is already there — `volume` has not been the sort key
+since 2026-09-07.

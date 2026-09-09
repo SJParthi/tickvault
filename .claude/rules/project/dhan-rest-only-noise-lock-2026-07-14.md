@@ -3579,3 +3579,16 @@ from an existing family, never a new page.
 | `GAP-SEC-01` `error!` (empty bearer token, paper mode) | coded log, once at boot | LIVE mode now REFUSES to boot on an empty API bearer token (the feed toggle sits on a publicly funnelled port); paper mode keeps the documented dev passthrough and says so once. Not a page: it is a boot-time configuration fact, and the operator is the one who seeded the value. |
 | `LAMBDA-NOTIFY-01` total-delivery failure | Lambda invocation ERROR | `telegram_webhook::handle` now returns `Err` when NOT ONE message of a batch reached Telegram. This is not a new alarm: the function's EXISTING `Errors` alarm fires, and its email fan-out is the leg that survives a dead bot token. A partial failure stays `Ok` (SNS would redeliver and re-page the ones that landed). |
 | `holiday-gate.sh` self-stop page | one SNS publish to the existing `tv-<env>-alerts` topic | Not a new alarm or family: the same topic and Lambda the autopilot uses, one plain-English line when the box switches itself off for an NSE holiday, so a wrong holiday verdict on a trading day is noticed at 08:31 IST instead of at the 09:20 alarm gate. |
+
+**Fourth addendum (2026-09-09) — one new counter, log-sink/local only, no page.**
+`tv_top_volume_rank_append_failed_total` (`dhan_feed_stack.rs`) counts snapshot
+rows the ILP buffer REFUSED at append time. Until 2026-09-09 that arm was
+`if writer.append_row(row).is_ok()` with no else — a per-row append error
+produced fewer rows with nothing anywhere reporting it, so a short snapshot read
+exactly like a quiet minute (the writer's own discard counter covers the FLUSH
+arms, never this one). Local `/metrics` only: **no EMF name and no alarm**, per
+the September budget position (forecast $142.24 against the $135.00 automatic
+`STOP_EC2_INSTANCES` line — a new EMF name is ~$0.30/mo and §2.3n's standing rule
+requires a LEVER, not a cost note). Zero on a healthy session, so any non-zero
+reading is the whole signal; it is the number an operator reads AFTER an existing
+family-(5) page, never a new page.

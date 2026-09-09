@@ -886,6 +886,14 @@ pub const INGEST_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_refused_total";
 /// cannot distinguish from an ordinary down day. Local `/metrics` only.
 pub const PREV_CLOSE_DISAGREEMENT_COUNTER: &str = "tv_prev_close_store_tick_disagreement_total";
 
+/// Snapshot rows the ILP buffer REFUSED at append time.
+///
+/// Local `/metrics` only, like its neighbour: no EMF name and no alarm, per
+/// the September budget position (forecast $142.24 against the $135.00
+/// automatic-stop line). Zero on a healthy session, so any non-zero reading is
+/// the whole signal.
+pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_failed_total";
+
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
 /// # Why this function exists at all — the two-atomic hazard
@@ -1140,6 +1148,10 @@ pub struct LiveIngest {
     /// Pre-resolved handle for [`PREV_CLOSE_DISAGREEMENT_COUNTER`], so the
     /// per-tick path pays one atomic add and never a registry lookup.
     prev_close_disagreement_counter: metrics::Counter,
+    /// Snapshot rows the ILP buffer refused at append time this session.
+    top_volume_append_failures: u64,
+    /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
+    top_volume_append_failure_counter: metrics::Counter,
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1421,7 +1433,6 @@ impl LiveIngest {
                 continue;
             }
 
-            let aggregator = &self.aggregator;
             let prev_close = &self.prev_close;
             let view = crate::depth_subscription_view::global_depth_subscription_view();
             let projection = crate::top_volume_snapshot::project_snapshot(
@@ -1429,16 +1440,25 @@ impl LiveIngest {
                 cadence,
                 family,
                 &ranked,
-                |security_id, segment| {
-                    // Both halves must be real. A missing LTP or a missing
-                    // previous close yields a non-finite, which the projection
-                    // REFUSES and counts -- never a fabricated zero percent,
-                    // which would read as "this contract did not move".
-                    let ltp = aggregator
-                        .last_ltp(Feed::Dhan, security_id, segment.binary_code())
-                        .unwrap_or(f64::NAN);
-                    let close = prev_close.get(security_id, segment).unwrap_or(f64::NAN);
-                    crate::volume_leaderboard::eligible_gain_pct(ltp, close).unwrap_or(f64::NAN)
+                |underlying_id| {
+                    // The UNDERLYING's move, from the SAME two RAM stores the
+                    // gainer verdict reads a few lines above -- so the column
+                    // and the filter can never disagree about whether this
+                    // contract's stock was up.
+                    //
+                    // Until 2026-09-09 this probed the CONTRACT's own previous
+                    // close. Nothing has ever written one (the store's single
+                    // production door, `record_prev_close_from_tick`, keeps
+                    // only the underlying segment), so every row returned
+                    // `None` -> NaN -> refused as `NonFiniteGain`. The table
+                    // was EMPTY every session and the refusal counter was the
+                    // only place it showed.
+                    let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+                    crate::volume_leaderboard::underlying_gain_pct(
+                        spot_prices.latest_paise(underlying_id, segment),
+                        prev_close.get(underlying_id, segment),
+                    )
+                    .unwrap_or(f64::NAN)
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
             );
@@ -1450,6 +1470,16 @@ impl LiveIngest {
             for row in &projection.rows {
                 if writer.append_row(row).is_ok() {
                     appended = appended.saturating_add(1);
+                } else {
+                    // Counted, not swallowed. Until 2026-09-09 a per-row ILP
+                    // append error produced FEWER rows with nothing anywhere
+                    // reporting it -- the writer's own discard counter covers
+                    // the flush arms, never this one. A short snapshot then
+                    // reads exactly like a quiet minute.
+                    refused = refused.saturating_add(1);
+                    self.top_volume_append_failures =
+                        self.top_volume_append_failures.saturating_add(1);
+                    self.top_volume_append_failure_counter.increment(1);
                 }
             }
         }
@@ -1593,6 +1623,12 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
+            top_volume_append_failures: 0,
+            top_volume_append_failure_counter: {
+                let c = metrics::counter!(TOP_VOLUME_APPEND_FAILURE_COUNTER);
+                c.increment(0);
+                c
+            },
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             replaying_wal: false,
@@ -1605,6 +1641,13 @@ impl LiveIngest {
     #[must_use]
     pub const fn prev_close_disagreements(&self) -> u64 {
         self.prev_close_disagreements
+    }
+
+    /// Snapshot rows the ILP buffer refused at append time this session.
+    /// Zero on a healthy session.
+    #[must_use]
+    pub const fn top_volume_append_failures(&self) -> u64 {
+        self.top_volume_append_failures
     }
 
     /// The previous-close store, for the gainer-eligibility filter.
@@ -16370,6 +16413,17 @@ mod tests {
             "the pre-open tick must be buffered for the writer — this row IS the fix; \
              without it the pre-open window is captured nowhere"
         );
+    }
+
+    #[test]
+    fn top_volume_append_failures_start_at_zero_and_are_readable_without_a_recorder() {
+        // The accessor exists so a per-row ILP append refusal is COUNTED
+        // rather than swallowed by the old `if append_row(..).is_ok()`, which
+        // made a short snapshot read exactly like a quiet minute. Zero on a
+        // fresh ingest, and readable with no metrics recorder installed —
+        // the counter handle is resolved at construction.
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(ingest.top_volume_append_failures(), 0);
     }
 
     #[test]

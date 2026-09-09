@@ -3640,8 +3640,23 @@ fn every_lambda_declares_the_rust_runtime() {
     // `runtime = "nodejs20.x"` and watching all 27 tests stay green.
     // Same shape as every one of the nine holes before it: the hole was
     // in WHAT THE SCANNER LOOKED AT, never in its list of banned words.
-    let mut entries: Vec<String> = git_ls_files_including_untracked(&["deploy/aws/**/*.tf"]);
+    // SCOPE FIX #20 (hole ELEVEN, 2026-09-09): repo-wide, not `deploy/aws/`.
+    //
+    // Hole ten made this scan RECURSIVE (`read_dir` -> a glob) and nobody
+    // re-asked the PREFIX. A `.tf` anywhere else — `infra/lambda.tf`,
+    // `modules/report/main.tf` — was invisible to the ONLY check that can see
+    // a managed runtime, and the anti-vacuity floor below still passed on the
+    // thirteen under `deploy/aws`, so a fourteenth elsewhere never tripped it.
+    // That is the identical "what does the scanner LOOK AT" failure, one level
+    // out, INSIDE the fix for the previous hole — which is the eleventh time
+    // this file has recorded that shape.
+    //
+    // `.tf.json` (terraform's HCL-JSON form) is enumerated too: `*.tf` does not
+    // match it, and while `.json` IS token-scanned, the token scanner is
+    // provably blind to `nodejs20.x` for the word-boundary reason above.
+    let mut entries: Vec<String> = git_ls_files_including_untracked(&["**/*.tf", "**/*.tf.json"]);
     entries.sort();
+    entries.dedup();
 
     for path in entries {
         let rel = path;
@@ -3683,6 +3698,10 @@ fn every_lambda_declares_the_rust_runtime() {
         }
     }
 
+    // Anti-vacuity. The floor is the thirteen production Lambdas that exist
+    // today; it is a FLOOR and not an equality, so a new Lambda anywhere in
+    // the tree raises the count rather than failing here — and the per-resource
+    // check above is what judges its runtime.
     assert!(
         resources >= 13,
         "expected at least the 13 known aws_lambda_function resources, found {resources} — \

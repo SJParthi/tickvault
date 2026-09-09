@@ -178,6 +178,20 @@ pub struct TopVolumeRankRow {
     pub underlying_id: i64,
     /// Cumulative day volume as observed, AFTER the monotonicity gate.
     pub volume: i64,
+    /// **The RANK KEY**: lots traded in the window that just closed, x 1000.
+    ///
+    /// Added 2026-09-09. Until then the table stored only `volume`, the
+    /// CUMULATIVE day count -- which has not been the sort key since
+    /// 2026-09-07, when the scope lock moved ranking to lots-in-window. So a
+    /// reader could see rank 1 hold less cumulative volume than rank 40 and
+    /// have nothing in the row to explain it. This column IS the number the
+    /// order was computed from, so the ordering is checkable from the table
+    /// alone rather than taken on trust.
+    ///
+    /// Milli-lots, so 1_000 is one lot. `u64` at the source; a value that
+    /// cannot fit `i64` is refused by the projection rather than wrapped
+    /// negative.
+    pub window_lots_milli: i64,
     /// Percentage change from the previous close. Already proven finite by
     /// the ranking layer's `eligible_gain_pct` refusal.
     pub gain_pct: f64,
@@ -206,6 +220,7 @@ pub fn top_volume_rank_create_ddl() -> String {
             security_id   LONG, \
             underlying_id LONG, \
             volume        LONG, \
+            window_lots_milli LONG, \
             gain_pct      DOUBLE, \
             subscribed    BOOLEAN\
         ) timestamp(ts) PARTITION BY HOUR \
@@ -224,6 +239,7 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("security_id", "LONG"),
     ("underlying_id", "LONG"),
     ("volume", "LONG"),
+    ("window_lots_milli", "LONG"),
     ("gain_pct", "DOUBLE"),
     ("subscribed", "BOOLEAN"),
 ];
@@ -456,6 +472,8 @@ impl TopVolumeRankWriter {
             .context("underlying_id")?
             .column_i64("volume", r.volume)
             .context("volume")?
+            .column_i64("window_lots_milli", r.window_lots_milli)
+            .context("window_lots_milli")?
             .column_f64("gain_pct", r.gain_pct)
             .context("gain_pct")?
             .column_bool("subscribed", r.subscribed)
@@ -879,6 +897,7 @@ mod tests {
             security_id: 44_321,
             underlying_id: 2885,
             volume: 117_567_970,
+            window_lots_milli: 42_500,
             gain_pct: 4.25,
             subscribed: true,
         }
@@ -1019,6 +1038,7 @@ mod tests {
             "segment=NSE_FNO",
             "rank=1i",
             "security_id=44321i",
+            "window_lots_milli=42500i",
             "underlying_id=2885i",
             "volume=117567970i",
             "subscribed=t",
