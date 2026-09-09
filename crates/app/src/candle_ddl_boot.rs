@@ -44,6 +44,17 @@ use tracing::{error, info, warn};
 /// Quiet-probe attempts before giving up on QuestDB readiness (× backoff
 /// = 60s worst case — the ts-pin migration precedent).
 pub const CANDLE_DDL_READINESS_ATTEMPTS: u32 = 12;
+
+/// Attempts at the candle-table ensure before the boot gives up.
+///
+/// Six attempts five seconds apart is thirty seconds — deliberately the SAME
+/// bound as [`LIVE_TABLE_DDL_ATTEMPTS`], because it answers the same question
+/// about the same database. Not unbounded: a QuestDB that will not accept a
+/// `CREATE TABLE` in half a minute is the boot-probe escalation codes' problem,
+/// and holding the boot behind it would turn a schema gap into a dark session.
+pub const CANDLE_ENSURE_ATTEMPTS: u32 = 6;
+/// Seconds between candle-ensure attempts.
+pub const CANDLE_ENSURE_BACKOFF_SECS: u64 = 5;
 /// Seconds between readiness probe attempts.
 pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 
@@ -115,9 +126,63 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     // BEFORE the CREATE TABLE loop, and the named views validate their
     // column references against the ensured tables.
     tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
-    tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await;
+
+    // RETRY the candle ensure, 2026-09-09.
+    //
+    // Until today this awaited the ensure ONCE and discarded the verdict —
+    // the same shape `run_live_table_ddl_at_boot` was given a six-attempt loop
+    // for on 2026-09-08, and this path is the one where a refusal costs most.
+    // `drop_legacy_candle_objects` runs immediately above and DROPS
+    // `candles_1s` on any boot whose sweep version moved, so between that drop
+    // and a refused CREATE the table simply does not exist: the seal writer's
+    // first ILP row auto-creates it with NO dedup key, and every replayed or
+    // re-flushed bar duplicates into it for the life of the table, silently.
+    //
+    // The readiness probe above cannot prevent this — it answers `SELECT 1`,
+    // which a QuestDB still replaying its own WAL answers happily and then
+    // refuses the DDL.
+    //
+    // Re-running an accepted table is free: every statement is `IF NOT EXISTS`
+    // or an idempotent `DEDUP ENABLE`.
+    let mut keyed = false;
+    for attempt in 1..=CANDLE_ENSURE_ATTEMPTS {
+        if tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await {
+            keyed = true;
+            if attempt > 1 {
+                info!(attempt, "candle DDL boot: candle tables keyed on retry");
+            }
+            break;
+        }
+        if attempt < CANDLE_ENSURE_ATTEMPTS {
+            warn!(
+                attempt,
+                next_in_secs = CANDLE_ENSURE_BACKOFF_SECS,
+                "candle DDL boot: a candle table's DEDUP-bearing statement was \
+                 refused — retrying rather than running the session on whatever \
+                 the first ILP row auto-creates"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(CANDLE_ENSURE_BACKOFF_SECS)).await;
+        }
+    }
+    if !keyed {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            attempts = CANDLE_ENSURE_ATTEMPTS,
+            "candle DDL boot: candle tables NOT confirmed keyed after every \
+             attempt. Consequence: any candle table that does not exist will be \
+             auto-created by the first ILP row WITHOUT its DEDUP UPSERT KEYS, \
+             and every replayed bar then duplicates into it instead of \
+             collapsing — silently, for the life of that table. The next boot \
+             re-runs this ensure; a table already created key-less is NOT \
+             repaired by it."
+        );
+    }
+
     tickvault_storage::console_views::ensure_named_views(questdb).await;
-    info!("candle DDL boot complete — retired-object sweep + candle ensure + named views done");
+    info!(
+        keyed,
+        "candle DDL boot complete — retired-object sweep + candle ensure attempted + named views"
+    );
 }
 
 /// Attempts at the `ticks` + `market_depth` DDL before the boot gives up.
@@ -244,6 +309,61 @@ mod tests {
             30
         );
         assert!(LIVE_TABLE_DDL_ATTEMPTS >= 2, "one attempt is not a retry");
+    }
+
+    /// The candle ensure gets the SAME retry bound as the live-table ensure,
+    /// because it answers the same question about the same database — and
+    /// because the boot DROPS `candles_1s` immediately before it, so a single
+    /// refused attempt leaves the seal writer to auto-create that table with
+    /// no dedup key for the life of the table.
+    ///
+    /// Asserted as an EQUALITY against its sibling rather than as its own
+    /// literal: two bounds for one database is two things to keep true, and a
+    /// literal here would let them drift apart silently.
+    #[test]
+    fn candle_ensure_retry_bound_matches_the_live_table_one() {
+        assert_eq!(CANDLE_ENSURE_ATTEMPTS, LIVE_TABLE_DDL_ATTEMPTS);
+        assert_eq!(CANDLE_ENSURE_BACKOFF_SECS, LIVE_TABLE_DDL_BACKOFF_SECS);
+        assert!(CANDLE_ENSURE_ATTEMPTS >= 2, "one attempt is not a retry");
+    }
+
+    /// The candle boot must RETRY the ensure and must not treat a refusal as
+    /// success.
+    ///
+    /// A source pin rather than a behavioural one, because the ensure needs a
+    /// live QuestDB. It asserts the three things that make the retry real: the
+    /// loop exists over the bound, the verdict is consulted, and the exhausted
+    /// path is a coded `error!` rather than a silent continue.
+    #[test]
+    fn the_candle_boot_retries_the_ensure_and_reports_exhaustion() {
+        let src = include_str!("candle_ddl_boot.rs");
+        let body = src
+            .split("pub async fn run_candle_ddl_at_boot")
+            .nth(1)
+            .expect("the candle boot fn must exist");
+        let body = body
+            .split("\n/// Attempts at the `ticks`")
+            .next()
+            .expect("the candle boot fn must end before the live-table section");
+        assert!(
+            body.contains("for attempt in 1..=CANDLE_ENSURE_ATTEMPTS"),
+            "the ensure must be retried over the bound, not awaited once"
+        );
+        assert!(
+            body.contains("ensure_shadow_candle_tables(questdb).await {"),
+            "the ensure's verdict must be CONSULTED — awaiting and discarding \
+             it is what let a refused CREATE run the whole session"
+        );
+        assert!(
+            body.contains("if !keyed {"),
+            "exhaustion must have its own arm"
+        );
+        assert!(
+            body.contains("HotPath02WriterQueueDrop"),
+            "exhaustion must be CODED, so a metric filter can read it — the \
+             same code the live-table exhaustion arm uses for the same \
+             consequence"
+        );
     }
 
     /// Against a port nothing listens on, every attempt fails, the loop
