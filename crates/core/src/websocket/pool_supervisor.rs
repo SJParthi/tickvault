@@ -2365,11 +2365,29 @@ impl SwapOutcome {
     /// already holds `new`). The guard is UNCHANGED, so the caller's belief
     /// must fall back to what it was before the command.
     pub const REASON_REFUSED: &'static str = "refused";
-    /// The unsubscribe ANSWERED with an error and the subscribe was never
-    /// sent. The socket still carries `old`, and no redial is scheduled —
-    /// but the guard already names `new` (see [`SubscribeGuard::try_swap`]:
-    /// the guard is replaced in place BEFORE the wire moves).
+    /// The unsubscribe ANSWERED with an error, the subscribe was never sent,
+    /// and the guard was NOT reverted (`undo_swap` declined: `new == old`, or
+    /// `old` was already held, or `new` was not in the set). The socket still
+    /// carries `old` and the guard still names `new`, so the caller must keep
+    /// believing `new` — a redial replays it.
+    ///
+    /// ⚠ CORRECTED 2026-09-09. This doc used to say the guard "already names
+    /// `new`" for BOTH wire failures, which stopped being true when the
+    /// refused-unsubscribe arm gained its `undo_swap` revert: on that arm the
+    /// guard names `old` again. The reason is now split so the ack carries the
+    /// revert as a FACT rather than an assumption — see
+    /// [`Self::REASON_WIRE_FAILED_REVERTED`].
     pub const REASON_WIRE_FAILED: &'static str = "wire_failed";
+    /// The unsubscribe ANSWERED with an error, the subscribe was never sent,
+    /// and the guard WAS reverted to `old`.
+    ///
+    /// The socket still carries `old` and so does the guard, so the caller must
+    /// unmark — otherwise the caller believes `new`, the guard believes `old`,
+    /// and every later minute plans `new -> newer`, which `try_swap` refuses as
+    /// `NotSubscribed` forever. That is exactly the "socket that never moves
+    /// again" [`Self::caller_should_unmark`] exists to prevent, and before this
+    /// reason existed it was the outcome on this arm.
+    pub const REASON_WIRE_FAILED_REVERTED: &'static str = "wire_failed_reverted";
     /// The unsubscribe landed (or timed out) and the subscribe then failed,
     /// so the socket may carry NOTHING. A redial is scheduled here, and the
     /// reconnect replay delivers `new` because the guard names it.
@@ -2377,18 +2395,33 @@ impl SwapOutcome {
 
     /// Whether the caller must revert its believed-held set to `old`.
     ///
-    /// Only for [`Self::REASON_REFUSED`]: that is the one outcome that left
-    /// the guard untouched. For the two wire failures the guard ALREADY names
-    /// `new` — a redial replays it, and the next swap is validated against
-    /// it — so a caller that reverted to `old` there would plan a swap the
-    /// guard refuses every minute for the rest of the session, which is the
-    /// exact "socket that never moves again" this ack exists to prevent.
+    /// True for exactly the two outcomes where the GUARD ends up naming `old`:
+    /// [`Self::REASON_REFUSED`] (the guard was never touched) and
+    /// [`Self::REASON_WIRE_FAILED_REVERTED`] (the guard was put back).
+    ///
+    /// False everywhere else, because there the guard names `new` — a redial
+    /// replays it and the next swap is validated against it, so a caller that
+    /// reverted to `old` would plan a swap the guard refuses every minute for
+    /// the rest of the session: the "socket that never moves again" this ack
+    /// exists to prevent.
+    ///
+    /// ⚠ CORRECTED 2026-09-09. This returned `true` only for `REASON_REFUSED`,
+    /// under a doc asserting that "for the two wire failures the guard ALREADY
+    /// names `new`". That was written before the refused-unsubscribe arm gained
+    /// its `undo_swap` revert, and neither the doc nor this method followed —
+    /// so on that arm the guard named `old`, the caller kept naming `new`, and
+    /// the socket froze in precisely the way the old doc claimed to avoid. The
+    /// fix is NOT a boolean flip on `REASON_WIRE_FAILED`: `undo_swap` can
+    /// decline, and flipping would then create the mirror divergence. The
+    /// emitter reports whether the revert actually happened, and this reads it.
     #[must_use]
     // TEST-EXEMPT: pinned by a_refused_swap_acks_not_held_refused_and_asks_the_caller_to_unmark and a_swap_whose_subscribe_fails_on_the_wire_acks_not_held_emptied
     pub fn caller_should_unmark(&self) -> bool {
         match self {
             Self::Held => false,
-            Self::NotHeld { reason } => *reason == Self::REASON_REFUSED,
+            Self::NotHeld { reason } => {
+                *reason == Self::REASON_REFUSED || *reason == Self::REASON_WIRE_FAILED_REVERTED
+            }
         }
     }
 }
@@ -4129,6 +4162,15 @@ where
                             // swap exists to keep useful.
                             let mut wire_failed = false;
                             let mut wire_timed_out = false;
+                            // Whether `undo_swap` ACTUALLY put `old` back. The
+                            // ack's `caller_should_unmark` is derived from this
+                            // fact rather than from the reason alone: a bare
+                            // "wire_failed means unmark" would be wrong on the
+                            // arms where `undo_swap` declines (new == old, old
+                            // already held, new not found), leaving the guard
+                            // naming `new` while the caller reverted to `old` —
+                            // the same divergence, inverted.
+                            let mut guard_reverted = false;
                             // Tracked separately from `wire_failed` because the two
                             // halves leave the socket in OPPOSITE states. A failed
                             // unsubscribe means the socket still holds its OLD
@@ -4157,6 +4199,7 @@ where
                                         // naming NEW is what makes that redial land
                                         // the chosen strike.
                                         if guard.undo_swap(new, old) {
+                                            guard_reverted = true;
                                             metrics::counter!(SWAP_GUARD_REVERTED_METRIC)
                                                 .increment(1);
                                             warn!(
@@ -4407,7 +4450,11 @@ where
                                 answer_swap(
                                     ack,
                                     SwapOutcome::NotHeld {
-                                        reason: SwapOutcome::REASON_WIRE_FAILED,
+                                        reason: if guard_reverted {
+                                            SwapOutcome::REASON_WIRE_FAILED_REVERTED
+                                        } else {
+                                            SwapOutcome::REASON_WIRE_FAILED
+                                        },
                                     },
                                 );
                             } else {
@@ -8199,6 +8246,91 @@ mod tests {
             !outcome.caller_should_unmark(),
             "the guard names the new instrument and the redial replays it — reverting the \
              caller's belief would plan a refused swap every minute"
+        );
+    }
+
+    /// The unsubscribe is REFUSED by the wire: the socket keeps delivering
+    /// `old`, the guard is reverted to `old`, and the caller must therefore
+    /// unmark — or it keeps believing `new` while the guard believes `old`, and
+    /// every later minute plans a swap `try_swap` refuses as `NotSubscribed`.
+    ///
+    /// This is the ack that was WRONG until 2026-09-09: it returned
+    /// `REASON_WIRE_FAILED`, whose `caller_should_unmark()` was `false`, under
+    /// a doc claiming the guard still named `new`. It had not since the revert
+    /// was added.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_whose_unsubscribe_is_refused_reverts_the_guard_and_asks_the_caller_to_unmark() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            // The initial dispatch succeeds; the swap's UNSUBSCRIBE is refused,
+            // so the subscribe is never sent.
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let outcome = ack_rx.try_recv().expect("the swap arm must answer");
+        assert_eq!(
+            outcome,
+            SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_WIRE_FAILED_REVERTED
+            },
+            "a refused unsubscribe that reverted the guard must say so, so the ack \
+             can be derived from the revert rather than guessed from the reason"
+        );
+        assert!(
+            outcome.caller_should_unmark(),
+            "the guard was put back to `old` and the socket still delivers `old`; a \
+             caller left believing `new` plans a swap the guard refuses every minute \
+             for the rest of the session"
+        );
+    }
+
+    /// The two wire failures must stay DISTINGUISHABLE. A timed-out unsubscribe
+    /// may still have landed, so the guard is deliberately NOT reverted there
+    /// and the caller must keep believing `new` — the mirror of the test above,
+    /// and the reason the fix is not a boolean flip on `REASON_WIRE_FAILED`.
+    #[test]
+    fn only_the_reverted_wire_failure_asks_the_caller_to_unmark() {
+        for (reason, expected) in [
+            (SwapOutcome::REASON_REFUSED, true),
+            (SwapOutcome::REASON_WIRE_FAILED_REVERTED, true),
+            (SwapOutcome::REASON_WIRE_FAILED, false),
+            (SwapOutcome::REASON_EMPTIED, false),
+        ] {
+            assert_eq!(
+                SwapOutcome::NotHeld { reason }.caller_should_unmark(),
+                expected,
+                "`{reason}` must {} the caller to unmark: unmark exactly when the \
+                 GUARD ends up naming `old`",
+                if expected { "ask" } else { "not ask" }
+            );
+        }
+        assert!(
+            !SwapOutcome::Held.caller_should_unmark(),
+            "a held swap moved the guard to `new` and the caller already believes it"
         );
     }
 

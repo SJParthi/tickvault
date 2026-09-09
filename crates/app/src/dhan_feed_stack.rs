@@ -1281,6 +1281,19 @@ impl LiveIngest {
         if !crate::top_volume_snapshot::within_capture_window(
             crate::top_volume_snapshot::secs_of_day_ist(now_ist_nanos),
         ) {
+            // Roll the baselines anyway. Ticks fold from the candle session
+            // open (09:00) but this gate holds ranking to 09:15, and the
+            // baseline is otherwise rolled ONLY inside `rank` -- so the first
+            // in-window sweep would measure from a contract's first observe
+            // and report ~15 minutes of volume as one window. O(tracked)
+            // integer writes on a population that is near-empty before the
+            // window opens; no sort, no allocation.
+            for family in [
+                crate::volume_leaderboard::OptionFamily::Index,
+                crate::volume_leaderboard::OptionFamily::Stock,
+            ] {
+                self.leaderboard.roll_baselines(family, cadence);
+            }
             return (0, 0);
         }
         // Two consumers of this pass now, and they are gated separately.
@@ -5067,6 +5080,15 @@ async fn run_frame_drain(
     let mut snapshot_rows_1s: u64 = 0;
     let mut snapshot_rows_5s: u64 = 0;
     let mut snapshot_refused: u64 = 0;
+    // A CLOSED seed channel is `Poll::Ready(None)` immediately and FOREVER.
+    // Under `biased;` that arm would then win every poll and permanently
+    // shadow every arm below it -- the 1s snapshot, the 5s depth-steering
+    // publish and the 30s silence read-out -- while spinning a core at 100%.
+    // Safe today only because a sender lives on `run_dhan_feed_stack`'s frame
+    // for the drain's whole life, six lines from a `drop(frame_tx)` that
+    // invites the symmetric edit. Latch the arm shut instead of relying on
+    // that.
+    let mut seed_closed = false;
 
     loop {
         tokio::select! {
@@ -5412,7 +5434,7 @@ async fn run_frame_drain(
             // detector that learned instruments from arriving ticks could
             // never report the one failure that matters here — an instrument
             // that arrives never.
-            maybe_seed = seed_rx.recv() => {
+            maybe_seed = seed_rx.recv(), if !seed_closed => {
                 if let Some(batch) = maybe_seed {
                     let now_millis = u64::try_from(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
@@ -5437,7 +5459,12 @@ async fn run_frame_drain(
                 }
                 // A closed channel is NORMAL — the attach task finishes and
                 // drops its sender. `recv` then returns None forever, so this
-                // arm must not treat that as a reason to end the drain.
+                // arm must not treat that as a reason to end the drain — but it
+                // must also stop being polled, or under `biased;` it starves
+                // every arm below.
+                else {
+                    seed_closed = true;
+                }
             }
             // Both snapshot arms sit AFTER the frame arm's `biased` priority, so
             // a snapshot can never preempt draining queued frames. They touch
@@ -16694,7 +16721,7 @@ mod tests {
         ingest.record_prev_close_from_tick(&packet(
             13,
             ExchangeSegment::IdxI,
-            24_100.50,
+            24_100.5,
             SESSION_SECS,
         ));
         assert_eq!(
@@ -21942,7 +21969,7 @@ mod frame_walk_accounting_tests {
     fn record_spot_price_lands_a_decoded_tick_where_the_attach_tasks_read_it() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
         floor_store_to_any_ltt(&ingest);
-        drain_one(&mut ingest, ticker_packet_in(13, 0, 24_500.10).to_vec());
+        drain_one(&mut ingest, ticker_packet_in(13, 0, 24_500.1).to_vec());
         assert_eq!(
             ingest
                 .spot_prices()
@@ -22589,6 +22616,38 @@ mod late_seed_tests {
             "the frame arm must come FIRST under `biased;` — seeding must never \
              preempt draining queued frames"
         );
+
+        // ADDED 2026-09-09. The assertion above pinned only ONE side of the
+        // seed arm, and the dangerous side is the other one. A closed channel
+        // is `Poll::Ready(None)` immediately and forever, so under `biased;`
+        // an unlatched seed arm STARVES every arm below it and spins a core.
+        // The arms below it are not bookkeeping: they are the 1s snapshot, the
+        // 5s depth-steering publish and the 30s silence read-out.
+        assert!(
+            drain.contains("maybe_seed = seed_rx.recv(), if !seed_closed"),
+            "the seed arm must be latched by `if !seed_closed`: a closed channel \
+             is Ready(None) forever, and under `biased;` it would shadow every \
+             arm below it while spinning at 100% CPU"
+        );
+        assert!(
+            drain.contains("seed_closed = true;"),
+            "nothing sets the seed latch, so `if !seed_closed` can never become \
+             false and the guard above is decorative"
+        );
+        for below in [
+            "snapshot_1s_timer.tick()",
+            "snapshot_5s_timer.tick()",
+            "silence_timer.tick()",
+        ] {
+            let at = drain
+                .find(below)
+                .unwrap_or_else(|| panic!("the drain must have a `{below}` arm"));
+            assert!(
+                seed_arm < at,
+                "`{below}` sits ABOVE the seed arm; if it is ever moved below one \
+                 that can go permanently ready, it stops running entirely"
+            );
+        }
     }
 
     #[test]

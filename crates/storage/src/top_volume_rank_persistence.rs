@@ -461,10 +461,13 @@ impl TopVolumeRankWriter {
 
     /// Appends one ranked-contract row.
     ///
+    /// A MARKER is set before the row and rewound if any step fails, so a
+    /// half-written row can never poison the buffer — see [`Self::append_row`].
+    ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_row(&mut self, r: &TopVolumeRankRow) -> Result<()> {
-        self.buffer
+    fn write_row(buffer: &mut Buffer, r: &TopVolumeRankRow) -> Result<()> {
+        buffer
             .table(TOP_VOLUME_RANK_TABLE)
             .context("table")?
             // Symbols BEFORE columns (ILP tags-before-fields rule).
@@ -492,8 +495,62 @@ impl TopVolumeRankWriter {
             .context("subscribed")?
             .at(TimestampNanos::new(r.snapshot_ts_ist_nanos))
             .context("designated timestamp")?;
-        self.pending = self.pending.saturating_add(1);
         Ok(())
+    }
+
+    /// Appends one ranked-contract row, atomically with respect to the buffer.
+    ///
+    /// # Why the marker (2026-09-09)
+    ///
+    /// `write_row` is a chain of `?`. If ANY step fails part-way, questdb-rs
+    /// has already written bytes AND advanced its own state machine: `table()`
+    /// sets `op_case = TableWritten`, and `check_op(Op::Table)` then REFUSES
+    /// every later `.table()` call — so one bad row silently killed this
+    /// writer for the rest of the process. `at()` is the realistic trigger: it
+    /// validates the timestamp only after the table, symbols and columns are
+    /// already in the buffer.
+    ///
+    /// Nothing recovered it, either. `pending` is bumped only AFTER the last
+    /// `?`, so a part-way failure leaves it at 0 — and `flush` early-returns on
+    /// `pending == 0`, so the one path that calls `discard_pending` (the only
+    /// code that clears the buffer) was unreachable in exactly the case that
+    /// needed it.
+    ///
+    /// `rewind_to_marker` truncates the output back to the row boundary and
+    /// restores the saved `BufferState`, so ONLY the bad row is dropped and
+    /// `pending` stays truthful for the good rows already buffered this sweep.
+    /// `clear()` was rejected: a sweep appends up to 250 rows per family, and
+    /// clearing on row 200 would throw away 199 good ones.
+    ///
+    /// # Errors
+    /// Propagates ILP buffer errors (table/column append failure).
+    pub fn append_row(&mut self, r: &TopVolumeRankRow) -> Result<()> {
+        // A marker may only be set on an empty buffer or after `at` — i.e.
+        // exactly at a row boundary, which is where this always runs. If it is
+        // refused the buffer is ALREADY mid-row from some path this reasoning
+        // did not cover, and a total reset is the only way back.
+        if self.buffer.set_marker().is_err() {
+            self.discard_pending();
+            self.buffer
+                .set_marker()
+                .context("top_volume_rank: marker refused on a cleared buffer")?;
+        }
+        match Self::write_row(&mut self.buffer, r) {
+            Ok(()) => {
+                self.buffer.clear_marker();
+                self.pending = self.pending.saturating_add(1);
+                Ok(())
+            }
+            Err(err) => {
+                if self.buffer.rewind_to_marker().is_err() {
+                    // Cannot happen (the marker was just set), but a silent
+                    // half-row here is the exact defect this guards, so fall
+                    // back to the reset rather than trusting the reasoning.
+                    self.discard_pending();
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Flushes buffered rows over ILP-HTTP (per-flush server ACK).
@@ -1034,6 +1091,50 @@ mod tests {
                 "type {ty} for column {col} is absent from the CREATE"
             );
         }
+    }
+
+    /// A row that fails PART-WAY must not poison the writer.
+    ///
+    /// `at()` validates the timestamp only after the table, symbols and columns
+    /// are already in the buffer, and `table()` has by then set questdb-rs to
+    /// `TableWritten`, where every later `.table()` is REFUSED. Before the
+    /// 2026-09-09 marker fix, one negative timestamp killed this writer for the
+    /// rest of the process — and `pending` stayed 0, so `flush`'s early return
+    /// meant nothing ever cleared it either.
+    #[test]
+    fn a_row_that_fails_part_way_does_not_poison_the_buffer() {
+        let mut w = TopVolumeRankWriter::for_test();
+
+        // A good row first, so the test also proves the rewind keeps it.
+        w.append_row(&row()).expect("first good row");
+        assert_eq!(w.pending(), 1);
+
+        // Negative designated timestamp: accepted by `TimestampNanos::new`'s
+        // caller chain up to `at()`, which rejects it AFTER the row's bytes
+        // are already written.
+        let mut bad = row();
+        bad.snapshot_ts_ist_nanos = -1;
+        assert!(
+            w.append_row(&bad).is_err(),
+            "a negative designated timestamp must be refused"
+        );
+        assert_eq!(
+            w.pending(),
+            1,
+            "the refused row must not be counted, and the good row must survive"
+        );
+
+        // The real assertion: the writer still works.
+        w.append_row(&row())
+            .expect("the writer must still accept rows after a part-way failure");
+        assert_eq!(w.pending(), 2);
+
+        let body = w.buffer_utf8();
+        assert_eq!(
+            body.lines().filter(|l| !l.trim().is_empty()).count(),
+            2,
+            "exactly the two GOOD rows are buffered; the partial row was rewound"
+        );
     }
 
     #[test]

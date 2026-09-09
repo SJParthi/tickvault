@@ -692,6 +692,40 @@ impl VolumeLeaderboard {
     /// The sort is O(n log n) in that traded population — MEASURED at 900 µs
     /// for the 20,220-contract worst case by
     /// `rank_sweep_cost_at_the_authorized_ceiling`.
+    /// Rolls ONE cadence's baselines forward to the contracts' current
+    /// cumulative volume, without ranking.
+    ///
+    /// # Why this exists (2026-09-09)
+    ///
+    /// A baseline is seeded at a contract's FIRST `observe`, and until this
+    /// existed it was rolled in exactly one place: [`Self::rank`]. But ticks
+    /// fold from the candle session open (09:00) while `rank` is gated to the
+    /// capture window (09:15), so the first in-window sweep computed
+    /// `volume(09:15) - volume(first observe ~09:00)` and reported up to
+    /// fifteen minutes of accumulated volume as a single one-second window.
+    /// That contract would take a depth socket on a number no other contract
+    /// on the board was measured over.
+    ///
+    /// Calling this on the out-of-window path keeps every baseline tracking
+    /// cumulative volume until ranking actually starts, so the first ranked
+    /// window measures the window.
+    ///
+    /// **Honest limit:** the over-count is not believed to be firing today.
+    /// NSE runs no pre-open call auction for F&O, a contract carrying
+    /// yesterday's trade time is refused as a stale trading day before it is
+    /// ever observed, and contracts attach after the window opens anyway. This
+    /// converts a property that currently holds because of exchange
+    /// microstructure into one that holds by construction.
+    ///
+    /// O(tracked) integer writes, no sort and no allocation — the same walk
+    /// `rank` already makes, without the ranking half.
+    pub fn roll_baselines(&mut self, family: OptionFamily, cadence: SnapshotCadence) {
+        let idx = window_index(cadence);
+        for tracked in self.family_mut(family).volumes.values_mut() {
+            tracked.baseline[idx] = tracked.contract.volume;
+        }
+    }
+
     pub fn rank<F, L>(
         &mut self,
         family: OptionFamily,
@@ -1210,6 +1244,59 @@ mod tests {
 
     fn all(_: &RankedContract) -> bool {
         true
+    }
+
+    /// Ticks fold from the candle session open (09:00) but ranking is gated to
+    /// the capture window (09:15). Without an out-of-window baseline roll, the
+    /// FIRST in-window sweep measures from the contract's first observe and
+    /// reports ~15 minutes of volume as one one-second window.
+    #[test]
+    fn roll_baselines_out_of_window_makes_the_first_ranked_window_measure_the_window() {
+        let mut lb = VolumeLeaderboard::new();
+
+        // 09:00 — first observe seeds the baseline at this volume.
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+        // 09:00 -> 09:15, pre-open accumulation nobody ranked.
+        lb.observe(stock(1, 100, 900_000), OptionFamily::Stock);
+
+        // What the out-of-window path now does on every skipped sweep.
+        lb.roll_baselines(OptionFamily::Stock, S1);
+
+        // 09:15 — the first RANKED window trades 500 units.
+        lb.observe(stock(1, 100, 900_500), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(
+            ranked[0].window_lots_milli, 500_000,
+            "the first ranked window must measure the WINDOW (500 units at lot 1 \
+             = 500_000 milli-lots), not the ~899,500 accumulated before ranking \
+             started"
+        );
+    }
+
+    /// The roll is per CADENCE. Rolling the 1s baseline must not disturb the 5s
+    /// one — they measure different windows and share only the contract.
+    #[test]
+    fn roll_baselines_for_one_cadence_leaves_the_other_alone() {
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+        lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+
+        lb.roll_baselines(OptionFamily::Stock, S1);
+        lb.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+
+        let one = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(
+            one[0].window_lots_milli, 400_000,
+            "the rolled 1s baseline measures only the 400 units since the roll"
+        );
+
+        let five = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+        assert_eq!(
+            five[0].window_lots_milli, 9_400_000,
+            "the 5s baseline was NOT rolled, so it still measures from its own \
+             seed — 10,400 - 1,000"
+        );
     }
 
     const S1: SnapshotCadence = SnapshotCadence::OneSecond;
