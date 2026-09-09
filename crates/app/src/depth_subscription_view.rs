@@ -20,12 +20,43 @@
 //!
 //! # Why TWO slots and not one merged set
 //!
-//! Depth-20 and depth-200 are steered by two INDEPENDENT loops. A single
-//! `ArcSwap` written by both would have each publisher overwrite the other's
+//! Depth-20 and depth-200 are steered independently. A single `ArcSwap`
+//! written by both would have each publisher overwrite the other's
 //! contribution on every minute — the last writer wins and the other pool's
-//! instruments read as unsubscribed until it publishes again. Two slots, one
-//! owner each, and a read that checks both: no clobbering is possible because
-//! no slot has two writers.
+//! instruments read as unsubscribed until it publishes again. Two slots with
+//! one owner each, and a read that checks both, removes that clobbering.
+//!
+//! # Concurrency: the invariant is ONE WRITER TASK, not one writer per slot
+//!
+//! ⚠ CORRECTED 2026-09-09. This section used to close with *"no clobbering is
+//! possible because no slot has two writers"*, and to describe the pools as
+//! *"two INDEPENDENT loops"*. Both were wrong, in opposite directions, and
+//! together they read as a safety proof that does not hold:
+//!
+//! * **It does not cover three of the five fields.** `depth20` and `depth200`
+//!   do have one publisher each. But `dropped`, `published_once` and
+//!   `last_publish_secs` are written by BOTH publishers — the `dropped` field
+//!   doc says so itself — and EVERY write in this module is a
+//!   load-rebuild-store on an `ArcSwap`, which is not atomic. Two concurrent
+//!   publishers would lose drops.
+//! * **There are not two loops.** There is ONE. Both publishes are made by
+//!   `depth_rebalance::publish_depth_subscriptions`' single caller — see the
+//!   real invariant below — so the present-tense "independent loops" claim
+//!   described a topology the code does not have, which is exactly what makes
+//!   a future split look free when it is not.
+//!
+//! The invariant this module actually relies on is therefore stronger and is
+//! stated here rather than inferred: **all publishing happens on the single
+//! `run_depth_rebalance` task.** `publish_depth_subscriptions`
+//! (`depth_rebalance.rs`) is the only production caller of either
+//! `publish_depth20*` or `publish_depth200*`, and it is called from two points
+//! in one loop body, so the two publishes are serialised by construction.
+//! Pinned by `the_view_has_exactly_one_publishing_call_site`.
+//!
+//! **Splitting depth-20 and depth-200 onto separate tasks is NOT a free
+//! change.** It requires `ArcSwap::rcu` on all three `ArcSwap` fields first —
+//! and the counter and `warn!` in `record_dropped` must be hoisted OUT of the
+//! retry closure before that, or a contended retry double-reports the refusal.
 //!
 //! # Complexity
 //!
@@ -170,7 +201,7 @@ impl DepthSubscriptionView {
     {
         let next = Self::collect(held);
         let previous = self.depth20.load_full();
-        self.record_dropped(&previous, &next, now_secs);
+        let _refused = self.record_dropped(&previous, &next, now_secs);
         self.depth20.store(Arc::new(next));
     }
 
@@ -189,7 +220,7 @@ impl DepthSubscriptionView {
     {
         let next = Self::collect(held);
         let previous = self.depth200.load_full();
-        self.record_dropped(&previous, &next, now_secs);
+        let _refused = self.record_dropped(&previous, &next, now_secs);
         self.depth200.store(Arc::new(next));
     }
 
@@ -291,9 +322,14 @@ impl DepthSubscriptionView {
     /// both walked once. Cold: once a minute per pool on the steering task,
     /// bounded by the pool budgets and [`MAX_DROPPED_TRACKED`]. The READ side
     /// (`classify_raw`) stays O(1).
+    ///
+    /// Returns the number of keys REFUSED by the cap. That count is what the
+    /// counter reports and what the tests assert on: a `metrics::counter!` is
+    /// process-global and cannot be read back, so a return value is the only
+    /// way to pin "one increment per KEY" rather than one per publish.
     // O(1) EXEMPT: cold per-minute steering path, bounded by the pool budgets
     // (≤ 250 + ≤ 5 held) and MAX_DROPPED_TRACKED; the hot-path reader is O(1).
-    fn record_dropped(&self, previous: &HashSet<Key>, next: &HashSet<Key>, now_secs: i64) {
+    fn record_dropped(&self, previous: &HashSet<Key>, next: &HashSet<Key>, now_secs: i64) -> u64 {
         let current = self.dropped.load();
         let mut map: HashMap<Key, i64> = HashMap::with_capacity(
             current
@@ -311,6 +347,7 @@ impl DepthSubscriptionView {
                 map.insert(*key, *dropped_at);
             }
         }
+        let mut refused: u64 = 0;
         for key in previous.iter() {
             if next.contains(key) {
                 continue;
@@ -331,24 +368,51 @@ impl DepthSubscriptionView {
                 // Fail-closed: refuse to remember more rather than grow
                 // without bound. A refused entry can never read as Ghost,
                 // which is the safe direction (no redial on a guess).
-                metrics::counter!(DROPPED_REFUSED_COUNTER).increment(1);
-                tracing::warn!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
-                        .code_str(),
-                    source = "dropped_map_full",
-                    tracked = map.len(),
-                    cap = MAX_DROPPED_TRACKED,
-                    "depth view dropped map is full; further drops this publish are not remembered and can never read as ghost (fail-closed: no redial on a guess)"
-                );
-                break;
+                //
+                // CORRECTED 2026-09-09, two defects in these four lines:
+                //
+                // (1) It counted the PUBLISH, not the KEYS -- one increment
+                //     however many instruments were forgotten. The depth-20
+                //     budget is DEPTH20_ENTRY_RANKS (250), and the retained
+                //     map can already be AT the cap when the loop starts, so
+                //     a single publish could forget 250 instruments and tell
+                //     the operator `1`. The counter's own doc says "inserts
+                //     refused", i.e. per-key was always the intended reading;
+                //     the code was what disagreed.
+                //
+                // (2) It `break`ed. That abandoned the `get_mut` stamp
+                //     refresh ABOVE for every remaining key -- silently
+                //     defeating the newer-drop-wins rule documented there,
+                //     and reviving the healthy-socket redial that rule was
+                //     written to stop (2026-09-08 hostile sweep). Refreshing
+                //     an existing stamp never grows the map, so the cap is no
+                //     reason to stop walking.
+                //
+                // Count per key, keep walking, and report once at the end so
+                // one publish still costs one log line.
+                refused = refused.saturating_add(1);
+                continue;
             }
             map.insert(*key, now_secs);
+        }
+        if refused > 0 {
+            metrics::counter!(DROPPED_REFUSED_COUNTER).increment(refused);
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "dropped_map_full",
+                refused,
+                tracked = map.len(),
+                cap = MAX_DROPPED_TRACKED,
+                "depth view dropped map is full; these instruments are not remembered and can never read as ghost (fail-closed: no redial on a guess)"
+            );
         }
         self.dropped.store(Arc::new(map));
         self.last_publish_secs
             .store(now_secs, std::sync::atomic::Ordering::Release);
         self.published_once
             .store(true, std::sync::atomic::Ordering::Release);
+        refused
     }
 }
 
@@ -360,9 +424,12 @@ impl DepthSubscriptionView {
 /// threading a handle through them would put the wiring's cost in the places
 /// least related to it.
 ///
-/// The ownership argument that makes the two slots safe is UNAFFECTED by this
-/// being global: each slot still has exactly one writer, and the accessor
-/// hands out a shared reference rather than a mutable one. `run_depth_rebalance`
+/// The ownership argument that makes the view safe is UNAFFECTED by this being
+/// global: the single-writer-TASK invariant in the module header is what holds
+/// (not "one writer per slot" — see the correction there), and the accessor
+/// hands out a shared reference rather than a mutable one, so a global cannot
+/// add a second writer without a second CALL SITE, which is the thing pinned by
+/// `the_view_has_exactly_one_publishing_call_site`. `run_depth_rebalance`
 /// still takes its view as an explicit parameter -- the global is used only at
 /// the spawn boundary -- so the loop stays testable against a private instance.
 ///
@@ -650,6 +717,94 @@ mod tests {
         assert_eq!(
             view.classify_raw(1, FNO, T0 + 10_000),
             DepthFrameClass::Unknown
+        );
+    }
+
+    #[test]
+    fn the_dropped_map_counts_every_refused_key_not_one_per_publish() {
+        // The counter increments PER KEY. Before 2026-09-09 it incremented
+        // once per publish and then `break`ed, so an operator was told `1`
+        // for up to a depth-20 budget's worth of forgotten instruments.
+        let view = DepthSubscriptionView::new();
+        let full: HashSet<Key> = (0..MAX_DROPPED_TRACKED as u64).map(|i| (i, FNO)).collect();
+        let none: HashSet<Key> = HashSet::new();
+        assert_eq!(
+            view.record_dropped(&full, &none, T0),
+            0,
+            "filling exactly to the cap refuses nothing"
+        );
+        assert_eq!(view.dropped_count(), MAX_DROPPED_TRACKED);
+
+        // The map is now AT the cap, so every one of these NEW keys is refused.
+        let overflow: HashSet<Key> = (900_000..900_137).map(|i| (i, FNO)).collect();
+        assert_eq!(
+            view.record_dropped(&overflow, &none, T0 + 1),
+            overflow.len() as u64,
+            "one increment per refused KEY, not one per publish"
+        );
+    }
+
+    #[test]
+    fn a_refused_key_does_not_stop_the_newer_drop_wins_refresh() {
+        // The cap arm used to `break`, which abandoned the `get_mut` stamp
+        // refresh ABOVE it for every remaining key. That silently defeated
+        // newer-drop-wins and redialled healthy sockets (2026-09-08 sweep).
+        // Here EVERY already-tracked key must still be refreshed even though
+        // the same publish refuses new ones -- and because a `HashSet` has no
+        // iteration order, asserting on ALL of them is what makes the old
+        // `break` fail deterministically wherever it landed.
+        let view = DepthSubscriptionView::new();
+        let tracked: HashSet<Key> = (0..MAX_DROPPED_TRACKED as u64).map(|i| (i, FNO)).collect();
+        let none: HashSet<Key> = HashSet::new();
+        view.record_dropped(&tracked, &none, T0);
+        assert_eq!(view.dropped_count(), MAX_DROPPED_TRACKED);
+
+        // Re-drop every tracked key (refreshes) alongside new keys (refused),
+        // far enough past T0 that a STALE stamp reads Ghost and a refreshed
+        // one reads RecentlyDropped.
+        let later = T0 + 4 * GHOST_GRACE_SECS;
+        let mut mixed = tracked.clone();
+        mixed.extend((900_000..900_137).map(|i| (i, FNO)));
+        let refused = view.record_dropped(&mixed, &none, later);
+        assert!(refused > 0, "the new keys must actually hit the cap");
+
+        // Probe inside the publish-freshness window.
+        let probe_at = later + 1;
+        let stale = tracked
+            .iter()
+            .filter(|(id, seg)| {
+                view.classify_raw(*id, *seg, probe_at) != DepthFrameClass::RecentlyDropped
+            })
+            .count();
+        assert_eq!(
+            stale, 0,
+            "{stale} tracked keys kept a stale stamp: the cap arm stopped the refresh"
+        );
+    }
+
+    #[test]
+    fn the_view_has_exactly_one_publishing_call_site() {
+        // The module header's safety argument is "all publishing happens on
+        // the single run_depth_rebalance task". That is only true while there
+        // is ONE production caller: every write here is load-rebuild-store on
+        // an `ArcSwap`, so a second concurrent publisher loses drops. Splitting
+        // the pools onto two tasks needs `rcu` FIRST -- see the header.
+        let rebalance = include_str!("depth_rebalance.rs");
+        let stack = include_str!("dhan_feed_stack.rs");
+        let calls = rebalance.matches("publish_depth_subscriptions(").count()
+            - rebalance.matches("fn publish_depth_subscriptions(").count();
+        assert_eq!(
+            calls, 2,
+            "publish_depth_subscriptions is called {calls} times; the header claims two \
+             points in ONE loop body. A new call site may be a second WRITER TASK -- \
+             read the concurrency section before changing this number."
+        );
+        assert!(
+            stack.matches("run_depth_rebalance(").count()
+                - stack.matches("fn run_depth_rebalance(").count()
+                <= 1,
+            "run_depth_rebalance is spawned more than once: the single-writer-task \
+             invariant the view relies on would no longer hold"
         );
     }
 
