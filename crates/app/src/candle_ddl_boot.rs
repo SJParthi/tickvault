@@ -197,8 +197,10 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured, and the \
-                 named views re-ensured against the now-existing rank table"
+                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured. The named \
+                 views were then RE-ATTEMPTED against the now-existing rank table; \
+                 that call reports its own outcome per view and returns nothing, so \
+                 this line claims the attempt, never its success."
             );
             return true;
         }

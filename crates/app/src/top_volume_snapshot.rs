@@ -585,6 +585,7 @@ mod tests {
             SnapshotRefusal::IdTooLargeForSignedColumn.as_str(),
             SnapshotRefusal::NonFiniteGain.as_str(),
             SnapshotRefusal::RankOutOfRange.as_str(),
+            SnapshotRefusal::LotsOutOfRange.as_str(),
         ];
         let mut sorted = labels;
         sorted.sort_unstable();

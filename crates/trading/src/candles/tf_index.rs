@@ -191,7 +191,7 @@ pub const MAX_PLAUSIBLE_RECEIPT_LEAD_SECS: i64 = 10;
 
 /// IST is UTC+05:30. `received_at_nanos` is UTC; `exchange_timestamp` is
 /// already IST (never add the offset to it — see `data-integrity.md`).
-const IST_UTC_OFFSET_SECS: i64 = 19_800;
+pub(crate) const IST_UTC_OFFSET_SECS: i64 = 19_800;
 
 /// The clock the candle grid buckets on: **the receipt clock, with the
 /// exchange clock as a fail-soft fallback**.
