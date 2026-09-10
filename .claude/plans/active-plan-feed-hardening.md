@@ -216,7 +216,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
 
     | Policy | What it gets right | Why it is wrong on its own |
     |---|---|---|
-    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(25)` + `subscribe(23)` on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
+    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(24)` + `subscribe(23)` *(was written as 25; proven ignored live 2026-09-10 — see the scope lock)* on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
     | **Static from the 2nd minute to EOD** | one contiguous 200-level book per instrument, perfectly comparable all day, zero churn, zero gaps | a 2% index move leaves the "ATM" strike deep OTM by the close. Its book thins to almost nothing, so the back half of the day records depth for a strike nobody is trading — technically complete data about the wrong instrument |
     | **HYSTERESIS (recommended)** | keeps the book on a strike that stays meaningful, while swapping rarely enough that the series stays readable | needs two named constants and a dwell timer — which is work, not a config flip |
 
@@ -4825,3 +4825,423 @@ functionalities (every new pub fn has a call site and a test), extreme check
 (six bite-proofs, all reverted). Resilience rows: no new tick-drop path — the
 arm records and never gates the fold; no ring, spill or DLQ change; O(1)
 uniqueness on the I-P1-11 composite key.
+
+---
+
+## ITEM 23 — the 2026-09-10 open-item sweep (operator: "then fix and resolve evryhtign enitlrey dude okay?")
+
+**Operator authorization (2026-09-10, typed directly in-session — preserve EXACTLY, typos
+included):**
+
+> "then fix and resolve evryhtign enitlrey dude okay? See meanwhile what ahppend to thsi ent volume i need the precise real calcualtion dude okay?"
+
+Given in DIRECT response to a message that ENUMERATED the nine open findings recorded in
+PR #1904's own "Open findings from the sweep — recorded, NOT fixed here" table plus the
+open draft PR #1901. That is the §28.2/§28.3 authorization shape this repository already
+accepts: a general go-ahead answering an enumerated ask selects the enumerated work.
+
+**Slot note.** `plan-gate.sh` V7 blocks every `crates/*/src/**.rs` push when more than
+`PLAN_GATE_MAX_ACTIVE` (5) `active-plan*.md` files exist, and the tree is at exactly 5.
+This item is therefore an ADDENDUM to this plan — which is `IN_PROGRESS`, carries all six
+required sections, and already references `crates/core`, `crates/app`, `crates/common` and
+`crates/storage` — rather than a sixth plan file. Count stays at 5; the gate passes.
+
+### Design
+
+Three investigations were run as parallel read-only agents (per
+`operator-charter-forever.md` §E). Two findings were CONFIRMED with a correction to their
+own numbers, one was REFUTED outright, and one refuted the *reason* a fix had never been
+attempted. Each row below carries the evidence, not the claim.
+
+| # | Finding | Verdict | Ships here |
+|---|---|---|---|
+| A | 804 parks a socket with no recovery | CONFIRMED — and its stated CAUSE is REFUTED | **yes** |
+| B | Control-plane sends await on the socket reader task | CONFIRMED, budget corrected 10 s → 8 s | **no — see "Deferred"** |
+| C | Dead-class report has no post-bell grace | CONFIRMED | **yes** |
+| D | Quote 21 "replay watermark NOT built" | CONFIRMED stale, in the ALARMING direction | **yes** |
+| E | 7,000/day vs 100,000/day rate limit | **REFUTED — no contradiction exists** | **yes (strike the row)** |
+| F | PR #1901 duplicated `#[test]` | CONFIRMED — and CI structurally cannot see it | **guard only** |
+
+#### A — 804: spend the one-shot respawn that is already built and unreachable
+
+Verified in `crates/core/src/websocket/pool_supervisor.rs`: `classify_disconnect` maps
+`InstrumentsExceedLimit` into the same arm as 806/808/810 (`:517-543`); that arm calls
+`park(ParkReason::FatalDisconnect)` (`:1247-1256`); `allows_one_respawn()` returns `false`
+for all three (`:863-871`); and `take_ghost_redial` is consulted only while
+`action == SupervisorAction::Continue` (`:4683-4686`), which a parked socket has left. Worse
+than "cannot reach": a park returns `ConnectionExit::Parked` (`:3621`), the connection loop
+RETURNS, and the spawned task at `dhan_feed_stack.rs:10493-10543` only logs and drops the
+alive-guard. **Nothing re-spawns it.** `PoolSupervisor::retire` (`:3365`) has zero production
+callers, so the budget slot is never released either.
+
+**The REFUTED half is what unblocks this.** `allows_one_respawn`'s own docblock (`:843-849`)
+and `test_no_park_reason_is_respawn_eligible_and_each_one_says_why` (`:6390-6392`) justify
+the refusal by asserting a redial "replays an identical over-limit set", so 804 would recur
+deterministically. **That is wrong about the mechanism.** Every guard mutation is cap-guarded
+fail-closed — `try_new` (`:1799-1813`), `try_extend` (`:1932-1953`), `try_swap`'s
+already-held check (`:2124-2140`) — so OUR retained set can never exceed
+`max_instruments_per_connection` by construction. A 804 therefore comes from the VENDOR's
+per-connection count exceeding ours (an ignored unsubscribe leaving Dhan holding N+1 where a
+depth-200 cap is 1, `pool_budget.rs:152-153`), and a FRESH connection starts vendor-side at
+zero.
+
+That last clause is this design's one **Assumed** premise and is stated rather than hidden:
+the vendor's per-connection accounting is not provable from this tree. It is, however, the
+same premise the existing `mark_lost` + replay design already relies on for every transient
+redial, so it is not a new bet.
+
+**The change:** split 804 out of the credential class into
+`DisconnectClass::SubscriptionRejected` + `ParkReason::SubscriptionRejected` with
+`allows_one_respawn() == true`. Nothing else moves — `park()` already routes an eligible
+reason through `schedule_redial` (`:1576`), so the respawn inherits the backoff ladder, the
+per-slot stagger, the ±375 ms jitter and the 6-per-300 s flap floor. A SECOND 804 finds
+`respawn_used == true` and parks permanently.
+
+**Bound: exactly one extra dial per socket per process lifetime**, on the existing ladder —
+1–16 dials in a whole session, orders of magnitude below the ghost-redial ceiling of 8 per
+socket already shipped (`:741-749`).
+
+**No set trim, deliberately.** The set is already ≤ cap; trimming would silently drop a
+contract we are authorized to carry, converting a recoverable socket into a permanently
+short one. What changes between the two attempts is the vendor's count, not ours.
+
+#### C — dead-class grace, DERIVED from the sibling rather than invented
+
+Verified: the sibling per-instrument silence page waits `SILENCE_SCANS_BEFORE_ALERT = 2`
+(`dhan_feed_stack.rs:4782`) for the reason stated at `:4776-4781` — *"One scan is not
+evidence: a scan landing in the shadow of a reconnect, or during the first seconds after a
+subscribe batch, sees instruments that are legitimately not ticking YET."* The dead-class
+report has no counter at all and fires on the first rising edge (`:3300-3308`). The exposure
+is real because `ClassLiveness::is_dead` (`:4508-4512`) requires `never == eligible`, which
+is exactly true at 09:15:00.x before the first print.
+
+`DEAD_CLASS_SCANS_BEFORE_REPORT` is **derived** from `SILENCE_SCANS_BEFORE_ALERT`, not
+restated as a second literal `2`, so two legs on the same 30-second arm cannot drift apart.
+The per-class counter array is cleared by `stand_down_dead_class_report` alongside the latch
+— without that, a pre-open sweep's count leaks into the bell and re-creates the bug the
+stand-down exists to prevent. The GAUGE stays level-triggered every sweep; only the log line
+and the counter wait.
+
+#### D and E — the two doc claims, and why only one of them was real
+
+D is stale in the ALARMING direction, which is the expensive one: `wal_applied_watermark.rs`
+landed in `6b7e5d7` (2026-09-05) and is production-WIRED — not merely present — consumed by
+the STAGE-C boot replay and the catch-up drain, with both sinks advancing it on ack. A
+session trusting the rule file opens work to build something that shipped five days ago,
+which is the `day_ohlc_tracker` (2026-08-12) failure class exactly.
+
+**E is REFUTED and the row is struck rather than fixed.** The premise was that the uploaded
+vendor pack says *Data APIs 7,000/day* against the rule files' 100,000/day. It does not:
+the pack says **Order** 7,000/day and **Data** 100,000/day
+(`docs/broker-ref-upload-2026-07-15/dhan/01-introduction.md:71`), agreeing with
+`docs/dhan-ref/01-introduction-and-rate-limits.md:51` and `08-annexure-enums.md:318`. The
+code agrees too (`OrderBudget::MAX_PER_DAY = 7_000`, orders). The transposition exists only
+on the live portal and is ALREADY adjudicated in-repo at
+`docs/dhan-ref/verification-2026-07-13.md:64,106-115`. No reconciliation work is
+outstanding. Recorded because a refuted finding is a result, and leaving it on the list
+would send the next session to re-derive it.
+
+#### F — PR #1901: a guard, not a cross-branch push
+
+Verified at `b89f272`: `crates/app/src/contract_underlying_map.rs:1131` and `:1132` are two
+consecutive `#[test]` lines both attached to the fn at `:1133`, while
+`pre_register_contract_underlying_counters_never_panics_without_a_recorder()` at `:1225` has
+**no attribute** and therefore never runs. It is not a name shadow and not a renamed
+copy-paste — it is an insertion that stole an attribute from the test below it.
+
+**Why nothing caught it:** `ci.yml:255` runs `cargo clippy --workspace --no-deps` —
+libs+bins, NOT `--all-targets` — so `#[cfg(test)]` code is never linted and both the
+`duplicate_macro_attributes` warning and the `dead_code` warning on the orphaned fn are
+structurally invisible to CI.
+
+This branch does **not** push to `claude/pensive-heisenberg-u2by0j`. It ships the workspace
+guard instead, so the ratchet catches #1901 on its next rebase and every future recurrence
+in any crate. Fixing the PR itself stays with the PR.
+
+### Deferred — B, with the reason stated rather than implied
+
+B is CONFIRMED: `drain` (`pool_supervisor.rs:3891`) takes `socket: &mut S` and executes its
+command block (`:3973`) BEFORE the `select!` whose only read arm is `socket.recv()`
+(`:4513-4515`); there is one `drain` call site (`:3714`) and no sibling task, so every send
+genuinely holds `recv()`. Worst case per iteration ≈ **8 s** unread — 5 s attach
+(`TOPUP_WIRE_BUDGET`, `:2290`), 2 s swap (`SWAP_WIRE_BUDGET` ×2, `:4186`/`:4228`), 1 s ping —
+against Dhan's 40 s silent close.
+
+One of the finding's own numbers is CORRECTED: item #5 claims the ping is bounded by 10 s.
+It is bounded by `PING_SEND_TIMEOUT = 1 s` (`connection.rs:331`, used at `:1505`), split out
+of the shared 10 s bound for exactly this reason (`:300-329`) and already pinned at
+`:1830-1859`. The ping is LOW, not MED.
+
+The fix is `futures_util::StreamExt::split` so a send and a read can be in flight at once,
+with the `SubscribeGuard` moving to the sender task — because `try_extend` / `try_swap` /
+`undo_swap` are all mutated inside those arms (`:4184-4205`), and leaving the guard on the
+reader while the wire moves would split one invariant across two tasks and break the revert
+asymmetry the 2026-09-09 work established (a REFUSED unsubscribe reverts, a TIMED-OUT one
+must not).
+
+**It is not shipped tonight, and the reason is the mandate itself.** The change alters
+`DhanFeedSocket`'s trait signature (`:3427`) from `&mut self` to `&self` on every send, so
+every fake in the test suite changes with it; it introduces a task whose lifetime must be
+bounded to the drain's or a send can outlive its socket; and it sits directly on the only
+path that captures ticks. A botched socket refactor is a larger tick-loss risk than the 8 s
+window it closes, and it deserves its own PR with its own adversarial pass rather than a
+place at the end of a five-fix sweep. The design above is complete enough to execute from.
+
+**One thing that makes the deferral safe to state:** the ack semantics were checked and are
+SAFE — no caller awaits an ack. `dhan_feed_stack.rs:8613`, `depth20_track.rs:582` and
+`depth_rebalance.rs:1072` all use `try_recv()` inside `retain_mut`, and
+`depth20_track.rs:466-467` documents that an unanswered ack is deliberately KEPT for the
+next minute. So a later ack changes nothing, and the deferral costs no correctness.
+
+### Edge Cases (Item 23)
+
+- **A:** a second 804 on the same socket in one process — must park permanently
+  (`respawn_used`). A 804 on a socket that has already spent its respawn on a transient
+  disconnect — same, parks. 805/806/808/810 must still park on the FIRST event.
+- **C:** a class that reads dead, then alive, then dead — the counter must reset on the
+  alive sweep, so the second dead run starts from one. A sweep landing exactly at
+  09:15:00.x — must not report. A pre-open sweep incrementing a count that then leaks past
+  the bell — prevented by clearing the array in the stand-down.
+- **D:** the correction must not retire the OTHER two Monday follow-ups named on the same
+  line (the no-in-session-deploy rule, the depth write-volume decision); both still stand.
+- **F:** the guard must not fire on a helper fn inside `mod tests` that legitimately carries
+  no `#[test]`.
+
+### Failure Modes (Item 23)
+
+- **A, worst case:** the Assumed premise is wrong and a fresh connection inherits the
+  vendor's count. Then one extra dial per socket per process earns a second 804 and parks —
+  the same end state as today, reached one bounded dial later. It cannot storm: the budget
+  is one, and the ladder still applies.
+- **C:** a genuinely dead class is reported ~30 s later than today. That is the trade, and it
+  is the same trade the sibling page already makes.
+- **F:** the guard is a source scan, so a sufficiently unusual formatting of `#[test]` could
+  evade it. Bounded by pinning the scan's own behaviour in a self-test.
+
+### Test Plan (Item 23)
+
+**A — re-bless with dated notes (both would fail, and both encode the refuted reasoning):**
+`test_no_park_reason_is_respawn_eligible_and_each_one_says_why` (`:6385`),
+`test_classify_disconnect_804_is_fatal_not_an_infinite_retry` (`:5315`). Stale-but-passing
+prose to correct: the `allows_one_respawn` docblock (`:843-852`), the "registers nothing at
+all" comment (`:3213-3221`), and the `ParkReason::ALL` length assertions (`:5179`,
+`:5361-5365`).
+**A — new:** one 804 → `SleepThenDial` not `Park`; a second 804 → `Park` with `connects == 2`
+end-to-end against the fake transport; the respawn goes through the ladder (`delay_ms > 0`,
+jitter present); 805/806/808/810 still park on the first event; `ParkReason::ALL.len() == 4`
+with unique labels.
+**A — verified unaffected by reading:** `test_supervisor_fatal_disconnect_parks` (`:5765`),
+`test_supervisor_805_parks_permanently` (`:5726`),
+`test_run_connection_parks_on_805_without_ever_redialing` (`:8961`),
+`test_a_parked_socket_stays_parked_through_every_event` (`:6487`).
+
+**C:** `the_dead_class_report_waits_the_same_scans_as_the_silence_page` — asserts the
+constant is DERIVED and drives `report_dead_classes` twice to prove one sweep does not emit
+and two do; `leaving_the_session_clears_the_dead_class_scan_counters`, extending the existing
+`leaving_the_session_clears_the_dead_class_latch` (`:23720`).
+
+**D:** a crossref assertion that both occurrences of the stale claim sit within N lines of
+the dated correction marker, so the annotation cannot be dropped while the module stays
+wired. The wiring itself is already pinned by `wal_applied_watermark_wiring_guard.rs`
+(15 tests).
+
+**F:** `every_test_fn_carries_exactly_one_test_attribute` — no two consecutive `#[test]`
+lines, and every non-helper `fn` inside a `mod tests` preceded by exactly one; plus a
+self-test pinning the scanner's own behaviour in both directions.
+
+### Rollback (Item 23)
+
+Each fix is its own commit and reverts independently. **A** reverts to the current
+park-forever behaviour by moving `InstrumentsExceedLimit` back into the `Fatal` arm — one
+match arm. **C** reverts by deleting the counter array and its gate — the report returns to
+first-edge firing. **D**, **E** and **F** are docs and a test; reverting costs nothing. No
+schema, no config, no DDL, no metric name changes, so nothing needs a deploy-order
+consideration.
+
+### Observability (Item 23)
+
+**No new metric name and no new alarm** — deliberate, and the budget is why. The September
+forecast read live on 2026-09-06 is **$142.24** against the AWS 90% `STOP_EC2_INSTANCES`
+line at **$135.00**, so `dhan-rest-only-noise-lock-2026-07-14.md` §2.3n's standing rule
+("the next addition of any size must come with a LEVER, not just a cost note") binds and this
+sweep brings no lever. What A adds is a new label VALUE on the EXISTING respawn counter,
+which costs nothing: the EMF selector folds label values into one summed per-host series.
+C removes log lines rather than adding them.
+
+### Honest envelope (Item 23)
+
+100% inside the tested envelope, with ratcheted regression coverage: the 804 respawn is
+bounded at exactly one extra dial per socket per process on the existing backoff ladder, and
+a second 804 parks permanently; the dead-class grace defers a verdict by one detector cycle
+and never weakens it; the two doc corrections are annotations, not rewrites. **NOT claimed:**
+that the 804 respawn will SUCCEED — its premise, that a fresh connection starts at zero
+vendor-side, is Assumed and unprovable from this tree, and if it is wrong the socket parks
+one bounded dial later than it does today; that the dead-class report is now free of false
+positives, since the first in-session sweep can still land before any option prints and the
+grace only makes that require two such sweeps; that the reader-task stall (B) is fixed — it
+is designed, deferred, and still costs up to 8 s of unread socket per drain iteration; or
+that any of this addresses vendor-side skip-forward loss, which carries no sequence number
+to detect.
+
+---
+
+## ITEM 24 — net volume was bar DIRECTION, not net volume (2026-09-10)
+
+**Operator, verbatim (typos preserved):**
+
+> "then fix and resolve evryhtign enitlrey dude okay? See meanwhile what ahppend to thsi ent volume i need the precise real calcualtion dude okay?"
+
+> "i celalry told you to fix and reoslve evrythign includign net voluem dude okay? Provide this as the detailed extreme easy understandble comparison dude okay? i mean automated easy table level comapriosn view where even any humans can udnerstand where it shoudl attarct even millions of custoimers dude"
+
+### The defect
+
+`LiveCandleState::net_volume()` derived a sign at SEAL time by comparing the
+bar's close against the previous bar's close, and applied it to the WHOLE
+bar's volume. It was documented honestly as "the quantity a broker chart plots
+as Net Volume". It is not that — it is bar DIRECTION × bar VOLUME.
+
+A bar that sells 1,000 into the bid and buys 400 on the offer, and closes one
+tick up, reported **+1,400**. The honest answer is **−600**. Wrong magnitude
+AND wrong sign, and wrong precisely when a bar's flow disagrees with its close
+— which is the case a net-volume reader consults the column to find.
+
+### Design
+
+Classic tick rule, evaluated ONCE per tick above the 24-timeframe loop:
+
+| This tick vs previous tick | Attribution |
+|---|---|
+| price **higher** | buy-initiated: `+delta` |
+| price **lower** | sell-initiated: `−delta` |
+| price **unchanged** | carries the previous direction (the zero-tick rule) |
+
+`delta` is `cumulative_volume − slot.last_cumulative` — the previous ACCEPTED
+tick's day-cumulative — which is the same quantity the fold uses for `volume`
+at a bucket rollover. That identity is what makes `|net| ≤ gross` hold rather
+than merely be hoped for.
+
+The zero-tick carry is per INSTRUMENT (`slot.last_tick_sign: i8`, 25 KB fleet-
+wide), not per timeframe: all 24 frames see one tick sequence, so 24 copies
+would only be able to drift.
+
+### Edge Cases
+
+| Case | Answer | Why |
+|---|---|---|
+| First tick for an instrument | unclassified (`0`) | `last_ltp` is `NaN`; `NaN` fails BOTH `>` and `<`, so an unguarded compare lands on the zero-tick arm and attributes the whole delta to a carry |
+| Flat tick, no carry yet | `0` | no side has revealed itself; guessing propagates to every following flat tick |
+| `delta == 0` | `0` | nothing traded — the common case for a repeated snapshot |
+| `price == 0.0` | `0` | the feed's absent-price sentinel, never a real price |
+| `u64` delta past `i64::MAX` | saturates | `-(u64 as i64)` wraps POSITIVE, recording a sell as a buy |
+| Unchanged decimal-clean price | equal | both sides come from `f32_to_f64_clean`; a widening `as f64` makes `10.20` read as an UPTICK on the majority of ticks |
+| Day boundary (`force_seal_all`) | carry cleared | yesterday's direction is not evidence about today |
+| Late tick (`fold_late_hlc`) | not accumulated | that path amends h/l/c and never volume; a net that grew while its gross did not would break the invariant on a row already written |
+
+### Failure Modes
+
+1. **The fabricated zero.** A bar rebuilt from a source that does not carry the
+   accumulator would report `Some(0)` — "perfectly balanced" — about a bar
+   nobody classified. Closed by `net_volume_classified: bool`, which costs
+   ZERO bytes (it lands in existing padding; measured `size_of` is 136 with and
+   without). The 128-byte disk-spill record is byte-full, so a replayed bar
+   persists NULL and says so.
+2. **A future caller on a non-classifying entry point.** The parameter is
+   `Option<i64>`, so "cannot classify" is representable rather than
+   indistinguishable from "balanced", and a `None` tick poisons the bucket's
+   flag. Pinned by a shrink-only caller budget.
+3. **Net exceeding gross.** Clamped in `net_volume()` on top of the fold's own
+   arithmetic; a row saying "traded 1,000 lots of which 5,000 were buys" would
+   read as a real market condition.
+
+### Test Plan
+
+`multi_tf_aggregator`: the wrong-sign case end-to-end, the zero-tick carry, a
+flat tick with no carry, the invariant over 40 alternating ticks × 24 frames,
+the first-tick refusal, the classifier's seven refusals, saturation, the
+decimal-clean comparison, and the day-boundary reset.
+`live_candle_state`: the three refusals, a balanced bar as a REAL `Some(0)`,
+the clamp, and the two size pins.
+`aggregator_cell`: the non-classifying entry reports NULL; the caller budget.
+`seal_spill`: a replayed record reports NULL, never a balanced zero.
+
+### Rollback
+
+Config-free and self-contained: revert the commit. The `net_volume` column
+already existed and is written by the same site, so no DDL, no migration and
+no on-disk format changed. Rows written before the revert keep whatever value
+they were written with — as they would under any change to this column.
+
+### Observability
+
+No new metric and no new alarm — deliberately. The September forecast is
+$142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line (read live
+2026-09-06), so a new EMF name needs a lever, not a cost note. The RAM cost is
+recorded in `aws-budget.md` under "RAM NOTE 2026-09-10": +8 B on
+`LiveCandleState` = ~10 MB on the aggregator table and ~4.8 MB on the seal
+ring, ~15 MB total, 0.046% of the 32 GiB host. Both compile-time budget
+asserts FIRED on this change and were raised deliberately with the arithmetic
+stated at each site.
+
+### Honest envelope
+
+This is **INFERRED** aggressor side, and no surface may relabel it. Dhan
+publishes no trade tape and no buy/sell flag; a Quote or Full packet is a
+periodic snapshot carrying a day-cumulative, so "volume since the previous
+tick" is itself an aggregate of every trade in that interval, signed as a
+unit. Where trades on both sides fall inside one snapshot interval they are
+attributed together. `total_buy_qty` / `total_sell_qty` cannot help — those are
+RESTING orders, and the fold already says nothing downstream may treat their
+difference as an imbalance of trades.
+
+The honest claim is **"tick-rule net volume"**, never "actual buy volume minus
+actual sell volume".
+
+NOT delivered: the accumulator does not survive a disk spill (format bump plus
+a mixed-stride reader — outstanding, recorded at the site).
+
+### ITEM 24a — the arithmetic was fixed and four DOCS still taught the old rule (2026-09-10, post-merge)
+
+Item 24 shipped in PR #1905. A follow-up sweep asked the narrower question the
+merge did not: *does anything still DESCRIBE `net_volume` by the retired
+definition?* Four sites did, all in `storage`, all downstream of the crate whose
+arithmetic changed:
+
+| Site | What it still said |
+|---|---|
+| `shadow_persistence.rs` — the comment above the DDL that **CREATES** the column | "the bar's volume signed by whether it closed above or below the bar before it … NULL when there is no previous bar to compare against" |
+| `shadow_seal_columns.rs` — the doc on the `net_volume: Option<i64>` **field** | "positive when the bar closed above the previous bar, negative when below" + "costs no per-instrument RAM" |
+| `shadow_candle_writer.rs` — the comment justifying the **NULL** | "NULL is the honest value for 'there was no previous bar to compare against'" |
+| `candle_pct_column_guard.rs` — the section header pinning that NULL | same phrase |
+
+**Both halves were wrong, and the second half is the one that would mislead an
+operator reading the table.** The sign is now flow, not direction — but also
+`None` no longer means "the day's first bar". `net_volume_classified` is set at
+bar-open from `signed_tick_volume.is_some()`, so a first-of-day bar WITH ticks
+is classified and reports a real value. `None` now means **this process did not
+classify the bar**: a disk-spill replay, a REST-folded bar, a zero-tick bar, or
+a zero-volume bar. That is a data-PROVENANCE fact. Reading a NULL as "start of
+day" would mislabel every spill-replayed row in `candles_<tf>`.
+
+**Why the merge missed them.** PR #1905 corrected the CONVERSION site in
+`shadow_seal_columns.rs` (~line 204) and left the field doc thirty lines above
+it untouched. The comment being edited got fixed; the doc a reader lands on from
+the type did not. Same file, same screen.
+
+Annotated in place with dated `⚠ CORRECTED` blocks rather than rewritten, per
+the house convention that the trail is the point.
+
+**Verified:** `candle_pct_column_guard` 12/12 green (it strips comments via
+`code_only`, so it could never have caught this — stated plainly rather than
+implied); `tickvault-storage --lib` 1,303 green; `cargo fmt --all --check`
+clean. A tree-wide sweep for the retired phrasing now returns only text inside
+explicit correction blocks.
+
+**NOT changed:** no arithmetic, no schema, no DDL statement, no test assertion.
+Comments and docs only. `ticks` is untouched and correctly has no `net_volume`
+column — a tick is one observation, net volume is a bar aggregate; its
+`total_buy_qty`/`total_sell_qty` are RESTING book totals and are already
+labelled as such.
+
+**STILL NOT delivered** (unchanged from Item 24): the accumulator does not
+survive a disk spill, so a replayed bar persists NULL. That needs a spill
+format bump plus a mixed-stride reader.

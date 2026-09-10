@@ -88,6 +88,46 @@ fn the_seed_is_actually_called_from_the_running_drain() {
 }
 
 #[test]
+fn the_ghost_family_is_seeded_so_the_unsubscribe_code_verdict_is_readable() {
+    // ADDED 2026-09-10 (compound-failure permutation sweep). The depth
+    // unsubscribe RequestCode was UNVERIFIED-LIVE (24 vs 25) when this was
+    // written; later the same day the live session read 25 as IGNORED and 24
+    // shipped, so 24 is now the one under verdict. The scope lock names
+    // exactly one instrument that can settle it: a session that ends
+    // with `ghost = 0` and `unsubscribed_grace > 0`. A label set that was never
+    // incremented is ABSENT from the exporter, not zero, so an unseeded ghost
+    // family makes that verdict unreadable — "no ghost" and "the detector
+    // never ran" collapse into the same silence. Every label of the family,
+    // because the agent computes its delta per LABEL SET.
+    let body = function_body(STACK, "fn seed_drain_loss_baselines()");
+    for field in [
+        "depth_ghost",
+        "depth_unsubscribed_grace",
+        "depth_ghost_redials",
+        "depth_ghost_exhausted",
+        "depth_refused",
+        "depth_dropped",
+        "depth_length_mismatch",
+    ] {
+        assert!(
+            body.contains(&format!("c.{field}.increment(0)")),
+            "tv_dhan_feed_depth_total{{outcome}} label `{field}` is not seeded in \
+             seed_drain_loss_baselines(). Until the first event of that kind the \
+             series does not exist, and the live unsubscribe-code verdict \
+             (ghost = 0 AND unsubscribed_grace > 0) cannot be read."
+        );
+    }
+    // The success arm must NOT be seeded here: `rows` moves on the first depth
+    // packet, and a seeded zero before the depth lane dials would read as
+    // positive evidence that a lane nothing has opened is healthy.
+    assert!(
+        !body.contains("c.depth_rows.increment(0)"),
+        "seed_drain_loss_baselines() seeds the depth `rows` success arm — a \
+         confident zero for a depth lane that has not dialed yet"
+    );
+}
+
+#[test]
 fn the_seed_is_not_hoisted_into_a_boot_wide_seeder() {
     // Guards the DESIGN decision, not just the presence. Seeding every
     // subsystem at boot would publish a confident zero for a drain that never

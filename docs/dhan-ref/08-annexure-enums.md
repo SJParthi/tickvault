@@ -110,7 +110,7 @@ SHIFTED toward 24; both readings are recorded and NEITHER is asserted as wire tr
 **UNVERIFIED-LIVE both ways, zero runtime impact** (depth WebSockets are FORBIDDEN FOREVER
 per `websocket-connection-scope-lock.md`; any currently-banned future depth work MUST
 live-probe before trusting either value). Code follow-up (comment-only, separate PR): the
-`constants.rs:395` "There is NO code 24" claim is now cross-surface-contested.
+`constants.rs:395` "There is NO code 24" claim is now cross-surface-contested. *(⚠ SETTLED LIVE 2026-09-10 — 25 ignored, 24 ships; see the end-of-file note.)*
 
 ### (c) Smaller classic-surface deltas (2026-07-14, Verified-live)
 
@@ -216,9 +216,9 @@ impl ExchangeSegment {
 | `21` | Subscribe — Full Packet        |
 | `22` | Unsubscribe — Full Packet      |
 | `23` | Subscribe — Full Market Depth  |
-| `25` | Unsubscribe — Full Market Depth|
+| `24` | Unsubscribe — Full Market Depth (classic surface; **LIVE-VERIFIED 2026-09-10: 25 is IGNORED** — see the end-of-file note) |
 
-> **SDK Note**: Python SDK `marketfeed.py` defines `Depth = 19` as a v1-only depth subscribe code (standalone market depth packet). This is deprecated in v2 and NOT listed above. The SDK rejects it for v2 subscriptions. Also note: the SDK's generic unsubscribe logic (`subscribe_code + 1`) produces code `24` for depth unsubscribe, but the correct code per this annexure is `25`. Our code uses `25`.
+> **SDK Note**: Python SDK `marketfeed.py` defines `Depth = 19` as a v1-only depth subscribe code (standalone market depth packet). This is deprecated in v2 and NOT listed above. The SDK rejects it for v2 subscriptions. Also note: the SDK's generic unsubscribe logic (`subscribe_code + 1`) produces code `24` for depth unsubscribe. **Until 2026-09-10 this note said the correct code was `25` and that our code used `25`; the live wire ignored every code-25 unsubscribe on 2026-09-10, and our code now sends `24`** (end-of-file note).
 
 ---
 
@@ -440,3 +440,25 @@ Others: `RSI_14`, `ATR_14`, `STOCHASTIC`, `STOCHRSI_14`, `MACD_26`, `MACD_12`, `
 | `CANCELLED` | Alert cancelled       |
 
 > **Note**: Conditional trigger order sub-objects use `discQuantity` (abbreviated), while regular orders use `disclosedQuantity`. Use the exact field name for each endpoint.
+
+---
+
+## 2026-09-10 — LIVE VERDICT: Unsubscribe Full Market Depth is **24**; code 25 is IGNORED by Dhan
+
+§(b) above recorded the 24-vs-25 split as "UNVERIFIED-LIVE both ways" and said
+any future depth work "MUST live-probe before trusting either value". The probe
+ran on 2026-09-10, the first session with the ghost-instrument family seeded, and
+with `25` on every unsubscribe frame:
+
+| Reading, 09:16–09:46 IST | Value |
+|---|---:|
+| `unsubscribe_ignored` events (a dropped contract still streaming past the 90 s grace) | **20** |
+| ghost redials armed | **10** |
+| distinct instruments streaming depth-200 on the 5 single-instrument sockets | **8** |
+
+Dhan honoured none of them. `24` — the classic-surface value and the SDK's own
+`subscribe_code + 1` — ships from 2026-09-10 (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`).
+**24 is itself unverified until a session reads `ghost = 0` with
+`unsubscribed_grace > 0`**; the same detector is the verdict instrument. Dated
+record and REJECT list: `.claude/rules/project/websocket-connection-scope-lock.md`
+"2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".

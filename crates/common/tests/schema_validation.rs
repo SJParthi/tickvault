@@ -162,6 +162,9 @@ fn schema_feed_unsubscribe_is_subscribe_plus_one() {
     assert_eq!(FEED_UNSUBSCRIBE_TICKER, FEED_REQUEST_TICKER + 1);
     assert_eq!(FEED_UNSUBSCRIBE_QUOTE, FEED_REQUEST_QUOTE + 1);
     assert_eq!(FEED_UNSUBSCRIBE_FULL, FEED_REQUEST_FULL + 1);
+    // Depth joined this rule on 2026-09-10, when the live wire proved the
+    // portal-export value (25) is ignored by Dhan. See constants.rs.
+    assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, FEED_REQUEST_TWENTY_DEPTH + 1);
 }
 
 // ---------------------------------------------------------------------------

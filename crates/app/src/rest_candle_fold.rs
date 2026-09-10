@@ -612,6 +612,13 @@ pub fn sealed_bucket_to_seal(
         // reject garbage) — u64 cannot carry a negative.
         volume: u64::try_from(b.volume.max(0)).unwrap_or(0),
         bucket_start_cumulative: 0,
+        // A REST bar is a whole minute delivered as one row: there is no tick
+        // sequence, so there is no tick RULE to apply and nothing to classify.
+        // `classified: false` makes `net_volume()` persist NULL, which is the
+        // honest answer — the accumulator being 0 would otherwise read as
+        // "this minute traded with perfectly balanced flow".
+        net_volume_signed: 0,
+        net_volume_classified: false,
         oi: 0,
         tick_count: 0,
         close_ts_ist_secs: b.last_bar_ist_secs.saturating_add(60),

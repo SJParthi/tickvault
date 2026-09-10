@@ -232,7 +232,8 @@ pub struct SubscriptionRequest {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TwoHundredDepthSubscriptionRequest {
-    /// Feed request code (23 = subscribe, 25 = unsubscribe).
+    /// Feed request code (23 = subscribe, 24 = unsubscribe — 25 was proven IGNORED
+    /// live on 2026-09-10; see `FEED_UNSUBSCRIBE_TWENTY_DEPTH`).
     #[serde(rename = "RequestCode")]
     pub request_code: u8,
     /// Exchange segment string (e.g., "NSE_EQ", "NSE_FNO").
@@ -867,14 +868,17 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_unsubscribe_request_code_25() {
+    fn test_two_hundred_depth_unsubscribe_request_code_24() {
+        // 25 was the value here until 2026-09-10, when a live session proved
+        // Dhan ignores it (20 unsubscribes, 0 honoured). 24 = subscribe + 1.
         let request = TwoHundredDepthSubscriptionRequest {
-            request_code: 25,
+            request_code: tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH,
             exchange_segment: "NSE_EQ".to_string(),
             security_id: "2885".to_string(),
         };
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"RequestCode\":25"));
+        assert!(json.contains("\"RequestCode\":24"));
+        assert!(!json.contains("\"RequestCode\":25"));
     }
 
     #[test]

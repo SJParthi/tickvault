@@ -152,6 +152,25 @@ struct InstrumentSlot {
     /// sentinel on this feed (Ticker-mode packets and pre-open instruments both
     /// carry it). Every consumer of this value already refuses a non-finite.
     last_ltp: f64,
+    /// Direction of the last CLASSIFIED tick for this instrument: `+1`
+    /// buy-initiated, `-1` sell-initiated, `0` before any classification.
+    ///
+    /// This is the zero-tick carry of the tick rule. A tick whose price equals
+    /// the previous tick's is attributed to the side that last moved the
+    /// price — unchanged-price ticks are the MAJORITY on a liquid contract, so
+    /// discarding them would under-report a bar's flow by most of its volume,
+    /// and splitting them evenly would invent a number the rule does not say.
+    ///
+    /// Per INSTRUMENT, not per timeframe. All 24 frames see the same tick
+    /// sequence, so one carry serves them all; storing it per frame would be 24
+    /// copies of one fact and would let them drift.
+    ///
+    /// `i8` because it holds three values. At `AGGREGATOR_MAX_SLOTS` (25,000)
+    /// that is 25 KB across the fleet — a rounding error against the 170 MB
+    /// slot table, and the reason this lives here rather than on
+    /// `LiveCandleState`, where it would have cost 24 bytes per instrument and
+    /// pushed a second budget assert.
+    last_tick_sign: i8,
 }
 
 /// Per-tick outcome, coalesced across all [`TF_COUNT`](crate::candles::TF_COUNT)
@@ -339,6 +358,84 @@ pub struct MultiTfAggregator {
 impl Default for MultiTfAggregator {
     fn default() -> Self {
         Self::new(FeedStrategy::DEFAULT)
+    }
+}
+
+/// Classifies one tick's traded volume as buy- or sell-initiated (the tick
+/// rule), returning it signed.
+///
+/// # The rule
+///
+/// - `price > prev` — an UPTICK. The trade lifted the offer, so the aggressor
+///   was a buyer: `+delta`.
+/// - `price < prev` — a DOWNTICK. The trade hit the bid: `-delta`.
+/// - `price == prev` — a ZERO TICK. Attributed to whichever side last moved
+///   the price, via `carry`. This is the case that decides whether the column
+///   is useful at all: unchanged-price ticks are the majority on a liquid
+///   contract, so discarding them would under-report a bar's flow by most of
+///   its volume, and halving them would invent a number the rule does not say.
+///
+/// `carry` is read AND updated: an up/down tick writes the new direction, a
+/// zero tick reads it and leaves it alone.
+///
+/// # The four refusals, each returning `0`
+///
+/// - **No delta** — nothing traded since the previous tick, so there is
+///   nothing to classify. The common case for a repeated snapshot.
+/// - **No previous price** (`prev` non-finite) — the first accepted tick for
+///   this instrument, where `last_ltp` is still `NaN`. `NaN` fails BOTH `>`
+///   and `<`, so an unguarded comparison would land on the zero-tick arm and
+///   attribute the whole first delta to a carry that is itself `0` — silently
+///   correct today, and silently wrong the moment the carry is non-zero from a
+///   previous day. Refused explicitly instead.
+/// - **Non-finite or non-positive current price** — `0.0` is this feed's
+///   absent-price sentinel (Ticker-mode packets, pre-open instruments), never
+///   a real price, and a poisoned price cannot classify anything.
+/// - **Zero tick with no carry** — the price has not moved since the first
+///   tick we ever saw for this instrument, so no side has revealed itself.
+///   Returning `0` says "unclassified"; guessing would be fabrication.
+///
+/// # Why the comparison is exact and not a tolerance
+///
+/// Both prices come from `f32_to_f64_clean`, so an unchanged price is
+/// bit-identical on both sides and compares equal. A widening `f32 as f64`
+/// would make `10.20` become `10.19999980926514` and report an unchanged price
+/// as an UPTICK — systematically, on the majority of ticks, which would turn
+/// this column into a near-copy of gross volume.
+///
+/// # Complexity
+/// O(1) — three compares, one negate, one byte written. Zero allocation. Runs
+/// ONCE per tick, never once per timeframe.
+#[inline]
+#[must_use]
+fn classify_tick_volume(prev: f64, price: f64, delta: u64, carry: &mut i8) -> i64 {
+    if delta == 0 || !price.is_finite() || price <= 0.0 {
+        return 0;
+    }
+    // Saturate BEFORE the sign: `-(u64 as i64)` past `i64::MAX` wraps POSITIVE,
+    // which would record a sell as a buy. Same hazard, same handling, as the
+    // tick-persistence path.
+    let magnitude = i64::try_from(delta).unwrap_or(i64::MAX);
+    if !prev.is_finite() || prev <= 0.0 {
+        // First classifiable tick for this instrument: there is no previous
+        // price to compare against, so the delta is real but unclassifiable.
+        // The carry is deliberately NOT written — inventing a direction here
+        // would then propagate to every zero tick that follows.
+        return 0;
+    }
+    if price > prev {
+        *carry = 1;
+        magnitude
+    } else if price < prev {
+        *carry = -1;
+        -magnitude
+    } else {
+        match *carry {
+            1 => magnitude,
+            -1 => -magnitude,
+            // No side has ever revealed itself for this instrument.
+            _ => 0,
+        }
     }
 }
 
@@ -602,6 +699,7 @@ impl MultiTfAggregator {
             cell: AggregatorCell::empty(),
             last_cumulative: 0,
             last_ltp: f64::NAN,
+            last_tick_sign: 0,
             // Deliberately NOT a baseline — see the field doc. The first tick
             // this slot folds replaces it with a real observation.
             volume_baseline_seeded: false,
@@ -1066,6 +1164,9 @@ impl MultiTfAggregator {
         // Recorded HERE, on the accepted-tick path, so it can never hold a price
         // the fold itself refused. Every earlier return in this function is a
         // refusal.
+        // Captured BEFORE the overwrite below — this is the tick rule's whole
+        // input, and it is available at exactly one instant in this function.
+        let prev_ltp = slot.last_ltp;
         slot.last_ltp = prices.last_traded_price;
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
@@ -1091,6 +1192,25 @@ impl MultiTfAggregator {
         // delta. It must stay above the loop.
         let extremes = slot.cell.observe_session_extremes(tick, fold_secs);
 
+        // TICK-RULE CLASSIFICATION — derived ONCE per tick, for the same
+        // reason `extremes` two lines up is: it is a comparison against the
+        // PREVIOUS PACKET, so running it inside the timeframe loop would
+        // compare a packet against itself for 23 of the 24 frames and destroy
+        // the answer.
+        //
+        // The delta is `cumulative - baseline`, where `baseline` is the
+        // previous ACCEPTED tick's day-cumulative for this instrument. That is
+        // the same quantity the fold uses for `volume` at a bucket rollover, so
+        // the net and the gross count exactly the same trades — which is what
+        // makes `net_volume().abs() <= volume` hold rather than merely be
+        // hoped for.
+        let signed_tick_volume = classify_tick_volume(
+            prev_ltp,
+            prices.last_traded_price,
+            cumulative_volume.saturating_sub(baseline),
+            &mut slot.last_tick_sign,
+        );
+
         for tf in TfIndex::ALL {
             match slot.cell.consume_tick_with_extremes(
                 tf,
@@ -1100,6 +1220,7 @@ impl MultiTfAggregator {
                 strategy,
                 cumulative_volume,
                 extremes,
+                Some(signed_tick_volume),
                 // Derived ONCE at :748, above this loop — the same hoisting
                 // contract as `prices` and `cumulative_volume`. Passing it
                 // down rather than recomputing it saves 48 conversions per
@@ -1240,6 +1361,19 @@ impl MultiTfAggregator {
             // UNSEEDED, not to a fabricated `0` baseline.
             slot.last_cumulative = 0;
             slot.volume_baseline_seeded = false;
+            // The tick-rule carry resets with the baseline, and for the same
+            // reason: a direction learned from yesterday's last print is not
+            // evidence about today's first. Carrying it across would attribute
+            // the whole of the new session's opening zero-tick volume to
+            // whichever side happened to move the price at yesterday's close.
+            //
+            // `last_ltp` is deliberately LEFT ALONE — it is a published
+            // accessor (`MultiTfAggregator::last_ltp`) whose contract is "the
+            // last accepted price", and blanking it here would make that
+            // reader answer `None` after a force-seal. The carry reset is
+            // enough: with `last_tick_sign` at 0, the first zero tick of the
+            // new day is refused as unclassified rather than mis-signed.
+            slot.last_tick_sign = 0;
             for tf in TfIndex::ALL {
                 if let Some(state) = slot.cell.force_seal(tf) {
                     emitted = emitted.saturating_add(1);
@@ -1392,6 +1526,429 @@ mod tests {
         }
     }
 
+    // -- tick-rule net volume (2026-09-10) ----------------------------------
+    //
+    // The classification lives HERE, not in the cell, because it needs the
+    // previous TICK and a cell only has bars. These tests drive the real
+    // `consume_tick` path end to end.
+
+    /// THE FIX, in one test: flow and close can DISAGREE, and the old
+    /// implementation reported the close.
+    ///
+    /// A bar that sells 1,000 into the bid and buys 400 on the offer, and
+    /// happens to close one tick above where it opened, has net flow of -600.
+    /// The pre-2026-09-10 code signed the whole 1,400 by the close direction
+    /// and reported +1,400 — wrong magnitude AND wrong sign.
+    #[test]
+    fn a_bar_that_closes_up_on_selling_flow_reports_negative_net_volume() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        // Establish a price, then a baseline tick so the first delta is real.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base, 100.0, 1_000),
+            None,
+            sink,
+        );
+        // DOWNTICK carrying 1,000: sell-initiated.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 1, 99.0, 2_000),
+            None,
+            sink,
+        );
+        // UPTICK carrying 400: buy-initiated. Closes ABOVE the first price.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 2, 101.0, 2_400),
+            None,
+            sink,
+        );
+
+        let bar = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .expect("bucket is open");
+        assert_eq!(bar.volume, 1_400, "gross is every lot that traded");
+        assert!(bar.close > 100.0, "the bar closed UP — that is the trap");
+        assert_eq!(
+            bar.net_volume(),
+            Some(-600),
+            "1,000 sold minus 400 bought. The old code signed the whole 1,400 \
+             by the close direction and answered +1,400 — wrong sign, wrong size"
+        );
+    }
+
+    /// The zero-tick carry: unchanged-price ticks keep the last direction.
+    ///
+    /// This is the case that decides whether the column is useful at all —
+    /// unchanged-price ticks are the majority on a liquid contract, so
+    /// discarding them would under-report a bar's flow by most of its volume.
+    #[test]
+    fn an_unchanged_price_carries_the_previous_direction() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base, 100.0, 1_000),
+            None,
+            sink,
+        );
+        // DOWNTICK 500 — sets the carry to sell.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 1, 99.0, 1_500),
+            None,
+            sink,
+        );
+        // FLAT 300 — same price, so it inherits the sell direction.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 2, 99.0, 1_800),
+            None,
+            sink,
+        );
+
+        assert_eq!(
+            agg.snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+                .expect("open")
+                .net_volume(),
+            Some(-800),
+            "500 on the downtick plus 300 carried at the same price"
+        );
+    }
+
+    /// Before any direction has revealed itself, a flat tick is UNCLASSIFIED.
+    ///
+    /// Guessing here would propagate: the carry would then sign every
+    /// subsequent flat tick on a direction nobody observed.
+    #[test]
+    fn a_flat_tick_with_no_carry_yet_contributes_nothing() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base, 100.0, 1_000),
+            None,
+            sink,
+        );
+        // Same price, real volume, and no direction has ever been observed.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 1, 100.0, 1_600),
+            None,
+            sink,
+        );
+
+        let bar = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .expect("open");
+        assert_eq!(bar.volume, 600, "the gross still counts it");
+        assert_eq!(
+            bar.net_volume(),
+            Some(0),
+            "traded but unclassifiable nets to zero — the bar DID trade, so \
+             this is a real reading, not the None of an untraded bar"
+        );
+    }
+
+    /// THE INVARIANT, driven through the real fold rather than asserted on a
+    /// hand-built state: the net can never exceed the gross.
+    #[test]
+    fn net_volume_never_exceeds_gross_volume_through_the_real_fold() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let mut cum = 1_000u32;
+        let mut price = 100.0f32;
+        let _ = agg.consume_tick(Feed::Dhan, &tick(77, SEG_IDX, base, price, cum), None, sink);
+        for i in 1..40u32 {
+            // Alternating direction with irregular sizes, so the net wanders.
+            price += if i % 3 == 0 { -0.5 } else { 0.25 };
+            cum += 10 * i;
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, base + i, price, cum),
+                None,
+                sink,
+            );
+        }
+
+        for tf in TfIndex::ALL {
+            let Some(bar) = agg.snapshot(Feed::Dhan, 77, SEG_IDX, tf) else {
+                continue;
+            };
+            if let Some(net) = bar.net_volume() {
+                assert!(
+                    net.unsigned_abs() <= bar.volume,
+                    "{tf:?}: net {net} exceeds gross {} — a row saying a bar \
+                     traded N lots of which more than N were buys",
+                    bar.volume
+                );
+            }
+        }
+    }
+
+    /// **Conservation across timeframes** — the property an operator checks by
+    /// eye: if `candles_1m` says a minute was +800, the `candles_1s` rows
+    /// underneath it must add up to +800.
+    ///
+    /// It holds BY CONSTRUCTION — `classify_tick_volume` runs once per tick and
+    /// the same signed number is added into every open bar, so the frames are
+    /// different WINDOWS over one classification, never different answers. But
+    /// "by construction" is a claim, and until this test nothing pinned it:
+    /// every other `net_volume` test asserts a property of ONE bar.
+    ///
+    /// This is also what makes a sub-minute frame legitimately look SPARSE
+    /// without being wrong. A second in which no tick arrived opens no bucket
+    /// at all — that is an absent ROW, not a missing measurement — and a
+    /// second whose only tick carried no new volume reports NULL. Neither
+    /// contributes to the sum, so the totals still agree.
+    #[test]
+    fn every_sub_minute_frame_sums_to_the_same_minute_net_volume() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut sealed: Vec<(TfIndex, i64)> = Vec::new();
+        // `OPEN` is minute-aligned, so [base, base+59] is exactly ONE M1 bucket.
+        let base = OPEN;
+
+        let mut cum = 1_000u32;
+        let mut price = 100.0f32;
+        for i in 0..60u32 {
+            // Irregular sizes and a flipping direction, including flat ticks
+            // that ride the carry — so the net is not trivially +gross and the
+            // sum has to do real work.
+            price += match i % 4 {
+                0 => 0.25,
+                1 => -0.50,
+                2 => 0.0,
+                _ => 0.75,
+            };
+            cum += 10 + i * 3;
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, base + i, price, cum),
+                None,
+                |_: Feed, _: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
+                    if let Some(net) = st.net_volume() {
+                        sealed.push((tf, net));
+                    }
+                },
+            );
+        }
+
+        let minute = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .and_then(|b| b.net_volume())
+            .expect("the minute bar traded and was classified");
+
+        // ANTI-VACUITY, checked before the loop that does the real asserting.
+        // Both of these have failed silently in this repository's history: a
+        // filter that excludes every frame makes the loop below assert nothing
+        // and the test pass green, and a net that equals the gross would mean
+        // the flat and down ticks above never exercised the carry — the sum
+        // would then be trivially conserved because every term has one sign.
+        let gross = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .map(|b| b.volume)
+            .expect("the minute bar exists");
+        assert!(
+            minute.unsigned_abs() < gross,
+            "the fixture never produced offsetting flow: net {minute} vs gross \
+             {gross} — conservation would hold trivially, so this test would \
+             prove nothing"
+        );
+
+        let mut frames_checked = 0usize;
+        for tf in TfIndex::ALL {
+            // Keep only frames whose buckets TILE this minute: the first starts
+            // exactly on the minute and the last still starts inside it. That
+            // admits every sub-minute frame and excludes D1, whose bucket began
+            // at midnight and holds volume this minute never saw.
+            if tf.bucket_start(base) != base || tf.bucket_start(base + 59) >= base + 60 {
+                continue;
+            }
+            frames_checked += 1;
+            let closed: i64 = sealed
+                .iter()
+                .filter(|(t, _)| *t == tf)
+                .map(|(_, net)| *net)
+                .sum();
+            // The frame's LAST bucket has not sealed yet, so it is still open
+            // and has to be read from the snapshot or the sum is short by it.
+            let still_open = agg
+                .snapshot(Feed::Dhan, 77, SEG_IDX, tf)
+                .and_then(|b| b.net_volume())
+                .unwrap_or(0);
+            assert_eq!(
+                closed + still_open,
+                minute,
+                "{tf:?}: its bars sum to {} but the minute they tile reports \
+                 {minute} — the frames disagree about the same trades, which \
+                 is the one thing a single per-tick classification is supposed \
+                 to make impossible",
+                closed + still_open
+            );
+        }
+
+        // The second-scale family alone is 19 frames; if the tiling filter ever
+        // stops admitting them, this test goes quiet rather than red.
+        assert!(
+            frames_checked >= 10,
+            "only {frames_checked} frames were compared — the tiling filter is \
+             excluding frames it should admit, so this test is no longer \
+             checking what it claims"
+        );
+    }
+
+    /// The first tick for an instrument has no previous price to compare to.
+    ///
+    /// `last_ltp` is `NaN` until the first accepted tick, and `NaN` fails BOTH
+    /// `>` and `<` — so an unguarded comparison would land on the zero-tick arm
+    /// and attribute the whole first delta to a carry. Refused instead.
+    #[test]
+    fn the_first_tick_of_an_instrument_is_never_classified() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base, 100.0, 5_000),
+            None,
+            sink,
+        );
+        assert_eq!(
+            agg.snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+                .expect("open")
+                .net_volume_signed,
+            0,
+            "the very first tick seeds the baseline; there is no previous \
+             price, so its delta is real but unclassifiable"
+        );
+    }
+
+    /// The classifier itself, exhaustively — the refusals are the interesting
+    /// half and each one is a hazard that has bitten this repository before.
+    #[test]
+    fn classify_tick_volume_refuses_every_input_it_cannot_read() {
+        let mut carry = 0i8;
+
+        // Nothing traded: nothing to classify.
+        assert_eq!(classify_tick_volume(100.0, 101.0, 0, &mut carry), 0);
+        assert_eq!(carry, 0, "a refused tick must not move the carry");
+
+        // No previous price (the first tick): real delta, unclassifiable.
+        assert_eq!(classify_tick_volume(f64::NAN, 101.0, 500, &mut carry), 0);
+        assert_eq!(
+            carry, 0,
+            "inventing a direction here would sign every following flat tick"
+        );
+
+        // Absent-price sentinel and poisoned prices on the current side.
+        assert_eq!(classify_tick_volume(100.0, 0.0, 500, &mut carry), 0);
+        assert_eq!(classify_tick_volume(100.0, f64::NAN, 500, &mut carry), 0);
+        assert_eq!(
+            classify_tick_volume(100.0, f64::INFINITY, 500, &mut carry),
+            0
+        );
+
+        // Flat with no carry: no side has revealed itself.
+        assert_eq!(classify_tick_volume(100.0, 100.0, 500, &mut carry), 0);
+
+        // Now the classifying cases.
+        assert_eq!(classify_tick_volume(100.0, 101.0, 500, &mut carry), 500);
+        assert_eq!(carry, 1, "an uptick sets the carry to buy");
+        assert_eq!(classify_tick_volume(101.0, 101.0, 300, &mut carry), 300);
+        assert_eq!(carry, 1, "a flat tick READS the carry, never rewrites it");
+        assert_eq!(classify_tick_volume(101.0, 99.0, 700, &mut carry), -700);
+        assert_eq!(carry, -1, "a downtick sets the carry to sell");
+        assert_eq!(classify_tick_volume(99.0, 99.0, 200, &mut carry), -200);
+    }
+
+    /// `-(u64 as i64)` past `i64::MAX` wraps POSITIVE, which would record a
+    /// sell as a buy. Same hazard, same handling, as the tick-persistence path.
+    #[test]
+    fn classify_tick_volume_saturates_instead_of_wrapping_a_sell_into_a_buy() {
+        let mut carry = -1i8;
+        let signed = classify_tick_volume(100.0, 99.0, u64::MAX, &mut carry);
+        assert!(signed < 0, "a downtick must never classify as buy volume");
+        assert_eq!(signed, -i64::MAX);
+    }
+
+    /// An exact comparison, never a widened `f32`.
+    ///
+    /// `10.20_f32 as f64` is `10.19999980926514`. Comparing that against a
+    /// decimal-clean `10.2` reports an UNCHANGED price as an UPTICK —
+    /// systematically, on the majority of ticks, which would turn this column
+    /// into a near-copy of gross volume.
+    #[test]
+    fn an_unchanged_decimal_clean_price_is_flat_not_an_uptick() {
+        let clean = tickvault_common::price_precision::f32_to_f64_clean(10.20_f32);
+        let mut carry = -1i8;
+        assert_eq!(
+            classify_tick_volume(clean, clean, 900, &mut carry),
+            -900,
+            "identical decimal-clean prices must compare EQUAL and take the \
+             carry, not read as a rise"
+        );
+    }
+
+    /// The day boundary resets the carry, never inherits it.
+    ///
+    /// A direction learned from yesterday's last print is not evidence about
+    /// today's first, and carrying it would attribute the whole of the new
+    /// session's opening flat volume to whichever side moved the price at
+    /// yesterday's close.
+    #[test]
+    fn a_force_seal_clears_the_tick_rule_carry() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base, 100.0, 1_000),
+            None,
+            sink,
+        );
+        // A downtick sets the carry to sell.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 1, 99.0, 1_500),
+            None,
+            sink,
+        );
+
+        let _ = agg.force_seal_all(sink);
+
+        // New day: a flat tick must NOT inherit yesterday's sell direction.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 86_400, 99.0, 200),
+            None,
+            sink,
+        );
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, base + 86_401, 99.0, 900),
+            None,
+            sink,
+        );
+
+        assert_eq!(
+            agg.snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+                .expect("open")
+                .net_volume_signed,
+            0,
+            "yesterday's direction is not evidence about today"
+        );
+    }
     // -- volume-conservation guards (live defect, measured 2026-08-24) ------
     //
     // The live box tiled ONE trading day five ways and got five different

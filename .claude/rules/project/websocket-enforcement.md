@@ -45,13 +45,13 @@ paths:
 
 11. **Order update field names differ from REST.** Single-char codes (`C`=CNC, `B`=Buy, etc.), PascalCase keys, `MsgCode: 42`.
 
-12. **Unsubscribe depth = code 25, NOT 24.** Dhan SDK has a bug here (subscribe_code + 1 = 24). Our code correctly uses 25.
+12. **Unsubscribe depth = code 24 (since 2026-09-10).** This rule said "25, NOT 24 — the SDK has a bug" until the live session of 2026-09-10 proved Dhan IGNORES code 25 (20 ignored unsubscribes, 10 ghost redials, 8 instruments on 5 depth-200 sockets in 30 minutes). 24 = `subscribe_code + 1`, the rule every other unsubscribe code obeys. Dated record: `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".
 
 ## Depth Rebalancing Rules (added 2026-04-16)
 
 13. **Depth rebalancing uses command channel — NEVER disconnect+reconnect for ATM swap.**
     - `DepthCommand::Swap20` for 20-level, `DepthCommand::Swap200` for 200-level
-    - Sends RequestCode 25 (unsub old) then 23 (sub new) on same WebSocket
+    - Sends RequestCode 24 (unsub old — was 25 until 2026-09-10, see rule 12) then 23 (sub new) on same WebSocket
     - Zero disconnect, zero reconnect, zero tick gap, O(1) latency
 
 14. **Depth connections cap at 60 retry attempts.** No infinite retry loops.

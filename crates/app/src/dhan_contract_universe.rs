@@ -1857,44 +1857,73 @@ pub async fn load_contract_universe(
     prices.extend(ram);
     let spot = spot_paise_by_symbol(&symbols, &prices);
 
-    // Publish the contract -> underlying/family mapping the ranking layer reads
-    // per tick. Built HERE because this is the one place that holds BOTH inputs
-    // -- the day's contract rows and the symbol map -- so building it anywhere
-    // else would mean re-reading two artifacts to learn what is already in hand.
-    //
-    // Before the selection, deliberately: the map describes what the artifact
-    // CONTAINS, not what capacity let us subscribe. A contract dropped for
-    // capacity is still one the drain may see a tick for (it can be on the
-    // depth pools), and an unmapped tick is silently unrankable.
-    {
-        crate::contract_underlying_map::pre_register_contract_underlying_counters();
-        let (legs, artifact_refusals) =
-            crate::contract_underlying_map::legs_from_artifact(&contracts, &symbols);
-        // Counted by REASON, not just totalled. The count alone is what this
-        // line carried until 2026-09-09, and on 2026-09-08 and 2026-09-09 it
-        // read `113182` then `113746` -- EVERY option leg in the artifact --
-        // while saying nothing about why, so the top-volume board ranked
-        // nothing for two sessions and the cause had to be found by reading
-        // source. See `count_artifact_refusals` for the full record.
-        let artifact_refusal_reasons =
-            crate::contract_underlying_map::count_artifact_refusals(&artifact_refusals);
-        let build = crate::contract_underlying_map::global_contract_underlying_map()
-            .publish_from_legs(&legs);
-        tracing::info!(
-            mapped_contracts = build.accepted,
-            refused_in_build = build.refusals.len(),
-            refused_in_artifact_scan = artifact_refusals.len(),
-            artifact_refusal_reasons = %artifact_refusal_reasons,
-            "contract-to-underlying map published — this is what the top-volume ranking \
-             can see"
-        );
-    }
-
     let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
     let mut selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
     // Carried on the selection rather than logged here alone, so the pure
     // classifier below can tell the two failures apart without re-reading I/O.
     selection.spot_rows_available = prices.len();
+
+    // Publish the contract -> underlying/family mapping the ranking layer reads
+    // per tick. Built HERE because this is the one place that holds BOTH inputs
+    // -- the day's contract rows and the symbol map -- so building it anywhere
+    // else would mean re-reading two artifacts to learn what is already in hand.
+    //
+    // AFTER the selection, with the SELECTED contracts ordered FIRST —
+    // CORRECTED 2026-09-10. This block sat BEFORE the selection on the
+    // reasoning that the map should describe what the artifact CONTAINS. The
+    // artifact contains every expiry: 76,890 option legs on 2026-09-10 against
+    // a 25,000-entry cap, so the build kept the first 25,000 in FILE order and
+    // refused 51,890 — and file order is not subscription order. A subscribed
+    // contract among the refused was unrankable, silently: its ticks arrived,
+    // `owner_of` answered `None`, and the drain skipped them by design. Now
+    // every subscribed option leg is mapped before any unsubscribed one takes
+    // a slot; the room left after them still goes to the artifact's remainder,
+    // so the map still describes more than the wire carries — just not INSTEAD
+    // of it.
+    {
+        crate::contract_underlying_map::pre_register_contract_underlying_counters();
+        let (legs, artifact_refusals) =
+            crate::contract_underlying_map::legs_from_artifact(&contracts, &symbols);
+        // Counted by REASON, not just totalled. The count alone is what the
+        // line below carried until 2026-09-09, and on 2026-09-08 and
+        // 2026-09-09 it read `113182` then `113746` -- EVERY option leg in the
+        // artifact -- while saying nothing about why, so the top-volume board
+        // ranked nothing for two sessions and the cause had to be found by
+        // reading source. See `count_artifact_refusals` for the full record.
+        let artifact_refusal_reasons =
+            crate::contract_underlying_map::count_artifact_refusals(&artifact_refusals);
+        let (legs, selected_first) =
+            crate::contract_underlying_map::order_selected_first(legs, &selection.instruments);
+        if selected_first == 0 && !selection.instruments.is_empty() {
+            // A non-empty selection that shares ZERO legs with the artifact means
+            // the two were built from different contract sets (a stale artifact
+            // after an expiry rollover, or an id-space mismatch). Every subscribed
+            // option is then unrankable, and the info line below would read as
+            // success on `mapped_contracts` alone.
+            tracing::warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "contract_map_selection_disjoint",
+                subscribed_instruments = selection.instruments.len(),
+                option_legs_in_artifact = legs.len(),
+                "contract-to-underlying map shares no option leg with the subscribed \
+                 set — the ranking cannot see any subscribed contract"
+            );
+        }
+        let build = crate::contract_underlying_map::global_contract_underlying_map()
+            .publish_from_legs(&legs);
+        tracing::info!(
+            mapped_contracts = build.accepted,
+            subscribed_option_legs_ordered_first = selected_first,
+            subscribed_instruments = selection.instruments.len(),
+            option_legs_in_artifact = legs.len(),
+            refused_in_build = build.refusals.len(),
+            refused_in_artifact_scan = artifact_refusals.len(),
+            artifact_refusal_reasons = %artifact_refusal_reasons,
+            "contract-to-underlying map published — this is what the top-volume ranking \
+             can see; every subscribed option leg was offered a slot before any \
+             unsubscribed one"
+        );
+    }
 
     tracing::info!(
         contracts_in_artifact = contracts.len(),

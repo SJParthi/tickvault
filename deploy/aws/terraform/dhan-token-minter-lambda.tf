@@ -95,10 +95,13 @@ resource "aws_lambda_function" "dhan_token_minter" {
   handler       = "bootstrap"
   runtime       = "provided.al2023"
   architectures = ["arm64"]
-  # 60s: the mint is one HTTP POST (bounded to 20s by MINT_TIMEOUT_SECS) plus
-  # 3 concurrent SSM reads and 1 SSM write. Generous headroom for a cold start
-  # without letting a hung call burn minutes.
-  timeout          = 60
+  # 120s (raised from 60 on 2026-09-10): the mint is up to TWO HTTP POSTs
+  # (each bounded to 20s by MINT_TIMEOUT_SECS) separated by a wait for the
+  # next 30s TOTP step (MAX_TOTP_ATTEMPTS = 2 — one in-invocation retry on a
+  # TOTP rejection), behind a 12s freshness floor: 12 + 20 + 30 + 20 = 82s
+  # worst case, plus 3 concurrent SSM reads and 1 SSM write. Headroom for a
+  # cold start without letting a hung call burn minutes.
+  timeout          = 120
   memory_size      = 128
   filename         = "${path.module}/.lambda-zips/dhan-token-minter.zip"
   source_code_hash = chomp(file("${path.module}/.lambda-zips/source.digest"))

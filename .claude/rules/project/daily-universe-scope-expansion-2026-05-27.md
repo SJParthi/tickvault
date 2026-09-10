@@ -2333,6 +2333,41 @@ Monday headroom, nothing more).
 
 **What Monday still needs, unchanged:** the replay-watermark code fix (a restart must not replay already-applied segments — the 25–75 GB per restart cost measured on 2026-09-03), a no-in-session-deploy rule, and the depth write-volume decision. None of those shipped tonight; the wipe buys Monday, not the week.
 
+> ### ⚠ CORRECTED 2026-09-10 — the replay watermark IS built and IS wired, and BOTH statements of "not built" have stood for five days
+>
+> Line 2259 above and line 2334 below each list "the replay-watermark code fix (a restart
+> must not replay already-applied segments)" as outstanding work. That was true when Quote 21
+> was written in the early hours of 2026-09-05. **It stopped being true the same day.**
+>
+> `crates/storage/src/wal_applied_watermark.rs` landed in `6b7e5d7` (2026-09-05, PR #1864 —
+> *"a restart never replays WAL frames it already applied — applied watermark,
+> ack-before-confirm, open-segment exclusion, disk floor and frame cap on replay"*), and it is
+> **production-WIRED, not merely present** — which is the distinction that matters, because a
+> module with no caller is not a fix:
+>
+> | Surface | Site |
+> |---|---|
+> | `frame_is_applied` / `range_is_applied` / `skip_below` | `wal_applied_watermark.rs:211`, `:224`, `:160` |
+> | STAGE-C boot replay + catch-up drain consume it | `dhan_feed_stack.rs:11994` (`mark_depth_tracked` / `mark_depth_untracked`, min-of-both), `:12200` (`reset_unapplied_below` + `persist_now`), `:6050`, `:10699` |
+> | Both sinks advance it on ACK | `tick_persistence.rs:2371`, `:3104`; `depth_persistence.rs:1939` (`note_depth_acked`) |
+> | The WIRING — not the module's existence — is pinned | `crates/app/tests/wal_applied_watermark_wiring_guard.rs` (14 tests, incl. `stage_c_boot_replay_is_the_fenced_form`, `the_catchup_drain_is_the_fenced_form`, `both_lane_confirms_wait_for_the_writer_ack`) |
+>
+> **Stale in the ALARMING direction, which is the expensive one.** A session trusting these
+> two lines opens work to build something that shipped five days ago — the exact cost the
+> `day_ohlc_tracker` row records on 2026-08-12, where a stale row did not merely fail to warn
+> but manufactured a false finding. It also understates the system: the 25–75 GB-per-restart
+> replay cost line 2334 cites as an open risk is the cost this module was built to remove.
+>
+> **NOT retired by this correction, and both still stand:** the other two Monday follow-ups
+> named on the same lines — the **no-in-session-deploy rule** and the **depth write-volume
+> decision**. Neither has shipped. Depth remains ~80% of the session payload, which is the
+> driver behind every disk quote in this file.
+>
+> The reusable half is the one this file keeps recording: a claim about whether a MECHANISM
+> exists is checkable in one command (`ls crates/storage/src/wal_applied_watermark.rs` and a
+> grep for its call sites), and must be re-run at the moment of writing rather than carried
+> forward. Two statements of it were carried forward for five days.
+
 ---
 
 ## ⚠ CORRECTED 2026-09-06 — the ten `EXECUTION_FAILURE` / `AccessDenied` flags in this file are STALE
