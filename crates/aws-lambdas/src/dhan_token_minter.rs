@@ -486,11 +486,33 @@ pub async fn fetch_credentials_from<S: SecretStore>(
     })
 }
 
-/// Mints a fresh Dhan access token via the TOTP flow.
+/// The vendor's own rejection text, whichever envelope carried it.
 ///
-/// # Errors
+/// Dhan is documented to answer a wrong PIN or a wrong TOTP as **200 with an
+/// error body** (`DhanError`), and the 2026-09-04 / 2026-09-10 rejections are
+/// only recorded in CloudWatch, not in this tree — so the status code they
+/// actually carried is **Unknown here**. Matching `DhanError` alone would make
+/// the retry unreachable on its own incident if that rejection was a 4xx.
 ///
-/// Returns the [`MintError`] describing which stage failed.
+/// Both envelopes are therefore read. The cost of being wrong in this
+/// direction is one extra login attempt on a body that merely mentions the
+/// word; the cost of being wrong the other way is the retry never firing at
+/// all. Every other variant (transport, config, SSM, malformed token) returns
+/// `None`: none of them is a code the next step can fix.
+fn totp_rejection_message(err: &MintError) -> Option<&str> {
+    match err {
+        MintError::DhanError(message) => Some(message.as_str()),
+        MintError::HttpStatus { body, .. } => Some(body.as_str()),
+        MintError::CredentialRead(_)
+        | MintError::TotpGeneration(_)
+        | MintError::Transport(_)
+        | MintError::NoToken(_)
+        | MintError::MalformedToken(_)
+        | MintError::Configuration(_)
+        | MintError::Publish(_) => None,
+    }
+}
+
 /// Rejections Dhan phrases as a TOTP problem, and nothing else.
 ///
 /// Matched case-insensitively on the token `totp` because the wording is
@@ -598,17 +620,19 @@ where
             sleep(fresh_wait).await;
         }
         match mint_token_once(http, auth_base_url, credentials).await {
-            Err(MintError::DhanError(message))
-                if attempt < MAX_TOTP_ATTEMPTS && is_totp_rejection(&message) =>
+            Err(err)
+                if attempt < MAX_TOTP_ATTEMPTS
+                    && totp_rejection_message(&err).is_some_and(is_totp_rejection) =>
             {
                 let next_step =
                     now_unix_secs().map_or(TOTP_STEP_SECS, secs_to_sleep_for_next_totp_step);
-                // The message is Dhan's own rejection text — never the code,
-                // the PIN or the token.
+                // The vendor rejection text — never the code, the PIN or the
+                // token. Read from EITHER envelope: a non-2xx carrying the same
+                // wording must retry too, or the fix misses its own incident.
                 warn!(
                     attempt,
                     wait_secs = next_step,
-                    reason = %capture_body(&message, 300),
+                    reason = %capture_body(totp_rejection_message(&err).unwrap_or_default(), 300),
                     "Dhan rejected the TOTP code; waiting for the next step and \
                      retrying ONCE with a code generated from it"
                 );
@@ -1925,6 +1949,130 @@ mod tests {
             1,
             "a second identical PIN is a second failed login and cannot succeed"
         );
+    }
+
+    /// A TOTP rejection delivered as a **non-2xx** must retry too.
+    ///
+    /// Dhan is documented to answer credential problems as 200-with-error, and
+    /// the retry originally matched that envelope alone. The status code the
+    /// 2026-09-04 / 2026-09-10 rejections actually carried is not recorded in
+    /// this tree, so a 4xx would have left the fix unreachable on the very
+    /// incident it was written for.
+    #[tokio::test]
+    async fn mint_token_retries_a_totp_rejection_carried_by_a_non_2xx_status() {
+        // One-shot server: the retry is REFUSED at the socket, so reaching
+        // `transport` proves a SECOND attempt was made. A no-retry build stops
+        // at the first response and reports `http_status`.
+        let (base, served) = start_mint_server(
+            "401 Unauthorized",
+            "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}",
+        )
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, waits) = recording_sleeper();
+
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect_err("a one-shot server cannot serve the retry");
+
+        assert_eq!(
+            err.stage(),
+            "transport",
+            "the second attempt must have been made and refused; got: {err}"
+        );
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the one-shot server served the first attempt only"
+        );
+        let waited = waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // NO COUNT IS ASSERTED, and that is deliberate: a count here would
+        // pin an artefact of the fake sleeper rather than a product property.
+        // The recording sleeper returns AT ONCE and never advances the clock,
+        // so both freshness reads see the same second and fire together or
+        // not at all — the reachable counts are 1 and 3, never 2. In
+        // PRODUCTION the sleeps are real, the step boundary is crossed, and
+        // the second freshness read returns 0, so the true count is 2. An
+        // `== 2` assertion therefore encoded the production shape and failed
+        // whenever the wall clock started with more than `MIN_CODE_LIFE_SECS`
+        // of code life; relaxing it to `2 || 3` still failed the other ~63%
+        // of the step (measured over 250 isolated runs of the compiled
+        // binary). The two assertions ABOVE are what actually prove the
+        // retry: `stage() == "transport"` says a second attempt reached the
+        // socket, and `served.len() == 1` says the one-shot server answered
+        // only the first. What is left to check here is the timeout budget.
+        assert!(
+            !waited.is_empty(),
+            "the rejection path always waits for the next TOTP step before \
+             the second attempt: {waited:?}"
+        );
+        assert!(
+            waited.iter().all(|secs| *secs <= TOTP_STEP_SECS),
+            "no single wait may exceed one TOTP step, or the 82 s worst case \
+             behind the 120 s Lambda timeout stops holding: {waited:?}"
+        );
+    }
+
+    /// A non-2xx that is NOT a TOTP problem still must not burn a second login.
+    #[tokio::test]
+    async fn mint_token_does_not_retry_a_non_totp_http_error() {
+        let (base, served) = start_mint_server(
+            "401 Unauthorized",
+            "{\"status\":\"error\",\"message\":\"Invalid client id\"}",
+        )
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, _) = recording_sleeper();
+
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect_err("a client-id rejection must fail");
+
+        assert_eq!(err.stage(), "http_status", "got: {err}");
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "a wrong client id cannot be fixed by the next TOTP step"
+        );
+    }
+
+    /// The rejection text is read from BOTH envelopes and from nothing else.
+    #[test]
+    fn totp_rejection_message_reads_either_envelope_and_no_other_variant() {
+        assert_eq!(
+            totp_rejection_message(&MintError::DhanError("Invalid TOTP".into())),
+            Some("Invalid TOTP")
+        );
+        assert_eq!(
+            totp_rejection_message(&MintError::HttpStatus {
+                status: 401,
+                body: "Invalid TOTP".into(),
+            }),
+            Some("Invalid TOTP")
+        );
+        for other in [
+            MintError::Transport("dns".into()),
+            MintError::TotpGeneration("bad base32".into()),
+            MintError::CredentialRead("denied".into()),
+            MintError::NoToken("{}".into()),
+            MintError::MalformedToken("nope".into()),
+            MintError::Configuration("missing".into()),
+            MintError::Publish("ssm".into()),
+        ] {
+            assert_eq!(
+                totp_rejection_message(&other),
+                None,
+                "no TOTP step can fix {other}"
+            );
+        }
     }
 
     #[test]

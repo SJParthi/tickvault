@@ -472,6 +472,31 @@ flight, are the two candidates and neither is measured. The retry heals the
 symptom in ~30 s instead of ~60 s and stops the false page; a persistent
 rejection still surfaces on the same alarm, one attempt later.
 
+> **AMENDED 2026-09-10 (same day, by an adversarial re-read) — the retry as
+> first written could have MISSED ITS OWN INCIDENT.** The match arm was
+> `Err(MintError::DhanError(message))`, i.e. the **200-with-error-envelope**
+> only. Dhan is documented to answer a wrong PIN or a wrong TOTP that way, and
+> the code's own test fixtures use it — but the status code the 2026-09-04 and
+> 2026-09-10 rejections ACTUALLY carried is recorded in CloudWatch, not in this
+> tree, so it is **Unknown here**. Had either been a 4xx, it would have
+> classified as `MintError::HttpStatus` and the retry would never have fired on
+> the very incident it was written for, while this section said it did.
+>
+> FIXED in the same PR: `totp_rejection_message(&err)` reads the vendor text
+> from EITHER envelope (`DhanError` body or `HttpStatus` body) and returns
+> `None` for every other variant — transport, config, SSM, malformed token —
+> because no next TOTP step can fix any of those. The no-retry guarantee for a
+> PIN or client-id rejection is unchanged and is now proven in both envelopes
+> (`mint_token_does_not_retry_a_pin_rejection`,
+> `mint_token_does_not_retry_a_non_totp_http_error`), and the retry itself is
+> proven on a non-2xx by `mint_token_retries_a_totp_rejection_carried_by_a_non_2xx_status`.
+>
+> **Honest cost of being wrong in the new direction:** a non-2xx body that
+> merely contains the word buys ONE extra login attempt. Being wrong the other
+> way meant the retry never firing at all. Recorded because a fix whose
+> reachability on its own incident is Unknown is not a fix that may be
+> described as shipped.
+
 **What a PR that violates §10.8 looks like (REJECT):** raises
 `MAX_TOTP_ATTEMPTS` above 2 (login-attempt burn on a wrong secret); retries a
 non-TOTP rejection; retries within the SAME TOTP step; lowers the Lambda
