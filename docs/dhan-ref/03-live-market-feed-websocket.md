@@ -343,7 +343,7 @@ pub enum FeedRequestCode {
     SubscribeFull        = 21,
     UnsubscribeFull      = 22,
     SubscribeFullDepth   = 23,
-    UnsubscribeFullDepth = 25,
+    UnsubscribeFullDepth = 24, // 25 was proven IGNORED live 2026-09-10 (08-annexure-enums.md, end note)
 }
 
 // ─── Feed Response Code Enum ───

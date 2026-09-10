@@ -341,6 +341,60 @@ silently-failed subscribe has **no other evidence in the entire system** — no 
 no parse failure, no log line of its own — so absence measured against a seeded key is
 the only thing that can ever report it.
 
+> **⚠ CORRECTED 2026-09-10 — "the app already gates the emit to the CONTINUOUS
+> session" was true of the per-instrument silence page and FALSE of the
+> dead-CLASS report that carries the same code.** `report_dead_classes`
+> ("instrument class produced NOTHING since subscribe") runs inside the scan,
+> ABOVE the 30-second arm's market-hours gate, and it fired `RISK-GAP-03` for
+> `NSE_FNO` at **08:33 IST and 09:00 IST on 2026-09-10**: ~22,000 option
+> contracts seeded at the 08:31 boot, warmup elapsed, and — because nothing
+> trades before the 09:15 bell — every one of them still never-ticked. Dead by
+> construction, on every trading morning, into the log-filter alarm this row
+> created. FIXED the same day: the class verdict is judged only when the scan's
+> own wall clock is inside the continuous session (`ist_secs_of_day_from_millis`
+> → `is_within_market_hours_ist`), and the latch stands down outside it so the
+> first in-session sweep raises a genuine edge. The alarm, its threshold and
+> its cost are unchanged; only the false morning page is gone. Pinned by
+> `the_dead_class_verdict_is_deferred_until_the_continuous_session`.
+>
+> > **AMENDED 2026-09-10 (same day, hours later, by an adversarial re-read of
+> > this very fix) — "only the false morning page is gone" was WRONG, and the
+> > half it missed is the one this file already had a rule for.** The gate
+> > shipped with the WALL CLOCK alone. The SIBLING per-instrument silence page,
+> > on the SAME 30-second arm, has required `silence_page_allowed_today()` — the
+> > TRADING CALENDAR — since **2026-08-14**, added for exactly this shape: the
+> > EventBridge start rule is `MON-FRI`, which INCLUDES NSE holidays, so on a
+> > weekday holiday the lane seeds the whole universe, receives nothing —
+> > correctly, the market is shut — and every seeded instrument crosses the
+> > floor at once. The class report inherited the market-hours half and NOT the
+> > calendar half, so on a holiday the box would have paged `RISK-GAP-03` for
+> > EVERY seeded segment at 09:15: the same regression the 2026-08-14 note
+> > closed, re-created one function up, inside the change that closed its
+> > sibling.
+> >
+> > FIXED in the same PR: the gate is now
+> > `dead_class_verdict_is_due(in_session, trading_day)` — a named pure function
+> > so the holiday case has a real test instead of a process-global `OnceLock`
+> > fixture — fed by `is_within_market_hours_ist(...)` AND
+> > `silence_page_allowed_today()`. Pinned by
+> > `a_weekday_holiday_never_judges_a_class_dead` (the logic) and
+> > `the_dead_class_gate_consults_both_the_clock_and_the_calendar` (the wiring,
+> > because a pure function nothing calls with both halves is worth nothing).
+> >
+> > **Still NOT claimed, and it is a REAL residual:** the first in-session sweep
+> > can land at 09:15:00.x, before any option contract has printed. At that
+> > instant ~22,000 contracts seeded at 08:31 are past warmup and have never
+> > ticked, so a whole class can still read dead in the first sub-second of a
+> > genuine trading day. There is no post-bell grace; the sibling page has one
+> > (`SILENCE_SCANS_BEFORE_ALERT`) and the class report does not. Recorded
+> > rather than fixed here: adding a grace changes WHEN a real dead class is
+> > reported, which is its own decision.
+> >
+> > The reusable half is the one this file keeps recording: **the fix for a
+> > false page is the place to check whether the sibling leg already solved a
+> > harder version of the same problem.** The calendar gate was eleven lines
+> > away, with a comment naming this exact failure, and the fix walked past it.
+
 **Family (5) is therefore SIX signals, not four:** lane down · socket parked · ticks
 dropped · **durable floor breached (new)** · **connected-but-silent (new)** · [the
 withdrawn drain-respawn row]. Cost: **+1 metric alarm ≈ $0.10/mo** and **+1 errcode

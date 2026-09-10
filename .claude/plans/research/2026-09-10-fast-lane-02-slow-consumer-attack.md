@@ -1,0 +1,30 @@
+# Fast-lane attack 02 — how OUR process becomes Dhan's slow consumer (2026-09-10)
+
+Read-only hostile review. Labels: **V** = Verified (file:line), **A** = Assumed, **U** = Unknown. No cargo run.
+
+## Receive-side shape (baseline, all V)
+
+- Reader task per socket: `socket.recv()` = ONE `stream.next().await` on `WebSocketStream<MaybeTlsStream<TcpStream>>` (`connection.rs:1019,1355,1558`) — rustls decrypt runs ON the reader task (inherent). Read buffer 16 KiB, max frame 512 KiB depth-200 (`connection.rs:197,175`).
+- Loop body: `sink.accept()` + `supervisor.on_event()` (`pool_supervisor.rs:4491-4494`). `accept` = WAL `try_send` + byte-budget atomics + ring `try_send`, no await (`pool_supervisor.rs:3037-3150`, `ws_frame_spill.rs:1078-1135`).
+- Ring: `mpsc::channel(65_536)` frames (`dhan_feed_stack.rs:3875,12219`), byte cap 192 MiB main / 64 MiB depth (`:4083,4229,4248`). Full ⇒ `RingFull` counted, frame stays in WAL, reader keeps polling.
+- Dwell gauge `record_ring_dwell` at `dhan_feed_stack.rs:5222`, published `:7978`, alarm ≥2,000 ms (noise-lock §2.3u). **Measured value: U** — no reading is recorded anywhere in the tree.
+- Runtime: 2 tokio workers, `AllowedCPUs=1-2` (`tickvault.service:256,263`; `main.rs:468-471`); QuestDB `cpuset 2,3`, `cpus 2.0` (`docker-compose.yml:187,193`); NIC IRQs → core 0, RPS off (`apply-host-tuning.sh:91-130`); rmem_max 128 MiB, autotune on, **SO_RCVBUF never set** (`99-tickvault-net.conf`, its own text).
+- OS threads on cores 1-2 besides the 2 workers: tv-tick-writer, tv-tick-rescue, tv-depth-writer, tv-depth-rescue, tv-top-volume-writer, ws-frame-spill-writer, tv-seal-escalate (7, V by `thread::Builder` census).
+
+## Permutations
+
+| # | Condition → mechanism | What we lose | Detected today | Sev | Fix shape |
+|---|---|---|---|---|---|
+| 1 | Disk saturates → WAL writer stalls → `spill_tx` FULL / byte budget hit → `error!` per refused frame **unthrottled**, ON the reader task (`ws_frame_spill.rs:1141`, `:1214`; reached from `pool_supervisor.rs:3059`). At 12,500 fps that is 12,500 JSON-formatted tracing events/s inside `recv()`. The supervisor throttled ITS lines on 2026-09-05 (`:3916-3940`) and named this exact storm; the storage-layer line one call deeper was missed. | Reader stops polling → Dhan skips forward → **upstream tick loss, invisible** | Partially: `WS-SPILL-02` filter pages; the reader stall itself is not measured | **CRITICAL** | Power-of-two throttle on both arms (V: `drop_critical` counter already exists) |
+| 2 | Contract attach at ~09:16: `Extend` runs ON the reader task before `select!` — up to `TOPUP_WIRE_BUDGET` 5 s, ≥42 sends × 25 ms (`pool_supervisor.rs:3971-4030`, `:2288`). Depth swaps: `SWAP_WIRE_BUDGET` 1 s per op, ≤4 swaps/socket/min (`:4183,4225`). | No `recv()` for 1–5 s on a main-feed socket **during the open burst**; kernel buffer absorbs (A: 128 MiB ≈ tens of s at 2 MB/s) but Dhan's server-side skip threshold is U | No — dwell measures ring, not reader | **HIGH** | Split sink/stream (`StreamExt::split`) so sends run on a sibling task |
+| 3 | QuestDB O3 merge/WAL-apply runs `cpus 2.0` on cpuset 2,3 → core 2 fully taken → app effectively 1 core for 2 workers + 7 OS threads + 16 reader tasks + drain | Reader tasks starve behind the drain on core 1 (tokio has no priority) → slow consumer | No: dwell flat (reader is upstream of ring); `worst_conn_tick_age` only at 600 s | **HIGH** | QuestDB `cpus: 1.5` or app AllowedCPUs=1 + reader-only runtime; measure `nr_throttled` |
+| 4 | `blocking_flush` → `block_in_place` 2× per 500 ms even when offloaded (`dhan_feed_stack.rs:4840,4970-4973,5029`). Each call demotes the worker and hands its queue to a fresh thread. | Migration jitter for the 16 reader tasks on a 2-worker runtime; A: tens of µs each | No | LOW | Skip `block_in_place` when `writer_is_offloaded()` AND depth offloaded |
+| 5 | Depth-200 client ping `socket.send_ping().await` on the reader's 1 s ticker, bounded by 10 s (`pool_supervisor.rs:4658-4670`, `connection.rs:298`). | A hung TLS write holds `recv()` up to 10 s every 10 s | No | MED | Same split as #2 |
+| 6 | Drain arms besides decode+fold: 1 s/5 s rank (2 sorts/s, 900 µs each ≈ 0.2%), `catch_up_seal` 5 s (9.67 ms = 0.2%), `scan_silence` 30 s (70 µs), flush arms (try_send only). Ring headroom at 12,500 fps ≈ 5.2 s. | ≤ ~12 ms pauses vs 5.2 s ring: none | Yes (dwell) | LOW | none |
+| 7 | Depth rows on the drain: 400 ILP appends per depth-200 packet, ~63,800 rows/s session-wide (`:7069`, CLAUDE.md measured rows). Per-row cost U. | If >5 µs/row the drain alone is >30% duty at the open | Yes (dwell, `ring_full`) | MED | Measure `drain_depth_frame` per-row cost |
+| 8 | 16 TLS decrypts + 16 `stream.next()` on 2 workers; a 512 KiB depth frame = 32 × 16 KiB reads (`connection.rs:197`) | A: fine at ~2 MB/s; U at 5.3 depth updates/s × 5 sockets | No | LOW | measure |
+| 9 | Alloy/Loki sidecars pinned to core 0 WITH softirq (`docker-compose.yml:416,451`); the log storm from #1 lands on the same core as packet receive | softirq starvation → netdev backlog (65,536 ≈ 0.87 s) drops | No | MED | consequence of #1; fix #1 |
+| 10 | Stacked disconnect frame discards data packets ahead of the control packet (`connection.rs:1600-1640`) | Real loss, logged only | Log-sink only | LOW | as recorded |
+
+## Bottom line
+The reader loop body IS two operations — but the WAL refusal path beneath it still formats an unthrottled `error!` per frame, and every socket's control-plane sends (attach, swap, ping) await on the very task whose only job is to keep polling. Neither is visible to the dwell gauge, which sits downstream of both.

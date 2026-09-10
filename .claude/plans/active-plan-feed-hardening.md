@@ -216,7 +216,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
 
     | Policy | What it gets right | Why it is wrong on its own |
     |---|---|---|
-    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(25)` + `subscribe(23)` on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
+    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(24)` + `subscribe(23)` *(was written as 25; proven ignored live 2026-09-10 — see the scope lock)* on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
     | **Static from the 2nd minute to EOD** | one contiguous 200-level book per instrument, perfectly comparable all day, zero churn, zero gaps | a 2% index move leaves the "ATM" strike deep OTM by the close. Its book thins to almost nothing, so the back half of the day records depth for a strike nobody is trading — technically complete data about the wrong instrument |
     | **HYSTERESIS (recommended)** | keeps the book on a strike that stays meaningful, while swapping rarely enough that the series stays readable | needs two named constants and a dwell timer — which is work, not a config flip |
 

@@ -3232,7 +3232,31 @@ impl LiveIngest {
         });
         metrics::gauge!(INSTRUMENTS_SILENT_GAUGE).set(silent as f64);
         metrics::gauge!(INSTRUMENTS_NEVER_TICKED_GAUGE).set(never as f64);
-        self.report_dead_classes(&classes);
+        // CORRECTED 2026-09-10: the class verdict is judged ONLY inside the
+        // continuous session. Until today this line ran unconditionally, and
+        // on 2026-09-10 it fired `RISK-GAP-03` for NSE_FNO at 08:33 IST and
+        // again at 09:00 IST: ~22,000 option contracts were seeded at the 08:31
+        // boot, their warmup elapsed, and — because NOTHING trades before the
+        // 09:15 bell — every one of them was still never-ticked. That is
+        // "dead" by construction, on every trading morning, and it drives the
+        // `errcode-risk-gap-03` log-filter alarm (noise lock §2.3a). The
+        // per-instrument silence PAGE on the 30 s arm has been session-gated
+        // since 2026-08-12; this rollup sat above that gate, inside the scan,
+        // and inherited none of it.
+        //
+        // Judged on `now_millis` — the same wall clock the scan itself uses —
+        // rather than a second clock read, so a test can drive both halves
+        // with one number. Outside the session the latch is CLEARED, not held:
+        // the pre-open must not carry a verdict into the bell, and a post-close
+        // latch would only ever be consulted by the next boot's fresh state.
+        if dead_class_verdict_is_due(
+            is_within_market_hours_ist(ist_secs_of_day_from_millis(now_millis)),
+            silence_page_allowed_today(),
+        ) {
+            self.report_dead_classes(&classes);
+        } else {
+            self.stand_down_dead_class_report();
+        }
         (silent, never, named)
     }
 
@@ -3284,6 +3308,19 @@ impl LiveIngest {
 
         metrics::gauge!(DEAD_CLASSES_GAUGE).set(dead_now as f64);
         self.dead_class_latch.store(current, Ordering::Relaxed);
+    }
+
+    /// The out-of-session counterpart of [`Self::report_dead_classes`]: no
+    /// class is judged, the gauge reads zero, and the latch is cleared so the
+    /// first in-session sweep can raise a genuine rising edge.
+    ///
+    /// Clearing rather than holding is deliberate. A latch set pre-open (the
+    /// 2026-09-10 shape) would suppress the very first honest verdict at
+    /// 09:15 as "already reported this episode" — the report would be lost
+    /// exactly when it became true.
+    fn stand_down_dead_class_report(&self) {
+        metrics::gauge!(DEAD_CLASSES_GAUGE).set(0.0);
+        self.dead_class_latch.store(0, Ordering::Relaxed);
     }
 
     /// Seals every bucket the watermark has moved past, mid-session.
@@ -3716,7 +3753,8 @@ fn seed_drain_loss_baselines() {
     // ADDED 2026-09-10 by the compound-failure permutation sweep. The ghost
     // family is the ONLY instrument that can verify the depth unsubscribe
     // RequestCode live: the scope lock names "a session with `ghost = 0` and
-    // `unsubscribed_grace > 0`" as the evidence that code 25 works. Unseeded,
+    // `unsubscribed_grace > 0`" as the evidence that the shipped code works
+    // (it caught 25 as IGNORED on 2026-09-10; 24 ships since). Unseeded,
     // that verdict cannot be read — a label set that was never incremented is
     // ABSENT from the exporter, and absent is indistinguishable from "no
     // ghost ever appeared". All four labels, for the per-label-set reason the
@@ -8111,6 +8149,30 @@ pub struct DhanFeedStackParams {
 /// `CROSSVERIFY_DEPS`.
 static TRADING_CALENDAR: OnceLock<Arc<tickvault_common::trading_calendar::TradingCalendar>> =
     OnceLock::new();
+
+/// Whether a dead-CLASS verdict may be judged on this sweep.
+///
+/// BOTH halves are required, and they answer different questions.
+///
+/// `in_session` is the WALL CLOCK. Before 09:15 nothing has traded, so a class
+/// that produced nothing is not dead — it has not been given a session to tick
+/// in. That half landed 2026-09-10, after the report fired at 08:33 and 09:00
+/// IST for `NSE_FNO` on ~22,000 contracts seeded at the 08:31 boot.
+///
+/// `trading_day` is the CALENDAR, and it is the half that fix forgot. The
+/// EventBridge start rule is `MON-FRI`, which INCLUDES NSE holidays, so on a
+/// weekday holiday the lane seeds the whole universe, receives nothing —
+/// correctly, the market is shut — and at 09:15 every seeded class reads dead
+/// at once. The sibling per-instrument silence page on this same 30 s arm has
+/// gated on the calendar since 2026-08-14 for exactly that reason
+/// (`silence_page_allowed_today`); the class report shipped with the
+/// wall-clock half alone and re-created that regression one function up.
+///
+/// Named pure function rather than an inline `&&` so the holiday case has a
+/// test that never has to set the process-global trading calendar.
+pub(crate) const fn dead_class_verdict_is_due(in_session: bool, trading_day: bool) -> bool {
+    in_session && trading_day
+}
 
 /// True when today is an NSE trading day — or when the calendar is not
 /// installed.
@@ -13333,6 +13395,19 @@ pub const fn is_within_market_hours_ist(secs_of_day: u64) -> bool {
         && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
 }
 
+/// IST seconds-of-day for a wall-clock instant in unix-epoch MILLISECONDS.
+///
+/// Pure and total: saturating throughout, so `u64::MAX` yields a number rather
+/// than a panic, and the drain's 30-second arm can hand it whatever the clock
+/// produced. Pairs with [`is_within_market_hours_ist`], which takes the
+/// seconds-of-day this returns.
+#[must_use]
+pub const fn ist_secs_of_day_from_millis(now_millis: u64) -> u64 {
+    let ist_secs = (now_millis / 1_000)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_SECONDS.unsigned_abs() as u64);
+    ist_secs % (tickvault_common::constants::SECONDS_PER_DAY as u64)
+}
+
 /// Current IST seconds-of-day.
 #[must_use]
 pub fn now_ist_secs_of_day() -> u64 {
@@ -13340,6 +13415,22 @@ pub fn now_ist_secs_of_day() -> u64 {
     let t = ist.time();
     u64::from(chrono::Timelike::num_seconds_from_midnight(&t))
 }
+
+// -- dead-class verdict is session-gated (2026-09-10) — test fixtures -----
+//
+// Wall-clock unix millis for three IST instants, shared by `mod tests` and
+// `mod connection_delivery_tests` (declared at file level so both can see
+// them; a module-private copy in one left the other with an E0425).
+// 1970-01-01 is fine: the gate reads seconds-of-day, not the date.
+/// 08:31 IST — the boot minute on 2026-09-10, when the false report fired.
+#[cfg(test)]
+const PRE_OPEN_0831_IST_MILLIS: u64 = (3 * 3_600 + 60) * 1_000;
+/// 09:16 IST — one minute into the continuous session.
+#[cfg(test)]
+const SESSION_0916_IST_MILLIS: u64 = (3 * 3_600 + 46 * 60) * 1_000;
+/// 10:00 IST — a plain in-session instant.
+#[cfg(test)]
+const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
 
 #[cfg(test)]
 mod tests {
@@ -17254,7 +17345,10 @@ mod tests {
     #[test]
     fn the_dead_class_rollup_is_wired_into_the_live_silence_sweep() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-        let seeded_at = 1_000u64;
+        // In-session base (10:00 IST). Since 2026-09-10 the class verdict is
+        // judged only inside the continuous session; the old `1_000` base was
+        // 05:30 IST and would now (correctly) report nothing.
+        let seeded_at = IN_SESSION_1000_IST_MILLIS;
         for sid in [13u64, 25, 51] {
             assert!(
                 ingest.seed(sid, ExchangeSegment::IdxI, seeded_at),
@@ -23495,5 +23589,154 @@ mod connection_delivery_tests {
             .find(|d| d.connection_index == slot)
             .expect("every slot has a row");
         assert_eq!(row.tick_age_secs, Some(0));
+    }
+
+    #[test]
+    fn ist_secs_of_day_from_millis_is_total_and_ist_shifted() {
+        assert_eq!(ist_secs_of_day_from_millis(0), 19_800, "epoch is 05:30 IST");
+        assert_eq!(
+            ist_secs_of_day_from_millis(IN_SESSION_1000_IST_MILLIS),
+            10 * 3_600
+        );
+        assert_eq!(
+            ist_secs_of_day_from_millis(PRE_OPEN_0831_IST_MILLIS),
+            8 * 3_600 + 31 * 60
+        );
+        assert_eq!(
+            ist_secs_of_day_from_millis(SESSION_0916_IST_MILLIS),
+            9 * 3_600 + 16 * 60
+        );
+        // IST midnight is 18:30 UTC.
+        assert_eq!(
+            ist_secs_of_day_from_millis((18 * 3_600 + 30 * 60) * 1_000),
+            0
+        );
+        // Total: the largest clock value must not panic and must stay a
+        // seconds-of-day.
+        assert!(
+            ist_secs_of_day_from_millis(u64::MAX)
+                < u64::from(tickvault_common::constants::SECONDS_PER_DAY)
+        );
+        assert!(!is_within_market_hours_ist(ist_secs_of_day_from_millis(
+            PRE_OPEN_0831_IST_MILLIS
+        )));
+        assert!(is_within_market_hours_ist(ist_secs_of_day_from_millis(
+            SESSION_0916_IST_MILLIS
+        )));
+    }
+
+    /// The 2026-09-10 false page, replayed: contracts seeded at the 08:31 boot,
+    /// warmup elapsed, nothing ticked — because the market is not open. That
+    /// is not a dead class; it is Tuesday morning.
+    #[test]
+    fn the_dead_class_verdict_is_deferred_until_the_continuous_session() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let seeded_at = PRE_OPEN_0831_IST_MILLIS;
+        for sid in [13u64, 25, 51] {
+            assert!(ingest.seed(sid, ExchangeSegment::IdxI, seeded_at));
+        }
+        let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+
+        // Past warmup, still pre-open: nothing may be judged and nothing
+        // latched — the pre-2026-09-10 code latched here and fired RISK-GAP-03.
+        let _ = ingest.scan_silence(seeded_at + floor + 1);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            0,
+            "a class that has not been given a session to tick in is not dead"
+        );
+
+        // First in-session sweep with still nothing received: NOW it is a
+        // dead class, and the edge must be a fresh rising edge.
+        let _ = ingest.scan_silence(SESSION_0916_IST_MILLIS);
+        let bit = 1u8 << segment_class_index(ExchangeSegment::IdxI);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            bit,
+            "the first in-session sweep must judge, or the gate has become a mute"
+        );
+    }
+
+    /// A weekday NSE HOLIDAY must never judge a class dead.
+    ///
+    /// The EventBridge start rule is `MON-FRI`, so on a holiday the box boots,
+    /// seeds the whole universe and receives nothing — correctly, the market is
+    /// shut. With the wall-clock half alone, 09:15 turned that into
+    /// `RISK-GAP-03` for every seeded segment: the same false page the sibling
+    /// per-instrument leg closed on 2026-08-14 by gating on the calendar.
+    ///
+    /// Driven through the pure verdict rather than the process-global calendar
+    /// so the holiday case is a real assertion and not a `OnceLock` fixture.
+    #[test]
+    fn a_weekday_holiday_never_judges_a_class_dead() {
+        assert!(
+            dead_class_verdict_is_due(true, true),
+            "in session on a trading day is the ONLY case that judges"
+        );
+        assert!(
+            !dead_class_verdict_is_due(true, false),
+            "09:15 on an NSE holiday: the market is shut, so a class that \
+             produced nothing is not dead — this is the 2026-08-14 regression"
+        );
+        assert!(
+            !dead_class_verdict_is_due(false, true),
+            "pre-open on a trading day still has nothing to judge"
+        );
+        assert!(!dead_class_verdict_is_due(false, false));
+    }
+
+    /// The pure verdict is worthless if the call site does not pass BOTH halves.
+    ///
+    /// Source-scan rather than behavioural because the calendar half reads a
+    /// process-global `OnceLock` that a unit test cannot un-set; this pins the
+    /// wiring, `a_weekday_holiday_never_judges_a_class_dead` pins the logic.
+    #[test]
+    fn the_dead_class_gate_consults_both_the_clock_and_the_calendar() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let gate = source
+            .split_once("if dead_class_verdict_is_due(")
+            .expect(
+                "the dead-class gate must go through dead_class_verdict_is_due, \
+                 never a bare wall-clock `if`",
+            )
+            .1
+            .split_once(") {")
+            .expect("unterminated dead-class gate")
+            .0;
+        assert!(
+            gate.contains("is_within_market_hours_ist("),
+            "the dead-class gate lost its wall-clock half"
+        );
+        assert!(
+            gate.contains("silence_page_allowed_today()"),
+            "the dead-class gate lost its TRADING-CALENDAR half — on a weekday \
+             NSE holiday it will page RISK-GAP-03 for every seeded segment"
+        );
+    }
+
+    /// A latch carried out of the session is cleared, never held: the next
+    /// in-session sweep must be able to raise a rising edge of its own.
+    #[test]
+    fn leaving_the_session_clears_the_dead_class_latch() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        for sid in [13u64, 25, 51] {
+            assert!(ingest.seed(sid, ExchangeSegment::IdxI, IN_SESSION_1000_IST_MILLIS));
+        }
+        let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+        let _ = ingest.scan_silence(IN_SESSION_1000_IST_MILLIS + floor + 1);
+        assert_ne!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            0,
+            "precondition: latched in-session"
+        );
+
+        // 16:00 IST — after the close.
+        let after_close = (10 * 3_600 + 30 * 60) * 1_000;
+        let _ = ingest.scan_silence(after_close);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed),
+            0,
+            "out of session the latch stands down"
+        );
     }
 }
