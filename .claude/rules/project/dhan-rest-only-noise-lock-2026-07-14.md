@@ -341,6 +341,22 @@ silently-failed subscribe has **no other evidence in the entire system** — no 
 no parse failure, no log line of its own — so absence measured against a seeded key is
 the only thing that can ever report it.
 
+> **⚠ CORRECTED 2026-09-10 — "the app already gates the emit to the CONTINUOUS
+> session" was true of the per-instrument silence page and FALSE of the
+> dead-CLASS report that carries the same code.** `report_dead_classes`
+> ("instrument class produced NOTHING since subscribe") runs inside the scan,
+> ABOVE the 30-second arm's market-hours gate, and it fired `RISK-GAP-03` for
+> `NSE_FNO` at **08:33 IST and 09:00 IST on 2026-09-10**: ~22,000 option
+> contracts seeded at the 08:31 boot, warmup elapsed, and — because nothing
+> trades before the 09:15 bell — every one of them still never-ticked. Dead by
+> construction, on every trading morning, into the log-filter alarm this row
+> created. FIXED the same day: the class verdict is judged only when the scan's
+> own wall clock is inside the continuous session (`ist_secs_of_day_from_millis`
+> → `is_within_market_hours_ist`), and the latch stands down outside it so the
+> first in-session sweep raises a genuine edge. The alarm, its threshold and
+> its cost are unchanged; only the false morning page is gone. Pinned by
+> `the_dead_class_verdict_is_deferred_until_the_continuous_session`.
+
 **Family (5) is therefore SIX signals, not four:** lane down · socket parked · ticks
 dropped · **durable floor breached (new)** · **connected-but-silent (new)** · [the
 withdrawn drain-respawn row]. Cost: **+1 metric alarm ≈ $0.10/mo** and **+1 errcode
