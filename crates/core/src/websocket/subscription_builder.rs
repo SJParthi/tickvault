@@ -26,7 +26,7 @@
 //! | Instruments per depth-200 CONNECTION | 1 | `docs/dhan-ref/04-full-market-depth-websocket.md:91`, `:270` |
 //! | `SecurityId` JSON type | **string** | `docs/dhan-ref/03-live-market-feed-websocket.md:72` |
 //! | Depth segments | NSE only | `docs/dhan-ref/04-full-market-depth-websocket.md:13`, `:274` |
-//! | Depth unsubscribe code | 25 (NOT 24) | `docs/dhan-ref/04-full-market-depth-websocket.md:280` |
+//! | Depth unsubscribe code | **24** (25 was proven IGNORED live on 2026-09-10) | `docs/dhan-ref/04-full-market-depth-websocket.md:280`, `docs/dhan-ref/08-annexure-enums.md` §(b) |
 //!
 //! # Why 5 + 5 + 5 + 1 = 16 is legal
 //!
@@ -319,12 +319,16 @@ pub fn build_twenty_depth_subscription_messages(
     ))
 }
 
-/// Builds batched 20-level depth unsubscribe messages (RequestCode **25**).
+/// Builds batched 20-level depth unsubscribe messages (RequestCode **24**).
 ///
-/// NOT 24. `docs/dhan-ref/04-full-market-depth-websocket.md:280` records that
-/// the vendor's own reference client derives unsubscribe as
-/// `subscribe_code + 1` = 24, which is a bug in that client; the Dhan
-/// Annexure value is 25 and that is what we send.
+/// 24, NOT 25 — since 2026-09-10. This function sent 25 until then, on the
+/// belief that the vendor reference client's `subscribe_code + 1` derivation
+/// (= 24) was a bug in that client. The live session of 2026-09-10 proved the
+/// opposite: every code-25 unsubscribe was ignored by Dhan (20
+/// `unsubscribe_ignored` events, 10 ghost redials, 8 instruments on 5
+/// depth-200 sockets in thirty minutes). The client was right; the portal
+/// export was wrong. `FEED_UNSUBSCRIBE_TWENTY_DEPTH` carries the evidence and
+/// the scope lock carries the dated record.
 ///
 /// (The vendor client's language is named in the referenced doc, not here —
 /// `rust-only-forever-lock-2026-07-19.md` keeps the interpreted-runtime's
@@ -362,13 +366,14 @@ pub fn build_two_hundred_depth_subscription_message(
     )
 }
 
-/// Builds the 200-level depth unsubscribe message (RequestCode 25).
+/// Builds the 200-level depth unsubscribe message (RequestCode 24 — see the
+/// depth-20 sibling above for why 25 was retired on 2026-09-10).
 pub fn build_two_hundred_depth_unsubscription_message(
     segment: ExchangeSegment,
     security_id: u64,
 ) -> Result<String, String> {
     build_two_hundred_depth_message(
-        tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 25
+        tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 24 for both 20- and 200-level
         segment,
         security_id,
     )
@@ -765,13 +770,17 @@ mod tests {
     }
 
     #[test]
-    fn test_twenty_depth_unsubscribe_is_code_25_not_24() {
+    fn test_twenty_depth_unsubscribe_is_code_24_not_25() {
+        // Inverted 2026-09-10: this test pinned 25 and called the vendor
+        // client's 24 "a BUG". The live wire ignored 25 twenty times in
+        // thirty minutes; 24 is `subscribe_code + 1`, the rule every other
+        // unsubscribe code in this file already obeys.
         let messages = build_twenty_depth_unsubscription_messages(&make_instruments(3), 100);
         assert!(
-            messages[0].contains("\"RequestCode\":25"),
-            "doc 04:280 — the vendor SDK's 24 is a BUG; the Annexure value is 25"
+            messages[0].contains("\"RequestCode\":24"),
+            "2026-09-10 live verdict — code 25 is ignored by Dhan; 24 ships"
         );
-        assert!(!messages[0].contains("\"RequestCode\":24"));
+        assert!(!messages[0].contains("\"RequestCode\":25"));
     }
 
     #[test]
@@ -820,11 +829,14 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_unsubscribe_is_code_25() {
+    fn test_two_hundred_depth_unsubscribe_is_code_24() {
         let msg = build_two_hundred_depth_unsubscription_message(ExchangeSegment::NseEquity, 2885)
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
-        assert_eq!(parsed["RequestCode"], 25);
+        assert_eq!(
+            parsed["RequestCode"], 24,
+            "2026-09-10 live verdict: 25 is ignored"
+        );
         assert_eq!(parsed["SecurityId"], "2885");
     }
 
