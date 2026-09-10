@@ -2674,7 +2674,32 @@ impl LiveIngest {
         // gap that had already been closed.) Keeping
         // the row means an instrument past the cap still has a complete tick
         // record; only its candles are missing, and the counter says so.
-        let hard_refusal = stats.refused_price || stats.refused_timestamp;
+        // 2026-09-10: the two DAY-MISMATCH refusals join the hard set.
+        //
+        // Operator directive, recorded in `websocket-connection-scope-lock.md`
+        // ("2026-09-10 — A TICK WHOSE EXCHANGE DAY IS NOT THE RECEIPT DAY IS
+        // REFUSED OUTRIGHT"): a tick whose exchange day is not the receipt day
+        // must not reach the database at all.
+        //
+        // They were CANDLE-ONLY from 2026-08-26, on the reasoning that "the ROW
+        // is a real last-traded price and is kept". That is true about a price
+        // and wrong about THIS table: `ts` is QuestDB's designated timestamp, so
+        // the kept row lands in a PREVIOUS DAY's partition and silently amends a
+        // day that already closed — indistinguishable, once there, from a
+        // genuine trade at that time on that day.
+        //
+        // The delivery mechanism is every reconnect: Dhan sends LAST TRADE
+        // TIME, so each connect snapshot re-injects one of these per dormant
+        // contract (measured mean 5 hours stale, max 34 days), which is why the
+        // operator saw the shape at 09:15 and after every manual restart.
+        //
+        // Both directions, deliberately: `future_trading_day` is the same
+        // defect mirrored, and leaving it candle-only would keep exactly half
+        // the hole open.
+        let hard_refusal = stats.refused_price
+            || stats.refused_timestamp
+            || stats.stale_trading_day
+            || stats.future_trading_day;
 
         // Two refuse only the CANDLE and keep the row — see above. They are
         // mutually exclusive with the three by construction, which is why this
@@ -2703,6 +2728,13 @@ impl LiveIngest {
         // being thrown away by the fold before reaching a writer built to
         // take them. It is candle-only and not a full acceptance because an
         // out-of-band second still cannot be placed in a bucket.
+        // ⚠ SUPERSEDED 2026-09-10 for the two DAY-MISMATCH reasons — both are
+        // HARD refusals now (operator directive; see the block above the
+        // `hard_refusal` binding). The paragraph below is kept verbatim because
+        // its reasoning is the record of why the row was originally kept, and
+        // reading it is what makes the reversal auditable rather than silent.
+        // Everything it says about the OTHER candle-only reasons still stands.
+        //
         // `future_trading_day` joins the candle-only set on 2026-09-09, in the
         // same change that created it, because a refusal the caller does not
         // consume is worse than no refusal at all: the fold declines the tick
@@ -2714,10 +2746,17 @@ impl LiveIngest {
         // a fall that the monotonicity gate defends until the 32-tick
         // re-latch. Candle-only and not hard, for the same reason as its
         // mirror: the ROW is a real last-traded price and is kept.
+        // ⚠ CORRECTED 2026-09-10 — `stale_trading_day` and `future_trading_day`
+        // are NO LONGER in this list. They moved to the HARD set above on the
+        // operator's dated directive; leaving them here would have been
+        // harmless arithmetic (`&& !hard_refusal` makes them unreachable) and
+        // actively misleading prose, since this list is what a reader consults
+        // to learn which refusals keep the row. The paragraph above still
+        // describes them as candle-only and is annotated rather than rewritten,
+        // per house convention — its REASONING is the record of why the row was
+        // kept, and why that reasoning failed for `ticks` specifically.
         let candle_only_refusal = (stats.out_of_session
             || stats.untraded_sentinel
-            || stats.stale_trading_day
-            || stats.future_trading_day
             || stats.untraded_timestamp
             || stats.out_of_band_timestamp
             || stats.slot_exhausted)
@@ -2730,6 +2769,17 @@ impl LiveIngest {
             } else if stats.refused_timestamp {
                 self.refused_timestamp = self.refused_timestamp.saturating_add(1);
                 "timestamp"
+            } else if stats.stale_trading_day {
+                // Named, never folded into `out_of_session`: the two are
+                // different faults with different remedies. Out-of-session is a
+                // clock/window question; a stale trading day is the vendor
+                // snapshotting a dormant contract's last real trade, and its
+                // rate is the honest measure of how much a reconnect injects.
+                self.refused_stale_trading_day = self.refused_stale_trading_day.saturating_add(1);
+                "stale_trading_day"
+            } else if stats.future_trading_day {
+                self.refused_future_trading_day = self.refused_future_trading_day.saturating_add(1);
+                "future_trading_day"
             } else {
                 self.refused_out_of_session = self.refused_out_of_session.saturating_add(1);
                 "out_of_session"
@@ -15788,6 +15838,28 @@ mod tests {
         );
     }
 
+    /// An in-session exchange second on **today's** IST day.
+    ///
+    /// Every drain test that expects a frame to FOLD needs this rather than a
+    /// frozen literal, and the reason is the 2026-09-10 day gate: the drain
+    /// stamps `received_at_nanos` from `Utc::now()`, so a hard-coded 2026-05-22
+    /// exchange second is a different IST DAY from the receipt and the tick is
+    /// refused outright — `folded` goes to 0 and the test fails on an
+    /// assertion that has nothing to do with what it was written to prove.
+    ///
+    /// 09:16:40 IST is the time of day, kept from the literal this replaced
+    /// (`1_779_355_000`): safely inside the candle session window, so the fold
+    /// opens a bucket whatever hour the suite actually runs at. Only the DATE
+    /// moves with the clock, which is the only part the day gate reads.
+    fn todays_in_session_ltt() -> u32 {
+        let ist_now = chrono::Utc::now().timestamp().saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ));
+        let ist_midnight = ist_now - ist_now.rem_euclid(86_400);
+        // 09:16:40 IST = 33,400 seconds past midnight.
+        u32::try_from((ist_midnight + 33_400).max(0)).unwrap_or(0)
+    }
+
     /// Builds one 16-byte ticker packet (response code 2) for `security_id`.
     fn ticker_packet(security_id: u32, ltp: f32, ltt: u32) -> [u8; 16] {
         let mut p = [0u8; 16];
@@ -17747,23 +17819,34 @@ mod tests {
         );
     }
 
-    /// A tick the vendor stamped for a FUTURE trading day must be booked as a
-    /// candle-only refusal, not swept through as a full acceptance.
+    /// A tick the vendor stamped for a FUTURE trading day must be REFUSED
+    /// OUTRIGHT — no candle, and no row in `ticks` either.
     ///
-    /// This is the bite-proof for the defect the fold gate shipped with: the
-    /// aggregator declined the tick and returned `future_trading_day`, and the
-    /// drain consumed the flag NOWHERE — neither `hard_refusal` nor
-    /// `candle_only_refusal` mentioned it — so the tick fell past both early
-    /// returns and reached `observe_for_ranking` carrying ANOTHER DAY'S
-    /// cumulative volume. That is precisely the baseline poisoning the comment
-    /// above `record_prev_close_from_tick` describes for its mirror,
-    /// `stale_trading_day`.
+    /// ⚠ RE-BLESSED 2026-09-10. This test shipped on 2026-09-09 asserting
+    /// `WrittenOutOfSession`, and the assertion was correct for the contract
+    /// that then existed: the day mismatch was a CANDLE-only refusal, because
+    /// the tick is a real last-traded price and discarding it would lose the
+    /// ability to tell "did not trade today" from "did not capture".
     ///
-    /// Removing `stats.future_trading_day` from `candle_only_refusal` makes
-    /// this fail on the outcome, which is the half that matters: the counter
-    /// assertion alone would still pass.
+    /// The operator reversed that on 2026-09-10 after finding rows in `ticks`
+    /// whose `received_at` was 09:15 today and whose `ts` was 15:29 on an
+    /// earlier day. `ts` is QuestDB's DESIGNATED timestamp, so those rows land
+    /// in a PRIOR DAY'S PARTITION — a table whose retention and audit meaning
+    /// are per-day silently gains rows in a day that already closed, on every
+    /// reconnect and after every deploy. Keeping the row cost more than it
+    /// bought. The dated authorization is in
+    /// `websocket-connection-scope-lock.md`, "2026-09-10 — A TICK WHOSE
+    /// EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED OUTRIGHT".
+    ///
+    /// The half that is NOT re-blessed, and is the half that matters: the tick
+    /// must still never reach `observe_for_ranking`. That was the original
+    /// defect — the fold declined the tick, the drain consumed the flag
+    /// NOWHERE, and it fell past both early returns carrying ANOTHER DAY'S
+    /// cumulative volume into the leaderboard baseline. Removing
+    /// `stats.future_trading_day` from `hard_refusal` makes this fail on the
+    /// outcome; the counter assertion alone would still pass.
     #[test]
-    fn a_future_dated_tick_is_a_candle_only_refusal_and_never_ranks() {
+    fn a_future_dated_tick_is_refused_outright_and_never_ranks() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
 
         // A plausible in-band exchange stamp (so it is not `out_of_band`) that
@@ -17785,9 +17868,16 @@ mod tests {
         let outcome = ingest.ingest_tick(&tick, 42, 1_779_321_600_000);
 
         assert!(
-            matches!(outcome, IngestOutcome::WrittenOutOfSession),
-            "a forward-stamped tick must be written and NOT folded; \
-             got {outcome:?}"
+            matches!(outcome, IngestOutcome::AggregatorRefused),
+            "a forward-stamped tick must be refused outright — not folded, and \
+             not written to a day that is not today; got {outcome:?}"
+        );
+        assert_eq!(
+            ingest.pending_rows(),
+            0,
+            "no row may be buffered for the writer: `ts` is the designated \
+             timestamp, so a written row would land in ANOTHER DAY'S partition. \
+             This assertion is the one the operator's directive turns on"
         );
 
         let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
@@ -17798,6 +17888,71 @@ mod tests {
         );
         assert_eq!(
             (price, ts, slot, oos, stale, oob),
+            (0, 0, 0, 0, 0, 0),
+            "no other refusal counter moves"
+        );
+    }
+
+    /// THE OPERATOR'S ROW, at the drain (2026-09-10, NSE_FNO 66422): received
+    /// today 09:15, exchange stamp 15:29 of a previous session.
+    ///
+    /// The mirror of the test above, and the one that matches what he actually
+    /// found in the database — his was the STALE direction, which arrives on
+    /// every reconnect and after every deploy because Dhan sends LAST TRADE
+    /// TIME and a dormant contract's connect snapshot carries whenever it last
+    /// traded (measured mean 5 hours, max 34 days).
+    ///
+    /// `pending_rows() == 0` is the whole assertion. `ts` is QuestDB's
+    /// DESIGNATED timestamp, so a written row lands in the PARTITION of the day
+    /// the vendor stamped — a table whose retention and audit meaning are
+    /// per-day silently gains rows in a day that already closed. That is the
+    /// defect; the missing candle was never the complaint.
+    #[test]
+    fn a_prior_day_snapshot_is_refused_outright_and_never_ranks() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+
+        // 1_779_321_600 is 2026-05-22 00:00:00 IST. Yesterday 15:29 IST, and
+        // a receipt today at 09:15 IST -- both inside the seconds-of-day
+        // window, which is exactly why every time-of-day gate waved it past.
+        let yesterday_1529 = 1_779_321_600 - 86_400 + 15 * 3_600 + 29 * 60;
+        let today_0915_utc_nanos = (1_779_321_600_i64 + 9 * 3_600 + 15 * 60
+            - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
+            * 1_000_000_000;
+
+        let packet = ticker_packet(66_422, 142.50, yesterday_1529);
+        let parsed = dispatch_frame(&packet, today_0915_utc_nanos)
+            .expect("a well-formed ticker packet must parse with a stale ltt");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        assert_ne!(
+            tick.received_at_nanos, 0,
+            "the gate stands down on a zero receipt — without one this test \
+             would prove nothing"
+        );
+
+        let outcome = ingest.ingest_tick(&tick, 42, 1_779_321_600_000);
+
+        assert!(
+            matches!(outcome, IngestOutcome::AggregatorRefused),
+            "a prior-day snapshot must be refused outright; got {outcome:?}"
+        );
+        assert_eq!(
+            ingest.pending_rows(),
+            0,
+            "NO row may be buffered: `ts` is the designated timestamp, so this \
+             row would land in a partition for a day that already closed — \
+             which is precisely the row the operator found"
+        );
+
+        let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
+        assert_eq!(
+            stale, 1,
+            "the stale stamp must land in its OWN field, separate from the \
+             routine out-of-session count"
+        );
+        assert_eq!(
+            (price, ts, slot, oos, oob, future),
             (0, 0, 0, 0, 0, 0),
             "no other refusal counter moves"
         );
@@ -18581,7 +18736,11 @@ mod tests {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
             received_at: std::time::Instant::now(),
-            bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
+            bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
+                13,
+                23_146.45,
+                todays_in_session_ltt(),
+            )),
         })
         .await
         .expect("the ring must accept a frame");
@@ -18652,7 +18811,11 @@ mod tests {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
             received_at: std::time::Instant::now(),
-            bytes: bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, 1_779_355_000)),
+            bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
+                13,
+                23_146.45,
+                todays_in_session_ltt(),
+            )),
         })
         .await
         .expect("the ring must accept a frame");
@@ -22184,10 +22347,49 @@ mod inline_depth_tests {
 mod frame_walk_accounting_tests {
     use super::*;
 
-    /// An arbitrary real epoch second. The session window does not matter
-    /// here: an out-of-session tick still WRITES A ROW and still counts as
-    /// folded, so these assertions hold whatever the clock says.
-    const ANY_LTT: u32 = 1_755_141_600;
+    /// An in-session exchange second on the SAME IST DAY as the receipt clock.
+    ///
+    /// ⚠ Was a frozen `const any_ltt() = 1_755_141_600` until 2026-09-10, under a
+    /// comment reading *"the session window does not matter here: an
+    /// out-of-session tick still WRITES A ROW and still counts as folded, so
+    /// these assertions hold whatever the clock says."* That was true of the
+    /// session WINDOW and is now false of the DAY: these fixtures build their
+    /// frames with `received_at: Instant::now()`, so a frozen 2025 stamp is a
+    /// year stale against a live receipt, and the day gate added on 2026-09-10
+    /// refuses it — correctly. `folded` went to 0 and four frame-walk tests
+    /// failed.
+    ///
+    /// Deriving it from the same clock the receipt uses is the honest repair,
+    /// not a relaxation: these tests are about FRAME-WALK ACCOUNTING — how many
+    /// packets a walk folds and how many bytes it abandons — and a fixture that
+    /// silently depended on the absence of a day gate was testing the walk
+    /// through a hole. The day gate itself is pinned by its own tests in
+    /// `multi_tf_aggregator`.
+    ///
+    /// Returns the receipt instant itself, not a fixed hour: exchange and
+    /// receipt then agree exactly, so the fold clock takes neither side's
+    /// disagreement and the frame is same-day by construction, whatever time
+    /// the suite happens to run at.
+    fn any_ltt() -> u32 {
+        let ist_now = chrono::Utc::now().timestamp().saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ));
+        u32::try_from(ist_now.max(0)).unwrap_or(0)
+    }
+
+    /// The RECEIPT clock for those same fixtures, as UTC nanoseconds.
+    ///
+    /// `drain_main_feed_frame` takes `received_at_nanos` in UTC and the fold
+    /// adds the IST offset back, so this is `any_ltt()` less that offset:
+    /// receipt and exchange then land on the same IST day by construction.
+    /// A frozen literal here was the other half of the same 2026-09-10
+    /// failure -- these call sites passed `1_000_000`, i.e. one millisecond
+    /// after the epoch, so a live exchange stamp read as FUTURE-dated by
+    /// fifty-six years and the day gate refused it.
+    fn any_recv_nanos() -> i64 {
+        (i64::from(any_ltt()) - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
+            .saturating_mul(1_000_000_000)
+    }
 
     // Wire codes for the three spot segments, for building test packets only.
     // Production filters on the ENUM VARIANTS, not on numbers -- so these are
@@ -22210,19 +22412,19 @@ mod frame_walk_accounting_tests {
     /// The same packet with the segment byte under the caller's control, so a
     /// test can prove which segments reach the spot-price store.
     fn ticker_packet_in(security_id: u32, segment: u8, ltp: f32) -> [u8; 16] {
-        let mut p = ticker_packet(security_id, ltp, ANY_LTT);
+        let mut p = ticker_packet(security_id, ltp, any_ltt());
         p[3] = segment;
         p
     }
 
     /// The spot store refuses ticks stamped before its trading-day floor, and
-    /// `ANY_LTT` is a fixed past instant — so every test that expects a price
+    /// `any_ltt()` is a fixed past instant — so every test that expects a price
     /// to LAND first pins the floor to that instant's IST day. A test that
     /// forgets this fails closed (the store refuses), never open.
     fn floor_store_to_any_ltt(ingest: &LiveIngest) {
         ingest
             .spot_prices()
-            .reset_for_trading_day(crate::spot_price_store::ist_day_of(ANY_LTT));
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(any_ltt()));
     }
 
     fn drain_one(ingest: &mut LiveIngest, bytes: Vec<u8>) {
@@ -22235,7 +22437,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22392,7 +22594,7 @@ mod frame_walk_accounting_tests {
     /// reading `unparseable = 1` would reasonably conclude a single bad packet.
     #[test]
     fn an_unknown_packet_code_reports_the_bytes_it_abandoned() {
-        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let good = ticker_packet(13, 100.5, any_ltt());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&good);
         bytes.extend_from_slice(&good);
@@ -22413,7 +22615,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22433,8 +22635,8 @@ mod frame_walk_accounting_tests {
     /// decoded on the fixed size — the stamp is a measurement, never a resync.
     #[test]
     fn a_vendor_length_stamp_that_disagrees_is_counted_and_the_packet_still_folds() {
-        let good = ticker_packet(13, 100.5, ANY_LTT);
-        let mut lying = ticker_packet(13, 100.5, ANY_LTT);
+        let good = ticker_packet(13, 100.5, any_ltt());
+        let mut lying = ticker_packet(13, 100.5, any_ltt());
         lying[1] = 15; // vendor says 15 bytes; the ticker layout is 16
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&good);
@@ -22451,7 +22653,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22471,7 +22673,7 @@ mod frame_walk_accounting_tests {
     /// assertion above would pass against a counter that always fires.
     #[test]
     fn a_clean_frame_abandons_no_bytes() {
-        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let good = ticker_packet(13, 100.5, any_ltt());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&good);
         bytes.extend_from_slice(&good);
@@ -22486,7 +22688,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22500,7 +22702,7 @@ mod frame_walk_accounting_tests {
     /// same way — it was the second half of the same blind spot.
     #[test]
     fn a_truncated_trailing_packet_reports_its_abandoned_bytes() {
-        let good = ticker_packet(13, 100.5, ANY_LTT);
+        let good = ticker_packet(13, 100.5, any_ltt());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&good);
         // A ticker header promising 16 bytes, with only 9 present.
@@ -22516,7 +22718,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22642,7 +22844,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22683,7 +22885,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22731,7 +22933,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
@@ -22777,7 +22979,7 @@ mod frame_walk_accounting_tests {
                 received_at: std::time::Instant::now(),
                 bytes: bytes.into(),
             },
-            1_000_000,
+            any_recv_nanos(),
             1_000,
             counters(),
         );
