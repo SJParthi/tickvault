@@ -44,7 +44,7 @@
 //! | 4    | 1 | `exchange_segment_code: u8`     |
 //! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`; 0..=4 = the legacy 5-frame set, 5..=20 = the C3 GDF-gated second-scale frames) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | `format_version: u8` (=1; 2026-07-21 C2 — 0 = pre-renumber legacy, REFUSED on load) |
+//! | 7    | 1 | `format_version: u8` (=2 since 2026-09-10; 2026-07-21 C2 — 0 = pre-renumber legacy, REFUSED on load; 1 = pre-accumulator, still readable) |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -55,13 +55,41 @@
 //! | 56   | 8 | `low: f64`                      |
 //! | 64   | 8 | `close: f64`                    |
 //! | 72   | 8 | `close_pct_from_prev_day: f64`  |
-//! | 80   | 8 | `bucket_open_prev_close: f64`   |
+//! | 80   | 8 | `net_volume_signed: i64` (**v2**; `i64::MIN` = not classified). **v1 wrote `bucket_open_prev_close: f64` here** — see the version note below |
 //! | 88   | 4 | `total_buy_qty: u32`            |
 //! | 92   | 4 | `total_sell_qty: u32`           |
 //! | 96   | 8 | `open_pct: f64` (§31 Option 2)  |
 //! | 104  | 8 | `change_pct: f64` (2026-06-02)  |
 //! | 112  | 8 | `open_gap_pct: f64` (2026-06-02)|
 //! | 120  | 8 | `security_id: u64` full (2026-06-29; zero in legacy records → low-32 at 0-4) |
+//!
+//! ## Format version 2 (2026-09-10) — bytes 80..88 change MEANING
+//!
+//! Version 1 wrote `bucket_open_prev_close: f64` at bytes 80..88. That field
+//! was the OLD net-volume sign baseline (the previous sealed bar's close), and
+//! the 2026-09-10 tick-rule rewrite stopped reading it: `net_volume` is now
+//! accumulated per tick, and `close_pct_from_prev_day` is drawn from
+//! `prev_day_close`, never from this field. A reference scan found **no
+//! production reader anywhere** — it was written, spilled, and consumed by
+//! nothing.
+//!
+//! Those 8 bytes are therefore reclaimed for `net_volume_signed: i64`, which
+//! is what lets a spill-replayed bar report real flow instead of NULL. The
+//! record does NOT grow.
+//!
+//! **Why this needs the version bump, and why the bump is safe.** A v1 record's
+//! bytes 80..88 hold an `f64` price; decoding those bits as an `i64` would
+//! produce a colossal fabricated net volume (24200.10_f64 reads as
+//! 4_673_285_811_324_502_016). The decoder therefore reads byte 7 FIRST: a
+//! record below version 2 reports "not classified" (SQL NULL), which is
+//! exactly the behaviour those records had when they were written. The load
+//! gate refuses only version 0, so v1 records still replay — nothing on disk
+//! is orphaned by the bump.
+//!
+//! `i64::MIN` is the "not classified" sentinel for v2 records. It cannot
+//! collide with a real value: `LiveCandleState::net_volume` clamps to
+//! `±volume`, so the reachable range is `[-i64::MAX, i64::MAX]` and `i64::MIN`
+//! sits strictly outside it.
 //!
 //! Total: 128 bytes. The trailing 8-byte padding region (bytes 120..128)
 //! is reserved for future field additions WITHOUT a file-format break —
@@ -98,7 +126,24 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// retirement RENUMBERED `TfIndex` ordinals (old M2=1 would decode as
 /// new M3=1 — silent TF mis-assignment), so `read_all` REFUSES records
 /// whose byte 7 is 0 (legacy ordinal space) instead of misdecoding them.
-pub const SEAL_SPILL_FORMAT_VERSION: u8 = 1;
+/// **Bumped 1 → 2 on 2026-09-10**: bytes 80..88 stopped being
+/// `bucket_open_prev_close: f64` (dead since the tick-rule rewrite — no
+/// production reader) and became `net_volume_signed: i64`, so a
+/// spill-replayed bar reports real flow instead of NULL. Same byte meaning
+/// read two ways, which is precisely what a version byte is for: `from_bytes`
+/// reads byte 7 before byte 80, and anything below 2 reports "not classified".
+/// The load gate still refuses only version 0, so v1 records on disk replay
+/// exactly as they did before.
+pub const SEAL_SPILL_FORMAT_VERSION: u8 = 2;
+
+/// Sentinel written into bytes 80..88 when a v2 record's bar was never
+/// classified (a REST-folded bar, a zero-tick bar). It cannot collide with a
+/// real reading: `LiveCandleState::net_volume` clamps to `±volume`, so the
+/// reachable range is `[-i64::MAX, i64::MAX]` and this value sits outside it.
+pub const SEAL_SPILL_NET_VOLUME_UNCLASSIFIED: i64 = i64::MIN;
+
+/// First format version whose bytes 80..88 carry `net_volume_signed`.
+pub const SEAL_SPILL_FIRST_NET_VOLUME_VERSION: u8 = 2;
 
 /// Self-contained binary record for spilled sealed bars.
 ///
@@ -135,13 +180,27 @@ pub struct SerializedSeal {
     pub low: f64,
     pub close: f64,
     pub close_pct_from_prev_day: f64,
-    /// Close of the PREVIOUS sealed bar, snapshotted at bucket open. Occupies
-    /// bytes 80..88 — vacated by `oi_pct_from_prev_day`, whose DDL column was
-    /// removed 2026-05-28 and which has written a literal `0.0` into every
-    /// record since. An OLD record therefore decodes `0.0` here, which is
-    /// exactly the "no baseline" sentinel, so pre-existing spill files replay
-    /// correctly with `net_volume = NULL` and NO format-version bump.
-    pub bucket_open_prev_close: f64,
+    /// Tick-rule signed order flow for this bar — buy-initiated minus
+    /// sell-initiated volume, accumulated per tick by the live fold. Bytes
+    /// 80..88, **format version 2 onward**.
+    ///
+    /// Paired with [`Self::net_volume_classified`]: this value is meaningless
+    /// unless that flag is true, and the two travel together precisely so a
+    /// bar nobody classified can never be replayed as "perfectly balanced
+    /// flow". On the wire they are ONE field — `i64::MIN`
+    /// ([`SEAL_SPILL_NET_VOLUME_UNCLASSIFIED`]) encodes the false flag —
+    /// because the record has no spare byte and that value is unreachable for
+    /// a real reading.
+    ///
+    /// ⚠ Bytes 80..88 held `bucket_open_prev_close: f64` in version 1. Reading
+    /// those bits as an `i64` fabricates an enormous net volume, which is why
+    /// [`Self::from_bytes`] checks the version byte before this field.
+    pub net_volume_signed: i64,
+    /// Whether the live fold classified this bar's flow. `false` replays as SQL
+    /// NULL — the honest answer for a bar this process never measured (a
+    /// REST-folded bar, a zero-tick bar, or any record written before format
+    /// version 2 existed).
+    pub net_volume_classified: bool,
     /// Vendor pending buy-order total, bytes 88..92 — the low half of the
     /// 8 bytes vacated by `volume_pct_from_prev_day` (same 2026-05-28 removal,
     /// same always-zero guarantee, same backward compatibility).
@@ -190,7 +249,15 @@ impl SerializedSeal {
         buf[56..64].copy_from_slice(&self.low.to_le_bytes());
         buf[64..72].copy_from_slice(&self.close.to_le_bytes());
         buf[72..80].copy_from_slice(&self.close_pct_from_prev_day.to_le_bytes());
-        buf[80..88].copy_from_slice(&self.bucket_open_prev_close.to_le_bytes());
+        // Bytes 80..88: net volume (v2). The unclassified sentinel is written
+        // rather than a zero — `0` is a legitimate reading ("balanced flow")
+        // and must stay distinguishable from "nobody measured this bar".
+        let net_on_wire = if self.net_volume_classified {
+            self.net_volume_signed
+        } else {
+            SEAL_SPILL_NET_VOLUME_UNCLASSIFIED
+        };
+        buf[80..88].copy_from_slice(&net_on_wire.to_le_bytes());
         buf[88..92].copy_from_slice(&self.total_buy_qty.to_le_bytes());
         buf[92..96].copy_from_slice(&self.total_sell_qty.to_le_bytes());
         // §31 Option 2: open_pct in the first 8 reserved bytes.
@@ -221,6 +288,20 @@ impl SerializedSeal {
             .get(buf[6] as usize)
             .copied()
             .unwrap_or(Feed::Dhan);
+        // Bytes 80..88 mean different things in v1 and v2, so the VERSION byte
+        // is read before them. This is the only field in the record whose
+        // decode is not positional, and getting it wrong is not a small error:
+        // a v1 `f64` price reinterpreted as an `i64` is a net volume in the
+        // quintillions, written into a production column as fact.
+        let net_raw = i64::from_le_bytes([
+            buf[80], buf[81], buf[82], buf[83], buf[84], buf[85], buf[86], buf[87],
+        ]);
+        let carries_net_volume = buf[7] >= SEAL_SPILL_FIRST_NET_VOLUME_VERSION;
+        let net_classified = carries_net_volume && net_raw != SEAL_SPILL_NET_VOLUME_UNCLASSIFIED;
+        // Zero rather than the raw bits when unclassified, so a caller that
+        // ignores the flag still cannot read a fabricated magnitude.
+        let net_signed = if net_classified { net_raw } else { 0 };
+
         // Full u64 security_id from the reserved 120-128 region (2026-06-29
         // widening). A legacy/Dhan record has zero there → fall back to the
         // low-32 at bytes 0-4 (Dhan ids fit u32; security_id is never 0).
@@ -263,9 +344,15 @@ impl SerializedSeal {
             close_pct_from_prev_day: f64::from_le_bytes([
                 buf[72], buf[73], buf[74], buf[75], buf[76], buf[77], buf[78], buf[79],
             ]),
-            bucket_open_prev_close: f64::from_le_bytes([
-                buf[80], buf[81], buf[82], buf[83], buf[84], buf[85], buf[86], buf[87],
-            ]),
+            // Bytes 80..88 are VERSION-DEPENDENT and are the one field in this
+            // record that cannot be decoded positionally. Version 1 wrote an
+            // `f64` price here; reading those bits as an `i64` yields a
+            // fabricated net volume in the quintillions (24_200.10_f64 decodes
+            // as 4_673_285_811_324_502_016). A pre-v2 record therefore reports
+            // "not classified" — which is exactly what it meant when written,
+            // since net volume did not survive a spill at all back then.
+            net_volume_signed: net_signed,
+            net_volume_classified: net_classified,
             total_buy_qty: u32::from_le_bytes([buf[88], buf[89], buf[90], buf[91]]),
             total_sell_qty: u32::from_le_bytes([buf[92], buf[93], buf[94], buf[95]]),
             // §31 Option 2: bytes 96..104 (zero in pre-§31 records → 0.0).
@@ -302,9 +389,9 @@ impl From<&BufferedSeal> for SerializedSeal {
     /// Lossless conversion from the trading-side ring payload to the
     /// storage-side wire-format record. `O(1)`, zero allocation.
     ///
-    /// Field-by-field copy. The 3 Wave-5 pct fields
-    /// (`close_pct_from_prev_day` / `bucket_open_prev_close` /
-    /// `total_buy_qty` / `total_sell_qty`) are carried through unchanged —
+    /// Field-by-field copy. The seal-time stamped fields
+    /// (`close_pct_from_prev_day` / `total_buy_qty` / `total_sell_qty`)
+    /// are carried through unchanged —
     /// per locked decision L-H6 they're stamped by the seal-time
     /// caller BEFORE the seal enters the ring, so by the time we
     /// serialise them the values are already correct (or 0.0 on
@@ -330,7 +417,8 @@ impl From<&BufferedSeal> for SerializedSeal {
             low: b.state.low,
             close: b.state.close,
             close_pct_from_prev_day: b.state.close_pct_from_prev_day,
-            bucket_open_prev_close: b.state.bucket_open_prev_close,
+            net_volume_signed: b.state.net_volume_signed,
+            net_volume_classified: b.state.net_volume_classified,
             total_buy_qty: b.state.total_buy_qty,
             total_sell_qty: b.state.total_sell_qty,
             open_pct: b.state.open_pct,
@@ -365,7 +453,11 @@ impl SerializedSeal {
         state.oi = self.oi;
         state.tick_count = self.tick_count;
         state.close_pct_from_prev_day = self.close_pct_from_prev_day;
-        state.bucket_open_prev_close = self.bucket_open_prev_close;
+        // The accumulator now SURVIVES the spill (format v2), so a replayed bar
+        // reports real flow. A v1 record decodes `classified = false`, which is
+        // the pre-v2 behaviour: `net_volume()` returns None and persists NULL.
+        state.net_volume_signed = self.net_volume_signed;
+        state.net_volume_classified = self.net_volume_classified;
         state.total_buy_qty = self.total_buy_qty;
         state.total_sell_qty = self.total_sell_qty;
         // §31 Option 2: already-stamped at original seal; session_open is
@@ -375,18 +467,6 @@ impl SerializedSeal {
         // derived (== close_pct_from_prev_day), so it's not a state field —
         // the replayed close_pct restores it at the next extraction.
         state.open_gap_pct = self.open_gap_pct;
-        // `net_volume_signed` / `net_volume_classified` are DELIBERATELY not
-        // restored, and `LiveCandleState::empty()` leaves the flag `false`, so
-        // a replayed bar persists `net_volume = NULL`.
-        //
-        // This record is byte-for-byte FULL at `SEAL_SPILL_RECORD_SIZE` — all
-        // 128 bytes are assigned — so carrying the accumulator through disk
-        // needs a format bump and a mixed-stride reader, which is not a change
-        // to make in passing. NULL is the honest reading in the meantime: a
-        // restored `0` would say "this bar traded with perfectly balanced
-        // flow" about a bar nobody classified, which is a fabrication rather
-        // than a gap. Pinned by
-        // `a_replayed_spill_record_reports_no_net_volume_never_a_balanced_zero`.
         Some(BufferedSeal::new(
             self.security_id,
             self.exchange_segment_code,
@@ -989,7 +1069,8 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            bucket_open_prev_close: 24_200.10,
+            net_volume_signed: -4_242,
+            net_volume_classified: true,
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
             open_pct: 7.7,
@@ -1050,7 +1131,8 @@ mod tests {
             low: 0.0,
             close: 0.0,
             close_pct_from_prev_day: -3.5,
-            bucket_open_prev_close: -10.0,
+            net_volume_signed: -10,
+            net_volume_classified: true,
             total_buy_qty: 0,
             total_sell_qty: 0,
             open_pct: -50.0,
@@ -1687,46 +1769,130 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.bucket_open_prev_close = 24_200.10;
+        state.net_volume_signed = -4_242;
+        state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 
-    /// A replayed spill record must report NO net volume, never a balanced zero.
+    /// The tick-rule accumulator SURVIVES a disk spill (record format v2).
     ///
-    /// The 128-byte record is byte-for-byte FULL, so the tick-rule accumulator
-    /// cannot ride through disk without a format bump. The failure mode this
-    /// pins is not the missing data — it is the SHAPE of the answer: without
-    /// `net_volume_classified`, a replayed bar would arrive with a zero
-    /// accumulator and a non-zero volume, and `net_volume()` would report
-    /// `Some(0)` — a confident "this bar's flow was perfectly balanced" about a
-    /// bar nobody classified. NULL is the honest answer; a fabricated zero is
-    /// strictly worse than a gap, because a reader cannot tell it from a real
-    /// balanced bar.
+    /// Before v2 this test pinned the opposite: bytes 80..88 carried the dead
+    /// `bucket_open_prev_close`, the record was byte-for-byte full, and a
+    /// replayed bar therefore persisted `net_volume = NULL`. Reclaiming those
+    /// eight bytes closes that gap — a bar rescued to disk and drained back now
+    /// reports the SAME signed flow it was classified with, so a QuestDB
+    /// outage no longer punches a NULL hole through the column.
+    ///
+    /// The sign matters as much as the magnitude: a bar whose flow was
+    /// sell-heavy must come back sell-heavy, not merely non-null.
     #[test]
-    fn a_replayed_spill_record_reports_no_net_volume_never_a_balanced_zero() {
+    fn a_replayed_spill_record_carries_the_net_volume_it_was_classified_with() {
         let seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 24_341.95);
-        let record = SerializedSeal::from(&seal);
-        let replayed = record
+        let original = seal.state.net_volume().expect("the fixture is classified");
+        let bytes = SerializedSeal::from(&seal).to_bytes();
+        let replayed = SerializedSeal::from_bytes(&bytes)
+            .expect("a well-formed record decodes")
             .try_into_buffered_seal()
             .expect("a known tf ordinal round-trips");
 
         assert!(
             replayed.state.volume > 0,
-            "precondition: the replayed bar carries real gross volume, which is \
-             what makes a Some(0) net reading look plausible"
+            "precondition: the replayed bar carries real gross volume"
         );
         assert!(
-            !replayed.state.net_volume_classified,
-            "a bar rebuilt from disk was never classified by this process"
+            replayed.state.net_volume_classified,
+            "the classification flag must ride through disk, or the value is \
+             discarded on read"
         );
         assert_eq!(
             replayed.state.net_volume(),
+            Some(original),
+            "same signed flow after a full disk round-trip"
+        );
+        assert!(
+            original < 0,
+            "fixture precondition: sell-heavy, so a sign \
+                flip or a fabricated zero cannot pass this test"
+        );
+    }
+
+    /// A version-1 record decodes as UNCLASSIFIED, never as a stray number.
+    ///
+    /// This is the half of the format bump that could silently corrupt: bytes
+    /// 80..88 held an `f64` price in v1, and reading those same bytes as an
+    /// `i64` yields an enormous nonsense figure (24 200.10 decodes as
+    /// 4_673_285_811_324_502_016). A v1 record left on disk across a deploy
+    /// MUST therefore be read by its version byte, not by its shape — the
+    /// honest answer for a bar this process never classified is NULL, exactly
+    /// as it was before the bump.
+    #[test]
+    fn a_version_one_record_decodes_as_unclassified_not_as_a_reinterpreted_price() {
+        let seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 24_341.95);
+        let mut bytes = SerializedSeal::from(&seal).to_bytes();
+        // Forge a v1 record: stamp the old version and put the old f64 payload
+        // back where the accumulator now lives.
+        bytes[7] = 1;
+        bytes[80..88].copy_from_slice(&24_200.10_f64.to_le_bytes());
+        // The checksum (if any) is recomputed by the reader's own rules; this
+        // asserts the version gate, so re-serialise through the same path the
+        // drain uses.
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("a v1 record still decodes");
+
+        assert!(
+            !decoded.net_volume_classified,
+            "a v1 record carries no accumulator — reading one is a fabrication"
+        );
+        assert_eq!(
+            decoded.net_volume_signed, 0,
+            "an unclassified record reports a neutral 0 alongside the false \
+             flag, never the reinterpreted price bits"
+        );
+        let replayed = decoded
+            .try_into_buffered_seal()
+            .expect("a known tf ordinal round-trips");
+        assert_eq!(
+            replayed.state.net_volume(),
             None,
-            "NULL, not a fabricated balanced zero — carrying the accumulator \
-             through disk needs a record-format bump, and until then the honest \
-             answer is that nobody classified this bar"
+            "NULL, exactly as before the format bump"
+        );
+    }
+
+    /// The unclassified sentinel round-trips as the flag, not as a value.
+    ///
+    /// `i64::MIN` is the on-wire marker for "this bar was never classified".
+    /// It cannot collide with a real reading — `net_volume()` clamps to
+    /// ±volume, and `volume` is a `u32` — but the encode/decode pair has to
+    /// agree on it or an unclassified bar comes back carrying the sentinel as
+    /// a number.
+    #[test]
+    fn the_unclassified_sentinel_round_trips_as_a_flag_never_as_a_value() {
+        let mut seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 24_341.95);
+        seal.state.net_volume_classified = false;
+        seal.state.net_volume_signed = 0;
+
+        let bytes = SerializedSeal::from(&seal).to_bytes();
+        assert_eq!(
+            i64::from_le_bytes([
+                bytes[80], bytes[81], bytes[82], bytes[83], bytes[84], bytes[85], bytes[86],
+                bytes[87],
+            ]),
+            SEAL_SPILL_NET_VOLUME_UNCLASSIFIED,
+            "an unclassified bar writes the sentinel, so the reader can tell it \
+             apart from a genuinely balanced bar"
+        );
+
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("a well-formed record decodes");
+        assert!(!decoded.net_volume_classified);
+        assert_eq!(decoded.net_volume_signed, 0);
+        assert_eq!(
+            decoded
+                .try_into_buffered_seal()
+                .expect("a known tf ordinal round-trips")
+                .state
+                .net_volume(),
+            None
         );
     }
 
@@ -1747,7 +1913,8 @@ mod tests {
         assert_eq!(serialised.low, 99.0);
         assert_eq!(serialised.close, 102.5);
         assert_eq!(serialised.close_pct_from_prev_day, 1.5);
-        assert_eq!(serialised.bucket_open_prev_close, 24_200.10);
+        assert_eq!(serialised.net_volume_signed, -4_242);
+        assert!(serialised.net_volume_classified);
         assert_eq!(serialised.total_buy_qty, 89_600);
         assert_eq!(serialised.total_sell_qty, 4_800);
     }
@@ -1756,7 +1923,8 @@ mod tests {
     fn test_from_buffered_seal_maps_all_twenty_one_tfs_to_correct_ordinal() {
         // Verify every TfIndex variant maps to its canonical ordinal
         // (0..=20: legacy 0..=4 byte-stable, C3 second-scale 5..=20
-        // appended — SEAL_SPILL_FORMAT_VERSION stays 1). This pins the
+        // appended — which needed NO version bump, the TF ordinal space being
+        // version-independent; the v2 bump was for bytes 80..88). This pins the
         // trading↔storage contract: a future re-ordering of TfIndex::ALL
         // would silently flip every spilled record's TF assignment.
         let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
@@ -1779,8 +1947,9 @@ mod tests {
         // Append-only proof: the 5 LEGACY frames (M1, M3, M5, M15, D1)
         // keep their exact pre-C3 ordinals 0..=4 — the C3 second-scale
         // frames are APPENDED after D1, never interleaved, so a pre-C3
-        // spilled record decodes to the SAME frame under the C3 binary
-        // (SEAL_SPILL_FORMAT_VERSION stays 1).
+        // spilled record decodes to the SAME frame under the C3 binary — which
+        // is why that change needed no version bump. (The version is 2 today,
+        // bumped 2026-09-10 for bytes 80..88, not for the ordinal space.)
         let legacy: [(TfIndex, u8); 5] = [
             (TfIndex::M1, 0),
             (TfIndex::M3, 1),
@@ -1826,7 +1995,7 @@ mod tests {
         // SAFETY: this clean-refusal arm is the same code shape the older
         // 5-frame binary takes for a C3-written record carrying ordinal
         // >= 5 — refused (skip + warn at the read site), NEVER a panic —
-        // which is what lets SEAL_SPILL_FORMAT_VERSION stay 1.
+        // which is what let the C3 append land without a version bump.
         s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range (21)
         assert_eq!(s.tf(), None);
         s.tf_ordinal = 255;
@@ -1866,8 +2035,12 @@ mod tests {
             original.state.close_pct_from_prev_day
         );
         assert_eq!(
-            recovered.state.bucket_open_prev_close,
-            original.state.bucket_open_prev_close
+            recovered.state.net_volume_signed,
+            original.state.net_volume_signed
+        );
+        assert_eq!(
+            recovered.state.net_volume_classified,
+            original.state.net_volume_classified
         );
         assert_eq!(recovered.state.total_buy_qty, original.state.total_buy_qty);
     }
