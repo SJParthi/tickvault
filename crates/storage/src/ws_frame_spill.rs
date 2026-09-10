@@ -697,7 +697,7 @@ pub const fn refusal_line_due(count: u64) -> bool {
     if count < REFUSAL_LINE_STRIDE {
         count.is_power_of_two()
     } else {
-        count % REFUSAL_LINE_STRIDE == 0
+        count.is_multiple_of(REFUSAL_LINE_STRIDE)
     }
 }
 
