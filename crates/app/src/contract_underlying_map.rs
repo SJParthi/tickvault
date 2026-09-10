@@ -426,6 +426,74 @@ pub fn legs_from_artifact(
     }
     (legs, refusals)
 }
+
+/// Refusals tallied by reason, largest first, zeros omitted.
+///
+/// The PURE half, deliberately: it takes no recorder and returns data, so the
+/// tallying rule is testable exactly as `build_snapshot` is. The counting half
+/// is [`count_artifact_refusals`].
+///
+/// Ordered by count DESCENDING and then by label, so the output is
+/// deterministic for a test and reads dominant-cause-first for a human. A
+/// refusal storm is almost always ONE cause, and the first pair is it.
+#[must_use]
+pub fn tally_refusals(refusals: &[(i64, LegRefusal)]) -> Vec<(LegRefusal, usize)> {
+    let mut tally: Vec<(LegRefusal, usize)> =
+        LegRefusal::ALL.iter().map(|&r| (r, 0usize)).collect();
+    for (_, reason) in refusals {
+        if let Some(slot) = tally.iter_mut().find(|(r, _)| r == reason) {
+            slot.1 += 1;
+        }
+    }
+    tally.retain(|(_, n)| *n > 0);
+    tally.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+    tally
+}
+
+/// Counts artifact-scan refusals on the per-reason counter and returns a
+/// one-line breakdown for the log.
+///
+/// # Why this exists (MEASURED 2026-09-09)
+///
+/// [`legs_from_artifact`] returns its refusals to the caller, and until today
+/// the caller logged only `refused_in_artifact_scan = <count>` and dropped the
+/// reasons. [`publish_from_legs`] counts the refusals IT produces; nothing
+/// counted these.
+///
+/// That gap cost real diagnosis time. On 2026-09-08 and 2026-09-09 the live
+/// lane refused 113,182 and then 113,746 option legs — EVERY leg in the
+/// artifact — and published an empty map, so the top-volume board ranked
+/// nothing for two whole sessions. The telemetry said `113746` and not one
+/// word about why; the cause (`missing_lot_size`, from a vendor `LOT_SIZE` of
+/// `"75.0"` that an integer parse refused) had to be found by reading source.
+/// One `missing_lot_size=113746` would have named it immediately.
+///
+/// # The honest limit of the counter half
+///
+/// The CloudWatch agent folds a metric's label values into ONE summed series
+/// per host, so the per-reason split does NOT survive to CloudWatch — there it
+/// is a single total. That is why this returns a STRING for the log line as
+/// well: the log is the surface where the breakdown actually reaches an
+/// operator. The counter is the local `/metrics` view and the trend.
+///
+/// Returns `"none"` for an empty slice rather than an empty string, so a log
+/// field is never blank and "nothing was refused" is stated rather than
+/// inferred from absence.
+#[must_use]
+pub fn count_artifact_refusals(refusals: &[(i64, LegRefusal)]) -> String {
+    for (_, reason) in refusals {
+        metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(1);
+    }
+    let tally = tally_refusals(refusals);
+    if tally.is_empty() {
+        return "none".to_owned();
+    }
+    tally
+        .iter()
+        .map(|(reason, n)| format!("{}={}", reason.as_str(), n))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 /// Puts the legs the main feed will actually SUBSCRIBE ahead of the rest, so
 /// they are the ones that fit inside [`MAX_TRACKED_CONTRACTS`].
 ///
@@ -1104,6 +1172,99 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn tally_refusals_orders_by_count_descending_so_the_dominant_cause_is_first() {
+        let refusals = vec![
+            (1, LegRefusal::UnresolvedUnderlyingSymbol),
+            (2, LegRefusal::MissingLotSize),
+            (3, LegRefusal::MissingLotSize),
+            (4, LegRefusal::MissingLotSize),
+            (5, LegRefusal::UnsupportedSegment),
+            (6, LegRefusal::UnsupportedSegment),
+        ];
+        let tally = tally_refusals(&refusals);
+        assert_eq!(
+            tally,
+            vec![
+                (LegRefusal::MissingLotSize, 3),
+                (LegRefusal::UnsupportedSegment, 2),
+                (LegRefusal::UnresolvedUnderlyingSymbol, 1),
+            ],
+            "the largest cause must sort first — a triager reads the head of \
+             this list and stops"
+        );
+    }
+
+    #[test]
+    fn tally_refusals_omits_reasons_that_did_not_fire() {
+        let tally = tally_refusals(&[(1, LegRefusal::AtCapacity)]);
+        assert_eq!(tally, vec![(LegRefusal::AtCapacity, 1)]);
+        // A zero for every other reason would bury the one that fired among
+        // six that did not, which is the opposite of the point.
+        assert_eq!(tally.len(), 1);
+    }
+
+    #[test]
+    fn tally_refusals_of_nothing_is_empty() {
+        assert!(tally_refusals(&[]).is_empty());
+    }
+
+    #[test]
+    fn tally_refusals_breaks_a_tie_on_the_label_so_the_output_is_deterministic() {
+        // Equal counts must not order by hash or by input position: a log line
+        // that reorders between runs cannot be diffed across sessions.
+        let a = tally_refusals(&[(1, LegRefusal::MissingLotSize), (2, LegRefusal::AtCapacity)]);
+        let b = tally_refusals(&[(2, LegRefusal::AtCapacity), (1, LegRefusal::MissingLotSize)]);
+        assert_eq!(a, b, "the same multiset must render the same order");
+        assert_eq!(
+            a[0].0,
+            LegRefusal::AtCapacity,
+            "at_capacity < missing_lot_size"
+        );
+    }
+
+    #[test]
+    fn count_artifact_refusals_names_the_dominant_reason_first() {
+        // The 2026-09-09 shape, scaled down: every leg refused for ONE reason.
+        // This is the string that would have ended the two-session diagnosis
+        // immediately, so it is asserted verbatim rather than by `contains`.
+        let refusals: Vec<(i64, LegRefusal)> = (0..5)
+            .map(|i| (i, LegRefusal::MissingLotSize))
+            .chain(std::iter::once((99, LegRefusal::UnsupportedSegment)))
+            .collect();
+        assert_eq!(
+            count_artifact_refusals(&refusals),
+            "missing_lot_size=5 unsupported_segment=1"
+        );
+    }
+
+    #[test]
+    fn count_artifact_refusals_says_none_rather_than_going_blank() {
+        // An empty field reads as "the log line is broken"; "none" states the
+        // fact. Also proves the function is safe with no recorder installed.
+        assert_eq!(count_artifact_refusals(&[]), "none");
+    }
+
+    #[test]
+    fn count_artifact_refusals_covers_every_reason_the_enum_carries() {
+        // Pairs with `all_variants_are_in_the_seed_list`: a variant added to
+        // `LegRefusal` without a label would render here, so this fails rather
+        // than silently dropping the new reason out of the breakdown.
+        let refusals: Vec<(i64, LegRefusal)> = LegRefusal::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| (i as i64, r))
+            .collect();
+        let rendered = count_artifact_refusals(&refusals);
+        for reason in LegRefusal::ALL {
+            assert!(
+                rendered.contains(&format!("{}=1", reason.as_str())),
+                "reason {} missing from {rendered}",
+                reason.as_str()
+            );
+        }
+    }
+
     fn pre_register_contract_underlying_counters_never_panics_without_a_recorder() {
         // Not-panicking IS the whole property here, and the name says so: with
         // no recorder installed there is nothing observable to assert against.
