@@ -679,6 +679,24 @@ const fn ws_type_index(ws_type: WsType) -> usize {
     }
 }
 
+/// Whether the `n`-th refused frame of this process earns a log line.
+///
+/// Powers of two: the 1st, 2nd, 4th, 8th … refusal log, every one is counted.
+/// ADDED 2026-09-10 (fast-lane attack sweep, finding 1): all three WAL refusal
+/// arms below logged one JSON-formatted `error!` PER REFUSED FRAME, and they
+/// run on the socket READER task inside `sink.accept()`. On 2026-09-04 the disk
+/// was full and **2,000,238** frames were refused before the WAL — that was
+/// two million log formats on the one task whose only job is to keep pace with
+/// Dhan, i.e. the self-amplifying slow-consumer stall this crate's capture
+/// floor exists to prevent, and one the ring-dwell gauge cannot see because it
+/// sits downstream of the reader. The `WS-SPILL-02` CloudWatch filter fires at
+/// threshold 1, so the first line still pages; the counters still move for
+/// every frame; only the flood is gone.
+#[must_use]
+pub const fn refusal_line_due(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
 /// Every [`WsType`], in [`ws_type_index`] order — the build order for the
 /// counter tables. Kept beside the index so the two cannot drift.
 const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
@@ -1138,12 +1156,14 @@ impl WsFrameSpill {
                 // likely of the two in production (it is what a writer stalled
                 // behind a saturated disk produces), so the arm that could not
                 // page was the one most likely to fire.
-                error!(
-                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
-                    ws_type = ws_type.as_str(),
-                    drop_count = prev + 1,
-                    "CRITICAL: WAL spill channel FULL — frame dropped (writer stalled)"
-                );
+                if refusal_line_due(prev + 1) {
+                    error!(
+                        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                        ws_type = ws_type.as_str(),
+                        drop_count = prev + 1,
+                        "CRITICAL: WAL spill channel FULL — frame dropped (writer stalled)"
+                    );
+                }
                 // Pre-resolved handles, NEVER the labelled macro form — this arm
                 // runs only when the process is already losing frames, which is
                 // the worst possible moment to allocate. See `SpillDropCounters`.
@@ -1168,12 +1188,14 @@ impl WsFrameSpill {
                 // it is a genuine durable-frame loss, so it must be LOUD, not
                 // a silent return (the pre-2026-06-09 behaviour).
                 let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
-                error!(
-                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
-                    ws_type = ws_type.as_str(),
-                    drop_count = prev + 1,
-                    "CRITICAL: WAL spill writer DEAD — frame dropped (durable floor lost)"
-                );
+                if refusal_line_due(prev + 1) {
+                    error!(
+                        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                        ws_type = ws_type.as_str(),
+                        drop_count = prev + 1,
+                        "CRITICAL: WAL spill writer DEAD — frame dropped (durable floor lost)"
+                    );
+                }
                 // Same label set as the Full arm so existing alerts on
                 // `tv_ws_frame_spill_drop_critical` fire for this cause too.
                 // Pre-resolved handles for the same reason as the Full arm.
@@ -1211,16 +1233,18 @@ impl WsFrameSpill {
         budget: u64,
     ) -> AppendOutcome {
         let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
-        error!(
-            code = ErrorCode::WsSpill02FrameDropped.code_str(),
-            ws_type = ws_type.as_str(),
-            drop_count = prev + 1,
-            frame_bytes,
-            queued_bytes,
-            budget_bytes = budget,
-            "CRITICAL: WAL spill queue at its BYTE budget — frame dropped \
+        if refusal_line_due(prev + 1) {
+            error!(
+                code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                ws_type = ws_type.as_str(),
+                drop_count = prev + 1,
+                frame_bytes,
+                queued_bytes,
+                budget_bytes = budget,
+                "CRITICAL: WAL spill queue at its BYTE budget — frame dropped \
              (queued payload too large; the record count is not the binding limit)"
-        );
+            );
+        }
         let idx = ws_type_index(ws_type);
         // Shares `drop_critical` with the other two arms so every existing
         // alarm on that series fires for this cause too — no new CloudWatch
@@ -8495,5 +8519,22 @@ mod queue_depth_visibility_tests {
              batch boundary so it costs one write per ~257 records, not one \
              per frame"
         );
+    }
+
+    #[test]
+    fn refusal_line_due_logs_the_first_and_every_power_of_two() {
+        use super::refusal_line_due;
+        // The first refusal MUST log (it is what pages); the flood must not.
+        assert!(refusal_line_due(1));
+        assert!(refusal_line_due(2));
+        assert!(!refusal_line_due(3));
+        assert!(refusal_line_due(4));
+        assert!(!refusal_line_due(1_000));
+        assert!(refusal_line_due(1 << 20));
+        // 2026-09-04: 2,000,238 refusals in one session would have produced
+        // 21 lines instead of two million.
+        let lines = (1..=2_000_238u64).filter(|n| refusal_line_due(*n)).count();
+        assert_eq!(lines, 21);
+        assert!(!refusal_line_due(0), "a zero count is not a refusal");
     }
 }
