@@ -73,15 +73,65 @@ fn hard_refusal_expr(src: &str) -> String {
 /// Fields that may appear in `hard_refusal`. Adding one is a decision that
 /// costs rows, so it must be made here, deliberately, and not by editing a
 /// boolean in passing.
-const MAY_BE_HARD: &[&str] = &["refused_price", "refused_timestamp"];
+///
+/// # 2026-09-10: the two day-mismatch reasons were added, and this guard is
+/// # what forced the reason to be written down
+///
+/// The header above states the ONE criterion: a hard refusal is correct when
+/// writing the row would put CORRUPT data in the table. It then names the
+/// corrupting shape precisely — *"a timestamp outside the plausible band with
+/// no receipt time to stamp the row from instead … would mint a 1970 or
+/// year-2106 partition that retention and archival, both keyed on the trading
+/// day, can never reach."*
+///
+/// A day mismatch is that same shape, one step milder and arguably worse:
+///
+/// * `ts` is QuestDB's DESIGNATED timestamp, so the row is filed by the day
+///   the VENDOR stamped, not the day it arrived.
+/// * That stamp is IN BAND, so `row_timestamp_ist_nanos` does NOT substitute
+///   the receipt time — it uses the value verbatim. The four cases in the
+///   table above all had that fallback; these two do not.
+/// * The partition it lands in is therefore a real, previously-closed trading
+///   day. A 1970 partition is obviously junk and gets ignored; a prior-day
+///   partition looks legitimate and gets **trusted** — by retention, by
+///   archival, by every per-day count, and by the operator reading the table.
+///
+/// MEASURED (operator, 2026-09-10, NSE_FNO 66422): `received_at` 09:15 today,
+/// `ts` 15:29 of a previous session. Dhan sends LAST TRADE TIME, so every
+/// connect snapshot of a dormant contract carries one — mean 5 hours stale,
+/// max 34 days — which means every reconnect and every deploy.
+///
+/// Dated authorization: `websocket-connection-scope-lock.md`, "2026-09-10 — A
+/// TICK WHOSE EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED OUTRIGHT".
+///
+/// ## The alternative that was NOT taken, stated because it is real
+///
+/// The row could have been KEPT and stamped from the RECEIPT instead — right
+/// partition, no loss, and the true trade time preserved in the
+/// `exchange_timestamp` column beside it. That is technically the stronger
+/// answer and it remains available. It was not taken because the operator
+/// directed an outright refusal after finding the rows, and because it changes
+/// what `ts` MEANS for one class of row, which is a schema-semantics decision
+/// rather than a gate decision. Recorded here rather than left implicit, so a
+/// future session weighing this has the option in front of it.
+const MAY_BE_HARD: &[&str] = &[
+    "refused_price",
+    "refused_timestamp",
+    "stale_trading_day",
+    "future_trading_day",
+];
 
 /// Fields that must NEVER appear: the tick is valid, only the fold is not.
+///
+/// `stale_trading_day` left this list on 2026-09-10 — see `MAY_BE_HARD` for
+/// the reason and for the alternative that was not taken. Everything still
+/// here has a receipt-time fallback in the writer, so its row lands in TODAY's
+/// partition and is honest; that is precisely what makes discarding it wrong.
 const MUST_NEVER_BE_HARD: &[&str] = &[
     "slot_exhausted",
     "out_of_session",
     "untraded_sentinel",
     "untraded_timestamp",
-    "stale_trading_day",
     "out_of_band_timestamp",
 ];
 
