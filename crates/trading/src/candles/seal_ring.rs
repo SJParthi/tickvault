@@ -160,13 +160,26 @@ impl BufferedSeal {
 }
 
 // Compile-time size assertion. `BufferedSeal` carries the entire
-// `LiveCandleState` (128 bytes after the 2026-06-05 Option B `close_ts_ist_secs`)
-// + the routing fields (security_id + segment + tf + padding). 144 bytes covers
-// it. Ring RAM = SEAL_BUFFER_CAPACITY × this size — see that constant's note on
+// `LiveCandleState` (136 bytes since the 2026-09-10 `net_volume_signed`
+// accumulator; 128 from the 2026-06-05 Option B `close_ts_ist_secs`) + the
+// routing fields (security_id + segment + tf + padding). 152 bytes covers it.
+// Ring RAM = SEAL_BUFFER_CAPACITY × this size — see that constant's note on
 // why the product is deliberately NOT restated as a literal here.
+//
+// 144 → 152 RAISED 2026-09-10. Fleet cost: SEAL_BUFFER_CAPACITY is
+// AGGREGATOR_MAX_SLOTS × TF_COUNT = 600,000, so the ring grows 86.4 MB →
+// 91.2 MB, +4.8 MB (0.015% of the r8g.xlarge 32 GiB host). The aggregator
+// cell's own budget carries a further +~10 MB; the whole net-volume change is
+// ~15 MB, recorded in `aws-budget.md` under the same date.
+//
+// The 152 stays a LITERAL for the same reason its sibling in
+// `aggregator_cell.rs` does: writing `size_of::<LiveCandleState>() + 16` here
+// would make the assert unable to fail on exactly the change it exists to
+// catch, and this one DID catch the net-volume field and made its cost
+// visible before it shipped.
 const _: () = assert!(
-    std::mem::size_of::<BufferedSeal>() <= 144,
-    "BufferedSeal exceeded 144-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
+    std::mem::size_of::<BufferedSeal>() <= 152,
+    "BufferedSeal exceeded 152-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
 );
 
 /// Outcome of [`SealRing::try_buffer`].
@@ -370,7 +383,12 @@ mod tests {
     fn test_buffered_seal_size_within_budget() {
         // Pinned by `const _ = assert!` above. Runtime-mirrored here
         // so a future field bloat fails grep-able tests too.
-        assert!(std::mem::size_of::<BufferedSeal>() <= 144);
+        //
+        // 144 -> 152 on 2026-09-10 with `LiveCandleState::net_volume_signed`
+        // (128 -> 136). Fleet cost recorded beside the const assert and in
+        // aws-budget.md: the ring is SEAL_BUFFER_CAPACITY x this size, so
+        // 86.4 MB -> 91.2 MB.
+        assert!(std::mem::size_of::<BufferedSeal>() <= 152);
     }
 
     #[test]

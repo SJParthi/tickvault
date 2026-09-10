@@ -192,13 +192,27 @@ impl ShadowSealRow {
             // the per-instrument RAM budget (operator request 2026-06-02).
             change_pct: seal.state.close_pct_from_prev_day,
             open_gap_pct: seal.state.open_gap_pct,
-            // Derived, not stored: the state carries the two INPUTS (the
-            // bar's own volume and the previous bar's close, snapshotted at
-            // bucket open) and this is the one place they become a signed
-            // figure. Keeping the derivation here rather than on
-            // `LiveCandleState` costs no per-instrument RAM at the 25,000-slot
-            // ceiling, and `net_volume()` owns every refusal — non-finite,
-            // non-positive, missing baseline — in one place.
+            // ⚠ CORRECTED 2026-09-10. This comment said "Derived, not stored:
+            // the state carries the two INPUTS (the bar's own volume and the
+            // previous bar's close, snapshotted at bucket open) and this is the
+            // one place they become a signed figure." That was accurate, and
+            // it described a calculation that was WRONG: signing a whole bar's
+            // volume by its close direction is bar DIRECTION, not net volume,
+            // and it inverts precisely when a bar's flow and its close
+            // disagree.
+            //
+            // `net_volume_signed` is now ACCUMULATED per tick by the live fold
+            // under the tick rule, so this is a read rather than a derivation.
+            // The comment's claim that it "costs no per-instrument RAM" is
+            // therefore also retired: it costs 8 bytes on `LiveCandleState`,
+            // ~10 MB across the 25,000-slot ceiling plus ~4.8 MB on the seal
+            // ring, priced at both const-asserts and in aws-budget.md.
+            //
+            // What is UNCHANGED: `net_volume()` still owns every refusal in one
+            // place, and it still returns `None` — persisted as SQL NULL —
+            // rather than a fabricated zero. It gained one: a bar this process
+            // did not classify (a disk-spill replay, a REST bar) reports NULL
+            // instead of claiming perfectly balanced flow.
             net_volume: seal.state.net_volume(),
             total_buy_qty: i64::from(seal.state.total_buy_qty),
             total_sell_qty: i64::from(seal.state.total_sell_qty),

@@ -457,11 +457,12 @@ pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms
 /// `site` (`new` | `extend` | `swap`).
 ///
 /// This one names an 804. Dhan answers a duplicate subscribe with error code
-/// 804, which `classify_disconnect` files as Fatal: the socket closes and this
-/// supervisor parks it for the session rather than redialling into the same
-/// refusal. So a single repeated instrument in ONE batch does not degrade a
-/// connection, it ends it — and every instrument that connection was carrying
-/// goes dark with it.
+/// 804, which `classify_disconnect` files as `SubscriptionRejected`: the socket
+/// closes, the supervisor spends its ONE re-dial, and a second 804 on that slot
+/// parks it for the session. A fresh connection resets the VENDOR's count, which
+/// is what makes the one re-dial worth taking — but it cannot un-repeat an
+/// instrument WE sent twice, so for this defect the re-dial is spent for nothing
+/// and the connection ends two 804s later, taking every instrument it carried.
 ///
 /// A non-zero value is therefore a PRODUCER defect that was caught rather than
 /// suffered: some caller built a set with a repeat in it. The instrument is
@@ -499,6 +500,26 @@ pub enum DisconnectClass {
     /// Entitlement or credential errors that never self-heal without operator
     /// action (806 data-API not subscribed, 808 auth failed, 810 client id
     /// invalid). Park; a human must fix the account or the config.
+    /// 804 — the VENDOR's per-connection instrument count was exceeded.
+    ///
+    /// Split out of [`Self::Fatal`] on 2026-09-10. It sat in the credential
+    /// class from 2026-08-14 on the reasoning that a re-dial "re-sends the
+    /// IDENTICAL over-limit subscribe set". **That reasoning is wrong about
+    /// whose count is over the limit.** [`SubscribeGuard`] refuses fail-closed
+    /// at `max_instruments_per_connection` in all three mutation sites
+    /// (`try_new`, `try_extend`, and `try_swap`'s already-held check), so OUR
+    /// retained set can never exceed the cap by construction — there is no
+    /// over-limit set for a re-dial to replay.
+    ///
+    /// A 804 therefore means the VENDOR is holding more for this connection
+    /// than we are, which is what an ignored unsubscribe produces: Dhan keeps
+    /// N+1 where a depth-200 cap is 1. A FRESH connection is the only thing
+    /// that can reset that count, which makes exactly one re-dial the correct
+    /// response and a second one pointless.
+    ///
+    /// Distinct from [`Self::Fatal`] rather than a widening of it: a
+    /// credential error repeats verbatim on a fresh socket and this does not.
+    SubscriptionRejected,
     Fatal,
 }
 
@@ -517,30 +538,29 @@ pub fn classify_disconnect(code: Option<DisconnectCode>) -> DisconnectClass {
         Some(
             DisconnectCode::DataApiSubscriptionRequired
             | DisconnectCode::AuthenticationFailed
-            | DisconnectCode::ClientIdInvalid
-            // 804 — "Requested number of instruments exceeds limit."
-            //
-            // MOVED here from the `_ => Transient` catch-all on 2026-08-14.
-            // Transient means "retry on the ladder", and retrying 804 re-sends
-            // the IDENTICAL over-limit subscribe set that was just rejected —
-            // forever, every 30s at the ladder's cap. Nothing in that loop can
-            // ever succeed, because nothing about the request changes between
-            // attempts. It is a request-shaped error wearing a transport-code
-            // costume, and the catch-all could not tell the difference.
-            //
-            // Worse, it is self-amplifying in exactly the direction that hurts
-            // most: a permanent connect/subscribe/reject cycle is precisely
-            // the traffic pattern 805 describes as "too many requests", whose
-            // documented consequence is the USER being blocked — so retrying
-            // one account-level rejection can earn another.
-            //
-            // Fatal parks the socket, and since 2026-08-14 a park is no longer
-            // silent: it emits a coded error naming the endpoint and slot, and
-            // `tv_dhan_ws_park_total` has an alarm. So this turns an invisible
-            // infinite loop into one page that names the real problem —
-            // somebody asked for more instruments than the endpoint allows.
-            | DisconnectCode::InstrumentsExceedLimit,
+            | DisconnectCode::ClientIdInvalid,
         ) => DisconnectClass::Fatal,
+        // 804 — the vendor's count for THIS connection is over its cap.
+        //
+        // Was in the Fatal arm above from 2026-08-14 to 2026-09-10. The note
+        // that put it there argued a re-dial "re-sends the IDENTICAL over-limit
+        // subscribe set", so nothing could change between attempts. Our set is
+        // not the one over the limit: `SubscribeGuard` refuses fail-closed at
+        // the endpoint cap in every mutation site, so it is within cap by
+        // construction. What is over is the VENDOR's count, which an ignored
+        // unsubscribe produces (Dhan holding N+1 where a depth-200 cap is 1),
+        // and a fresh connection is the only thing that resets it.
+        //
+        // So exactly ONE re-dial is the right answer and a second is not:
+        // `ParkReason::SubscriptionRejected` is the tree's first
+        // `allows_one_respawn() == true`, which spends the one-shot budget that
+        // has been wired and tested but unreachable since it was written.
+        //
+        // The 805 hazard the old note raised is still respected: the respawn
+        // rides the existing backoff ladder, the per-slot stagger and the
+        // 6-per-300s flap floor, and it happens at most once per socket per
+        // process. That is 1-16 extra dials in a whole session, not a cycle.
+        Some(DisconnectCode::InstrumentsExceedLimit) => DisconnectClass::SubscriptionRejected,
         _ => DisconnectClass::Transient,
     }
 }
@@ -795,13 +815,21 @@ pub enum ParkReason {
     PoolOverflow,
     /// An entitlement or credential error that needs operator action.
     FatalDisconnect,
+    /// 804 — the vendor's per-connection count was over its cap. The ONLY
+    /// reason in this tree whose [`ParkReason::allows_one_respawn`] is `true`.
+    SubscriptionRejected,
     /// Orderly shutdown.
     Shutdown,
 }
 
 impl ParkReason {
     /// Every reason, for baseline pre-registration of the park counter.
-    pub const ALL: [Self; 3] = [Self::PoolOverflow, Self::FatalDisconnect, Self::Shutdown];
+    pub const ALL: [Self; 4] = [
+        Self::PoolOverflow,
+        Self::FatalDisconnect,
+        Self::SubscriptionRejected,
+        Self::Shutdown,
+    ];
 
     /// Stable lowercase tag for logs and metric labels.
     #[must_use]
@@ -809,6 +837,7 @@ impl ParkReason {
         match self {
             Self::PoolOverflow => "pool_overflow",
             Self::FatalDisconnect => "fatal_disconnect",
+            Self::SubscriptionRejected => "subscription_rejected",
             Self::Shutdown => "shutdown",
         }
     }
@@ -830,7 +859,7 @@ impl ParkReason {
     /// rather than letting a new reason inherit whichever answer happens to be
     /// the fallthrough.
     ///
-    /// # Every reason answers `false` today, and each for its OWN reason
+    /// # Three reasons answer `false`, one answers `true`, each for its OWN reason
     ///
     /// * [`Self::PoolOverflow`] (805) — re-dialing does not retry a failure, it
     ///   EXECUTES a healthy sibling. Dhan kills the OLDEST socket per extra
@@ -841,32 +870,53 @@ impl ParkReason {
     ///   code that reaches it (806 data-API not subscribed, 808 auth failed,
     ///   810 client id invalid) needs a human to fix the account or the config,
     ///   so a re-dial re-presents the identical rejected credential and earns
-    ///   the identical rejection. The one member that is NOT a credential —
-    ///   804, instruments-exceed-limit — is worse rather than better: the
-    ///   `SubscribeGuard` replays the SAME retained set on re-dial, so the
-    ///   outcome is deterministic, and `classify_disconnect`'s own note records
-    ///   that this connect/reject cycle is the traffic pattern 805 describes,
-    ///   whose documented consequence is the USER being blocked. So a 804
-    ///   re-dial can cost a sibling too.
+    ///   the identical rejection. **804 left this class on 2026-09-10** — see
+    ///   [`Self::SubscriptionRejected`] below.
     /// * [`Self::Shutdown`] — we asked for it. Re-dialing during shutdown is
     ///   not recovery, it is refusing to stop.
     ///
-    /// # What a `true` reason would have to look like
+    /// * [`Self::SubscriptionRejected`] (804) — **the one `true`.** It is
+    ///   neither overflow nor credential. Our subscribe set cannot be the
+    ///   thing over the limit: [`SubscribeGuard`] refuses fail-closed at
+    ///   `max_instruments_per_connection` in `try_new`, in `try_extend`, and
+    ///   in `try_swap`'s already-held check, so the retained set is within cap
+    ///   by construction. The count that IS over is the vendor's, which an
+    ///   ignored unsubscribe produces, and only a fresh connection resets it.
+    ///   So the state CAN differ by the next attempt, and the cost of being
+    ///   wrong is one wasted dial on this slot alone — bounded to exactly one
+    ///   by `respawn_used`, and still paced by the ladder, the per-slot
+    ///   stagger and the flap floor, so it cannot become the connect/reject
+    ///   cycle that 805 punishes.
+    ///
+    ///   **The one Assumed premise, stated rather than hidden:** that a fresh
+    ///   connection starts at zero in the vendor's per-connection accounting.
+    ///   That is not provable from this tree. It is, however, the same premise
+    ///   `mark_lost` + replay already relies on for every transient redial, so
+    ///   it is not a new bet — and if it is wrong the socket parks one bounded
+    ///   dial later than it does today, which is the same end state.
+    ///
+    /// # What a `true` reason has to look like
     ///
     /// A TRANSPORT fatal that is neither overflow nor credential: one where the
     /// worst case of being wrong is a single wasted dial on this slot alone,
     /// and where the state that produced it can plausibly differ by the next
-    /// attempt. No such reason exists in this tree today — which is the finding,
-    /// not an omission. The mechanism below is wired and tested so that the day
-    /// one is introduced, it is a one-line answer here rather than a redesign.
-    #[must_use]
+    /// attempt. [`Self::SubscriptionRejected`] is the first such reason, found
+    /// on 2026-09-10; the mechanism below had been wired and tested since it
+    /// was written, waiting for exactly one.
     pub const fn allows_one_respawn(self) -> bool {
         match self {
             // Re-dialing kills a healthy sibling. Never.
             Self::PoolOverflow => false,
-            // Credential/entitlement (806/808/810) repeats the rejection; 804
-            // replays an identical over-limit set and can earn an 805.
+            // Credential/entitlement (806/808/810). A fresh socket re-presents
+            // the identical rejected credential and earns the identical
+            // rejection. 804 LEFT this class on 2026-09-10 -- see below.
             Self::FatalDisconnect => false,
+            // 804. The one `true` in this tree, and the docblock above
+            // describes exactly this shape: neither overflow nor credential,
+            // the worst case of being wrong is ONE wasted dial on this slot
+            // alone, and the state that produced it CAN differ by the next
+            // attempt because a fresh connection resets the vendor's count.
+            Self::SubscriptionRejected => true,
             // We asked to stop.
             Self::Shutdown => false,
         }
@@ -1254,6 +1304,21 @@ impl ConnectionSupervisor {
                              cannot self-heal — parking. Operator action required."
                         );
                         self.park(ParkReason::FatalDisconnect, now)
+                    }
+                    DisconnectClass::SubscriptionRejected => {
+                        error!(
+                            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                            endpoint = self.slot.endpoint.as_str(),
+                            pool_index = self.slot.pool_index,
+                            disconnect_code = code.map_or(0, |c| c.as_u16()),
+                            "Dhan closed this socket with 804 (instruments exceed limit). Our \
+                             retained set is within the endpoint cap by construction, so the \
+                             count that is over is the vendor's for this connection — an \
+                             ignored unsubscribe leaves them holding more than we do. Taking \
+                             the one-shot respawn: a fresh connection resets that count. A \
+                             second 804 on this slot parks it permanently."
+                        );
+                        self.park(ParkReason::SubscriptionRejected, now)
                     }
                     DisconnectClass::TokenStale => {
                         // Floor the LADDER, then add this socket's stagger —
@@ -1666,7 +1731,7 @@ pub enum SubscribeGuardRefusal {
     ///
     /// Fail-closed, and this is the sharpest of the three: applying it would
     /// send a subscribe for an instrument already on this socket, and Dhan
-    /// answers a duplicate subscribe with an 804 — Fatal, so the connection
+    /// answers a duplicate subscribe with an 804, so the connection
     /// closes and parks for the session. Refusing costs one minute's swap;
     /// applying costs every instrument the connection was carrying.
     #[error("{endpoint} was asked to swap in an instrument it already holds")]
@@ -1702,8 +1767,9 @@ pub struct SubscribeGuard {
 /// relying on that. It is the LAST place a set can be inspected before it
 /// reaches the wire, it is shared by all four endpoint types, and the cost of
 /// a duplicate reaching Dhan is not a degraded connection but a dead one:
-/// error 804 is Fatal, so the socket closes, the supervisor parks it for the
-/// session, and every instrument that connection was carrying goes dark.
+/// error 804 closes the socket, and while the supervisor will spend one
+/// re-dial on it, that re-dial replays the SAME duplicated set — so the second
+/// 804 parks the slot for the session and every instrument it carried goes dark.
 ///
 /// # Why DROP rather than refuse the whole set
 ///
@@ -1768,7 +1834,7 @@ fn drop_duplicates(
                 segment = example.segment.as_str(),
                 "a subscription set carried the same instrument more than once — \
                  dropped before it reached the wire, because Dhan answers a \
-                 duplicate subscribe with an 804 (Fatal) and the connection \
+                 duplicate subscribe with an 804 and the connection \
                  would have parked for the session. The producer built a set \
                  with a repeat in it."
             );
@@ -2058,8 +2124,9 @@ impl SubscribeGuard {
     /// [`SubscribeSwap::subscribe`]. Order matters on a depth-200 socket,
     /// which accepts exactly one instrument: subscribing before unsubscribing
     /// asks for two, and Dhan answers an over-limit subscribe with **804**,
-    /// which is Fatal — retrying re-sends the identical over-limit set
-    /// forever and can earn an 805 account block.
+    /// which closes the socket. The supervisor spends its one re-dial, and
+    /// since the guard replays the SAME two-instrument set, the second 804
+    /// parks the slot for the session.
     ///
     /// # Why the retained set is updated even though the wire has not moved
     ///
@@ -2128,7 +2195,7 @@ impl SubscribeGuard {
         // `old == new` above catches the no-op. This catches the different
         // case: `new` is held at some OTHER position, so the swap would
         // unsubscribe `old` and then subscribe something the socket already
-        // has. Dhan answers that with an 804 — Fatal — and the supervisor
+        // has. Dhan answers that with an 804 — and the supervisor
         // parks the connection for the session, taking every instrument it
         // carried with it.
         //
@@ -2151,7 +2218,7 @@ impl SubscribeGuard {
                 security_id = new.security_id,
                 segment = new.segment.as_str(),
                 "refusing a swap whose NEW instrument this connection already \
-                 holds — subscribing it twice is an 804, which is Fatal and \
+                 holds — subscribing it twice is an 804, which costs a re-dial and then a park, and \
                  parks the connection for the session"
             );
             return Err(SubscribeGuardRefusal::AlreadySubscribed {
@@ -3468,7 +3535,7 @@ pub trait DhanFeedSocket: Send {
     /// loudly, because the alternative — reporting success and leaving the old
     /// instrument subscribed — puts a depth-200 connection over its
     /// one-instrument limit on the very next subscribe, and Dhan answers that
-    /// with a Fatal 804.
+    /// with an 804 (one re-dial, then a permanent park).
     fn send_unsubscribe(
         &mut self,
         batch: &[SubscribeInstrument],
@@ -4155,7 +4222,7 @@ where
                             // UNSUBSCRIBE FIRST. A depth-200 connection holds
                             // exactly one instrument; subscribing before
                             // unsubscribing asks for two, and Dhan answers an
-                            // over-limit subscribe with 804 — Fatal, and
+                            // over-limit subscribe with 804, and
                             // retrying re-sends the same over-limit set
                             // forever. The order is the safety property.
                             // Both calls bounded by `SWAP_WIRE_BUDGET`. See
@@ -4828,9 +4895,11 @@ mod tests {
     // -- the 804 guard: no connection may carry one instrument twice --------
     //
     // Dhan answers a duplicate subscribe with error code 804, which
-    // `classify_disconnect` files as Fatal: the socket closes and the
-    // supervisor parks it for the SESSION. So a repeat is not a wasted slot,
-    // it is the loss of every instrument that connection was carrying.
+    // `classify_disconnect` files as `SubscriptionRejected`: the socket closes,
+    // the supervisor spends its one re-dial, and — since that re-dial replays
+    // the SAME duplicated set — the second 804 parks the slot for the SESSION.
+    // So a repeat is not a wasted slot, it is the loss of every instrument that
+    // connection was carrying, two 804s later.
     //
     // Every producer today builds a duplicate-free set. These pin that the
     // guard does not depend on that — it is the last place a set can be
@@ -4848,7 +4917,7 @@ mod tests {
         for i in &flat {
             assert!(
                 seen.insert((i.security_id, i.segment)),
-                "duplicate {i:?} in a subscribe batch — that is an 804 (Fatal)"
+                "duplicate {i:?} in a subscribe batch — that is an 804"
             );
         }
     }
@@ -4947,7 +5016,7 @@ mod tests {
 
     /// A depth-200 connection accepts exactly ONE instrument. Subscribing
     /// before unsubscribing asks for two, and Dhan answers an over-limit
-    /// subscribe with 804 — Fatal, and retrying re-sends the same over-limit
+    /// subscribe with 804, and a second one on the same socket parks it
     /// set forever. The ORDER is the safety property, so it is pinned by the
     /// field names rather than left to a comment.
     #[test]
@@ -5169,20 +5238,23 @@ mod tests {
         // `PoolSupervisor::new`, and the CloudWatch agent baselines PER LABEL
         // COMBINATION: a reason missing from ALL has its first park eaten as
         // the delta baseline, so `tv-<env>-dhan-socket-parked` stays silent for
-        // exactly that reason. `[Self; 3]` alone does not protect against
+        // exactly that reason. `[Self; 4]` alone does not protect against
         // that — adding a variant forces only `as_str()`'s match to change,
         // and the array compiles untouched.
         //
         // Same shape as `pool_budget::test_endpoint_type_has_exactly_four_...`,
         // which is what makes `DhanEndpointType::ALL` — the other half of the
         // registration loop — genuinely compile-protected.
-        assert_eq!(ParkReason::ALL.len(), 3, "exactly three park reasons");
+        assert_eq!(ParkReason::ALL.len(), 4, "exactly four park reasons");
 
         // Exhaustive match: adding a variant stops this compiling until ALL
         // and this arm list are updated together.
         for reason in ParkReason::ALL {
             match reason {
-                ParkReason::PoolOverflow | ParkReason::FatalDisconnect | ParkReason::Shutdown => {}
+                ParkReason::PoolOverflow
+                | ParkReason::FatalDisconnect
+                | ParkReason::SubscriptionRejected
+                | ParkReason::Shutdown => {}
             }
         }
 
@@ -5231,7 +5303,7 @@ mod tests {
     /// `instruments(n)` always starts at 0, so extending a 250-instrument set
     /// with `instruments(150)` supplies 150 instruments it ALREADY has. On the
     /// wire that is 150 duplicate subscribes, and Dhan answers a duplicate
-    /// subscribe with an 804 — Fatal. The guard now drops them, so a test
+    /// subscribe with an 804. The guard now drops them, so a test
     /// wanting a real top-up has to ask for one.
     fn instruments_from(start: usize, n: usize) -> Vec<SubscribeInstrument> {
         (start..start.saturating_add(n))
@@ -5299,25 +5371,59 @@ mod tests {
         );
     }
 
-    /// 804 must NOT ride the reconnect ladder (2026-08-14 regression pin).
+    /// 804 gets its OWN class: one re-dial, then park (2026-09-10).
     ///
-    /// "Requested number of instruments exceeds limit" is a REQUEST error
-    /// wearing a transport-code costume. Retrying it re-sends the identical
-    /// over-limit subscribe set that was just rejected, forever, every 30s at
-    /// the ladder's cap — nothing about the request changes between attempts,
-    /// so nothing in that loop can ever succeed.
+    /// # What this replaced, and why the old reasoning was wrong
     ///
-    /// It is also self-amplifying in the worst direction: a permanent
-    /// connect/subscribe/reject cycle is exactly the traffic 805 calls "too
-    /// many requests", whose documented consequence is the USER being blocked.
-    /// So retrying one account-level rejection can earn another.
+    /// From 2026-08-14 to 2026-09-10 this test pinned 804 as `Fatal`, on the
+    /// stated grounds that *"retrying it re-sends the identical over-limit
+    /// subscribe set that was just rejected — nothing about the request
+    /// changes between attempts, so nothing in that loop can ever succeed."*
+    ///
+    /// The premise is FALSE, and it is false in the one direction that
+    /// mattered: **our retained set cannot exceed the endpoint cap by
+    /// construction.** `SubscribeGuard::try_extend` refuses past
+    /// `subscription_capacity()` before a byte reaches the wire, and the
+    /// planner refuses the WHOLE pool rather than truncating. So when Dhan
+    /// answers 804, the count that is over the cap is THEIRS, not ours — an
+    /// unsubscribe they ignored leaves them holding instruments we no longer
+    /// count. Measured 2026-09-10: 20 ignored unsubscribes and 10 ghost
+    /// redials in 30 minutes, on the very code (25) that was proven wrong the
+    /// same day.
+    ///
+    /// A FRESH connection resets the vendor's per-connection count. That is
+    /// precisely the thing the old reasoning said could not change, and it is
+    /// what makes one re-dial worth taking.
+    ///
+    /// # What is NOT retracted from the old reasoning
+    ///
+    /// The self-amplification warning still binds and is why this is ONE
+    /// re-dial rather than a ladder: a permanent connect/reject cycle is
+    /// exactly the traffic 805 calls "too many requests", whose documented
+    /// consequence is *"may result in user being blocked"*. One dial is not a
+    /// cycle; a second 804 on the same slot parks it permanently.
     #[test]
-    fn test_classify_disconnect_804_is_fatal_not_an_infinite_retry() {
+    fn test_classify_disconnect_804_is_its_own_class_not_fatal_and_not_transient() {
         assert_eq!(
             classify_disconnect(Some(DisconnectCode::InstrumentsExceedLimit)),
+            DisconnectClass::SubscriptionRejected,
+            "804 is neither Fatal (a fresh connection resets the vendor's count, \
+             so the state CAN differ) nor Transient (a ladder re-dials forever \
+             and that traffic is what earns an 805)"
+        );
+
+        // The two neighbours it must NOT be confused with, asserted here so a
+        // future merge that collapses the arms fails on this test rather than
+        // in production.
+        assert_ne!(
+            classify_disconnect(Some(DisconnectCode::InstrumentsExceedLimit)),
             DisconnectClass::Fatal,
-            "804 (instruments exceed limit) must PARK, not retry. Transient here means \
-             re-sending the same rejected subscribe set every 30s forever."
+            "Fatal parks on the FIRST 804 — that is the behaviour this change removed"
+        );
+        assert_ne!(
+            classify_disconnect(Some(DisconnectCode::InstrumentsExceedLimit)),
+            DisconnectClass::Transient,
+            "Transient rides the full ladder — an unbounded connect/reject cycle"
         );
     }
 
@@ -6370,42 +6476,78 @@ mod tests {
 
     // -- one-shot respawn after a park -------------------------------------
     //
-    // The eligibility TABLE is empty today (see `allows_one_respawn`), so the
-    // tests below split into two halves that must both hold:
+    // The eligibility TABLE has exactly ONE `true` since 2026-09-10 (see
+    // `allows_one_respawn`), so the tests below split into three halves that
+    // must all hold:
     //
     //   * the NEVER half, driven end-to-end through the real event path for
-    //     every reason that exists. This is the half that matters — a wrong
-    //     `true` here re-dials into an 805 and executes a healthy sibling.
+    //     every reason that must stay `false`. This is the half that matters —
+    //     a wrong `true` here re-dials into an 805 and executes a healthy
+    //     sibling.
+    //   * the ONE-TRUE half, which pins that 804 and ONLY 804 is eligible, so
+    //     a second reason cannot join it by a one-word edit.
     //   * the EXACTLY-ONCE half, driven through `respawn_budget_allows`, the
-    //     production predicate `park` gates on. It is tested directly because
-    //     no production reason can reach it today, and a test that could only
-    //     pass by being unreachable would prove nothing about the bound.
+    //     production predicate `park` gates on — a `true` reason must still
+    //     stop at ONE re-dial, never loop.
 
     #[test]
-    fn test_no_park_reason_is_respawn_eligible_and_each_one_says_why() {
-        // THE FINDING, pinned. Every park reason in this tree is one whose
+    fn test_only_subscription_rejected_is_respawn_eligible_and_each_one_says_why() {
+        // THE FINDING, pinned. Three park reasons in this tree are ones whose
         // re-dial is actively harmful, not merely useless:
         //   PoolOverflow  — Dhan kills the OLDEST socket, so a re-dial costs a
         //                   healthy fully-subscribed sibling.
         //   FatalDisconnect — 806/808/810 are credential/entitlement and repeat
-        //                   verbatim; 804 replays an identical over-limit set
-        //                   and its connect/reject cycle can earn an 805.
+        //                   verbatim: a fresh socket re-presents the identical
+        //                   rejected credential and earns the identical answer.
         //   Shutdown      — we asked to stop.
         //
-        // Flipping any of these to `true` must fail here first, so the change
-        // is a confrontation with the reasoning rather than a one-word edit.
+        // The fourth is the one exception, and it is an exception for a reason
+        // the other three cannot claim:
+        //   SubscriptionRejected — 804 says the VENDOR's count for this
+        //                   connection is over its cap. Our retained set is
+        //                   within the cap by construction, so the count that
+        //                   is over is theirs — an ignored unsubscribe leaves
+        //                   them holding more than we do. A FRESH connection
+        //                   resets that count, so the state that produced the
+        //                   rejection genuinely CAN differ on the next attempt.
+        //                   Worst case of being wrong: ONE wasted dial on this
+        //                   slot alone — no sibling is touched.
+        //
+        // Flipping any of these must fail here first, so the change is a
+        // confrontation with the reasoning rather than a one-word edit.
         for reason in ParkReason::ALL {
-            assert!(
-                !reason.allows_one_respawn(),
-                "{} must NOT be respawn-eligible — re-dialing it is harmful, \
-                 not merely wasted; see ParkReason::allows_one_respawn",
+            let expected = matches!(reason, ParkReason::SubscriptionRejected);
+            assert_eq!(
+                reason.allows_one_respawn(),
+                expected,
+                "{} respawn-eligibility must be {expected} — see \
+                 ParkReason::allows_one_respawn for why each answer is what \
+                 it is; a wrong `true` re-dials into harm, a wrong `false` \
+                 parks a slot a fresh connection would have recovered",
                 reason.as_str()
             );
         }
+
+        // Exactly ONE `true` in the whole tree. A second reason flipped to
+        // `true` passes the loop above only if its `matches!` arm was widened
+        // too, and this count is the thing that catches a widened arm.
+        let eligible = ParkReason::ALL
+            .into_iter()
+            .filter(|r| r.allows_one_respawn())
+            .count();
+        assert_eq!(
+            eligible, 1,
+            "exactly one park reason may be respawn-eligible; adding a second \
+             needs its own dated reasoning, not a one-word edit"
+        );
+
         // Exhaustive: a new variant stops this compiling until it is decided.
         for reason in ParkReason::ALL {
             match reason {
-                ParkReason::PoolOverflow | ParkReason::FatalDisconnect | ParkReason::Shutdown => {}
+                ParkReason::PoolOverflow
+                | ParkReason::FatalDisconnect
+                | ParkReason::SubscriptionRejected
+                | ParkReason::Shutdown => {}
             }
         }
     }
@@ -6443,15 +6585,18 @@ mod tests {
     #[test]
     fn test_credential_class_fatal_never_respawns_it_parks_on_the_first_fatal() {
         // 806 / 808 / 810 are credential + entitlement: a re-dial re-presents
-        // the identical rejected credential. 804 is the non-credential member
-        // and is worse, not better — the guard replays the SAME over-limit set
-        // and the connect/reject cycle is the pattern 805 punishes.
+        // the identical rejected credential and earns the identical rejection.
+        //
+        // 804 LEFT this list on 2026-09-10 and is covered by its own test
+        // below. The reason it left is that the sentence this comment used to
+        // carry about it — "the guard replays the SAME over-limit set" — was
+        // false: our set is within the cap by construction, so an 804 is the
+        // VENDOR's count being over, and a fresh connection resets that.
         let now = t0();
         for code in [
             DisconnectCode::DataApiSubscriptionRequired,
             DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
-            DisconnectCode::InstrumentsExceedLimit,
         ] {
             let mut s = sup(DhanEndpointType::Depth20, 1, now);
             let _ = s.on_event(ConnEvent::BeginDial, now);
@@ -6465,6 +6610,60 @@ mod tests {
             );
             assert_eq!(s.phase(), ConnPhase::Parked, "{code:?}");
         }
+    }
+
+    /// 804 takes ONE re-dial, then parks — driven through the REAL event path.
+    ///
+    /// The two halves are asserted separately because only one of them is a
+    /// behaviour change: the first 804 must now produce a dial instead of a
+    /// park, and the SECOND must still park. A change that granted the first
+    /// without bounding the second would turn an account-level rejection into
+    /// the unbounded connect/reject cycle that 805 punishes.
+    #[test]
+    fn test_804_takes_exactly_one_respawn_then_parks_on_the_second() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+
+        // First 804: one re-dial, on the ladder's own delay. The socket is NOT
+        // parked — that is the whole change.
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let first = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::InstrumentsExceedLimit),
+            },
+            now,
+        );
+        assert!(
+            matches!(first, SupervisorAction::SleepThenDial { .. }),
+            "the FIRST 804 must spend the one-shot respawn — a fresh connection \
+             resets the vendor's per-connection count; got {first:?}"
+        );
+        assert_ne!(
+            s.phase(),
+            ConnPhase::Parked,
+            "the first 804 must NOT park — that was the pre-2026-09-10 behaviour"
+        );
+
+        // Second 804 on the SAME slot: the budget is spent, so it parks. A
+        // fresh connection did not help, which is the evidence that the count
+        // being over is not something a re-dial can fix.
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let second = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::InstrumentsExceedLimit),
+            },
+            now,
+        );
+        assert_eq!(
+            second,
+            SupervisorAction::Park {
+                reason: ParkReason::SubscriptionRejected
+            },
+            "the SECOND 804 must park — one re-dial is the bound, and an \
+             unbounded cycle is what earns an 805"
+        );
+        assert_eq!(s.phase(), ConnPhase::Parked);
+        assert_eq!(s.park_reason(), Some(ParkReason::SubscriptionRejected));
     }
 
     #[test]
@@ -6541,16 +6740,24 @@ mod tests {
         );
 
         // And the production gate is that predicate applied to the reason
-        // table: with every reason ineligible, no state of the flag yields a
-        // respawn today.
+        // table. Since 2026-09-10 the table has exactly one eligible reason,
+        // so this loop asserts BOTH directions rather than a blanket never:
+        // the three ineligible reasons must park in either flag state, and the
+        // one eligible reason must respawn ONLY while its budget is intact.
         for reason in ParkReason::ALL {
-            for used in [false, true] {
-                assert!(
-                    !respawn_budget_allows(reason.allows_one_respawn(), used),
-                    "{} must not respawn (respawn_used={used})",
-                    reason.as_str()
-                );
-            }
+            let eligible = reason.allows_one_respawn();
+            assert_eq!(
+                respawn_budget_allows(eligible, false),
+                eligible,
+                "{} with budget intact must respawn iff it is eligible",
+                reason.as_str()
+            );
+            assert!(
+                !respawn_budget_allows(eligible, true),
+                "{} must NOT respawn once the budget is spent — the bound is \
+                 per SLOT, and it holds for the eligible reason too",
+                reason.as_str()
+            );
         }
     }
 
@@ -7757,7 +7964,7 @@ mod tests {
         unsubscribes: usize,
         /// Every wire call in order, so a test can assert that the
         /// unsubscribe went out BEFORE the subscribe. On a depth-200 socket
-        /// the reverse order asks for two instruments and earns a Fatal 804,
+        /// the reverse order asks for two instruments and earns an 804,
         /// so the ORDER is the property under test, not the counts.
         wire_calls: Vec<&'static str>,
         pings: usize,
@@ -8114,7 +8321,7 @@ mod tests {
 
     /// THE safety property. A depth-200 connection holds exactly one
     /// instrument; subscribing before unsubscribing asks for two, and Dhan
-    /// answers an over-limit subscribe with 804 — Fatal, and retrying
+    /// answers an over-limit subscribe with 804, and retrying
     /// re-sends the identical over-limit set forever.
     #[tokio::test(start_paused = true)]
     async fn a_swap_unsubscribes_before_it_subscribes() {
@@ -8468,7 +8675,7 @@ mod tests {
 
     /// A failed unsubscribe must NOT be followed by the subscribe. Sending it
     /// anyway is the exact shape that takes a depth-200 connection to two
-    /// instruments and earns the Fatal 804.
+    /// instruments and earns the 804.
     #[tokio::test(start_paused = true)]
     async fn a_failed_unsubscribe_stops_the_swap_rather_than_subscribing_anyway() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
@@ -8504,7 +8711,7 @@ mod tests {
             s.wire_calls,
             vec!["subscribe", "unsubscribe"],
             "the subscribe went out after the unsubscribe FAILED — that is the \
-             over-limit shape Dhan answers with a Fatal 804"
+             over-limit shape Dhan answers with an 804"
         );
     }
 
@@ -8512,7 +8719,7 @@ mod tests {
     /// socket carrying nothing — and must force a redial.
     ///
     /// The order of the two wire calls is a safety property (subscribing first
-    /// on a one-instrument depth socket asks for two and earns a Fatal 804), and
+    /// on a one-instrument depth socket asks for two and earns an 804), and
     /// this is its consequence: when the first call succeeds and the second does
     /// not, a depth-200 connection holds ZERO instruments.
     ///
@@ -8708,7 +8915,7 @@ mod tests {
         );
         let s = st.lock().expect("fake state");
         // No subscribe follows the timed-out unsubscribe ON THIS SOCKET —
-        // that would be the over-limit shape Dhan answers with a Fatal 804.
+        // that would be the over-limit shape Dhan answers with an 804 (one re-dial, then a permanent park).
         // The third call is the REDIAL replaying the retained set on a fresh
         // connection (2026-09-01): a timed-out unsubscribe may have landed,
         // so the socket is treated as emptied and re-dialled, never left

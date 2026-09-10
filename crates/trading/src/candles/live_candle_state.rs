@@ -36,6 +36,46 @@ pub struct LiveCandleState {
     pub close: f64,
     /// **Incremental** volume within this bucket.
     pub volume: u64,
+    /// Tick-rule SIGNED volume accumulated across this bucket: buy-initiated
+    /// volume minus sell-initiated volume, in the same units as
+    /// [`Self::volume`].
+    ///
+    /// # What replaced what (2026-09-10)
+    ///
+    /// Until today `net_volume()` DERIVED a sign at seal time by comparing the
+    /// bar's close against the previous bar's close, and signed the WHOLE
+    /// bar's volume with it. That is a bar-DIRECTION proxy, not net volume: a
+    /// bar that traded 900 lots on the offer and 1,000 on the bid but happened
+    /// to close one tick up reported `+1,900`, when the honest answer is
+    /// `-100`. The proxy is not merely imprecise — it has the WRONG SIGN
+    /// whenever a bar's close disagrees with its flow, which is exactly the
+    /// divergence a net-volume reader is looking for.
+    ///
+    /// # The rule
+    ///
+    /// Classic tick rule, evaluated ONCE per tick above the timeframe loop:
+    /// the volume traded since the previous tick is BUY-initiated when this
+    /// tick's price is above the previous tick's, SELL-initiated when below,
+    /// and — the zero-tick case — carries the PREVIOUS tick's direction when
+    /// the price is unchanged. Carrying rather than discarding matters:
+    /// unchanged-price ticks are the majority on a liquid contract, and
+    /// dropping them would under-report the bar's flow by most of its volume.
+    ///
+    /// # What this is NOT, stated because the vendor gives us no better
+    ///
+    /// This is INFERRED aggressor side, not reported aggressor side. Dhan's
+    /// feed carries no buy/sell flag and no trade-by-trade tape — a Quote or
+    /// Full packet is a periodic snapshot carrying a day-cumulative volume, so
+    /// the "volume since the previous tick" is itself an aggregate of every
+    /// trade in that interval, signed as a unit. Where several trades on both
+    /// sides fall inside one snapshot interval, they are attributed together.
+    /// `total_buy_qty` / `total_sell_qty` cannot help: those are RESTING order
+    /// totals, and this file's fold says in as many words that nothing
+    /// downstream may treat their difference as an imbalance of trades.
+    ///
+    /// The honest claim is therefore "tick-rule net volume", never "actual
+    /// buy volume minus actual sell volume", and no surface may relabel it.
+    pub net_volume_signed: i64,
     /// Cumulative-volume snapshot at bucket-open. Set ONCE per bucket
     /// open; retained for column-contract compatibility.
     pub bucket_start_cumulative: u64,
@@ -93,6 +133,31 @@ pub struct LiveCandleState {
     /// OPENING GAP % (gap-up positive, gap-down negative). Stamped at
     /// seal time. `0.0` if `prev_day_close` is `0.0` (div-by-zero guard).
     pub open_gap_pct: f64,
+    /// `true` when [`Self::net_volume_signed`] was accumulated by the live
+    /// fold; `false` when this bar was rebuilt from a source that does not
+    /// carry it.
+    ///
+    /// # Why this exists, and why it is not a defensive nicety
+    ///
+    /// The 128-byte disk-spill record (`seal_spill::SEAL_SPILL_RECORD_SIZE`)
+    /// is byte-for-byte FULL — every one of its 128 bytes is assigned — so a
+    /// spilled bar cannot carry the accumulator without a coordinated on-disk
+    /// format migration. Without this flag a replayed bar would arrive with
+    /// `net_volume_signed == 0` and `volume > 0`, and `net_volume()` would
+    /// report `Some(0)`: a confident "this bar's flow was perfectly balanced"
+    /// for a bar nobody classified. That is a fabricated reading, and strictly
+    /// worse than the `NULL` the column is designed to accept.
+    ///
+    /// So the flag is the honest half of a deliberately incomplete change:
+    /// the LIVE path (fold → ring → writer) classifies and reports; the SPILL
+    /// path (fold → ring evicted → disk → replay) reports `NULL` and says so.
+    /// Carrying the accumulator through disk is a format bump plus a mixed-
+    /// stride reader, and it is recorded as outstanding rather than rushed
+    /// through beside a hot-path change.
+    ///
+    /// Costs ZERO bytes: it lands in padding the struct already had after its
+    /// three trailing `u32`s (measured — `size_of` is 136 with and without).
+    pub net_volume_classified: bool,
 }
 
 impl LiveCandleState {
@@ -108,6 +173,7 @@ impl LiveCandleState {
             low: f64::INFINITY,
             close: 0.0,
             volume: 0,
+            net_volume_signed: 0,
             bucket_start_cumulative: 0,
             oi: 0,
             tick_count: 0,
@@ -120,6 +186,7 @@ impl LiveCandleState {
             session_open: 0.0,
             open_pct: 0.0,
             open_gap_pct: 0.0,
+            net_volume_classified: false,
         }
     }
 
@@ -201,64 +268,73 @@ impl LiveCandleState {
         self.open_gap_pct = pct_change(self.session_open, self.prev_day_close);
     }
 
-    /// Signed volume, the quantity a broker chart plots as "Net Volume":
-    /// `+volume` when this bar closed above the previous bar, `-volume` when
-    /// below, `0` when unchanged.
+    /// Tick-rule net volume for this bar: buy-initiated minus sell-initiated.
     ///
     /// Returns `None` — persisted as SQL NULL — when the question cannot be
     /// asked. That distinction is the whole reason this returns an `Option`:
-    /// `0` here means "the price did not move", and it must NOT also mean
-    /// "there was no previous bar". `close_pct_from_prev_day` above collapses
-    /// both onto `0.0` because its column has carried that sentinel since the
-    /// first row ever written; this column is new, so it can be honest.
+    /// `0` here means "the bar's flow was balanced", and it must NOT also mean
+    /// "no trade was classifiable". `close_pct_from_prev_day` collapses both
+    /// onto `0.0` because its column has carried that sentinel since the first
+    /// row ever written; this column can be honest.
     ///
-    /// # The four refusals
+    /// # What this replaced, and why the old answer could be the WRONG SIGN
     ///
-    /// - **No baseline** (`bucket_open_prev_close == 0.0`) — the first bar of
-    ///   the session, or a previous bar from an earlier trading day. A chart
-    ///   has no bar to the left of its first bar either.
-    /// - **Untraded bar** (`close == 0.0`) — `0.0` is this pipeline's absent
-    ///   price sentinel, not a real price of zero.
-    /// - **Non-finite either side** — `NaN` fails BOTH `>` and `<` under
-    ///   partial ordering, so an unguarded comparison would silently land on
-    ///   the `else` arm and persist `0` (a real "flat" reading) for a poisoned
-    ///   input. Refused explicitly instead.
-    /// - **Volume beyond the signed ceiling** — negating a `u64` past
-    ///   `i64::MAX` wraps POSITIVE, turning a sell bar into a buy bar. The
-    ///   saturating conversion below makes that unrepresentable; the same
-    ///   hazard is already handled this way on the tick-persistence path.
+    /// From its introduction to 2026-09-10 this function derived a sign at
+    /// SEAL time — `close > bucket_open_prev_close` — and applied it to the
+    /// whole bar's volume. It was documented honestly as "the quantity a
+    /// broker chart plots as Net Volume", and it is not that: it is bar
+    /// direction times bar volume. A bar that traded 1,000 lots into the bid
+    /// and 900 into the offer, and closed one tick up on the last print,
+    /// reported `+1,900` where the honest reading is `-100`. The failure is
+    /// not a rounding difference; the sign is inverted precisely when flow and
+    /// close disagree, which is the case a net-volume reader is looking at the
+    /// column to find.
     ///
-    /// # Why the comparison is exact and not a tolerance
+    /// See [`Self::net_volume_signed`] for the rule now used, and for the
+    /// stated limit: this is INFERRED aggressor side, because the vendor
+    /// publishes neither a trade tape nor a buy/sell flag.
     ///
-    /// Both sides come from `f32_to_f64_clean`, so an unchanged price is
-    /// bit-identical on both and compares equal. A widening `f32 as f64`
-    /// would make `10.20` become `10.19999980926514` and report an unchanged
-    /// price as a RISE — systematically, on every flat bar. That is why
-    /// [`Self::bucket_open_prev_close`] is `f64` and copied verbatim rather
-    /// than stored narrow and re-widened.
+    /// # The three refusals
+    ///
+    /// - **Not classified** (`!net_volume_classified`) — this bar was rebuilt
+    ///   from a source that does not carry the accumulator, today meaning the
+    ///   disk spill. Refused rather than reported as balanced; see that
+    ///   field for why a `Some(0)` here would be a fabrication.
+    ///
+    /// - **Untraded bar** (`tick_count == 0`) — no tick was folded, so nothing
+    ///   was classified. Distinct from a balanced bar.
+    /// - **No classifiable volume** (`volume == 0`) — every tick in the bucket
+    ///   arrived with the day-cumulative unchanged, which is what a repeated
+    ///   snapshot of a quiet instrument looks like. There were prints to
+    ///   count only if volume moved.
+    ///
+    /// A bar that traded and whose flow genuinely nets to zero returns
+    /// `Some(0)`, and that is a real reading, not a refusal.
+    ///
+    /// # The invariant a reader may rely on
+    ///
+    /// `net_volume().abs() <= volume`, always. The accumulator is a sum of
+    /// per-tick deltas each of which is bounded by that tick's contribution to
+    /// `volume`, and the saturation below cannot widen it. A row violating it
+    /// is a fold defect, not a market condition.
     ///
     /// # Complexity
-    /// O(1) — two compares and one negate on fields already in this struct.
-    /// Zero allocation. Runs once per SEAL, never once per tick.
+    /// O(1) — one compare and one saturating convert on fields already in this
+    /// struct. Zero allocation. Runs once per SEAL, never once per tick; the
+    /// per-tick work is a single `i64` add in the fold.
     #[inline]
     #[must_use]
     pub fn net_volume(&self) -> Option<i64> {
-        let prev = self.bucket_open_prev_close;
-        let close = self.close;
-        if prev <= 0.0 || close <= 0.0 || !prev.is_finite() || !close.is_finite() {
+        if !self.net_volume_classified || self.tick_count == 0 || self.volume == 0 {
             return None;
         }
-        // Saturate BEFORE the sign is applied: `-(u64 as i64)` on a value past
-        // `i64::MAX` wraps to a positive number, which would persist a sell bar
-        // as a buy bar.
-        let magnitude = i64::try_from(self.volume).unwrap_or(i64::MAX);
-        if close > prev {
-            Some(magnitude)
-        } else if close < prev {
-            Some(-magnitude)
-        } else {
-            Some(0)
-        }
+        // The accumulator is already `i64` and each addition saturates, so the
+        // magnitude cannot wrap. Clamping to the bar's own volume is belt-and
+        // -braces on the stated invariant: an accumulator that somehow exceeded
+        // the bar it belongs to would be a fold defect, and reporting a net
+        // larger than the gross would look like a real market reading.
+        let ceiling = i64::try_from(self.volume).unwrap_or(i64::MAX);
+        Some(self.net_volume_signed.clamp(-ceiling, ceiling))
     }
 }
 
@@ -609,86 +685,108 @@ mod tests {
     /// struct did not grow, which is the property the assertions downstream
     /// actually depend on.
     #[test]
-    fn reclaiming_the_dropped_percentages_kept_the_state_at_128_bytes() {
+    fn the_state_is_136_bytes_and_every_size_assert_knows_it() {
         assert_eq!(
             std::mem::size_of::<LiveCandleState>(),
-            128,
-            "LiveCandleState changed size — BufferedSeal (<=144), AggregatorCell \
+            136,
+            "LiveCandleState changed size — BufferedSeal (<=152), AggregatorCell \
              (MAX_AGGREGATOR_CELL_BYTES) and SerializedSeal (SEAL_SPILL_RECORD_SIZE) \
-             all assume 128 and every one of them is at zero slack today."
+             all assume this figure and every one of them is at zero slack today. \
+             128 -> 136 on 2026-09-10 for `net_volume_signed`; the cost is recorded \
+             in aws-budget.md."
         );
     }
 
-    /// The four refusals, each one a real hazard rather than defensive noise.
+    /// The classified MARKER is free — it must land in existing padding.
+    ///
+    /// If it ever stops being free, the two RAM budgets move again and the
+    /// arithmetic recorded beside them goes stale. Asserting the size WITHOUT
+    /// it is not possible from here, so this asserts the property that makes
+    /// it free: the struct is a multiple of its 8-byte alignment with room to
+    /// spare after the three trailing `u32`s.
+    #[test]
+    fn the_classified_marker_costs_nothing() {
+        assert_eq!(std::mem::align_of::<LiveCandleState>(), 8);
+        // 11 f64 + 2 u64 + 2 i64 + 3 u32 + 1 bool = 133 bytes of payload,
+        // which is why 136 has room and the flag is free.
+        assert_eq!(std::mem::size_of::<LiveCandleState>(), 136);
+    }
+
+    /// The three refusals, each one a real hazard rather than defensive noise.
     #[test]
     fn net_volume_refuses_every_question_it_cannot_answer() {
         let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
         s.volume = 1_000;
+        s.net_volume_classified = true;
+        s.net_volume_signed = 400;
+        s.tick_count = 3;
 
-        // No baseline: the first bar of a session has nothing to its left.
-        s.bucket_open_prev_close = 0.0;
-        assert_eq!(s.net_volume(), None);
+        // Sanity: with all three preconditions met it DOES answer.
+        assert_eq!(s.net_volume(), Some(400));
 
-        // Untraded bar: 0.0 is the absent-price sentinel, not a price.
-        s.bucket_open_prev_close = 100.0;
-        s.close = 0.0;
+        // Not classified: a bar rebuilt from a source that does not carry the
+        // accumulator. Reporting `Some(0)` here would say "perfectly balanced"
+        // about a bar nobody classified.
+        s.net_volume_classified = false;
         assert_eq!(s.net_volume(), None);
+        s.net_volume_classified = true;
 
-        // Non-finite: NaN fails BOTH `>` and `<`, so an unguarded compare
-        // would silently persist 0 — a real "flat" reading — for garbage.
-        s.close = f64::NAN;
+        // Untraded bar: no tick was folded, so nothing was classified.
+        s.tick_count = 0;
         assert_eq!(s.net_volume(), None);
-        s.close = 100.0;
-        s.bucket_open_prev_close = f64::INFINITY;
+        s.tick_count = 3;
+
+        // No classifiable volume: every tick repeated the same day-cumulative,
+        // so there were no prints to attribute to a side.
+        s.volume = 0;
         assert_eq!(s.net_volume(), None);
     }
 
+    /// A traded bar whose flow genuinely nets to zero is a REAL reading.
+    ///
+    /// This is the distinction the `Option` exists for, and it is the one a
+    /// naive implementation collapses: `Some(0)` means balanced, `None` means
+    /// unanswerable, and a reader must be able to tell them apart.
     #[test]
-    fn net_volume_signs_by_direction_and_zero_means_flat() {
+    fn a_balanced_bar_reports_zero_and_that_is_not_a_refusal() {
         let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
         s.volume = 1_000;
-        s.bucket_open_prev_close = 100.0;
-
-        s.close = 101.0;
-        assert_eq!(s.net_volume(), Some(1_000), "a rise is positive volume");
-        s.close = 99.0;
-        assert_eq!(s.net_volume(), Some(-1_000), "a fall is negative volume");
-        s.close = 100.0;
+        s.tick_count = 8;
+        s.net_volume_classified = true;
+        s.net_volume_signed = 0;
         assert_eq!(
             s.net_volume(),
             Some(0),
-            "an unchanged close is a real, reportable zero — distinct from None"
+            "500 lots bought and 500 sold is a balanced bar, not an unknown one"
         );
     }
 
-    /// `-(u64 as i64)` past `i64::MAX` wraps POSITIVE, which would persist a
-    /// sell bar as a buy bar. The saturating conversion makes that
-    /// unrepresentable.
+    /// THE INVARIANT: the net can never exceed the gross it is drawn from.
+    ///
+    /// A row violating it would look like a real market reading — "this bar
+    /// traded 1,000 lots, of which 5,000 were buys" — so the clamp is the last
+    /// line of defence behind the fold's own arithmetic.
     #[test]
-    fn net_volume_saturates_instead_of_wrapping_a_sell_bar_into_a_buy_bar() {
+    fn net_volume_can_never_exceed_the_bars_own_volume() {
         let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
-        s.bucket_open_prev_close = 100.0;
-        s.close = 99.0; // a FALL — the sign must stay negative
+        s.tick_count = 4;
+        s.net_volume_classified = true;
+        s.volume = 1_000;
+
+        s.net_volume_signed = 5_000;
+        assert_eq!(
+            s.net_volume(),
+            Some(1_000),
+            "clamped to the bar's own gross"
+        );
+        s.net_volume_signed = -5_000;
+        assert_eq!(s.net_volume(), Some(-1_000), "and on the sell side too");
+
+        // The saturating ceiling: a `u64` volume past `i64::MAX` must not wrap
+        // the clamp bound into a negative number, which would invert the sign.
         s.volume = u64::MAX;
-        let nv = s.net_volume().expect("finite inputs");
-        assert!(nv < 0, "a fall must never persist as a positive net volume");
-        assert_eq!(nv, -i64::MAX);
-    }
-
-    /// The comparison must be exact, not a widened `f32`. `10.20_f32 as f64`
-    /// is `10.19999980926514`; comparing that against a decimal-clean `10.2`
-    /// reports an UNCHANGED price as a rise, on every flat bar, forever.
-    #[test]
-    fn an_unchanged_price_is_flat_and_not_a_fabricated_rise() {
-        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
-        s.volume = 500;
-        let clean = tickvault_common::price_precision::f32_to_f64_clean(10.20_f32);
-        s.bucket_open_prev_close = clean;
-        s.close = clean;
-        assert_eq!(
-            s.net_volume(),
-            Some(0),
-            "identical decimal-clean prices must compare equal"
-        );
+        s.net_volume_signed = i64::MIN;
+        let nv = s.net_volume().expect("classified and traded");
+        assert!(nv < 0, "a sell-heavy bar must never report as buy-heavy");
     }
 }

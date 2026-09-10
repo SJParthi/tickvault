@@ -5082,3 +5082,119 @@ grace only makes that require two such sweeps; that the reader-task stall (B) is
 is designed, deferred, and still costs up to 8 s of unread socket per drain iteration; or
 that any of this addresses vendor-side skip-forward loss, which carries no sequence number
 to detect.
+
+---
+
+## ITEM 24 — net volume was bar DIRECTION, not net volume (2026-09-10)
+
+**Operator, verbatim (typos preserved):**
+
+> "then fix and resolve evryhtign enitlrey dude okay? See meanwhile what ahppend to thsi ent volume i need the precise real calcualtion dude okay?"
+
+> "i celalry told you to fix and reoslve evrythign includign net voluem dude okay? Provide this as the detailed extreme easy understandble comparison dude okay? i mean automated easy table level comapriosn view where even any humans can udnerstand where it shoudl attarct even millions of custoimers dude"
+
+### The defect
+
+`LiveCandleState::net_volume()` derived a sign at SEAL time by comparing the
+bar's close against the previous bar's close, and applied it to the WHOLE
+bar's volume. It was documented honestly as "the quantity a broker chart plots
+as Net Volume". It is not that — it is bar DIRECTION × bar VOLUME.
+
+A bar that sells 1,000 into the bid and buys 400 on the offer, and closes one
+tick up, reported **+1,400**. The honest answer is **−600**. Wrong magnitude
+AND wrong sign, and wrong precisely when a bar's flow disagrees with its close
+— which is the case a net-volume reader consults the column to find.
+
+### Design
+
+Classic tick rule, evaluated ONCE per tick above the 24-timeframe loop:
+
+| This tick vs previous tick | Attribution |
+|---|---|
+| price **higher** | buy-initiated: `+delta` |
+| price **lower** | sell-initiated: `−delta` |
+| price **unchanged** | carries the previous direction (the zero-tick rule) |
+
+`delta` is `cumulative_volume − slot.last_cumulative` — the previous ACCEPTED
+tick's day-cumulative — which is the same quantity the fold uses for `volume`
+at a bucket rollover. That identity is what makes `|net| ≤ gross` hold rather
+than merely be hoped for.
+
+The zero-tick carry is per INSTRUMENT (`slot.last_tick_sign: i8`, 25 KB fleet-
+wide), not per timeframe: all 24 frames see one tick sequence, so 24 copies
+would only be able to drift.
+
+### Edge Cases
+
+| Case | Answer | Why |
+|---|---|---|
+| First tick for an instrument | unclassified (`0`) | `last_ltp` is `NaN`; `NaN` fails BOTH `>` and `<`, so an unguarded compare lands on the zero-tick arm and attributes the whole delta to a carry |
+| Flat tick, no carry yet | `0` | no side has revealed itself; guessing propagates to every following flat tick |
+| `delta == 0` | `0` | nothing traded — the common case for a repeated snapshot |
+| `price == 0.0` | `0` | the feed's absent-price sentinel, never a real price |
+| `u64` delta past `i64::MAX` | saturates | `-(u64 as i64)` wraps POSITIVE, recording a sell as a buy |
+| Unchanged decimal-clean price | equal | both sides come from `f32_to_f64_clean`; a widening `as f64` makes `10.20` read as an UPTICK on the majority of ticks |
+| Day boundary (`force_seal_all`) | carry cleared | yesterday's direction is not evidence about today |
+| Late tick (`fold_late_hlc`) | not accumulated | that path amends h/l/c and never volume; a net that grew while its gross did not would break the invariant on a row already written |
+
+### Failure Modes
+
+1. **The fabricated zero.** A bar rebuilt from a source that does not carry the
+   accumulator would report `Some(0)` — "perfectly balanced" — about a bar
+   nobody classified. Closed by `net_volume_classified: bool`, which costs
+   ZERO bytes (it lands in existing padding; measured `size_of` is 136 with and
+   without). The 128-byte disk-spill record is byte-full, so a replayed bar
+   persists NULL and says so.
+2. **A future caller on a non-classifying entry point.** The parameter is
+   `Option<i64>`, so "cannot classify" is representable rather than
+   indistinguishable from "balanced", and a `None` tick poisons the bucket's
+   flag. Pinned by a shrink-only caller budget.
+3. **Net exceeding gross.** Clamped in `net_volume()` on top of the fold's own
+   arithmetic; a row saying "traded 1,000 lots of which 5,000 were buys" would
+   read as a real market condition.
+
+### Test Plan
+
+`multi_tf_aggregator`: the wrong-sign case end-to-end, the zero-tick carry, a
+flat tick with no carry, the invariant over 40 alternating ticks × 24 frames,
+the first-tick refusal, the classifier's seven refusals, saturation, the
+decimal-clean comparison, and the day-boundary reset.
+`live_candle_state`: the three refusals, a balanced bar as a REAL `Some(0)`,
+the clamp, and the two size pins.
+`aggregator_cell`: the non-classifying entry reports NULL; the caller budget.
+`seal_spill`: a replayed record reports NULL, never a balanced zero.
+
+### Rollback
+
+Config-free and self-contained: revert the commit. The `net_volume` column
+already existed and is written by the same site, so no DDL, no migration and
+no on-disk format changed. Rows written before the revert keep whatever value
+they were written with — as they would under any change to this column.
+
+### Observability
+
+No new metric and no new alarm — deliberately. The September forecast is
+$142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line (read live
+2026-09-06), so a new EMF name needs a lever, not a cost note. The RAM cost is
+recorded in `aws-budget.md` under "RAM NOTE 2026-09-10": +8 B on
+`LiveCandleState` = ~10 MB on the aggregator table and ~4.8 MB on the seal
+ring, ~15 MB total, 0.046% of the 32 GiB host. Both compile-time budget
+asserts FIRED on this change and were raised deliberately with the arithmetic
+stated at each site.
+
+### Honest envelope
+
+This is **INFERRED** aggressor side, and no surface may relabel it. Dhan
+publishes no trade tape and no buy/sell flag; a Quote or Full packet is a
+periodic snapshot carrying a day-cumulative, so "volume since the previous
+tick" is itself an aggregate of every trade in that interval, signed as a
+unit. Where trades on both sides fall inside one snapshot interval they are
+attributed together. `total_buy_qty` / `total_sell_qty` cannot help — those are
+RESTING orders, and the fold already says nothing downstream may treat their
+difference as an imbalance of trades.
+
+The honest claim is **"tick-rule net volume"**, never "actual buy volume minus
+actual sell volume".
+
+NOT delivered: the accumulator does not survive a disk spill (format bump plus
+a mixed-stride reader — outstanding, recorded at the site).

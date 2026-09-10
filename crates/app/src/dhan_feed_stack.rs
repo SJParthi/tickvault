@@ -1066,6 +1066,30 @@ pub struct LiveIngest {
     /// per class per session. One line per episode is the signal; the rest is
     /// noise that buries it.
     dead_class_latch: AtomicU8,
+    /// Consecutive IN-SESSION sweeps each class has read dead, saturating at
+    /// [`DEAD_CLASS_SCANS_BEFORE_REPORT`].
+    ///
+    /// # Why a counter and not just the latch above
+    ///
+    /// The 2026-09-10 session gate stopped the pre-open false report, and its
+    /// own dated note in `websocket-connection-scope-lock.md` recorded what it
+    /// did NOT fix: the first in-session sweep can land at 09:15:00.x, before
+    /// any option contract has printed. At that instant ~22,000 contracts
+    /// seeded at 08:31 are past warmup and have never ticked, so a whole class
+    /// still reads dead in the first sub-second of a genuine trading day.
+    ///
+    /// The sibling per-instrument page has had exactly this grace since it was
+    /// written ([`SILENCE_SCANS_BEFORE_ALERT`]), and the class rollup inherited
+    /// the session gate from it without inheriting the grace. This is the
+    /// grace, DERIVED from that constant rather than restated, so the two can
+    /// never drift to different numbers.
+    ///
+    /// One `AtomicU8` per class rather than a packed word: the counter is
+    /// per-class and saturating, and a bitmask cannot hold a count. Cleared
+    /// wholesale out of session by [`Self::stand_down_dead_class_report`], for
+    /// the same reason the latch is — a count accumulated pre-open must not
+    /// carry into the bell.
+    dead_class_dead_scans: [AtomicU8; SEGMENT_CLASS_COUNT],
     aggregator: MultiTfAggregator,
     writer: TickWriter,
     seq_refused: u64,
@@ -1695,6 +1719,7 @@ impl LiveIngest {
             inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
             dead_class_latch: AtomicU8::new(0),
+            dead_class_dead_scans: [const { AtomicU8::new(0) }; SEGMENT_CLASS_COUNT],
             // Created HERE rather than passed in, so one drain can never end
             // up writing a store a different reader is holding. Boot clones
             // the `Arc` straight back out for the attach tasks.
@@ -3279,6 +3304,10 @@ impl LiveIngest {
 
         for index in 0..SEGMENT_CLASS_COUNT {
             if !classes.is_dead(index) {
+                // Alive again: the grace restarts from zero, so a class that
+                // flickers dead-alive-dead needs a fresh run of consecutive
+                // dead sweeps before it can report.
+                self.dead_class_dead_scans[index].store(0, Ordering::Relaxed);
                 continue;
             }
             let Some(segment) = segment_class_at(index) else {
@@ -3290,6 +3319,27 @@ impl LiveIngest {
 
             if previous & bit != 0 {
                 // Already reported this episode — count nothing, log nothing.
+                continue;
+            }
+
+            // The grace. One in-session sweep is not evidence: the very first
+            // sweep of a trading day can land at 09:15:00.x, before any option
+            // contract has printed, with ~22,000 contracts seeded at 08:31 and
+            // already past their warmup. Requiring the condition to survive a
+            // full detector cycle is the same bar the sibling per-instrument
+            // page has always used.
+            //
+            // The counter advances but the bit is CLEARED from `current` below
+            // the threshold. That is load-bearing: `current` becomes the latch,
+            // and a latched bit reads as "already reported this episode" on the
+            // next sweep — so holding it here would consume the episode without
+            // ever having emitted, turning the grace into permanent silence.
+            let seen = self.dead_class_dead_scans[index]
+                .load(Ordering::Relaxed)
+                .saturating_add(1);
+            self.dead_class_dead_scans[index].store(seen, Ordering::Relaxed);
+            if seen < DEAD_CLASS_SCANS_BEFORE_REPORT {
+                current &= !bit;
                 continue;
             }
             metrics::counter!(DEAD_CLASS_METRIC, "segment" => segment.as_str()).increment(1);
@@ -3321,6 +3371,14 @@ impl LiveIngest {
     fn stand_down_dead_class_report(&self) {
         metrics::gauge!(DEAD_CLASSES_GAUGE).set(0.0);
         self.dead_class_latch.store(0, Ordering::Relaxed);
+        // The grace counters go with the latch, for the same reason: dead
+        // sweeps accumulated before the bell are not evidence about the
+        // session, and carrying them across would let the first in-session
+        // sweep report on the strength of pre-open scans — which is exactly
+        // the false morning report the session gate was added to stop.
+        for scans in &self.dead_class_dead_scans {
+            scans.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Seals every bucket the watermark has moved past, mid-session.
@@ -4780,6 +4838,26 @@ const SILENCE_SCAN_INTERVAL: std::time::Duration =
 /// are legitimately not ticking YET. Two consecutive scans 30s apart mean the
 /// condition survived a full detector cycle.
 const SILENCE_SCANS_BEFORE_ALERT: u32 = 2;
+
+/// Consecutive IN-SESSION sweeps a whole instrument class must read dead
+/// before the rollup reports it.
+///
+/// DERIVED from [`SILENCE_SCANS_BEFORE_ALERT`], never restated as a literal.
+/// The two answer the same question at two scopes — "has this survived a full
+/// detector cycle, or did one sweep catch a moment?" — and a class reading
+/// dead is strictly the harder claim, so it can never deserve LESS evidence
+/// than one instrument reading silent. Writing `2` here instead would let the
+/// per-instrument grace be tuned while this one silently stayed behind.
+const DEAD_CLASS_SCANS_BEFORE_REPORT: u8 = {
+    // The cast is checked at compile time rather than saturated at runtime:
+    // this must fail the build if the sibling constant is ever raised past a
+    // u8, not quietly clamp to 255 scans (two hours of silence).
+    assert!(
+        SILENCE_SCANS_BEFORE_ALERT <= u8::MAX as u32,
+        "SILENCE_SCANS_BEFORE_ALERT no longer fits the dead-class scan counter"
+    );
+    SILENCE_SCANS_BEFORE_ALERT as u8
+};
 
 /// How many frames pass before the fold republishes its depth gauges.
 const DRAIN_REPORT_EVERY: u64 = 1_024;
@@ -17368,26 +17446,114 @@ mod tests {
              its warmup window"
         );
 
-        // Past the window with nothing received: the class is dead and the
-        // latch records it exactly once.
-        let _ = ingest.scan_silence(seeded_at + floor + 1);
+        // Past the window with nothing received — but ONE sweep is not
+        // evidence (2026-09-10 grace). The bit must stay clear here, because
+        // the very first in-session sweep of a real trading day can land at
+        // 09:15:00.x before anything has printed.
         let bit = 1u8 << segment_class_index(ExchangeSegment::IdxI);
+        let _ = ingest.scan_silence(seeded_at + floor + 1);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            0,
+            "one dead sweep must not report — that is the 09:15:00.x false \
+             report the grace exists to prevent"
+        );
+
+        // The SECOND consecutive dead sweep is the report.
+        let _ = ingest.scan_silence(seeded_at + floor + 2);
         assert_eq!(
             ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
             bit,
-            "three seeded indices past warmup with zero ticks is a dead class, \
-             and the live sweep must be the thing that notices"
+            "three seeded indices past warmup with zero ticks across a full \
+             detector cycle is a dead class, and the live sweep must be the \
+             thing that notices"
         );
 
-        // Edge-latched: a second sweep in the same episode must not re-raise.
+        // Edge-latched: a third sweep in the same episode must not re-raise.
         let before = ingest.dead_class_latch.load(Ordering::Relaxed);
-        let _ = ingest.scan_silence(seeded_at + floor + 2);
+        let _ = ingest.scan_silence(seeded_at + floor + 3);
         assert_eq!(
             ingest.dead_class_latch.load(Ordering::Relaxed),
             before,
             "the sweep runs every 30s and a dead class stays dead all session; \
              re-reporting would emit ~1,100 identical lines per session and \
              bury the signal it exists to raise"
+        );
+    }
+
+    /// The grace is DERIVED from the per-instrument one, not restated.
+    ///
+    /// The class rollup inherited the 2026-09-10 session gate from its sibling
+    /// per-instrument page and did NOT inherit that page's grace — which is
+    /// how a whole class could still read dead in the first sub-second of a
+    /// genuine trading day. This pins that the two numbers cannot drift: raise
+    /// one and this fails until the other follows.
+    #[test]
+    fn the_dead_class_grace_is_derived_from_the_per_instrument_one() {
+        assert_eq!(
+            u32::from(DEAD_CLASS_SCANS_BEFORE_REPORT),
+            SILENCE_SCANS_BEFORE_ALERT,
+            "a class reading dead is the HARDER claim of the two, so it can \
+             never deserve less evidence than one instrument reading silent"
+        );
+        assert!(
+            DEAD_CLASS_SCANS_BEFORE_REPORT >= 2,
+            "a grace of one is no grace at all — the whole point is that the \
+             condition must survive a full detector cycle"
+        );
+    }
+
+    /// A class that flickers alive restarts its grace from zero.
+    ///
+    /// Without the reset an intermittent class would accumulate dead sweeps
+    /// across unrelated episodes and eventually report on evidence that was
+    /// never consecutive — which is the opposite of what "survived a full
+    /// detector cycle" means.
+    #[test]
+    fn a_class_that_ticks_again_restarts_the_dead_class_grace() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let seeded_at = IN_SESSION_1000_IST_MILLIS;
+        assert!(ingest.seed(13, ExchangeSegment::IdxI, seeded_at));
+        let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+        let bit = 1u8 << segment_class_index(ExchangeSegment::IdxI);
+        let index = segment_class_index(ExchangeSegment::IdxI);
+
+        // One dead sweep: counted, not reported.
+        let _ = ingest.scan_silence(seeded_at + floor + 1);
+        assert_eq!(
+            ingest.dead_class_dead_scans[index].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(ingest.dead_class_latch.load(Ordering::Relaxed) & bit, 0);
+
+        // It ticks. The class is alive, so the grace resets.
+        // Feed the detector directly — the same call `fold_tick` makes.
+        // Going through a full ParsedTick would drag in the fold, the writer
+        // and the ranking board, none of which this test is about.
+        let _ = ingest.detector.observe(
+            tickvault_core::pipeline::tick_gap_detector::TickObservation {
+                key: (13, ExchangeSegment::IdxI),
+                ltt_epoch_secs: 1,
+                volume: 1,
+                open_interest: 0,
+                recv_monotonic_millis: seeded_at + floor + 2,
+            },
+        );
+        let _ = ingest.scan_silence(seeded_at + floor + 2);
+        assert_eq!(
+            ingest.dead_class_dead_scans[index].load(Ordering::Relaxed),
+            0,
+            "a live sweep must reset the run, or the evidence stops being \
+             consecutive"
+        );
+
+        // One dead sweep again is therefore still not enough.
+        let _ = ingest.scan_silence(seeded_at + floor * 4);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            0,
+            "the run restarted, so this is the FIRST dead sweep of a new \
+             episode, not the second of the old one"
         );
     }
 
@@ -23646,14 +23812,28 @@ mod connection_delivery_tests {
             "a class that has not been given a session to tick in is not dead"
         );
 
-        // First in-session sweep with still nothing received: NOW it is a
-        // dead class, and the edge must be a fresh rising edge.
-        let _ = ingest.scan_silence(SESSION_0916_IST_MILLIS);
+        // In-session sweeps with still nothing received: NOW the class is
+        // judged, and the edge must be a fresh rising edge.
+        //
+        // TWO sweeps, not one: the pre-open sweeps above accumulated no grace
+        // (the stand-down clears it), so the in-session run starts from zero,
+        // which is precisely the property this asserts. The FIRST in-session
+        // sweep can land at 09:15:00.x before anything has printed.
         let bit = 1u8 << segment_class_index(ExchangeSegment::IdxI);
+        let _ = ingest.scan_silence(SESSION_0916_IST_MILLIS);
+        assert_eq!(
+            ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
+            0,
+            "the pre-open sweeps must not count toward the in-session grace — 
+             if they did, the gate would merely DELAY the false report to the 
+             bell instead of preventing it"
+        );
+        let _ = ingest.scan_silence(SESSION_0916_IST_MILLIS + 1);
         assert_eq!(
             ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
             bit,
-            "the first in-session sweep must judge, or the gate has become a mute"
+            "a full in-session detector cycle with nothing received must judge, 
+             or the gate has become a mute"
         );
     }
 
@@ -23723,7 +23903,9 @@ mod connection_delivery_tests {
             assert!(ingest.seed(sid, ExchangeSegment::IdxI, IN_SESSION_1000_IST_MILLIS));
         }
         let floor = tickvault_core::pipeline::tick_gap_detector::DEFAULT_SILENCE_FLOOR_MILLIS;
+        // Two sweeps to clear the grace, then the latch is set.
         let _ = ingest.scan_silence(IN_SESSION_1000_IST_MILLIS + floor + 1);
+        let _ = ingest.scan_silence(IN_SESSION_1000_IST_MILLIS + floor + 2);
         assert_ne!(
             ingest.dead_class_latch.load(Ordering::Relaxed),
             0,
