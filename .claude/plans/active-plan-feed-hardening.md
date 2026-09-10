@@ -4854,3 +4854,50 @@ actual sell volume".
 
 NOT delivered: the accumulator does not survive a disk spill (format bump plus
 a mixed-stride reader — outstanding, recorded at the site).
+
+### ITEM 24a — the arithmetic was fixed and four DOCS still taught the old rule (2026-09-10, post-merge)
+
+Item 24 shipped in PR #1905. A follow-up sweep asked the narrower question the
+merge did not: *does anything still DESCRIBE `net_volume` by the retired
+definition?* Four sites did, all in `storage`, all downstream of the crate whose
+arithmetic changed:
+
+| Site | What it still said |
+|---|---|
+| `shadow_persistence.rs` — the comment above the DDL that **CREATES** the column | "the bar's volume signed by whether it closed above or below the bar before it … NULL when there is no previous bar to compare against" |
+| `shadow_seal_columns.rs` — the doc on the `net_volume: Option<i64>` **field** | "positive when the bar closed above the previous bar, negative when below" + "costs no per-instrument RAM" |
+| `shadow_candle_writer.rs` — the comment justifying the **NULL** | "NULL is the honest value for 'there was no previous bar to compare against'" |
+| `candle_pct_column_guard.rs` — the section header pinning that NULL | same phrase |
+
+**Both halves were wrong, and the second half is the one that would mislead an
+operator reading the table.** The sign is now flow, not direction — but also
+`None` no longer means "the day's first bar". `net_volume_classified` is set at
+bar-open from `signed_tick_volume.is_some()`, so a first-of-day bar WITH ticks
+is classified and reports a real value. `None` now means **this process did not
+classify the bar**: a disk-spill replay, a REST-folded bar, a zero-tick bar, or
+a zero-volume bar. That is a data-PROVENANCE fact. Reading a NULL as "start of
+day" would mislabel every spill-replayed row in `candles_<tf>`.
+
+**Why the merge missed them.** PR #1905 corrected the CONVERSION site in
+`shadow_seal_columns.rs` (~line 204) and left the field doc thirty lines above
+it untouched. The comment being edited got fixed; the doc a reader lands on from
+the type did not. Same file, same screen.
+
+Annotated in place with dated `⚠ CORRECTED` blocks rather than rewritten, per
+the house convention that the trail is the point.
+
+**Verified:** `candle_pct_column_guard` 12/12 green (it strips comments via
+`code_only`, so it could never have caught this — stated plainly rather than
+implied); `tickvault-storage --lib` 1,303 green; `cargo fmt --all --check`
+clean. A tree-wide sweep for the retired phrasing now returns only text inside
+explicit correction blocks.
+
+**NOT changed:** no arithmetic, no schema, no DDL statement, no test assertion.
+Comments and docs only. `ticks` is untouched and correctly has no `net_volume`
+column — a tick is one observation, net volume is a bar aggregate; its
+`total_buy_qty`/`total_sell_qty` are RESTING book totals and are already
+labelled as such.
+
+**STILL NOT delivered** (unchanged from Item 24): the accumulator does not
+survive a disk spill, so a replayed bar persists NULL. That needs a spill
+format bump plus a mixed-stride reader.

@@ -1695,6 +1695,117 @@ mod tests {
         }
     }
 
+    /// **Conservation across timeframes** — the property an operator checks by
+    /// eye: if `candles_1m` says a minute was +800, the `candles_1s` rows
+    /// underneath it must add up to +800.
+    ///
+    /// It holds BY CONSTRUCTION — `classify_tick_volume` runs once per tick and
+    /// the same signed number is added into every open bar, so the frames are
+    /// different WINDOWS over one classification, never different answers. But
+    /// "by construction" is a claim, and until this test nothing pinned it:
+    /// every other `net_volume` test asserts a property of ONE bar.
+    ///
+    /// This is also what makes a sub-minute frame legitimately look SPARSE
+    /// without being wrong. A second in which no tick arrived opens no bucket
+    /// at all — that is an absent ROW, not a missing measurement — and a
+    /// second whose only tick carried no new volume reports NULL. Neither
+    /// contributes to the sum, so the totals still agree.
+    #[test]
+    fn every_sub_minute_frame_sums_to_the_same_minute_net_volume() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut sealed: Vec<(TfIndex, i64)> = Vec::new();
+        // `OPEN` is minute-aligned, so [base, base+59] is exactly ONE M1 bucket.
+        let base = OPEN;
+
+        let mut cum = 1_000u32;
+        let mut price = 100.0f32;
+        for i in 0..60u32 {
+            // Irregular sizes and a flipping direction, including flat ticks
+            // that ride the carry — so the net is not trivially +gross and the
+            // sum has to do real work.
+            price += match i % 4 {
+                0 => 0.25,
+                1 => -0.50,
+                2 => 0.0,
+                _ => 0.75,
+            };
+            cum += 10 + i * 3;
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, base + i, price, cum),
+                None,
+                |_: Feed, _: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
+                    if let Some(net) = st.net_volume() {
+                        sealed.push((tf, net));
+                    }
+                },
+            );
+        }
+
+        let minute = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .and_then(|b| b.net_volume())
+            .expect("the minute bar traded and was classified");
+
+        // ANTI-VACUITY, checked before the loop that does the real asserting.
+        // Both of these have failed silently in this repository's history: a
+        // filter that excludes every frame makes the loop below assert nothing
+        // and the test pass green, and a net that equals the gross would mean
+        // the flat and down ticks above never exercised the carry — the sum
+        // would then be trivially conserved because every term has one sign.
+        let gross = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .map(|b| b.volume)
+            .expect("the minute bar exists");
+        assert!(
+            minute.unsigned_abs() < gross,
+            "the fixture never produced offsetting flow: net {minute} vs gross \
+             {gross} — conservation would hold trivially, so this test would \
+             prove nothing"
+        );
+
+        let mut frames_checked = 0usize;
+        for tf in TfIndex::ALL {
+            // Keep only frames whose buckets TILE this minute: the first starts
+            // exactly on the minute and the last still starts inside it. That
+            // admits every sub-minute frame and excludes D1, whose bucket began
+            // at midnight and holds volume this minute never saw.
+            if tf.bucket_start(base) != base || tf.bucket_start(base + 59) >= base + 60 {
+                continue;
+            }
+            frames_checked += 1;
+            let closed: i64 = sealed
+                .iter()
+                .filter(|(t, _)| *t == tf)
+                .map(|(_, net)| *net)
+                .sum();
+            // The frame's LAST bucket has not sealed yet, so it is still open
+            // and has to be read from the snapshot or the sum is short by it.
+            let still_open = agg
+                .snapshot(Feed::Dhan, 77, SEG_IDX, tf)
+                .and_then(|b| b.net_volume())
+                .unwrap_or(0);
+            assert_eq!(
+                closed + still_open,
+                minute,
+                "{tf:?}: its bars sum to {} but the minute they tile reports \
+                 {minute} — the frames disagree about the same trades, which \
+                 is the one thing a single per-tick classification is supposed \
+                 to make impossible",
+                closed + still_open
+            );
+        }
+
+        // The second-scale family alone is 19 frames; if the tiling filter ever
+        // stops admitting them, this test goes quiet rather than red.
+        assert!(
+            frames_checked >= 10,
+            "only {frames_checked} frames were compared — the tiling filter is \
+             excluding frames it should admit, so this test is no longer \
+             checking what it claims"
+        );
+    }
+
     /// The first tick for an instrument has no previous price to compare to.
     ///
     /// `last_ltp` is `NaN` until the first accepted tick, and `NaN` fails BOTH

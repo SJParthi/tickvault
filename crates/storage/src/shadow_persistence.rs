@@ -278,10 +278,27 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         let alter_open_gap_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
         let _ = run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
-        // 2026-09-09: net volume — the bar's volume signed by whether it
-        // closed above or below the bar before it, which is the line Dhan's
-        // chart plots. NULL (never 0) when there is no previous bar to
-        // compare against, so a first-of-day bar is blank rather than flat.
+        // net volume — the bar's SIGNED ORDER FLOW: buy-initiated volume minus
+        // sell-initiated volume, accumulated per tick under the tick rule
+        // (uptick = buy-initiated, downtick = sell-initiated, unchanged price
+        // carries the previous direction). INFERRED, not observed: Dhan
+        // publishes no trade tape and no aggressor flag.
+        //
+        // NULL (never 0) when THIS PROCESS DID NOT CLASSIFY the bar — a
+        // disk-spill replay, a REST-folded bar, or a bar with no ticks or no
+        // volume. `0` would claim perfectly balanced flow about a bar nobody
+        // measured, which is a different fact.
+        //
+        // ⚠ CORRECTED 2026-09-10. This comment sits above the DDL that CREATES
+        // the column, so it is the definition of record — and until today it
+        // read "the bar's volume signed by whether it closed above or below the
+        // bar before it … NULL when there is no previous bar to compare
+        // against, so a first-of-day bar is blank rather than flat". BOTH
+        // halves are now false: the sign is flow, not direction, and a
+        // first-of-day bar with ticks now reports a real value. The arithmetic
+        // was fixed in `live_candle_state` / `multi_tf_aggregator`; this
+        // storage-layer comment was left behind, which is how a reader would
+        // have gone on trusting the retired definition.
         //
         // `total_buy_qty` / `total_sell_qty` are the vendor's PENDING
         // order-book totals at the bar's last observed packet — resting

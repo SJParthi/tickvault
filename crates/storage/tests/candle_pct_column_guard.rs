@@ -234,15 +234,22 @@ fn self_test_code_only_strips_comments_keeps_code() {
 }
 
 // ============================================================================
-// 7. Net volume + the book totals (2026-09-09) — the SAME five-link chain.
+// 7. Net volume + the book totals — the SAME five-link chain.
 //
 //    These are LONG columns, not DOUBLE, and `net_volume` is the one column in
 //    the whole candle schema that is deliberately OMITTED rather than
 //    zero-filled when absent: omitting an ILP column persists NULL, and NULL is
-//    the honest value for "there was no previous bar to compare against".
-//    Writing `0` would draw a FLAT bar on a chart, which is a different claim.
-//    That distinction is the thing most likely to be "tidied away" by a future
-//    refactor, so it is pinned by name here.
+//    the honest value for "this process did not classify this bar's flow" — a
+//    disk-spill replay, a REST-folded bar, or a bar with no ticks or no volume.
+//    Writing `0` would claim perfectly balanced flow about a bar nobody
+//    measured, and would draw a FLAT bar on a chart. That distinction is the
+//    thing most likely to be "tidied away" by a future refactor, so it is
+//    pinned by name here.
+//
+//    ⚠ CORRECTED 2026-09-10: the NULL reason above read "there was no previous
+//    bar to compare against", which belonged to the retired close-vs-close
+//    definition. `net_volume` is now tick-rule signed order flow, and a
+//    first-of-day bar with ticks reports a real value rather than NULL.
 // ============================================================================
 
 /// Assert a LONG candle column is wired across DDL, ALTER self-heal, ILP
