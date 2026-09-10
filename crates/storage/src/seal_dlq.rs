@@ -112,8 +112,17 @@ pub struct SealDlqRecord {
     pub close: f64,
     #[serde(default)]
     pub close_pct_from_prev_day: f64,
+    /// Tick-rule signed order flow (see `SerializedSeal::net_volume_signed`).
+    /// Replaced `bucket_open_prev_close` on 2026-09-10 — that was the retired
+    /// scheme's sign baseline and had no production reader anywhere.
+    ///
+    /// Every field in this record is `serde(default)`, so a DLQ file written
+    /// before today decodes `0` / `false` — NOT classified, which is exactly
+    /// what those records meant: net volume did not survive recovery at all.
     #[serde(default)]
-    pub bucket_open_prev_close: f64,
+    pub net_volume_signed: i64,
+    #[serde(default)]
+    pub net_volume_classified: bool,
     #[serde(default)]
     pub total_buy_qty: u32,
     #[serde(default)]
@@ -160,7 +169,8 @@ impl From<&SerializedSeal> for SealDlqRecord {
             low: s.low,
             close: s.close,
             close_pct_from_prev_day: s.close_pct_from_prev_day,
-            bucket_open_prev_close: s.bucket_open_prev_close,
+            net_volume_signed: s.net_volume_signed,
+            net_volume_classified: s.net_volume_classified,
             total_buy_qty: s.total_buy_qty,
             total_sell_qty: s.total_sell_qty,
             open_pct: s.open_pct,
@@ -193,7 +203,8 @@ impl From<&SealDlqRecord> for SerializedSeal {
             low: r.low,
             close: r.close,
             close_pct_from_prev_day: r.close_pct_from_prev_day,
-            bucket_open_prev_close: r.bucket_open_prev_close,
+            net_volume_signed: r.net_volume_signed,
+            net_volume_classified: r.net_volume_classified,
             total_buy_qty: r.total_buy_qty,
             total_sell_qty: r.total_sell_qty,
             open_pct: r.open_pct,
@@ -427,7 +438,8 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            bucket_open_prev_close: 24_200.10,
+            net_volume_signed: -4_242,
+            net_volume_classified: true,
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
             open_pct: 7.7,
@@ -464,9 +476,69 @@ mod tests {
         assert_eq!(r.low, 0.0);
         assert_eq!(r.close, 0.0);
         assert_eq!(r.close_pct_from_prev_day, 0.0);
-        assert_eq!(r.bucket_open_prev_close, 0.0);
+        assert_eq!(r.net_volume_signed, 0);
+        assert!(!r.net_volume_classified);
         assert_eq!(r.total_buy_qty, 0);
         assert_eq!(r.total_sell_qty, 0);
+    }
+
+    /// A DLQ line written BEFORE the accumulator existed still parses, as
+    /// unclassified — the deploy-boundary case.
+    ///
+    /// `data/dlq/seals-*.ndjson` is append-only and survives a restart, so the
+    /// first boot after this change reads lines carrying the old
+    /// `bucket_open_prev_close` key and no `net_volume_*` keys at all. Two
+    /// properties have to hold together or a real recovery file becomes
+    /// unreadable: the unknown key must be IGNORED (no `deny_unknown_fields`),
+    /// and the missing keys must default to `0` / `false` rather than failing
+    /// the parse. `false` is also the honest reading — those bars genuinely
+    /// were not classified, because the record could not carry the flow.
+    #[test]
+    fn a_pre_accumulator_dlq_line_parses_as_unclassified_not_as_a_parse_error() {
+        let legacy = r#"{
+            "security_id": 13,
+            "exchange_segment_code": 0,
+            "feed": "dhan",
+            "tf_ordinal": 0,
+            "bucket_start_ist_secs": 1716000900,
+            "tick_count": 5,
+            "volume": 1234,
+            "bucket_start_cumulative": 1000,
+            "oi": 50000,
+            "open": 100.0,
+            "high": 105.0,
+            "low": 99.0,
+            "close": 102.5,
+            "close_pct_from_prev_day": 1.5,
+            "bucket_open_prev_close": 24200.10,
+            "total_buy_qty": 89600,
+            "total_sell_qty": 4800,
+            "open_pct": 0.0,
+            "change_pct": 0.0,
+            "open_gap_pct": 0.0
+        }"#;
+
+        let r: SealDlqRecord =
+            serde_json::from_str(legacy).expect("a pre-accumulator DLQ line must still parse");
+
+        assert_eq!(r.security_id, 13, "the rest of the record survives intact");
+        assert_eq!(r.volume, 1234);
+        assert!(
+            !r.net_volume_classified,
+            "a record written before the accumulator existed was never classified"
+        );
+        assert_eq!(r.net_volume_signed, 0);
+
+        // And the replay path it feeds reports NULL, never a fabricated zero.
+        let seal = SerializedSeal::from(&r);
+        assert!(!seal.net_volume_classified);
+        assert_eq!(
+            seal.try_into_buffered_seal()
+                .expect("a known tf ordinal round-trips")
+                .state
+                .net_volume(),
+            None
+        );
     }
 
     #[test]
@@ -498,7 +570,8 @@ mod tests {
             "low",
             "close",
             "close_pct_from_prev_day",
-            "bucket_open_prev_close",
+            "net_volume_signed",
+            "net_volume_classified",
             "total_buy_qty",
             "total_sell_qty",
             "open_pct",
@@ -529,7 +602,8 @@ mod tests {
         assert_eq!(r.low, s.low);
         assert_eq!(r.close, s.close);
         assert_eq!(r.close_pct_from_prev_day, s.close_pct_from_prev_day);
-        assert_eq!(r.bucket_open_prev_close, s.bucket_open_prev_close);
+        assert_eq!(r.net_volume_signed, s.net_volume_signed);
+        assert_eq!(r.net_volume_classified, s.net_volume_classified);
         assert_eq!(r.total_buy_qty, s.total_buy_qty);
         assert_eq!(r.total_sell_qty, s.total_sell_qty);
     }
@@ -561,7 +635,8 @@ mod tests {
             low: 0.0,
             close: 0.0,
             close_pct_from_prev_day: -3.5,
-            bucket_open_prev_close: -10.0,
+            net_volume_signed: -10,
+            net_volume_classified: true,
             total_buy_qty: 0,
             total_sell_qty: 0,
             open_pct: -50.0,

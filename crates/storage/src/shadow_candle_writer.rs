@@ -707,7 +707,8 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.bucket_open_prev_close = 24_200.10;
+        state.net_volume_signed = -4_242;
+        state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, feed)
