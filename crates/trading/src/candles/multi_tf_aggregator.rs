@@ -1052,12 +1052,51 @@ impl MultiTfAggregator {
         if tick.received_at_nanos > 0 {
             let receipt_ist_secs = tick.received_at_nanos / 1_000_000_000
                 + crate::candles::tf_index::IST_UTC_OFFSET_SECS;
-            if i64::from(fold_secs) / 86_400 > receipt_ist_secs / 86_400 {
+            let fold_day = i64::from(fold_secs) / 86_400;
+            let receipt_day = receipt_ist_secs / 86_400;
+            if fold_day > receipt_day {
                 crate::candles::fold_counters::fold_counters()
                     .tick_refused_future_trading_day
                     .increment(1);
                 return ConsumeStats {
                     future_trading_day: true,
+                    ..ConsumeStats::default()
+                };
+            }
+            // STALE, judged against the RECEIPT — added 2026-09-10, and this
+            // is the arm that actually catches the operator's row.
+            //
+            // The watermark gate below cannot: it compares a tick against the
+            // HIGHEST fold clock seen so far, and on a clean boot the very
+            // first tick of the session IS the stale connect snapshot. It
+            // therefore sets the watermark to its own prior-day value, sails
+            // through its own comparison, and every later tick then looks
+            // fresh by contrast. Ordering, not arithmetic, was the hole: a
+            // reference derived from the data cannot judge the first datum.
+            //
+            // The receipt clock has no such dependence — it is OUR machine's
+            // clock, disciplined by chrony and gated at boot by BOOT-03, and
+            // it is already the reference the FUTURE arm above trusts for
+            // exactly this reason. Using it on both sides makes the rule
+            // symmetric and order-independent: the exchange day must BE the
+            // receipt day.
+            //
+            // Measured shape this refuses (operator, 2026-09-10, NSE_FNO
+            // 66422): received today 09:15, exchange stamp 15:29 of a previous
+            // session. Dhan sends LAST TRADE TIME, so every connect snapshot
+            // of a dormant contract carries one — mean 5 hours stale, max 34
+            // days, per the measurement recorded below.
+            //
+            // The watermark gate is KEPT beneath this, not replaced: it is the
+            // only day guard available when there is no receipt at all (a
+            // pre-TVW3 WAL frame), and it independently catches out-of-order
+            // arrivals inside a single day.
+            if fold_day < receipt_day {
+                crate::candles::fold_counters::fold_counters()
+                    .tick_refused_stale_trading_day
+                    .increment(1);
+                return ConsumeStats {
+                    stale_trading_day: true,
                     ..ConsumeStats::default()
                 };
             }
@@ -2602,6 +2641,103 @@ mod tests {
         );
     }
 
+    /// THE OPERATOR'S ROW (2026-09-10, NSE_FNO 66422): received at 09:15
+    /// today, exchange stamp 15:29 of a PREVIOUS session.
+    ///
+    /// This is the FIRST tick the aggregator ever sees, which is what makes it
+    /// the sharp case. The watermark gate cannot catch it — the tick sets the
+    /// very watermark it would be compared against (pinned one test below, as
+    /// the defect it is). The receipt clock has no such dependence, so the
+    /// refusal here is order-independent and holds on a cold boot with no WAL
+    /// backlog, which is exactly the shape a deploy or a restart produces.
+    #[test]
+    fn a_prior_day_snapshot_is_refused_on_the_first_tick_of_a_cold_boot() {
+        let mut agg = MultiTfAggregator::default();
+
+        // Yesterday 15:29 IST — inside the seconds-of-day window on BOTH ends,
+        // which is precisely why every time-of-day gate waved it through.
+        let yesterday_1529 = DAY - 86_400 + 15 * 3_600 + 29 * 60;
+        // Received today at 09:15 IST. `received_at_nanos` is UTC epoch nanos,
+        // so the IST offset comes off before it is stamped.
+        let today_0915_utc_secs =
+            i64::from(DAY + 9 * 3_600 + 15 * 60) - crate::candles::tf_index::IST_UTC_OFFSET_SECS;
+
+        let mut t = tick(66_422, SEG_IDX, yesterday_1529, 142.50, 12_000);
+        t.received_at_nanos = today_0915_utc_secs * 1_000_000_000;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.stale_trading_day,
+            "an exchange stamp from a previous day must be refused against the \
+             RECEIPT, on the very first tick, with no watermark to lean on"
+        );
+        assert!(
+            !stats.future_trading_day,
+            "the mirror arm must not also fire — the two are exclusive"
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
+            "and it must not take a slot or open a bucket on a day that closed"
+        );
+    }
+
+    /// The same instant, judged fresh: same clock, same contract, today's stamp.
+    ///
+    /// Without this the test above passes just as well against a gate that
+    /// refuses everything.
+    #[test]
+    fn a_same_day_tick_at_the_same_receipt_instant_is_accepted() {
+        let mut agg = MultiTfAggregator::default();
+
+        let today_0915 = DAY + 9 * 3_600 + 15 * 60;
+        let today_0915_utc_secs =
+            i64::from(today_0915) - crate::candles::tf_index::IST_UTC_OFFSET_SECS;
+
+        let mut t = tick(66_422, SEG_IDX, today_0915, 142.50, 12_000);
+        t.received_at_nanos = today_0915_utc_secs * 1_000_000_000;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            !stats.stale_trading_day,
+            "a tick whose exchange day IS the receipt day must fold normally"
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_some(),
+            "and it must open its bucket"
+        );
+    }
+
+    /// A tick received just after IST midnight, stamped just before it, is NOT
+    /// stale — it is a boundary crossing, and refusing it would silently drop
+    /// the last trades of every session.
+    ///
+    /// `fold_clock_ist_secs` is what makes this safe: receipt and exchange
+    /// agree well inside the trusted band, so the FOLD clock is the receipt,
+    /// and both sides of the comparison land on the same day. The gate is
+    /// therefore judging a genuine day mismatch, not a clock straddle.
+    #[test]
+    fn a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale() {
+        let mut agg = MultiTfAggregator::default();
+
+        let just_before_midnight = DAY - 1;
+        let just_after_midnight_utc_secs =
+            i64::from(DAY + 1) - crate::candles::tf_index::IST_UTC_OFFSET_SECS;
+
+        let mut t = tick(66_422, SEG_IDX, just_before_midnight, 142.50, 12_000);
+        t.received_at_nanos = just_after_midnight_utc_secs * 1_000_000_000;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            !stats.stale_trading_day,
+            "two seconds apart is inside the trusted band, so the fold clock \
+             takes the receipt and both sides land on the same day — a \
+             refusal here would drop real closing trades every session"
+        );
+    }
+
     #[test]
     fn a_prior_day_replay_frame_folds_unseeded_and_is_refused_once_seeded() {
         let yesterday_in_session = DAY - 86_400 + 33_300 + 60;
@@ -4040,5 +4176,325 @@ mod out_of_band_timestamp_tests {
             None,
             "id 27 on IDX_I is a DIFFERENT instrument"
         );
+    }
+}
+
+/// The DAY-GATE PERMUTATION SWEEP (2026-09-10).
+///
+/// The gate added on 2026-09-10 refuses a tick whose EXCHANGE day is not the
+/// RECEIPT day. That is two clocks, two directions and a stand-down sentinel,
+/// and it sits in the middle of a chain of five earlier refusals — so the
+/// behaviour that matters is not one arm but the GRID: which arm wins, what
+/// happens at each boundary, and what happens when a clock is not merely
+/// wrong but absurd.
+///
+/// Every test here was written because the grid position was UNPINNED, not
+/// because it was known broken. Three of them turned out to matter:
+///
+///   * the one-nanosecond receipt is exactly what broke seven drain tests on
+///     the day the gate shipped — fixtures passing `1_000_000` were handing
+///     the gate a 1970 receipt against a 2026 stamp;
+///   * the `i64::MAX` receipt is the only input that could PANIC, because the
+///     release profile sets `overflow-checks = true` and this arm does
+///     arithmetic on a caller-supplied number;
+///   * the ORDER tests pin that a corrupt price or an out-of-band second is
+///     still judged by the arm that owns it, so a day mismatch can never
+///     mask a harder fault or steal its counter.
+#[cfg(test)]
+mod day_gate_permutation_sweep {
+    use super::tests::{DAY, SEG_IDX, tick};
+    use super::*;
+
+    /// IST seconds -> the UTC epoch nanos the drain would stamp for them.
+    fn receipt_at_ist(ist_secs: i64) -> i64 {
+        (ist_secs - crate::candles::tf_index::IST_UTC_OFFSET_SECS) * 1_000_000_000
+    }
+
+    const TODAY_0916: u32 = DAY + 9 * 3_600 + 16 * 60;
+
+    // -- the stand-down sentinel, on the STALE side -------------------------
+
+    /// The sentinel case is pinned for the FUTURE arm one module up; this is
+    /// its mirror, and it is the one that actually runs in production. A
+    /// pre-TVW3 WAL frame carries no receipt, and boot replay of a segment
+    /// deferred at yesterday's shutdown is PRIOR-DAY by construction — so if
+    /// the sentinel did not stand down here, every such replay would be
+    /// refused and the deferred backlog would never fold.
+    ///
+    /// The watermark gate below it is what judges those frames, exactly as it
+    /// did before this change.
+    #[test]
+    fn a_prior_day_frame_with_no_receipt_is_left_to_the_watermark() {
+        let mut agg = MultiTfAggregator::default();
+        let yesterday = DAY - 86_400 + 33_400;
+        let t = tick(13, SEG_IDX, yesterday, 100.0, 1);
+        assert_eq!(t.received_at_nanos, 0, "fixture must exercise the sentinel");
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            !stats.stale_trading_day,
+            "with no second clock the receipt gate must stand down — refusing \
+             here would strand every pre-TVW3 boot replay, which is prior-day \
+             by construction"
+        );
+    }
+
+    /// A NEGATIVE receipt is garbage, not a clock, and it is treated as the
+    /// sentinel rather than as a 1970 instant.
+    ///
+    /// The distinction is not academic: `receipt_ist_secs / 86_400` truncates
+    /// TOWARD ZERO in Rust, so a negative receipt would compute day 0 for
+    /// anything inside the first 86,400 seconds before the epoch and slide the
+    /// comparison silently. Standing down is the only answer that cannot be
+    /// subtly wrong, and the `> 0` guard is what delivers it.
+    #[test]
+    fn a_negative_receipt_clock_stands_the_gate_down_rather_than_guessing() {
+        let mut agg = MultiTfAggregator::default();
+        let mut t = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
+        t.received_at_nanos = -1_000_000_000;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            !stats.stale_trading_day && !stats.future_trading_day,
+            "a negative receipt is not a clock; the gate must not judge a day \
+             against it in either direction"
+        );
+    }
+
+    // -- absurd-but-positive clocks ----------------------------------------
+
+    /// THE BUG THAT BROKE SEVEN TESTS on the day this gate shipped.
+    ///
+    /// Six drain fixtures passed `received_at_nanos = 1_000_000` — one
+    /// millisecond after the epoch — as a "don't care" value, because before
+    /// the gate nothing read it. Against a live 2026 exchange stamp that is a
+    /// receipt fifty-six years in the past, so the stamp is FUTURE-dated by
+    /// fifty-six years and refused. `folded` went to 0 and the fixtures failed
+    /// on assertions about frame-walk accounting, which is a symptom miles
+    /// from the cause.
+    ///
+    /// Pinned so the next reader who sees `folded: 0` in a drain test has the
+    /// answer in a test name instead of an afternoon.
+    #[test]
+    fn a_one_nanosecond_receipt_reads_a_live_stamp_as_future_dated() {
+        let mut agg = MultiTfAggregator::default();
+        let mut t = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
+        t.received_at_nanos = 1;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.future_trading_day,
+            "a 1970 receipt against a 2026 stamp IS a future-dated tick, and \
+             the gate is right to say so — the fixture was wrong, not the gate"
+        );
+    }
+
+    /// The only input that could PANIC: `overflow-checks = true` is set on the
+    /// release profile, and this arm divides and ADDS to a caller-supplied
+    /// `i64`. `i64::MAX / 1_000_000_000` is 9,223,372,036, and adding the
+    /// 19,800-second IST offset stays nine orders of magnitude below the
+    /// ceiling — so the arithmetic is safe by construction rather than by
+    /// luck, and this test is what keeps it that way if the offset ever moves
+    /// or the division is removed.
+    #[test]
+    fn a_receipt_clock_at_the_i64_ceiling_refuses_without_overflowing() {
+        let mut agg = MultiTfAggregator::default();
+        let mut t = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
+        t.received_at_nanos = i64::MAX;
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.stale_trading_day,
+            "a receipt at the end of time makes every real stamp stale — the \
+             verdict is unhelpful but it must be a VERDICT, never a panic on \
+             the per-tick path"
+        );
+    }
+
+    /// The measured worst case, from the vendor's own behaviour: Dhan sends
+    /// LAST TRADE TIME, and a dormant contract's connect snapshot was measured
+    /// at a maximum of 34 days stale. That is the top of the envelope this
+    /// gate exists to refuse.
+    #[test]
+    fn the_measured_thirty_four_day_maximum_stale_snapshot_is_refused() {
+        let mut agg = MultiTfAggregator::default();
+        let thirty_four_days_ago = DAY - 34 * 86_400 + 33_400;
+        let mut t = tick(66_422, SEG_IDX, thirty_four_days_ago, 142.50, 12_000);
+        t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.stale_trading_day,
+            "the measured 34-day maximum must be refused — this is the top of \
+             the envelope, not a hypothetical"
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
+            "and it must not take a slot"
+        );
+    }
+
+    // -- day boundaries -----------------------------------------------------
+
+    /// One SECOND apart across IST midnight, far outside the trusted band, is
+    /// a genuine day mismatch and is refused.
+    ///
+    /// This is the sharp edge of the rule and it is deliberate: the comparison
+    /// is on DAYS, so a single second can flip it. It is safe because the
+    /// trusted band already collapses a real straddle onto one clock (pinned
+    /// by `a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale`)
+    /// and because the candle session closes at 15:40 IST — nothing legitimate
+    /// trades within a second of midnight.
+    #[test]
+    fn an_exchange_stamp_one_second_before_midnight_is_stale_against_the_next_day() {
+        let mut agg = MultiTfAggregator::default();
+        // Receipt is a full working day later, so the trusted band cannot
+        // collapse the two onto one clock.
+        let mut t = tick(13, SEG_IDX, DAY - 1, 100.0, 1);
+        t.received_at_nanos = receipt_at_ist(i64::from(DAY + 33_400));
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.stale_trading_day,
+            "23:59:59 of the previous IST day is a different day, and the gate \
+             is a DAY comparison — a second is enough"
+        );
+    }
+
+    /// Exactly IST midnight is the FIRST second of the new day, not the last
+    /// second of the old one. Off-by-one here would refuse a whole day's
+    /// opening tick on the boundary.
+    #[test]
+    fn an_exchange_stamp_exactly_at_ist_midnight_belongs_to_the_new_day() {
+        let mut agg = MultiTfAggregator::default();
+        let mut t = tick(13, SEG_IDX, DAY, 100.0, 1);
+        t.received_at_nanos = receipt_at_ist(i64::from(DAY + 33_400));
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            !stats.stale_trading_day,
+            "00:00:00 IST is day D, not day D-1 — the floor division must put \
+             the boundary second on the new day"
+        );
+    }
+
+    // -- ORDER: which arm wins when two faults are true at once -------------
+
+    /// A corrupt PRICE outranks a day mismatch, and must: the price arm is a
+    /// hard refusal whose remedy is "this packet is unusable", while the day
+    /// arm's remedy is "this is a stale snapshot". Booking a NaN price under
+    /// `stale_trading_day` would make the stale-snapshot rate — the number the
+    /// operator reads to size reconnect noise — silently include corruption.
+    #[test]
+    fn an_insane_price_is_judged_before_a_day_mismatch() {
+        let mut agg = MultiTfAggregator::default();
+        let yesterday = DAY - 86_400 + 33_400;
+        let mut t = tick(13, SEG_IDX, yesterday, f32::NAN, 1);
+        t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(stats.refused_price, "the price arm owns a NaN");
+        assert!(
+            !stats.stale_trading_day,
+            "and the day arm must not also claim it — one tick, one reason, or \
+             the stale-snapshot rate stops meaning what it says"
+        );
+    }
+
+    /// The vendor's never-traded sentinel (`exchange_timestamp == 0`) is
+    /// judged by its own arm, which KEEPS THE ROW. Letting it fall to the day
+    /// gate would turn it into a hard refusal and lose the ability to tell
+    /// "did not trade today" from "did not capture" — the exact false-OK the
+    /// 2026-08-26 fix removed.
+    #[test]
+    fn an_untraded_sentinel_never_reaches_the_day_gate() {
+        let mut agg = MultiTfAggregator::default();
+        let mut t = tick(13, SEG_IDX, 0, 100.0, 1);
+        t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.untraded_timestamp,
+            "the sentinel keeps its own arm, which keeps the row"
+        );
+        assert!(
+            !stats.stale_trading_day && !stats.future_trading_day,
+            "the day gate must not see it — epoch 0 is a sentinel, not a 1970 \
+             trading day, and refusing it hard would lose the row"
+        );
+    }
+
+    /// An out-of-band second is also judged before the day gate, and also
+    /// keeps its row. It is the LARGEST of the candle-only reasons — 2,008,916
+    /// ticks in one measured session — so a day gate that swallowed it would
+    /// silently convert 2.4% of a session from kept rows to discarded ones.
+    #[test]
+    fn an_out_of_band_stamp_never_reaches_the_day_gate() {
+        let mut agg = MultiTfAggregator::default();
+        let mut t = tick(13, SEG_IDX, MIN_PLAUSIBLE_EXCHANGE_TS_SECS - 1, 100.0, 1);
+        t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            stats.out_of_band_timestamp,
+            "a below-floor second belongs to the band arm, which keeps the row"
+        );
+        assert!(
+            !stats.stale_trading_day && !stats.future_trading_day,
+            "the day gate must not re-judge it as a stale day and discard the row"
+        );
+    }
+
+    // -- the grid -----------------------------------------------------------
+
+    /// STALE and FUTURE can never both be true, across the whole grid.
+    ///
+    /// They are exclusive by arithmetic (`>` then `<` on the same pair), but
+    /// the drain books ONE reason per tick from an `if/else if` chain, so an
+    /// overlap would silently drop one counter and mis-attribute the other.
+    /// This walks nine day offsets against three receipt days and asserts the
+    /// invariant on every cell, rather than trusting the arithmetic to stay
+    /// the arithmetic.
+    #[test]
+    fn stale_and_future_are_mutually_exclusive_across_the_grid() {
+        for day_offset in [-34_i64, -2, -1, 0, 1, 2, 34] {
+            for receipt_offset in [-1_i64, 0, 1] {
+                let mut agg = MultiTfAggregator::default();
+                let stamp = i64::from(DAY) + day_offset * 86_400 + 33_400;
+                let Ok(stamp_u32) = u32::try_from(stamp) else {
+                    continue;
+                };
+                let mut t = tick(13, SEG_IDX, stamp_u32, 100.0, 1);
+                t.received_at_nanos =
+                    receipt_at_ist(i64::from(DAY) + receipt_offset * 86_400 + 33_400);
+
+                let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+                assert!(
+                    !(stats.stale_trading_day && stats.future_trading_day),
+                    "day_offset {day_offset}, receipt_offset {receipt_offset}: \
+                     both day flags set. The drain books ONE reason per tick, \
+                     so an overlap loses a counter and mis-names the other"
+                );
+                // And exactly one of the three outcomes holds.
+                let same_day = day_offset == receipt_offset;
+                assert_eq!(
+                    !stats.stale_trading_day && !stats.future_trading_day,
+                    same_day,
+                    "day_offset {day_offset}, receipt_offset {receipt_offset}: \
+                     a tick folds if and only if the two days match"
+                );
+            }
+        }
     }
 }

@@ -451,7 +451,8 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.bucket_open_prev_close = 24_200.10;
+        state.net_volume_signed = -4_242;
+        state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
@@ -789,9 +790,19 @@ mod tests {
 
     #[test]
     fn test_submit_preserves_seal_payload_through_spill_round_trip() {
-        // The full LiveCandleState (including the 3 Wave-5 pct fields)
-        // must round-trip from BufferedSeal → ring → eviction → spill
-        // file → on-disk SerializedSeal record without any field loss.
+        // The full LiveCandleState must round-trip from BufferedSeal → ring →
+        // eviction → spill file → on-disk SerializedSeal record without field
+        // loss — the net-volume accumulator included, since record format v2.
+        //
+        // ⚠ `bucket_open_prev_close` is DELIBERATELY not carried and this test
+        // is what proves it stays out: the record dropped it in v2 to make room
+        // for the accumulator, so a fixture that still set it failed this exact
+        // equality. Dropping it is safe because the field is DEAD — no
+        // production code reads it (`close_pct_from_prev_day` is stamped from
+        // `prev_day_close`, see `LiveCandleState::stamp_seal_percentages`), and
+        // its only remaining references are the three writes-then-asserts in
+        // `aggregator_cell.rs`. If a future change gives it a real reader, this
+        // assertion fails and the record needs the field back.
         let (spill, dlq) = temp_pair("preserve-fields");
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
