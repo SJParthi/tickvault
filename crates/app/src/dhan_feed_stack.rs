@@ -3249,7 +3249,10 @@ impl LiveIngest {
         // with one number. Outside the session the latch is CLEARED, not held:
         // the pre-open must not carry a verdict into the bell, and a post-close
         // latch would only ever be consulted by the next boot's fresh state.
-        if is_within_market_hours_ist(ist_secs_of_day_from_millis(now_millis)) {
+        if dead_class_verdict_is_due(
+            is_within_market_hours_ist(ist_secs_of_day_from_millis(now_millis)),
+            silence_page_allowed_today(),
+        ) {
             self.report_dead_classes(&classes);
         } else {
             self.stand_down_dead_class_report();
@@ -8146,6 +8149,30 @@ pub struct DhanFeedStackParams {
 /// `CROSSVERIFY_DEPS`.
 static TRADING_CALENDAR: OnceLock<Arc<tickvault_common::trading_calendar::TradingCalendar>> =
     OnceLock::new();
+
+/// Whether a dead-CLASS verdict may be judged on this sweep.
+///
+/// BOTH halves are required, and they answer different questions.
+///
+/// `in_session` is the WALL CLOCK. Before 09:15 nothing has traded, so a class
+/// that produced nothing is not dead — it has not been given a session to tick
+/// in. That half landed 2026-09-10, after the report fired at 08:33 and 09:00
+/// IST for `NSE_FNO` on ~22,000 contracts seeded at the 08:31 boot.
+///
+/// `trading_day` is the CALENDAR, and it is the half that fix forgot. The
+/// EventBridge start rule is `MON-FRI`, which INCLUDES NSE holidays, so on a
+/// weekday holiday the lane seeds the whole universe, receives nothing —
+/// correctly, the market is shut — and at 09:15 every seeded class reads dead
+/// at once. The sibling per-instrument silence page on this same 30 s arm has
+/// gated on the calendar since 2026-08-14 for exactly that reason
+/// (`silence_page_allowed_today`); the class report shipped with the
+/// wall-clock half alone and re-created that regression one function up.
+///
+/// Named pure function rather than an inline `&&` so the holiday case has a
+/// test that never has to set the process-global trading calendar.
+pub(crate) const fn dead_class_verdict_is_due(in_session: bool, trading_day: bool) -> bool {
+    in_session && trading_day
+}
 
 /// True when today is an NSE trading day — or when the calendar is not
 /// installed.
@@ -23627,6 +23654,63 @@ mod connection_delivery_tests {
             ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
             bit,
             "the first in-session sweep must judge, or the gate has become a mute"
+        );
+    }
+
+    /// A weekday NSE HOLIDAY must never judge a class dead.
+    ///
+    /// The EventBridge start rule is `MON-FRI`, so on a holiday the box boots,
+    /// seeds the whole universe and receives nothing — correctly, the market is
+    /// shut. With the wall-clock half alone, 09:15 turned that into
+    /// `RISK-GAP-03` for every seeded segment: the same false page the sibling
+    /// per-instrument leg closed on 2026-08-14 by gating on the calendar.
+    ///
+    /// Driven through the pure verdict rather than the process-global calendar
+    /// so the holiday case is a real assertion and not a `OnceLock` fixture.
+    #[test]
+    fn a_weekday_holiday_never_judges_a_class_dead() {
+        assert!(
+            dead_class_verdict_is_due(true, true),
+            "in session on a trading day is the ONLY case that judges"
+        );
+        assert!(
+            !dead_class_verdict_is_due(true, false),
+            "09:15 on an NSE holiday: the market is shut, so a class that \
+             produced nothing is not dead — this is the 2026-08-14 regression"
+        );
+        assert!(
+            !dead_class_verdict_is_due(false, true),
+            "pre-open on a trading day still has nothing to judge"
+        );
+        assert!(!dead_class_verdict_is_due(false, false));
+    }
+
+    /// The pure verdict is worthless if the call site does not pass BOTH halves.
+    ///
+    /// Source-scan rather than behavioural because the calendar half reads a
+    /// process-global `OnceLock` that a unit test cannot un-set; this pins the
+    /// wiring, `a_weekday_holiday_never_judges_a_class_dead` pins the logic.
+    #[test]
+    fn the_dead_class_gate_consults_both_the_clock_and_the_calendar() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let gate = source
+            .split_once("if dead_class_verdict_is_due(")
+            .expect(
+                "the dead-class gate must go through dead_class_verdict_is_due, \
+                 never a bare wall-clock `if`",
+            )
+            .1
+            .split_once(") {")
+            .expect("unterminated dead-class gate")
+            .0;
+        assert!(
+            gate.contains("is_within_market_hours_ist("),
+            "the dead-class gate lost its wall-clock half"
+        );
+        assert!(
+            gate.contains("silence_page_allowed_today()"),
+            "the dead-class gate lost its TRADING-CALENDAR half — on a weekday \
+             NSE holiday it will page RISK-GAP-03 for every seeded segment"
         );
     }
 
