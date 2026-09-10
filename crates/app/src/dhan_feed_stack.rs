@@ -3713,6 +3713,28 @@ fn seed_drain_loss_baselines() {
     c.refused_timestamp.increment(0);
     c.refused_slot.increment(0);
     c.refused_session.increment(0);
+    // ADDED 2026-09-10 by the compound-failure permutation sweep. The ghost
+    // family is the ONLY instrument that can verify the depth unsubscribe
+    // RequestCode live: the scope lock names "a session with `ghost = 0` and
+    // `unsubscribed_grace > 0`" as the evidence that code 25 works. Unseeded,
+    // that verdict cannot be read — a label set that was never incremented is
+    // ABSENT from the exporter, and absent is indistinguishable from "no
+    // ghost ever appeared". All four labels, for the per-label-set reason the
+    // ingest_refused family records above; all four are DrainCounters fields,
+    // so the ownership guard sees them as drain-owned.
+    c.depth_ghost.increment(0);
+    c.depth_unsubscribed_grace.increment(0);
+    c.depth_ghost_redials.increment(0);
+    c.depth_ghost_exhausted.increment(0);
+    // The depth family's LOSS labels, same reason: `refused` and `dropped` are
+    // zero on a healthy lane, so their first non-zero sample is the event —
+    // and the agent drops the first sample of a series it has never seen.
+    // `rows` is deliberately NOT seeded here: it is the success arm and moves
+    // on the first depth packet, so seeding it would publish a confident zero
+    // for a depth lane that has not dialed yet.
+    c.depth_refused.increment(0);
+    c.depth_dropped.increment(0);
+    c.depth_length_mismatch.increment(0);
 }
 
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
