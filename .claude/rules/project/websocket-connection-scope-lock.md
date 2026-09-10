@@ -2308,7 +2308,7 @@ probed before any cadence increase ships.
 `docs/dhan-ref/08-annexure-enums.md` records the depth UNSUBSCRIBE RequestCode as a
 cross-surface split — **24 vs 25** — with the weight of evidence "SHIFTED toward 24"
 and the conclusion **"UNVERIFIED-LIVE both ways"**. `constants.rs:397` ships
-`FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`.
+`FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`. *(⚠ SUPERSEDED 2026-09-10 — the constant is now 24; the live session proved 25 ignored. See "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".)*
 
 If 25 is the wrong code, every unsubscribe is a silent no-op at Dhan's side and every
 swap becomes an ADD. A depth-200 socket then reaches 2 instruments against a cap of 1
@@ -2504,7 +2504,7 @@ fallback to the banned engine.
    frame drain, which this same lock forbids. The subscribed set therefore
    reflects the ranking as of the last sweep before the minute mark.
 4. **The unsubscribe RequestCode (24 vs 25) is still UNVERIFIED-LIVE**, exactly
-   as the FOURTH-quote section records. Ranked steering does not raise the
+   as the FOURTH-quote section records. *(⚠ RESOLVED 2026-09-10: 25 was proven IGNORED on the wire and 24 now ships — see the 2026-09-10 section.)* Ranked steering does not raise the
    swap cadence — it is still at most one swap per socket per minute — so it
    multiplies that risk by nothing, but it does not retire it either.
 5. **Churn is UNMEASURED.** `tv_depth200_ranked_swaps_total{outcome}` is the
@@ -2569,7 +2569,7 @@ vacuous-pass shape closed in #1884 arriving one structure later.
 2. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The operator's
    Dhan pack (uploaded 2026-09-08) reads `25 = Unsubscribe — Full Market Depth`,
    which is what ships; the 24-vs-25 split recorded in the annexure is not
-   retired by a document, only by a live probe.
+   retired by a document, only by a live probe. *(⚠ The live probe happened on 2026-09-10: 25 was ignored, 24 ships — see the 2026-09-10 section.)*
 3. **Depth-200 has no hysteresis band.** Its planner is one contract per socket
    and swaps whenever the top five distinct underlyings change; churn is
    measured by `tv_depth200_ranked_swaps_total`, not bounded by a band.
@@ -2641,7 +2641,7 @@ unsubscribed contract "is not detected". It is now:
 **This is the safety net the FOURTH-quote section said must exist before the
 apply cadence is raised.** If code 25 is wrong for an endpoint, every swap
 becomes an add, the ghost shows within 90 s, and the socket is rebuilt within
-the cooldown instead of sitting at 804 for the session.
+the cooldown instead of sitting at 804 for the session. *(⚠ 2026-09-10: this is exactly what happened — 20 ignored unsubscribes, 10 redials, no socket parked. Code 25 WAS wrong; 24 ships since the 2026-09-10 section.)*
 
 #### Also delivered: the two per-cadence faces of `top_volume_rank`
 
@@ -2669,7 +2669,10 @@ faces gives that without writing every row twice.
    are the read-out.
 4. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The ghost counter
    is now the instrument that verifies it: a session with `ghost = 0` and
-   `unsubscribed_grace > 0` is the evidence that 25 works.
+   `unsubscribed_grace > 0` is the evidence that 25 works. *(⚠ 2026-09-10: the
+   session read the OPPOSITE — 20 ignored, 10 redials, so 25 does NOT work and
+   24 now ships; the same counter pair is the verdict instrument for 24. See
+   "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".)*
 
 #### What a PR that violates this section looks like (REJECT)
 
@@ -2761,7 +2764,7 @@ unsubscribe code on a live session FIRST, then raise the cadence.** The instrume
 for that probe now exists and is live — `tv_dhan_feed_depth_total{outcome="ghost"}`
 against `{outcome="unsubscribed_grace"}`. A session that ends with `ghost = 0` and
 `unsubscribed_grace > 0` is the evidence that code 25 works, and the cadence raise
-becomes a small change the following day.
+becomes a small change the following day. *(⚠ 2026-09-10: the evidence came back the other way for 25 — see the 2026-09-10 section; the same counter pair is now the verdict instrument for 24.)*
 
 **What a PR that violates this section looks like (REJECT):** raises the apply
 cadence before that probe reads clean; ships the raise without converting the
@@ -2868,3 +2871,82 @@ once chosen**. That is stricter than today, where a top-up runs until 09:30.
   case where the live price leaves the window.
 - Presents futures centring as an accuracy improvement — the measurement above
   says it is a coverage change, and the honest claim is the coverage one.
+
+### 2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE: 25 IS IGNORED, 24 SHIPS
+
+**The verbatim operator demand (2026-09-10, typed directly in-session — preserve
+EXACTLY):**
+
+> "Fix and resolve everything I don't want any open items dude okay?"
+
+Given in DIRECT response to a live-health report that listed, as its first open
+item, that Dhan was ignoring the depth unsubscribe on the wire. That is the
+§28.2/§28.3 authorization shape this repository already accepts: a general
+go-ahead answering an ENUMERATED ask selects the enumerated work. Recorded HERE
+before the constant moves, per the rule-file-first law.
+
+#### The verdict the FOURTH-quote section asked for, read from the first session that could give it
+
+The 2026-09-06 FOURTH-quote section bound the ordering *"probe the unsubscribe
+code on a live session FIRST, then raise the cadence"*, and the 2026-09-09 section
+named the instrument: `tv_dhan_feed_depth_total{outcome="ghost"}` against
+`{outcome="unsubscribed_grace"}`, seeded at zero on 2026-09-10 so the answer could
+be read at all. The session of 2026-09-10 (build carrying #1903, first ranked
+swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
+
+| Reading, 09:16–09:46 IST, 2026-09-10 | Value |
+|---|---:|
+| `WS-GAP-02` / `source = "unsubscribe_ignored"` ERROR lines | **20** |
+| Ghost redials armed (`outcome = "ghost_redial"`) | **10** |
+| Distinct instruments streaming depth-200 | **8**, on **5** single-instrument sockets |
+| Code on the wire for every one of those unsubscribes | **25** (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`) |
+
+A socket that was told to drop a contract kept receiving it past the 90 s grace,
+on every socket that swapped, every time. **Dhan did not honour a single code-25
+unsubscribe.** The ghost detector did exactly what the 2026-09-08 (THIRD) section
+built it for — it detected, it redialled, and the redial rebuilt the vendor's view
+from ours — so nothing was lost and no socket parked. What it cannot do is make 25
+mean "unsubscribe" to the vendor.
+
+#### What changes
+
+| Surface | Was | Now |
+|---|---|---|
+| `constants.rs::FEED_UNSUBSCRIBE_TWENTY_DEPTH` | 25 | **24** |
+| depth-20 and depth-200 unsubscribe frames | `RequestCode: 25` | `RequestCode: 24` |
+| The pin test | `test_depth_unsubscribe_code_is_25` | `test_depth_unsubscribe_code_is_24_and_is_subscribe_plus_one` |
+| Every doc, rule and comment asserting "25, NOT 24" | asserted | annotated with this date |
+
+24 is not a guess: it is the ONLY other value either vendor surface names. The
+classic annexure page (stable across every crawl since 2026-06-02) lists
+`24 | Unsubscribe - Full Market Depth`, and the vendor's own reference client
+derives every unsubscribe as `subscribe_code + 1`, which is how Ticker (15→16),
+Quote (17→18) and Full (21→22) already work in this codebase — depth (23→24) now
+follows the same rule the other three have always followed. The "25" came from
+the portal export alone, and the live wire has now disagreed with the portal.
+
+#### ⚠ What this does NOT claim (Rule 11)
+
+- **24 is UNVERIFIED-LIVE until the next session reads it.** The verdict
+  instrument is unchanged: a session that ends with `ghost = 0` and
+  `unsubscribed_grace > 0` is the evidence that 24 works. If 24 is ALSO ignored,
+  the same detector will say so within 90 s of the first swap, the redial will
+  keep every socket alive exactly as it did on 2026-09-10, and the honest next
+  step is a support ticket with both codes' evidence — not a third guess.
+- **The apply cadence does NOT move.** The FOURTH-quote ordering binds until 24
+  reads clean on a live session; the 2026-09-09 section's blockers on the
+  cadence raise (804 parks the socket and the redial cannot reach a parked
+  socket; per-call swap caps; `send_swap` unguarded on `pending`; two QuestDB
+  queries per iteration; the stall threshold) all stand.
+- **Nothing was lost on 2026-09-10.** Ghost rows are STILL WRITTEN by design; the
+  cost of the wrong code was redial churn and stale depth-200 books, not data.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Reverts the constant to 25 without a dated live reading showing 24 ignored AND
+  25 honoured — a document is not a wire.
+- Raises the apply cadence on the strength of this change before a session has
+  read `ghost = 0` with `unsubscribed_grace > 0` on code 24.
+- Leaves any doc, rule or comment asserting "25, NOT 24" un-annotated — a stale
+  assertion in this direction sends the next reader back to the code that was
+  proven ignored.

@@ -90,8 +90,10 @@ fn the_seed_is_actually_called_from_the_running_drain() {
 #[test]
 fn the_ghost_family_is_seeded_so_the_unsubscribe_code_verdict_is_readable() {
     // ADDED 2026-09-10 (compound-failure permutation sweep). The depth
-    // unsubscribe RequestCode (24 vs 25) is UNVERIFIED-LIVE, and the scope lock
-    // names exactly one instrument that can settle it: a session that ends
+    // unsubscribe RequestCode was UNVERIFIED-LIVE (24 vs 25) when this was
+    // written; later the same day the live session read 25 as IGNORED and 24
+    // shipped, so 24 is now the one under verdict. The scope lock names
+    // exactly one instrument that can settle it: a session that ends
     // with `ghost = 0` and `unsubscribed_grace > 0`. A label set that was never
     // incremented is ABSENT from the exporter, not zero, so an unseeded ghost
     // family makes that verdict unreadable — "no ghost" and "the detector

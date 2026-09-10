@@ -29,8 +29,9 @@
 //! * It never EMPTIES a socket. If fewer than five contracts are ranked, a
 //!   socket holding an off-ranking contract keeps it rather than being
 //!   unsubscribed to nothing — an empty depth socket delivers nothing and the
-//!   unsubscribe code is itself unverified live (the 24-vs-25 split the rule
-//!   file records).
+//!   unsubscribe code was unverified live when this was written (the 24-vs-25
+//!   split; settled 2026-09-10 — 25 proven IGNORED, 24 ships, 24 itself
+//!   UNVERIFIED-LIVE until a session reads `ghost = 0`).
 //! * It cannot FILL an empty socket (`held == None`). A swap needs an old
 //!   instrument to unsubscribe; a first subscription is a different command
 //!   shape and stays with the legacy first-adoption path.

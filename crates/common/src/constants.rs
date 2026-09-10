@@ -392,9 +392,27 @@ pub const MAX_INSTRUMENTS_PER_TWO_HUNDRED_DEPTH_CONNECTION: usize = 1;
 pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
 /// Unsubscription request code for full market depth feed (both 20 and 200 level).
-/// Dhan Annexure: UnsubscribeFullDepth = 25. There is NO code 24.
-/// vendor SDK (fulldepth.py) also uses 25 for unsubscribe.
-pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
+///
+/// **24 since 2026-09-10 — `subscribe_code + 1`, the same rule Ticker (15→16),
+/// Quote (17→18) and Full (21→22) follow above.** This shipped as 25 from the
+/// depth revival until 2026-09-10 on the strength of the portal annexure export
+/// and a citation of the vendor reference client; the classic annexure page
+/// and that client's own `subscribe_code + 1` derivation both say 24
+/// (`docs/dhan-ref/08-annexure-enums.md` §(b) records the cross-surface split).
+///
+/// The live session of 2026-09-10 settled it in the direction the WIRE answered:
+/// with 25 on every unsubscribe frame, the ghost detector logged **20**
+/// `unsubscribe_ignored` events and armed **10** ghost redials inside the first
+/// thirty minutes, and **8** distinct instruments were streaming depth-200 on
+/// the 5 single-instrument sockets — Dhan did not honour one code-25
+/// unsubscribe. 24 is the ONLY other value either vendor surface names.
+///
+/// 24 is itself UNVERIFIED-LIVE until a session reads `ghost = 0` with
+/// `unsubscribed_grace > 0` on `tv_dhan_feed_depth_total`; the detector that
+/// caught 25 is the same instrument that verifies 24. Dated record:
+/// `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE
+/// REQUESTCODE IS SETTLED LIVE".
+pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 24;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — Header Byte Offsets
@@ -4458,8 +4476,18 @@ mod tests {
     // --- Unsubscribe code for depth ---
 
     #[test]
-    fn test_depth_unsubscribe_code_is_25() {
-        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25);
+    fn test_depth_unsubscribe_code_is_24_and_is_subscribe_plus_one() {
+        // 2026-09-10: 25 was proven IGNORED on the wire (20 unsubscribe_ignored
+        // events, 10 ghost redials, 8 instruments on 5 depth-200 sockets in the
+        // first 30 minutes). 24 is the classic-annexure value and the same
+        // `subscribe_code + 1` rule every other unsubscribe code obeys.
+        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 24);
+        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, FEED_REQUEST_TWENTY_DEPTH + 1);
+        assert_ne!(
+            FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25,
+            "25 is the code Dhan ignored live on 2026-09-10; reverting it needs a \
+             dated live reading in websocket-connection-scope-lock.md first"
+        );
     }
 
     // --- Application constants ---

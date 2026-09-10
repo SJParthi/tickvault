@@ -1356,8 +1356,10 @@ impl ConnectionSupervisor {
                 self.reconnects = self.reconnects.saturating_add(1);
                 // WS-GAP-02: the vendor is still streaming an instrument this
                 // socket unsubscribed. Either the unsubscribe RequestCode is
-                // wrong for this endpoint (the 24-vs-25 split the annexure
-                // records as unverified live) or Dhan dropped the request.
+                // wrong for this endpoint (the 24-vs-25 split — 25 was proven
+                // IGNORED live on 2026-09-10 by exactly this arm firing 10
+                // times; 24 ships and is itself unverified until a session
+                // reads ghost = 0) or Dhan dropped the request.
                 // Both have the same remedy and neither has an ack to read:
                 // the redial replays the guard's CURRENT set, which does not
                 // include the ghost, so the vendor's view is rebuilt from

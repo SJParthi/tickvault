@@ -71,11 +71,12 @@
 //! hash probe each — never a per-contract scan for its underlying, which would
 //! be O(contracts x underlyings).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 use crate::dhan_contract_universe::ContractRow;
 use crate::volume_leaderboard::OptionFamily;
@@ -425,6 +426,48 @@ pub fn legs_from_artifact(
     }
     (legs, refusals)
 }
+/// Puts the legs the main feed will actually SUBSCRIBE ahead of the rest, so
+/// they are the ones that fit inside [`MAX_TRACKED_CONTRACTS`].
+///
+/// # Why the order matters (MEASURED 2026-09-10)
+///
+/// [`legs_from_artifact`] yields every OPTIDX/OPTSTK leg in the artifact across
+/// ALL expiries — **76,890** on 2026-09-10 — while [`build_snapshot`] keeps the
+/// FIRST 25,000 it meets and refuses the rest (**51,890** `AtCapacity` that
+/// day). Artifact order is not subscription order, so a contract that was on
+/// the wire could sit among the refused, and an unmapped contract is skipped
+/// by the ranking SILENTLY: it never reaches a depth socket and nothing says
+/// why. Ordering the selected set first turns "whichever 25,000 the file
+/// listed first" into "every contract we subscribed, then whatever room is
+/// left".
+///
+/// Matches on the I-P1-11 composite `(security_id, segment)`, never the id
+/// alone. Stable: relative order inside each half is preserved, so the refusal
+/// set is deterministic across boots for the same artifact and selection.
+/// Returns the reordered legs and how many of them were in the selection.
+///
+/// # Complexity
+///
+/// O(selected) to build the set, one O(legs) partition pass — cold, once per
+/// attach on the contract task, never a hot path.
+#[must_use]
+pub fn order_selected_first(
+    legs: Vec<LegIds>,
+    selected: &[SubscribeInstrument],
+) -> (Vec<LegIds>, usize) {
+    let picked: HashSet<ContractKey> = selected
+        .iter()
+        .map(|instrument| (instrument.security_id, instrument.segment))
+        .collect();
+    let (mut ordered, rest): (Vec<LegIds>, Vec<LegIds>) = legs.into_iter().partition(|leg| {
+        u64::try_from(leg.contract_security_id)
+            .is_ok_and(|id| picked.contains(&(id, leg.contract_segment)))
+    });
+    let selected_count = ordered.len();
+    ordered.extend(rest);
+    (ordered, selected_count)
+}
+
 /// The published mapping. Cheap to clone — it is one `Arc`.
 #[derive(Debug, Clone)]
 pub struct ContractUnderlyingMap {
@@ -1093,5 +1136,72 @@ mod tests {
         let a = global_contract_underlying_map();
         let b = global_contract_underlying_map();
         assert!(std::sync::Arc::ptr_eq(a, b));
+    }
+
+    // -- order_selected_first (2026-09-10: the artifact holds ~77k option legs
+    //    against a 25,000 cap; artifact order used to decide who was mapped) --
+
+    fn subscribed(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment,
+        }
+    }
+
+    #[test]
+    fn order_selected_first_keeps_subscribed_contracts_ahead_and_stable() {
+        let legs: Vec<LegIds> = (1..=5).map(|i| leg(i, 13)).collect();
+        let picked = [subscribed(4, FNO), subscribed(2, FNO)];
+        let (ordered, count) = order_selected_first(legs, &picked);
+        let ids: Vec<i64> = ordered.iter().map(|l| l.contract_security_id).collect();
+        // Selected first, in their ORIGINAL relative order; then the rest,
+        // also in original order. Stability is what makes the refusal set
+        // deterministic across boots.
+        assert_eq!(ids, vec![2, 4, 1, 3, 5]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn order_selected_first_matches_the_composite_key_never_the_id_alone() {
+        // I-P1-11: a subscription for id 7 on NSE_EQ is a DIFFERENT instrument
+        // from option contract 7 on NSE_FNO. Matching on the bare id would
+        // promote a contract nobody subscribed.
+        let legs = vec![leg(7, 13), leg(8, 13)];
+        let picked = [subscribed(7, ExchangeSegment::NseEquity)];
+        let (ordered, count) = order_selected_first(legs, &picked);
+        assert_eq!(count, 0);
+        let ids: Vec<i64> = ordered.iter().map(|l| l.contract_security_id).collect();
+        assert_eq!(ids, vec![7, 8], "nothing promoted, order untouched");
+    }
+
+    #[test]
+    fn a_subscribed_contract_listed_last_in_the_artifact_is_mapped_before_the_cap() {
+        // The 2026-09-10 shape: more legs than the cap, and the contract we
+        // actually put on the wire sits at the END of the artifact. Before
+        // the reorder it was the one refused; the ranking then skipped every
+        // one of its ticks silently.
+        let last = MAX_TRACKED_CONTRACTS as i64 + 1;
+        let legs: Vec<LegIds> = (1..=last).map(|i| leg(i, 13)).collect();
+        let picked = [subscribed(last as u64, FNO)];
+        let (ordered, count) = order_selected_first(legs, &picked);
+        assert_eq!(count, 1);
+        let (map, build) = build_snapshot(&ordered);
+        assert_eq!(map.len(), MAX_TRACKED_CONTRACTS);
+        assert_eq!(
+            under(&map, (last as u64, FNO)),
+            Some(13),
+            "the subscribed contract must be mapped — it is the one whose ticks arrive"
+        );
+        // The cap refuses in ARRIVAL order, so the leg that no longer fits is
+        // the LAST unselected one — the subscribed leg took the slot the
+        // artifact's tail would have had. The refusal is still counted, never
+        // hidden. (The first draft of this assertion expected leg 1 refused,
+        // which would mean the map evicted an already-accepted leg — it does
+        // not, and must not.)
+        assert_eq!(
+            build.refusals,
+            vec![(MAX_TRACKED_CONTRACTS as i64, LegRefusal::AtCapacity)]
+        );
+        assert_eq!(under(&map, (1, FNO)), Some(13), "leg 1 keeps its slot");
     }
 }
