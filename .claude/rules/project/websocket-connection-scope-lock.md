@@ -2950,3 +2950,108 @@ the portal export alone, and the live wire has now disagreed with the portal.
 - Leaves any doc, rule or comment asserting "25, NOT 24" un-annotated — a stale
   assertion in this direction sends the next reader back to the code that was
   proven ignored.
+
+### 2026-09-10 — A TICK WHOSE EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED OUTRIGHT, not just kept out of candles
+
+**The verbatim operator demand (2026-09-10, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "ssee just now i saw one query which is this nse fno securityid dude which had ticks recievd at is 9.15 am but why the fuck ts is last even 3.29 pm motherfucker see clealry note this motherufcker which is clealry ntoe our recievd at shodu lbe between 9.15 am till 3.49 pm for fno right meanwhiel ts also shodul be always between 9.15 am till 3.49 pm for fno right  okay can you fix this issue and assure this also dude okay? see because whenevr we manually or fix or deploy soemthigna nd if the server starts means then the incoming recivign ticks shdou lneevr ver be inegtsed right into db right do you understand my point tel me dude okay?"
+
+The operator additionally CHOSE the refusal shape from an enumerated three-way
+question — *"Refuse the row entirely"*, over stamping it with the receipt time
+and over also tightening the seconds-of-day window. Both halves are recorded
+because the second is what makes this a narrow change rather than a wide one.
+
+#### The row he found, and why it exists
+
+`security_id 66422` (NSE_FNO, `web.dhan.co/Charts?exch=NSE&seg=D&secid=66422`)
+carried `received_at` = today 09:15 and `ts` = 15:29. Nothing was broken at the
+receipt end; the row is the documented consequence of a decision taken here on
+2026-08-26.
+
+**Dhan sends LAST TRADE TIME, never "now".** A dormant contract snapshotted at
+the 09:15 connect therefore carries the stamp of whenever it last actually
+traded. `multi_tf_aggregator.rs` records the measurement in its own words:
+*"measured mean 5 hours, max 34 days"*, and *"verified live as 8,898 fabricated
+bars in a database created empty that same morning."*
+
+That was found and fixed on 2026-08-26 — **for candles only.** The refusal was
+made CANDLE-ONLY, and the code says so verbatim:
+
+> *"a prior-day frame is then refused as `stale_trading_day`, which is a
+> CANDLE-ONLY refusal, so its row is still written to `ticks` and only the
+> bogus bar is skipped. Recovery keeps everything it could legitimately keep."*
+
+The stated reason — *"the ROW is a real last-traded price and is kept"* — is
+defensible about a price and wrong about **this table**.
+
+#### Why keeping the row was wrong, specifically
+
+`ts` is QuestDB's **designated timestamp**. A row stamped with a previous
+session's LTT does not merely look odd next to its `received_at`: it lands in a
+**previous day's partition**, silently amending a day that already closed. And
+once there it is indistinguishable from a genuine 15:29 trade on that day —
+nobody reading the table later can tell the back-dated snapshot from the real
+tick. That is the false-OK class, written into the one table the whole system
+treats as ground truth.
+
+**The operator's second sentence names the delivery mechanism exactly.** Every
+reconnect and every deploy restart draws a fresh snapshot burst, so each one
+injected a batch of these rows. That is why the shape appears at 09:15 and
+after every manual restart.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Gate | A tick whose IST exchange DAY differs from its IST receipt DAY is **HARD-refused** — no row in `ticks`, no candle, no leaderboard entry |
+| Direction | Both. `stale_trading_day` (exchange day BEFORE receipt day) and `future_trading_day` (exchange day AFTER receipt day) are refused identically |
+| Counted | `tv_dhan_feed_ingest_refused_total{reason}` with the reason preserved — a refusal that reaches no counter is a silent drop, which is what this section exists to stop |
+| No receipt | `received_at_nanos <= 0` is the documented "no receipt" sentinel (pre-`TVW3` WAL frames). With no second clock there is nothing to compare, so the gate STANDS DOWN rather than guessing. Those frames are replay, not live |
+| Seconds-of-day window | **UNCHANGED** at 09:00–15:40 (`TICK_PERSIST_START/END_SECS_OF_DAY_IST`) — see below |
+
+#### ⚠ What this does NOT change, and why the operator was told before choosing
+
+The operator's message asks for **09:15–15:49**. The window is deliberately NOT
+moved, and he selected the option that leaves it alone after being shown why:
+
+- The **09:00** start is authorized and load-bearing. The 2026-08-28 section of
+  this file moved candle bucketing to a 09:00 session start to capture the
+  pre-open, and `CONTINUOUS_SESSION_START_SECS_OF_DAY_IST` (09:15) exists as a
+  SEPARATE, narrower constant precisely so silence detection does not page
+  during the pre-open. Indices tick continuously from 09:00; moving the persist
+  start to 09:15 would discard that data.
+- The **15:40** end is 10 minutes past the 15:30 close, which already covers the
+  closing tail. Extending to 15:49 buys nine minutes in which nothing trades.
+
+The row that prompted this was never a window problem. `15:29` is INSIDE the
+existing window on both ends — that is exactly why it passed. The defect was
+always the DAY, never the time of day, and the day gate is what this section
+adds.
+
+#### ⚠ Honest cost (Rule 11)
+
+A dormant contract now leaves **no row at all** until it genuinely trades. Before
+this change it left one row per snapshot, back-dated. There is no third option
+that keeps a record without either back-dating a closed partition or fabricating
+a trade at the receipt instant — the operator was shown all three and chose the
+refusal. If a last-traded-price record for dormant contracts is ever wanted, it
+belongs in its own table with an honest schema, never back-dated into `ticks`.
+
+**NOT claimed:** that this repairs rows already written. It does not. Existing
+back-dated rows remain in their prior-day partitions and would need a separate,
+operator-authorized cleanup — which is a DELETE against `ticks`, a SEBI-retention
+table, and is therefore deliberately not started here.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Returns `stale_trading_day` or `future_trading_day` to the candle-only set.
+- Writes a day-mismatched tick under a receipt-derived `ts` (the fabrication the
+  operator declined).
+- Refuses a day-mismatched tick without counting it.
+- Applies the gate when `received_at_nanos <= 0` — that is a WAL replay frame
+  with no second clock, and guessing there re-creates the 2026-08-26 defect from
+  the other direction.
+- Moves `TICK_PERSIST_START_SECS_OF_DAY_IST` off 09:00 under cover of this
+  quote — the operator chose the option that leaves the window alone.
