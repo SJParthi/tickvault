@@ -120,19 +120,37 @@ pub struct ShadowSealRow {
     /// (today's 09:15 open vs yesterday's close). Lands in the
     /// `open_gap_pct` DOUBLE column (operator request 2026-06-02).
     pub open_gap_pct: f64,
-    /// The bar's volume SIGNED by direction — the line Dhan's chart plots as
-    /// "Net Volume": positive when the bar closed above the previous bar,
-    /// negative when below, `0` when the price did not move.
+    /// The bar's SIGNED ORDER FLOW — buy-initiated volume minus sell-initiated
+    /// volume, accumulated per tick under the classic tick rule: an uptick is
+    /// buy-initiated, a downtick sell-initiated, and an unchanged price carries
+    /// the previous direction. `|net_volume| <= volume` always holds, because
+    /// both are summed from the same per-tick cumulative delta.
     ///
-    /// `None` means **no previous bar to compare against** — the day's first
-    /// bar of this timeframe, a bar whose predecessor belongs to a different
-    /// IST day, or a bar with an unusable close. It lands as a **NULL**
-    /// column, never as `0`: on a chart, `0` draws a flat bar and NULL draws
-    /// nothing, and those are different facts.
+    /// ⚠ **CORRECTED 2026-09-10 — this doc described the OLD, WRONG definition
+    /// until today**, and it is the doc a reader lands on from the type. It
+    /// said "positive when the bar closed above the previous bar, negative when
+    /// below". That was bar DIRECTION applied to the whole bar's volume, which
+    /// inverts exactly when a bar's flow and its close disagree — the case
+    /// somebody consults this column to find. It also claimed the value "costs
+    /// no per-instrument RAM"; it costs 8 bytes on `LiveCandleState`. The
+    /// conversion site below was corrected in the same change that fixed the
+    /// arithmetic; this field doc was not, which is why it is annotated rather
+    /// than quietly rewritten.
     ///
-    /// Derived at conversion time from
-    /// [`LiveCandleState::net_volume`](tickvault_trading::candles::LiveCandleState::net_volume)
-    /// rather than stored on the state, so it costs no per-instrument RAM.
+    /// **`None` no longer means "the day's first bar".** A first bar with ticks
+    /// IS classified and DOES report flow. `None` now means **this process did
+    /// not classify the bar** — a disk-spill replay (the 128-byte record cannot
+    /// carry the accumulator), a REST-folded bar, a bar with no ticks, or a bar
+    /// with zero volume. That is a data-PROVENANCE fact, not a calendar one.
+    ///
+    /// It lands as a **NULL** column, never as `0`: on a chart `0` draws a flat
+    /// bar and NULL draws nothing, and "perfectly balanced flow" is a different
+    /// claim from "nobody measured the flow".
+    ///
+    /// **INFERRED, not observed.** Dhan publishes no trade tape and no
+    /// aggressor flag, so the side is inferred from the price move. Read from
+    /// [`LiveCandleState::net_volume`](tickvault_trading::candles::LiveCandleState::net_volume),
+    /// which owns every refusal in one place.
     pub net_volume: Option<i64>,
     /// `LiveCandleState::total_buy_qty` (`u32`) widened to `i64`. The vendor's
     /// total PENDING BUY-order quantity resting in the book at this bar's last
