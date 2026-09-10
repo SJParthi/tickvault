@@ -1884,6 +1884,14 @@ pub async fn load_contract_universe(
         crate::contract_underlying_map::pre_register_contract_underlying_counters();
         let (legs, artifact_refusals) =
             crate::contract_underlying_map::legs_from_artifact(&contracts, &symbols);
+        // Counted by REASON, not just totalled. The count alone is what the
+        // line below carried until 2026-09-09, and on 2026-09-08 and
+        // 2026-09-09 it read `113182` then `113746` -- EVERY option leg in the
+        // artifact -- while saying nothing about why, so the top-volume board
+        // ranked nothing for two sessions and the cause had to be found by
+        // reading source. See `count_artifact_refusals` for the full record.
+        let artifact_refusal_reasons =
+            crate::contract_underlying_map::count_artifact_refusals(&artifact_refusals);
         let (legs, selected_first) =
             crate::contract_underlying_map::order_selected_first(legs, &selection.instruments);
         if selected_first == 0 && !selection.instruments.is_empty() {
@@ -1910,6 +1918,7 @@ pub async fn load_contract_universe(
             option_legs_in_artifact = legs.len(),
             refused_in_build = build.refusals.len(),
             refused_in_artifact_scan = artifact_refusals.len(),
+            artifact_refusal_reasons = %artifact_refusal_reasons,
             "contract-to-underlying map published — this is what the top-volume ranking \
              can see; every subscribed option leg was offered a slot before any \
              unsubscribed one"
