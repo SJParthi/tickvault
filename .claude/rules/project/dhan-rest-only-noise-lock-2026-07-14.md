@@ -390,6 +390,47 @@ the only thing that can ever report it.
 > > rather than fixed here: adding a grace changes WHEN a real dead class is
 > > reported, which is its own decision.
 > >
+> > > **RESOLVED 2026-09-10 (same day, hours later) — the grace now exists, and
+> > > it is DERIVED from the sibling rather than restated.** The paragraph above
+> > > closes with *"Recorded rather than fixed here: adding a grace changes WHEN
+> > > a real dead class is reported, which is its own decision."* That decision
+> > > was put to the operator with this item enumerated and answered *"Fix and
+> > > resolve everything I don't want any open items dude okay?"* — the
+> > > §28.2/§28.3 authorization shape this repository already accepts.
+> > >
+> > > `DEAD_CLASS_SCANS_BEFORE_REPORT` is a `const` block that CASTS
+> > > `SILENCE_SCANS_BEFORE_ALERT`, with a compile-time `assert!` on the range —
+> > > so the two can never drift to different numbers, and raising the sibling
+> > > past a `u8` fails the build rather than silently clamping to 255 scans
+> > > (two hours). `dead_class_dead_scans: [AtomicU8; SEGMENT_CLASS_COUNT]`
+> > > counts CONSECUTIVE in-session dead sweeps per class; a class that ticks
+> > > again resets its own counter to zero, and the out-of-session stand-down
+> > > clears the whole array beside the latch.
+> > >
+> > > **The load-bearing detail, stated because it is the way this fix could
+> > > have been silently wrong:** below the threshold the class's bit is CLEARED
+> > > from the value that becomes the latch. `current` IS the next sweep's
+> > > `previous`, and a latched bit reads as *"already reported this episode"* —
+> > > so holding the bit during the grace would have consumed the episode
+> > > without ever emitting, turning a grace into permanent silence. The gauge
+> > > still counts the class as dead throughout, so a dashboard shows the live
+> > > state while the log waits for evidence.
+> > >
+> > > Bite-proven in both directions: deleting the three-line gate fails
+> > > `the_dead_class_rollup_is_wired_into_the_live_silence_sweep`,
+> > > `the_dead_class_verdict_is_deferred_until_the_continuous_session` and
+> > > `a_class_that_ticks_again_restarts_the_dead_class_grace`; restoring it
+> > > passes all six. The deferred-until-session test now asserts BOTH halves —
+> > > that the pre-open sweeps contribute NOTHING to the in-session run, which
+> > > is what stops the gate merely postponing the false report to the bell.
+> > >
+> > > **What this costs, honestly:** a genuinely dead class is now reported ~30
+> > > seconds later than before (one extra sweep at `SILENCE_SCAN_INTERVAL_SECS`).
+> > > That is the trade the paragraph above said needed deciding, and it is the
+> > > same trade the per-instrument page has been making since it was written.
+> > > No alarm, no metric and no EMF name changes — this is a log-emit gate on
+> > > an existing coded error.
+> >
 > > The reusable half is the one this file keeps recording: **the fix for a
 > > false page is the place to check whether the sibling leg already solved a
 > > harder version of the same problem.** The calendar gate was eleven lines

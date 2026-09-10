@@ -559,7 +559,11 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // tv_dhan_feed_ingest_ticks_total (ticks actually folded),
     // tv_dhan_feed_ingest_refused_total, tv_dhan_ws_reconnect_total,
     // tv_dhan_ws_park_total (a parked socket is a PERMANENTLY dark shard —
-    // ParkReason::FatalDisconnect is never re-dialed),
+    // ParkReason::FatalDisconnect is never re-dialed; and since 2026-09-10
+    // SubscriptionRejected reaches a park only on the SECOND 804, after its
+    // one re-dial is spent, so every label value on this metric still means
+    // permanently dark. That 4th label value adds ONE series, ~$0.30/mo,
+    // counted in the honest total below rather than left implicit),
     // tv_dhan_ws_dial_failed_total (the 2026-08-12 class itself),
     // tv_ticks_lost_total (the workspace's only explicit tick-loss SLA
     // counter), tv_ws_frame_spill_drop_critical (the WAL durable-floor breach).

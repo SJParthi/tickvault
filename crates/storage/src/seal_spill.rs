@@ -375,6 +375,18 @@ impl SerializedSeal {
         // derived (== close_pct_from_prev_day), so it's not a state field —
         // the replayed close_pct restores it at the next extraction.
         state.open_gap_pct = self.open_gap_pct;
+        // `net_volume_signed` / `net_volume_classified` are DELIBERATELY not
+        // restored, and `LiveCandleState::empty()` leaves the flag `false`, so
+        // a replayed bar persists `net_volume = NULL`.
+        //
+        // This record is byte-for-byte FULL at `SEAL_SPILL_RECORD_SIZE` — all
+        // 128 bytes are assigned — so carrying the accumulator through disk
+        // needs a format bump and a mixed-stride reader, which is not a change
+        // to make in passing. NULL is the honest reading in the meantime: a
+        // restored `0` would say "this bar traded with perfectly balanced
+        // flow" about a bar nobody classified, which is a fabrication rather
+        // than a gap. Pinned by
+        // `a_replayed_spill_record_reports_no_net_volume_never_a_balanced_zero`.
         Some(BufferedSeal::new(
             self.security_id,
             self.exchange_segment_code,
@@ -1679,6 +1691,43 @@ mod tests {
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
+    }
+
+    /// A replayed spill record must report NO net volume, never a balanced zero.
+    ///
+    /// The 128-byte record is byte-for-byte FULL, so the tick-rule accumulator
+    /// cannot ride through disk without a format bump. The failure mode this
+    /// pins is not the missing data — it is the SHAPE of the answer: without
+    /// `net_volume_classified`, a replayed bar would arrive with a zero
+    /// accumulator and a non-zero volume, and `net_volume()` would report
+    /// `Some(0)` — a confident "this bar's flow was perfectly balanced" about a
+    /// bar nobody classified. NULL is the honest answer; a fabricated zero is
+    /// strictly worse than a gap, because a reader cannot tell it from a real
+    /// balanced bar.
+    #[test]
+    fn a_replayed_spill_record_reports_no_net_volume_never_a_balanced_zero() {
+        let seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 24_341.95);
+        let record = SerializedSeal::from(&seal);
+        let replayed = record
+            .try_into_buffered_seal()
+            .expect("a known tf ordinal round-trips");
+
+        assert!(
+            replayed.state.volume > 0,
+            "precondition: the replayed bar carries real gross volume, which is \
+             what makes a Some(0) net reading look plausible"
+        );
+        assert!(
+            !replayed.state.net_volume_classified,
+            "a bar rebuilt from disk was never classified by this process"
+        );
+        assert_eq!(
+            replayed.state.net_volume(),
+            None,
+            "NULL, not a fabricated balanced zero — carrying the accumulator \
+             through disk needs a record-format bump, and until then the honest \
+             answer is that nobody classified this bar"
+        );
     }
 
     #[test]

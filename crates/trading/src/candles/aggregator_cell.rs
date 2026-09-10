@@ -588,6 +588,14 @@ impl AggregatorCell {
     // ONCE per tick and passed down, never recomputed per timeframe. Bundling
     // them into a struct would either reintroduce that per-timeframe cost or
     // add an indirection on the per-tick path, for no behavioural gain.
+    //
+    // `signed_tick_volume` is the newest member of that contract and the one
+    // that MUST be hoisted rather than derived here: it compares this tick
+    // against the PREVIOUS TICK, and inside this function the only "previous"
+    // available is this timeframe's own running close. Deriving it here would
+    // compare a packet against itself for 23 of the 24 timeframes on the first
+    // tick of every bucket and silently destroy the classification — the exact
+    // trap `observe_session_extremes` carries a comment about one caller up.
     // APPROVED: argument count is the hot-path contract, see above.
     #[allow(clippy::too_many_arguments)]
     pub fn consume_tick_with_extremes(
@@ -599,6 +607,7 @@ impl AggregatorCell {
         strategy: FeedStrategy,
         cumulative_volume: u64,
         extremes: SessionExtremeDelta,
+        signed_tick_volume: Option<i64>,
         fold_secs: u32,
     ) -> ConsumeOutcome {
         self.fold(
@@ -609,6 +618,7 @@ impl AggregatorCell {
             strategy,
             cumulative_volume,
             extremes,
+            signed_tick_volume,
             fold_secs,
         )
     }
@@ -642,6 +652,18 @@ impl AggregatorCell {
             strategy,
             cumulative_volume,
             SessionExtremeDelta::default(),
+            // `None` — "this entry point CANNOT classify", which is a
+            // different statement from "this tick was balanced". Tick-rule
+            // classification needs the PREVIOUS tick's price, which lives on
+            // the aggregator SLOT, not on a cell — so a bar folded through
+            // here is marked unclassified and `net_volume()` returns NULL
+            // rather than a confident, fabricated zero.
+            //
+            // `MultiTfAggregator::consume_tick` is the single live fold path
+            // and it goes through `consume_tick_with_extremes`, which carries
+            // the hoisted classification. Pinned by
+            // `only_the_extremes_entry_classifies_net_volume`.
+            None,
             fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
         )
     }
@@ -664,6 +686,7 @@ impl AggregatorCell {
         strategy: FeedStrategy,
         cumulative_volume: u64,
         extremes: SessionExtremeDelta,
+        signed_tick_volume: Option<i64>,
         fold_secs: u32,
     ) -> ConsumeOutcome {
         let ord = tf.as_ordinal();
@@ -787,6 +810,7 @@ impl AggregatorCell {
                     prev_close: net_volume_baseline(&self.last_sealed[ord], bucket_start),
                 },
                 cumulative_volume,
+                signed_tick_volume,
                 fold_secs,
             );
             return ConsumeOutcome::Updated;
@@ -837,6 +861,7 @@ impl AggregatorCell {
                 tick,
                 prices,
                 cumulative_volume,
+                signed_tick_volume,
                 fold_secs,
             );
             // Session extremes keep arriving through the first bucket's life,
@@ -888,6 +913,7 @@ impl AggregatorCell {
                         prev_close: prev_close_for_new_bucket,
                     },
                     cumulative_volume,
+                    signed_tick_volume,
                     fold_secs,
                 ),
             );
@@ -1139,6 +1165,7 @@ fn open_bucket(
     bucket_start_cumulative: u64,
     ctx: BucketOpenContext,
     cumulative_volume: u64,
+    signed_tick_volume: Option<i64>,
     fold_secs: u32,
 ) -> LiveCandleState {
     let BucketOpenContext {
@@ -1161,6 +1188,17 @@ fn open_bucket(
         low: price,
         close: price,
         volume: cumulative_volume.saturating_sub(bucket_start_cumulative),
+        // Seeded, not zeroed. The tick that OPENS a bucket carries real
+        // classified volume — `volume` above counts it, so dropping its sign
+        // here would make the first tick of every bucket the one trade the
+        // net-volume column cannot see. On a 1-second frame that is a large
+        // share of every bar.
+        net_volume_signed: signed_tick_volume.unwrap_or(0),
+        // The LIVE fold is the one place that classifies. Every other producer
+        // of a `LiveCandleState` — `new()`, the spill decoder — leaves this
+        // `false`, so `net_volume()` refuses rather than reporting a bar it
+        // never classified as perfectly balanced.
+        net_volume_classified: signed_tick_volume.is_some(),
         bucket_start_cumulative,
         oi: i64::from(tick.open_interest),
         tick_count: 1,
@@ -1343,6 +1381,7 @@ fn fold_in_bucket(
     tick: &ParsedTick,
     prices: TickPrices,
     cumulative_volume: u64,
+    signed_tick_volume: Option<i64>,
     fold_secs: u32,
 ) {
     let price = prices.last_traded_price;
@@ -1451,6 +1490,31 @@ fn fold_in_bucket(
             .volume_regression_suppressed
             .increment(1);
     }
+    // Tick-rule net volume: accumulate the classified delta the caller derived
+    // ONCE for this tick, above the timeframe loop.
+    //
+    // `None` means the caller CANNOT classify — it has no previous tick price —
+    // and it poisons the bucket's flag rather than contributing nothing. A bar
+    // that received even one unclassified tick has an accumulator that no
+    // longer describes all of its volume, and reporting it would be a partial
+    // answer wearing a complete one's clothes.
+    //
+    // Accumulated UNCONDITIONALLY otherwise, deliberately not gated on the
+    // volume widening above. The two answer different questions: that guard
+    // suppresses a STALE packet whose day-cumulative went backwards, and such a
+    // packet's delta is already zero because the caller derives it from the
+    // same monotonic slot baseline. A second condition here would only create a
+    // way for the gross and the net to disagree about which ticks count.
+    //
+    // Saturating, not wrapping: a sum past `i64::MAX` must pin at the ceiling,
+    // never flip a buy bar into a sell bar. `net_volume()` clamps to the bar's
+    // own volume on top of that.
+    match signed_tick_volume {
+        Some(delta) => {
+            state.net_volume_signed = state.net_volume_signed.saturating_add(delta);
+        }
+        None => state.net_volume_classified = false,
+    }
     state.tick_count = state.tick_count.saturating_add(1);
     // Last NON-ZERO wins: a blank pre-market 0 must never clobber a real
     // baseline captured earlier in the session. The widened fields are `0.0`
@@ -1485,10 +1549,16 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
         state.close = price;
         state.close_ts_ist_secs = fold_secs;
     }
+    // `net_volume_signed` is deliberately NOT touched here, and the omission is
+    // the same one `volume` already makes: this path amends a SEALED bar's
+    // high/low/close from a late tick and never its volume, because the
+    // cumulative that tick carries belongs to a bucket that has moved on. A net
+    // that grew while the gross bounding it did not would break the
+    // `net_volume().abs() <= volume` invariant on a row already written.
     state.tick_count = state.tick_count.saturating_add(1);
 }
 
-// Per-instrument RAM pin. TF_COUNT × 128 B × 2 arrays (`slots` +
+// Per-instrument RAM pin. TF_COUNT × 136 B × 2 arrays (`slots` +
 // `last_sealed`) + TF_COUNT flags, padded.
 //
 // RAISED 2026-08-10: 5_632 → 6_400 for TF_COUNT 21 → 24 (M2/M30/M60
@@ -1498,13 +1568,27 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // mystery const-assert.
 //
 // Fleet cost at the slot ceiling, stated because this constant multiplies:
-//   24 TF × 128 B × 2 = 6_144 B, padded ≤ 6_400 B per instrument
-//   × AGGREGATOR_MAX_SLOTS (25,000) = ~160 MB
-// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.49% —
-// up from ~141 MB at 21 frames. On the retired 4 GiB t4g.medium the same
-// table would have been ~3.9% of the entire machine, which is the sort of
-// number that used to make "just add three timeframes" a real decision.
-const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 128 * 2 + TF_COUNT * 4 + 160;
+//   24 TF × 136 B × 2 = 6_528 B, padded ≤ 6_784 B per instrument
+//   × AGGREGATOR_MAX_SLOTS (25,000) = ~170 MB
+// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.52% —
+// up from ~141 MB at 21 frames and ~160 MB at 24 frames × 128 B. On the
+// retired 4 GiB t4g.medium the same table would have been ~4.1% of the
+// entire machine, which is the sort of number that used to make "just add
+// three timeframes" a real decision.
+//
+// 128 → 136 RAISED 2026-09-10 for `LiveCandleState::net_volume_signed`, the
+// tick-rule net-volume accumulator. The per-instrument cost is +256 B and the
+// fleet cost is +~10 MB (0.03% of the host); the seal ring's own budget one
+// file over carries a further +4.8 MB, so the whole change is ~15 MB. Recorded
+// in `aws-budget.md` under the same date, per this assert's own instruction.
+//
+// The 136 stays a LITERAL and is deliberately NOT written as
+// `size_of::<LiveCandleState>()`. Deriving it from the thing it bounds would
+// make this assert vacuous — it would still catch a change to the CELL's own
+// layout while silently permitting unbounded growth of the state it holds,
+// which is the exact tripwire that fired on this change and made its real cost
+// visible. A budget that cannot fail is not a budget.
+const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 136 * 2 + TF_COUNT * 4 + 160;
 const _: () = assert!(
     std::mem::size_of::<AggregatorCell>() <= MAX_AGGREGATOR_CELL_BYTES,
     "AggregatorCell exceeded its per-instrument budget — this multiplies by AGGREGATOR_MAX_SLOTS (25,000); update aws-budget.md before raising."
@@ -1675,32 +1759,105 @@ mod tests {
         assert_eq!(cell.snapshot(TfIndex::M1).oi, 4_500);
     }
 
-    // -- net-volume wiring (operator 2026-09-09: reproduce the chart line) ---
+    // -- net-volume wiring --------------------------------------------------
+    //
+    // REWRITTEN 2026-09-10. The four tests that stood here pinned the OLD
+    // semantics — sign the whole bar's volume by comparing its close against
+    // the previous bar's — which was bar DIRECTION, not net volume, and had
+    // the WRONG SIGN whenever a bar's flow and its close disagreed. See
+    // `LiveCandleState::net_volume_signed` for the replacement rule.
+    //
+    // Their subject matter did not disappear: `bucket_open_prev_close` is
+    // still snapshotted at bucket open, is still refused across a day
+    // boundary, and is still what `close_pct_from_prev_day` is drawn from.
+    // Those properties are asserted below WITHOUT going through `net_volume`,
+    // which no longer reads that field at all. The tick-rule semantics
+    // themselves live one level up, in `multi_tf_aggregator`, because the
+    // classification needs a previous TICK and a cell has only bars.
 
     #[test]
-    fn the_days_first_bar_has_no_previous_close_and_reports_no_net_volume() {
-        // The distinction the whole `Option` exists for: the first bar of the
-        // session has no predecessor, which is NOT the same as "the price did
-        // not move". Reporting 0 here would draw a flat bar on a chart where
-        // the honest answer is a blank.
+    fn this_entry_point_does_not_classify_so_it_reports_no_net_volume() {
+        // `AggregatorCell::consume_tick` has no access to the previous tick's
+        // price, so it cannot apply the tick rule. The honest answer is a
+        // refusal — NOT `Some(0)`, which would claim a bar traded with
+        // perfectly balanced flow when nobody classified a single print.
         let mut cell = AggregatorCell::empty();
         let strategy = FeedStrategy::DEFAULT;
-        let first = tick_at(OPEN, 100.00, 500);
-        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 500);
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 60, 101.00, 1_300),
+            500,
+            strategy,
+            1_300,
+        );
 
         let bar = cell.snapshot(TfIndex::M1);
-        assert_eq!(bar.bucket_open_prev_close, 0.0, "no baseline exists yet");
-        assert_eq!(bar.net_volume(), None, "blank, never a fabricated flat");
+        assert_eq!(bar.volume, 800, "the GROSS is still folded normally");
+        assert!(
+            !bar.net_volume_classified,
+            "an unclassified bar must say so, so the refusal is structural \
+             rather than a coincidence of the accumulator being zero"
+        );
+        assert_eq!(
+            bar.net_volume(),
+            None,
+            "unclassified is NULL, never a fabricated balanced zero"
+        );
     }
 
     #[test]
-    fn the_second_bar_signs_its_volume_against_the_first_bars_close() {
+    fn only_the_extremes_entry_classifies_net_volume() {
+        // The guard behind the `0` passed at the other two entry points. If a
+        // production caller ever appears on those, every bar it folds silently
+        // reports balanced flow — so the fact that they are test-only is load
+        // bearing, and it is asserted here rather than assumed.
+        let src = include_str!("multi_tf_aggregator.rs");
+        assert!(
+            src.contains("consume_tick_with_extremes("),
+            "the live fold must go through the classifying entry point"
+        );
+        assert!(
+            src.contains("classify_tick_volume("),
+            "the live fold must derive the tick-rule sign, once per tick"
+        );
+        let cell_src = include_str!("aggregator_cell.rs");
+        // Assembled at runtime so this scan does not match its own source and
+        // count itself — the self-referential-guard trap.
+        let needle = format!("{}{}", "consume_tick_with_", "prices(");
+        let uses = cell_src.split(needle.as_str()).count() - 1;
+        assert_eq!(
+            uses, 4,
+            "the non-classifying entry has exactly FOUR mentions today — its \
+             own definition, the `consume_tick` delegate above it, and two \
+             test call sites — and it passes 0 for the tick-rule sign, so any \
+             bar folded through it reports balanced flow it never classified. \
+             A fifth mention means a new caller: give it the hoisted \
+             classification, or route it through consume_tick_with_extremes."
+        );
+    }
+
+    #[test]
+    fn the_days_first_bar_has_no_previous_close_baseline() {
+        // The distinction `bucket_open_prev_close` exists for, asserted on the
+        // field itself now that `net_volume` no longer reads it: the first bar
+        // of a session has no predecessor, which is NOT the same as "the price
+        // did not move".
         let mut cell = AggregatorCell::empty();
         let strategy = FeedStrategy::DEFAULT;
-
-        // Bar 1 closes at 100.
         cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
-        // Bar 2 opens in the next minute and trades UP.
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).bucket_open_prev_close,
+            0.0,
+            "no baseline exists yet"
+        );
+    }
+
+    #[test]
+    fn the_second_bar_takes_the_first_bars_close_as_its_baseline() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
         let up = tick_at(OPEN + 60, 101.00, 1_300);
         cell.consume_tick(TfIndex::M1, &up, 500, strategy, 1_300);
 
@@ -1711,22 +1868,6 @@ mod tests {
             "the sealing bar's close is the new bar's baseline"
         );
         assert_eq!(bar.volume, 800, "1_300 cumulative less the 500 carried in");
-        assert_eq!(
-            bar.net_volume(),
-            Some(800),
-            "closed above the previous bar, so the volume signs positive"
-        );
-    }
-
-    #[test]
-    fn a_bar_that_closes_below_the_previous_one_signs_negative() {
-        let mut cell = AggregatorCell::empty();
-        let strategy = FeedStrategy::DEFAULT;
-        cell.consume_tick(TfIndex::M1, &tick_at(OPEN, 100.00, 500), 0, strategy, 500);
-        let down = tick_at(OPEN + 60, 99.00, 1_100);
-        cell.consume_tick(TfIndex::M1, &down, 500, strategy, 1_100);
-
-        assert_eq!(cell.snapshot(TfIndex::M1).net_volume(), Some(-600));
     }
 
     #[test]
@@ -1734,8 +1875,8 @@ mod tests {
         // `last_sealed` is cleared only by the day-boundary force-seal, which
         // runs at shutdown. On any day that did not happen — a crash, a
         // mid-session restart, a weekend — it still holds YESTERDAY's bar.
-        // Signing today's first bar against it would report an OVERNIGHT GAP
-        // as intraday direction, on the bar an operator reads hardest.
+        // Using it as today's first baseline would report an OVERNIGHT GAP as
+        // intraday movement, on the bar an operator reads hardest.
         let mut cell = AggregatorCell::empty();
         let strategy = FeedStrategy::DEFAULT;
 
@@ -1753,12 +1894,11 @@ mod tests {
         let today = tick_at(OPEN + 86_400, 130.00, 40);
         cell.consume_tick(TfIndex::M1, &today, 900, strategy, 940);
 
-        let bar = cell.snapshot(TfIndex::M1);
         assert_eq!(
-            bar.bucket_open_prev_close, 0.0,
+            cell.snapshot(TfIndex::M1).bucket_open_prev_close,
+            0.0,
             "a cross-day baseline is refused, not carried"
         );
-        assert_eq!(bar.net_volume(), None);
     }
 
     #[test]
@@ -2739,6 +2879,7 @@ mod session_extreme_delta_tests {
             FeedStrategy::DEFAULT,
             u64::from(cum),
             delta,
+            None,
             fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
         );
     }
@@ -3134,6 +3275,7 @@ mod session_extreme_delta_tests {
                     strategy,
                     u64::from(cum),
                     delta,
+                    None,
                     fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
                 );
             }
@@ -3156,6 +3298,7 @@ mod session_extreme_delta_tests {
                 strategy,
                 30,
                 delta,
+                None,
                 fold_clock_ist_secs(spike.exchange_timestamp, spike.received_at_nanos),
             );
         }
@@ -3364,6 +3507,7 @@ mod permutation_regression_tests {
             strategy(),
             10,
             d,
+            None,
             fold_clock_ist_secs(a.exchange_timestamp, a.received_at_nanos),
         );
 
@@ -3382,6 +3526,7 @@ mod permutation_regression_tests {
             strategy(),
             20,
             d,
+            None,
             fold_clock_ist_secs(silent.exchange_timestamp, silent.received_at_nanos),
         );
 
@@ -3403,6 +3548,7 @@ mod permutation_regression_tests {
             strategy(),
             30,
             d,
+            None,
             fold_clock_ist_secs(c.exchange_timestamp, c.received_at_nanos),
         );
 

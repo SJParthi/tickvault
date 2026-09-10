@@ -1166,3 +1166,50 @@ The Elastic IP is **$3.60/mo** and does not close the gap alone.
 Full record: `dhan-rest-only-noise-lock-2026-07-14.md`, same date. The four flags
 below are retained verbatim per house convention; where they conflict with this
 banner, the banner wins.
+
+---
+
+## RAM NOTE 2026-09-10 — tick-rule net volume (+~15 MB host RAM, +$0.00/mo)
+
+**Why this note exists at all.** Two compile-time asserts in `crates/trading`
+carry the instruction *"update aws-budget.md before raising"*, and both FIRED
+on this change rather than being remembered afterwards. This is that update.
+The guards did their job: an 8-byte field that looks free multiplies by
+`AGGREGATOR_MAX_SLOTS × TF_COUNT`, and the number below is what that
+multiplication actually comes to.
+
+**The change.** `LiveCandleState` gains `net_volume_signed: i64` — the tick-rule
+net-volume accumulator that replaced a seal-time derivation which had the WRONG
+SIGN whenever a bar's flow and its close disagreed. Struct size **128 → 136
+bytes**, MEASURED, not estimated.
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `MAX_AGGREGATOR_CELL_BYTES` (`aggregator_cell.rs`) | `TF_COUNT × 128 × 2 + …` = 6,400 B/instrument | `TF_COUNT × 136 × 2 + …` = 6,784 B/instrument | ~160 MB → **~170 MB** at the 25,000-slot ceiling |
+| `BufferedSeal` (`seal_ring.rs`) | ≤ 144 B | ≤ **152** B | ring is `SEAL_BUFFER_CAPACITY` (600,000) × this: 86.4 MB → **91.2 MB** |
+| **Total** | | | **~+15 MB** |
+
+Against the r8g.xlarge's 32 GiB (operator Quote 13) that is **0.046%** of the
+host. The aggregator table moves 0.49% → 0.52% of the machine.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new CloudWatch
+metric, no new alarm, no EMF name. The September position is unmoved: read live
+2026-09-06, `limit_amount` **$150**, the 90% `STOP_EC2_INSTANCES` action line
+**$135.00**, forecast **$142.24** — already $7.24 over that line, and this
+change neither helps nor worsens it.
+
+**Why both budgets keep a LITERAL rather than `size_of::<LiveCandleState>()`.**
+Deriving a budget from the thing it bounds makes it unable to fail on exactly
+the change it exists to catch — it would still catch a change to the CELL's own
+layout while silently permitting unbounded growth of the state inside it. Both
+asserts are stated at the sites; a budget that cannot fail is not a budget, and
+these two are the reason this note has a measured number in it instead of a
+guess.
+
+**What is NOT claimed.** This is a RAM note, not a disk note. The `net_volume`
+column already existed in the candle DDL and is written as before, so
+`market_data` storage is unchanged. The 128-byte on-disk seal-spill record is
+UNCHANGED and byte-full, so a spilled-and-replayed bar persists `net_volume =
+NULL` rather than carrying the accumulator — recorded as outstanding in
+`seal_spill.rs`, because a format bump plus a mixed-stride reader is not a
+change to make beside a hot-path one.
