@@ -491,28 +491,146 @@ pub async fn fetch_credentials_from<S: SecretStore>(
 /// # Errors
 ///
 /// Returns the [`MintError`] describing which stage failed.
-// TEST-EXEMPT: live Dhan HTTP call — its two decision points (URL building, response classification) are covered by build_mint_url + parse_mint_response tests.
+/// Rejections Dhan phrases as a TOTP problem, and nothing else.
+///
+/// Matched case-insensitively on the token `totp` because the wording is
+/// Dhan's, not ours. A PIN or client-id rejection must NOT be retried: a
+/// second identical PIN is a second failed login on the account and cannot
+/// succeed, whereas a TOTP rejection is a CLOCK problem that the next 30 s
+/// step genuinely resolves.
+#[must_use]
+pub fn is_totp_rejection(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("totp")
+}
+
+/// Mint attempts per invocation: the first, plus ONE retry with the NEXT TOTP
+/// step's code after a TOTP rejection.
+///
+/// # Why one, and why in-invocation (MEASURED 2026-09-04 and 2026-09-10)
+///
+/// The 12 s freshness floor ([`secs_to_sleep_for_fresh_totp`]) ended the
+/// sub-second coin flip, and the mint STILL came back `Invalid TOTP` on the
+/// first attempt on two of the seven trading days to 2026-09-10 (09-04 and
+/// 09-10), each time succeeding on the platform's async retry about a minute
+/// later. So the code was fresh and Dhan rejected it anyway — a validator-side
+/// clock offset larger than the floor covers, or a step boundary crossed in
+/// flight. Two consequences: every such morning FIRED the Lambda `Errors`
+/// alarm and paged for a condition that healed itself, and the shared token
+/// stayed stale for the minute the platform retry takes. Waiting for the NEXT
+/// step and trying once more with a code generated at that step's start turns
+/// the page into a WARN line and the stale minute into ~30 s.
+///
+/// One, not more: a second consecutive rejection is not a clock artefact — it
+/// is a wrong secret, a changed PIN, or a Dhan-side outage — and looping on it
+/// would spend the account's login attempts. Two rejections fail the
+/// invocation exactly as before, so the alarm still fires when something is
+/// actually wrong. Budget: 12 s floor + 20 s HTTP + 30 s step + 20 s HTTP =
+/// 82 s worst case, inside the Lambda's 120 s timeout.
+pub const MAX_TOTP_ATTEMPTS: u8 = 2;
+
+/// Seconds until the NEXT TOTP step begins: `1..=30`, never 0.
+///
+/// Unlike [`secs_to_sleep_for_fresh_totp`], which sleeps ONLY when the current
+/// code is nearly spent, this always crosses the boundary — the retry must
+/// generate a code from a step Dhan has not yet judged.
+#[must_use]
+pub fn secs_to_sleep_for_next_totp_step(unix_secs: u64) -> u64 {
+    TOTP_STEP_SECS - (unix_secs % TOTP_STEP_SECS)
+}
+
+/// The unix clock in whole seconds, or `None` if it predates the epoch.
+fn now_unix_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Mints a token with a freshly generated TOTP code, retrying ONCE with the
+/// next step's code on a TOTP rejection (see [`MAX_TOTP_ATTEMPTS`]).
+///
+/// # Errors
+///
+/// Returns the [`MintError`] describing which stage failed.
+// TEST-EXEMPT: thin shell over mint_token_with_sleeper with the real tokio sleep — the retry ladder is tested through the injected sleeper.
 pub async fn mint_token(
     http: &reqwest::Client,
     auth_base_url: &str,
     credentials: &DhanCredentials,
 ) -> Result<SecretString, MintError> {
-    // Never spend a TOTP code that is about to expire. Without this the mint
-    // POST went out with 200–540 ms of code life on every invocation, which
-    // failed as "Invalid TOTP" whenever Dhan's round-trip or clock offset
-    // exceeded that — twice in the week of 2026-08-17. See
-    // `secs_to_sleep_for_fresh_totp` for the measured evidence.
-    let sleep_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| secs_to_sleep_for_fresh_totp(d.as_secs()))
-        .unwrap_or(0);
-    if sleep_secs > 0 {
-        info!(
-            sleep_secs,
-            "waiting for the next TOTP step so the mint uses a code with a full 30s of life"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+    mint_token_with_sleeper(http, auth_base_url, credentials, |secs| async move {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    })
+    .await
+}
+
+/// [`mint_token`] with the sleep injected, so the retry ladder is testable
+/// without waiting out a real TOTP step.
+///
+/// # Errors
+///
+/// Returns the [`MintError`] describing which stage failed. A TOTP rejection
+/// on the LAST permitted attempt is returned as-is (`dhan_rejected`), so the
+/// operator alarm still keys on it.
+pub async fn mint_token_with_sleeper<F, Fut>(
+    http: &reqwest::Client,
+    auth_base_url: &str,
+    credentials: &DhanCredentials,
+    sleep: F,
+) -> Result<SecretString, MintError>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut attempt: u8 = 1;
+    loop {
+        // Never spend a TOTP code that is about to expire. Without this the
+        // mint POST went out with 200–540 ms of code life on every invocation,
+        // which failed as "Invalid TOTP" whenever Dhan's round-trip or clock
+        // offset exceeded that — twice in the week of 2026-08-17. See
+        // `secs_to_sleep_for_fresh_totp` for the measured evidence.
+        let fresh_wait = now_unix_secs().map_or(0, secs_to_sleep_for_fresh_totp);
+        if fresh_wait > 0 {
+            info!(
+                sleep_secs = fresh_wait,
+                "waiting for the next TOTP step so the mint uses a code with a full 30s of life"
+            );
+            sleep(fresh_wait).await;
+        }
+        match mint_token_once(http, auth_base_url, credentials).await {
+            Err(MintError::DhanError(message))
+                if attempt < MAX_TOTP_ATTEMPTS && is_totp_rejection(&message) =>
+            {
+                let next_step =
+                    now_unix_secs().map_or(TOTP_STEP_SECS, secs_to_sleep_for_next_totp_step);
+                // The message is Dhan's own rejection text — never the code,
+                // the PIN or the token.
+                warn!(
+                    attempt,
+                    wait_secs = next_step,
+                    reason = %capture_body(&message, 300),
+                    "Dhan rejected the TOTP code; waiting for the next step and \
+                     retrying ONCE with a code generated from it"
+                );
+                sleep(next_step).await;
+                attempt = attempt.saturating_add(1);
+            }
+            outcome => return outcome,
+        }
     }
+}
+
+/// ONE mint attempt with the CURRENT step's code — no freshness wait, no retry.
+///
+/// # Errors
+///
+/// Returns the [`MintError`] describing which stage failed.
+// TEST-EXEMPT: live Dhan HTTP call — its two decision points (URL building, response classification) are covered by build_mint_url + parse_mint_response tests, and the call itself by the loopback-server tests through mint_token_with_sleeper.
+async fn mint_token_once(
+    http: &reqwest::Client,
+    auth_base_url: &str,
+    credentials: &DhanCredentials,
+) -> Result<SecretString, MintError> {
     let totp_code = generate_totp_code(&credentials.totp_secret)?;
     let url = build_mint_url(auth_base_url);
 
@@ -1556,12 +1674,14 @@ mod tests {
     // classification, body reading — rather than a mock of it.
     // -----------------------------------------------------------------------
 
-    /// Starts a one-shot HTTP server that captures the request line and
-    /// answers with `status` and `body`. Returns (base_url, captured_request).
-    async fn start_mint_server(
-        status_line: &'static str,
-        body: &'static str,
-    ) -> (String, std::sync::Arc<Mutex<String>>) {
+    /// Starts a loopback HTTP server that answers ONE connection per entry of
+    /// `responses`, in order, capturing each request. Returns
+    /// (base_url, captured_requests). A caller that connects more times than
+    /// there are responses gets a refused connection — which is what proves a
+    /// retry did NOT happen.
+    async fn start_mint_server_sequence(
+        responses: &'static [(&'static str, &'static str)],
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
@@ -1573,29 +1693,64 @@ mod tests {
             .expect("local_addr must be readable")
             .port();
         let base_url = format!("http://127.0.0.1:{port}");
-        let captured = std::sync::Arc::new(Mutex::new(String::new()));
+        let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&captured);
 
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = vec![0u8; 8192];
-            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap_or(0);
-            if let Ok(mut guard) = sink.lock() {
-                *guard = String::from_utf8_lossy(&buf[..read]).to_string();
+            for (status_line, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                if let Ok(mut guard) = sink.lock() {
+                    guard.push(String::from_utf8_lossy(&buf[..read]).to_string());
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
-            let response = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
         });
 
         (base_url, captured)
+    }
+
+    /// One-shot variant: a single response, then the listener closes.
+    async fn start_mint_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        let responses: &'static [(&'static str, &'static str)] =
+            Box::leak(vec![(status_line, body)].into_boxed_slice());
+        start_mint_server_sequence(responses).await
+    }
+
+    /// The boxed future a recording sleeper hands back — named so the tuple
+    /// below stays readable (clippy::type_complexity).
+    type RecordedSleep = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// A sleeper that records what it was asked and returns at once.
+    fn recording_sleeper() -> (
+        impl Fn(u64) -> RecordedSleep,
+        std::sync::Arc<Mutex<Vec<u64>>>,
+    ) {
+        let sleeps = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let recorder = std::sync::Arc::clone(&sleeps);
+        let sleeper = move |secs: u64| {
+            let recorder = std::sync::Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(secs);
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+        (sleeper, sleeps)
     }
 
     fn test_credentials() -> DhanCredentials {
@@ -1625,7 +1780,9 @@ mod tests {
         let request = captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .first()
+            .cloned()
+            .unwrap_or_default();
         assert!(
             request.starts_with("POST /app/generateAccessToken?"),
             "must POST the documented path; got: {}",
@@ -1659,21 +1816,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_token_maps_dhans_200_with_error_envelope_to_dhan_rejected() {
-        // Dhan answers 200 with an error envelope for a wrong PIN or TOTP.
-        let (base, _) = start_mint_server(
-            "200 OK",
-            "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}",
-        )
-        .await;
+    async fn mint_token_maps_a_repeated_totp_rejection_to_dhan_rejected() {
+        // Dhan answers 200 with an error envelope for a wrong TOTP. Since
+        // 2026-09-10 the FIRST such answer is retried once with the next
+        // step's code; a SECOND one is final and keeps the `dhan_rejected`
+        // stage so the operator alarm still fires on a genuinely wrong secret.
+        const TOTP_REJECTED: &str = "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}";
+        let (base, served) =
+            start_mint_server_sequence(&[("200 OK", TOTP_REJECTED), ("200 OK", TOTP_REJECTED)])
+                .await;
         let http = build_http_client().expect("client must build");
+        let (sleeper, sleeps) = recording_sleeper();
 
-        let err = mint_token(&http, &base, &test_credentials())
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
             .await
-            .expect_err("an error envelope must fail even at HTTP 200");
+            .expect_err("two rejections must fail even at HTTP 200");
 
         assert_eq!(err.stage(), "dhan_rejected");
         assert!(err.to_string().contains("Invalid TOTP"), "got: {err}");
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            usize::from(MAX_TOTP_ATTEMPTS),
+            "exactly MAX_TOTP_ATTEMPTS mints, never a loop"
+        );
+        let waited = sleeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            waited.iter().any(|s| (1..=30).contains(s)),
+            "the retry must wait for the NEXT TOTP step, got sleeps {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_token_retries_once_with_the_next_step_after_a_totp_rejection() {
+        // The 2026-09-04 / 2026-09-10 shape: first attempt rejected on TOTP,
+        // the next step's code accepted. Before 2026-09-10 this paged the
+        // Lambda Errors alarm and left the shared token stale for a minute.
+        let jwt = sample_jwt();
+        let ok_body: &'static str = Box::leak(
+            format!("{{\"accessToken\":\"{jwt}\",\"dhanClientId\":\"1106656882\"}}")
+                .into_boxed_str(),
+        );
+        let (base, served) = start_mint_server_sequence(Box::leak(
+            vec![
+                (
+                    "200 OK",
+                    "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}",
+                ),
+                ("200 OK", ok_body),
+            ]
+            .into_boxed_slice(),
+        ))
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, sleeps) = recording_sleeper();
+
+        let token = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect("the retry must succeed on the second response");
+
+        assert_eq!(token.expose_secret(), jwt);
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
+        let waited = sleeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            waited.iter().any(|s| (1..=30).contains(s)),
+            "a retry without waiting for the next step would resend the code Dhan \
+             just rejected; got sleeps {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_token_does_not_retry_a_pin_rejection() {
+        // A one-shot server: if the code retried, the second connection would
+        // be refused and the stage would read `transport`, not `dhan_rejected`.
+        let (base, served) = start_mint_server(
+            "200 OK",
+            "{\"status\":\"error\",\"message\":\"Invalid PIN\"}",
+        )
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, _) = recording_sleeper();
+
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect_err("a PIN rejection must fail");
+
+        assert_eq!(err.stage(), "dhan_rejected", "got: {err}");
+        assert!(err.to_string().contains("Invalid PIN"), "got: {err}");
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "a second identical PIN is a second failed login and cannot succeed"
+        );
+    }
+
+    #[test]
+    fn test_is_totp_rejection_matches_dhans_wording_and_nothing_else() {
+        assert!(is_totp_rejection("Invalid TOTP"));
+        assert!(is_totp_rejection("invalid totp code"));
+        assert!(is_totp_rejection("TOTP expired"));
+        assert!(!is_totp_rejection("Invalid PIN"));
+        assert!(!is_totp_rejection("Invalid client id"));
+        assert!(!is_totp_rejection(""));
+    }
+
+    #[test]
+    fn test_secs_to_sleep_for_next_totp_step_always_crosses_the_boundary() {
+        for base in [0u64, 1_700_000_010, 1_756_705_200] {
+            for offset in 0..TOTP_STEP_SECS {
+                let now = base + offset;
+                let wait = secs_to_sleep_for_next_totp_step(now);
+                assert!(
+                    (1..=TOTP_STEP_SECS).contains(&wait),
+                    "now={now} wait={wait}"
+                );
+                assert_eq!(
+                    (now + wait) % TOTP_STEP_SECS,
+                    0,
+                    "must land on a step boundary"
+                );
+                assert_ne!(
+                    (now + wait) / TOTP_STEP_SECS,
+                    now / TOTP_STEP_SECS,
+                    "the retry must use a DIFFERENT step's code"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_max_totp_attempts_is_exactly_one_retry() {
+        // One retry heals a clock artefact; a loop would spend login attempts
+        // on a wrong secret. Changing this needs the dated record in
+        // groww-shared-token-minter-2026-07-02.md §10.8 updated first.
+        assert_eq!(MAX_TOTP_ATTEMPTS, 2);
     }
 
     #[tokio::test]

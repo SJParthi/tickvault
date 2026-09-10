@@ -436,3 +436,43 @@ The §7 trigger list applies. Additionally reinforced on any session editing
 `crates/aws-lambdas/src/dhan_token_minter.rs`,
 `deploy/aws/terraform/dhan-token-minter-lambda.tf`, or any file containing
 `dhan-token-minter`, `DHAN_ACCESS_TOKEN_SECRET`, or `generateAccessToken`.
+
+### §10.8 — 2026-09-10: ONE in-invocation retry after a TOTP rejection (the 06:05 page that healed itself)
+
+**The verbatim operator authorization (2026-09-10, typed directly in-session):**
+
+> "Fix and resolve everything I don't want any open items dude okay?"
+
+Given in DIRECT response to a live-health report whose open items named this
+one: the minter's FIRST attempt came back `Invalid TOTP` on **2026-09-04 and
+2026-09-10** (two of the seven trading days to date, with the §10 12-second
+freshness floor already in place), each time succeeding on the platform's
+async retry about a minute later — and each time FIRING
+`tv-<env>-dhan-token-minter-errors` and paging for a condition that healed
+itself, while the shared token stayed stale for that minute.
+
+**What changes:** `mint_token` now makes at most `MAX_TOTP_ATTEMPTS = 2`
+attempts per invocation. After a rejection whose text names the TOTP
+(`is_totp_rejection`, case-insensitive on the word — a PIN or client-id
+rejection is NEVER retried, a second identical PIN being a second failed
+login), it waits for the NEXT 30-second TOTP step (`secs_to_sleep_for_next_totp_step`,
+always crosses the boundary), generates a code from that step, and tries once
+more. A second rejection fails the invocation exactly as before, so a wrong
+secret still pages. The Lambda timeout moves 60 → 120 s for the budget
+(12 s floor + 20 s HTTP + 30 s step + 20 s HTTP = 82 s worst case).
+
+**What is unchanged:** single minter (§10.2), enumerated SSM ARNs, the JWT
+shape gate before the write, no secret in any log line (the retry `warn!`
+carries Dhan's rejection text, never the code, PIN or token), the
+`*-not-invoked` alarm, the daily schedule.
+
+**NOT claimed:** that this explains WHY a fresh code is rejected — a
+validator-side clock offset larger than 12 s, or a step boundary crossed in
+flight, are the two candidates and neither is measured. The retry heals the
+symptom in ~30 s instead of ~60 s and stops the false page; a persistent
+rejection still surfaces on the same alarm, one attempt later.
+
+**What a PR that violates §10.8 looks like (REJECT):** raises
+`MAX_TOTP_ATTEMPTS` above 2 (login-attempt burn on a wrong secret); retries a
+non-TOTP rejection; retries within the SAME TOTP step; lowers the Lambda
+timeout below the 82 s worst case; logs the code, PIN or token on the retry.
