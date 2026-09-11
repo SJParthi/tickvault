@@ -3458,6 +3458,43 @@ forecast read live 2026-09-06 is **$142.24** against an automatic
 with a LEVER, not a cost note. This change carries no lever, so it carries no
 CloudWatch cost. It is the number an operator reads AFTER an existing page.
 
+#### ⚠ CORRECTED 2026-09-11 (same day) — the instrument had TWO fabricated-zero paths, and both biased it toward zero
+
+A six-agent adversarial sweep of this module, run hours after it landed and
+before it had ever produced a live reading, found two independent ways for it
+to record a **0 ms arrival that never happened**. Both are fixed; both are
+bite-proven in each direction. They are recorded rather than quietly patched
+because they are the same class as the pool-byte defect this section already
+carries — and because an instrument that is wrong toward zero is wrong in the
+direction that reads as good news.
+
+| # | Defect | Why it fires | Fix |
+|---|---|---|---|
+| **1** | A **ghost stream answers a fresh stamp.** `Key` is `(security_id, wire_segment, pool)` — the pool byte separates depth-20 from depth-200, but **nothing separates socket 3 from socket 7 inside one pool.** | Dhan ignores the unsubscribe (proven for code 25 on 2026-09-10 and code 24 on 2026-09-11; mean ghost tail ~374 s). A dropped contract keeps streaming from the OLD socket, leaves `held_anywhere`, is legally re-taken onto a DIFFERENT socket, and the next in-flight ghost packet resolves the new stamp at ~0 ms for a socket that has delivered nothing. | `record_subscribe_at` gains `may_already_be_streaming`, answered at both dispatch sites from `DepthSubscriptionView::classify_raw`. Anything but `Unknown` means this process has a recent record of the contract on a depth socket → refuse the measurement and count `unmeasurable`. |
+| **2** | A **back-dated receipt clamped to zero and counted as `arrived`.** | NOT an NTP edge case. The drain's `received_at_nanos` is deliberately back-dated by ring dwell (`Utc::now()` minus `frame.received_at.elapsed()`) while the stamp is a raw `Utc::now()`. Ring dwell has its own alarm at 2,000 ms, so under any backlog a packet received before the dispatch and drained after lands here. The old code did `.max(0)` and still counted `arrived`. | A receipt preceding its subscribe is counted `reordered` and records NO sample. The entry is still CONSUMED — the contract has delivered a packet, so it must not also age into `silent_window`. |
+| **3** | A **wire-REFUSED swap aged into a false `silent_window`.** | The stamp fires on the `Ok(())` arm of `try_send`, which proves the command reached a CHANNEL, not that the connection took it. On a `NotHeld`/refused/sender-dropped ack the believed hold is reverted — but the stamp survived and was swept at 120 s as a dark window for a subscribe that never happened. | `forget()`, called from both reconcile revert arms. Idempotent. |
+
+**Two honest limits, stated rather than left to be found.** The gate
+deliberately OVER-refuses the harmless cross-pool case, because `classify_raw`
+is pool-blind — depth-20 holding a contract now refuses a depth-200 stamp the
+pool byte would already have protected. Over-refusing costs one sample;
+under-refusing costs the series' credibility. And the module header's claim of
+*"Zero allocation on every arm"* was **false in the deallocation direction**
+and is corrected in place: `pin()` returns a `seize` guard whose drop runs that
+collector's deferred reclamation, so the drain — which pins far more often than
+the steering task — performs essentially all of this map's frees.
+
+**Also hardened in the same change, and it closes a finding in both
+directions:** `depth_first_packet_wiring_guard.rs` was the only guard of its
+family scanning RAW source while ten siblings strip comments first, so a
+deleted call site left behind as `// record_subscribe_at(...)` would have kept
+every assertion green. The inverse is not theoretical either — the explanatory
+sentence added to a dispatch site the same day moved the scan's anchor and
+turned a placement test RED against correct code. It now strips comments,
+anchors on the CALL rather than the bare name, carries a `guard_self_test`
+bite-proving it can fail, and drops an assertion that was **vacuous**
+(`level_loop > 0`, an offset that cannot be zero once the `find` succeeded).
+
 #### ⚠ What this does NOT do (Rule 11)
 
 - **It does not make a swap faster.** It reports how long the new contract

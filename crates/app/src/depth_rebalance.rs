@@ -1019,11 +1019,23 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
             // (2026-09-11), on the Ok arm only -- the Full and Closed arms
             // below never reach the wire, and a stamp there would age out
             // into a false `silent_window`.
+            // Refuse the measurement when this process has a recent record of
+            // the contract on a depth socket: an ignored unsubscribe leaves it
+            // streaming from the OLD socket, and that packet would answer this
+            // stamp with a fabricated ~0 ms. See `record_subscribe_at`.
+            let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let may_already_be_streaming =
+                crate::depth_subscription_view::global_depth_subscription_view().classify_raw(
+                    swap.new.security_id,
+                    swap.new.segment.binary_code(),
+                    now_nanos / 1_000_000_000,
+                ) != crate::depth_subscription_view::DepthFrameClass::Unknown;
             crate::depth_first_packet::global_depth_first_packet_tracker().record_subscribe_at(
                 swap.new.security_id,
                 swap.new.segment,
                 tickvault_core::parser::depth::DepthFeedKind::TwoHundred,
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                now_nanos,
+                may_already_be_streaming,
             );
             metrics::counter!(REBALANCE_SWAPS_SENT).increment(1);
             true
@@ -1090,6 +1102,17 @@ pub fn reconcile_pending_swaps(sockets: &mut [RebalanceSocket]) -> usize {
         let before = pending.old;
         socket.pending = None;
         if unmark {
+            // The wire never took it, so its dark-window clock must stop here
+            // — otherwise it is swept at 120 s into `silent_window`, reporting
+            // a dark socket for a subscribe that never happened. Read from the
+            // hold the swap ADVANCED to, before the revert restores `before`.
+            if let Some(taken) = socket.held {
+                crate::depth_first_packet::global_depth_first_packet_tracker().forget(
+                    taken.security_id,
+                    taken.segment,
+                    tickvault_core::parser::depth::DepthFeedKind::TwoHundred,
+                );
+            }
             socket.held = before;
             unmarked = unmarked.saturating_add(1);
             metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "not_held").increment(1);
