@@ -7343,6 +7343,7 @@ fn drain_depth_frame(
             crate::depth_first_packet::global_depth_first_packet_tracker().observe_at(
                 header.security_id,
                 header.exchange_segment_code,
+                kind,
                 received_at_nanos,
             );
         }
