@@ -1316,6 +1316,50 @@ impl MultiTfAggregator {
             )
         };
 
+        // COUNTER-RESTART DETECTION — hoisted ABOVE the timeframe loop on
+        // 2026-09-11. The ordering was a real defect, not a style point: a
+        // frame whose bucket OPENED on this very tick seeded its net from an
+        // unattributed carry measured against the PRE-restart counter, and the
+        // rebase that clears that carry ran after the loop, too late to stop
+        // it. The bar then published a sign for trades whose span no longer
+        // existed — reproduced by
+        // `hostile_a_carried_sign_across_a_restart_inverts_the_published_net`
+        // as `volume 200, net_signed -800`: a fully SELL-initiated bar whose
+        // only real flow was a 200-unit BUY. The magnitude form is
+        // `hostile_a_carried_sign_survives_a_counter_restart_and_exceeds_the_bars_volume`.
+        //
+        // Hoisting is behaviour-preserving for everything else. `baseline` is
+        // captured above, so this tick's classification still sees the old
+        // anchor and its delta still saturates to 0; and `rebase_open_buckets`
+        // PRESERVES each open bucket's counted volume while re-anchoring its
+        // `bucket_start_cumulative`, so folding after the rebase lands on the
+        // same volume as folding before it did.
+        //
+        // The two-events reasoning — why an ENORMOUS backwards step is a wrap
+        // or a day rollover and a small one is a stale packet — is recorded in
+        // full at the surviving stale-packet arm below.
+        let restarted = cumulative_volume < slot.last_cumulative
+            && slot.last_cumulative - cumulative_volume >= CUMULATIVE_RESTART_DROP_FLOOR;
+        if restarted {
+            // RE-ANCHOR on the new value rather than refusing it. This costs
+            // exactly one tick's delta (the wrapping tick's own volume is
+            // unattributable — its true delta spans the wrap and cannot be
+            // recovered from a truncated counter) and keeps the instrument
+            // alive for the remainder of the session.
+            slot.last_cumulative = cumulative_volume;
+            // Re-anchoring the SLOT baseline alone is NOT sufficient: every
+            // bucket that is already OPEN still holds a
+            // `bucket_start_cumulative` from before the restart, so its volume
+            // would freeze for the rest of the bucket (up to 59 minutes on
+            // M60) while `tick_count` kept rising. The cell re-bases those in
+            // the same breath, preserving what each has already counted, and
+            // drops every unattributed carry with them.
+            slot.cell.rebase_open_buckets(cumulative_volume);
+            crate::candles::fold_counters::fold_counters()
+                .cumulative_reanchored
+                .increment(1);
+        }
+
         for tf in TfIndex::ALL {
             match slot.cell.consume_tick_with_extremes(
                 tf,
@@ -1429,30 +1473,20 @@ impl MultiTfAggregator {
             // The two are separated by MAGNITUDE, which is the only signal
             // available: no real stale packet is behind by half the `u32`
             // range, and every wrap and every rollover is.
-            let backwards_by = slot.last_cumulative - cumulative_volume;
-            if backwards_by >= CUMULATIVE_RESTART_DROP_FLOOR {
-                // RE-ANCHOR on the new value rather than refusing it. This
-                // costs exactly one tick's delta (the wrapping tick's own
-                // volume is unattributable — its true delta spans the wrap and
-                // cannot be recovered from a truncated counter) and keeps the
-                // instrument alive for the remainder of the session.
-                slot.last_cumulative = cumulative_volume;
-                // Re-anchoring the SLOT baseline alone is NOT sufficient: every
-                // bucket that is already OPEN still holds a
-                // `bucket_start_cumulative` from before the restart, so its
-                // volume would freeze for the rest of the bucket (up to 59
-                // minutes on M60) while `tick_count` kept rising. The cell
-                // re-bases those in the same breath, preserving what each has
-                // already counted.
-                slot.cell.rebase_open_buckets(cumulative_volume);
-                crate::candles::fold_counters::fold_counters()
-                    .cumulative_reanchored
-                    .increment(1);
-            } else {
-                crate::candles::fold_counters::fold_counters()
-                    .cumulative_regression
-                    .increment(1);
-            }
+            //
+            // 2026-09-11: the RESTART half of this decision is made ABOVE the
+            // timeframe loop (search `let restarted =`). It has to be: a
+            // bucket that OPENS on the restarting tick would otherwise seed
+            // its net from a carry the rebase had not yet cleared. A restart
+            // therefore never reaches this arm — the hoisted branch has
+            // already re-anchored `last_cumulative` to `cumulative_volume`, so
+            // neither comparison above is true on that tick. What survives
+            // here is the STALE-PACKET half, which needs no re-anchor: its
+            // delta is already neutralised by `saturating_sub` and its price
+            // was refused as an input to the tick rule above.
+            crate::candles::fold_counters::fold_counters()
+                .cumulative_regression
+                .increment(1);
         }
         stats
     }
@@ -2620,8 +2654,9 @@ mod tests {
         assert_eq!(total(TfIndex::S1), expected);
     }
 
-    /// The carried SIGN travels with the carried units, so the bar that
-    /// receives them counts the same trades twice over — once gross, once net.
+    /// The carried SIGN travels with the carried units into the SAME bar, so
+    /// the receiving bar counts one set of trades twice over — once gross,
+    /// once net.
     ///
     /// This is the half a gross-only fix silently leaves broken. `volume` and
     /// `net_volume` are two readings of ONE set of trades, and
@@ -2631,13 +2666,22 @@ mod tests {
     /// `net_volume_classified` still reported the bar fully classified — a
     /// confident answer over volume nobody signed.
     ///
-    /// BITE PROOF: dropping `carry.net` from the bucket-open seed leaves this
-    /// bar at `Some(1000)` against a gross of 2,000 — half its flow missing,
-    /// and nothing anywhere saying so.
+    /// WHICH bar receives it is the part this test pins, and it changed on
+    /// 2026-09-11. The carry is settled into the bar that is OPEN when the
+    /// late tick arrives, at that bar's SEAL — not into the next bar to open.
+    /// Right-endpoint chaining forces it: the following bucket must start
+    /// exactly where this one ended, so units parked past that endpoint would
+    /// fall in a gap. It is also the better answer on its own terms — the open
+    /// bar is the one temporally nearer the refused tick.
+    ///
+    /// BITE PROOF: dropping `carry.net` from `UnattributedCarry::settle_into`
+    /// leaves this bar at `Some(1000)` against a gross of 2,000 — half its
+    /// flow missing, and nothing anywhere saying so.
     #[test]
     fn a_settled_carry_brings_its_sign_with_it_not_just_its_units() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let mut m1: std::collections::HashMap<u32, LiveCandleState> =
+            std::collections::HashMap::new();
 
         // Every tick is an UPTICK, so every delta is buy-initiated and the
         // arithmetic stays readable: net must equal gross throughout.
@@ -2645,19 +2689,24 @@ mod tests {
             (0_u32, 1_000_u32, 100.0_f32), // seeds the baseline (unclassified)
             (60, 2_000, 101.0),            // rolls 1m: opens bucket 60
             (10, 3_000, 102.0),            // LATE for 1m — carries +1,000
-            (120, 4_000, 103.0),           // rolls 1m: opens bucket 120
+            (120, 4_000, 103.0),           // rolls 1m: SEALS bucket 60
         ] {
             let _ = agg.consume_tick(
                 Feed::Dhan,
                 &tick(77, SEG_IDX, OPEN + off, px, cum),
                 None,
-                sink,
+                |_, _, _, tf, st| {
+                    if tf == TfIndex::M1 {
+                        m1.insert(st.bucket_start_ist_secs, st);
+                    }
+                },
             );
         }
 
-        let bar = agg
-            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-            .expect("bucket 120 is open");
+        let bar = m1
+            .get(&(OPEN + 60))
+            .copied()
+            .expect("bucket 60 sealed when the 120 tick rolled it");
         assert_eq!(
             bar.volume, 2_000,
             "its own 1,000 plus the 1,000 the late tick brought"
@@ -2674,23 +2723,31 @@ mod tests {
     /// A bar that settles units nobody could SIGN inherits the ignorance —
     /// it does not report a confident net over volume it never classified.
     ///
-    /// The unclassifiable case is reachable on the live path and is not the
-    /// first-tick one: `classify_tick_volume` also refuses when real volume
-    /// arrives at an UNCHANGED price and no side has ever revealed itself for
-    /// that instrument, which is the ordinary state of an instrument whose
-    /// opening prints all match. A late tick of that shape carries units and
-    /// no direction.
+    /// ⚠ HONEST SCOPE, and it is narrower than it looks. On the live path the
+    /// `unclassified` half of the carry is BELT-AND-BRACES rather than
+    /// load-bearing, because of how `classify_tick_volume` reaches its `None`
+    /// arm: real volume at an UNCHANGED price with no side ever revealed for
+    /// this instrument. Once any side reveals itself the per-instrument sign
+    /// carry latches, and every later flat tick classifies — so a carry can
+    /// only be unclassified while EVERY bar so far is also unclassified,
+    /// including the one that receives it. There is therefore no reachable
+    /// sequence in which a fully-classified bar settles unsignable units.
     ///
-    /// Settling its gross while leaving `net_volume_classified` true would
-    /// publish a net computed from a strict subset of the bar's own volume and
-    /// assert it complete — the exact false-OK the column exists to refuse.
+    /// The flag is kept anyway, and this test with it, for two reasons: the
+    /// `Ticker`-mode path (`consume_tick_with_prices`) passes `None` for every
+    /// tick, and a future change to the classifier that widens its `None` arm
+    /// would otherwise silently publish a net over volume it never signed.
+    /// What this test pins UNCONDITIONALLY is the other half — that the units
+    /// are counted.
     ///
-    /// BITE PROOF: dropping `&& !carry.unclassified` from the bucket-open seed
-    /// turns the assertion below into `Some(1000)` against a gross of 2,000.
+    /// BITE PROOF: dropping the `owed > state.volume` widening from
+    /// `UnattributedCarry::settle_into` leaves this bar at 1,000 of its 2,000
+    /// units.
     #[test]
     fn a_bar_that_settles_unsignable_units_refuses_to_report_a_net() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let mut m1: std::collections::HashMap<u32, LiveCandleState> =
+            std::collections::HashMap::new();
 
         for (off, cum, px) in [
             // Flat opening prints: no side ever reveals itself, so every
@@ -2698,19 +2755,24 @@ mod tests {
             (0_u32, 1_000_u32, 100.0_f32), // first tick — unclassifiable
             (60, 2_000, 100.0),            // flat, carry still 0 — unclassifiable
             (10, 3_000, 100.0),            // LATE for 1m, and UNSIGNABLE
-            (120, 4_000, 101.0),           // first real move: rolls 1m, classifiable
+            (120, 4_000, 101.0),           // first real move: SEALS bucket 60
         ] {
             let _ = agg.consume_tick(
                 Feed::Dhan,
                 &tick(77, SEG_IDX, OPEN + off, px, cum),
                 None,
-                sink,
+                |_, _, _, tf, st| {
+                    if tf == TfIndex::M1 {
+                        m1.insert(st.bucket_start_ist_secs, st);
+                    }
+                },
             );
         }
 
-        let bar = agg
-            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-            .expect("bucket 120 is open");
+        let bar = m1
+            .get(&(OPEN + 60))
+            .copied()
+            .expect("bucket 60 sealed when the 120 tick rolled it");
         assert_eq!(
             bar.volume, 2_000,
             "the units are still counted — ignorance of direction is not a \
@@ -4503,6 +4565,657 @@ mod tests {
              headroom vs the {envelope:.0}/sec open burst: {:.1}x (fold only; \
              decode + ILP append are NOT included)",
             ticks_per_sec / envelope
+        );
+    }
+
+    // ======================================================================
+    // HOSTILE REVIEW 2026-09-11 — adversarial probes of the unattributed
+    // carry (commit 3ed705a5a). Added by a hostile reviewer; production code
+    // untouched.
+    // ======================================================================
+
+    /// Sums every emitted bar of one timeframe, last-emission-per-bucket wins
+    /// (a Refold amend re-emits its bucket).
+    fn hostile_run(seq: &[(u32, u32)]) -> std::collections::HashMap<(TfIndex, u32), u64> {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut bars: std::collections::HashMap<(TfIndex, u32), u64> =
+            std::collections::HashMap::new();
+        for (off, cum) in seq {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, *cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+        bars
+    }
+
+    fn hostile_total(bars: &std::collections::HashMap<(TfIndex, u32), u64>, want: TfIndex) -> u64 {
+        bars.iter()
+            .filter(|((tf, _), _)| *tf == want)
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
+    /// FINDING A — a STALE in-bucket packet clears a carry the bucket never
+    /// swept, so the carried units reach no bar at all.
+    ///
+    /// `settle_carry_into_open_bucket` applies only the SIGNED half on the
+    /// grounds that "`cumulative - bucket_start` already contains the refused
+    /// tick". That is true only while the in-bucket packet's cumulative is at
+    /// or above the carried one. A STALE packet carries a SMALLER cumulative
+    /// (measured on the live box: security 68407 took 5 regressions before
+    /// 09:40 IST on 2026-09-11), the volume-regression guard suppresses the
+    /// widening, and the carry is cleared with its gross unswept.
+    #[test]
+    fn hostile_a_stale_in_bucket_packet_clears_a_carry_it_never_swept() {
+        //  off  cum    what it does to the S1 frame
+        //   0   1000   seeds the baseline, opens bucket t0 (vol 0)
+        //   1   1100   rolls: seals t0(0), opens t1 (vol 100)
+        //   2   1300   rolls: seals t1(100), opens t2 (vol 200)
+        //   2   1400   in-bucket: t2 vol -> 300, baseline 1400
+        //   1   1600   LATE for S1 -> AmendedLate + carry.gross = 200
+        //   2   1450   STALE (1450 < 1600) and IN-BUCKET for t2:
+        //              vol -> 350 (only 50 of the carry swept)
+        //              settle_carry_into_open_bucket CLEARS the other 150
+        //   3   1700   rolls: seals t2(350), opens t3 at baseline 1600
+        const SEQ: &[(u32, u32)] = &[
+            (0, 1_000),
+            (1, 1_100),
+            (2, 1_300),
+            (2, 1_400),
+            (1, 1_600),
+            (2, 1_450),
+            (3, 1_700),
+        ];
+        let bars = hostile_run(SEQ);
+        let expected = 1_700_u64 - 1_000;
+        assert_eq!(
+            hostile_total(&bars, TfIndex::D1),
+            expected,
+            "sanity: the day bar sweeps everything"
+        );
+        assert_eq!(
+            hostile_total(&bars, TfIndex::M1),
+            expected,
+            "sanity: the minute bar sweeps everything"
+        );
+        assert_eq!(
+            hostile_total(&bars, TfIndex::S1),
+            expected,
+            "the 1s frames must tile the day exactly -- a carry cleared by a \
+             stale in-bucket packet is volume that reached no bar"
+        );
+    }
+
+    /// FINDING B — a carry outstanding when `catch_up_seal` drains the slot,
+    /// with no later tick to open a bucket, is forfeited entirely at the day
+    /// boundary. `force_seal` takes the carry BEFORE the uninitialised check
+    /// and then returns `None`.
+    #[test]
+    fn hostile_a_carry_is_forfeited_when_catch_up_seal_drained_the_slot() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut bars: std::collections::HashMap<(TfIndex, u32), u64> =
+            std::collections::HashMap::new();
+        //   0  1000  seeds, opens S1 t0
+        //   1  1100  rolls: seals t0(0), opens t1 (100)
+        //   2  1300  rolls: seals t1(100), opens t2 (200); baseline 1300
+        //   1  1500  LATE for S1 -> AmendedLate + carry.gross = 200
+        for (off, cum) in [(0_u32, 1_000_u32), (1, 1_100), (2, 1_300), (1, 1_500)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+        }
+        // The watermark-driven sealer drains S1's t2 bucket. The carry stays.
+        let _ = agg.catch_up_seal_all(OPEN + 10, |_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+        // No further tick for this instrument; the day ends.
+        agg.force_seal_all(|_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+
+        let expected = 1_500_u64 - 1_000;
+        assert_eq!(
+            hostile_total(&bars, TfIndex::D1),
+            expected,
+            "sanity: the day bar swept the late tick in-bucket"
+        );
+        assert_eq!(
+            hostile_total(&bars, TfIndex::S1),
+            expected,
+            "a carry outstanding across an intraday catch-up seal must still \
+             reach a bar -- force_seal drops it on an uninitialised slot"
+        );
+    }
+
+    /// FINDING C — the carried SIGN survives a counter restart even though
+    /// `rebase_open_buckets` claims to drop the carry.
+    ///
+    /// The restart is detected AFTER the timeframe loop, so the wrapping tick
+    /// has already rolled the bucket and `open_bucket` has already seeded the
+    /// new bar's `net_volume_signed` with `carry.net`. `rebase_open_buckets`
+    /// then clears `carried_*` and re-anchors `bucket_start_cumulative` — but
+    /// it never touches `net_volume_signed`. The gross died with the counter;
+    /// the sign did not.
+    ///
+    /// Result: a bar whose `net_volume_signed` exceeds its own `volume`,
+    /// which `net_volume()` silently CLAMPS to `±volume` — publishing
+    /// "100% of this bar's flow was one-directional" about flow that traded
+    /// before the counter restarted.
+    #[test]
+    fn hostile_a_carried_sign_survives_a_counter_restart_and_exceeds_the_bars_volume() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut s1: Vec<(u32, LiveCandleState)> = Vec::new();
+        let push = |tf: TfIndex, st: LiveCandleState, out: &mut Vec<(u32, LiveCandleState)>| {
+            if tf == TfIndex::S1 {
+                out.push((st.bucket_start_ist_secs, st));
+            }
+        };
+
+        //  off  cum             price  what it does to the S1 frame
+        //   0   3_000_000_000   100    seeds; opens t0
+        //   1   3_000_000_500   100    rolls: seals t0(0), opens t1 (500)
+        //   2   3_000_001_000   100    rolls: seals t1(500), opens t2 (500)
+        //   1   3_000_002_000   101    LATE -> AmendedLate; carry {gross 1000, net +1000}
+        //   3   100             101    u32 WRAP: rolls t2, opens t3 seeded with carry.net
+        //                              = +1000 and volume 0; restart re-anchor follows
+        //   3   300             101    in-bucket: t3 volume -> 200, net -> +1200
+        //   4   400             101    rolls t3 and publishes it
+        const SEQ: &[(u32, u32, f32)] = &[
+            (0, 3_000_000_000, 100.0),
+            (1, 3_000_000_500, 100.0),
+            (2, 3_000_001_000, 100.0),
+            (1, 3_000_002_000, 101.0),
+            (3, 100, 101.0),
+            (3, 300, 101.0),
+            (4, 400, 101.0),
+        ];
+        for (off, cum, px) in SEQ {
+            let t = tick(13, SEG_IDX, OPEN + off, *px, *cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                push(tf, st, &mut s1)
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| push(tf, st, &mut s1));
+
+        let mut by_bucket: std::collections::HashMap<u32, LiveCandleState> =
+            std::collections::HashMap::new();
+        for (start, st) in s1 {
+            by_bucket.insert(start, st);
+        }
+        let t3 = by_bucket
+            .get(&(OPEN + 3))
+            .copied()
+            .expect("the post-restart bucket must have been published");
+        println!(
+            "HOSTILE C: post-restart S1 bar volume={} net_volume_signed={} net_volume()={:?}",
+            t3.volume,
+            t3.net_volume_signed,
+            t3.net_volume()
+        );
+        assert!(
+            u64::try_from(t3.net_volume_signed.abs()).unwrap_or(u64::MAX) <= t3.volume,
+            "net_volume_signed ({}) exceeds the bar's own volume ({}) — the \
+             carried sign crossed a counter restart its gross did not",
+            t3.net_volume_signed,
+            t3.volume
+        );
+    }
+
+    /// FINDING C2 — the same leak, tuned so the clamp INVERTS the sign.
+    ///
+    /// The carried net is a SELL (-1,000) from before the counter restart.
+    /// The post-restart bar's own and only classified flow is a BUY (+200).
+    /// `net_volume_signed` becomes -800, `net_volume()` clamps it to -200, and
+    /// the bar publishes "every unit of this bar's volume was sell-initiated"
+    /// about 200 units that were, on this fold's own classification,
+    /// buy-initiated.
+    #[test]
+    fn hostile_a_carried_sign_across_a_restart_inverts_the_published_net() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut s1: Vec<(u32, LiveCandleState)> = Vec::new();
+        const SEQ: &[(u32, u32, f32)] = &[
+            (0, 3_000_000_000, 100.0),
+            (1, 3_000_000_500, 100.0),
+            (2, 3_000_001_000, 100.0),
+            (1, 3_000_002_000, 99.0), // LATE downtick -> carry.net = -1000
+            (3, 100, 99.0),           // u32 wrap
+            (3, 300, 105.0),          // post-restart BUY of 200 units
+            (4, 400, 106.0),
+        ];
+        for (off, cum, px) in SEQ {
+            let t = tick(13, SEG_IDX, OPEN + off, *px, *cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                if tf == TfIndex::S1 {
+                    s1.push((st.bucket_start_ist_secs, st));
+                }
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            if tf == TfIndex::S1 {
+                s1.push((st.bucket_start_ist_secs, st));
+            }
+        });
+        let mut by_bucket: std::collections::HashMap<u32, LiveCandleState> =
+            std::collections::HashMap::new();
+        for (start, st) in s1 {
+            by_bucket.insert(start, st);
+        }
+        let t3 = by_bucket.get(&(OPEN + 3)).copied().expect("published");
+        println!(
+            "HOSTILE C2: volume={} net_signed={} net_volume()={:?}",
+            t3.volume,
+            t3.net_volume_signed,
+            t3.net_volume()
+        );
+        assert_eq!(
+            t3.net_volume(),
+            Some(200),
+            "the bar's only classified flow was +200 (a buy); the published \
+             net must not be negative"
+        );
+    }
+
+    /// FUZZ — `|net_volume_signed| <= volume` on EVERY emitted bar. The
+    /// doc on `LiveCandleState::net_volume` states this as a structural fact;
+    /// `net_volume()` clamps on top of it, so a violation is invisible to a
+    /// reader and shows up only here.
+    #[test]
+    fn hostile_fuzz_net_never_exceeds_gross_on_any_emitted_bar() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut violations: Vec<(Vec<(u32, u32, f32)>, TfIndex, u32, i64, u64)> = Vec::new();
+        for _case in 0..3_000 {
+            let n = 6 + (next() % 8) as usize;
+            let mut seq: Vec<(u32, u32, f32)> = vec![(0, 1_000, 100.0)];
+            let mut cum: u32 = 1_000;
+            let mut off: u32 = 0;
+            let mut px: f32 = 100.0;
+            for _ in 0..n {
+                off = if next() % 10 < 7 {
+                    off + 1 + (next() % 2) as u32
+                } else {
+                    off.saturating_sub(1 + (next() % 3) as u32)
+                };
+                cum = if next() % 10 < 8 {
+                    cum + 50 + (next() % 200) as u32
+                } else {
+                    cum.saturating_sub(10 + (next() % 120) as u32)
+                };
+                px = match next() % 3 {
+                    0 => px + 1.0,
+                    1 => (px - 1.0).max(1.0),
+                    _ => px,
+                };
+                seq.push((off.min(110), cum, px));
+            }
+
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            let mut bars: std::collections::HashMap<(TfIndex, u32), LiveCandleState> =
+                std::collections::HashMap::new();
+            for (off, cum, px) in &seq {
+                let t = tick(13, SEG_IDX, OPEN + off, *px, *cum);
+                let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            agg.force_seal_all(|_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st);
+            });
+            for ((tf, start), st) in &bars {
+                let mag = u64::try_from(st.net_volume_signed.abs()).unwrap_or(u64::MAX);
+                if mag > st.volume {
+                    violations.push((seq.clone(), *tf, *start, st.net_volume_signed, st.volume));
+                    break;
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} of 3000 sequences published a bar whose |net| exceeds its own \
+             volume. First: tf={:?} bucket={} net={} volume={} seq={:?}",
+            violations.len(),
+            violations[0].1,
+            violations[0].2,
+            violations[0].3,
+            violations[0].4,
+            violations[0].0
+        );
+    }
+
+    /// FINDING D — no counter restart needed. `settle_carry_into_open_bucket`
+    /// adds the carried NET on the stated grounds that the GROSS "is already
+    /// swept by `cumulative − bucket_start`". When the settling packet is
+    /// STALE that sweep is suppressed by the volume-regression guard, so the
+    /// bar receives the sign of units it does not hold.
+    ///
+    /// `net_volume()` then clamps and publishes `±volume` — maximum
+    /// conviction — for a bar whose own classified flow was smaller.
+    #[test]
+    fn hostile_a_stale_settling_packet_gives_a_bar_a_net_it_has_no_volume_for() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut s1: Vec<(u32, LiveCandleState)> = Vec::new();
+        //  off  cum    price   S1
+        //   0   1000   100     seed; open t0
+        //   1   1100   101     roll: seal t0(0), open t1 (vol 100, net +100)
+        //   2   1200   102     roll: seal t1, open t2 (vol 100, net +100)
+        //   1   1500   103     LATE -> AmendedLate; carry {gross 300, net +300}
+        //   2   1250    99     STALE + in-bucket: vol -> 150 only; carry's NET
+        //                      (+300) is applied, its GROSS is discarded
+        //   3   1600   104     roll: publishes t2
+        const SEQ: &[(u32, u32, f32)] = &[
+            (0, 1_000, 100.0),
+            (1, 1_100, 101.0),
+            (2, 1_200, 102.0),
+            (1, 1_500, 103.0),
+            (2, 1_250, 99.0),
+            (3, 1_600, 104.0),
+        ];
+        for (off, cum, px) in SEQ {
+            let t = tick(13, SEG_IDX, OPEN + off, *px, *cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                if tf == TfIndex::S1 {
+                    s1.push((st.bucket_start_ist_secs, st));
+                }
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            if tf == TfIndex::S1 {
+                s1.push((st.bucket_start_ist_secs, st));
+            }
+        });
+        let mut by_bucket: std::collections::HashMap<u32, LiveCandleState> =
+            std::collections::HashMap::new();
+        for (start, st) in s1 {
+            by_bucket.insert(start, st);
+        }
+        let t2 = by_bucket.get(&(OPEN + 2)).copied().expect("published");
+        println!(
+            "HOSTILE D: bucket t2 volume={} net_signed={} net_volume()={:?}",
+            t2.volume,
+            t2.net_volume_signed,
+            t2.net_volume()
+        );
+        assert!(
+            u64::try_from(t2.net_volume_signed.abs()).unwrap_or(u64::MAX) <= t2.volume,
+            "|net_volume_signed| ({}) exceeds the bar's own volume ({}) with no \
+             counter restart anywhere — the carry's sign was settled without \
+             its gross",
+            t2.net_volume_signed,
+            t2.volume
+        );
+    }
+
+    /// FUZZ, CONTROL — the net invariant under a strictly rising cumulative.
+    #[test]
+    fn hostile_fuzz_control_net_invariant_holds_when_cumulative_is_monotonic() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut violations = 0_usize;
+        for _case in 0..3_000 {
+            let n = 6 + (next() % 8) as usize;
+            let mut seq: Vec<(u32, u32, f32)> = vec![(0, 1_000, 100.0)];
+            let mut cum: u32 = 1_000;
+            let mut off: u32 = 0;
+            let mut px: f32 = 100.0;
+            for _ in 0..n {
+                off = if next() % 10 < 7 {
+                    off + 1 + (next() % 2) as u32
+                } else {
+                    off.saturating_sub(1 + (next() % 3) as u32)
+                };
+                let _ = next();
+                cum += 50 + (next() % 200) as u32;
+                px = match next() % 3 {
+                    0 => px + 1.0,
+                    1 => (px - 1.0).max(1.0),
+                    _ => px,
+                };
+                seq.push((off.min(110), cum, px));
+            }
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            let mut bars: std::collections::HashMap<(TfIndex, u32), LiveCandleState> =
+                std::collections::HashMap::new();
+            for (off, cum, px) in &seq {
+                let t = tick(13, SEG_IDX, OPEN + off, *px, *cum);
+                let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            agg.force_seal_all(|_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st);
+            });
+            if bars
+                .values()
+                .any(|st| u64::try_from(st.net_volume_signed.abs()).unwrap_or(u64::MAX) > st.volume)
+            {
+                violations += 1;
+            }
+        }
+        assert_eq!(violations, 0, "monotonic control broke the net invariant");
+    }
+
+    /// FUZZ — conservation with the watermark-driven `catch_up_seal_all`
+    /// interleaved, which is how the live drain actually runs. Hunting a
+    /// DOUBLE COUNT as hard as a loss: a carry that survives a catch-up drain
+    /// and is then settled into a bucket that had already swept it would
+    /// INVENT volume.
+    #[test]
+    fn hostile_fuzz_conservation_with_catch_up_seals_interleaved() {
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut over = 0_usize;
+        let mut under = 0_usize;
+        let mut first_over: Option<String> = None;
+        let mut first_under: Option<String> = None;
+        for _case in 0..4_000 {
+            let n = 6 + (next() % 10) as usize;
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            let mut bars: std::collections::HashMap<(TfIndex, u32), u64> =
+                std::collections::HashMap::new();
+            let mut log: Vec<String> = Vec::new();
+            let mut cum: u32 = 1_000;
+            let mut off: u32 = 0;
+            let first_cum = cum;
+            let mut max_cum = cum;
+            {
+                let t = tick(13, SEG_IDX, OPEN, 100.0, cum);
+                let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+                });
+                log.push(format!("({off},{cum})"));
+            }
+            for _ in 0..n {
+                off = if next() % 10 < 7 {
+                    off + 1 + (next() % 2) as u32
+                } else {
+                    off.saturating_sub(1 + (next() % 3) as u32)
+                };
+                cum = if next() % 10 < 8 {
+                    cum + 50 + (next() % 200) as u32
+                } else {
+                    cum.saturating_sub(10 + (next() % 120) as u32)
+                };
+                let off = off.min(110);
+                max_cum = max_cum.max(cum);
+                let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+                let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+                });
+                log.push(format!("({off},{cum})"));
+                // The live drain sweeps on a timer; imitate it.
+                if next() % 3 == 0 {
+                    let cutoff = OPEN + off.saturating_sub(1);
+                    let _ = agg.catch_up_seal_all(cutoff, |_, _, _, tf, st| {
+                        bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+                    });
+                    log.push(format!("catchup(@{})", off.saturating_sub(1)));
+                }
+            }
+            agg.force_seal_all(|_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+            let s1: u64 = bars
+                .iter()
+                .filter(|((tf, _), _)| *tf == TfIndex::S1)
+                .map(|(_, v)| *v)
+                .sum();
+            // Ground truth: D1's bucket spans the day, so it never refuses a
+            // tick. Use the raw arithmetic so a D1 defect cannot hide one.
+            let expected = u64::from(max_cum - first_cum);
+            if s1 > expected {
+                over += 1;
+                if first_over.is_none() {
+                    first_over = Some(format!("S1={s1} expected={expected} seq={}", log.join(" ")));
+                }
+            } else if s1 < expected {
+                under += 1;
+                if first_under.is_none() {
+                    first_under =
+                        Some(format!("S1={s1} expected={expected} seq={}", log.join(" ")));
+                }
+            }
+        }
+        println!(
+            "HOSTILE CATCHUP FUZZ: over(DOUBLE COUNT)={over} under(LOSS)={under} / 4000\n  \
+             first over: {first_over:?}\n  first under: {first_under:?}"
+        );
+        assert_eq!(
+            (over, under),
+            (0, 0),
+            "conservation broken under interleaved catch-up seals"
+        );
+    }
+
+    /// FUZZ, CONTROL — identical generator but the cumulative NEVER goes
+    /// backwards. If this passes while the unrestricted fuzz fails, the stale
+    /// packet is the whole cause.
+    #[test]
+    fn hostile_fuzz_control_monotonic_cumulative_conserves() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut failures = 0_usize;
+        let mut first: Option<(Vec<(u32, u32)>, u64, u64)> = None;
+        for _case in 0..4_000 {
+            let n = 6 + (next() % 8) as usize;
+            let mut seq: Vec<(u32, u32)> = vec![(0, 1_000)];
+            let mut cum: u32 = 1_000;
+            let mut off: u32 = 0;
+            for _ in 0..n {
+                let r = next() % 10;
+                off = if r < 7 {
+                    off + 1 + (next() % 2) as u32
+                } else {
+                    off.saturating_sub(1 + (next() % 3) as u32)
+                };
+                let _ = next();
+                cum += 50 + (next() % 200) as u32;
+                seq.push((off.min(110), cum));
+            }
+            let bars = hostile_run(&seq);
+            let d1 = hostile_total(&bars, TfIndex::D1);
+            let s1 = hostile_total(&bars, TfIndex::S1);
+            if s1 != d1 {
+                failures += 1;
+                if first.is_none() {
+                    first = Some((seq, s1, d1));
+                }
+            }
+        }
+        assert_eq!(failures, 0, "monotonic control failed: {first:?}");
+    }
+
+    /// FUZZ — every frame must tile the day to the SAME total, over many
+    /// randomly reordered / occasionally-stale sequences. The oracle is D1,
+    /// whose single bucket spans the day and therefore never refuses a tick.
+    #[test]
+    fn hostile_fuzz_every_frame_tiles_the_day_to_one_total() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut failures: Vec<(Vec<(u32, u32)>, u64, u64, u64)> = Vec::new();
+        for _case in 0..4_000 {
+            let n = 6 + (next() % 8) as usize;
+            let mut seq: Vec<(u32, u32)> = vec![(0, 1_000)];
+            let mut cum: u32 = 1_000;
+            let mut off: u32 = 0;
+            for _ in 0..n {
+                // Mostly forward in time, sometimes a late arrival.
+                let r = next() % 10;
+                off = if r < 7 {
+                    off + 1 + (next() % 2) as u32
+                } else {
+                    off.saturating_sub(1 + (next() % 3) as u32)
+                };
+                // Mostly rising cumulative, sometimes a stale (smaller) one.
+                let s = next() % 10;
+                cum = if s < 8 {
+                    cum + 50 + (next() % 200) as u32
+                } else {
+                    cum.saturating_sub(10 + (next() % 120) as u32)
+                };
+                seq.push((off.min(110), cum));
+            }
+            let bars = hostile_run(&seq);
+            let d1 = hostile_total(&bars, TfIndex::D1);
+            let s1 = hostile_total(&bars, TfIndex::S1);
+            let m1 = hostile_total(&bars, TfIndex::M1);
+            if s1 != d1 || m1 != d1 {
+                failures.push((seq, s1, m1, d1));
+            }
+        }
+        let over = failures.iter().filter(|(_, s1, _, d1)| s1 > d1).count();
+        let under = failures.iter().filter(|(_, s1, _, d1)| s1 < d1).count();
+        let m1_over = failures.iter().filter(|(_, _, m1, d1)| m1 > d1).count();
+        let m1_under = failures.iter().filter(|(_, _, m1, d1)| m1 < d1).count();
+        let stale = failures
+            .iter()
+            .filter(|(seq, _, _, _)| seq.windows(2).any(|w| w[1].1 < w[0].1))
+            .count();
+        println!(
+            "HOSTILE FUZZ: {} failures / 4000. S1 over-reports (DOUBLE COUNT): {over}; \
+             S1 under-reports (LOSS): {under}. M1 over: {m1_over}; M1 under: {m1_under}. \
+             failures whose sequence contains a STALE (backwards) cumulative: {stale}",
+            failures.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "{} of 4000 sequences failed conservation. First 3:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(3)
+                .map(|(seq, s1, m1, d1)| format!("  seq={seq:?}\n    S1={s1} M1={m1} D1={d1}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

@@ -1214,7 +1214,7 @@ NULL` rather than carrying the accumulator — recorded as outstanding in
 `seal_spill.rs`, because a format bump plus a mixed-stride reader is not a
 change to make beside a hot-path one.
 
-## RAM NOTE 2026-09-11 — unattributed volume carry (+10.2 MB host RAM, +$0.00/mo)
+## RAM NOTE 2026-09-11 — unattributed volume carry (+10.8 MB host RAM, +$0.00/mo)
 
 **Why this note exists.** `MAX_AGGREGATOR_CELL_BYTES` in
 `crates/trading/src/candles/aggregator_cell.rs` carries the instruction
@@ -1226,11 +1226,14 @@ measured fleet number before the change shipped rather than after.
 **The change.** `AggregatorCell` gains a per-timeframe carry for volume a
 frame was told about by a tick it could not fold — `[u64; TF_COUNT]` gross,
 `[i64; TF_COUNT]` signed, `[bool; TF_COUNT]` unclassified — so a late tick's
-units land in a bar instead of no bar at all.
+units land in a bar instead of no bar at all. Plus one more
+`[bool; TF_COUNT]`: a per-frame flag recording that a cumulative-counter
+restart has broken that frame's right-endpoint chain, so the next bucket it
+opens anchors on the live counter rather than on a number from the erased axis.
 
 | Budget | Was | Now | Fleet delta |
 |---|---|---|---|
-| `MAX_AGGREGATOR_CELL_BYTES` | `TF_COUNT × 136 × 2 + TF_COUNT × 4 + 160` = 6,784 B allowed, **6,568 B actual** | `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160` = 7,192 B allowed, **6,976 B actual** | ~164 MB → **~174 MB** at `AGGREGATOR_MAX_SLOTS` (25,000) |
+| `MAX_AGGREGATOR_CELL_BYTES` | `TF_COUNT × 136 × 2 + TF_COUNT × 4 + 160` = 6,784 B allowed, **6,568 B actual** | `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160` = 7,192 B allowed, **7,000 B actual** | ~164 MB → **~175 MB** at `AGGREGATOR_MAX_SLOTS` (25,000) |
 
 Both actuals are MEASURED with `size_of`, not estimated. Against the
 r8g.xlarge's 32 GiB (operator Quote 13) the delta is **0.03%** of the host.
