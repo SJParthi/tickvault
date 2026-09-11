@@ -1015,6 +1015,15 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
                 ack: ack_rx,
                 old: before,
             });
+            // Start the dark-window clock for the ARRIVING contract
+            // (2026-09-11), on the Ok arm only -- the Full and Closed arms
+            // below never reach the wire, and a stamp there would age out
+            // into a false `silent_window`.
+            crate::depth_first_packet::global_depth_first_packet_tracker().record_subscribe_at(
+                swap.new.security_id,
+                swap.new.segment,
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            );
             metrics::counter!(REBALANCE_SWAPS_SENT).increment(1);
             true
         }
@@ -1328,6 +1337,10 @@ pub async fn run_depth_rebalance(
     }
     pre_register_rebalance_counters();
     crate::depth20_track::pre_register_depth20_counters();
+    // Seed all three first-packet outcome series at zero (2026-09-11), so a
+    // counter whose first increment is the event it reports cannot be the
+    // sample an exporter drops -- the 2026-08-28 seeding defect, not repeated.
+    crate::depth_first_packet::pre_register_first_packet_counters();
     crate::depth200_ranked_steer::pre_register_ranked_counters();
     crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
     crate::depth_seed::pre_register_seed_counters();
@@ -1403,6 +1416,13 @@ pub async fn run_depth_rebalance(
                  affected swaps are planned again this minute"
             );
         }
+        // Give up on contracts still dark past the first-packet window, on the
+        // same beat that settles the swap-ack half of the same swap
+        // (2026-09-11). Here and NOT on the drain: this walk is O(pending) and
+        // the drain is the one task that must never stop reading the socket.
+        crate::depth_first_packet::global_depth_first_packet_tracker()
+            .sweep_expired_at(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+
         // Republish the reconciled truth. Placed here rather than at the end of
         // the iteration on purpose -- see `publish_depth_subscriptions`.
         publish_depth_subscriptions(&subscription_view, &sockets, &depth20);

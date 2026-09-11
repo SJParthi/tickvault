@@ -7328,6 +7328,24 @@ fn drain_depth_frame(
         // The rows are STILL written -- the levels arrived, and "capture
         // everything" is not suspended for an instrument we did not want;
         // the verdict only counts, and asks the socket to redial.
+        // Time-to-first-packet (2026-09-11). The hot-path arm is ONE relaxed
+        // atomic load whenever no swap is outstanding, which is almost every
+        // packet of a session; only while a subscribe is awaited does it cost
+        // a hash probe, and only the single packet that resolves it does any
+        // work at all. Placed beside the ghost check because both are
+        // per-PACKET questions about the same key, and for the same reason:
+        // before the level loop, so neither costs anything per row.
+        //
+        // Replayed frames are skipped on the same grounds the ghost check
+        // skips them -- a WAL frame captured before the subscribe would
+        // report a latency measured against a clock it never ran on.
+        if frame.connection_index != u8::MAX {
+            crate::depth_first_packet::global_depth_first_packet_tracker().observe_at(
+                header.security_id,
+                header.exchange_segment_code,
+                received_at_nanos,
+            );
+        }
         if frame.connection_index != u8::MAX {
             match crate::depth_subscription_view::global_depth_subscription_view().classify_raw(
                 header.security_id,

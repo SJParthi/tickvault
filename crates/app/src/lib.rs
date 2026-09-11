@@ -114,6 +114,7 @@ pub mod depth200_ranked_steer;
 pub mod depth20_layout;
 pub mod depth20_ranked_steer;
 pub mod depth20_track;
+pub mod depth_first_packet;
 pub mod depth_rebalance;
 pub mod depth_seed;
 pub mod depth_subscription_view;
