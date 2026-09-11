@@ -5181,6 +5181,106 @@ mod tests {
         assert_eq!(violations, 0, "monotonic control broke the net invariant");
     }
 
+    /// The conservation fuzzes' violation LEDGER, extracted from the fuzz body
+    /// so the reporting path has a test of its own.
+    ///
+    /// A fuzz that passes never executes its own failure branch, so the report
+    /// a future debugger reads at 3am is text nothing has ever run. That is the
+    /// same shape as the defect this file's own history records — a cutoff that
+    /// ran 4,000 cases and sealed NOTHING, so the invariant it claimed to prove
+    /// was never once evaluated. The report is not decoration: it is the whole
+    /// output of the fuzz on the one run that matters.
+    ///
+    /// The over/under split is kept because a DOUBLE COUNT and a LOSS have
+    /// opposite causes and want opposite fixes; collapsing them into one
+    /// "failures" number would throw away the first thing you need to know.
+    #[derive(Default)]
+    struct ConservationTally {
+        over: usize,
+        under: usize,
+        first_over: Option<String>,
+        first_under: Option<String>,
+    }
+
+    impl ConservationTally {
+        /// Records one case. Equality is NOT a violation and must leave every
+        /// field untouched — the fuzz calls this on all 4,000 cases, so a
+        /// mis-handled equal case would count every passing run as a failure.
+        fn record(&mut self, s1: u64, expected: u64, seq: &[String]) {
+            if s1 == expected {
+                return;
+            }
+            let (count, first) = if s1 > expected {
+                (&mut self.over, &mut self.first_over)
+            } else {
+                (&mut self.under, &mut self.first_under)
+            };
+            *count += 1;
+            // `get_or_insert_with`, so the FIRST violation of each kind is the
+            // one retained. The earliest reproducer is the cheapest to debug;
+            // overwriting it with the latest would hand back the longest.
+            first.get_or_insert_with(|| {
+                format!("S1={s1} expected={expected} seq={}", seq.join(" "))
+            });
+        }
+
+        fn summary(&self) -> String {
+            format!(
+                "over(DOUBLE COUNT)={} under(LOSS)={} / 4000\n  first over: {:?}\n  \
+                 first under: {:?}",
+                self.over, self.under, self.first_over, self.first_under
+            )
+        }
+    }
+
+    /// The ledger above is the fuzzes' only output on a failing run, and a
+    /// passing fuzz never exercises it. This is that missing test.
+    #[test]
+    fn the_conservation_ledger_splits_by_direction_and_keeps_the_first() {
+        let mut tally = ConservationTally::default();
+
+        // Equal is not a violation: nothing moves. This is the case that runs
+        // 4,000 times on a healthy tree.
+        tally.record(500, 500, &["(0,1000)".to_string()]);
+        assert_eq!((tally.over, tally.under), (0, 0));
+        assert!(tally.first_over.is_none() && tally.first_under.is_none());
+
+        // More volume than the ground truth = DOUBLE COUNT.
+        tally.record(700, 500, &["(0,1000)".to_string(), "(1,1200)".to_string()]);
+        assert_eq!((tally.over, tally.under), (1, 0));
+        assert_eq!(
+            tally.first_over.as_deref(),
+            Some("S1=700 expected=500 seq=(0,1000) (1,1200)")
+        );
+
+        // Less than the ground truth = LOSS, and it must land on the OTHER
+        // counter. A single shared counter would report a loss as a double
+        // count and send the next debugger at the opposite bug.
+        tally.record(300, 500, &["(0,1000)".to_string()]);
+        assert_eq!((tally.over, tally.under), (1, 1));
+        assert_eq!(
+            tally.first_under.as_deref(),
+            Some("S1=300 expected=500 seq=(0,1000)")
+        );
+
+        // A later violation increments the count but must NOT replace the
+        // retained reproducer.
+        tally.record(900, 500, &["(0,9999)".to_string()]);
+        assert_eq!((tally.over, tally.under), (2, 1));
+        assert_eq!(
+            tally.first_over.as_deref(),
+            Some("S1=700 expected=500 seq=(0,1000) (1,1200)"),
+            "the FIRST over-report must survive a later one"
+        );
+
+        // The summary names both directions and carries both reproducers.
+        let summary = tally.summary();
+        assert!(summary.contains("over(DOUBLE COUNT)=2"), "{summary}");
+        assert!(summary.contains("under(LOSS)=1"), "{summary}");
+        assert!(summary.contains("S1=700 expected=500"), "{summary}");
+        assert!(summary.contains("S1=300 expected=500"), "{summary}");
+    }
+
     /// FUZZ — conservation with the watermark-driven `catch_up_seal_all`
     /// interleaved, which is how the live drain actually runs. Hunting a
     /// DOUBLE COUNT as hard as a loss: a carry that survives a catch-up drain
@@ -5195,10 +5295,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut over = 0_usize;
-        let mut under = 0_usize;
-        let mut first_over: Option<String> = None;
-        let mut first_under: Option<String> = None;
+        let mut tally = ConservationTally::default();
         for _case in 0..4_000 {
             let n = 6 + (next() % 10) as usize;
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
@@ -5273,28 +5370,11 @@ mod tests {
             // Ground truth: D1's bucket spans the day, so it never refuses a
             // tick. Use the raw arithmetic so a D1 defect cannot hide one.
             let expected = u64::from(max_cum - first_cum);
-            // One branch, not four accumulators. The over/under split is what
-            // matters (a DOUBLE COUNT and a LOSS have opposite causes), so it
-            // is kept — but "remember the first of each kind" was four
-            // mutable locals doing what `get_or_insert_with` does in one.
-            if s1 != expected {
-                let (count, first) = if s1 > expected {
-                    (&mut over, &mut first_over)
-                } else {
-                    (&mut under, &mut first_under)
-                };
-                *count += 1;
-                first.get_or_insert_with(|| {
-                    format!("S1={s1} expected={expected} seq={}", log.join(" "))
-                });
-            }
+            tally.record(s1, expected, &log);
         }
-        println!(
-            "HOSTILE CATCHUP FUZZ: over(DOUBLE COUNT)={over} under(LOSS)={under} / 4000\n  \
-             first over: {first_over:?}\n  first under: {first_under:?}"
-        );
+        println!("HOSTILE CATCHUP FUZZ: {}", tally.summary());
         assert_eq!(
-            (over, under),
+            (tally.over, tally.under),
             (0, 0),
             "conservation broken under interleaved catch-up seals"
         );
