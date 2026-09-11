@@ -4692,6 +4692,86 @@ mod tests {
         );
     }
 
+    /// FINDING D — a late tick arriving AFTER the watermark drain lost its
+    /// units at the day boundary. Found by the fuzz above once its cutoff was
+    /// repaired; 796 of 4,000 sequences were losing volume.
+    ///
+    /// The sibling test
+    /// `hostile_a_carry_is_forfeited_when_catch_up_seal_drained_the_slot`
+    /// looks like this one and is not: there the late tick arrives BEFORE the
+    /// drain, so `catch_up_seal` settles the carry into the bucket it is about
+    /// to publish and conservation holds. Reverse the order — drain first,
+    /// late tick second — and the carry has no bucket to settle into. The day
+    /// then ends, `force_seal` finds an uninitialised slot, and the units are
+    /// dropped.
+    ///
+    /// | off | cum   | effect |
+    /// |----:|------:|---|
+    /// | 0   | 1_000 | seeds the baseline; opens t0 |
+    /// | 1   | 1_100 | rolls: seals t0, opens t1 at the chained endpoint 1_000 |
+    /// | —   | —     | `catch_up_seal_all(@2)` drains t1 (100 units); slot uninitialised |
+    /// | 1   | 1_500 | LATE for the drained bucket — carried, with no bucket to take it |
+    /// | —   | —     | day end: the carry must reach t1, not the floor |
+    ///
+    /// 1,500 − 1,000 = 500 units traded. t0 is the SEEDING bucket and holds
+    /// 0 by construction — with no previous cumulative there is no span for
+    /// it to measure — so the whole 500 belongs to t1: the 100 it had already
+    /// counted, widened to 500 by the carry the late tick left behind.
+    #[test]
+    fn hostile_a_late_tick_after_the_drain_must_not_lose_its_units_at_day_end() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut bars: std::collections::HashMap<(TfIndex, u32), u64> =
+            std::collections::HashMap::new();
+
+        for (off, cum) in [(0_u32, 1_000_u32), (1, 1_100)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+        }
+        // The watermark drains t1 — BEFORE the late tick, which is what makes
+        // this different from the sibling test.
+        let _ = agg.catch_up_seal_all(OPEN + 2, |_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+        // Now the late packet for the bucket that was just published.
+        let late = tick(13, SEG_IDX, OPEN + 1, 100.0, 1_500);
+        let _ = agg.consume_tick(Feed::Dhan, &late, None, |_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+        // No further tick for this instrument; the day ends.
+        agg.force_seal_all(|_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+
+        let expected = 1_500_u64 - 1_000;
+        assert_eq!(
+            hostile_total(&bars, TfIndex::D1),
+            expected,
+            "sanity: the day bar's bucket never closed, so it swept the late \
+             tick in-bucket and must show the full span"
+        );
+        assert_eq!(
+            bars.get(&(TfIndex::S1, OPEN)).copied(),
+            Some(0),
+            "sanity: the day's first bucket seeds the baseline and measures no \
+             span — if this is ever non-zero the arithmetic below moves"
+        );
+        assert_eq!(
+            bars.get(&(TfIndex::S1, OPEN + 1)).copied(),
+            Some(500),
+            "the drained bucket must be AMENDED from 100 to 500 by the units \
+             the late tick left behind — re-emitting it is an UPSERT on the \
+             same bucket, exactly what an `AmendedLate` price fix already does. \
+             Without the amend it stays at 100 and 400 units reach no bar"
+        );
+        assert_eq!(
+            hostile_total(&bars, TfIndex::S1),
+            expected,
+            "every unit that traded must land in some S1 bar"
+        );
+    }
+
     /// FINDING C — the carried SIGN survives a counter restart even though
     /// `rebase_open_buckets` claims to drop the carry.
     ///
@@ -4820,6 +4900,93 @@ mod tests {
         );
     }
 
+    /// FINDING C3 — the OTHER `chain_broken` consumption site, and the one
+    /// that fails SILENTLY for a whole bucket.
+    ///
+    /// The two restart tests above both restart on a tick that ROLLS, so the
+    /// broken chain is consumed at the roll site. This one restarts while the
+    /// frame has NO open bucket — the slot was drained by the watermark
+    /// sealer — so the flag is consumed by
+    /// `AggregatorCell::next_bucket_start_cumulative` instead.
+    ///
+    /// That path is the dangerous one. `rebase_open_buckets` re-anchors OPEN
+    /// buckets onto the new axis, so a bar that was open across the restart
+    /// chains correctly. `last_sealed` is NOT re-anchored — a bar sealed
+    /// BEFORE the restart keeps a right endpoint on the erased axis. Chaining
+    /// the next bucket to it computes `volume = cumulative − start` against a
+    /// number the post-restart counter may not reach for hours, so the bar
+    /// publishes **0 volume with a rising tick count** — no error, no
+    /// counter, nothing to see. The instrument simply stops reporting flow.
+    ///
+    /// Sequence (S1 frame, `u32` wrap between step 3 and step 4):
+    ///
+    /// | off | cum           | effect |
+    /// |----:|--------------:|---|
+    /// | 0   | 3_000_000_000 | seeds; opens t0 |
+    /// | 0   | 3_000_000_500 | in-bucket; t0 volume 500 |
+    /// | —   | —             | `catch_up_seal_all` drains t0; slot uninitialised, `last_sealed` endpoint 3_000_000_500 |
+    /// | 5   | 200           | WRAP. No open bucket to rebase, so the flag is taken HERE; t5 opens at 200 |
+    /// | 5   | 900           | in-bucket; t5 volume 700 — the real post-restart flow |
+    /// | 6   | 1_000         | rolls t5 and publishes it |
+    ///
+    /// Expected: t5 reports **700**. Without the broken chain it reports 0,
+    /// because `200 − 3_000_000_500` saturates.
+    #[test]
+    fn hostile_a_restart_with_no_open_bucket_must_not_chain_to_the_erased_axis() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut s1: Vec<(u32, LiveCandleState)> = Vec::new();
+        let push = |tf: TfIndex, st: LiveCandleState, out: &mut Vec<(u32, LiveCandleState)>| {
+            if tf == TfIndex::S1 {
+                out.push((st.bucket_start_ist_secs, st));
+            }
+        };
+
+        for (off, cum) in [(0_u32, 3_000_000_000_u32), (0, 3_000_000_500)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                push(tf, st, &mut s1)
+            });
+        }
+        // The watermark sealer drains S1's open bucket. `last_sealed` now
+        // holds a bar whose right endpoint is 3_000_000_500 — a number the
+        // post-wrap counter will never reach.
+        let _ = agg.catch_up_seal_all(OPEN + 4, |_, _, _, tf, st| push(tf, st, &mut s1));
+
+        for (off, cum) in [(5_u32, 200_u32), (5, 900), (6, 1_000)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                push(tf, st, &mut s1)
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| push(tf, st, &mut s1));
+
+        let mut by_bucket: std::collections::HashMap<u32, LiveCandleState> =
+            std::collections::HashMap::new();
+        for (start, st) in s1 {
+            by_bucket.insert(start, st);
+        }
+        let t5 = by_bucket
+            .get(&(OPEN + 5))
+            .copied()
+            .expect("the first post-restart bucket must have been published");
+        println!(
+            "HOSTILE C3: post-restart-no-open-bucket S1 bar volume={} tick_count={}",
+            t5.volume, t5.tick_count
+        );
+        assert!(
+            t5.tick_count > 0,
+            "sanity: the bar must have seen ticks at all"
+        );
+        assert_eq!(
+            t5.volume, 700,
+            "a bucket opened after a counter restart must anchor on the LIVE \
+             cumulative, not on a right endpoint from the erased axis — \
+             chaining across the restart reports 0 volume while {} ticks land \
+             in the bar, with no error anywhere",
+            t5.tick_count
+        );
+    }
+
     /// FUZZ — `|net_volume_signed| <= volume` on EVERY emitted bar. The
     /// doc on `LiveCandleState::net_volume` states this as a structural fact;
     /// `net_volume()` clamps on top of it, so a violation is invisible to a
@@ -4879,16 +5046,21 @@ mod tests {
                 }
             }
         }
+        // Hoisted, and `first()` rather than `[0]`: the indexed form is valid
+        // ONLY because the assert short-circuits, so it reads as a panic
+        // waiting for a careless edit. This evaluates on every run and cannot
+        // panic on an empty vec.
+        let first = violations.first().map_or_else(
+            || "<none>".to_string(),
+            |(seq, tf, start, net, vol)| {
+                format!("tf={tf:?} bucket={start} net={net} volume={vol} seq={seq:?}")
+            },
+        );
         assert!(
             violations.is_empty(),
             "{} of 3000 sequences published a bar whose |net| exceeds its own \
-             volume. First: tf={:?} bucket={} net={} volume={} seq={:?}",
-            violations.len(),
-            violations[0].1,
-            violations[0].2,
-            violations[0].3,
-            violations[0].4,
-            violations[0].0
+             volume. First: {first}",
+            violations.len()
         );
     }
 
@@ -5063,12 +5235,31 @@ mod tests {
                 });
                 log.push(format!("({off},{cum})"));
                 // The live drain sweeps on a timer; imitate it.
+                //
+                // CUTOFF `off + 1`, not `off - 1`. The first version of this
+                // fuzz used `off - 1` and therefore SEALED NOTHING, ever: an
+                // S1 bucket at `OPEN + off` ends at `OPEN + off + 1`, which is
+                // never <= `OPEN + off - 1`, and the generator's `off` never
+                // climbs far enough (max ~30 over 15 steps) for a MINUTE
+                // bucket to end before the cutoff either. The test ran 4,000
+                // cases, logged `catchup(@N)` each time, and drained not one
+                // bar — a fuzz that passed while testing nothing, found by its
+                // own emit closure showing as never-executed under llvm-cov.
+                //
+                // `off + 1` is the realistic cutoff, not a contrived one: the
+                // live drain's watermark is driven by the whole feed, so it is
+                // routinely AHEAD of any single instrument's last tick. It
+                // drains the bucket this instrument still has open, and the
+                // generator then sends ticks at EARLIER offsets 30% of the
+                // time — the drained-slot-then-late-tick shape that
+                // `hostile_a_carry_is_forfeited_when_catch_up_seal_drained_the_slot`
+                // reproduces one case at a time.
                 if next() % 3 == 0 {
-                    let cutoff = OPEN + off.saturating_sub(1);
+                    let cutoff = OPEN + off + 1;
                     let _ = agg.catch_up_seal_all(cutoff, |_, _, _, tf, st| {
                         bars.insert((tf, st.bucket_start_ist_secs), st.volume);
                     });
-                    log.push(format!("catchup(@{})", off.saturating_sub(1)));
+                    log.push(format!("catchup(@{})", off + 1));
                 }
             }
             agg.force_seal_all(|_, _, _, tf, st| {
@@ -5082,17 +5273,20 @@ mod tests {
             // Ground truth: D1's bucket spans the day, so it never refuses a
             // tick. Use the raw arithmetic so a D1 defect cannot hide one.
             let expected = u64::from(max_cum - first_cum);
-            if s1 > expected {
-                over += 1;
-                if first_over.is_none() {
-                    first_over = Some(format!("S1={s1} expected={expected} seq={}", log.join(" ")));
-                }
-            } else if s1 < expected {
-                under += 1;
-                if first_under.is_none() {
-                    first_under =
-                        Some(format!("S1={s1} expected={expected} seq={}", log.join(" ")));
-                }
+            // One branch, not four accumulators. The over/under split is what
+            // matters (a DOUBLE COUNT and a LOSS have opposite causes), so it
+            // is kept — but "remember the first of each kind" was four
+            // mutable locals doing what `get_or_insert_with` does in one.
+            if s1 != expected {
+                let (count, first) = if s1 > expected {
+                    (&mut over, &mut first_over)
+                } else {
+                    (&mut under, &mut first_under)
+                };
+                *count += 1;
+                first.get_or_insert_with(|| {
+                    format!("S1={s1} expected={expected} seq={}", log.join(" "))
+                });
             }
         }
         println!(
@@ -5206,16 +5400,20 @@ mod tests {
              failures whose sequence contains a STALE (backwards) cumulative: {stale}",
             failures.len()
         );
+        // Hoisted out of the `assert!` argument list. Inside it the chain is
+        // evaluated only on failure, so it is dead text on every passing run —
+        // and a six-line expression buried in a macro argument is the harder
+        // thing to read either way. `take(3)` of an empty vec costs nothing.
+        let first_three = failures
+            .iter()
+            .take(3)
+            .map(|(seq, s1, m1, d1)| format!("  seq={seq:?}\n    S1={s1} M1={m1} D1={d1}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             failures.is_empty(),
-            "{} of 4000 sequences failed conservation. First 3:\n{}",
-            failures.len(),
-            failures
-                .iter()
-                .take(3)
-                .map(|(seq, s1, m1, d1)| format!("  seq={seq:?}\n    S1={s1} M1={m1} D1={d1}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            "{} of 4000 sequences failed conservation. First 3:\n{first_three}",
+            failures.len()
         );
     }
 }

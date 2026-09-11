@@ -1013,7 +1013,7 @@ impl AggregatorCell {
                     && bucket_start == last.bucket_start_ist_secs
                 {
                     fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
-                    // SEAL SITE 5 of 5 — and the one that proves the guard
+                    // SEAL SITE 5 of 6 — and the one that proves the guard
                     // earns its keep. I wrote this change believing there
                     // were four emission points; the source scan found this
                     // fifth `AmendedLate` arm on its first run. Same reason
@@ -1317,7 +1317,7 @@ impl AggregatorCell {
                     fold_secs,
                 ),
             );
-            // SEAL SITE 1 of 5 (see `stamp_seal_percentages`). Stamped
+            // SEAL SITE 1 of 6 (see `stamp_seal_percentages`). Stamped
             // BEFORE `last_sealed` is written, so the late-refold path below
             // amends an already-stamped bar rather than a blank one.
             sealed_state.stamp_seal_percentages();
@@ -1342,7 +1342,7 @@ impl AggregatorCell {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
                 fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
-                // SEAL SITE 4 of 5, and one of the two a careless fix misses: the
+                // SEAL SITE 4 of 6, and one of the two a careless fix misses: the
                 // late tick just moved `close`, so a percentage stamped at
                 // the original seal is now stale for the row that actually
                 // gets persisted. Re-stamp from the amended close.
@@ -1357,9 +1357,22 @@ impl AggregatorCell {
 
     /// Day-boundary force-seal of one timeframe slot.
     ///
-    /// Returns `Some(sealed)` only when the slot actually held an opened
-    /// bucket — an untouched slot returns `None` and emits NOTHING. That is
-    /// the sparsity guarantee at the seal path.
+    /// Returns `Some(bar)` in exactly two cases, and `None` otherwise:
+    ///
+    /// 1. the slot held an opened bucket — that bucket, sealed; or
+    /// 2. the slot was drained INTRADAY by [`Self::catch_up_seal`] and a
+    ///    carry is still outstanding — the bar that drain published,
+    ///    AMENDED with the units the carry holds (an UPSERT on the same
+    ///    bucket, the shape `ConsumeOutcome::AmendedLate` already uses).
+    ///
+    /// A genuinely untouched slot — no bucket, no carry — returns `None` and
+    /// emits NOTHING. That is the sparsity guarantee at the seal path, and
+    /// case 2 does not weaken it: an instrument that never traded has no
+    /// carry to settle, so it still emits nothing.
+    ///
+    /// Case 2 was added 2026-09-11. Before it, those units were dropped —
+    /// 796 of 4,000 fuzzed sequences lost volume that way once the drain was
+    /// made to actually seal.
     ///
     /// Re-arms the slot for day-open, and CLEARS `last_sealed` so a stray
     /// late tick can never UPSERT a previous-day bar.
@@ -1369,7 +1382,15 @@ impl AggregatorCell {
     pub fn force_seal(&mut self, tf: TfIndex) -> Option<LiveCandleState> {
         let ord = tf.as_ordinal();
         self.armed_for_day_open[ord] = true;
-        self.last_sealed[ord] = LiveCandleState::empty();
+        // TAKEN, not read-then-cleared. The clear below is deliberate (a
+        // stray late tick must never UPSERT a previous-day bar) but the
+        // drained-slot amend arm further down needs the bar that was there,
+        // and reading it AFTER the clear is how the first version of that arm
+        // silently did nothing: `is_uninitialised()` was always true, so it
+        // returned `None` on every call and the units it exists to rescue
+        // were dropped exactly as before.
+        let previously_sealed =
+            std::mem::replace(&mut self.last_sealed[ord], LiveCandleState::empty());
         // The session-extreme baseline is a DAY-scoped quantity, so the day
         // boundary must drop it: carrying yesterday's high across midnight
         // would make today's genuinely-lower session high look like a fall and
@@ -1394,19 +1415,54 @@ impl AggregatorCell {
         // gross is added directly because, unlike the in-bucket path, nothing
         // is about to recompute `volume` from the cumulative span.
         //
-        // A carry with NO open bucket to receive it is the one case that
-        // forfeits: it is dropped below with the slot. That needs both a
-        // refused tick AND an intraday `catch_up_seal` drain AND no tick
-        // between the drain and the boundary — bounded to one tick's delta on
-        // one timeframe, and the alternative (resurrecting a drained bucket)
-        // would UPSERT a bar the seal path has already published.
+        // A carry with NO open bucket to receive it used to FORFEIT here, on
+        // the reasoning that it "needs both a refused tick AND an intraday
+        // `catch_up_seal` drain AND no tick between the drain and the
+        // boundary — bounded to one tick's delta on one timeframe", and that
+        // the alternative "would UPSERT a bar the seal path has already
+        // published".
+        //
+        // BOTH HALVES WERE WRONG, and the second is what made the first look
+        // acceptable.
+        //
+        // The FREQUENCY: 796 of 4,000 fuzzed sequences lost volume this way —
+        // the first losing case dropped 688 of 1,542 units. It reads as rare
+        // only if you picture a busy instrument. An instrument quiet enough
+        // for the watermark to drain its bucket is exactly the instrument
+        // whose next packet arrives after that drain, so the "rare"
+        // conjunction is the NORMAL regime for an illiquid contract. It went
+        // unmeasured because the fuzz that claimed to interleave catch-up
+        // seals used a cutoff that could never seal anything — see the dated
+        // note in `hostile_fuzz_conservation_with_catch_up_seals_interleaved`.
+        //
+        // The UPSERT: re-emitting a published bucket is not a hazard to be
+        // avoided, it is the established mechanism.
+        // `ConsumeOutcome::AmendedLate` does exactly this, through the SAME
+        // `on_seal` sink, and the row is an UPSERT keyed on the bucket, so the
+        // published bar is CORRECTED rather than duplicated. Refusing to use
+        // it here did not protect the data; it silently discarded units that
+        // had already been counted as received.
+        //
+        // Those units belong in `last_sealed` and nowhere else:
+        // `carry_unattributed` is reached ONLY from the late arms, which
+        // require `bucket_start <= last_sealed.bucket_start_ist_secs`.
         let carry = self.take_carry(ord);
         if self.slots[ord].is_uninitialised() {
-            return None;
+            if carry == UnattributedCarry::default() || previously_sealed.is_uninitialised() {
+                return None;
+            }
+            let mut amended = previously_sealed;
+            carry.settle_into(&mut amended);
+            // SEAL SITE 6 of 6 (see `stamp_seal_percentages`) — the
+            // amend-on-drain arm. The settle moved `volume`, so the
+            // percentages beside it must be recomputed, exactly as sites 4
+            // and 5 do for a late price amend.
+            amended.stamp_seal_percentages();
+            return Some(amended);
         }
         carry.settle_into(&mut self.slots[ord]);
         let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
-        // SEAL SITE 2 of 5 (see `stamp_seal_percentages`).
+        // SEAL SITE 2 of 6 (see `stamp_seal_percentages`).
         sealed.stamp_seal_percentages();
         Some(sealed)
     }
@@ -1455,7 +1511,7 @@ impl AggregatorCell {
         let carry = self.take_carry(ord);
         carry.settle_into(&mut self.slots[ord]);
         let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
-        // SEAL SITE 3 of 5 (see `stamp_seal_percentages`). Stamped before
+        // SEAL SITE 3 of 6 (see `stamp_seal_percentages`). Stamped before
         // `last_sealed` so a subsequent late refold amends a stamped bar.
         sealed.stamp_seal_percentages();
         self.last_sealed[ord] = sealed;
@@ -3849,6 +3905,79 @@ mod session_extreme_delta_tests {
             );
         }
     }
+    /// A session LOW that RISES is impossible on a real tape, and the mark
+    /// must refuse it — the mirror of the session-high case beside it.
+    ///
+    /// An exchange session low is monotone downward by definition, so a packet
+    /// reporting a HIGHER low than one already seen is evidence of a stale or
+    /// corrupt frame, never of the market. The mark therefore holds and the
+    /// regression is counted (`session_extreme_regressed_low`).
+    ///
+    /// This is tested because its SIBLING was and it was not. The
+    /// `session_extreme_regressed_high` arm ten lines above is exercised by
+    /// the out-of-order tests; the low arm was reached by nothing — the "one
+    /// row, two structures, only one tested" shape. A low mark that silently
+    /// followed a stale packet upward would let the next genuine print restore
+    /// a level already known as an apparent NEW low, attributing a print from
+    /// minutes ago to whichever bucket happens to be open now.
+    #[test]
+    fn a_session_low_that_rises_is_refused_and_the_mark_holds() {
+        let mut cell = AggregatorCell::empty();
+        let second = advance_past_first_bucket(&mut cell, 200.0, 100.0);
+
+        // Establish the mark: the session low genuinely falls to 90.
+        let mut fresh = tick_at(second + 10, 100.0, 25);
+        fresh.day_low = 90.0;
+        let established = cell.observe_session_extremes(
+            &fresh,
+            fold_clock_ist_secs(fresh.exchange_timestamp, fresh.received_at_nanos),
+        );
+        assert_eq!(
+            established.new_low,
+            Some(90.0),
+            "a genuine fall must be reported"
+        );
+
+        // A stale packet claims the session low ROSE to 95.
+        let mut regressed = tick_at(second + 20, 100.0, 30);
+        regressed.day_low = 95.0;
+        let d = cell.observe_session_extremes(
+            &regressed,
+            fold_clock_ist_secs(regressed.exchange_timestamp, regressed.received_at_nanos),
+        );
+        assert!(
+            d.new_low.is_none(),
+            "a RISING session low is not a new low and must report nothing"
+        );
+
+        // Proof the mark is still 90 and not 95: a print at 92 is BELOW the
+        // regressed value and ABOVE the true mark. If the mark had followed
+        // the stale packet up, this would read as a new low.
+        let mut probe = tick_at(second + 30, 100.0, 35);
+        probe.day_low = 92.0;
+        let d92 = cell.observe_session_extremes(
+            &probe,
+            fold_clock_ist_secs(probe.exchange_timestamp, probe.received_at_nanos),
+        );
+        assert!(
+            d92.new_low.is_none(),
+            "92 is above the true mark of 90 — reporting it as a new low would \
+             mean the stale packet moved the mark"
+        );
+
+        // And a genuine new low still works.
+        let mut lower = tick_at(second + 40, 100.0, 40);
+        lower.day_low = 88.0;
+        let d88 = cell.observe_session_extremes(
+            &lower,
+            fold_clock_ist_secs(lower.exchange_timestamp, lower.received_at_nanos),
+        );
+        assert_eq!(
+            d88.new_low,
+            Some(88.0),
+            "the mark must still track genuine falls"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4440,16 +4569,16 @@ mod open_bucket_ordering_tests {
 
         let stamps = prod.matches(".stamp_seal_percentages()").count();
         assert_eq!(
-            stamps, 5,
-            "expected exactly 5 stamp calls (one per emission site), found \
+            stamps, 6,
+            "expected exactly 6 stamp calls (one per emission site), found \
              {stamps}. If you ADDED an emission path, stamp it and raise this \
              number. If you REMOVED one, lower it. Do not delete this assertion."
         );
 
         let markers = prod.matches("SEAL SITE").count();
         assert_eq!(
-            markers, 5,
-            "each stamp call must carry its `SEAL SITE n of 5` marker so the \
+            markers, 6,
+            "each stamp call must carry its `SEAL SITE n of 6` marker so the \
              next reader can find all of them from any one of them"
         );
 
@@ -4480,5 +4609,136 @@ mod open_bucket_ordering_tests {
                  guard is scanning the wrong text"
             );
         }
+    }
+
+    /// `Default` must agree with `empty()`, because it is the only
+    /// constructor a caller reaches without naming one.
+    ///
+    /// Not a formality. `AggregatorCell` carries three pieces of state whose
+    /// zero value is load-bearing — the unattributed carry, its signed
+    /// counterpart, and the per-frame `chain_broken` flag. A `Default` that
+    /// ever drifted from `empty()` would hand out a cell that believes it owes
+    /// units to a bar that does not exist, or that its right-endpoint chain
+    /// was broken by a counter restart that never happened. Both are silent:
+    /// the cell folds, publishes, and is simply wrong.
+    #[test]
+    fn default_and_empty_must_construct_the_same_cell() {
+        let mut from_default = AggregatorCell::default();
+        let mut from_empty = AggregatorCell::empty();
+
+        // Observable equivalence rather than field equality: the fields are
+        // private and two cells that behave identically through the public
+        // surface ARE the same cell as far as any caller can tell.
+        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::D1] {
+            assert_eq!(
+                from_default.last_sealed_snapshot(tf),
+                from_empty.last_sealed_snapshot(tf),
+                "{tf:?}: a fresh cell must hold no sealed bar either way"
+            );
+        }
+        let a = from_default.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN, 100.0, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let b = from_empty.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN, 100.0, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        assert_eq!(a, b, "the first fold must land identically");
+        assert_eq!(
+            from_default.snapshot(TfIndex::M1),
+            from_empty.snapshot(TfIndex::M1),
+            "and leave identical state behind"
+        );
+    }
+
+    /// A tick too old to amend is DISCARDED even under `Refold` — the
+    /// drained-slot arm, which no test reached.
+    ///
+    /// `catch_up_seal` drains the open slot on the watermark, leaving
+    /// `last_sealed` populated and the slot empty. A tick arriving after that
+    /// for a bucket STRICTLY BEFORE the sealed one cannot be amended (only the
+    /// last sealed bucket is amendable) and must not re-open a bucket at or
+    /// before it — doing so would lose that bar's open/high/low, re-baseline
+    /// its volume, and UPSERT a corrupted row over the one already published.
+    ///
+    /// The other `DiscardLate` site (the open-slot path) is tested; this one
+    /// sits behind a watermark drain and was reached by nothing. It also
+    /// carries the tick's units, which is the half that matters for volume
+    /// conservation: the slot baseline advances past this tick regardless, so
+    /// a discard that forgot to carry would lose the units outright.
+    #[test]
+    fn a_tick_older_than_the_drained_bucket_is_discarded_but_its_units_are_kept() {
+        let mut cell = AggregatorCell::empty();
+        // Bucket OPEN, then roll to OPEN+60.
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN, 100.0, 10),
+            0,
+            FeedStrategy::DEFAULT,
+            10,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 60, 105.0, 20),
+            10,
+            FeedStrategy::DEFAULT,
+            20,
+        );
+        // The watermark drains OPEN+60. `last_sealed` is now that bucket and
+        // the slot is uninitialised.
+        let drained = cell
+            .catch_up_seal(TfIndex::M1, OPEN + 600)
+            .expect("the watermark must seal the open bucket");
+        assert_eq!(drained.bucket_start_ist_secs, OPEN + 60);
+
+        // A very stale packet for bucket OPEN — one whole bucket before the
+        // sealed one, so not amendable even under Refold.
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 10, 130.0, 21),
+            20,
+            FeedStrategy::DEFAULT,
+            21,
+        );
+        assert_eq!(
+            out,
+            ConsumeOutcome::DiscardLate,
+            "a bucket older than the last sealed one can never be amended"
+        );
+        let after = cell
+            .last_sealed_snapshot(TfIndex::M1)
+            .expect("the sealed bar must still be there");
+        assert_eq!(
+            after.high, 105.0,
+            "the 130.0 print must NOT have touched the published bar"
+        );
+        assert_eq!(
+            after.bucket_start_ist_secs,
+            OPEN + 60,
+            "and must not have been replaced by a re-opened older bucket"
+        );
+
+        // The units are not lost: the next bucket this frame opens settles
+        // them. Cumulative ran 20 -> 21, so one unit is owed.
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 120, 106.0, 30),
+            21,
+            FeedStrategy::DEFAULT,
+            30,
+        );
+        let live = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            live.volume, 10,
+            "the discarded tick's unit plus the new bucket's own 9 — a discard \
+             that forgot to carry would report 9"
+        );
     }
 }
