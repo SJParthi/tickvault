@@ -2938,6 +2938,71 @@ swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
 > is the single strongest thing to put in front of Dhan engineering, which the
 > "20 vs 10" framing was too small to show.
 >
+> > ##### ⚠ CORRECTED 2026-09-11 (same day, by an adversarial re-read) — "byte-identical" is TRUE and is NOT EVIDENCE OF ANYTHING. 80 is our own ceiling, and this section refutes itself two paragraphs down.
+> >
+> > The paragraph above calls the identical signature "the single strongest
+> > thing to put in front of Dhan engineering." **It is the weakest, because
+> > every number in it is pinned by OUR code and could not have come out any
+> > other way.**
+> >
+> > | "signature" dimension | what actually fixes it |
+> > |---|---|
+> > | **80** lines | `GHOST_REDIAL_SESSION_CEILING` = 8 × **10** depth sockets = **80**. Arithmetic maximum. |
+> > | **40 / 40** split | 5 depth-20 + 5 depth-200 sockets × 8 = 40 each. Forced. |
+> > | **all ten** sockets | there are exactly ten. |
+> > | ceiling reached ~1 h in | the line is emitted ONLY inside the `Ok(())` arm of `request_ghost_redial`, which returns `Err(SessionCeiling)` past 8. |
+> >
+> > So the two sessions did not produce the same number because Dhan behaved
+> > the same way — **they produced the same number because a counter that
+> > saturates at 80 reported 80 twice.** A vendor that honoured code 24 on
+> > 30% of frames and ignored 25 entirely would still print 80/40/40 as long
+> > as *any* ghost survived per socket. **A metric that can only report one
+> > value is not evidence**, and the section immediately below this one says
+> > so without noticing: *"every socket reaches `GHOST_REDIAL_SESSION_CEILING`
+> > (8) and stands down by design."*
+> >
+> > **What IS non-forced, and is therefore the real evidence:** `ghost`
+> > (5,345,436) and `unsubscribed_grace` (1,686,468) have no ceiling. No
+> > 2026-09-10 counterparts were recorded, so the one comparison that could
+> > discriminate between the two codes was never taken.
+> >
+> > **This is not a claim that 24 or 25 works.** Both were almost certainly
+> > ignored. It is a claim that **the argument as recorded cannot survive
+> > vendor scrutiny**, and a ticket built on it invites "we cannot reproduce;
+> > send a capture."
+> >
+> > **What the next session must do instead, in order:**
+> >
+> > 1. **Record the unbounded counters on BOTH days** — those are the numbers
+> >    that can differ.
+> > 2. **Run the one-socket probe.** A depth-200 socket holds **exactly one**
+> >    instrument, so "did the stream stop?" has nothing to mask it: send the
+> >    unsubscribe, **do not re-subscribe**, watch that `connection_index` for
+> >    frame silence (`FrameSilenceElapsed` already measures it). Silence ⇒ 25
+> >    works and the ghost verdict is OURS. Continued delivery ⇒ vendor-side,
+> >    decisively, from one socket and about four minutes.
+> > 3. **Try `RequestCode 12`.** The vendor's own depth guide documents only
+> >    `23` (subscribe) and `12` (disconnect) — **no per-instrument
+> >    unsubscribe at all** — and `build_disconnect_message` exists with
+> >    **ZERO production callers** (`FEED_REQUEST_DISCONNECT` appears only in
+> >    `constants.rs` and two test files). The only stop mechanism the vendor
+> >    documents has never been sent.
+> > 4. **Ask the right question.** Not *"why is 25 ignored?"* but **"what is
+> >    the supported way to stop a depth stream for one instrument — is 25
+> >    implemented on the Indian feed, or is 12 the only mechanism?"**
+> >
+> > **Also not ruled out, and it is ours:** a wire-FAILED unsubscribe still
+> > produces a ghost. `held` advances on `try_send` Ok — command *queued*,
+> > not sent — and reconcile KEEPS that advanced belief on both wire-failure
+> > arms, so the view publishes a contract as dropped that the socket was
+> > never told to drop. Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
+> > = 0 excludes this, and that must be re-read PER REASON, not as a rollup.
+> >
+> > The reusable half is the one this file keeps recording, now about a
+> > measurement rather than a constant: **before citing a number as evidence,
+> > ask what its maximum is.** This one had been written down three times,
+> > beside its own ceiling, without anyone computing 8 × 10.
+>
 > **Why the lines stop around 10:21–10:46 and not at the 15:40 close:** every
 > socket reaches `GHOST_REDIAL_SESSION_CEILING` (8) and stands down by design.
 > The ghosts kept streaming for the remaining ~5 hours with no further redial —
@@ -3325,6 +3390,36 @@ smaller than written.
 - Repeats "804 parks the socket for the session" without the one-respawn
   correction.
 - Reports the 5,250,076 ghosts as data loss. They are written.
+- Cites the 80/40/40 "byte-identical signature" as evidence about the vendor —
+  it is `GHOST_REDIAL_SESSION_CEILING` × socket count and could report no other
+  number (see the CORRECTED block above).
+
+#### ⚠ 2026-09-11 — five traps in reading the NEXT session's data, found before it was read
+
+A ghost line and an ask line are now both instrumented, but a naive join of
+them (or of either against `market_depth`) returns a **clean-looking wrong
+answer**. Each of these was verified in source; none is a defect in the lane,
+and all five are properties of how the evidence must be QUERIED.
+
+| # | Trap | Why a naive read is wrong |
+|---|---|---|
+| 1 | **`Held` short-circuits over the UNION of both pools** (`depth_subscription_view.rs`: `depth20.contains \|\| depth200.contains` is tested BEFORE `dropped`) | A contract dropped from depth-200 while depth-20 still holds it classifies `Held`, never `Ghost`, and is never logged. That file's own docblock measures depth-200's entry set as *"by construction almost always inside depth-20's top 250 — roughly 19 of every 20."* **So depth-200 unsubscribes are nearly INVISIBLE to the ghost test, and their absence reads as "depth-200 unsubscribes worked."** The short-circuit is CORRECT for its real job — never redial a socket for a contract we legitimately hold elsewhere — so it must not be "fixed"; the reading must account for it. |
+| 2 | **`d5` rows are not depth-socket rows** | `market_depth` holds three `depth_kind`s, and `d5` comes from Full-mode MAIN-FEED packets. Since the 2026-09-11 FOURTH board puts SPOT on depth-20, and every spot is also a main-feed Full instrument, `d5` rows keep arriving after a spot unsubscribe — innocently, forever. **Filter `depth_kind IN ('d20','d200')` or every spot unsubscribe is unfalsifiable.** |
+| 3 | **Timestamp frames differ** | `market_depth.ts` is `received_at_nanos + IST_UTC_OFFSET_NANOS` — naive IST in a UTC-typed column — while the log timer emits a real `+05:30` offset. Comparing the log stamp as an instant against `ts` as UTC is out by **5 h 30 m**, so every row reads as "after" every ask. |
+| 4 | **Ring dwell back-dates rows** | `received_at_nanos = Utc::now() − frame.received_at.elapsed()`, so a row that physically arrived AFTER the ask can be stamped BEFORE it by up to the ring dwell (alarmed only at 2,000 ms, worst at the open). Early post-ask rows go missing from a strict `ts > ask` window. |
+| 5 | **`top_volume_rank` cannot defeat the re-subscribe confound for the contracts under test** | It persists only the top `TOP_VOLUME_RANK_PER_FAMILY` (250), and a contract is dropped *because* it fell off the board — so it usually has **no row at all**, not a `subscribed=false` row. `subscribed` also comes from the per-MINUTE publish while snapshots write at 1 s/5 s, so a re-subscribed contract reads `false` for up to 60 s. |
+
+**Two worst cases that are byte-identical to success, and must be excluded
+before any conclusion:** (a) a session where nothing left the top 250 produces
+zero asks AND zero ghosts — indistinguishable from "unsubscribe now works";
+the only separator is `unsubscribed_grace > 0`. (b) The deploy not shipping
+produces ghost lines with no ids — identical to 2026-09-10/11; **verify the
+binary sha before trusting a null result.**
+
+**What survives all five:** the ASK record (`depth_unsubscribe_sent`) has no
+redial ceiling, so it is the only surface covering the 78.5% of ghosting that
+happens after every socket exhausts its redials — and the one-socket depth-200
+probe in the CORRECTED block above needs none of these joins at all.
 
 ### 2026-09-11 (SECOND) — the depth-200 hysteresis band widens 3 → 15, under the remedy the 2026-09-07 lock already prescribes
 
@@ -3891,6 +3986,18 @@ depth-200, on all ten sockets, every socket reaching
 was merely *wrong* would be expected to differ from another wrong code in at
 least one dimension. **Two byte-identical signatures is the evidence that the
 RequestCode is not the variable.**
+
+> **⚠ CORRECTED 2026-09-11 (same day) — the "byte-identical signature" argument
+> is CIRCULAR and must not be put in a vendor ticket.** 80 = `GHOST_REDIAL_
+> SESSION_CEILING` (8) × 10 depth sockets, and the 40/40 split is 5+5 sockets ×
+> 8: the line is emitted only inside the `Ok(())` arm of `request_ghost_redial`,
+> which refuses past the ceiling. Two saturated ceilings are identical by
+> construction, whatever the vendor did. The unbounded counters (`ghost`,
+> `unsubscribed_grace`) are the only discriminating numbers and were recorded
+> for one day only. **The CONCLUSION may well be right; the evidence offered
+> cannot support it.** Full correction, the one-socket probe that settles it in
+> ~4 minutes, and the untried `RequestCode 12`: see the dated block under
+> "⚠ RE-MEASURED 2026-09-11" above.
 
 When neither value works, the value's job changes. It stops being *"make it
 work"* and becomes *"make the vendor ticket unarguable"* — and

@@ -4364,6 +4364,36 @@ where
                                     Err(_elapsed) => {
                                         wire_failed = true;
                                         wire_timed_out = true;
+                                        // THE AMBIGUOUS ARM, and until now the
+                                        // silent one.
+                                        //
+                                        // A timeout is deliberately NOT reverted
+                                        // above because the frame MAY have landed.
+                                        // That is exactly why it needs a record: a
+                                        // landed-then-ignored unsubscribe produces
+                                        // a ghost, and without this line that ghost
+                                        // has no ask to pair against and reads as
+                                        // the vendor ignoring a request we cannot
+                                        // show we made.
+                                        //
+                                        // `warn!`, not `info!`: unlike the success
+                                        // arm this is a degraded outcome, and it is
+                                        // rare — the budget is a full second and
+                                        // the measured swap rate is ~24 a minute.
+                                        warn!(
+                                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                            source = "depth_unsubscribe_timed_out",
+                                            endpoint = supervisor.slot().endpoint.as_str(),
+                                            pool_index = supervisor.slot().pool_index,
+                                            security_id = drop_this.security_id,
+                                            segment = drop_this.segment.as_str(),
+                                            request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                            "depth unsubscribe timed out on the wire — it MAY have \
+                                             landed, so the guard is deliberately not reverted and \
+                                             this instrument may or may not still be subscribed; a \
+                                             later ghost for it is not evidence the vendor ignored \
+                                             a request we know was sent"
+                                        );
                                     }
                                 }
                             }
