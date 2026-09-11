@@ -3327,10 +3327,38 @@ measured that window.
 
 | Site | Cadence | Cost |
 |---|---|---|
-| depth-20 dispatch, `Ok(())` arm only | ≤ 5/min | O(1) |
+| depth-20 dispatch, `Ok(())` arm only | ≤ 20/min | O(1) |
 | depth-200 dispatch, `Ok(())` arm only | ≤ 5/min | O(1) |
 | frame drain, beside the ghost check, **before the level loop** | per depth PACKET | **one relaxed atomic load** when idle; + one hash probe while a swap is outstanding |
 | per-minute sweep, beside the swap-ack reconcile | 1/min | O(pending), capped at `MAX_PENDING` = 1,024 |
+
+> **⚠ CORRECTED 2026-09-11 — the depth-20 cadence in the table above read
+> “≤ 5/min” and the real figure is ≤ 20/min, four times higher.** Found by the
+> same 6-agent sweep that found the three code bugs in this module, and it is
+> the identical mistake this file records elsewhere in prose: the depth-200
+> cap IS five a minute pool-wide (`MAX_RANKED_SWAPS_PER_MINUTE` =
+> `DEPTH_200_SOCKET_BUDGET`, one per socket × five sockets, and its own
+> docblock says so in those words), and that figure was carried across to the
+> depth-20 row where it does not hold. depth-20 permits
+> `MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE` = 4 per socket
+> (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, const-asserted ≤ the channel depth
+> because “a cap above the depth is not a cap”) across five sockets.
+>
+> **Read the depth-200 row as correct and unchanged.** Only the depth-20 cell
+> moved.
+>
+> **What the wrong number understated:** the stamp rate into the pending set,
+> which is the input to the `MAX_PENDING` = 1,024 ceiling and to the
+> per-minute sweep's O(pending) cost. Neither conclusion changes — at 25
+> stamps a minute against a 120 s lifetime the set holds on the order of 50,
+> two orders of magnitude under the cap — but a reader sizing that ceiling
+> from this table would have been working from a quarter of the real rate.
+>
+> The reusable half is the one this file keeps recording: **a per-socket
+> figure and a pool-wide figure are different claims, and the two depth pools
+> express their caps in different units.** Quoting one pool's number into the
+> other pool's row is how they get conflated — and the two rows sitting
+> adjacent with the same value is exactly what made it look checked.
 
 Series (local `/metrics` only — see the budget row below):
 `tv_depth_first_packet_latency_ms` (histogram) and
