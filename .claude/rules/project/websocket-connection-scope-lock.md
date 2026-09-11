@@ -3523,3 +3523,209 @@ bite-proving it can fail, and drops an assertion that was **vacuous**
   term 4 above is the market's, not ours.
 - Adds an EMF name or alarm for these series without a LEVER in the same
   change.
+
+### 2026-09-11 (THIRD) — DEPTH-20 IS TOP 7 UNDERLYINGS BY PERCENTAGE MOVE, FUTURES + OPTIONS, FROM PRE-OPEN — and the 5-second cadence ask is WITHDRAWN
+
+**The verbatim operator demands (2026-09-11, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+**Quote A (the withdrawal — this is what unblocks everything else):**
+> "yes go ahead with thsi newer requiremente which i have sated clealry dude okay firget the fucking dpeth 20 seconds level resuscoirbe bro okay? just go ehad wiht this newer mintue level resubscrbe newer requirmeen t aloen dude okay? do you really udnerstadn ddue okay?"
+
+**Quote B (the requirement):**
+> "see its simplembro just pcik the percnetage mvoe dude to fidn the top 7 that too startign pre oprn itself shodu lbe spotted dude okay? so after evry one minute also it shodu lobe chekd dude okay? do you understand my ppioitn dude okay? nwo did you get my point dude okay? i clelaury told yo uto pick top 7 futures startign pre makret based on percnetage change dude see that too after 9.15 am also startign 9l.16 am always check the same top 7 percnetage change current expiry futures dude and its repsective options of atm plus or minus also rigth for btoh calla nd ptu dude okay? and then for index only nifty and bankn ifty futures and its repscetive options atm plus or min us 10 rigth dude now chekc this and tell me will it sit udner 250 slots and how will yo usubscibre this also dude see because evry unique fno shouslbe be subscirbe dspeartely rigth dide becuase if you need to swap with subscirbe reusbscirbe emans then tell me dude okay?"
+
+**Quote A was given in DIRECT response to a message that had just reported the
+capacity arithmetic (247/250 at ATM±5), the swap-clock blocker (23 swaps to move
+one name against a 20/minute budget), and the five REJECT rows this reverses —
+and that closed by asking for his words on the record before any code. He
+answered by authorizing the design AND withdrawing the cadence ask that was the
+hardest blocker.** Recorded HERE, before the code, per the rule-file-first law.
+
+#### What Quote A RETIRES — and this is the most consequential line in this section
+
+The 5-second apply cadence has been asked for four times (2026-09-06 Quote A,
+the 2026-09-06 FOURTH quote, 2026-09-08, 2026-09-09) and refused four times for
+reasons recorded above: the per-call swap caps hold no cross-call state, the
+unguarded `send_swap` pending slot, two QuestDB queries per iteration against a
+5-second tick, and the 180 s stall threshold written for a 60 s loop.
+
+**Quote A withdraws it: "forget the … depth 20 seconds level resubscribe …
+just go ahead with this newer minute level resubscribe."** The apply cadence is
+therefore **ONE MINUTE, by the operator's own instruction**, and the four
+blockers above are moot rather than deferred. The FOURTH-quote ordering ("probe
+the unsubscribe code FIRST, then raise the cadence") is likewise moot for THIS
+design: there is no raise. It stands unchanged for any FUTURE cadence proposal.
+
+#### What this SUPERSEDES
+
+This reverses the 2026-09-06 depth lock on three of its four axes, and the
+2026-09-07 sort-key lock on one. Recorded rather than overwritten:
+
+| Surface | 2026-09-06 / 09-07 locked value | 2026-09-11 (THIRD) |
+|---|---|---|
+| Instrument class | stock options ONLY (`OPTSTK`); *"No underlying spot or futures or indices or indices fmo"* | **stock options + STOCK FUTURES + INDEX futures + INDEX options** (NIFTY/BANKNIFTY only) |
+| Selection unit | individual CONTRACTS, top 250 by volume | **top 7 UNDERLYINGS**, each contributing its future + ladder |
+| Sort key | `window_lots_milli` (lots traded in the window) | **absolute percentage move of the UNDERLYING**, in integer basis points |
+| Gainer role | eligibility FILTER, never the sort key | **the sort key itself** — and it is the ABSOLUTE move, so a faller ranks equally with a riser |
+| Ranking start | 09:15 (`within_capture_window`) | **09:00 — pre-open** |
+| Apply cadence | once a minute at :08 | **unchanged, once a minute** |
+| depth-200 | unchanged by this quote | **UNCHANGED** — top 5 distinct underlyings by lots-in-window, band of 20 |
+
+**depth-200 is NOT touched by this quote.** Quote B says *"this is purely
+related to depth 20"* in its 2026-09-06 ancestor and says nothing about the deep
+pool here. The 2026-09-11 (SECOND) band widening stands, the volume key stands,
+and stock-options-only stands for depth-200.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Selection unit | **UNDERLYING**, not contract |
+| Sort key | `move_bps = ((ltp_paise − prev_close_paise).abs() × 10_000) / prev_close_paise` — **i64, integer, no float anywhere on the path** |
+| Direction | **ABSOLUTE.** A −8% faller and a +8% riser rank identically. This follows the operator's 2026-09-06 words *"top 7 among between top gainers losers combined"*; it is the one place this section ASSUMES rather than quotes, and it is a one-constant flip (`DEPTH20_RANK_ABSOLUTE_MOVE`) if he means gainers only |
+| Inputs | `SpotPriceStore` (ltp) and `PrevCloseStore` (prev close) — both integer paise, both already live from 09:00, both already the gainer filter's own inputs |
+| Stock names | **top 7** by `move_bps` |
+| Per stock name | its **nearest-expiry FUTURE** (1 slot) + its options **ATM ± `DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE` = 5**, CE and PE (22 slots) = **23** |
+| Index names | **NIFTY and BANKNIFTY only**, unconditionally — never ranked, never displaced |
+| Per index name | its **nearest-expiry FUTURE** (1 slot) + its options **ATM ± `DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE` = 10**, CE and PE (42 slots) = **43** |
+| Total | 2 × 43 + 7 × 23 = **247 of 250** |
+| Ranking cadence | every minute, from **09:00** |
+| Apply cadence | every minute at :08 — **UNCHANGED** (Quote A) |
+| Entry / exit | enter at rank ≤ 7; **keep until rank > `DEPTH20_NAME_EXIT_RANK` = 12** |
+| Budget | 250 depth-20 instruments, 5 sockets × 50. UNCHANGED |
+| Segment | `NSE_FNO` only. SENSEX / BANKEX remain structurally impossible (BSE_FNO, Dhan serves depth on NSE alone) |
+| Contract source | the daily master artifact. Hardcoding contract ids remains a REJECT — they expire |
+
+#### The capacity arithmetic, and why ATM±5 is a CEILING not a preference
+
+| Block | Contracts | Slots |
+|---|---|---:|
+| NIFTY future | 1 | 1 |
+| BANKNIFTY future | 1 | 1 |
+| NIFTY options ATM±10 | 21 strikes × CE+PE | 42 |
+| BANKNIFTY options ATM±10 | 21 strikes × CE+PE | 42 |
+| 7 stock futures | 7 | 7 |
+| 7 stock ladders ATM±5 | 11 strikes × CE+PE × 7 | 154 |
+| **Total** | | **247** |
+| Ceiling (`5 × 50`) | | 250 |
+| **Spare** | | **3** |
+
+ATM±6 for stocks gives 275 — **over by 25**, and `plan_pool` refuses the WHOLE
+pool fail-closed rather than truncating, which is a session-ending failure. So
+±5 is the arithmetic ceiling in the operator's stated shape, not a judgement.
+
+**⚠ The packing caveat, stated because it changes the answer.** 250 is
+`5 sockets × 50` and a contract cannot straddle a socket. Under FREE packing
+(contracts fill any socket) 247 fits. Under SOCKET-AFFINE packing (all of one
+name's contracts on one socket, so a rotation touches one socket) NIFTY takes 43
+of 50 and BANKNIFTY takes 43 of 50, stranding 14 slots, and 7 × 23 = 161 does not
+fit the remaining 150 — ATM±4 (19/name → 133) does. **Free packing is what
+ships**, because the wider ladder is worth more than the cheaper swap at a
+one-minute cadence, and `plan_pool` already packs the main feed this way.
+
+#### ⚠ The swap clock — the honest cost, and why the band exists
+
+| Fact | Value |
+|---|---:|
+| Swaps per socket per minute | 4 (`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE`, const-asserted = channel depth) |
+| Pool-wide per minute | **20** |
+| One stock name rotating out | 23 out + 23 in = **23 swaps** |
+| Minutes to apply ONE name change | **2** |
+| Whole board turning over | 250 ÷ 20 = **12.5 minutes** |
+
+A percentage-move key re-orders in BOTH directions every minute, unlike
+cumulative volume which only ever rises. **Without a band the board would chase a
+list it can never match**, and that is not a hypothetical: the 2026-09-11 (SECOND)
+section measured depth-200 at 93.5% of its swap cap with a 1.07-minute mean hold,
+on a key that at least rises monotonically.
+
+`DEPTH20_NAME_EXIT_RANK = 12` is the remedy the 2026-09-07 lock already
+prescribes verbatim — *"the answer is a longer window or a hysteresis band on
+entry/exit"* — applied at the NAME level: a name entered as a top-7 keeps its 23
+slots until it falls out of the top 12 (~6% of the ~208 live F&O underlyings).
+It is the same shape as depth-20's existing 250/300 contract band and
+depth-200's 5/20 name band, and it is **not derived** — no measurement of
+minute-to-minute rank drift on this key exists, because no session has ever
+ranked on it. `tv_depth20_name_swaps_total{outcome}` is the read-out that tunes
+it.
+
+#### ⚠ The honest envelope (mandatory per operator-charter §F)
+
+**Pre-open ranking is the cleanest part of this design and the operator is right
+about it.** Volume is zero for everything before 09:15, which is exactly why the
+2026-09-06 lock's own REJECT row calls a pre-open volume ranking *"meaningless"*.
+A percentage-move ranking has no such failure mode: both its inputs are live from
+09:00. The `within_capture_window` gate that starts at 09:15 exists to stop a
+midnight-spanning process publishing YESTERDAY's volumes — a volume-specific
+hazard — so opening the percentage ranking earlier is a narrow, reasoned unlock
+and NOT a weakening of that gate, which stays exactly as it is for the volume
+board.
+
+**NOT claimed — pre-open coverage is partial, and by how much is measured.** The
+2026-08-28 measurement in this file records that ~750 equities deliver one stale
+snapshot at ~08:30 (rejected, outside the window) and then **nothing until the
+09:07 auction print**. So between 09:00 and 09:07 most stock underlyings have no
+spot price and cannot be ranked at all; the board fills from whatever HAS printed
+and completes after the auction. An instrument with no spot must rank NOTHING —
+never zero, which would tie it with a genuinely flat name and hand it a socket.
+
+**NOT claimed — that this improves capture.** 2026-09-10 and 2026-09-11 both
+ended with every depth socket at `GHOST_REDIAL_SESSION_CEILING` and 5,250,076
+ghost packets still arriving, because Dhan ignored the unsubscribe on BOTH code
+25 and code 24. **Every swap this design performs is a swap whose unsubscribe the
+vendor is currently proven to ignore.** Fewer swaps means fewer ghosts, and a
+name-level band means far fewer swaps than a contract-level board — so this
+design is strictly better for that failure than what it replaces. It does not fix
+it, and the support ticket the 2026-09-11 section calls for remains the only
+real remedy.
+
+**NOT claimed — that a thin stock has a ±5 ladder.** 81 of 210 underlyings
+measured 2026-08-27 have ladders where ±25 already takes EVERY strike that
+exists. ±5 is 11 strikes, well inside that, so it is almost always available —
+but `fit_atm_window` returning fewer strikes than asked must fill the remainder
+from the next-ranked name, never leave slots idle and never silently narrow
+another name's window.
+
+**NOT claimed — that percentage move is the right key.** It is the operator's
+key. The measured argument for volume was that it finds the BUSIEST book;
+percentage move finds the most MOVED name, which is a different and equally
+defensible question for a depth capture. Recorded so the trade is on the record.
+
+#### ⚠ What this quote does NOT authorize
+
+- **Any change to depth-200.** Its key, band, budget and stock-options-only
+  restriction are untouched.
+- **Any deletion of SEBI or audit rows** — `instrument_lifecycle`,
+  `instrument_lifecycle_audit`, `index_constituency`, `order_audit`,
+  `order_update_events`, `position_update_events`, `ws_event_audit`. A general
+  "go ahead" is exactly the shape §5-class REJECT lists name as insufficient.
+- Any change to the socket or instrument budget (250 + 5 remain).
+- Any fifth Dhan endpoint type, or more than 16 total connections.
+- Raising the apply cadence — Quote A withdraws that ask outright.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Widening `PrevCloseStore` to `NseFno` — the 2026-09-09 section's one
+  never-open row. The ranking uses the UNDERLYING's prev close, which is
+  `NseEquity` and already written.
+- Depth on `BSE_FNO`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Uses a **float** anywhere in the sort key. The 2026-09-07 lock's reasoning
+  binds unchanged: a non-finite comparator is non-transitive and corrupts a sort
+  wholesale, and `prev_close = 0` is a proven NaN source in this repository.
+  Integer basis points remove the failure mode rather than guard against it.
+- Ranks a name whose spot or prev close is missing as 0% — that ties it with a
+  genuinely flat name and hands it a socket it did not earn.
+- Divides by a zero or non-positive prev close without refusing and counting.
+- Removes the name-level exit band, or lets a name lose its 23 slots on a single
+  minute in which it slipped to rank 8.
+- Applies the ranking from the frame drain, or more than once a minute.
+- Raises the apply cadence citing this section — Quote A withdraws the ask.
+- Lets a stock name displace NIFTY or BANKNIFTY, which are unconditional.
+- Ships ATM±6 or wider for stocks (275 > 250, and the pool is refused whole).
+- Hardcodes contract security-ids.
+- Reports the pool as enabled while its instrument set is empty — including the
+  09:00–09:07 window, where most equities have not printed.
+- Changes depth-200 under cover of this quote.
