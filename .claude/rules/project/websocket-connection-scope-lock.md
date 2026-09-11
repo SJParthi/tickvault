@@ -2966,6 +2966,81 @@ swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
 > > 2026-09-10 counterparts were recorded, so the one comparison that could
 > > discriminate between the two codes was never taken.
 > >
+> > ##### ✅ STEP 1 DONE 2026-09-11 (same evening) — the 09-10 counters WERE still recoverable, and the two days are NOT alike
+> >
+> > The block above says the 2026-09-10 counterparts "were never recorded, so
+> > the one comparison that could discriminate between the two codes was never
+> > taken." That was true of what anyone had written down, and **false of what
+> > still existed**: the CloudWatch EMF group keeps the per-outcome split, and
+> > `filter-log-events` can still read it. It was taken.
+> >
+> > **Method, and why it is trustworthy.** The EMF record carries a **delta per
+> > scrape**, not a cumulative, so a session total is the SUM of ~538 samples.
+> > `logs:StartQuery` is denied to `claude-code-agent`, so the aggregation is
+> > client-side over `filter-log-events`. **The method validates itself:** run
+> > against 2026-09-11 it reproduces every already-known figure EXACTLY — ghost
+> > 5,345,436 · grace 1,686,468 · rows 793,936,960 · depth-20 swaps 7,662 ·
+> > depth-200 swaps 1,799. A method that reproduces five known numbers to the
+> > unit is trusted for the sixth.
+> >
+> > | Full session, one continuous run each | **2026-09-10 · code 25** | **2026-09-11 · code 24** | ratio |
+> > |---|---:|---:|---:|
+> > | boots inside the window | 1 | 1 | — |
+> > | depth-20 swaps sent | 6,068 | 7,662 | 1.26x |
+> > | depth-200 swaps sent | 1,712 | 1,799 | 1.05x |
+> > | **total unsubscribes** | **7,780** | **9,461** | **1.22x** |
+> > | depth rows stored | 226,667,920 | 793,936,960 | 3.50x |
+> > | **ghost packets** | **110,114** | **5,345,436** | **48.5x** |
+> > | **unsubscribed_grace** | **55,160** | **1,686,468** | **30.6x** |
+> > | ghost_redial | 80 | 80 | **1.00 — the ceiling** |
+> > | ghost_exhausted | 10 | 10 | **1.00 — the ceiling** |
+> >
+> > **The only two numbers that matched are the only two that COULD NOT differ.**
+> > That is the circularity above, now demonstrated with data rather than
+> > arithmetic: `ghost_redial` is 8 x 10 sockets on both days, and everything
+> > without a ceiling differs by one to two orders of magnitude.
+> >
+> > **Three independent normalisations, because ghost scales with traffic:**
+> >
+> > | normalised measure | 09-10 (25) | 09-11 (24) | ratio |
+> > |---|---:|---:|---:|
+> > | ghost packets per unsubscribe | 14.2 | 565.0 | **40x** |
+> > | ghost packets per 1M depth rows | 486 | 6,733 | **13.9x** |
+> > | **ghost / grace — traffic-independent** | **1.996** | **3.170** | **1.59x** |
+> > | implied mean streaming tail, `T = 90(1+r)` | **~270 s** | **~375 s** | |
+> > | ratio if NEVER honoured (`510/90`) | **4.667 ⇒ 510 s** | same | |
+> >
+> > The `ghost / grace` row is the one to lead with: it is two counters over the
+> > SAME packet stream in two different windows, so it cancels traffic by
+> > construction. All three point the same way.
+> >
+> > **What this DOES establish:**
+> > 1. **The byte-identical argument is refuted by measurement, not only by
+> >    arithmetic.** The days differ enormously wherever a ceiling does not
+> >    forbid it. This needs no causal claim at all.
+> > 2. **Neither code is fully honoured** — ghost > 0 on both days.
+> > 3. **Neither code is fully IGNORED either**, which is new: both ratios sit
+> >    BELOW the never-honoured ceiling of 4.667, so some unsubscribes are
+> >    taking effect. "Dhan ignores it" is too strong for either day.
+> >
+> > **⚠ What this does NOT establish — the cause.** Four other PRs merged
+> > between the two deployed builds (`55126249b`, `ad778aa50`, `16190ce2a`,
+> > `61f6e448e`, `0e6f95fc8`), and `ad778aa50` carried a "subscribed-first
+> > contract map" alongside the code flip. **Depth traffic also differed 3.50x
+> > between the two days and that difference is itself unexplained.** So the
+> > honest statement is *"the two sessions behaved very differently and code 25
+> > ghosted far less on every normalisation"*, NOT *"code 25 is better because
+> > it is 25"*. The one-socket probe (step 2) is still what settles cause,
+> > and it is still unrun.
+> >
+> > **One bounded measurement caveat, stated because it cuts the convenient
+> > way.** `55126249b` ("seed the depth ghost family ... so the unsubscribe-code
+> > verdict is readable") merged at 08:52 IST on 09-10, twenty-two minutes AFTER
+> > that session booted — so 09-10 ran unseeded, and the agent drops the FIRST
+> > sample of a series it has never seen. That under-counts **09-10**, the day
+> > with fewer ghosts, so correcting it would NARROW the gap. It is bounded at
+> > one sample of 538 (~0.2%), far too small to move any row above.
+> >
 > > **This is not a claim that 24 or 25 works.** Both were almost certainly
 > > ignored. It is a claim that **the argument as recorded cannot survive
 > > vendor scrutiny**, and a ticket built on it invites "we cannot reproduce;
