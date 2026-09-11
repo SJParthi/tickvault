@@ -2023,6 +2023,67 @@ mod tests {
         }
     }
 
+    /// `rebase_open_buckets` keeps what a bucket already counted and lets it
+    /// keep rising across a cumulative RESTART.
+    ///
+    /// BITE PROOF: without the rebase, the second assertion below reads 900
+    /// instead of 50,900 — the bucket freezes at its pre-restart figure and
+    /// never counts another unit for the rest of its life.
+    ///
+    /// The rebase anchors at `cumulative − volume`, never at `cumulative`:
+    /// those 900 units really traded, so anchoring at the restarted counter
+    /// would erase them.
+    #[test]
+    fn rebase_open_buckets_preserves_counted_volume_and_resumes_counting() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // A bucket that has counted 900 units against a near-ceiling counter.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN, 100.0, 4_000_000_000),
+            3_999_999_100,
+            strategy,
+            4_000_000_000,
+        );
+        assert_eq!(cell.snapshot(TfIndex::M1).volume, 900);
+
+        // THE RESTART: the vendor's counter comes back near zero.
+        cell.rebase_open_buckets(100_000);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            900,
+            "the units already counted must survive the rebase"
+        );
+
+        // 50,000 more trade off the RESTARTED counter, in the same bucket.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 5, 101.0, 150_000),
+            100_000,
+            strategy,
+            150_000,
+        );
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            50_900,
+            "900 before the restart plus 50,000 after it; a frozen bucket \
+             would still read 900"
+        );
+    }
+
+    /// An UNINITIALISED slot has no bucket to re-base, and touching one would
+    /// fabricate a bucket that never opened.
+    #[test]
+    fn rebase_open_buckets_skips_slots_that_have_never_opened() {
+        let mut cell = AggregatorCell::empty();
+        cell.rebase_open_buckets(100_000);
+        assert!(
+            cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "a slot that never opened must stay uninitialised"
+        );
+    }
+
     #[test]
     fn test_a_late_arriving_day_open_still_reaches_the_days_first_bucket() {
         // WHAT THIS ACTUALLY PINS (operator asked 2026-08-19 whether the
